@@ -1620,8 +1620,9 @@ async fn serve_ca_pva_qsrv(
         ca_port,
         config.tcp_port,
         config.acf.clone(),
-        config.autosave_config.clone(),
-        config.autosave_manager.clone(),
+        // Autosave is the PVA server's below: C has one save task per IOC.
+        None,
+        None,
         &mut config.servers,
     )
     .await?;

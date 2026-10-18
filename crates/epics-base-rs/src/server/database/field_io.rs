@@ -4735,6 +4735,7 @@ impl PvDatabase {
 
     /// C `dbPutMenuIndex` (`dbStaticRun.c:540-561`): `index` stored only when
     /// `0 <= index < nChoice`, a bound the `.db` loader's own does not keep.
+    /// A refusal is `InvalidValue` of the status's `errSymLookup` text alone.
     pub async fn put_pv_menu_index(&self, name: impl AsRef<[u8]>, index: i32) -> CaResult<()> {
         let name = name.as_ref();
         let (base, field) = super::parse_pv_name(name);
@@ -4743,21 +4744,19 @@ impl PvDatabase {
             .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
         let (field, _) = rec.put_name(field);
         let record_type = rec.read().record.record_type().to_string();
-        let refused = |status: &str| {
-            CaError::InvalidValue(format!("{}: {status}", String::from_utf8_lossy(name)))
-        };
         let choices = crate::server::db_loader::menu_choices_of(&record_type, &field)
-            .ok_or_else(|| refused("Menu not found"))?;
+            .ok_or_else(|| CaError::InvalidValue("Menu not found".into()))?;
         let label = usize::try_from(index)
             .ok()
             .and_then(|i| choices.get(i))
-            .ok_or_else(|| refused("Bad Field value"))?;
+            .ok_or_else(|| CaError::InvalidValue("Bad Field value".into()))?;
         self.put_pv_static(name, label).await
     }
 
     /// C `dbPutString` on the record's static entry (`dbStaticLib.c:2570-2662`):
     /// `text` converted as a `.db` field value is, with no `special()`, no
-    /// processing and no post. A VAL put also clears UDF, as there.
+    /// processing and no post. A VAL put also clears UDF, as there. A
+    /// refusal is `InvalidValue` of the status's `errSymLookup` text alone.
     pub async fn put_pv_static(&self, name: impl AsRef<[u8]>, text: &str) -> CaResult<()> {
         let name = name.as_ref();
         let (base, field) = super::parse_pv_name(name);
@@ -4789,11 +4788,7 @@ impl PvDatabase {
                     if refusal.stored {
                         crate::server::db_loader::apply_fields(&mut *inst, &field, &mut common)?;
                     }
-                    return Err(CaError::InvalidValue(format!(
-                        "{record_name}.{}: {}",
-                        field[0].name,
-                        refusal.status()
-                    )));
+                    return Err(CaError::InvalidValue(refusal.status().into()));
                 }
             }
         }

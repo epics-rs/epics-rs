@@ -14,13 +14,7 @@ use epics_base_rs::server::autosave::save_file::{SaveEntry, read_save_file, writ
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
 
 fn quick_backup() -> BackupConfig {
-    BackupConfig {
-        enable_savb: false,
-        num_seq_files: 0,
-        seq_period: Duration::from_secs(60),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    }
+    BackupConfig { enable_savb: false }
 }
 
 async fn setup_db() -> Arc<PvDatabase> {
@@ -52,6 +46,7 @@ async fn test_periodic_save_set() {
                 request_pvs: vec!["TEMP".into(), "PRESS".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Periodic {
@@ -62,11 +57,14 @@ async fn test_periodic_save_set() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
 
     // The first pass arms the timer; the next, a MIN_DELAY later, saves.
     for _ in 0..150 {
@@ -99,6 +97,7 @@ async fn test_manual_save() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -125,6 +124,7 @@ async fn test_multiple_sets_independent() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -137,6 +137,7 @@ async fn test_multiple_sets_independent() {
                 request_pvs: vec!["PRESS".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -178,6 +179,7 @@ async fn test_restore_all() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -227,6 +229,7 @@ async fn test_one_set_failure_no_impact() {
                 request_pvs: vec!["PRESS".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -239,6 +242,7 @@ async fn test_one_set_failure_no_impact() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -267,6 +271,7 @@ async fn test_concurrent_manual_periodic_serialized() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Periodic {
@@ -277,11 +282,14 @@ async fn test_concurrent_manual_periodic_serialized() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
 
     // Manual saves while periodic is running
     for _ in 0..5 {
@@ -312,6 +320,7 @@ async fn test_shutdown_cleanup() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Periodic {
@@ -322,11 +331,14 @@ async fn test_shutdown_cleanup() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
 
     epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     mgr.shutdown();
@@ -357,6 +369,7 @@ async fn test_save_once_failure_updates_stats() {
                 request_pvs: vec!["TEMP".into()],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -386,6 +399,7 @@ async fn test_empty_pv_list_saves_header_and_end() {
                 request_pvs: vec![],
                 backup: quick_backup(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -417,6 +431,7 @@ async fn a_shutdown_before_the_tasks_run_still_ends_them() {
                     request_pvs: vec!["TEMP".into()],
                     backup: quick_backup(),
                     macros: HashMap::new(),
+                    macro_string: String::new(),
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::Periodic {
@@ -426,11 +441,14 @@ async fn a_shutdown_before_the_tasks_run_still_ends_them() {
             .build()
             .await,
     );
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
     mgr.shutdown();
     // The event is the outer join resolving: every set task has finished its
     // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
@@ -459,6 +477,7 @@ async fn a_set_task_ends_when_the_manager_drops_without_shutdown() {
                     request_pvs: vec!["TEMP".into()],
                     backup: quick_backup(),
                     macros: HashMap::new(),
+                    macro_string: String::new(),
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::Periodic {
@@ -469,11 +488,14 @@ async fn a_set_task_ends_when_the_manager_drops_without_shutdown() {
             .await,
     );
     let set = Arc::downgrade(&mgr.sets()[0].0);
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
     handle.abort();
     drop(mgr);

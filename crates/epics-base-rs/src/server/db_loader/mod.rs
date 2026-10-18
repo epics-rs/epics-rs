@@ -19,7 +19,9 @@ pub use include::{
     db_open_file_located, db_path, expand_includes, loaded_path, parse_db_file,
     parse_db_file_with_breaktables, parse_db_opened_with_breaktables, set_loaded_path,
 };
-pub(crate) use include::{db_load_config, parse_db_opened_held, resolve_db_file};
+pub(crate) use include::{
+    db_expand_file_name, db_load_config, parse_db_opened_held, resolve_db_file,
+};
 pub(crate) use install::{InstallHost, LoadRejected, install_records};
 pub use source::{DbIncludeFrame, DbSource};
 pub use substitution::{

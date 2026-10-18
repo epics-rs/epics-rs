@@ -1738,7 +1738,7 @@ pub(crate) fn escaped_from_raw(src: &[u8]) -> String {
 ///
 /// (C's `!c` breaks are its string terminator; a [`ScalcString`] cannot contain a
 /// NUL, so `s.len()` is C's `strlen` and those breaks have nothing to do here.)
-fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
+pub(crate) fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
     fn nibble(c: u8) -> u8 {
         (c as char).to_digit(16).expect("checked is_ascii_hexdigit") as u8
     }

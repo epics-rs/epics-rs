@@ -5,7 +5,8 @@ mod access_commands;
 pub(crate) use access_commands::as_init;
 mod breakpoint_commands;
 mod commands;
-pub(crate) use commands::db_records_once_only;
+pub use commands::{DbLoadRecordsHook, db_load_records_hook, set_db_load_records_hook};
+pub(crate) use commands::{db_get_string, db_records_once_only, record_names_type_major};
 /// TAB completion for the interactive editor. Host-only, for the same
 /// reason `run_repl_interactive` is: it is built on `rustyline`.
 #[cfg(not(epics_embedded_target))]
@@ -1851,7 +1852,7 @@ fn paint_error_if(msg: &str, color: bool) -> String {
 /// `iocsh.cpp` interpolates. `io::Error`'s Display is the same sentence with
 /// ` (os error N)` appended, so the suffix comes off rather than the message
 /// being rebuilt from a table this port would then have to keep in step.
-fn c_strerror(e: &std::io::Error) -> String {
+pub(crate) fn c_strerror(e: &std::io::Error) -> String {
     let text = e.to_string();
     match e.raw_os_error() {
         Some(errno) => text

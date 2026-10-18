@@ -330,13 +330,13 @@ impl PvaServer {
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("the PVA server's run loop is awaited on an executor");
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
-            Some(mgr.clone().start(&reactor, self.db.clone()))
+            mgr.clone().start(&reactor, self.db.clone())
         } else if let Some((cfg, method)) = self.autosave_config.clone() {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.
-            Some(Arc::new(builder.build().await).start(&reactor, self.db.clone()))
+            Arc::new(builder.build().await).start(&reactor, self.db.clone())
         } else {
             None
         };
@@ -408,11 +408,6 @@ impl PvaServer {
         let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
-        let autosave_cmds = self
-            .autosave_manager
-            .as_ref()
-            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
-
         let server = Arc::new(self);
 
         let server_clone = server.clone();
@@ -437,11 +432,6 @@ impl PvaServer {
             // `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
-            if let Some(cmds) = autosave_cmds {
-                for cmd in cmds {
-                    shell.register(cmd);
-                }
-            }
             shell.register(super::iocsh::pvxsr_command());
             let result = shell.run_repl();
             let _ = tx.send(result);
@@ -480,11 +470,6 @@ impl PvaServer {
         let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
-        let autosave_cmds = self
-            .autosave_manager
-            .as_ref()
-            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
-
         let server = Arc::new(self);
 
         let server_clone = server.clone();
@@ -505,11 +490,6 @@ impl PvaServer {
             // server's live policy cell.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
-            if let Some(cmds) = autosave_cmds {
-                for cmd in cmds {
-                    shell.register(cmd);
-                }
-            }
             shell.register(super::iocsh::pvxsr_command());
             let result = shell.run_repl();
             let _ = tx.send(result);

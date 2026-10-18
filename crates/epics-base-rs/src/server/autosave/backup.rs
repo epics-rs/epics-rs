@@ -3,34 +3,22 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Local;
 
-use super::error::{AutosaveError, AutosaveResult};
-use super::format::CompatMode;
-use super::save_file::{SaveEntry, validate_save_file, write_save_file_with_mode};
+use super::error::AutosaveResult;
+use super::format::END_MARKER;
+use super::save_file::{SaveEntry, keep_permissions, write_save_file_with_settings};
+use super::settings::SrSettings;
 
-/// Backup policy configuration.
+/// A set's own backup policy. The sequence files and dated backups are
+/// the IOC's ([`super::settings::SrSettings`]), as C's globals are.
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     /// Enable .savB backup (default: true)
     pub enable_savb: bool,
-    /// Number of sequence files .sav0-.savN (default: 3, 0=disable)
-    pub num_seq_files: usize,
-    /// Sequence rotation period (default: 60s)
-    pub seq_period: Duration,
-    /// Enable dated backups .sav_YYMMDD-HHMMSS (default: false)
-    pub enable_dated: bool,
-    /// Dated backup interval (default: 1h)
-    pub dated_interval: Duration,
 }
 
 impl Default for BackupConfig {
     fn default() -> Self {
-        Self {
-            enable_savb: true,
-            num_seq_files: 3,
-            seq_period: Duration::from_secs(60),
-            enable_dated: false,
-            dated_interval: Duration::from_secs(3600),
-        }
+        Self { enable_savb: true }
     }
 }
 
@@ -40,7 +28,7 @@ impl Default for BackupConfig {
 /// opens the destination CREATE|TRUNCATE before it can fail, so copying
 /// onto an existing backup destroys that generation the moment the write
 /// runs short of space — the previous good `.savB` is left zero-length and
-/// `find_best_save_file` then rejects it for the missing `<END>`. Copying
+/// `fopen_and_check` then rejects it for the missing `<END>`. Copying
 /// to a sibling temp path and renaming makes that intermediate state
 /// unconstructible: `dst` holds its previous complete content or the new
 /// copy, never a truncation.
@@ -53,94 +41,79 @@ impl Default for BackupConfig {
 /// Power-loss durability is unchanged and deliberately not claimed here:
 /// a backup is derived data, and the `.sav` write owns the `fsync`
 /// sequence that makes the original durable.
-pub(super) async fn publish_copy(src: &Path, dst: &Path) -> AutosaveResult<()> {
-    let mut tmp = dst.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let src = src.to_path_buf();
-    let dst = dst.to_path_buf();
-    let published = crate::runtime::fs::blocking({
-        let (src, dst, tmp) = (src.clone(), dst.clone(), tmp.clone());
-        move || {
-            let published = std::fs::copy(&src, &tmp).and_then(|_| std::fs::rename(&tmp, &dst));
-            if published.is_err() {
-                // The rename never happened, so this temp file is the only
-                // trace of the attempt; leaving it would accumulate one per
-                // failed cycle next to the save set.
-                let _ = std::fs::remove_file(&tmp);
-            }
-            published
-        }
-    })
-    .await;
-    // Announced here rather than by the callers: this is the only place a
-    // backup artefact is written, and one caller (the `_SBAD_` copy of a
-    // corrupt `.savB`) treats the failure as non-fatal and keeps no other
-    // trace of it, so a backup silently stopped being written while the
-    // set went on reporting successful saves.
-    if let Err(ref e) = published {
+pub(super) async fn publish_copy(
+    src: &Path,
+    dst: &Path,
+    settings: &SrSettings,
+) -> AutosaveResult<()> {
+    if settings.debug() >= 5 {
         crate::runtime::log::errlog_vprintf(format_args!(
-            "autosave: backup {} -> {} not written: {e}\n",
+            "../dbrestore.c:myFileCopy copying '{}' to '{}'\n",
             src.display(),
             dst.display()
         ));
     }
-    published?;
-    Ok(())
+    let mut tmp = dst.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let published = crate::runtime::fs::blocking({
+        let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+        move || Ok(copy_through(&src, &dst, &tmp))
+    })
+    .await
+    .unwrap_or_else(|e| Err((format!("Can't open file '{}'", dst.display()), e)));
+    // Announced here rather than by the callers: this is the only place a
+    // backup artefact is written, as C's `myFileCopy` is.
+    match published {
+        Ok(()) => Ok(()),
+        Err((line, e)) => {
+            crate::runtime::log::errlog_vprintf(format_args!("../dbrestore.c:myFileCopy {line}\n"));
+            Err(e.into())
+        }
+    }
 }
 
-/// State for tracking timed backup operations.
-///
-/// Each field is a watermark meaning "the artefact it governs is on
-/// disk". They are private, and the two transitions that move them
-/// (`Self::rotate_seq` and `Self::write_dated`) publish first and
-/// advance after, so a watermark standing ahead of the file it names
-/// cannot be constructed. Advancing `seq_index` past a copy that did not
-/// happen is what used to leave a destroyed slot unrewritten for a whole
-/// `seq_period`.
-#[derive(Debug, Default)]
-pub struct BackupState {
-    last_seq_time: Option<std::time::Instant>,
-    last_dated_time: Option<std::time::Instant>,
-    seq_index: usize,
+/// `publish_copy`'s blocking half; the error carries C's `myFileCopy` line.
+/// C names the source when it cannot be read and the destination for
+/// anything after (dbrestore.c:181-216).
+fn copy_through(src: &Path, dst: &Path, tmp: &Path) -> Result<(), (String, std::io::Error)> {
+    use std::io::Write as _;
+    let failed = |what: &str, path: &Path| {
+        let line = format!("{what} '{}'", path.display());
+        move |e| (line, e)
+    };
+    let contents = std::fs::read(src).map_err(failed("Can't open file", src))?;
+    let published = std::fs::File::create(tmp)
+        .map_err(failed("Can't open file", dst))
+        // C only says "Error closing file" for a failed write-back and still
+        // returns OK (dbrestore.c:209-218), so a short backup passes as
+        // made; here it fails.
+        .and_then(|mut file| {
+            // C's `fopen(dest, "wb")` keeps the mode of a file already there.
+            keep_permissions(&file, dst);
+            file.write_all(&contents)
+                .map_err(failed("Error closing file", dst))
+        })
+        // A destination C could not `fopen(dest, "wb")`.
+        .and_then(|()| std::fs::rename(tmp, dst).map_err(failed("Can't open file", dst)));
+    if published.is_err() {
+        // The rename never happened, so this temp file is the only trace of
+        // the attempt; leaving it would accumulate one per failed cycle next
+        // to the save set.
+        let _ = std::fs::remove_file(tmp);
+    }
+    published
 }
 
-impl BackupState {
-    /// Copy `.sav` into the current sequence slot and take the next one.
-    async fn rotate_seq(&mut self, sav_path: &Path, config: &BackupConfig) -> AutosaveResult<()> {
-        if config.num_seq_files == 0 {
-            return Ok(());
-        }
-        if self
-            .last_seq_time
-            .is_some_and(|t| t.elapsed() < config.seq_period)
-        {
-            return Ok(());
-        }
-        let ext = format!("sav{}", self.seq_index);
-        publish_copy(sav_path, &sav_path.with_extension(&ext)).await?;
-        self.seq_index = (self.seq_index + 1) % config.num_seq_files;
-        self.last_seq_time = Some(std::time::Instant::now());
-        Ok(())
-    }
+/// C `fGetDateStr` (fGetDateStr.c:79).
+pub(super) fn date_str() -> String {
+    Local::now().format("%y%m%d-%H%M%S").to_string()
+}
 
-    /// Copy `.sav` to a timestamped name once per `dated_interval`.
-    async fn write_dated(&mut self, sav_path: &Path, config: &BackupConfig) -> AutosaveResult<()> {
-        if !config.enable_dated {
-            return Ok(());
-        }
-        if self
-            .last_dated_time
-            .is_some_and(|t| t.elapsed() < config.dated_interval)
-        {
-            return Ok(());
-        }
-        let timestamp = Local::now().format("%y%m%d-%H%M%S");
-        let ext = format!("sav_{timestamp}");
-        publish_copy(sav_path, &sav_path.with_extension(&ext)).await?;
-        self.last_dated_time = Some(std::time::Instant::now());
-        Ok(())
-    }
+/// C's `line` between two rows of `stars` `***`s.
+pub(super) fn print_banner(stars: usize, line: &str) {
+    let row = "*** ".repeat(stars - 1) + "***";
+    println!("{row}\n{line}\n{row}");
 }
 
 /// Whether the `.savB` backup still holds the *outgoing* generation and
@@ -164,6 +137,42 @@ pub enum SavbState {
     Rewritten,
 }
 
+/// C `check_file`'s answer (`BS_NONE`, `BS_BAD`, `BS_OK`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileState {
+    None,
+    Bad,
+    Ok,
+}
+
+/// C `check_file` (save_restore.c:1642-1690): a file that opens is good
+/// when `<END>` starts 7 or 6 bytes before its end.
+pub(super) async fn check_file(path: &Path, settings: &SrSettings) -> FileState {
+    let path = path.to_path_buf();
+    let Ok(bytes) = crate::runtime::fs::blocking(move || std::fs::read(path)).await else {
+        return FileState::None;
+    };
+    for back in [7, 6] {
+        let Some(start) = bytes.len().checked_sub(back) else {
+            println!("save_restore:check_file: seek failed");
+            return FileState::Bad;
+        };
+        // C's `fgets` of the rest cannot come back empty here, so its
+        // "fgets failed" line has no counterpart.
+        let tmpstr = fgets(&bytes[start..], back);
+        if settings.debug() >= 5 {
+            println!(
+                "save_restore:check_file: tmpstr='{}'",
+                String::from_utf8_lossy(tmpstr)
+            );
+        }
+        if tmpstr.starts_with(END_MARKER.as_bytes()) {
+            return FileState::Ok;
+        }
+    }
+    FileState::Bad
+}
+
 /// Make sure a valid `.savB` exists *before* the `.sav` is overwritten.
 ///
 /// C pivots this decision on the `.savB` itself, not on the `.sav`
@@ -183,47 +192,50 @@ async fn ensure_savb(
     sav_path: &Path,
     config: &BackupConfig,
     entries: &[SaveEntry],
-    compat: CompatMode,
+    settings: &SrSettings,
 ) -> AutosaveResult<SavbState> {
     if !config.enable_savb {
         return Ok(SavbState::Disabled);
     }
     let savb = sav_path.with_extension("savB");
-    let state = validate_save_file(&savb).await;
-    if matches!(state, Ok(true)) {
+    let state = check_file(&savb, settings).await;
+    if state == FileState::Ok {
         return Ok(SavbState::Ok);
     }
 
-    crate::runtime::log::errlog_vprintf(format_args!(
-        "autosave: backup file ({}) bad or not found. Writing a new one.\n",
+    let datetime = date_str();
+    println!(
+        "save_restore:write_save_file: Backup file ({}) bad or not found.  Writing a new one. [{datetime}]",
         savb.display()
-    ));
-    // `validate_save_file` reports an unopenable file as an error and a
-    // file without the `<END>` marker as `Ok(false)`, which is C's
-    // `BS_NONE` / `BS_BAD` split. Only the second one has content worth
-    // keeping for diagnosis, and losing that copy is not worth failing
-    // the cycle over — `publish_copy` already reports it.
-    if matches!(state, Ok(false)) {
+    );
+    // Only a `.savB` that is there has content worth keeping for
+    // diagnosis, and losing that copy is not worth failing the cycle over.
+    if state == FileState::Bad {
         let mut aside = savb.as_os_str().to_os_string();
-        aside.push(format!("_SBAD_{}", Local::now().format("%y%m%d-%H%M%S")));
-        let _ = publish_copy(&savb, Path::new(&aside)).await;
+        aside.push(format!("_SBAD_{datetime}"));
+        let aside = Path::new(&aside);
+        if publish_copy(&savb, aside, settings).await.is_err() {
+            println!(
+                "save_restore:write_save_file: myFileCopy() failed for '{}' -> '{}'",
+                savb.display(),
+                aside.display()
+            );
+        }
     }
-    if let Err(e) = write_save_file_with_mode(&savb, entries, compat).await {
-        // Announced here for the same reason `publish_copy` announces its
-        // own failures: this is the one backup write that does not go
-        // through it, and C prints the equivalent line before returning.
-        crate::runtime::log::errlog_vprintf(format_args!(
-            "autosave: backup {} not written: {e}\n",
-            savb.display()
-        ));
+    if let Err(e) = write_save_file_with_settings(&savb, entries, settings).await {
+        print_banner(
+            19,
+            &format!("save_restore:write_save_file: Can't write new backup file. [{datetime}]"),
+        );
         return Err(e);
     }
     Ok(SavbState::Rewritten)
 }
 
-/// Rotate backups before writing a new `.sav` file.
-///
-/// Order: guarantee `.savB` -> sequence rotation -> dated backup.
+/// Guarantee a usable `.savB` before writing a new `.sav` file. The
+/// sequence files and dated backups are the save task's
+/// ([`super::save_set::SaveSet::do_seq`],
+/// [`super::save_set::SaveSet::do_periodic_dated_backup`]), as in C.
 ///
 /// A failed rotation is reported rather than swallowed, and the caller
 /// must not overwrite the `.sav` it could not preserve: the whole point
@@ -236,45 +248,10 @@ async fn ensure_savb(
 pub async fn rotate_backups(
     sav_path: &Path,
     config: &BackupConfig,
-    state: &mut BackupState,
     entries: &[SaveEntry],
-    compat: CompatMode,
-) -> Result<SavbState, RotateError> {
-    let at = |step| move |error| RotateError { step, error };
-    let savb_state = ensure_savb(sav_path, config, entries, compat)
-        .await
-        .map_err(at(BackupStep::Savb))?;
-
-    // The sequenced and dated copies are made from the generation about
-    // to be replaced, so unlike `.savB` they have nothing to copy when
-    // that generation is missing or corrupt.
-    if sav_path.exists() && validate_save_file(sav_path).await.unwrap_or(false) {
-        state
-            .rotate_seq(sav_path, config)
-            .await
-            .map_err(at(BackupStep::Seq))?;
-        state
-            .write_dated(sav_path, config)
-            .await
-            .map_err(at(BackupStep::Dated))?;
-    }
-
-    Ok(savb_state)
-}
-
-/// The [`rotate_backups`] step that failed: C gives each its own list
-/// status (save_restore.c:2069, :2197, :2257).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupStep {
-    Savb,
-    Seq,
-    Dated,
-}
-
-#[derive(Debug)]
-pub struct RotateError {
-    pub step: BackupStep,
-    pub error: AutosaveError,
+    settings: &SrSettings,
+) -> AutosaveResult<SavbState> {
+    ensure_savb(sav_path, config, entries, settings).await
 }
 
 /// Advance `.savB` to the generation just written, which is the other
@@ -283,11 +260,26 @@ pub struct RotateError {
 /// Skipped precisely when the pre-write half already wrote this
 /// generation into `.savB` (C's `backup_state != BS_NEW` guard), so the
 /// file is never written twice in one cycle.
-pub async fn publish_savb(sav_path: &Path, savb_state: SavbState) -> AutosaveResult<()> {
+pub async fn publish_savb(
+    sav_path: &Path,
+    savb_state: SavbState,
+    settings: &SrSettings,
+) -> AutosaveResult<()> {
     if savb_state != SavbState::Ok {
         return Ok(());
     }
-    publish_copy(sav_path, &sav_path.with_extension("savB")).await
+    publish_copy(sav_path, &sav_path.with_extension("savB"), settings).await
+}
+
+/// What C `fgets(buf, n, fp)` reads from `bytes`: at most `n - 1` bytes,
+/// through the first newline.
+fn fgets(bytes: &[u8], n: usize) -> &[u8] {
+    let max = bytes.len().min(n.saturating_sub(1));
+    let end = bytes[..max]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(max, |at| at + 1);
+    &bytes[..end]
 }
 
 /// Modification time of `path`, or `None` when the filesystem will not
@@ -300,46 +292,186 @@ async fn modified_time(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-/// Find the best available save file for restore.
+/// C `do_seq`'s first slot for a list (save_restore.c:2162-2179): the
+/// first one `stat` cannot see, else the one modified longest ago.
+pub(super) async fn oldest_seq_slot(sav_path: &Path, num_seq_files: usize) -> usize {
+    let mut oldest = (0, None);
+    for i in 0..num_seq_files {
+        let Some(mtime) = modified_time(&sav_path.with_extension(format!("sav{i}"))).await else {
+            return i;
+        };
+        if oldest.1.is_none_or(|t| mtime < t) {
+            oldest = (i, Some(mtime));
+        }
+    }
+    oldest.0
+}
+
+/// `name` with `suffix` appended, as C `strncat`s onto a file name.
+fn appended(name: &Path, suffix: &str) -> PathBuf {
+    let mut s = name.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// C `fopen_and_check` (dbrestore.c:1236-1311): the file a boot restore
+/// reads — `fname`, then `fname` + `B`, then the sequence files — and
+/// whether it is a sequence file (C's `*status = 1`), under `settings`'
+/// `save_restoreNumSeqFiles` and `save_restoreDatedBackupFiles`.
 ///
-/// Priority: `.sav`, then `.savB`, then the NEWEST valid sequence slot.
+/// C tries the slot closest in time to now and then the slots after it in
+/// index order, wrapping, which after a bad newest slot is the OLDEST one,
+/// since `do_seq` writes round-robin. That is a C defect: here the slots are
+/// tried closest first, all of them.
+pub async fn fopen_and_check(fname: &Path, settings: &SrSettings) -> Option<(PathBuf, bool)> {
+    let log = |line: String| {
+        crate::runtime::log::errlog_vprintf(format_args!("../dbrestore.c:fopen_and_check {line}\n"))
+    };
+    let num_seq_files = settings.seq_files();
+    let first = check_restore_file(fname, settings).await;
+    if settings.debug() >= 1 {
+        // C prints the `FILE *`; any address stands for a file that opened.
+        let fd = if first {
+            format!("{:p}", fname.as_os_str().as_encoded_bytes().as_ptr())
+        } else {
+            "(nil)".to_string()
+        };
+        println!("fopen_and_check: checkFile returned {fd}");
+    }
+    if first {
+        return Some((fname.to_path_buf(), false));
+    }
+    let savb = appended(fname, "B");
+    log(format!("Trying backup file '{}'", savb.display()));
+    if check_restore_file(&savb, settings).await {
+        return Some((savb, false));
+    }
+    // Every slot is tried, as in C; the ones `stat` dates younger than C's
+    // 1e9 s horizon (:1265, :1281) first, closest to now first.
+    let now = SystemTime::now();
+    let mut slots = Vec::new();
+    for i in 0..num_seq_files {
+        let path = appended(fname, &i.to_string());
+        let mtime = modified_time(&path).await;
+        if let Some(mtime) = mtime
+            && settings.debug() >= 5
+        {
+            // `fabs(difftime(currTime, st_mtime))`, both whole seconds.
+            let secs = |t: SystemTime| {
+                t.duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64)
+            };
+            let ctime = chrono::DateTime::<Local>::from(mtime).format("%a %b %e %H:%M:%S %Y\n");
+            log(format!("'{}' modified at {ctime}", path.display()));
+            log(format!(
+                "'{}' is {:.6} seconds old",
+                path.display(),
+                (secs(now) - secs(mtime)).abs() as f64
+            ));
+        }
+        let age = mtime
+            .map(|mtime| now.duration_since(mtime).unwrap_or_else(|e| e.duration()))
+            .filter(|age| *age < Duration::from_secs(1_000_000_000));
+        slots.push((age.is_none(), age, path));
+    }
+    slots.sort();
+    let mut last = appended(fname, "0");
+    if slots.first().is_none_or(|(undated, ..)| *undated) {
+        log("Can't figure out which seq file is most recent,".to_string());
+        log(format!(
+            "so I'm just going to start with '{}'.",
+            last.display()
+        ));
+    }
+    for (.., path) in slots {
+        log(format!("Trying backup file '{}'", path.display()));
+        if check_restore_file(&path, settings).await {
+            return Some((path, true));
+        }
+        last = path;
+    }
+    log("Can't find a file to restore from...".to_string());
+    log(format!("...last tried '{}'. I give up.", last.display()));
+    println!("save_restore: **********************************\n");
+    None
+}
+
+/// C `checkFile` (dbrestore.c:1137-1234): whether `file` opens and ends in
+/// `<END>`; a file that does not is copied to `file` + `_RBAD_[date]`.
 ///
-/// The first two are a real ordering: `.savB` is refreshed from `.sav` on
-/// every rotation cycle, so it is never older than a sequence slot, which
-/// is refreshed only once per `seq_period`. The slots are not an ordering.
-/// `BackupState::rotate_seq` fills them round-robin, so once the index
-/// has wrapped, slot 0 is as likely to hold the oldest generation as the
-/// newest — reading them by index restored a file up to
-/// `num_seq_files - 1` rotation periods stale and named it in
-/// `RestoreResult.source_file` with no warning, silently reverting every
-/// setpoint changed in that window.
-pub async fn find_best_save_file(base_path: &Path, config: &BackupConfig) -> Option<PathBuf> {
-    // Try .sav first
-    if let Ok(true) = validate_save_file(base_path).await {
-        return Some(base_path.to_path_buf());
+/// C trusts a file whose header carries no version, or one below 1.8,
+/// without the `<END>` test (:1163-1180). Every autosave-rs header (V1.0,
+/// CRead's V1.7) and a headerless `PV1 1.0` line would pass that way, so
+/// the test is made on every file here.
+async fn check_restore_file(file: &Path, settings: &SrSettings) -> bool {
+    let log = |line: String| {
+        crate::runtime::log::errlog_vprintf(format_args!("../dbrestore.c:checkFile {line}\n"))
+    };
+    let debug = settings.debug();
+    if debug >= 2 {
+        println!("checkFile: entry");
     }
-
-    // Try .savB
-    if config.enable_savb {
-        let savb = base_path.with_extension("savB");
-        if let Ok(true) = validate_save_file(&savb).await {
-            return Some(savb);
+    let path = file.to_path_buf();
+    let Ok(bytes) = crate::runtime::fs::blocking(move || std::fs::read(path)).await else {
+        log(format!("Can't open file '{}'.", file.display()));
+        return false;
+    };
+    if debug >= 2 {
+        // The number after the header's first `R`, else its first `V`.
+        let header = fgets(&bytes, usize::MAX);
+        let tag = header
+            .iter()
+            .position(|&b| b == b'R')
+            .or_else(|| header.iter().position(|&b| b == b'V'));
+        if let Some(at) = tag {
+            let version = if header.get(at + 1).is_some_and(u8::is_ascii_digit) {
+                crate::calc::engine::strtod::strtod(&header[at + 1..]).value
+            } else {
+                0.0
+            };
+            println!("checkFile: version={version:.6}");
         }
     }
-
-    // Sequence slots, newest first.
-    let mut newest: Option<(Option<SystemTime>, PathBuf)> = None;
-    for i in 0..config.num_seq_files {
-        let ext = format!("sav{i}");
-        let seq_path = base_path.with_extension(&ext);
-        if !matches!(validate_save_file(&seq_path).await, Ok(true)) {
-            continue;
-        }
-        let mtime = modified_time(&seq_path).await;
-        if newest.as_ref().is_none_or(|(best, _)| mtime > *best) {
-            newest = Some((mtime, seq_path));
-        }
+    // An empty file, or one too short to seek back over the marker, C
+    // gives up on at its `fgets` without a word (:1159-1161, :1190-1192).
+    if bytes.len() < 6 {
+        return false;
     }
-
-    newest.map(|(_, path)| path)
+    // `fgets(tmpstr, n, ...)` from `back` bytes before the end.
+    let ends = |back: usize, n: usize| {
+        let Some(start) = bytes.len().checked_sub(back) else {
+            return false;
+        };
+        let tail = fgets(&bytes[start..], n);
+        if debug >= 5 {
+            println!(
+                "checkFile: files ends with '{}'",
+                String::from_utf8_lossy(tail)
+            );
+        }
+        tail.starts_with(END_MARKER.as_bytes())
+    };
+    if ends(6, 6) || ends(7, 7) {
+        return true;
+    }
+    log(format!("File '{}' is not trusted.", file.display()));
+    let rbad = appended(
+        file,
+        &format!(
+            "_RBAD_{}",
+            if settings.dated_backup_files() {
+                date_str()
+            } else {
+                String::new()
+            }
+        ),
+    );
+    if publish_copy(file, &rbad, settings).await.is_err() {
+        log(format!(
+            "myFileCopy() failed for '{}' -> '{}'",
+            file.display(),
+            rbad.display()
+        ));
+    }
+    false
 }

@@ -176,9 +176,14 @@ async fn autosave_process_mode_restores_a_link_field() {
     .await
     .unwrap();
 
-    let result = restore_from_entries_with_mode(&db, &path, RestoreMode::Process)
-        .await
-        .unwrap();
+    let result = restore_from_entries_with_mode(
+        &db,
+        &path,
+        RestoreMode::Process,
+        &epics_base_rs::server::autosave::settings::SrSettings::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         result.failed_puts.len(),
         0,

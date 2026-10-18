@@ -1,10 +1,16 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::runtime::log::errlog_vprintf;
 use crate::types::EpicsValue;
 use chrono::Local;
 
 use super::error::{AutosaveError, AutosaveResult};
-use super::format::{ARRAY_MARKER, CompatMode, END_MARKER, VERSION};
+use super::format::{ARRAY_MARKER, END_MARKER};
+use super::settings::SrSettings;
+use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::epics_string::{print_escaped, raw_from_escaped_bytes};
 
 /// A single PV entry in a .sav file.
 #[derive(Debug, Clone)]
@@ -47,55 +53,53 @@ pub struct SaveFileContents {
     /// the restore outright. A file that omits the line tells a C IOC the
     /// save set was complete, so this is not decoration.
     pub not_connected: usize,
+    /// How many entries precede the `!` line, where C's restore reads it
+    /// and with `save_restoreIncompleteSetsOk` cleared stops.
+    pub incomplete_at: Option<usize>,
 }
 
 /// Write a .sav file atomically (tmp -> fsync -> rename).
-///
-/// Uses the autosave-rs native format ([`CompatMode::Native`]). For a
-/// file a C IOC must be able to read, use [`write_save_file_with_mode`]
-/// with [`CompatMode::CRead`].
 pub async fn write_save_file(path: &Path, entries: &[SaveEntry]) -> AutosaveResult<()> {
-    write_save_file_with_mode(path, entries, CompatMode::Native).await
+    write_save_file_with_settings(path, entries, &SrSettings::default()).await
 }
 
-/// Write a .sav file atomically (tmp -> fsync -> rename) in the given
-/// [`CompatMode`].
-///
-/// In [`CompatMode::CRead`] the header banner is `save/restore` (the
-/// banner a C IOC's `restore.c` / `asVerify` expects) instead of the
-/// autosave-rs banner. The per-PV line format (`PVNAME value`,
-/// arrays as `PVNAME @array@ { ... }`) is shared by both modes — the
-/// `SaveEntry.value` text is already mode-encoded by the caller via
-/// [`value_to_save_str`] / [`value_to_save_str_c`]. A C IOC can read
-/// a `CRead`-written file because the line grammar and `<END>` marker
-/// match C autosave's `dbrestore.c` parser.
-pub async fn write_save_file_with_mode(
+/// C's `AUTOSAVE_RELEASE`: the release, then Perl's `localtime` of the
+/// build.
+static SR_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let epoch: i64 = env!("EPICS_RS_BUILD_EPOCH").parse().unwrap_or(0);
+    let compiled = chrono::DateTime::from_timestamp(epoch, 0)
+        .unwrap_or_default()
+        .with_timezone(&Local);
+    format!(
+        "Autosave release 6.1, compiled {}",
+        compiled.format("%a %b %e %H:%M:%S %Y")
+    )
+});
+
+/// Write a .sav file atomically (tmp -> fsync -> rename) in the file
+/// format C `write_it` writes, so a C IOC restores it. Each
+/// `SaveEntry.value` is already [`value_to_save_str`] text.
+pub async fn write_save_file_with_settings(
     path: &Path,
     entries: &[SaveEntry],
-    mode: CompatMode,
+    settings: &SrSettings,
 ) -> AutosaveResult<()> {
     let mut content = String::new();
 
-    // Header. C autosave writes `# <banner>\t<datetime>` where the
-    // banner begins with `save/restore` — restore.c only checks for a
-    // leading `#` comment and skips it, but asVerify and operators
-    // expect the canonical banner.
-    let now = Local::now();
-    let banner = match mode {
-        CompatMode::Native => VERSION,
-        CompatMode::CRead => "save/restore V1.7",
-    };
+    // C `write_it`'s header (save_restore.c:1803), whose SRversion is
+    // AUTOSAVE_RELEASE (configure/CONFIG:31, autosave_release.pl:7). It
+    // carries no `R` or `V`, so `checkFile` skips the `<END>` check for
+    // these files exactly as for C's (dbrestore.c:1162-1180).
     content.push_str(&format!(
-        "# {}\t{}\n",
-        banner,
-        now.format("%Y-%m-%d %H:%M:%S")
+        "# {}\tAutomatically generated - DO NOT MODIFY - {}\n",
+        *SR_VERSION,
+        Local::now().format("%y%m%d-%H%M%S")
     ));
 
     // C's incomplete-set declaration, in C's exact wording because a C
     // IOC parses it: `dbrestore.c` takes the count from the text after
     // the `!` and refuses the whole restore when the site has cleared
-    // `save_restoreIncompleteSetsOk`. Written in both modes — this is
-    // the file format, not the value encoding that `CompatMode` selects.
+    // `save_restoreIncompleteSetsOk`.
     let not_connected = entries.iter().filter(|e| !e.connected).count();
     if not_connected > 0 {
         content.push_str(&format!(
@@ -110,7 +114,9 @@ pub async fn write_save_file_with_mode(
             content.push_str(&entry.value);
             content.push('\n');
         } else {
-            content.push_str(&format!("#{}\t(not connected)\n", entry.pv_name));
+            // C `write_it`'s `#name value` for a channel that never
+            // connected (save_restore.c:1296, :1835), which `asVerify` counts.
+            content.push_str(&format!("#{} Search Issued\n", entry.pv_name));
         }
     }
 
@@ -130,21 +136,59 @@ pub async fn write_save_file_with_mode(
     // `tokio::fs` behind — that is a blocking call dressed as an async one and
     // it panics on any thread that is not a tokio runtime thread, which is
     // every callback thread under `exec_backend`.
+    //
+    // Each failure prints what C `write_it` prints for the step it stands
+    // for (save_restore.c:1773-1981). C writes the file in place, so an
+    // unopenable temp file and a refused rename are both its failed `open`.
     let tmp_path = path.with_extension("tmp");
     let final_path = path.to_path_buf();
     let parent = path.parent().map(|p| p.to_path_buf());
-    crate::runtime::fs::blocking(move || {
+    let permissions = settings.file_permissions.load(Ordering::Relaxed);
+    let must_set = settings.must_set_permissions.load(Ordering::Relaxed) != 0;
+    let open_failed = Arc::new(AtomicBool::new(false));
+    let flag = open_failed.clone();
+    let written = crate::runtime::fs::blocking(move || {
         use std::io::Write as _;
+        let datetime = super::backup::date_str();
+        let unopened = |e: &std::io::Error| {
+            flag.store(true, Ordering::Relaxed);
+            println!(
+                "save_restore:write_it - unable to open file '{}' [{datetime}]",
+                final_path.display()
+            );
+            my_print_errno("write_it", "../save_restore.c", 1774, e);
+        };
         {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, permissions);
+            let mut file = options.open(&tmp_path).inspect_err(unopened)?;
+            if must_set {
+                set_permissions(&file, permissions, &final_path);
+            } else {
+                keep_permissions(&file, &final_path);
+            }
+            file.write_all(content.as_bytes()).inspect_err(|e| {
+                // A short write surfaces at C's `fclose`.
+                errlog_vprintf(format_args!(
+                    "../save_restore.c:write_it fclose returned -1 [{datetime}]\n"
+                ));
+                my_print_errno("write_it", "../save_restore.c", 1935, e);
+                errlog_vprintf(format_args!(
+                    "../save_restore.c:write_it Giving up on this attempt to write '{}'. [{}]\n",
+                    final_path.file_name().unwrap_or_default().display(),
+                    super::backup::date_str()
+                ));
+            })?;
+            file.sync_all().inspect_err(|e| {
+                errlog_vprintf(format_args!(
+                    "../save_restore.c:write_it fsync returned -1 [{datetime}]\n"
+                ));
+                my_print_errno("write_it", "../save_restore.c", 1925, e);
+            })?;
         }
-        std::fs::rename(&tmp_path, &final_path)?;
+        std::fs::rename(&tmp_path, &final_path).inspect_err(unopened)?;
         // Sync parent directory to make the rename durable across power loss
         if let Some(parent) = parent
             && let Ok(dir) = std::fs::File::open(parent)
@@ -153,9 +197,81 @@ pub async fn write_save_file_with_mode(
         }
         Ok(())
     })
-    .await?;
-
+    .await;
+    // `save_restoreIoErrors` (save_restore.c:1962, :1987).
+    match &written {
+        Ok(()) => settings.io_errors.store(0, Ordering::Relaxed),
+        Err(_) if open_failed.load(Ordering::Relaxed) => {
+            settings.io_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {}
+    }
+    written?;
     Ok(())
+}
+
+/// C `write_it`'s `fchmod` after `save_restoreSet_FilePermissions`
+/// (save_restore.c:1777-1786), which does not stop the write.
+fn set_permissions(file: &std::fs::File, permissions: u32, path: &Path) {
+    #[cfg(unix)]
+    if let Err(e) = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(permissions))
+    {
+        println!(
+            "write_it - when changing {} file permission:",
+            path.display()
+        );
+        print_chmod_error(e.raw_os_error().unwrap_or(0));
+    }
+    #[cfg(not(unix))]
+    let _ = (file, permissions, path);
+}
+
+/// The mode C's in-place `open(O_TRUNC)` leaves on a file that is already
+/// there, which a temp file renamed over it would otherwise replace.
+pub(super) fn keep_permissions(file: &std::fs::File, path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = file.set_permissions(meta.permissions());
+    }
+}
+
+/// C `print_chmod_error` (save_restore.c:1696-1740).
+#[cfg(unix)]
+fn print_chmod_error(err: i32) {
+    let (short, long) = match err {
+        libc::EBADF => (
+            "EBADF: Descriptor is not valid.".to_owned(),
+            "A file descriptor argument was out of range, referred to a file that was not open, or a read or write request was made to a file that is not open for that operation.",
+        ),
+        libc::EPERM => (
+            "EPERM: The operation is not permitted.".to_owned(),
+            "You must have appropriate privileges or be the owner of the object or other resource to do the requested operation.",
+        ),
+        libc::EROFS => (
+            "EROFS: Read-only file system.".to_owned(),
+            "You have attempted an update operation in a file system that only supports read operations.",
+        ),
+        libc::EINTR => (
+            "EINTR: Interrupted function call.".to_owned(),
+            "The function was interrupted by a signal.",
+        ),
+        libc::EINVAL => (
+            "EINVAL: The value specified for the argument is not correct.".to_owned(),
+            "A function was passed incorrect argument values, or an operation was attempted on an object and the operation specified is not supported for that type of object.",
+        ),
+        n => (format!("Unknown errno {n}"), ""),
+    };
+    println!("Error {err} - {short}\n{long}");
+}
+
+/// C `myPrintErrno` (dbrestore.c:114-117), called at `file`:`line`; C calls
+/// it only when `errno` is set.
+pub(super) fn my_print_errno(s: &str, file: &str, line: u32, e: &std::io::Error) {
+    if let Some(errno) = e.raw_os_error() {
+        errlog_vprintf(format_args!(
+            "{file}({line}): [0x{errno:x}]={s}:{}\n",
+            crate::server::iocsh::c_strerror(e)
+        ));
+    }
 }
 
 /// Read a .sav file and validate `<END>` marker.
@@ -179,15 +295,7 @@ pub struct PartialSaveFile {
 ///
 /// [`read_save_file`] is this with the incomplete case turned into
 /// `None`, which is what restore needs: a truncated file must not be
-/// pushed into the database as if it were the whole save set. `asVerify`
-/// deliberately reads what restore refuses — C's `do_asVerify_fp`
-/// (`verify.c` at `R6-0-20-g186f467`) warns that it cannot find the
-/// `<END>` marker and then compares every PV line in the file anyway,
-/// because which PVs a truncated file does hold is exactly what the
-/// operator looking at it needs to know.
-///
-/// One parse and one marker test behind both, so the two views cannot
-/// disagree about what a file contains.
+/// pushed into the database as if it were the whole save set.
 pub async fn read_partial_save_file(path: &Path) -> AutosaveResult<PartialSaveFile> {
     let content = crate::runtime::fs::read_to_string(path)
         .await
@@ -261,18 +369,18 @@ pub(super) fn parse_save_content(content: &str) -> SaveFileContents {
                 .take_while(char::is_ascii_digit)
                 .collect();
             out.not_connected = digits.parse().unwrap_or(0);
+            out.incomplete_at.get_or_insert(out.entries.len());
             continue;
         }
 
         // Header/comment lines
         if framing.starts_with('#') {
-            // A PV that had no value to save. `(not connected)` is what
-            // this writer emits; `Search Issued` / `Search Failed` are
-            // what C's `write_it` leaves in `pchannel->value` for a
-            // channel that never connected, and C's own `asVerify` counts
-            // the first of them. Matching both is what lets a C-written
-            // file's unsaved PVs stay visible here instead of passing as
-            // ordinary comments.
+            // A PV that had no value to save. `Search Issued` / `Search
+            // Failed` are what C's `write_it` leaves in `pchannel->value`
+            // for a channel that never connected, and C's own `asVerify`
+            // counts the first of them; `(not connected)` is what an older
+            // autosave-rs wrote. Matching them keeps the unsaved PVs
+            // visible here instead of passing as ordinary comments.
             let inner = &framing[1..];
             if inner.contains("(not connected)")
                 || inner.contains("Search Issued")
@@ -364,7 +472,7 @@ where
 /// unescaping the elements that were quoted. Unquoted elements keep the
 /// old tolerance for surrounding whitespace, so hand-written `[1, 2]`
 /// still reads as two elements.
-fn decode_array_text(s: &str) -> Vec<String> {
+pub(super) fn decode_array_text(s: &str) -> Vec<String> {
     let inner = s.strip_prefix('[').unwrap_or(s);
     // `strip_suffix`, not `trim_end_matches`: only the form's own
     // closing bracket comes off, so `]` inside a quoted element cannot
@@ -424,22 +532,18 @@ fn decode_array_text(s: &str) -> Vec<String> {
 fn parse_c_array_line(line: &str) -> Option<SaveEntry> {
     // Format: PV_NAME @array@ { "e1" "e2" "e3" }
     let marker_pos = line.find(ARRAY_MARKER)?;
-    let pv_name = line[..marker_pos].trim();
-    let rest = line[marker_pos + ARRAY_MARKER.len()..].trim();
-
-    if !rest.starts_with('{') || !rest.ends_with('}') {
-        return None;
-    }
-
-    let inner = rest[1..rest.len() - 1].trim();
-    let elements = parse_c_array_elements(inner);
-    let value = encode_array_text(&elements);
-
     Some(SaveEntry {
-        pv_name: pv_name.to_string(),
-        value,
+        pv_name: line[..marker_pos].trim().to_string(),
+        value: c_array_value(&line[marker_pos..])?,
         connected: true,
     })
+}
+
+/// `@array@ { "e1" "e2" }` as the `[..]` text the parse holds.
+fn c_array_value(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(ARRAY_MARKER)?.trim();
+    let inner = rest.strip_prefix('{')?.strip_suffix('}')?.trim();
+    Some(encode_array_text(parse_c_array_elements(inner)))
 }
 
 /// Parse C array elements: `"e1" "e2" "e3"` or `1.0 2.0 3.0`
@@ -457,12 +561,16 @@ fn parse_c_array_elements(s: &str) -> Vec<String> {
         }
 
         if chars.peek() == Some(&'"') {
-            // Quoted string element
+            // Quoted string element, decoded once with C's
+            // `epicsStrnRawFromEscaped` (dbrestore.c:623). C first takes the
+            // `\` off `\"` and `\\` (:583-586) and so decodes `\\q` as `q`;
+            // that double decode is a C defect, not kept.
             chars.next(); // skip opening quote
             let mut elem = String::new();
             loop {
                 match chars.next() {
                     Some('\\') => {
+                        elem.push('\\');
                         if let Some(c) = chars.next() {
                             elem.push(c);
                         }
@@ -472,7 +580,8 @@ fn parse_c_array_elements(s: &str) -> Vec<String> {
                     None => break,
                 }
             }
-            elements.push(elem);
+            let raw = raw_from_escaped_bytes(elem.as_bytes());
+            elements.push(String::from_utf8_lossy(&raw).into_owned());
         } else {
             // Unquoted element (number)
             let mut elem = String::new();
@@ -488,63 +597,30 @@ fn parse_c_array_elements(s: &str) -> Vec<String> {
     elements
 }
 
-/// Convert an EpicsValue to a save file string.
-pub fn value_to_save_str(value: &EpicsValue) -> String {
-    match value {
-        EpicsValue::String(s) => format!(
-            "\"{}\"",
-            s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"")
-        ),
-        EpicsValue::Double(v) => format!("{:.14e}", v),
-        EpicsValue::Float(v) => format!("{:.7e}", v),
-        EpicsValue::Short(v) => v.to_string(),
-        EpicsValue::Long(v) => v.to_string(),
-        EpicsValue::Int64(v) => v.to_string(),
-        EpicsValue::Enum(v) => v.to_string(),
-        // NTEnum carrier never reaches an autosave write (it is consumed
-        // at the link-write boundary), but serialize the index for
-        // exhaustiveness, identical to `Enum`.
-        EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
-        EpicsValue::Char(v) => v.to_string(),
-        EpicsValue::DoubleArray(arr) => {
-            encode_array_text(arr.iter().map(|v| format!("{:.14e}", v)))
-        }
-        EpicsValue::LongArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::CharArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::ShortArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::FloatArray(arr) => encode_array_text(arr.iter().map(|v| format!("{:.7e}", v))),
-        EpicsValue::EnumArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::Int64Array(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::UInt64(v) => v.to_string(),
-        EpicsValue::UInt64Array(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::UShort(v) => v.to_string(),
-        EpicsValue::ULong(v) => v.to_string(),
-        EpicsValue::UShortArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::ULongArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::UChar(v) => v.to_string(),
-        EpicsValue::UCharArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
-        EpicsValue::StringArray(arr) => {
-            encode_array_text(arr.iter().map(|s| s.as_str_lossy().into_owned()))
-        }
-    }
+/// C's DOUBLE_FMT (save_restore.h:45).
+fn double_text(v: f64) -> String {
+    format!("{:.14}", CFloat(v).g())
 }
 
-/// Convert an `EpicsValue` to a **C-autosave wire-compatible** save
-/// string, so a C IOC (or `asVerify` in a C IOC) can read the file.
+/// C's FLOAT_FMT (save_restore.h:44).
+fn float_text(v: f32) -> String {
+    format!("{:.7}", CFloat(f64::from(v)).g())
+}
+
+/// An `EpicsValue` as its `.sav` text, so a C IOC can read the file.
 ///
-/// Differences from [`value_to_save_str`] (autosave-rs native):
-///
-/// * Scalar strings are written **unquoted** — C autosave's
-///   `dbrestore.c` treats everything after the first space on a line
-///   as the literal value; it does not strip quotes from a scalar.
-/// * Scalar numbers are plain (same as native).
-/// * Arrays use C's `@array@ { "v" "v" ... }` form (the form the
-///   native reader already accepts via `parse_c_array_line`), with
-///   every element double-quoted and `"`/`\` escaped — instead of the
-///   native `[v,v,v]` form a C IOC cannot parse.
-pub fn value_to_save_str_c(value: &EpicsValue) -> String {
+/// * Scalar strings are written unquoted and escaped — C autosave's
+///   `dbrestore.c` takes everything after the first space on a line as
+///   the value and decodes its escapes.
+/// * Arrays use C's `@array@ { "v" "v" ... }` form, with every element
+///   double-quoted and `"`/`\` escaped.
+pub fn value_to_save_str(value: &EpicsValue) -> String {
+    // C `SR_write_array_data`'s DBF_STRING element (dbrestore.c:1391-1405).
     fn esc(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
     }
     fn c_array<T, I>(iter: I) -> String
     where
@@ -558,10 +634,11 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         format!("{ARRAY_MARKER} {{ {} }}", parts.join(" "))
     }
     match value {
-        // Scalars: plain printf form, strings unquoted.
-        EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-        EpicsValue::Double(v) => format!("{:.14e}", v),
-        EpicsValue::Float(v) => format!("{:.7e}", v),
+        // Scalars: plain printf form, a string through C `write_it`'s
+        // `epicsStrPrintEscaped` (save_restore.c:1861).
+        EpicsValue::String(s) => print_escaped(s.as_bytes()),
+        EpicsValue::Double(v) => double_text(*v),
+        EpicsValue::Float(v) => float_text(*v),
         EpicsValue::Short(v) => v.to_string(),
         EpicsValue::Long(v) => v.to_string(),
         EpicsValue::Int64(v) => v.to_string(),
@@ -571,9 +648,13 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         // exhaustiveness, identical to `Enum`.
         EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
-        // Arrays: C `@array@ { "v" "v" }` form.
-        EpicsValue::DoubleArray(arr) => c_array(arr.iter().map(|v| format!("{:.14e}", v))),
-        EpicsValue::FloatArray(arr) => c_array(arr.iter().map(|v| format!("{:.7e}", v))),
+        // Arrays: C `@array@ { "v" "v" }` form. C's escaped-string branch
+        // for a CHAR waveform (save_restore.c:1850) compares a dbAddr type
+        // against CA's DBF_CHAR (4, dbFld USHORT): C writes a CHAR waveform
+        // as this array and a USHORT one as a string it cannot restore. A C
+        // defect, not copied: every waveform is written as an array.
+        EpicsValue::DoubleArray(arr) => c_array(arr.iter().map(|v| double_text(*v))),
+        EpicsValue::FloatArray(arr) => c_array(arr.iter().map(|v| float_text(*v))),
         EpicsValue::LongArray(arr) => c_array(arr.iter()),
         EpicsValue::CharArray(arr) => c_array(arr.iter()),
         EpicsValue::ShortArray(arr) => c_array(arr.iter()),
@@ -594,18 +675,17 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
 /// Parse a save file value string back to EpicsValue, using template for type.
 pub fn parse_save_value(raw: &str, template: &EpicsValue) -> Option<EpicsValue> {
     let s = raw.trim();
+    // [`value_to_save_str`]'s own array text, handed over without a file.
+    if s.starts_with(ARRAY_MARKER) {
+        return parse_save_value(&c_array_value(s)?, template);
+    }
     match template {
         // Untrimmed: C `dbrestore` hands everything after the separator to
         // `dbPutString`, so a scalar string's spaces are part of its value.
-        EpicsValue::String(_) => {
-            if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-                let inner = &raw[1..raw.len() - 1];
-                let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
-                Some(EpicsValue::String(unescaped.into()))
-            } else {
-                Some(EpicsValue::String(raw.to_string().into()))
-            }
-        }
+        // C `scalar_restore`'s `epicsStrnRawFromEscaped` (dbrestore.c:235).
+        EpicsValue::String(_) => Some(EpicsValue::String(
+            raw_from_escaped_bytes(raw.as_bytes()).into(),
+        )),
         EpicsValue::Double(_) => s.parse::<f64>().ok().map(EpicsValue::Double),
         EpicsValue::Float(_) => s.parse::<f32>().ok().map(EpicsValue::Float),
         EpicsValue::Long(_) => s.parse::<i32>().ok().map(EpicsValue::Long),
@@ -668,7 +748,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::autosave::format::CompatMode;
     use crate::types::EpicsValue;
 
     /// M6: a C-format scalar string is written UNQUOTED (C autosave
@@ -676,9 +755,25 @@ mod tests {
     #[test]
     fn c_format_scalar_string_unquoted() {
         let v = EpicsValue::String("hello world".to_string().into());
-        assert_eq!(value_to_save_str_c(&v), "hello world");
-        // Native quotes it.
-        assert_eq!(value_to_save_str(&v), "\"hello world\"");
+        assert_eq!(value_to_save_str(&v), "hello world");
+    }
+
+    /// C `get_channel_values` and `SR_write_array_data` print a double with
+    /// DOUBLE_FMT and a float with FLOAT_FMT (save_restore.h:44-45).
+    #[test]
+    fn floating_values_are_written_with_c_formats() {
+        assert_eq!(value_to_save_str(&EpicsValue::Double(1.5)), "1.5");
+        assert_eq!(value_to_save_str(&EpicsValue::Double(1e20)), "1e+20");
+        assert_eq!(value_to_save_str(&EpicsValue::Double(0.1 + 0.2)), "0.3");
+        assert_eq!(value_to_save_str(&EpicsValue::Float(0.1)), "0.1");
+        assert_eq!(
+            value_to_save_str(&EpicsValue::DoubleArray(vec![1.25, -2.0].into())),
+            "@array@ { \"1.25\" \"-2\" }"
+        );
+        assert_eq!(
+            value_to_save_str(&EpicsValue::FloatArray(vec![1.0e-5].into())),
+            "@array@ { \"1e-05\" }"
+        );
     }
 
     /// C `dbrestore` reads a scalar line as `%80s%c%[^\n\r]`: the value is
@@ -688,15 +783,14 @@ mod tests {
         let template = EpicsValue::String(Default::default());
         for text in [" MF", "MF ", "   "] {
             let v = EpicsValue::String(text.to_string().into());
-            for written in [value_to_save_str_c(&v), value_to_save_str(&v)] {
-                let contents = parse_save_content(&format!("X:post {written}\n"));
-                let entry = &contents.entries[0];
-                assert_eq!(
-                    parse_save_value(&entry.value, &template),
-                    Some(v.clone()),
-                    "{written:?}"
-                );
-            }
+            let written = value_to_save_str(&v);
+            let contents = parse_save_content(&format!("X:post {written}\n"));
+            let entry = &contents.entries[0];
+            assert_eq!(
+                parse_save_value(&entry.value, &template),
+                Some(v.clone()),
+                "{written:?}"
+            );
         }
         // A number still ignores the spaces around it.
         assert_eq!(
@@ -710,12 +804,10 @@ mod tests {
     #[test]
     fn c_format_array_uses_at_array_form() {
         let v = EpicsValue::LongArray(vec![1, 2, 3].into());
-        assert_eq!(value_to_save_str_c(&v), "@array@ { \"1\" \"2\" \"3\" }");
-        assert_eq!(value_to_save_str(&v), "[1,2,3]");
+        assert_eq!(value_to_save_str(&v), "@array@ { \"1\" \"2\" \"3\" }");
     }
 
-    /// M6: a `.sav` written in `CompatMode::CRead` carries the
-    /// `save/restore` banner (the banner a C IOC expects) and is
+    /// M6: a written `.sav` carries C `write_it`'s header line and is
     /// still readable by the Rust reader — the array form
     /// round-trips through `parse_c_array_line`.
     #[epics_macros_rs::epics_test]
@@ -726,23 +818,21 @@ mod tests {
         let entries = vec![
             SaveEntry {
                 pv_name: "PV:SCALAR".to_string(),
-                value: value_to_save_str_c(&EpicsValue::Long(42)),
+                value: value_to_save_str(&EpicsValue::Long(42)),
                 connected: true,
             },
             SaveEntry {
                 pv_name: "PV:ARRAY".to_string(),
-                value: value_to_save_str_c(&EpicsValue::LongArray(vec![10, 20].into())),
+                value: value_to_save_str(&EpicsValue::LongArray(vec![10, 20].into())),
                 connected: true,
             },
         ];
-        write_save_file_with_mode(&path, &entries, CompatMode::CRead)
-            .await
-            .unwrap();
+        write_save_file(&path, &entries).await.unwrap();
 
         let content = crate::runtime::fs::read_to_string(&path).await.unwrap();
         assert!(
-            content.starts_with("# save/restore"),
-            "C-compat file must carry the save/restore banner, got: {content}"
+            content.starts_with("# Autosave release 6.1, compiled "),
+            "{content}"
         );
         assert!(content.contains("PV:ARRAY @array@ { \"10\" \"20\" }"));
 
@@ -757,24 +847,5 @@ mod tests {
         assert_eq!(arr.value, "[10,20]");
         let parsed = parse_save_value(&arr.value, &EpicsValue::LongArray(vec![].into())).unwrap();
         assert_eq!(parsed, EpicsValue::LongArray(vec![10, 20].into()));
-    }
-
-    /// M6: native mode still writes the autosave-rs banner.
-    #[epics_macros_rs::epics_test]
-    async fn native_save_file_keeps_native_banner() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("native.sav");
-        write_save_file(
-            &path,
-            &[SaveEntry {
-                pv_name: "PV1".to_string(),
-                value: "1".to_string(),
-                connected: true,
-            }],
-        )
-        .await
-        .unwrap();
-        let content = crate::runtime::fs::read_to_string(&path).await.unwrap();
-        assert!(content.starts_with("# autosave-rs"));
     }
 }

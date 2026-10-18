@@ -52,7 +52,7 @@ fn config_with_good_sav(dir: &std::path::Path, stem: &str) -> (AutosaveStartupCo
 }
 
 /// C frees a list whose request file did not open (save_restore.c:
-/// 2460-2462): nothing of it is left for `fdblist` to list.
+/// 2460-2462): nothing of it is left for `save_restoreShow` to list.
 async fn assert_not_kept(mgr: &AutosaveManager) {
     assert!(mgr.set_names().is_empty());
     assert!(mgr.status_all().await.is_empty());

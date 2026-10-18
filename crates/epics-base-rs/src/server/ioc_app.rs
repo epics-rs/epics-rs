@@ -673,18 +673,14 @@ impl IocRunConfig {
     pub async fn run_shell(self, server_commands: Vec<CommandDef>) -> CaResult<()> {
         let reactor = crate::runtime::task::Reactor::current()
             .ok_or_else(|| CaError::InvalidValue("the IOC runner has no reactor".into()))?;
-        let autosave_cmds = self
-            .autosave_manager
-            .as_ref()
-            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
         let autosave = if let Some(mgr) = self.autosave_manager {
-            Some(mgr.start(&reactor, self.db.clone()))
+            mgr.start(&reactor, self.db.clone())
         } else if let Some((cfg, method)) = self.autosave_config {
             let mgr = autosave::AutosaveBuilder::new()
                 .add_set(cfg, method)
                 .build()
                 .await;
-            Some(Arc::new(mgr).start(&reactor, self.db.clone()))
+            Arc::new(mgr).start(&reactor, self.db.clone())
         } else {
             None
         };
@@ -702,11 +698,7 @@ impl IocRunConfig {
             // `_main_` (`osdThread.c:406-412`).
             crate::runtime::task::register_main_thread();
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
-            for cmd in server_commands
-                .into_iter()
-                .chain(shell_commands)
-                .chain(autosave_cmds.into_iter().flatten())
-            {
+            for cmd in server_commands.into_iter().chain(shell_commands) {
                 shell.register(cmd);
             }
             let _ = tx.send(shell.run_repl());
@@ -1529,16 +1521,8 @@ impl IocBuild {
         // Collect restore paths and builder from startup config (scoped mutex lock)
         let (pass0_files, pass1_files, builder_opt) = if let Some(ref config) = autosave_startup {
             let cfg = config.lock().unwrap();
-            let pass0: Vec<std::path::PathBuf> = cfg
-                .pass0_restores
-                .iter()
-                .map(|r| cfg.resolve_save_file(&r.filename))
-                .collect();
-            let pass1: Vec<std::path::PathBuf> = cfg
-                .pass1_restores
-                .iter()
-                .map(|r| cfg.resolve_save_file(&r.filename))
-                .collect();
+            let pass0 = cfg.boot_restores(false);
+            let pass1 = cfg.boot_restores(true);
             // Built even with no set yet: a `create_monitor_set` after
             // `iocInit` adds to this manager (C `create_data_set`).
             (pass0, pass1, Some(cfg.into_builder()))
@@ -1573,16 +1557,11 @@ impl IocBuild {
                 InitHookState::AfterInitDevSup,
                 Box::new(move || {
                     Box::pin(async move {
-                        for sav_path in &files {
-                            if let Err(e) = autosave::restore_from_file(
-                                &db_p0,
-                                sav_path,
-                                autosave::RestorePass::Zero,
-                            )
-                            .await
-                            {
-                                eprintln!("pass0 restore warning: {} - {e}", sav_path.display());
-                            }
+                        // `reboot_restore` logs its own failure, as C's.
+                        for item in &files {
+                            let _ =
+                                autosave::reboot_restore(&db_p0, item, autosave::RestorePass::Zero)
+                                    .await;
                         }
                     })
                 }),
@@ -1598,16 +1577,11 @@ impl IocBuild {
                 InitHookState::AfterInitDatabase,
                 Box::new(move || {
                     Box::pin(async move {
-                        for sav_path in &files {
-                            if let Err(e) = autosave::restore_from_file(
-                                &db_p1,
-                                sav_path,
-                                autosave::RestorePass::One,
-                            )
-                            .await
-                            {
-                                eprintln!("pass1 restore warning: {} - {e}", sav_path.display());
-                            }
+                        // `reboot_restore` logs its own failure, as C's.
+                        for item in &files {
+                            let _ =
+                                autosave::reboot_restore(&db_p1, item, autosave::RestorePass::One)
+                                    .await;
                         }
                         if let Some(path) = cfg_path {
                             if let Err(e) = autosave::restore_from_file(
@@ -1617,7 +1591,10 @@ impl IocBuild {
                             )
                             .await
                             {
-                                eprintln!("autosave restore warning: {} - {e}", path.display());
+                                crate::runtime::log::errlog_vprintf(format_args!(
+                                    "autosave restore warning: {} - {e}\n",
+                                    path.display()
+                                ));
                             }
                         }
                     })
@@ -1898,6 +1875,17 @@ impl BuiltIoc {
             hook();
         }
 
+        // C creates the save_restore task with the first set
+        // (save_restore.c:2335-2351), so it is saving before the script's
+        // lines after `iocInit` run, whichever runner serves; the runners'
+        // own `start` is now `None`. When the runner ends it is stopped and
+        // waited for, as C's at-exit save_restoreShutdown does (:771-775).
+        let autosave_task = autosave_manager.clone().and_then(|mgr| {
+            let reactor = crate::runtime::task::Reactor::current()?;
+            let task = mgr.clone().start(&reactor, db.clone())?;
+            Some((mgr, task))
+        });
+
         // C `iocRun` starts the servers HERE — `if (iocBuildMode ==
         // buildServers) { dbRunServers(); initHookAnnounce(
         // initHookAfterCaServerRunning); }` (`iocInit.c:265-268`), which
@@ -1951,8 +1939,16 @@ impl BuiltIoc {
         // announces (see [`crate::server::db_server::announce_serving`]), and
         // this line is where C's ordering is restored.
         let generation = crate::server::db_server::serving_generation();
+        let serve = runner(config);
         let mut server = ProtocolServer {
-            handle: bridge.spawn(runner(config)),
+            handle: bridge.spawn(async move {
+                let result = serve.await;
+                if let Some((mgr, task)) = autosave_task {
+                    mgr.shutdown();
+                    let _ = task.await;
+                }
+                result
+            }),
             finished: None,
             live: true,
         };

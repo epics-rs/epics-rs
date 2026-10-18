@@ -964,11 +964,6 @@ impl CaServer {
         let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
-        let autosave_cmds = self
-            .autosave_manager
-            .as_ref()
-            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
-
         let server = Arc::new(self);
 
         // C `rsrv_register_server` joins the `dbServer` list (`dbServer.c:30`)
@@ -1040,11 +1035,6 @@ impl CaServer {
                 shell.register(cmd);
             }
             register_fn(&shell);
-            if let Some(cmds) = autosave_cmds {
-                for cmd in cmds {
-                    shell.register(cmd);
-                }
-            }
             let result = shell.run_repl();
             let _ = tx.send(result);
         });
@@ -1202,7 +1192,7 @@ impl CaServer {
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             let mgr = mgr.clone();
             let db_save = self.db.clone();
-            Some(mgr.start(&seam_reactor, db_save))
+            mgr.start(&seam_reactor, db_save)
         } else if let Some((cfg, method)) = self.autosave_config.clone() {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
@@ -1210,7 +1200,7 @@ impl CaServer {
             // there is nothing left here to abandon the autosave task for.
             let mgr = Arc::new(builder.build().await);
             let db_save = self.db.clone();
-            Some(mgr.start(&seam_reactor, db_save))
+            mgr.start(&seam_reactor, db_save)
         } else {
             None
         };

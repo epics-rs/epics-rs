@@ -23,7 +23,7 @@ use std::time::Duration;
 use epics_base_rs::runtime::task::{Reactor, TaskHandle, sleep};
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager};
-use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
+use epics_base_rs::server::autosave::save_set::{ManualSource, SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -82,14 +82,9 @@ impl Rig {
                         save_path,
                         request_file: None,
                         request_pvs: vec!["T:SAVED".into()],
-                        backup: BackupConfig {
-                            enable_savb: false,
-                            num_seq_files: 0,
-                            seq_period: Duration::from_secs(60),
-                            enable_dated: false,
-                            dated_interval: Duration::from_secs(3600),
-                        },
+                        backup: BackupConfig { enable_savb: false },
                         macros: HashMap::new(),
+                        macro_string: String::new(),
                         search_paths: Vec::new(),
                     },
                     SaveStrategy::Manual,
@@ -97,7 +92,7 @@ impl Rig {
                 .build()
                 .await,
         );
-        let handle = Some(mgr.clone().start(&Reactor::current().unwrap(), db.clone()));
+        let handle = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
         Self {
             db,
             mgr,
@@ -168,16 +163,23 @@ async fn a_failed_save_reports_its_text_and_cant_write() {
 #[epics_macros_rs::epics_test]
 async fn a_manual_restore_reports_its_outcome() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::new(dir.path().join("s.sav")).await;
+    let path = dir.path().join("s.sav");
+    let mut rig = Rig::new(path.clone()).await;
     rig.pass().await;
-    let _ = rig.mgr.manual_restore("s", &rig.db).await;
+    let restore = async |rig: &Rig| {
+        rig.mgr
+            .manual_restore(&rig.db, &path, "s.sav", ManualSource::SaveFile, "")
+            .await
+    };
+    assert_eq!(restore(&rig).await, -1);
+    // The save task's own text over `do_manual_restore`'s (save_restore.c:1141).
     assert_eq!(
         rig.pass().await.1,
-        one("Manual restore failed"),
+        one("Restore of 's.sav' Failed"),
         "no file yet"
     );
     rig.mgr.manual_save("s", &rig.db).await.unwrap();
-    rig.mgr.manual_restore("s", &rig.db).await.unwrap();
-    assert_eq!(rig.pass().await.1, one("Manual restore succeeded"));
+    assert_eq!(restore(&rig).await, 0);
+    assert_eq!(rig.pass().await.1, one("Restore of 's.sav' Succeeded"));
     rig.stop().await;
 }

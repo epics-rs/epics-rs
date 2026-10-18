@@ -20,14 +20,9 @@ fn config(dir: &std::path::Path) -> SaveSetConfig {
         save_path: dir.join("task.sav"),
         request_file: None,
         request_pvs: vec!["TEMP".into()],
-        backup: BackupConfig {
-            enable_savb: false,
-            num_seq_files: 0,
-            seq_period: Duration::from_secs(60),
-            enable_dated: false,
-            dated_interval: Duration::from_secs(3600),
-        },
+        backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: Vec::new(),
     }
 }

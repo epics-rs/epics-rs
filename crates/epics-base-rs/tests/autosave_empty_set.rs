@@ -19,6 +19,7 @@ fn config(dir: &std::path::Path) -> SaveSetConfig {
         request_pvs: Vec::new(),
         backup: BackupConfig::default(),
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: vec![dir.to_path_buf()],
     }
 }
@@ -46,7 +47,7 @@ async fn a_request_file_declaring_no_pvs_builds_and_saves_an_empty_list() {
 
     let db = Arc::new(PvDatabase::new());
     let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-    let handle = mgr.clone().start(&reactor, db);
+    let handle = mgr.clone().start(&reactor, db).unwrap();
     let sav = dir.path().join("auto_settings.sav");
     for _ in 0..100 {
         if std::fs::read_to_string(&sav).is_ok_and(|t| t.contains("<END>")) {

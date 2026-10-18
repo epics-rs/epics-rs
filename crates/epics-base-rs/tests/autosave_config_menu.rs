@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use epics_base_rs::server::autosave::config_menu::{self, ConfigFile};
 use epics_base_rs::server::autosave::{AutosaveBuilder, AutosaveStartupConfig, SaveSetConfig};
-use epics_base_rs::server::autosave::{BackupConfig, CompatMode, SaveStrategy};
+use epics_base_rs::server::autosave::{BackupConfig, SaveStrategy};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -109,7 +109,8 @@ fn find_config_files_lists_matching_cfg_files_with_descriptions() {
     std::fs::write(dir.path().join("CFG_gamma.sav"), "").unwrap();
     std::fs::write(dir.path().join("OTHER_delta.cfg"), "").unwrap();
 
-    let mut found = config_menu::find_config_files(Some(dir.path()), "CFG").unwrap();
+    let mut found =
+        config_menu::find_config_files(Some(dir.path()), "CFG", &Default::default()).unwrap();
     found.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(
         found,
@@ -124,9 +125,16 @@ fn find_config_files_lists_matching_cfg_files_with_descriptions() {
             },
         ]
     );
-    assert_eq!(config_menu::find_config_files(None, "CFG"), Err(-1));
     assert_eq!(
-        config_menu::find_config_files(Some(&dir.path().join("missing")), "CFG"),
+        config_menu::find_config_files(None, "CFG", &Default::default()),
+        Err(-1)
+    );
+    assert_eq!(
+        config_menu::find_config_files(
+            Some(&dir.path().join("missing")),
+            "CFG",
+            &Default::default()
+        ),
         Err(-1)
     );
 }
@@ -182,7 +190,6 @@ async fn a_load_of_a_missing_file_completes_with_failure() {
 async fn holder_with_set(dir: &std::path::Path) -> Arc<Mutex<AutosaveStartupConfig>> {
     std::fs::write(dir.join("CFGMenu.req"), "TGT\nXMenu:currDesc\n").unwrap();
     let mgr = AutosaveBuilder::new()
-        .compat(CompatMode::CRead)
         .add_set(
             SaveSetConfig {
                 name: "CFGMenu".into(),
@@ -191,6 +198,7 @@ async fn holder_with_set(dir: &std::path::Path) -> Arc<Mutex<AutosaveStartupConf
                 request_pvs: Vec::new(),
                 backup: BackupConfig::default(),
                 macros: HashMap::new(),
+                macro_string: String::new(),
                 search_paths: vec![dir.to_path_buf()],
             },
             SaveStrategy::Manual,

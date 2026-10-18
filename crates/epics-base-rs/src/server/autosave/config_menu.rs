@@ -6,7 +6,6 @@
 //! its completion is C `configMenuCallback`: `D = status` under the
 //! record's lock, then `scanOnce` so the second process reports it.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,9 +15,12 @@ use crate::server::database::{PvDatabase, SubroutineContext};
 use crate::server::record::{ContextSubroutineFn, Record};
 use crate::types::EpicsValue;
 
-use super::save_set::restore_ascii_file;
-use super::startup::AutosaveStartupConfig;
-use super::verify;
+use super::request::concatenate_paths;
+use super::save_set::ManualSource;
+use super::settings::SrSettings;
+use super::startup::{
+    AutosaveStartupConfig, manual_restore_request_ok, manual_save_manager, run_manual_restore,
+};
 
 /// C `NUM_ITEMS`: menu entries per page.
 const NUM_ITEMS: usize = 10;
@@ -33,25 +35,54 @@ pub struct ConfigFile {
 
 /// C `findConfigFiles`: the `<config>_*.cfg` files in `dir`, in directory
 /// order, or `Err(-1)` when `dir` cannot be read.
-pub fn find_config_files(dir: Option<&Path>, config: &str) -> Result<Vec<ConfigFile>, i32> {
-    let dir = dir.ok_or(-1)?;
-    let entries = std::fs::read_dir(dir).map_err(|_| -1)?;
+pub fn find_config_files(
+    dir: Option<&Path>,
+    config: &str,
+    settings: &SrSettings,
+) -> Result<Vec<ConfigFile>, i32> {
+    let debug = settings.debug();
     let prefix = format!("{config}_");
+    if debug != 0 {
+        println!("findConfigFiles: config='{config}', config_underscore={prefix}");
+    }
+    let shown = dir.map(|d| d.display().to_string()).unwrap_or_default();
+    let Some(entries) = dir.and_then(|d| std::fs::read_dir(d).ok()) else {
+        if debug != 0 {
+            println!("findConfigFiles: opendir('{shown}') failed.");
+        }
+        return Err(-1);
+    };
+    if debug != 0 {
+        println!("findConfigFiles: opendir('{shown}') succeeded.");
+    }
     let mut found = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        let Some(name) = file_name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".cfg"))
-        else {
+        if debug > 1 {
+            println!("findConfigFiles: checking '{file_name}'.");
+        }
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
             continue;
         };
-        let description = std::fs::read_to_string(dir.join(file_name))
-            .ok()
-            .and_then(|text| {
+        if debug != 0 {
+            println!("findConfigFiles: found '{file_name}'");
+            println!("findConfigFiles: searching '{rest}' for .cfg");
+        }
+        let Some(name) = rest.strip_suffix(".cfg") else {
+            continue;
+        };
+        if debug != 0 {
+            println!("findConfigFiles: found config file '{name}'");
+        }
+        let fullpath = concatenate_paths(&shown, file_name, settings);
+        let description = match std::fs::read_to_string(&fullpath) {
+            Ok(text) => {
+                if debug != 0 {
+                    println!("findConfigFiles: searching '{fullpath}' for description");
+                }
                 text.lines().find_map(|line| {
                     let at = line.find("Menu:currDesc")?;
                     // C skips the one separator character after the name.
@@ -60,11 +91,28 @@ pub fn find_config_files(dir: Option<&Path>, config: &str) -> Result<Vec<ConfigF
                     chars.next();
                     Some(chars.as_str().trim_end_matches('\r').to_string())
                 })
-            });
+            }
+            Err(_) => {
+                if debug != 0 {
+                    println!("findConfigFiles: can't open '{file_name}'");
+                }
+                None
+            }
+        };
         found.push(ConfigFile {
             name: name.to_string(),
             description,
         });
+    }
+    if debug != 0 {
+        println!("findConfigFiles: ");
+        for f in &found {
+            println!(
+                "\tname='{}'; desc='{}'",
+                f.name,
+                f.description.as_deref().unwrap_or("(null)")
+            );
+        }
     }
     Ok(found)
 }
@@ -137,7 +185,10 @@ fn list_do(
     let config = text(rec, "A");
     let page = number(rec, "B") as i64;
     let find = number(rec, "C") != 0.0;
-    let save_dir = holder.lock().unwrap().save_file_path.clone();
+    let (save_dir, settings) = {
+        let cfg = holder.lock().unwrap();
+        (cfg.save_file_path.clone(), cfg.settings.clone())
+    };
     if ctx.dpvt::<Vec<ConfigFile>>().is_none() {
         ctx.set_dpvt(Vec::<ConfigFile>::new());
     }
@@ -145,7 +196,7 @@ fn list_do(
 
     let mut status = 0;
     if find || list.first().is_none_or(|f| f.name.is_empty()) {
-        match find_config_files(save_dir.as_deref(), &config) {
+        match find_config_files(save_dir.as_deref(), &config, &settings) {
             Ok(found) => *list = found,
             Err(s) => {
                 list.clear();
@@ -247,21 +298,17 @@ impl Completion {
     }
 }
 
-/// C `getMacroString(reqFile)`: the macros of the set built from it.
-fn set_macros(holder: &Mutex<AutosaveStartupConfig>, req_file: &str) -> HashMap<String, String> {
+/// C `getMacroString(reqFile)`: the macro string of the set built from it.
+fn set_macros(holder: &Mutex<AutosaveStartupConfig>, req_file: &str) -> String {
     let manager = holder.lock().unwrap().manager.clone();
     manager
         .and_then(|m| m.find_set_by_request_file(req_file))
-        .map(|(set, _)| set.config().macros.clone())
+        .map(|(set, _)| set.config().macro_string.clone())
         .unwrap_or_default()
 }
 
 fn save_dir_path(holder: &Mutex<AutosaveStartupConfig>, filename: &str) -> PathBuf {
-    let dir = holder.lock().unwrap().save_file_path.clone();
-    match dir {
-        Some(dir) if !Path::new(filename).is_absolute() => dir.join(filename),
-        _ => PathBuf::from(filename),
-    }
+    holder.lock().unwrap().save_dir_file(filename)
 }
 
 /// C `fdbrestoreX(filename, getMacroString(reqFile), ...)`: queue an
@@ -274,44 +321,30 @@ fn fdbrestore_x(
     filename: String,
     done: Completion,
 ) -> i32 {
+    let settings = holder.lock().unwrap().settings.clone();
+    if !manual_restore_request_ok(&filename, "", &settings) {
+        return -1;
+    }
     let macros = set_macros(holder, req_file);
     let path = save_dir_path(holder, &filename);
+    let (manager, settings) = {
+        let cfg = holder.lock().unwrap();
+        (cfg.manager.clone(), cfg.settings.clone())
+    };
     spawn_background(CallbackPriority::Low, async move {
-        let status = match restore_ascii_file(&db, &path, &macros).await {
-            Err(_) => {
-                crate::runtime::log::errlog_vprintf(format_args!(
-                    "../save_restore.c:do_manual_restore Can't open save file.\n"
-                ));
-                -1
-            }
-            Ok(r) => {
-                let errs = r.failed_puts.len()
-                    + r.not_found.len()
-                    + r.parse_failed.len()
-                    + r.not_connected_at_save;
-                if errs != 0 {
-                    errs as i32
-                } else {
-                    verify_status(&db, &path).await
-                }
-            }
-        };
+        let status = run_manual_restore(
+            manager,
+            &settings,
+            &db,
+            &path,
+            &filename,
+            ManualSource::AsciiFile,
+            &macros,
+        )
+        .await;
         done.finish(status);
     });
     0
-}
-
-/// C `do_asVerify(file, -1, ...)`: differences plus PVs not connected,
-/// -1 when the file cannot be read.
-async fn verify_status(db: &PvDatabase, path: &Path) -> i32 {
-    match verify::verify(db, path).await {
-        Err(_) => -1,
-        Ok(report) => report
-            .entries
-            .iter()
-            .filter(|e| !matches!(e.result, verify::MatchResult::Match))
-            .count() as i32,
-    }
 }
 
 /// C `manual_save(reqFile, filename, ...)`: write the set built from
@@ -323,39 +356,16 @@ fn manual_save(
     filename: String,
     done: Completion,
 ) -> i32 {
-    if req_file.is_empty() {
-        println!("manual_save: bad filename");
-        return -1;
-    }
-    let Some(manager) = holder.lock().unwrap().manager.clone() else {
-        println!("manual_save: message queue not initialized (no restore set has been created?)");
+    // C passes configMenuCallback and the record as its user pointer.
+    let callback = format!("{:p}", Completion::finish as fn(Completion, i32));
+    let puser = format!("{:p}", &done);
+    let Some(manager) = manual_save_manager(holder, req_file, &filename, &callback, &puser) else {
         return -1;
     };
-    let set = manager.find_set_by_request_file(req_file);
     let path = save_dir_path(holder, &filename);
+    let req_file = req_file.to_string();
     spawn_background(CallbackPriority::Low, async move {
-        let status = match set {
-            None => -1,
-            Some((set, lock)) => {
-                let saved = {
-                    let _guard = lock.lock().await;
-                    set.save_to(&db, &path).await
-                };
-                match saved {
-                    Err(_) => {
-                        println!(
-                            "save_restore: write_save_file() failed for {}",
-                            set.save_file()
-                        );
-                        -1
-                    }
-                    Ok(missing) => match verify_status(&db, &path).await {
-                        0 => missing as i32,
-                        s => s,
-                    },
-                }
-            }
-        };
+        let status = manager.save_file_op(&db, &req_file, &filename, &path).await;
         done.finish(status);
     });
     0

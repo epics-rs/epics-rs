@@ -180,7 +180,7 @@ async fn test_disconnected_pv_roundtrip() {
 fn test_short_array_roundtrip() {
     let val = EpicsValue::ShortArray(vec![1, -2, 3, 0, -32768].into());
     let s = value_to_save_str(&val);
-    assert_eq!(s, "[1,-2,3,0,-32768]");
+    assert_eq!(s, r#"@array@ { "1" "-2" "3" "0" "-32768" }"#);
     let parsed = parse_save_value(&s, &EpicsValue::ShortArray(vec![].into())).unwrap();
     assert_eq!(parsed, val);
 }
@@ -205,7 +205,7 @@ fn test_float_array_roundtrip() {
 fn test_enum_array_roundtrip() {
     let val = EpicsValue::EnumArray(vec![0, 1, 65535, 42].into());
     let s = value_to_save_str(&val);
-    assert_eq!(s, "[0,1,65535,42]");
+    assert_eq!(s, r#"@array@ { "0" "1" "65535" "42" }"#);
     let parsed = parse_save_value(&s, &EpicsValue::EnumArray(vec![].into())).unwrap();
     assert_eq!(parsed, val);
 }
@@ -218,7 +218,7 @@ fn test_empty_new_array_types() {
         EpicsValue::EnumArray(vec![].into()),
     ] {
         let s = value_to_save_str(template);
-        assert_eq!(s, "[]");
+        assert_eq!(s, "@array@ {  }");
         let parsed = parse_save_value(&s, template).unwrap();
         match (&parsed, template) {
             (EpicsValue::ShortArray(a), EpicsValue::ShortArray(_)) => assert!(a.is_empty()),

@@ -171,9 +171,9 @@ file "commonPlugins_settings.req", P=$(P)
 Once the IOC is running, use these iocsh commands:
 
 ```
-fdblist                    # List all save sets and their status
-fdbsave simDetector_settings.req   # Trigger immediate save
-fdbrestore simDetector_settings    # Restore from .sav file
+save_restoreShow                     # List all save sets and their status
+manual_save simDetector_settings.req   # Trigger immediate save
+fdbrestore simDetector_settings.sav   # Restore from .sav file
 ```
 
 ## Verify

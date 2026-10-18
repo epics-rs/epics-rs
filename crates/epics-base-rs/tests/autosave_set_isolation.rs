@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
@@ -18,13 +17,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
 
 fn no_backup() -> BackupConfig {
-    BackupConfig {
-        enable_savb: false,
-        num_seq_files: 0,
-        seq_period: Duration::from_secs(60),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    }
+    BackupConfig { enable_savb: false }
 }
 
 fn manual_set(name: &str, save_path: std::path::PathBuf, req: std::path::PathBuf) -> SaveSetConfig {
@@ -35,6 +28,7 @@ fn manual_set(name: &str, save_path: std::path::PathBuf, req: std::path::PathBuf
         request_pvs: Vec::new(),
         backup: no_backup(),
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: Vec::new(),
     }
 }
@@ -96,7 +90,7 @@ async fn a_failing_save_set_does_not_take_the_others_with_it() {
     assert_eq!(entries[0].pv_name, "TEMP");
 
     // C frees a list that did not build (save_restore.c:2460-2462), so
-    // `fdblist`, which reads `status_all`, lists only the built one.
+    // `status_all` lists only the built one.
     let statuses = mgr.status_all().await;
     let names: Vec<&str> = statuses.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, vec!["auto_settings"]);

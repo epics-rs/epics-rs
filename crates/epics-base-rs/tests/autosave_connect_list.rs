@@ -53,6 +53,7 @@ async fn first_pass(pvs: &[&str]) {
         request_pvs: pvs.iter().map(|p| p.to_string()).collect(),
         backup: BackupConfig::default(),
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: Vec::new(),
     };
     let mgr = Arc::new(

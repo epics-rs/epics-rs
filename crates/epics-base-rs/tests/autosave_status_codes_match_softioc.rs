@@ -26,6 +26,7 @@ use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager};
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
+use epics_base_rs::server::autosave::settings::SrSettings;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -86,11 +87,12 @@ struct Rig {
 }
 
 impl Rig {
-    async fn new(save_path: PathBuf, backup: BackupConfig) -> Self {
-        Self::with_sets(vec![("s", save_path, backup)]).await
+    /// `num_seq_files` is the IOC's `save_restoreNumSeqFiles`.
+    async fn new(save_path: PathBuf, backup: BackupConfig, num_seq_files: i32) -> Self {
+        Self::with_sets(vec![("s", save_path, backup)], num_seq_files).await
     }
 
-    async fn with_sets(sets: Vec<(&str, PathBuf, BackupConfig)>) -> Self {
+    async fn with_sets(sets: Vec<(&str, PathBuf, BackupConfig)>, num_seq_files: i32) -> Self {
         let (db, _) = IocBuilder::new()
             .db_string(DB, &HashMap::new())
             .unwrap()
@@ -111,7 +113,11 @@ impl Rig {
         };
         let status = sub("T:SR_status");
         let list = sub("T:SR_0_Status");
-        let mut builder = AutosaveBuilder::new().status_prefix("T:");
+        let settings = Arc::new(SrSettings::default());
+        settings.set_num_seq_files(num_seq_files);
+        let mut builder = AutosaveBuilder::new()
+            .status_prefix("T:")
+            .settings(settings);
         for (name, save_path, backup) in sets {
             builder = builder.add_set(
                 SaveSetConfig {
@@ -121,16 +127,17 @@ impl Rig {
                     request_pvs: vec!["T:SAVED".into()],
                     backup,
                     macros: HashMap::new(),
+                    macro_string: String::new(),
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::Manual,
             );
         }
         let mgr = Arc::new(builder.build().await);
-        let handle = Some(mgr.clone().start(
+        let handle = mgr.clone().start(
             &Reactor::current().expect("the test driver enters an executor"),
             db.clone(),
-        ));
+        );
         Self {
             db,
             mgr,
@@ -180,14 +187,8 @@ async fn next_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (f64, u
     panic!("no post within 4 s");
 }
 
-fn backup(enable_savb: bool, num_seq_files: usize) -> BackupConfig {
-    BackupConfig {
-        enable_savb,
-        num_seq_files,
-        seq_period: Duration::from_secs(60),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    }
+fn backup(enable_savb: bool) -> BackupConfig {
+    BackupConfig { enable_savb }
 }
 
 async fn valid_sav(path: &Path) {
@@ -207,7 +208,7 @@ async fn valid_sav(path: &Path) {
 #[epics_macros_rs::epics_test]
 async fn a_set_that_has_not_saved_reports_no_status() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::new(dir.path().join("s.sav"), backup(false, 0)).await;
+    let mut rig = Rig::new(dir.path().join("s.sav"), backup(false), 0).await;
     assert_eq!(rig.next_status().await, NO_STATUS);
     assert_eq!(rig.next_list().await, NO_STATUS);
     rig.stop().await;
@@ -217,7 +218,7 @@ async fn a_set_that_has_not_saved_reports_no_status() {
 #[epics_macros_rs::epics_test]
 async fn a_clean_save_reports_ok() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::new(dir.path().join("s.sav"), backup(false, 0)).await;
+    let mut rig = Rig::new(dir.path().join("s.sav"), backup(false), 0).await;
     assert_eq!(rig.save().await, OK);
     rig.stop().await;
 }
@@ -227,7 +228,7 @@ async fn a_clean_save_reports_ok() {
 #[epics_macros_rs::epics_test]
 async fn a_rewritten_savb_reports_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::new(dir.path().join("s.sav"), backup(true, 0)).await;
+    let mut rig = Rig::new(dir.path().join("s.sav"), backup(true), 0).await;
     assert_eq!(rig.save().await, WARNING);
     rig.stop().await;
 }
@@ -236,21 +237,23 @@ async fn a_rewritten_savb_reports_warning() {
 #[epics_macros_rs::epics_test]
 async fn an_unwritable_sav_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::new(dir.path().join("absent").join("s.sav"), backup(false, 0)).await;
+    let mut rig = Rig::new(dir.path().join("absent").join("s.sav"), backup(false), 0).await;
     assert_eq!(rig.save().await, FAILURE);
     rig.stop().await;
 }
 
-/// SR_STATUS_SEQ_WARN: a sequence file cannot be written
-/// (save_restore.c:2197).
+/// SR_STATUS_SEQ_WARN: a sequence file can be neither copied nor written
+/// (save_restore.c:2194-2199).
 #[epics_macros_rs::epics_test]
 async fn an_unwritable_sequence_file_reports_seq_fail() {
     let dir = tempfile::tempdir().unwrap();
     let sav = dir.path().join("s.sav");
     valid_sav(&sav).await;
     std::fs::create_dir(sav.with_extension("sav0")).unwrap();
-    let mut rig = Rig::new(sav, backup(false, 1)).await;
-    assert_eq!(rig.save().await, SEQ_FAIL);
+    let mut rig = Rig::new(sav, backup(false), 1).await;
+    assert_eq!(rig.save().await, OK);
+    rig.mgr.sets()[0].0.do_seq(&rig.db).await;
+    assert_eq!(rig.next_status().await, SEQ_FAIL);
     rig.stop().await;
 }
 
@@ -260,14 +263,17 @@ async fn an_unwritable_sequence_file_reports_seq_fail() {
 #[epics_macros_rs::epics_test]
 async fn sr_status_is_the_worst_list_status() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rig = Rig::with_sets(vec![
-        (
-            "bad",
-            dir.path().join("absent").join("bad.sav"),
-            backup(false, 0),
-        ),
-        ("good", dir.path().join("good.sav"), backup(false, 0)),
-    ])
+    let mut rig = Rig::with_sets(
+        vec![
+            (
+                "bad",
+                dir.path().join("absent").join("bad.sav"),
+                backup(false),
+            ),
+            ("good", dir.path().join("good.sav"), backup(false)),
+        ],
+        0,
+    )
     .await;
     assert_eq!(rig.next_status().await, NO_STATUS);
     rig.mgr.manual_save("good", &rig.db).await.unwrap();

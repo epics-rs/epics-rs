@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::MAX_INCLUDE_DEPTH;
 use super::macros::MacroContext;
+use super::settings::SrSettings;
 use super::startup::is_valid_first_pv_char;
 
 /// A single entry parsed from a .req file.
@@ -51,26 +52,27 @@ pub async fn load_request_file_with_search_paths(
     search_paths: &[PathBuf],
     macros: &MacroContext,
 ) -> AutosaveResult<RequestList> {
-    let mut opened = None;
-    for path in req_file_candidates(filename, search_paths) {
-        if let Ok(content) = crate::runtime::fs::read_to_string(&path).await {
-            opened = Some((path, content));
-            break;
-        }
-    }
-    let Some((path, content)) = opened else {
-        println!("save_restore:readReqFile: unable to open file {filename}. Exiting.");
-        return Err(AutosaveError::ReqFileUnopened(filename.to_string()));
-    };
-    let canonical = crate::runtime::fs::canonicalize(&path)
-        .await
-        .unwrap_or(path);
+    read_request_list(filename, search_paths, macros, "", &SrSettings::default()).await
+}
+
+/// [`load_request_file_with_search_paths`] tracing as `settings` says;
+/// `macrostring` is the text `macros` came from, which the traces print.
+pub(crate) async fn read_request_list(
+    filename: &str,
+    search_paths: &[PathBuf],
+    macros: &MacroContext,
+    macrostring: &str,
+    settings: &SrSettings,
+) -> AutosaveResult<RequestList> {
     let mut walk = IncludeWalk {
-        stack: vec![canonical.clone()],
+        stack: Vec::new(),
         search_paths,
         unopened: false,
+        settings,
     };
-    let entries = parse_request_inner(&content, macros, 0, &canonical, &mut walk)?;
+    let Some(entries) = read_req_file(filename, macrostring, macros, 0, &mut walk)? else {
+        return Err(AutosaveError::ReqFileUnopened(filename.to_string()));
+    };
     Ok(RequestList {
         entries,
         include_unopened: walk.unopened,
@@ -83,22 +85,12 @@ struct IncludeWalk<'a> {
     stack: Vec<PathBuf>,
     search_paths: &'a [PathBuf],
     unopened: bool,
-}
-
-/// The paths C `openReqFile` tries for `name`, in order.
-fn req_file_candidates(name: &str, search_paths: &[PathBuf]) -> Vec<PathBuf> {
-    if search_paths.is_empty() {
-        return vec![PathBuf::from(name)];
-    }
-    search_paths
-        .iter()
-        .map(|dir| concatenate_paths(&dir.to_string_lossy(), name).into())
-        .collect()
+    settings: &'a SrSettings,
 }
 
 /// C `concatenate_paths` (save_restore.c:750-768): one `/` between the
 /// two, so an absolute `s2` lands UNDER `s1` rather than replacing it.
-fn concatenate_paths(s1: &str, s2: &str) -> String {
+pub(crate) fn concatenate_paths(s1: &str, s2: &str, settings: &SrSettings) -> String {
     let mut dest = s1.to_string();
     if !s2.is_empty() && !s2.starts_with('/') && !dest.is_empty() && !dest.ends_with('/') {
         dest.push('/');
@@ -107,17 +99,66 @@ fn concatenate_paths(s1: &str, s2: &str) -> String {
         Some(rest) if dest.ends_with('/') => dest.push_str(rest),
         _ => dest.push_str(s2),
     }
+    concatenated(&dest, settings);
     dest
 }
 
-/// [`load_request_file_with_search_paths`]'s include opener.
-fn open_include(name: &str, search_paths: &[PathBuf]) -> Option<(PathBuf, String)> {
-    req_file_candidates(name, search_paths)
-        .into_iter()
-        .find_map(|path| {
-            let content = std::fs::read_to_string(&path).ok()?;
-            Some((std::fs::canonicalize(&path).unwrap_or(path), content))
-        })
+/// `concatenate_paths`'s trace, for a site whose path rs joined once,
+/// before the C call that joins it again.
+pub(crate) fn concatenated(dest: &str, settings: &SrSettings) {
+    if settings.debug() > 2 {
+        println!("save_restore:concatenate_paths: dest='{dest}'");
+    }
+}
+
+/// C `openReqFile(reqFile, fpp)` (save_restore.c:3481-3534) without its
+/// recent-name cache: the first of `search_paths` that holds `name`, else
+/// `name` from the current directory when there are none. `want` is
+/// C's non-NULL `fpp`.
+fn open_req_file(
+    name: &str,
+    search_paths: &[PathBuf],
+    want: bool,
+    settings: &SrSettings,
+) -> Option<(PathBuf, String)> {
+    let debug = settings.debug();
+    let mut opened = None;
+    if debug > 5 {
+        let fpp = if want {
+            format!("{:p}", &opened)
+        } else {
+            "(nil)".to_string()
+        };
+        println!("save_restore:openReqFile: entry: reqFile='{name}', fpp={fpp}");
+    }
+    if search_paths.is_empty() {
+        opened = read_req(PathBuf::from(name));
+    } else {
+        for dir in search_paths {
+            let path = concatenate_paths(&dir.to_string_lossy(), name, settings);
+            opened = read_req(path.into());
+            if opened.is_some() {
+                break;
+            }
+        }
+    }
+    if debug > 5 {
+        match opened {
+            Some(_) => println!("openReqFile: found '{name}' by searching"),
+            None => println!("openReqFile: didn't find '{name}' by searching"),
+        }
+    }
+    opened
+}
+
+fn read_req(path: PathBuf) -> Option<(PathBuf, String)> {
+    let content = std::fs::read_to_string(&path).ok()?;
+    Some((path, content))
+}
+
+/// C `openReqFile(reqFile, NULL)`: whether the request file is found.
+pub(crate) fn req_file_exists(name: &str, search_paths: &[PathBuf], settings: &SrSettings) -> bool {
+    open_req_file(name, search_paths, false, settings).is_some()
 }
 
 /// Load a .req file from a string (for testing without filesystem).
@@ -159,22 +200,67 @@ pub fn parse_request_string(
     Ok(entries)
 }
 
-fn parse_request_inner(
-    content: &str,
+/// C `readReqFile(reqFile, plist, macrostring)` (save_restore.c:3538-3706)
+/// for one file and its includes, `None` when the file did not open.
+fn read_req_file(
+    req_file: &str,
+    macrostring: &str,
     macros: &MacroContext,
     depth: usize,
-    source_path: &Path,
     walk: &mut IncludeWalk,
-) -> AutosaveResult<Vec<RequestEntry>> {
+) -> AutosaveResult<Option<Vec<RequestEntry>>> {
     if depth > MAX_INCLUDE_DEPTH {
         return Err(AutosaveError::IncludeDepthExceeded(MAX_INCLUDE_DEPTH));
+    }
+    let debug = walk.settings.debug();
+    // C's `plist`: one list for the whole include tree.
+    let list = format!("{:p}", walk.search_paths.as_ptr());
+    if debug > 1 {
+        println!(
+            "save_restore:readReqFile: entry: reqFile='{req_file}', plist={list}, macrostring='{macrostring}'"
+        );
+    }
+    let Some((path, content)) = open_req_file(req_file, walk.search_paths, true, walk.settings)
+    else {
+        println!("save_restore:readReqFile: unable to open file {req_file}. Exiting.");
+        return Ok(None);
+    };
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    if walk.stack.contains(&canonical) {
+        let mut chain: Vec<String> = walk.stack.iter().map(|p| p.display().to_string()).collect();
+        chain.push(canonical.display().to_string());
+        return Err(AutosaveError::IncludeCycle { chain });
+    }
+    walk.stack.push(canonical.clone());
+
+    let pairs = crate::server::iocsh::macro_defn_pairs(macrostring);
+    if !macrostring.is_empty() && debug >= 5 {
+        println!("save_restore:readReqFile: Current macro definitions:");
+        super::save_set::report_macros(macrostring);
+        println!("save_restore:readReqFile: --------------------------");
     }
 
     let mut entries = Vec::new();
 
-    for (idx, raw_line) in content.lines().enumerate() {
+    for (idx, raw_line) in content.split_inclusive('\n').enumerate() {
         let line_no = idx + 1;
         let line = raw_line.trim();
+
+        if debug >= 2 {
+            // C expands only with definitions (`handle && pairs`).
+            if !macrostring.is_empty() && debug > 5 {
+                println!("save_restore:readReqFile:handle={:p}", macros);
+                if let Some((name, value)) = pairs.first() {
+                    println!("save_restore:readReqFile:pairs[0]='{name}'");
+                    if let Some(value) = value {
+                        println!("save_restore:readReqFile:pairs[1]='{value}'");
+                    }
+                }
+            }
+            let eline = macros.expand_quiet(raw_line);
+            let name = eline.split_ascii_whitespace().next().unwrap_or("");
+            println!("save_restore:readReqFile: line='{raw_line}', eline='{eline}', name='{name}'");
+        }
 
         if line.is_empty() {
             continue;
@@ -207,26 +293,18 @@ fn parse_request_inner(
                     .collect(),
             );
 
-            let Some((canonical, inc_content)) = open_include(&expanded_path, walk.search_paths)
-            else {
-                println!("save_restore:readReqFile: unable to open file {expanded_path}. Exiting.");
-                walk.unopened = true;
-                continue;
-            };
-
-            // Cycle detection
-            if walk.stack.contains(&canonical) {
-                let mut chain: Vec<String> =
-                    walk.stack.iter().map(|p| p.display().to_string()).collect();
-                chain.push(canonical.display().to_string());
-                return Err(AutosaveError::IncludeCycle { chain });
+            let eline = macros.expand_quiet(raw_line);
+            let (template_file, new_macro) = c_include_args(&eline);
+            if debug >= 2 {
+                println!("save_restore:readReqFile: preparing to include file: eline='{eline}'");
+                println!(
+                    "save_restore:readReqFile: calling readReqFile('{template_file}', {list},'{new_macro}')"
+                );
             }
-
-            walk.stack.push(canonical.clone());
-            let sub_entries =
-                parse_request_inner(&inc_content, &child_macros, depth + 1, &canonical, walk)?;
-            entries.extend(sub_entries);
-            walk.stack.pop();
+            match read_req_file(&expanded_path, &new_macro, &child_macros, depth + 1, walk)? {
+                Some(sub_entries) => entries.extend(sub_entries),
+                None => walk.unopened = true,
+            }
             continue;
         }
 
@@ -238,12 +316,43 @@ fn parse_request_inner(
         entries.push(RequestEntry {
             pv_name: name.to_string(),
             expanded_from: (name != line).then(|| line.to_string()),
-            source_file: source_path.to_path_buf(),
+            source_file: canonical.clone(),
             line_no,
         });
     }
+    walk.stack.pop();
+    if debug > 1 {
+        println!("save_restore:readReqFile: exit: reqFile='{req_file}'.");
+    }
 
-    Ok(entries)
+    Ok(Some(entries))
+}
+
+/// The template file and macro string C's `readReqFile` takes from an
+/// expanded `file` line (save_restore.c:3611-3644), for its trace.
+fn c_include_args(eline: &str) -> (String, String) {
+    let t = eline.get(4..).unwrap_or("").trim_start();
+    let t = t.strip_prefix('"').unwrap_or(t).trim_start();
+    let end = t
+        .find(|c: char| c.is_ascii_whitespace() || c == '"' || c == '#')
+        .unwrap_or(t.len());
+    let mut new_macro = String::new();
+    for c in t[end..].chars() {
+        if c.is_ascii_whitespace() || c == ',' {
+            if new_macro.len() >= 3 && !new_macro.ends_with(',') {
+                new_macro.push(',');
+            }
+        } else if c != '"' {
+            new_macro.push(c);
+        }
+    }
+    if new_macro.ends_with(',') {
+        new_macro.pop();
+    }
+    if new_macro.len() < 3 {
+        new_macro.clear();
+    }
+    (t[..end].to_string(), new_macro)
 }
 
 /// C `readReqFile`'s channel name (save_restore.c:3605-3650): the expanded

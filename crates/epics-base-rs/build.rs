@@ -30,6 +30,9 @@
 
 fn main() {
     stamp_vcs_version();
+    // autosave's `compiled <ctime>` (autosave_release.pl:6); a build of this
+    // crate is C's compile of save_restore.c.
+    println!("cargo::rustc-env=EPICS_RS_BUILD_EPOCH={}", build_epoch());
 
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
@@ -127,9 +130,7 @@ fn git(args: &[&str]) -> Option<String> {
 /// was shelling out to `date`, which cannot be the fallback for a missing
 /// program.
 fn build_timestamp() -> (String, String) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64);
+    let secs = build_epoch();
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     let time = secs.rem_euclid(86_400);
     let now = format!(
@@ -138,6 +139,12 @@ fn build_timestamp() -> (String, String) {
         (time % 3600) / 60
     );
     (now.clone(), format!("build date/time: {now}"))
+}
+
+fn build_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// Days since the epoch to a civil date — Howard Hinnant's `civil_from_days`,

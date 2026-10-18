@@ -36,14 +36,9 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy) -> (u64, bool) {
                     save_path: dir.path().join("stop.sav"),
                     request_file: None,
                     request_pvs: vec!["TEMP".into()],
-                    backup: BackupConfig {
-                        enable_savb: false,
-                        num_seq_files: 0,
-                        seq_period: Duration::from_secs(60),
-                        enable_dated: false,
-                        dated_interval: Duration::from_secs(3600),
-                    },
+                    backup: BackupConfig { enable_savb: false },
                     macros: HashMap::new(),
+                    macro_string: String::new(),
                     search_paths: Vec::new(),
                 },
                 strategy,
@@ -52,11 +47,14 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy) -> (u64, bool) {
             .await,
     );
     let (set, lock) = mgr.sets()[0].clone();
-    let handle = mgr.clone().start(
-        &epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
     let guard = lock.clone().lock_owned().await;
     let before = set.stats().save_count.load(Ordering::Relaxed);
     // The second pass, a second after the first, owes a save and is now

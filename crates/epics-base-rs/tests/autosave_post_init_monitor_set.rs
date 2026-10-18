@@ -100,7 +100,7 @@ fn create_monitor_set_after_ioc_init_keeps_no_unloadable_set() {
     let ctx = CommandContext::new(db, bridge);
 
     // C's wrapper ignores the status, and `readReqFile` has printed its
-    // line; the freed list leaves nothing for fdblist (save_restore.c:2460).
+    // line; the freed list leaves nothing for save_restoreShow (save_restore.c:2460).
     find(&cmds, "create_monitor_set")
         .handler
         .call(

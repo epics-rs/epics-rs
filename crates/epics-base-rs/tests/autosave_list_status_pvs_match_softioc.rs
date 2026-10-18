@@ -67,14 +67,9 @@ fn set(name: &str, save_path: PathBuf, pv: &str) -> SaveSetConfig {
         save_path,
         request_file: None,
         request_pvs: vec![pv.into()],
-        backup: BackupConfig {
-            enable_savb: false,
-            num_seq_files: 0,
-            seq_period: Duration::from_secs(60),
-            enable_dated: false,
-            dated_interval: Duration::from_secs(3600),
-        },
+        backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: Vec::new(),
     }
 }
@@ -144,7 +139,10 @@ async fn a_clean_save_fills_its_list_records_in_creation_order() {
             .build()
             .await,
     );
-    let handle = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let handle = mgr
+        .clone()
+        .start(&Reactor::current().unwrap(), db.clone())
+        .unwrap();
     sleep(Duration::from_millis(500)).await;
     let before: Vec<_> = names
         .iter()
@@ -200,7 +198,10 @@ async fn a_value_it_could_not_fetch_is_counted_in_statusstr() {
             .build()
             .await,
     );
-    let handle = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let handle = mgr
+        .clone()
+        .start(&Reactor::current().unwrap(), db.clone())
+        .unwrap();
     let _ = mgr.manual_save("first", &db).await;
     sleep(Duration::from_millis(1500)).await;
     mgr.shutdown();

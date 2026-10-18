@@ -21,7 +21,7 @@ use epics_base_rs::runtime::task::{Reactor, sleep};
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
-use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
+use epics_base_rs::server::autosave::save_set::{ManualSource, SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -74,14 +74,9 @@ fn set_config(save_path: PathBuf) -> SaveSetConfig {
         save_path,
         request_file: None,
         request_pvs: vec!["T:SR_status".into()],
-        backup: BackupConfig {
-            enable_savb: false,
-            num_seq_files: 0,
-            seq_period: Duration::from_secs(60),
-            enable_dated: false,
-            dated_interval: Duration::from_secs(3600),
-        },
+        backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
+        macro_string: String::new(),
         search_paths: Vec::new(),
     }
 }
@@ -145,10 +140,13 @@ async fn three_heartbeats_toggle_the_bo_as_ca_put_does() {
             .build()
             .await,
     );
-    let handle = mgr.clone().start(
-        &Reactor::current().expect("the test driver enters an executor"),
-        db.clone(),
-    );
+    let handle = mgr
+        .clone()
+        .start(
+            &Reactor::current().expect("the test driver enters an executor"),
+            db.clone(),
+        )
+        .unwrap();
 
     let mut beats = Vec::new();
     for _ in 0..3 {
@@ -210,16 +208,14 @@ async fn a_manual_restore_processes_as_ca_put_does() {
     .await
     .unwrap();
     let mgr = AutosaveBuilder::new()
-        .add_set(set_config(path), SaveStrategy::Manual)
+        .add_set(set_config(path.clone()), SaveStrategy::Manual)
         .build()
         .await;
 
-    let restored = mgr.manual_restore("s", &db).await.unwrap();
-    assert!(
-        restored.failed_puts.is_empty(),
-        "{:?}",
-        restored.failed_puts
-    );
+    let status = mgr
+        .manual_restore(&db, &path, "s.sav", ManualSource::SaveFile, "")
+        .await;
+    assert_eq!(status, 0);
     let (value, stat, sevr) = first_post(&db, "T:SR_status", &mut rx).await;
     assert_eq!(
         (value.to_f64(), stat, sevr),

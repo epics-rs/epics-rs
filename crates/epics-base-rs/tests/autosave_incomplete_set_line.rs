@@ -10,10 +10,7 @@
 //! set was complete; parsing it as a PV line — which is what a leading
 //! `!` used to do here — invents a PV named `!` and loses the statement.
 
-use epics_base_rs::server::autosave::format::CompatMode;
-use epics_base_rs::server::autosave::save_file::{
-    SaveEntry, read_save_file, write_save_file_with_mode,
-};
+use epics_base_rs::server::autosave::save_file::{SaveEntry, read_save_file, write_save_file};
 use epics_base_rs::server::autosave::save_set::restore_from_entries;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -26,39 +23,32 @@ fn entry(name: &str, value: &str, connected: bool) -> SaveEntry {
     }
 }
 
-/// The line is the file format, not the value encoding, so it is
-/// written in both modes — a C IOC reads `Native` files too.
+/// The declaration sits right under the header.
 #[epics_macros_rs::epics_test]
-async fn an_incomplete_set_declares_itself_in_both_modes() {
+async fn an_incomplete_set_declares_itself() {
     let dir = tempfile::tempdir().unwrap();
-    for (mode, name) in [
-        (CompatMode::Native, "native.sav"),
-        (CompatMode::CRead, "cread.sav"),
-    ] {
-        let path = dir.path().join(name);
-        write_save_file_with_mode(
-            &path,
-            &[
-                entry("PV1", "1.0", true),
-                entry("PV2", "", false),
-                entry("PV3", "", false),
-            ],
-            mode,
-        )
+    let path = dir.path().join("incomplete.sav");
+    write_save_file(
+        &path,
+        &[
+            entry("PV1", "1.0", true),
+            entry("PV2", "", false),
+            entry("PV3", "", false),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let text = epics_base_rs::runtime::fs::read_to_string(&path)
         .await
         .unwrap();
-
-        let text = epics_base_rs::runtime::fs::read_to_string(&path)
-            .await
-            .unwrap();
-        assert!(
-            text.contains("! 2 channel(s) not connected - or not all gets were successful"),
-            "{name} must declare the two PVs it could not save; got: {text:?}"
-        );
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with('#'), "header first");
-        assert!(lines[1].starts_with('!'), "then the declaration: {lines:?}");
-    }
+    assert!(
+        text.contains("! 2 channel(s) not connected - or not all gets were successful"),
+        "the file must declare the two PVs it could not save; got: {text:?}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with('#'), "header first");
+    assert!(lines[1].starts_with('!'), "then the declaration: {lines:?}");
 }
 
 /// A complete set says nothing, because C says nothing.
@@ -66,7 +56,7 @@ async fn an_incomplete_set_declares_itself_in_both_modes() {
 async fn a_complete_set_writes_no_declaration() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("all.sav");
-    write_save_file_with_mode(&path, &[entry("PV1", "1.0", true)], CompatMode::Native)
+    write_save_file(&path, &[entry("PV1", "1.0", true)])
         .await
         .unwrap();
     let text = epics_base_rs::runtime::fs::read_to_string(&path)
@@ -119,13 +109,9 @@ async fn a_c_written_incomplete_file_keeps_its_count_and_names_no_pv() {
 async fn the_declaration_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rt.sav");
-    write_save_file_with_mode(
-        &path,
-        &[entry("PV1", "1.0", true), entry("PV2", "", false)],
-        CompatMode::CRead,
-    )
-    .await
-    .unwrap();
+    write_save_file(&path, &[entry("PV1", "1.0", true), entry("PV2", "", false)])
+        .await
+        .unwrap();
 
     let contents = read_save_file(&path).await.unwrap().expect("has <END>");
     assert_eq!(contents.not_connected, 1);

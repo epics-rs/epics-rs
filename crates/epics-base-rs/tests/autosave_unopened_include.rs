@@ -26,6 +26,7 @@ fn config(dir: &std::path::Path) -> SaveSetConfig {
         request_pvs: Vec::new(),
         backup: BackupConfig::default(),
         macros: HashMap::from([("P".into(), "IOC:".into())]),
+        macro_string: String::new(),
         search_paths: vec![dir.to_path_buf()],
     }
 }

@@ -10,7 +10,7 @@ use crate::server::database::{DbNode, parse_pv_name};
 use crate::server::db_loader;
 use crate::server::record::{Base, FieldDeclaration, FieldDesc, Special, served_element_size};
 use crate::types::{DbFieldType, DbfCode, EpicsValue, RecordName};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// C `dbRecordsOnceOnly` (`dbLexRoutines.c:52-53`), the exported `int` a
 /// startup script sets with `var dbRecordsOnceOnly 1`.
@@ -521,7 +521,7 @@ fn db_nodes_type_major(ctx: &CommandContext) -> Vec<DbNode> {
 /// `if (dbIsAlias(pdbentry)) continue`, which `dbjlr` (`dbJLink.c:520`),
 /// `dbcar` (`dbCaTest.c:85`) and `dbWriteRecordFP` (`dbStaticLib.c:826`)
 /// each spell for themselves.
-fn record_names_type_major(ctx: &CommandContext) -> Vec<RecordName> {
+pub(crate) fn record_names_type_major(ctx: &CommandContext) -> Vec<RecordName> {
     db_nodes_type_major(ctx)
         .into_iter()
         .filter(|node| node.alias_of.is_none())
@@ -1628,7 +1628,7 @@ fn cmd_dbpf() -> CommandDef {
 /// Link fields are not routed here: `dbGetString`'s link arms re-render from
 /// the parsed link and `dbpr` prints the type alongside them, which is
 /// [`render_dbpr_link`]'s job.
-pub(super) fn db_get_string(
+pub(crate) fn db_get_string(
     inst: &crate::server::record::RecordInstance,
     desc: &crate::server::record::FieldDesc,
     value: &EpicsValue,
@@ -5377,13 +5377,20 @@ fn cmd_db_load_records() -> CommandDef {
             };
 
             // C says NOTHING on the success path: `dbLoadRecords` calls
-            // the (always-NULL in base) `dbLoadRecordsHook` and returns 0
+            // `dbLoadRecordsHook` (NULL in base) and returns 0
             // (`dbAccess.c:804-807`). A progress line here is output no C
             // IOC produces, on the stream a startup script's own output
             // shares. The failure path is [`db_load_records`], which owns
             // the summary and has already written it.
             let mut faults = db_loader::DbFaults::default();
-            match db_load_records(ctx, path, parse_macro_string(macros_str), &mut faults) {
+            let subs = String::from_utf8_lossy(macros_str);
+            match db_load_records(
+                ctx,
+                path,
+                &subs,
+                parse_macro_string(macros_str),
+                &mut faults,
+            ) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 Err(_) => Ok(CommandOutcome::Failed),
             }
@@ -5643,6 +5650,7 @@ fn db_read_database_macros(
 fn db_load_records(
     ctx: &CommandContext,
     file: &str,
+    subs: &str,
     macros: HashMap<Vec<u8>, Vec<u8>>,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
@@ -5659,8 +5667,26 @@ fn db_load_records(
         if matches!(failure, DbReadFailure::AfterIocInit) {
             ctx.console_eprintln("    Records cannot be loaded after iocInit!");
         }
+    } else if let Some(hook) = db_load_records_hook() {
+        hook(file, subs);
     }
     read
+}
+
+/// C `DB_LOAD_RECORDS_HOOK_ROUTINE`: the file and the RAW substitution
+/// string of a `dbLoadRecords` that succeeded.
+pub type DbLoadRecordsHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// C `dbLoadRecordsHook` (`dbAccess.c:74`), process-wide as in C, so an
+/// installer keeps the previous one and chains to it.
+static DB_LOAD_RECORDS_HOOK: Mutex<Option<DbLoadRecordsHook>> = Mutex::new(None);
+
+pub fn db_load_records_hook() -> Option<DbLoadRecordsHook> {
+    DB_LOAD_RECORDS_HOOK.lock().unwrap().clone()
+}
+
+pub fn set_db_load_records_hook(hook: Option<DbLoadRecordsHook>) {
+    *DB_LOAD_RECORDS_HOOK.lock().unwrap() = hook;
 }
 
 /// Resolve a `dbLoadTemplate` `.substitutions` file. C keeps the
@@ -5915,15 +5941,15 @@ fn cmd_db_load_template() -> CommandDef {
                 // second install path of its own — the `.dbd` side effects
                 // (`registrar`, `link`) included.
                 let mut faults = db_loader::DbFaults::default();
-                if db_load_records(ctx, &load.file, merged, &mut faults).is_err() {
+                let sub_collect = c_sub_collect(&String::from_utf8_lossy(macros_str), &load.macros);
+                if db_load_records(ctx, &load.file, &sub_collect, merged, &mut faults).is_err() {
                     // C `msiLoadRecords` (`dbLoadTemplate.y:49-57`) names the
                     // row that failed, then `yyerror` + `YYABORT`: the rows
                     // after this one are never read, and `yyparse` fails the
                     // command.
                     ctx.console_eprintln(&format!(
-                        "dbLoadRecords(\"{}\", {})",
-                        load.file,
-                        c_sub_collect(&String::from_utf8_lossy(macros_str), &load.macros)
+                        "dbLoadRecords(\"{}\", {sub_collect})",
+                        load.file
                     ));
                     eprint_substitution_fault(
                         ctx,

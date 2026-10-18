@@ -58,6 +58,24 @@ impl MacroContext {
         .text
     }
 
+    /// [`Self::expand`] without macLib's warnings, for a trace of a line
+    /// whose expansion is reported elsewhere.
+    pub(super) fn expand_quiet(&self, input: &str) -> String {
+        if self.macros.is_empty() {
+            return input.to_string();
+        }
+        crate::server::db_loader::expand_macros(
+            input,
+            &self.macros,
+            crate::server::db_loader::MacroExpandOptions {
+                env_fallback: false,
+                dollar_escape: false,
+                suppress_warnings: true,
+            },
+        )
+        .text
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.macros.get(key).map(|s| s.as_str())
     }

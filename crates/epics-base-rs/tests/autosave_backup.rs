@@ -1,10 +1,6 @@
-use std::time::Duration;
-
-use epics_base_rs::server::autosave::backup::{
-    BackupConfig, BackupState, find_best_save_file, rotate_backups,
-};
-use epics_base_rs::server::autosave::format::CompatMode;
+use epics_base_rs::server::autosave::backup::{BackupConfig, fopen_and_check, rotate_backups};
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
+use epics_base_rs::server::autosave::settings::SrSettings;
 
 fn make_entry(name: &str, val: &str) -> SaveEntry {
     SaveEntry {
@@ -24,105 +20,19 @@ async fn test_savb_created() {
         .await
         .unwrap();
 
-    let config = BackupConfig {
-        enable_savb: true,
-        num_seq_files: 0,
-        seq_period: Duration::from_secs(60),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    };
-    let mut state = BackupState::default();
+    let config = BackupConfig { enable_savb: true };
 
     rotate_backups(
         &sav_path,
         &config,
-        &mut state,
         &[make_entry("PV1", "1.0")],
-        CompatMode::Native,
+        &SrSettings::default(),
     )
     .await
     .unwrap();
 
     let savb_path = sav_path.with_extension("savB");
     assert!(savb_path.exists());
-}
-
-#[epics_macros_rs::epics_test]
-async fn test_seq_rotation() {
-    let dir = tempfile::tempdir().unwrap();
-    let sav_path = dir.path().join("test.sav");
-
-    let config = BackupConfig {
-        enable_savb: false,
-        num_seq_files: 3,
-        seq_period: Duration::from_millis(1), // very short for testing
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    };
-    let mut state = BackupState::default();
-
-    // Create and rotate 3 times
-    for i in 0..3 {
-        write_save_file(&sav_path, &[make_entry("PV1", &i.to_string())])
-            .await
-            .unwrap();
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
-        rotate_backups(
-            &sav_path,
-            &config,
-            &mut state,
-            &[make_entry("PV1", &i.to_string())],
-            CompatMode::Native,
-        )
-        .await
-        .unwrap();
-    }
-
-    // All 3 seq files should exist
-    assert!(sav_path.with_extension("sav0").exists());
-    assert!(sav_path.with_extension("sav1").exists());
-    assert!(sav_path.with_extension("sav2").exists());
-}
-
-#[epics_macros_rs::epics_test]
-async fn test_dated_filename() {
-    let dir = tempfile::tempdir().unwrap();
-    let sav_path = dir.path().join("test.sav");
-
-    write_save_file(&sav_path, &[make_entry("PV1", "1.0")])
-        .await
-        .unwrap();
-
-    let config = BackupConfig {
-        enable_savb: false,
-        num_seq_files: 0,
-        seq_period: Duration::from_secs(60),
-        enable_dated: true,
-        dated_interval: Duration::from_millis(1),
-    };
-    let mut state = BackupState::default();
-
-    rotate_backups(
-        &sav_path,
-        &config,
-        &mut state,
-        &[make_entry("PV1", "1.0")],
-        CompatMode::Native,
-    )
-    .await
-    .unwrap();
-
-    // Check that a dated file was created (sav_YYMMDD-HHMMSS)
-    let entries: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("test.sav_"))
-        })
-        .collect();
-    assert_eq!(entries.len(), 1);
 }
 
 #[epics_macros_rs::epics_test]
@@ -141,8 +51,7 @@ async fn test_corrupt_sav_fallback_to_savb() {
         .await
         .unwrap();
 
-    let config = BackupConfig::default();
-    let best = find_best_save_file(&sav_path, &config).await;
+    let best = fopen_and_check(&sav_path, &undated()).await.map(|(p, _)| p);
     assert_eq!(best.unwrap(), savb_path);
 }
 
@@ -158,8 +67,7 @@ async fn test_no_sav_only_savb() {
         .await
         .unwrap();
 
-    let config = BackupConfig::default();
-    let best = find_best_save_file(&sav_path, &config).await;
+    let best = fopen_and_check(&sav_path, &undated()).await.map(|(p, _)| p);
     assert_eq!(best.unwrap(), savb_path);
 }
 
@@ -184,8 +92,7 @@ async fn test_seq_file_fallback() {
     .await
     .unwrap();
 
-    let config = BackupConfig::default();
-    let best = find_best_save_file(&sav_path, &config).await;
+    let best = fopen_and_check(&sav_path, &undated()).await.map(|(p, _)| p);
     assert_eq!(best.unwrap(), sav_path.with_extension("sav1"));
 }
 
@@ -199,8 +106,7 @@ async fn test_partial_write_corrupt() {
         .await
         .unwrap();
 
-    let config = BackupConfig::default();
-    let best = find_best_save_file(&path, &config).await;
+    let best = fopen_and_check(&path, &undated()).await.map(|(p, _)| p);
     assert!(best.is_none());
 }
 
@@ -214,22 +120,14 @@ async fn test_rotate_preserves_existing() {
         .await
         .unwrap();
 
-    let config = BackupConfig {
-        enable_savb: true,
-        num_seq_files: 1,
-        seq_period: Duration::from_millis(1),
-        enable_dated: false,
-        dated_interval: Duration::from_secs(3600),
-    };
-    let mut state = BackupState::default();
+    let config = BackupConfig { enable_savb: true };
 
     // Rotate
     rotate_backups(
         &sav_path,
         &config,
-        &mut state,
         &[make_entry("PV1", "1.0")],
-        CompatMode::Native,
+        &SrSettings::default(),
     )
     .await
     .unwrap();
@@ -238,4 +136,11 @@ async fn test_rotate_preserves_existing() {
     assert!(sav_path.exists());
     // .savB should exist
     assert!(sav_path.with_extension("savB").exists());
+}
+
+/// The default settings with `save_restoreDatedBackupFiles` cleared.
+fn undated() -> SrSettings {
+    let settings = SrSettings::default();
+    settings.set_dated_backup_files(0);
+    settings
 }

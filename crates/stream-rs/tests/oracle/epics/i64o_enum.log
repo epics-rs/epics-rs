@@ -1,41 +1,41 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto i64o_ie P"
-Stream::initRecord rec: filename="l.proto" protocol="i64o_ie" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "i64o_ie")
-Stream::initRecord rec: initialize the first time
-StreamCore::startProtocol(rec, startMode=StartInit)
-StreamCore::evalCommand(rec): activeCommand = out
-StreamCore::evalOut: outputLine = "E<0d><0a>"
-StreamCore::evalOut(rec): lockRequest(0)
-Stream::initRecord rec: waiting for initDone
-StreamCore::lockCallback(rec, StreamIoSuccess)
-StreamCore::writeCallback(rec, StreamIoSuccess)
-StreamCore::evalCommand(rec): activeCommand = in
-StreamCore::readCallback(rec, StreamIoSuccess input="c", size=1)
-StreamCore::readCallback(rec) inputBuffer="c", size 1
-StreamCore::readCallback(rec) inTerminator <0d><0a> not found
-StreamCore::readCallback(rec) wait for more input
-StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
-StreamCore::readCallback(rec) inputBuffer="c", size 1
-StreamCore::readCallback(rec) inTerminator <0d><0a> not found
-StreamCore::readCallback(rec) end flag received
-StreamCore::readCallback(rec) input line: "c"
-StreamCore::matchInput(rec): format = "%{a|b|c}"
-StreamCore::scanValue(rec, format=%{, long) input="c" value=2
-Stream::scan() currentValueLength=1
-Stream::matchValue(rec): success, 1 bytes consumed
-StreamCore::evalCommand(rec): activeCommand = end
-StreamCore::finishProtocol(rec, Success) bus owner
-Stream::protocolFinishHook(rec, Success)
-Stream::protocolFinishHook rec: signalling init done
-Stream::initRecord rec: initDone
-Stream::initRecord rec: initialized. don't convert
-streamInitRecord(rec) done status=0
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto i64o_ie P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="i64o_ie" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "i64o_ie")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	StreamCore::startProtocol(rec, startMode=StartInit)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::evalOut: outputLine = "E<0d><0a>"
+_main_	StreamCore::evalOut(rec): lockRequest(0)
+_main_	Stream::initRecord rec: waiting for initDone
+P	StreamCore::lockCallback(rec, StreamIoSuccess)
+P	StreamCore::writeCallback(rec, StreamIoSuccess)
+P	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="c", size=1)
+P	StreamCore::readCallback(rec) inputBuffer="c", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) wait for more input
+P	StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
+P	StreamCore::readCallback(rec) inputBuffer="c", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) end flag received
+P	StreamCore::readCallback(rec) input line: "c"
+P	StreamCore::matchInput(rec): format = "%{a|b|c}"
+P	StreamCore::scanValue(rec, format=%{, long) input="c" value=2
+P	Stream::scan() currentValueLength=1
+P	Stream::matchValue(rec): success, 1 bytes consumed
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) bus owner
+P	Stream::protocolFinishHook(rec, Success)
+P	Stream::protocolFinishHook rec: signalling init done
+_main_	Stream::initRecord rec: initDone
+_main_	Stream::initRecord rec: initialized. don't convert
+_main_	streamInitRecord(rec) done status=0
 VAL 2 = 0x2
 SEVR "NO_ALARM"
 STAT "NO_ALARM"

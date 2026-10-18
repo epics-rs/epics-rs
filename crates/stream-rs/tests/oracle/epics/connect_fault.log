@@ -1,29 +1,29 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto c P"
-Stream::initRecord rec: filename="l.proto" protocol="c" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "c")
-Stream::initRecord rec: initialize the first time
-streamInitRecord(rec) done status=0x2
-Stream::process(rec)
-Stream::process(rec) start
-StreamCore::startProtocol(rec, startMode=StartNormal)
-StreamCore::evalCommand(rec): activeCommand = connect
-Stream::process(rec): protocol started
-rec connectToAsynPort: Can't connect to 127.0.0.1:<port>: Operation now in progress
-StreamCore::connectCallback(rec, StreamIoFault) activeCommand: connect
-rec: Connect failed
-StreamCore::finishProtocol(rec, Fault) not bus owner
-Stream::protocolFinishHook(rec, Fault)
-rec: Protocol aborted
-recordProcessCallback(rec) processing record
-Stream::process(rec)
-Stream::process(rec) error status=UDF (17)
-recordProcessCallback(rec) processing record done
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto c P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="c" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "c")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	Stream::process(rec)
+_main_	Stream::process(rec) start
+_main_	StreamCore::startProtocol(rec, startMode=StartNormal)
+_main_	StreamCore::evalCommand(rec): activeCommand = connect
+_main_	Stream::process(rec): protocol started
+P	rec connectToAsynPort: Can't connect to 127.0.0.1:<port>: Operation now in progress
+P	StreamCore::connectCallback(rec, StreamIoFault) activeCommand: connect
+P	rec: Connect failed
+P	StreamCore::finishProtocol(rec, Fault) not bus owner
+P	Stream::protocolFinishHook(rec, Fault)
+P	rec: Protocol aborted
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) error status=UDF (17)
+cbLow	recordProcessCallback(rec) processing record done
 VAL 0 = 0x0
 SEVR "INVALID"
 STAT "UDF"

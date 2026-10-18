@@ -1,26 +1,26 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto lst P"
-Stream::initRecord rec: filename="l.proto" protocol="lst" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "lst")
-Stream::initRecord rec: initialize the first time
-streamInitRecord(rec) done status=0x2
-Stream::process(rec)
-Stream::process(rec) start
-StreamCore::startProtocol(rec, startMode=StartNormal)
-StreamCore::evalCommand(rec): activeCommand = out
-StreamCore::formatOutput(rec): format = %s
-Stream::formatValue(rec, format=%s, fieldaddr=(nil)
-Stream::formatValue(rec) format=%s type=DBF_STRING
-Stream::formatValue(rec): writeData failed
-rec: Cannot format value with '%s'
-StreamCore::finishProtocol(rec, FormatError) not bus owner
-Stream::protocolFinishHook(rec, FormatError)
-Stream::process(rec): could not start protocol, status=CALC (12)
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto lst P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="lst" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "lst")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	Stream::process(rec)
+_main_	Stream::process(rec) start
+_main_	StreamCore::startProtocol(rec, startMode=StartNormal)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::formatOutput(rec): format = %s
+_main_	Stream::formatValue(rec, format=%s, fieldaddr=(nil)
+_main_	Stream::formatValue(rec) format=%s type=DBF_STRING
+_main_	Stream::formatValue(rec): writeData failed
+_main_	rec: Cannot format value with '%s'
+_main_	StreamCore::finishProtocol(rec, FormatError) not bus owner
+_main_	Stream::protocolFinishHook(rec, FormatError)
+_main_	Stream::process(rec): could not start protocol, status=CALC (12)
 VAL 20 = 0x14
 SEVR "INVALID"
 STAT "CALC"

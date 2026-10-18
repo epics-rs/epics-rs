@@ -1,8 +1,8 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-rec: Empty I/O link. Forgot the leading '@' or confused INP with OUT or link is too long ?
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	rec: Empty I/O link. Forgot the leading '@' or confused INP with OUT or link is too long ?
 VAL 0 = 0x0
 SEVR "NO_ALARM"
 STAT "UDF"

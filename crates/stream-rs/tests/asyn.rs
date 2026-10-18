@@ -338,9 +338,7 @@ fn attaching_prints_what_c_prints() {
     assert_eq!(lines, oracle("attach-connected"));
     drop(found);
 
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     let (found, lines) = attach(&client, "P");
     assert!(found.is_some());
     assert_eq!(lines, oracle("attach-disconnected"));
@@ -434,9 +432,7 @@ fn a_refused_lock_is_reported_once_and_its_end_once() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
     let handle = port("DC", octet_transport_capabilities());
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     let (client, locks) = rec("rec");
     let (bus, _) = attach(&client, "DC");
     let bus = bus.unwrap();
@@ -513,9 +509,7 @@ fn a_refused_lock_leaves_the_interface_idle_for_a_connect() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
     let handle = port("P", octet_transport_capabilities());
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     let (client, _locks, connects) = rec_connects("rec");
     let (bus, _) = attach(&client, "P");
     let bus = bus.unwrap();
@@ -621,9 +615,7 @@ fn stream_reinit_takes_the_port_down_and_up_as_c_does() {
 fn stream_reinit_failures_print_what_c_prints() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     let handle = port("P", octet_transport_capabilities());
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     let mut err = Vec::new();
     let statuses = [None, Some("Z"), Some("P")]
         .map(|portname| stream_rs::asyn::stream_reinit(portname, 0, &mut err));
@@ -986,6 +978,15 @@ impl PortDriver for Script {
             }
         }
     }
+}
+
+/// Disconnect `handle`'s port and keep it down: an auto-connect port's
+/// connect timer connects it again 10 ms on (asynManager.c:2184).
+fn disconnect_for_good(handle: &asyn_rs::port_handle::PortHandle) {
+    handle.set_auto_connect(0, false).unwrap();
+    handle
+        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
+        .unwrap();
 }
 
 /// A connected [`Script`] port called `name`, and its book.
@@ -1929,9 +1930,7 @@ fn disconnecting_a_disconnected_device_only_calls_back() {
     let (client, calls) = rec_calls("rec", None);
     let (bus, _) = attach(&client, "DA");
     let bus = bus.unwrap();
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     // A disconnect reaching the port would now fault.
     book.lock().unwrap().disconnect_fails = Some("disconnected twice");
     let ((), lines) = all_threads(|| {
@@ -1978,9 +1977,7 @@ fn a_failed_connect_faults() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
     let (handle, book) = script("CF");
-    handle
-        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
-        .unwrap();
+    disconnect_for_good(&handle);
     book.lock().unwrap().connect_fails = Some("refused");
     let (client, calls) = rec_calls("rec", None);
     let (bus, _) = attach(&client, "CF");
@@ -2073,6 +2070,21 @@ fn reads_now(calls: &Calls) -> Vec<(StreamIoStatus, OwnedReadInput, isize)> {
     calls.reads.try_iter().collect()
 }
 
+/// A readCallback's status, input and answer.
+type ReadCall = (StreamIoStatus, OwnedReadInput, isize);
+
+/// [`reads_now`] for input whose last readCallback asks for more, and the
+/// timeout of the read timer that starts (:1204-1209, :1302-1306): with
+/// no read request the read timeout is 0, so it may be in already.
+fn reads_then_timeout(calls: &Calls) -> (Vec<ReadCall>, ReadCall) {
+    let mut reads = reads_now(calls);
+    let timeout = match reads.last() {
+        Some((IoTimeout, ..)) => reads.pop().unwrap(),
+        _ => calls.reads.recv_timeout(WAIT).unwrap(),
+    };
+    (reads, timeout)
+}
+
 /// supportsAsyncRead, intrCallbackOctet and asynReadHandler
 /// (AsynDriverInterface.cc:388-402, :1101-1212): an "I/O Intr" record's
 /// poll reads the device's greeting, which comes back to it as an interrupt.
@@ -2161,13 +2173,17 @@ fn a_device_terminator_is_cut_off_without_a_protocol_one() {
         .set_input_eos_blocking(AsynUser::new(0), b"\r\n")
         .unwrap();
     input(&handle, &book, b"12\r\n", EomReason::empty());
-    input(&handle, &book, b"3\n", EomReason::empty());
     assert_eq!(
         reads_now(&calls),
-        [
-            (End, OwnedReadInput::Bytes(b"12".to_vec()), 0),
-            (Success, OwnedReadInput::Bytes(b"3\n".to_vec()), -1)
-        ]
+        [(End, OwnedReadInput::Bytes(b"12".to_vec()), 0)]
+    );
+    input(&handle, &book, b"3\n", EomReason::empty());
+    assert_eq!(
+        reads_then_timeout(&calls),
+        (
+            vec![(Success, OwnedReadInput::Bytes(b"3\n".to_vec()), -1)],
+            (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+        )
     );
 }
 
@@ -2181,13 +2197,15 @@ fn input_wanting_more_times_out() {
     let ((), lines) = all_threads(|| {
         input(&handle, &book, b"12", EomReason::empty());
         assert_eq!(
-            reads_now(&calls),
-            [(Success, OwnedReadInput::Bytes(b"12".to_vec()), -1)]
+            reads_then_timeout(&calls),
+            (
+                vec![(Success, OwnedReadInput::Bytes(b"12".to_vec()), -1)],
+                (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+            )
         );
-        assert_eq!(
-            calls.reads.recv_timeout(WAIT),
-            Ok((IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0))
-        );
+        // the timeout ends the read: nothing follows it
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(reads_now(&calls), []);
     });
     assert_eq!(
         of(&lines, &["asynReadHandler"]),

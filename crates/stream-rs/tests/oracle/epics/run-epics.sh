@@ -12,7 +12,8 @@
 # debug lines cannot interleave.
 # Kept from stderr:
 # StreamEpics.cc's and StreamCore.cc's debug lines and the error lines (no
-# source file), without the thread name and file:line prefix, but for
+# source file), each as its thread's name, a tab and the line without the
+# file:line prefix (the order across threads is the scheduler's), but for
 # attachBus's line (it prints a pointer), the bus's error lines and
 # iocsh's own, and errlog's lines, whose place among the others the
 # errlog thread decides. After the run the log has "FIELD value" for VAL
@@ -152,16 +153,22 @@ EOC
     # and writes each whole, which may land after the thread name of a
     # line printed in pieces: that name goes back on the line after it
     perl -ne '$_ = $carry . $_; $carry = "";
-        if (s/^(.*?)(sevr=\w+ )/$2/) { $carry = $1; push @e, $_; next } END { print @e }
+        if (s/^(.*?)(sevr=\w+ )/$2/) { $carry = $1; push @e, $_; next } END { print map { "errlog\t$_" } @e }
         next unless $on ||= /Stream(Epics|Core)\.cc:\d+: /;
         # dbgf of an ENUM array, not the device, prints it
         next if /^recGblRecSupError: dbGet missing /;
         next if /^\e\[|^cas WARNING: |^iocsh Error: |^iocRun: |^iocPause: |^iocInit: |^Starting iocInit|^#|StreamCore::attachBus\(/;
-        next unless s/^\S+ //;
+        # the thread name, "-" for the lines of drvStreamInit, printed
+        # before the thread name hook is set
+        next unless s/^(\S+) //;
+        $t = $1;
+        $t =~ /\.cc?:\d+:$/ and ($_, $t) = ("$t $_", "-");
+        # the errlog thread prints its lines with no thread name
+        $t = "errlog" if $t eq "recGblRecordError:";
         s/( failed\\n)\S+ (?!Stream(Core|Epics)\.cc:)\S+\.cc?:\d+: .*/$1/;
         next if /^\S+ lockRequest: port \S+ not connected$/;
         s/127\.0\.0\.1:\d+/127.0.0.1:<port>/;
-        if (s/^(\S+\.cc?):\d+: //) { print if $1 eq "StreamCore.cc" || $1 eq "StreamEpics.cc" } else { print }' \
+        if (s/^(\S+\.cc?):\d+: //) { print "$t\t$_" if $1 eq "StreamCore.cc" || $1 eq "StreamEpics.cc" } else { print "$t\t$_" }' \
         "$work/$c.err" >"$here/$c.log"
     # dbgf prints "DBF_TYPE:  value" (a string in quotes), dbpf's echo of
     # its put too, and an array "DBF_TYPE[NORD]:  a  b", wrapped at 80

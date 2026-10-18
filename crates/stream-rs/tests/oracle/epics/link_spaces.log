@@ -1,17 +1,17 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "   l.proto    p    P"
-Stream::initRecord rec: filename="l.proto" protocol="p   " bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "p   ")
-Protocol 'p ' not found in protocol file 'l.proto'
-while reading protocol 'p ' for 'rec'
-rec: Protocol parse error
-rec: Record initialization failed
-streamInitRecord(rec) done status=0x1f70012
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "   l.proto    p    P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="p   " bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "p   ")
+_main_	Protocol 'p ' not found in protocol file 'l.proto'
+_main_	while reading protocol 'p ' for 'rec'
+_main_	rec: Protocol parse error
+_main_	rec: Record initialization failed
+_main_	streamInitRecord(rec) done status=0x1f70012
 VAL 0 = 0x0
 SEVR "INVALID"
 STAT "UDF"

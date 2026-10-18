@@ -392,8 +392,15 @@ fn masked(l: &str) -> String {
     out + rest
 }
 
+/// A line of the C log: the C thread that printed it, and the line.
+struct Logged {
+    thread: String,
+    line: String,
+}
+
 /// The C log, made comparable: the protocol path is the oracle directory.
-fn expected(name: &str) -> Vec<String> {
+/// The dbgf lines after the run have no thread.
+fn expected(name: &str) -> Vec<Logged> {
     // C keeps the spaces before the bus name in the protocol name
     // (StreamEpics.cc initRecord) and finds no protocol "p   ": the port
     // ends the name at its last byte, so the link with spaces round its
@@ -406,26 +413,32 @@ fn expected(name: &str) -> Vec<String> {
     let log = std::fs::read_to_string(oracle_dir().join(format!("{file}.log"))).unwrap();
     let dir = log
         .lines()
-        .find_map(|l| l.strip_prefix("StreamProtocolParser::path = "))
+        .find_map(|l| l.strip_prefix("-\tStreamProtocolParser::path = "))
         .unwrap()
         .to_string();
     log.lines()
-        .flat_map(run_on_split)
-        .map(|l| {
+        .map(|l| match l.split_once('\t') {
+            Some((thread, line)) => (thread, line),
+            None => ("", l),
+        })
+        .flat_map(|(thread, line)| run_on_split(thread, line))
+        .map(|Logged { thread, line }| {
             // C leaves OVAL behind VAL once MPST and APST are both Always
             // (devstringoutStream.c:39-40); the port does not.
-            if name == "so_init_always" && l == "OVAL \"one\"" {
-                return "OVAL \"two\"".to_string();
+            if name == "so_init_always" && line == "OVAL \"one\"" {
+                let line = "OVAL \"two\"".to_string();
+                return Logged { thread, line };
             }
-            let l = masked(&fixed_convert_text(&l.replace(&dir, "<dir>")));
-            if name == "link_spaces" {
-                l.replace(
+            let line = masked(&fixed_convert_text(&line.replace(&dir, "<dir>")));
+            let line = if name == "link_spaces" {
+                line.replace(
                     "parse link string \"l.proto p P\"",
                     "parse link string \"   l.proto    p    P\"",
                 )
             } else {
-                l
-            }
+                line
+            };
+            Logged { thread, line }
         })
         .collect()
 }
@@ -434,20 +447,73 @@ fn expected(name: &str) -> Vec<String> {
 /// the line runs on into the next debug line, with that line's thread name
 /// and file:line (run-epics.sh cuts it when it is neither StreamCore.cc's
 /// nor StreamEpics.cc's); the port ends the line.
-fn run_on_split(line: &str) -> Vec<String> {
+fn run_on_split(thread: &str, line: &str) -> Vec<Logged> {
+    let logged = |thread: &str, line: &str| Logged {
+        thread: thread.to_string(),
+        line: line.to_string(),
+    };
     match line.split_once(" failed\\n") {
         Some((head, next)) if head.starts_with("StreamCore::scanValue(") => {
-            let mut out = vec![format!("{head} failed")];
-            if let Some((_, next)) = next.split_once(' ') {
-                out.push(
-                    next.split_once(": ")
-                        .map_or(next, |(_, rest)| rest)
-                        .to_string(),
-                );
+            let mut out = vec![logged(thread, &format!("{head} failed"))];
+            if let Some((next_thread, next)) = next.split_once(' ') {
+                let next = next.split_once(": ").map_or(next, |(_, rest)| rest);
+                out.push(logged(next_thread, next));
             }
             out
         }
-        _ => vec![line.to_string()],
+        _ => vec![logged(thread, line)],
+    }
+}
+
+/// Whether `got` is the C threads' lines in some interleaving: each
+/// thread's lines in their order, with no order across threads, which C's
+/// scheduler decides run to run (the iocInit thread's "waiting for
+/// initDone" against the port thread's callbacks, the errlog thread's
+/// lines). On a mismatch, the number of `got` lines matched the furthest.
+fn interleaves(got: &[String], want: &[Logged]) -> Result<(), usize> {
+    let mut threads: Vec<(&str, Vec<&str>)> = Vec::new();
+    for l in want {
+        match threads.iter_mut().find(|(t, _)| *t == l.thread) {
+            Some((_, lines)) => lines.push(&l.line),
+            None => threads.push((&l.thread, vec![&l.line])),
+        }
+    }
+    let seqs: Vec<Vec<&str>> = threads.into_iter().map(|(_, lines)| lines).collect();
+    // two threads can print the same line next, so search: the state is
+    // each thread's count of matched lines
+    fn search(
+        got: &[String],
+        seqs: &[Vec<&str>],
+        at: &mut Vec<usize>,
+        seen: &mut std::collections::HashSet<Vec<usize>>,
+        furthest: &mut usize,
+    ) -> bool {
+        let n: usize = at.iter().sum();
+        *furthest = (*furthest).max(n);
+        if n == got.len() {
+            return at.iter().zip(seqs).all(|(&i, s)| i == s.len());
+        }
+        if !seen.insert(at.clone()) {
+            return false;
+        }
+        for t in 0..seqs.len() {
+            if seqs[t].get(at[t]) == Some(&got[n].as_str()) {
+                at[t] += 1;
+                let found = search(got, seqs, at, seen, furthest);
+                at[t] -= 1;
+                if found {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut furthest = 0;
+    let mut at = vec![0; seqs.len()];
+    if search(got, &seqs, &mut at, &mut Default::default(), &mut furthest) {
+        Ok(())
+    } else {
+        Err(furthest)
     }
 }
 
@@ -535,9 +601,14 @@ async fn run_case(name: &str) {
     ERRLOG.lock().clear();
     stream_rs::error::set_stream_debug(1);
 
-    let mut want = expected(name);
+    let mut logged = expected(name);
     let has = |o: &str| case.opts.iter().any(|x| x == o);
-    let fields_want = want.split_off(want.len() - 6 - case.dump.len());
+    let mut fields_want: Vec<String> = logged
+        .split_off(logged.len() - 6 - case.dump.len())
+        .into_iter()
+        .map(|l| l.line)
+        .collect();
+    let want: Vec<String> = logged.iter().map(|l| l.line.clone()).collect();
     let errlog_want = want.iter().filter(|l| l.starts_with("sevr=")).count();
     // the driver's lines are printed by the first case only
     let drv = if DRV_LINES.lock().is_empty() { 0 } else { 2 };
@@ -691,16 +762,25 @@ async fn run_case(name: &str) {
         *l = masked(&l.replace(&dir, "<dir>"));
     }
     got.extend(ERRLOG.lock().drain(..));
-    want.extend(fields_want);
     for (c, port) in fixed_fields(name) {
-        let l = want.iter_mut().find(|l| l == c);
+        let l = fields_want.iter_mut().find(|l| l == c);
         *l.unwrap_or_else(|| panic!("{name}: C no longer shows its defect")) = port.to_string();
     }
-    got.extend(fields(&db, &case.dump));
+    let fields_got = fields(&db, &case.dump);
     if has("report") {
         stdout.extend(shell(&db, "streamReportRecord rec").await);
     }
-    assert_eq!(got, want, "{name}");
+    if let Err(at) = interleaves(&got, &logged) {
+        let threads: Vec<String> = logged
+            .iter()
+            .map(|l| format!("{}\t{}", l.thread, l.line))
+            .collect();
+        panic!(
+            "{name}: line {at} is no C thread's next line\n got: {:#?}\n C: {threads:#?}",
+            &got[at.min(got.len())..]
+        );
+    }
+    assert_eq!(fields_got, fields_want, "{name}");
     let mut stdout_want = Vec::new();
     for side in ["reload", "report"] {
         if has(side) {

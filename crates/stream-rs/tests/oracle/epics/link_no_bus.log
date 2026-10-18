@@ -1,13 +1,13 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto p"
-Stream::initRecord rec: filename="l.proto" protocol="p" bus="" addr=0 params=""
-rec: Missing bus name
-rec: Record initialization failed
-streamInitRecord(rec) done status=0x202000b
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto p"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="p" bus="" addr=0 params=""
+_main_	rec: Missing bus name
+_main_	rec: Record initialization failed
+_main_	streamInitRecord(rec) done status=0x202000b
 VAL 0 = 0x0
 SEVR "NO_ALARM"
 STAT "UDF"

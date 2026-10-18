@@ -16,11 +16,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <string>
 #include <vector>
 #include "StreamFormatConverter.h"
 #include "StreamProtocol.h"
 #include "StreamError.h"
+
+// TimestampConverter::scanDouble fills the fields a format leaves out from
+// time(NULL); ORACLE_NOW pins it, as tests/timestamp_converter.rs pins its.
+extern "C" time_t time(time_t* t) {
+    struct timespec ts;
+    const char* now = getenv("ORACLE_NOW");
+    if (now) ts.tv_sec = strtol(now, NULL, 10);
+    else clock_gettime(CLOCK_REALTIME, &ts);
+    if (t) *t = ts.tv_sec;
+    return ts.tv_sec;
+}
 
 static std::string hexdec(const char* h) {
     std::string s; if (h[0] == 0x2e) return s; while (h[0] && h[1]) { unsigned v; sscanf(h, "%2x", &v); s.push_back((char)v); h += 2; } return s;

@@ -10,6 +10,8 @@ ARCH=${EPICS_HOST_ARCH:-linux-x86_64}
 # TimestampConverter prints and scans local time; tests/timestamp_converter.rs
 # sets the same zone.
 export TZ=CET-1CEST,M3.5.0,M10.5.0/3
+# and a scan takes the fields its format leaves out from "today" (oracle.cc)
+export ORACLE_NOW=1700000000
 cd "$(dirname "$0")"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

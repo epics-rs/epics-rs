@@ -1,10 +1,12 @@
 //! `%T` byte for byte against C: each line of
 //! `tests/oracle/conv/timestamp.in` runs here as `oracle.cc` runs it on C
-//! StreamDevice, in the zone `run-c.sh` gives it, and must print the same
-//! line as `timestamp.out`.
+//! StreamDevice, in the zone and on the "today" `run-c.sh` gives it, and
+//! must print the same line as `timestamp.out`.
 
 use std::fmt::Write;
 use std::sync::Once;
+
+use parking_lot::{Mutex, MutexGuard};
 
 use stream_rs::StreamBuffer;
 use stream_rs::converter::{find, parse_format};
@@ -15,9 +17,20 @@ use stream_rs::error::{
 };
 use stream_rs::format::StreamFormat;
 use stream_rs::protocol::FormatType;
+use stream_rs::timestamp_converter::scan_double_at;
 
-/// `run-c.sh`'s zone. Every test calls this before any time function runs.
-fn zone() {
+/// `run-c.sh`'s `ORACLE_NOW`: the "today" a scan takes the fields its
+/// format leaves out from, 2023-11-14 23:13:20 CET.
+const ORACLE_NOW: libc::time_t = 1700000000;
+
+/// `run-c.sh`'s zone, and the time functions to this test alone until the
+/// guard drops: glibc's mktime picks the side of a repeated DST hour from
+/// what earlier calls left process-wide, which in `oracle.cc` are the
+/// previous lines only. Every test calls this before any time function
+/// runs.
+fn zone() -> MutexGuard<'static, ()> {
+    static TIME: Mutex<()> = Mutex::new(());
+    let time = TIME.lock();
     static ZONE: Once = Once::new();
     ZONE.call_once(|| {
         // SAFETY: every test of this binary waits here before it reads the
@@ -27,6 +40,7 @@ fn zone() {
         set_stream_msg_time_stamped(0);
         set_get_thread_name_function(None);
     });
+    time
 }
 
 fn hex(b: &[u8]) -> String {
@@ -88,7 +102,7 @@ fn run(case: &str) -> String {
         } else {
             let input = [unhex(f[2]).as_slice(), &[0]].concat();
             let mut val = 1234.5f64;
-            let n = c.scan_double(&fmt, CPtr::new(&input), &mut val);
+            let n = scan_double_at(ORACLE_NOW, &fmt, CPtr::new(&input), &mut val);
             write!(line, " n={n} val={:016x}", val.to_bits()).unwrap();
         }
     }
@@ -98,7 +112,7 @@ fn run(case: &str) -> String {
 
 /// The `timestamp.in` lines `keep` selects, each with C's line cut by `cut`.
 fn check(keep: impl Fn(&str) -> bool, cut: impl Fn(&str) -> String) {
-    zone();
+    let _time = zone();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle/conv/");
     let cases = std::fs::read_to_string(format!("{dir}timestamp.in")).unwrap();
     let expected = std::fs::read_to_string(format!("{dir}timestamp.out")).unwrap();
@@ -216,7 +230,7 @@ fn print_double_matches_c() {
 
 #[test]
 fn print_double_leaves_out_cs_bugs() {
-    zone();
+    let _time = zone();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle/conv/");
     let cases = std::fs::read_to_string(format!("{dir}timestamp.in")).unwrap();
     let expected = std::fs::read_to_string(format!("{dir}timestamp.out")).unwrap();
@@ -235,7 +249,7 @@ fn print_double_leaves_out_cs_bugs() {
 /// C's `strchr(fracbuffer, '.') + 1` is NULL + 1 for `%0f`.
 #[test]
 fn a_zero_digit_fraction_prints_nothing() {
-    zone();
+    let _time = zone();
     assert_eq!(out_text(&run("pd\t%T(%S.%0f)\t1700000000.5")), "20.");
 }
 
@@ -347,7 +361,7 @@ fn scan_double_matches_c() {
 
 #[test]
 fn scan_double_leaves_out_cs_bugs() {
-    zone();
+    let _time = zone();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle/conv/");
     let cases = std::fs::read_to_string(format!("{dir}timestamp.in")).unwrap();
     let expected = std::fs::read_to_string(format!("{dir}timestamp.out")).unwrap();
@@ -369,7 +383,7 @@ fn scan_double_leaves_out_cs_bugs() {
 /// fraction, so there is no oracle line.
 #[test]
 fn an_all_zero_fraction_scans() {
-    zone();
+    let _time = zone();
     let line = run(&format!("sd\t%T(%s.%3f)\t{}", hex(b"1700000000.000")));
     assert_eq!(scanned(&line), 1700000000.0, "{line}");
     let line = run(&format!("sd\t%T(%s.%f)\t{}", hex(b"0.000")));
@@ -379,7 +393,7 @@ fn an_all_zero_fraction_scans() {
 /// A rounded fraction carries through every field of the time.
 #[test]
 fn a_rounded_fraction_carries_into_the_second() {
-    zone();
+    let _time = zone();
     // 2023-12-31 23:59:59.9996 CET
     let line = run("pd\t%T(%Y-%m-%d %H:%M:%S.%3f)\t1704063599.9996");
     assert_eq!(out_text(&line), "2024-01-01 00:00:00.000");
@@ -392,7 +406,7 @@ fn a_rounded_fraction_carries_into_the_second() {
 /// More than 12 fraction digits overflow C's buffer; rs prints 12.
 #[test]
 fn fraction_digits_stop_at_12() {
-    zone();
+    let _time = zone();
     let line = run("pd\t%T(%13f)\t1700000000.5");
     assert_eq!(out_text(&line), "500000000000");
     let line = run("pd\t%T(%2147483647f|%S)\t1700000000.5");

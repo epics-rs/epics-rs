@@ -1,14 +1,14 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer5/smbo/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto lw P"
-Stream::initRecord rec: filename="l.proto" protocol="lw" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "lw")
-Stream::initRecord rec: initialize the first time
-streamInitRecord(rec) done status=0x2
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto lw P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="lw" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "lw")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
 VAL "Illegal Value"
 SEVR "NO_ALARM"
 STAT "UDF"

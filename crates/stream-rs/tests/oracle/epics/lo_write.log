@@ -1,49 +1,49 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto lw P"
-Stream::initRecord rec: filename="l.proto" protocol="lw" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "lw")
-Stream::initRecord rec: initialize the first time
-streamInitRecord(rec) done status=0x2
-Stream::process(rec)
-Stream::process(rec) start
-StreamCore::startProtocol(rec, startMode=StartNormal)
-StreamCore::evalCommand(rec): activeCommand = out
-StreamCore::formatOutput(rec): format = %d
-Stream::formatValue(rec, format=%d, fieldaddr=(nil)
-Stream::formatValue(rec) format=%d type=DBF_LONG
-streamPrintf(rec,format=%d)
-StreamCore::printValue(rec, %d, -3 = 0xfffffffffffffffd): "W-3"
-StreamCore::evalOut: outputLine = "W-3<0d><0a>"
-StreamCore::evalOut(rec): lockRequest(5000)
-Stream::process(rec): protocol started
-StreamCore::lockCallback(rec, StreamIoSuccess)
-StreamCore::writeCallback(rec, StreamIoSuccess)
-StreamCore::evalCommand(rec): activeCommand = in
-StreamCore::readCallback(rec, StreamIoSuccess input="-", size=1)
-StreamCore::readCallback(rec) inputBuffer="-", size 1
-StreamCore::readCallback(rec) inTerminator <0d><0a> not found
-StreamCore::readCallback(rec) wait for more input
-StreamCore::readCallback(rec, StreamIoEnd input="7", size=1)
-StreamCore::readCallback(rec) inputBuffer="-7", size 2
-StreamCore::readCallback(rec) inTerminator <0d><0a> not found
-StreamCore::readCallback(rec) end flag received
-StreamCore::readCallback(rec) input line: "-7"
-StreamCore::matchInput(rec): format = "%d"
-StreamCore::scanValue(rec, format=%d, long) input="-7" value=-7
-Stream::scan() currentValueLength=2
-Stream::matchValue(rec): success, 2 bytes consumed
-StreamCore::evalCommand(rec): activeCommand = end
-StreamCore::finishProtocol(rec, Success) bus owner
-Stream::protocolFinishHook(rec, Success)
-recordProcessCallback(rec) processing record
-Stream::process(rec)
-Stream::process(rec) ready. don't convert
-recordProcessCallback(rec) processing record done
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto lw P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="lw" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "lw")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	Stream::process(rec)
+_main_	Stream::process(rec) start
+_main_	StreamCore::startProtocol(rec, startMode=StartNormal)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::formatOutput(rec): format = %d
+_main_	Stream::formatValue(rec, format=%d, fieldaddr=(nil)
+_main_	Stream::formatValue(rec) format=%d type=DBF_LONG
+_main_	streamPrintf(rec,format=%d)
+_main_	StreamCore::printValue(rec, %d, -3 = 0xfffffffffffffffd): "W-3"
+_main_	StreamCore::evalOut: outputLine = "W-3<0d><0a>"
+_main_	StreamCore::evalOut(rec): lockRequest(5000)
+_main_	Stream::process(rec): protocol started
+P	StreamCore::lockCallback(rec, StreamIoSuccess)
+P	StreamCore::writeCallback(rec, StreamIoSuccess)
+P	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="-", size=1)
+P	StreamCore::readCallback(rec) inputBuffer="-", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) wait for more input
+P	StreamCore::readCallback(rec, StreamIoEnd input="7", size=1)
+P	StreamCore::readCallback(rec) inputBuffer="-7", size 2
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) end flag received
+P	StreamCore::readCallback(rec) input line: "-7"
+P	StreamCore::matchInput(rec): format = "%d"
+P	StreamCore::scanValue(rec, format=%d, long) input="-7" value=-7
+P	Stream::scan() currentValueLength=2
+P	Stream::matchValue(rec): success, 2 bytes consumed
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) bus owner
+P	Stream::protocolFinishHook(rec, Success)
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) ready. don't convert
+cbLow	recordProcessCallback(rec) processing record done
 VAL -7 = 0xfffffff9
 SEVR "NO_ALARM"
 STAT "NO_ALARM"

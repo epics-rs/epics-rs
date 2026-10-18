@@ -166,8 +166,10 @@ fn finest_fraction(text: &[u8]) -> Option<usize> {
     }
 }
 
-/// `scanDouble`, with "today" taken from `now`.
-pub(crate) fn scan_double_at(
+/// `scanDouble`, with "today" taken from `now`, which C takes from
+/// `time(NULL)` (TimestampConverter.cc scanDouble) and `scan_double` from
+/// the same.
+pub fn scan_double_at(
     now: libc::time_t,
     fmt: &StreamFormat,
     input: CPtr<'_>,

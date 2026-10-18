@@ -1,41 +1,41 @@
-drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
-streamInitRecord(rec): SEVR=0
-streamInitRecord(rec): create new Stream object
-streamInitRecord(rec): calling initRecord
-Stream::initRecord rec: parse link string "l.proto aoii P"
-Stream::initRecord rec: filename="l.proto" protocol="aoii" bus="P" addr=0 params=""
-Stream::initRecord rec: attachBus("P", 0, "")
-Stream::initRecord rec: parse("l.proto", "aoii")
-Stream::initRecord rec: initialize the first time
-streamInitRecord(rec) done status=0x2
-streamGetIointInfo(rec,cmd=0): stream=0x595da13f98d0, ioscanpvt=0x595da13fb420
-streamGetIointInfo(rec): start later...
-rec: starting "I/O Intr"
-StreamCore::startProtocol(rec, startMode=StartAsync)
-StreamCore::evalCommand(rec): activeCommand = in
-StreamCore::readCallback(rec, StreamIoSuccess input="V=6.5<0d><0a>", size=7)
-StreamCore::readCallback(rec) inputBuffer="V=6.5<0d><0a>", size 7
-StreamCore::readCallback(rec) inTerminator <0d><0a> at position 5
-StreamCore::readCallback(rec) input line: "V=6.5"
-StreamCore::matchInput(rec): format = "%f"
-StreamCore::scanValue(rec, format=%f, double) input="6.5" value=6.50000
-Stream::scan() currentValueLength=3
-Stream::matchValue(rec): success, 3 bytes consumed
-StreamCore::evalCommand(rec): activeCommand = end
-StreamCore::finishProtocol(rec, Success) not bus owner
-Stream::protocolFinishHook(rec, Success)
-recordProcessCallback(rec) processing record
-Stream::process(rec)
-Stream::process(rec) ready. convert
-recordProcessCallback(rec) processing record done
-recordProcessCallback(rec) restart async protocol
-StreamCore::startProtocol(rec, startMode=StartAsync)
-StreamCore::evalCommand(rec): activeCommand = in
-StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
-StreamCore::readCallback(rec) inputBuffer="", size 0
-StreamCore::readCallback(rec) inTerminator <0d><0a> not found
-StreamCore::readCallback(rec) async timeout: just restart
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=0
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "l.proto aoii P"
+_main_	Stream::initRecord rec: filename="l.proto" protocol="aoii" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("l.proto", "aoii")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	streamGetIointInfo(rec,cmd=0): stream=0x560dcbc3a930, ioscanpvt=0x560dcbc3c4d0
+_main_	streamGetIointInfo(rec): start later...
+_main_	rec: starting "I/O Intr"
+_main_	StreamCore::startProtocol(rec, startMode=StartAsync)
+_main_	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="V=6.5<0d><0a>", size=7)
+P	StreamCore::readCallback(rec) inputBuffer="V=6.5<0d><0a>", size 7
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> at position 5
+P	StreamCore::readCallback(rec) input line: "V=6.5"
+P	StreamCore::matchInput(rec): format = "%f"
+P	StreamCore::scanValue(rec, format=%f, double) input="6.5" value=6.50000
+P	Stream::scan() currentValueLength=3
+P	Stream::matchValue(rec): success, 3 bytes consumed
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) not bus owner
+P	Stream::protocolFinishHook(rec, Success)
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) ready. convert
+cbLow	recordProcessCallback(rec) processing record done
+cbLow	recordProcessCallback(rec) restart async protocol
+cbLow	StreamCore::startProtocol(rec, startMode=StartAsync)
+cbLow	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+P	StreamCore::readCallback(rec) inputBuffer="", size 0
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) async timeout: just restart
 VAL 13
 SEVR "NO_ALARM"
 STAT "NO_ALARM"

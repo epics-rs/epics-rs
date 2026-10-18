@@ -102,6 +102,27 @@ async fn r10_65_failed_string_link_writes_the_diagnostic_and_does_not_gate_the_c
     );
 }
 
+/// `epicsSnprintf(*psvalue, STRING_SIZE-1, ...)` (sCalcoutRecord.c:940) keeps
+/// 38 characters of the diagnostic; the C oracle IOC gives
+/// `SC_with_a_long_name_xx:fetch(AA) faile`.
+#[epics_macros_rs::epics_test]
+async fn a_long_record_name_cuts_the_fetch_diagnostic_at_38_characters() {
+    let db = PvDatabase::new();
+    let mut c = scalcout("AA");
+    c.put_field("INAA", EpicsValue::String("NOSUCHREC".into()))
+        .unwrap();
+    db.add_record("SC_with_a_long_name_xx", Box::new(c))
+        .await
+        .unwrap();
+
+    process(&db, "SC_with_a_long_name_xx").await;
+
+    assert_eq!(
+        field(&db, "SC_with_a_long_name_xx", "AA").await,
+        EpicsValue::String("SC_with_a_long_name_xx:fetch(AA) faile".into()),
+    );
+}
+
 /// Negative control for the gate: the SAME failure on a NUMERIC link does gate
 /// the calc (`InputFetchPolicy::AbortOnFirstFailure`), so VAL freezes. The two
 /// loops must not share a policy.
@@ -174,8 +195,10 @@ async fn r10_65_char_waveform_source_is_read_as_escaped_text() {
     );
 }
 
-/// C caps the string fields at STRING_SIZE-1 = 39 bytes (the `epicsSnprintf` /
-/// `epicsStrSnPrintEscaped` size argument, and the DBR_STRING buffer itself).
+/// `epicsStrSnPrintEscaped(*psvalue, STRING_SIZE-1, ...)` (sCalcoutRecord.c:925)
+/// keeps 38 characters and the NUL, and may cut an escape in half; a
+/// DBR_STRING read fills the 40-byte field, 39 characters. The C oracle IOC
+/// gives 38 x's, 37 x's and a lone backslash, and 39 characters.
 #[epics_macros_rs::epics_test]
 async fn r10_65_fetched_string_is_capped_at_the_c_field_width() {
     let db = PvDatabase::new();
@@ -197,7 +220,37 @@ async fn r10_65_fetched_string_is_capped_at_the_c_field_width() {
 
     assert_eq!(
         field(&db, "SC", "AA").await,
-        EpicsValue::String("x".repeat(39).into()),
-        "STRING_SIZE-1 = 39 bytes reach AA"
+        EpicsValue::String("x".repeat(38).into()),
+        "the STRING_SIZE-1 size argument leaves 38 characters"
+    );
+
+    let mut cut = WaveformRecord::new(64, DbFieldType::Char);
+    cut.put_field(
+        "VAL",
+        EpicsValue::CharArray(format!("{}\\n", "x".repeat(37)).into_bytes().into()),
+    )
+    .unwrap();
+    db.add_record("WFCUT", Box::new(cut)).await.unwrap();
+    db.add_record("SLONG", Box::new(StringinRecord::new(&"y".repeat(39))))
+        .await
+        .unwrap();
+    let mut c = scalcout("AA");
+    c.put_field("INAA", EpicsValue::String("WFCUT".into()))
+        .unwrap();
+    c.put_field("INBB", EpicsValue::String("SLONG".into()))
+        .unwrap();
+    db.add_record("SC2", Box::new(c)).await.unwrap();
+
+    process(&db, "SC2").await;
+
+    assert_eq!(
+        field(&db, "SC2", "AA").await,
+        EpicsValue::String(format!("{}\\", "x".repeat(37)).into()),
+        "the escaped backslash is cut after its first character"
+    );
+    assert_eq!(
+        field(&db, "SC2", "BB").await,
+        EpicsValue::String("y".repeat(39).into()),
+        "a DBR_STRING read fills the field"
     );
 }

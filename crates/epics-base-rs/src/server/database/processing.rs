@@ -112,18 +112,22 @@ use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 use super::{FrameGate, InFrame, PvDatabase, debug_armed};
 
 /// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
-/// string field a string-input link writes into. The text therefore carries at
-/// most 39 bytes plus the NUL, which is what `epicsSnprintf(..., STRING_SIZE-1,
-/// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
+/// string field a string-input link writes into: a DBR_STRING read carries at
+/// most 39 bytes plus the NUL.
 const STRING_FIELD_MAX_LEN: usize = 39;
 
-/// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
-fn truncate_string_field(s: PvString) -> PvString {
+/// `epicsStrSnPrintEscaped(*psvalue, STRING_SIZE-1, ...)` (:925) and
+/// `epicsSnprintf(*psvalue, STRING_SIZE-1, ...)` (:940) are handed a 39-byte
+/// size, so each keeps 38 characters and the NUL.
+const STRING_SIZE_ARG_MAX_LEN: usize = STRING_FIELD_MAX_LEN - 1;
+
+/// Cut a string-link value to `max` bytes.
+fn truncate_string_field(s: PvString, max: usize) -> PvString {
     let bytes = s.as_bytes();
-    if bytes.len() <= STRING_FIELD_MAX_LEN {
+    if bytes.len() <= max {
         return s;
     }
-    PvString::from_bytes(&bytes[..STRING_FIELD_MAX_LEN])
+    PvString::from_bytes(&bytes[..max])
 }
 
 /// The DBR_STRING view of a [`Record::string_input_links`](crate::server::record::Record::string_input_links) source, C
@@ -165,10 +169,10 @@ fn string_link_text(value: &EpicsValue) -> PvString {
                 _ => out.push_str(&format!("\\x{b:02x}")),
             }
         }
-        return truncate_string_field(PvString::from(out));
+        return truncate_string_field(PvString::from(out), STRING_SIZE_ARG_MAX_LEN);
     }
     match value.convert_to(DbFieldType::String) {
-        EpicsValue::String(s) => truncate_string_field(s),
+        EpicsValue::String(s) => truncate_string_field(s, STRING_FIELD_MAX_LEN),
         _ => PvString::new(),
     }
 }
@@ -4749,12 +4753,13 @@ impl PvDatabase {
                 // "%s:fetch(%s) failed", pcalc->name, sFldnames[i])` — the
                 // failed fetch REPLACES the value with the diagnostic; the
                 // previous string is not kept, and the record still computes.
-                crate::server::recgbl::simm::LinkFetch::Failed => {
-                    truncate_string_field(PvString::from(format!(
+                crate::server::recgbl::simm::LinkFetch::Failed => truncate_string_field(
+                    PvString::from(format!(
                         "{}:fetch({val_field}) failed",
                         String::from_utf8_lossy(name)
-                    )))
-                }
+                    )),
+                    STRING_SIZE_ARG_MAX_LEN,
+                ),
             };
             results.push((val_field.to_string(), EpicsValue::String(text)));
         }

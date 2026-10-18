@@ -377,6 +377,10 @@ pub(crate) fn write_array_params(
     Ok(())
 }
 
+/// `ADCORE_VERSION.ADCORE_REVISION.ADCORE_MODIFICATION` (ADCoreVersion.h) of
+/// the ADCore this crate ports, `6c53844e` (`doc/reference-pin.md`).
+const AD_CORE_VERSION: &str = "3.14.0";
+
 /// Write the C++ `asynNDArrayDriver` constructor's "read-only parameters"
 /// block (`asynNDArrayDriver.cpp:954-1005`) onto a freshly created
 /// [`NDArrayDriverParams`].
@@ -401,15 +405,10 @@ pub fn init_read_only_params(
     port_name: &str,
 ) -> AsynResult<()> {
     port_base.set_string_param(params.port_name_self, 0, port_name)?;
-    // C `:961-966` publishes "ADCORE_VERSION.ADCORE_REVISION.
-    // ADCORE_MODIFICATION" into both strings. There is no ADCore in this
-    // workspace to take a version from, so both carry the `ad-core-rs` crate
-    // version, which is the same artefact's version for this port. C's
-    // comment at `:964-965` applies unchanged: a concrete driver overwrites
-    // DriverVersion after construction.
-    let version = env!("CARGO_PKG_VERSION");
-    port_base.set_string_param(params.ad_core_version, 0, version)?;
-    port_base.set_string_param(params.driver_version, 0, version)?;
+    // C `:961-966` publishes the ADCore version into both strings; a
+    // concrete driver overwrites DriverVersion after construction.
+    port_base.set_string_param(params.ad_core_version, 0, AD_CORE_VERSION)?;
+    port_base.set_string_param(params.driver_version, 0, AD_CORE_VERSION)?;
 
     port_base.set_int32_param(params.array_size_x, 0, 0)?;
     port_base.set_int32_param(params.array_size_y, 0, 0)?;
@@ -1691,11 +1690,10 @@ pub(crate) mod tests {
         params: &NDArrayDriverParams,
         port_name: &str,
     ) {
-        let version = env!("CARGO_PKG_VERSION");
         for (name, index, want) in [
             ("PORT_NAME_SELF", params.port_name_self, port_name),
-            ("ADCORE_VERSION", params.ad_core_version, version),
-            ("DRIVER_VERSION", params.driver_version, version),
+            ("ADCORE_VERSION", params.ad_core_version, "3.14.0"),
+            ("DRIVER_VERSION", params.driver_version, "3.14.0"),
             ("FILE_WRITE_MESSAGE", params.file_write_message, ""),
             ("FILE_PATH", params.file_path, ""),
             ("FILE_NAME", params.file_name, ""),

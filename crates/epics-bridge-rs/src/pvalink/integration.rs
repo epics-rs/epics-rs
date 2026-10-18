@@ -627,7 +627,7 @@ impl PvaLinkResolver {
     /// The attach-time scan pvxs runs when the shared channel is already
     /// connected at link-open (`pvxs/ioc/pvalink_lset.cpp:148-167`): the
     /// CPP passive gate, then C `scanOnce`. Unlike the steady-state
-    /// [`scan_target_should_process`] there is no PACT pre-check; the
+    /// [`scan_target_already_locked`] there is no PACT pre-check; the
     /// queued `dbProcess` meets a busy record as C's does.
     fn scan_attached_record(&self, record: &[u8], passive_only: bool) {
         let Some(db_handle) = self.db.read().clone() else {
@@ -1025,8 +1025,7 @@ async fn run_notify_forwarder(
 /// [`run_notify_forwarder`]).
 /// CPP passive gate + PACT pre-check for one scan target, evaluated
 /// under the target's write lock — pvxs `ScanTrack::scan`
-/// (`pvxs/ioc/pvalink_channel.cpp:313-323`). Returns `true` if the record should
-/// be processed now, `false` if it was gated out:
+/// (`pvxs/ioc/pvalink_channel.cpp:313-323`). A target is gated out when:
 ///   - a `CPP` (`passive_only`) target whose SCAN is not Passive is
 ///     skipped (pvxs `check_passive && prec->scan != 0`); a non-zero
 ///     SCAN (Event, I/O Intr, periodic) means the record has its own
@@ -1040,23 +1039,30 @@ async fn run_notify_forwarder(
 ///     stream onto a stuck async target drives it to SCAN_ALARM/INVALID
 ///     after MAX_LOCK consecutive busy attempts.
 ///
-/// This is the single owner of the scan-time `rpro` set, used by the
-/// steady-state forwarder ([`scan_once`]). The write guard is
-/// released before returning so the caller's process call can take its
-/// own locks. A missing record returns `false`.
-fn scan_target_should_process(db_handle: &PvDatabase, record: &[u8], passive_only: bool) -> bool {
+/// Otherwise the record is processed, `dbProcess` without PUTF, and
+/// processed WITH links so the scan fans out via INP/OUT/FLNK.
+///
+/// The caller MUST hold `record`'s lock, as pvxs's does ("caller has locked
+/// record", pvalink_channel.cpp:312): the PACT test and the process it gates
+/// see one state, so a record that goes active in between cannot fall into
+/// `dbProcess`'s own PACT guard. This is the single owner of the scan-time
+/// `rpro` set, used by both phases of [`scan_once`].
+fn scan_target_already_locked(db_handle: &PvDatabase, record: &[u8], passive_only: bool) {
     let Some(rec) = db_handle.get_record(record) else {
-        return false;
+        return;
     };
-    let mut tg = rec.write();
-    if passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
-        return false;
+    {
+        let mut tg = rec.write();
+        if passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
+            return;
+        }
+        if tg.is_processing() {
+            tg.common.rpro = 1;
+            return;
+        }
     }
-    if tg.is_processing() {
-        tg.common.rpro = 1;
-        return false;
-    }
-    true
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    let _ = db_handle.process_record_with_links_already_locked(record, &mut visited);
 }
 
 async fn scan_once(
@@ -1137,48 +1143,19 @@ async fn scan_once(
             if !*atomic {
                 break;
             }
-            // CPP passive gate + PACT pre-check (pvxs `ScanTrack::scan`);
-            // see `scan_target_should_process`. The target write lock is
-            // released before the process call below, which takes its own
-            // per-record locks.
-            if !scan_target_should_process(&db_handle, record, *passive_only) {
-                continue;
-            }
-            // B3: process WITH links so the CP/CPP-driven scan fans
-            // out via INP/OUT/FLNK — a pvalink feeding a calc record
-            // must propagate to the calc's FLNK chain. Bare
-            // `process_record` runs only `process_local` and would
-            // drop the chain. A fresh `visited` set: this is the
-            // foreign-caller entry, like the scan loop and FLNK
-            // dispatch.
-            //
-            // An atomic target runs while the epoch (`lock_records` over
-            // the atomic member set) is still held — its advisory write
-            // gate is already owned by this transaction. The gate is not
-            // reentrant, so an atomic target MUST process through the
-            // `_already_locked` entry; processing it via the
-            // gate-acquiring `process_record_with_links` would dead-lock
-            // the epoch against itself.
-            let mut visited = epics_base_rs::server::database::ProcStack::new();
-            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited);
+            // The epoch above holds this target's lock.
+            scan_target_already_locked(&db_handle, record, *passive_only);
         }
     }
 
     // Non-atomic phase — reached only after the epoch above went out of
-    // scope, so each of these is a genuine fresh foreign entry that takes
-    // its own per-record gate, exactly as pvxs gives each non-atomic
-    // target its own `DBLocker`.
+    // scope; pvxs gives each non-atomic target its own `DBLocker`.
     for (record, _order, atomic, passive_only) in &targets {
         if *atomic {
             continue;
         }
-        if !scan_target_should_process(&db_handle, record, *passive_only) {
-            continue;
-        }
-        let mut visited = epics_base_rs::server::database::ProcStack::new();
-        let _ = db_handle
-            .process_record_with_links(record, &mut visited)
-            .await;
+        let _held = db_handle.lock_records([record]);
+        scan_target_already_locked(&db_handle, record, *passive_only);
     }
 }
 

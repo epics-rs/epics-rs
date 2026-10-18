@@ -3235,8 +3235,6 @@ enum OpKind {
     Rpc,
     /// PVA `PUT_GET` (cmd 12): atomic put-then-get round trip.
     PutGet,
-    /// PVA `PROCESS` (cmd 16): trigger record processing, no value.
-    Process,
     /// PVA `ARRAY` (cmd 14): ChannelArray windowed-array operation
     /// (INIT binds an array field, then get/put a `[offset,count,stride]`
     /// slice or get/set its length). pvAccessCPP
@@ -3259,7 +3257,6 @@ impl OpKind {
             OpKind::Monitor => Command::Monitor,
             OpKind::Rpc => Command::Rpc,
             OpKind::PutGet => Command::PutGet,
-            OpKind::Process => Command::Process,
             OpKind::Array => Command::Array,
             OpKind::GetField => Command::GetField,
         }
@@ -5119,21 +5116,6 @@ pub(super) async fn handle_connection_io(
                         )
                         .await?;
                     }
-                    OpKind::Process => {
-                        handle_process(
-                            &reactor,
-                            &frame,
-                            &tx,
-                            &mut channels,
-                            order,
-                            &mut rx_type_cache,
-                            peer,
-                            &cred,
-                            &exec_fin_tx,
-                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
-                        )
-                        .await?;
-                    }
                     kind => {
                         handle_op(
                             &reactor,
@@ -5555,26 +5537,6 @@ pub(super) async fn handle_connection_io(
                 )
                 .await?;
             }
-            Some(Command::Process) => {
-                // trigger record processing with no value
-                // transfer (PVA cmd 16). Full INIT/PROCESS/DESTROY
-                // lifecycle — routed through the source's typed
-                // `process_checked` (WRITE-class ACF gate).
-                peer_entry.op_init();
-                handle_process(
-                    &reactor,
-                    &frame,
-                    &tx,
-                    &mut channels,
-                    order,
-                    &mut rx_type_cache,
-                    peer,
-                    &cred,
-                    &exec_fin_tx,
-                    &park,
-                )
-                .await?;
-            }
             Some(Command::Array) => {
                 // ChannelArray windowed-array op (PVA cmd 14). Full
                 // INIT / getArray / putArray / setLength / getLength /
@@ -5600,41 +5562,6 @@ pub(super) async fn handle_connection_io(
                     &exec_fin_tx,
                 )
                 .await?;
-            }
-            Some(Command::OriginTag) => {
-                // I-5: pvxs origin-tag is an optional payload for
-                // tracing/debugging that the spec lets servers
-                // ignore. We log at debug level and carry on so a
-                // client that sends one still works.
-                debug!(
-                    peer = ?peer,
-                    bytes = frame.payload.len(),
-                    "OriginTag received (silently consumed)"
-                );
-            }
-            Some(Command::AclChange) => {
-                // I-5: AclChange is a server → client push that
-                // pvxs / pvAccessCPP servers emit when access
-                // rights for a channel change. We don't yet wire
-                // up server-side ACF mutation events, so receiving
-                // one as a server (which shouldn't happen) is
-                // logged-and-ignored. As a client we'd react in
-                // the read loop.
-                debug!(
-                    peer = ?peer,
-                    "AclChange received as server (unexpected); ignoring"
-                );
-            }
-            Some(Command::MultipleData) => {
-                // I-5: MultipleData was a never-really-deployed
-                // batch monitor delivery format. pvxs decodes it
-                // but our client/server only emit single-data
-                // monitor frames. Server-side receipt is
-                // inappropriate — log and drop.
-                debug!(
-                    peer = ?peer,
-                    "MultipleData received as server (unexpected); ignoring"
-                );
             }
             Some(Command::Echo) => {
                 // Echo back the same frame.
@@ -5672,9 +5599,17 @@ pub(super) async fn handle_connection_io(
                 )
                 .await?;
             }
-            _ => {
-                // Unhandled — keep going.
-            }
+            // In pvxs `ConnBase::bevRead`'s switch with a no-op handler.
+            Some(Command::SearchResponse | Command::AuthNZ | Command::ConnectionValidated) => {}
+            // Its `default:` (conn.cpp:248-251): logged, dropped, no reply.
+            _ => crate::pvxs_log::log(
+                crate::pvxs_log::TCP_IO,
+                crate::pvxs_log::Level::Debug,
+                format_args!(
+                    "Client {peer} Ignore unexpected command 0x{:02x}",
+                    frame.header.command
+                ),
+            ),
         }
         }
     }
@@ -6325,273 +6260,6 @@ async fn handle_put_get(
     Ok(())
 }
 
-/// PVA `PROCESS` (cmd 16) handler — trigger record processing
-/// with no value transfer.
-///
-/// Sub-command lifecycle:
-/// - INIT  (`subcmd & 0x08`): decode + discard the pvRequest, register
-///   the op, reply `ioid + subcmd + status` (no introspection — there
-///   is no value type to negotiate).
-/// - PROCESS (`subcmd & 0x08 == 0`): run the WRITE-gated
-///   `process_checked` on the source, reply `ioid + subcmd + status`.
-///   The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`)
-///   is the EPICS `lastRequest()` rider — the ChannelProcess client sends
-///   `QOS_DESTROY` to mean "process this, then destroy the op"
-///   (`clientContextImpl.cpp:548-570`), NOT a standalone destroy. It must
-///   still execute and reply; the op is freed only after the reply, via
-///   the same `finish_exec_data_task` path GET/PUT/RPC use. Standalone op
-///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
-#[allow(clippy::too_many_arguments)]
-async fn handle_process(
-    reactor: &epics_base_rs::runtime::task::Reactor,
-    frame: &Frame,
-    tx: &SrvTx,
-    channels: &mut ChannelTable,
-    order: ByteOrder,
-    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
-    // PROCESS transfers no value but its INIT pvRequest descriptor is still
-    // decoded, so it shares the same cache as every other inbound decode.
-    decode_cache: &mut TypeCache,
-    peer: std::net::SocketAddr,
-    cred: &Arc<ClientCredentials>,
-    // data-phase-completion sender (see [`handle_op`]). The spawned
-    // PROCESS exec task installs an `ExecFinishGuard` so the owner returns
-    // the op to `Idle` when its reply is sent.
-    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
-    // Where an INIT goes when the channel has no descriptor yet — the
-    // port's `pending`/`mpending`. See [`park_op_for_intro`].
-    park: &ParkCtx<'_>,
-) -> PvaResult<()> {
-    // Inbound payload decodes with the frame's own header order (pvxs
-    // latches `peerBE` per received message, conn.cpp:195-198); `order`
-    // (config) is used only for outbound reply frames.
-    let inbound_order = frame.order();
-    let mut cur = frame.cursor();
-    let sid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let ioid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-
-    // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
-    // evaluated before the per-channel borrow below.
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
-
-    // Data-phase frames resolve their channel via the connection-wide op
-    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
-    // PROCESS is a single request-response op (GPR-like), so the frame SID
-    // is not re-validated; INIT keeps the frame's channel.
-    let sid = if subcmd & QosFlags::INIT != 0 {
-        sid
-    } else {
-        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
-    };
-
-    let mut ch = match channels.get_mut(&sid) {
-        Some(c) => c,
-        None => {
-            send_op_error(
-                tx,
-                OpKind::Process,
-                ioid,
-                subcmd,
-                Status::error("unknown channel sid"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    // Attribute the inbound PROCESS frame to the channel and route every
-    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
-    // `handle_op`).
-    ch.stat.add_op_rx(frame);
-    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
-
-    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
-    // (pvxs serverchan.cpp:70-112 / src/server.cpp:100-112; see `handle_op`).
-    let source = ch.source.clone();
-    let source = &source;
-
-    if subcmd & QosFlags::INIT != 0 {
-        // duplicate INIT on a live IOID is connection-fatal
-        // (connection-wide scope per pvxs `opByIOID`).
-        if dup_ioid {
-            return Err(PvaError::Decode(format!(
-                "duplicate PROCESS INIT on live IOID {ioid}"
-            )));
-        }
-        // PROCESS still requires a descriptor — even though
-        // PROCESS has no value payload, the source must commit to
-        // *some* introspection at channel creation. A missing
-        // descriptor means the source cannot yet describe what PROCESS
-        // would act on, so the op parks until it can.
-        let intro = match ch.introspection.clone() {
-            Some(d) => d,
-            None => {
-                park_op_for_intro(
-                    reactor,
-                    &mut ch,
-                    frame,
-                    OpKind::Process,
-                    subcmd,
-                    sid,
-                    ioid,
-                    park,
-                );
-                return Ok(());
-            }
-        };
-        // route the PROCESS INIT pvRequest through the SAME
-        // structured boundary as the generic GET/PUT/MONITOR INIT path
-        // (`decode_init_pv_request`). PROCESS transfers no value,
-        // but the create-time pvRequest carries `record._options` a
-        // provider can interpret (and a gateway must forward through
-        // `createChannelProcess(..., pvRequest)`, pva2pva
-        // channel.cpp:98-107), so it is preserved into the op state and
-        // surfaced as `ChannelContext.pv_request` at EXEC. A present-but-
-        // malformed pvRequest is a peer wire-decode fault. The previous
-        // `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..)
-        // .ok())` collapsed "absent body", "malformed descriptor", and
-        // "malformed value" all into a silent no-op, so a truncated/
-        // corrupt PROCESS INIT was acknowledged with `Status::ok()` and
-        // the op registered. Mirror pvxs `from_wire_type_value` +
-        // `if(!M.good()) bev.reset()` (serverget.cpp:371-375): a malformed
-        // descriptor or value is connection-fatal (the read loop closes
-        // the circuit, no op reply), uniform with the generic INIT path.
-        // A non-null descriptor that needs value bytes but ends before them
-        // is the same fault; only the all-empty-structs default selector
-        // (and the NULL `0xFF` descriptor) legitimately has a 0-byte body.
-        let (_req_desc, req_value) =
-            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(PvaError::Decode(format!("PROCESS INIT pvRequest: {e}")));
-                }
-            };
-        let mask = BitSet::all_set(intro.total_bits());
-        let mut process_op = non_monitor_op_state(intro, OpKind::Process, mask);
-        process_op.pv_request = req_value;
-        ch.insert_op(ioid, process_op);
-
-        // INIT response: ioid + subcmd + status. No type descriptor —
-        // PROCESS negotiates no value.
-        let mut payload = Vec::new();
-        payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
-        Status::ok().write_into(order, &mut payload);
-        let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
-        let mut buf = Vec::new();
-        h.write_into(&mut buf);
-        buf.extend_from_slice(&payload);
-        let _ = chan_tx.send(buf).await;
-        return Ok(());
-    }
-
-    // PROCESS data phase — no payload to decode.
-    let init_pv_request = match ch.ops().get(&ioid) {
-        None => {
-            // silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
-            // return without reply here to handle the DESTROY_REQUEST race.
-            return Ok(());
-        }
-        Some(o) => {
-            // the data-phase command must match the operation
-            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
-            // the connection when an IOID is driven by the wrong
-            // operation class. Without this check any live IOID on
-            // the channel could be driven into record processing via
-            // a dedicated PROCESS data frame. Mirror the generic
-            // handler's protocol-error policy.
-            if o.kind != OpKind::Process {
-                return Err(PvaError::Decode(format!(
-                    "PROCESS data-phase frame for IOID {ioid} initialised as {:?} \
-                     (pvxs serverget.cpp:421-436 protocol error)",
-                    o.kind
-                )));
-            }
-            o.pv_request.clone()
-        }
-    };
-    let pv_name = ch.name.clone();
-    let ctx = crate::server_native::source::ChannelContext {
-        peer,
-        creds: cred.clone(),
-        // PROCESS INIT pvRequest, preserved from the op state so a source
-        // — and a gateway forwarding createChannelProcess(..., pvRequest)
-        // — can inspect `record._options`.
-        pv_request: init_pv_request,
-        log: Default::default(),
-    };
-    let src = source.clone();
-    let tx_clone = chan_tx.clone();
-    // run this PROCESS exec only when the op is `Idle`, and ignore a
-    // second EXEC while the first is in flight rather than aborting it (pvxs
-    // `serverget.cpp:467-476`/`:511-514`).
-    let op_id = match begin_exec(&mut ch, ioid) {
-        Some(id) => id,
-        None => {
-            debug!(ioid, "PROCESS EXEC ignored: op already executing");
-            return Ok(());
-        }
-    };
-    let exec_fin = ExecFinished {
-        sid,
-        ioid,
-        op_id,
-        success: false,
-        scratch: None,
-    };
-    let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(reactor, async move {
-        // return this op to `Idle` (via the read-loop owner) when the
-        // task ends so a later explicit re-EXEC is accepted.
-        let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
-        let checked = src
-            .access_gate()
-            .check_with_roles(
-                &pv_name,
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.roles,
-                &ctx.creds.method,
-                &ctx.creds.authority,
-            )
-            .await;
-        // a panic in the user PROCESS handler becomes an error
-        // reply instead of skipping the reply below.
-        let op_log = ctx.log.clone();
-        let result = catch_handler_panic(src.process_checked(checked, ctx))
-            .await
-            .map_err(|e| OpError::failed(e))
-            .and_then(|r| r);
-        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
-
-        let mut payload = Vec::new();
-        payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
-        match result {
-            Ok(()) => Status::ok().write_into(order, &mut payload),
-            Err(e) => e.wire_status().write_into(order, &mut payload),
-        }
-        let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
-        let mut buf = Vec::new();
-        h.write_into(&mut buf);
-        buf.extend_from_slice(&payload);
-        // PROCESS is one-shot (see the PUT_GET reply): the flag is unread.
-        exec_fin_guard.reply(&tx_clone, buf, false).await;
-    });
-    // Store the abort guard and, when this PROCESS frame carried the
-    // last-request bit (`subcmd & 0x10`), defer the op's removal until its
-    // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
-    // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
-    Ok(())
-}
-
 /// One decoded ChannelArray data-phase sub-operation, selected by the
 /// `subcmd` QOS bits (pvAccessCPP `responseHandlers.cpp:2148-2207`). The
 /// windowing parameters and put value are decoded from the frame *before*
@@ -6669,7 +6337,7 @@ async fn handle_channel_array(
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order; `order`
-    // (config) drives only outbound reply frames (see [`handle_process`]).
+    // (config) drives only outbound reply frames.
     let inbound_order = frame.order();
     let mut cur = frame.cursor();
     let sid = cur
@@ -9141,12 +8809,12 @@ async fn handle_op(
             });
             finish_exec_data_task(&mut ch, ioid, subcmd, abort);
         }
-        // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
-        // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
-        // never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Process | OpKind::Array | OpKind::GetField => {
+        // PUT_GET / ARRAY / GET_FIELD have dedicated handlers
+        // (`handle_put_get`, `handle_channel_array`, `handle_get_field`) and
+        // are never dispatched into `handle_op`.
+        OpKind::PutGet | OpKind::Array | OpKind::GetField => {
             unreachable!(
-                "PUT_GET / PROCESS / ARRAY / GET_FIELD are routed to their own handlers, not handle_op"
+                "PUT_GET / ARRAY / GET_FIELD are routed to their own handlers, not handle_op"
             )
         }
     }
@@ -20184,16 +19852,12 @@ mod tests {
     /// `RULE(1, WRITE) { AUTHORITY("MyCA") }` — WRITE only for a
     /// peer whose `authority` (x509 root-CA CommonName) is `"MyCA"`.
     ///
-    /// `process_hits` counts whether the WRITE-class `process` hook
-    /// ran — it must run only when the gate granted WRITE. The bug:
-    /// `handle_process` / `handle_put_get` GET-leg passed a literal
-    /// `""` as the authority to `AccessGate::check`, so even a peer
-    /// presenting `authority="MyCA"` failed `authority_match` and
-    /// was wrongly denied.
+    /// The bug: `handle_put_get`'s GET leg passed a literal `""` as the
+    /// authority to `AccessGate::check`, so even a peer presenting
+    /// `authority="MyCA"` failed `authority_match` and was wrongly denied.
     struct AuthorityGatedSource {
         gate: epics_base_rs::server::access_security::AccessGate,
         value: std::sync::Arc<parking_lot::Mutex<i32>>,
-        process_hits: std::sync::Arc<std::sync::atomic::AtomicU32>,
     }
 
     impl AuthorityGatedSource {
@@ -20214,7 +19878,6 @@ mod tests {
             Self {
                 gate: epics_base_rs::server::access_security::AccessGate::required(cell, resolver),
                 value: std::sync::Arc::new(parking_lot::Mutex::new(7)),
-                process_hits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             }
         }
     }
@@ -20252,43 +19915,6 @@ mod tests {
         async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
-        fn process(
-            &self,
-            _: &[u8],
-        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-            self.process_hits
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Ok(()) }
-        }
-    }
-
-    /// Build the (sid → ChannelState) map plus a primed PROCESS op
-    /// for `ioid`, so a PROCESS data-phase frame dispatches straight
-    /// into the WRITE-gate check.
-    #[cfg(test)]
-    fn primed_process_channels(sid: u32, ioid: u32, source: DynSource) -> ChannelTable {
-        let intro = three_field_intro();
-        let mut ops = HashMap::new();
-        let mask = BitSet::all_set(intro.total_bits());
-        ops.insert(
-            ioid,
-            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::Process, mask),
-        );
-        let mut channels = ChannelTable::new();
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro)),
-                source,
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            })
-            .with_ops(ops),
-        );
-        channels
     }
 
     /// Credentials for the `x509` method carrying a chosen root-CA
@@ -20660,133 +20286,6 @@ mod tests {
         );
     }
 
-    /// Regression (Defect 1, native PROCESS handler): a peer whose
-    /// x509 `authority` matches an `AUTHORITY(...)`-scoped WRITE rule
-    /// MUST be granted PROCESS. `handle_process` passed a literal
-    /// `""` as the authority to `AccessGate::check`, so the
-    /// matching-CA peer failed `authority_match` and was wrongly
-    /// denied — its `process` hook never ran.
-    #[epics_macros_rs::epics_test]
-    async fn process_honors_authority_scoped_write_rule() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 500;
-        let src = AuthorityGatedSource::new();
-        let process_hits = std::sync::Arc::clone(&src.process_hits);
-        let source: DynSource = std::sync::Arc::new(src);
-
-        let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = test_srv_tx(16);
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        // PROCESS data-phase frame: sid + ioid + subcmd(0x00).
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        let frame = synth_frame(Command::Process, order, payload);
-
-        // Peer presents the matching root CA — WRITE must be granted.
-        handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("handle_process ok");
-
-        let resp = rx.recv().await.expect("PROCESS response emitted");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(
-            status.is_success(),
-            "PROCESS from a peer with matching AUTHORITY must succeed, \
-             got non-success status"
-        );
-        assert_eq!(
-            process_hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "process hook must run when AUTHORITY-scoped WRITE rule matches"
-        );
-    }
-
-    /// Negative control for the test above: a peer whose `authority`
-    /// does NOT match the `AUTHORITY("MyCA")` rule gets PROCESS
-    /// denied and the `process` hook never runs. Confirms the fix
-    /// forwards the real authority rather than blanket-granting.
-    #[epics_macros_rs::epics_test]
-    async fn process_denied_for_wrong_authority() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 501;
-        let src = AuthorityGatedSource::new();
-        let process_hits = std::sync::Arc::clone(&src.process_hits);
-        let source: DynSource = std::sync::Arc::new(src);
-
-        let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = test_srv_tx(16);
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        let frame = synth_frame(Command::Process, order, payload);
-
-        handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("OtherCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("handle_process ok");
-
-        let resp = rx.recv().await.expect("PROCESS response emitted");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(
-            !status.is_success(),
-            "PROCESS from a peer with the wrong AUTHORITY must be denied"
-        );
-        assert_eq!(
-            process_hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "process hook must NOT run when AUTHORITY does not match"
-        );
-    }
-
     /// Build a channel whose `ioid` op was initialised as `kind`,
     /// so a wrong-kind data frame can be driven against it.
     #[cfg(test)]
@@ -20820,116 +20319,11 @@ mod tests {
         channels
     }
 
-    /// Regression: the dedicated `handle_process` data phase must
-    /// reject a frame whose IOID was initialised as a different
-    /// operation class. Before the fix it only checked
-    /// `ch.ops().contains_key(ioid)`, so a client could INIT a GET (or
-    /// MONITOR) and then drive a PROCESS data frame through it,
-    /// triggering record processing on an op that never negotiated
-    /// PROCESS. pvxs `serverget.cpp:421-436` resets the connection on
-    /// a wrong-kind IOID.
-    #[epics_macros_rs::epics_test]
-    async fn ex_r5_process_data_rejects_get_initialised_ioid() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 600;
-        let src = AuthorityGatedSource::new();
-        let process_hits = std::sync::Arc::clone(&src.process_hits);
-        let source: DynSource = std::sync::Arc::new(src);
-
-        // IOID initialised as a GET, not a PROCESS.
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = test_srv_tx(16);
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        let frame = synth_frame(Command::Process, order, payload);
-
-        let res = handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await;
-        assert!(
-            res.is_err(),
-            "PROCESS data against a GET-initialised IOID must be a protocol error"
-        );
-        assert_eq!(
-            process_hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "record processing must NOT run for a wrong-kind PROCESS frame"
-        );
-    }
-
-    /// Regression: `handle_process` must also reject a PROCESS
-    /// data frame against a MONITOR-initialised IOID.
-    #[epics_macros_rs::epics_test]
-    async fn ex_r5_process_data_rejects_monitor_initialised_ioid() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 601;
-        let src = AuthorityGatedSource::new();
-        let process_hits = std::sync::Arc::clone(&src.process_hits);
-        let source: DynSource = std::sync::Arc::new(src);
-
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor, source.clone());
-        let (tx, _rx) = test_srv_tx(16);
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        let frame = synth_frame(Command::Process, order, payload);
-
-        let res = handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await;
-        assert!(
-            res.is_err(),
-            "PROCESS data against a MONITOR-initialised IOID must be a protocol error"
-        );
-        assert_eq!(
-            process_hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "record processing must NOT run for a wrong-kind PROCESS frame"
-        );
-    }
-
     /// a (sid → ChannelState) map with introspection but NO
-    /// registered ops, so a PROCESS INIT frame exercises the INIT
+    /// registered ops, so an INIT frame exercises the INIT
     /// pvRequest decode + registration path.
     #[cfg(test)]
-    fn process_channels_no_op(sid: u32, source: DynSource) -> ChannelTable {
+    fn channels_no_op(sid: u32, source: DynSource) -> ChannelTable {
         let intro = three_field_intro();
         let mut channels = ChannelTable::new();
         channels.insert(
@@ -20945,168 +20339,6 @@ mod tests {
             }),
         );
         channels
-    }
-
-    /// build a PROCESS INIT frame `sid + ioid + 0x08 +
-    /// pv_request_bytes`.
-    #[cfg(test)]
-    fn process_init_frame(sid: u32, ioid: u32, pv_request: &[u8], order: ByteOrder) -> Frame {
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x08); // INIT
-        payload.extend_from_slice(pv_request);
-        synth_frame(Command::Process, order, payload)
-    }
-
-    /// drive `handle_process` for an INIT frame and return
-    /// `(connection_fatal, ops contains ioid, reply status success)`.
-    /// `reply_success` is `None` when no op reply was emitted (the
-    /// connection-fatal `bev.reset()` path emits no frame).
-    #[cfg(test)]
-    async fn run_process_init(
-        sid: u32,
-        ioid: u32,
-        pv_request: &[u8],
-        order: ByteOrder,
-    ) -> (bool, bool, Option<bool>) {
-        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-        let mut channels = process_channels_no_op(sid, source.clone());
-        let (tx, mut rx) = test_srv_tx(16);
-        let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
-        let frame = process_init_frame(sid, ioid, pv_request, order);
-
-        let result = handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await;
-        let fatal = result.is_err();
-
-        let registered = channels.get(&sid).unwrap().ops().contains_key(&ioid);
-        let reply_success = rx.try_recv().ok().map(|resp| {
-            let (rframe, _) = try_parse_frame(&resp)
-                .expect("frame parses")
-                .expect("complete frame");
-            let mut cur = rframe.cursor();
-            let _ioid = cur.get_u32(order).expect("ioid");
-            let _subcmd = cur.get_u8().expect("subcmd");
-            Status::decode(&mut cur, order)
-                .expect("status")
-                .is_success()
-        });
-        (fatal, registered, reply_success)
-    }
-
-    /// Regression: a PROCESS INIT whose pvRequest VALUE is present but
-    /// truncated is a peer wire-decode fault — connection-fatal
-    /// (`bev.reset()` parity, pvxs `serverget.cpp:371-375`), emitting no
-    /// op reply and registering no IOID. The previous
-    /// `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..).ok())`
-    /// swallowed the value error and registered the op with `Status::ok()`.
-    #[epics_macros_rs::epics_test]
-    async fn bfr8_process_init_truncated_value_rejected_and_unregistered() {
-        let order = ByteOrder::Little;
-        // Valid Int descriptor, then a truncated (2-byte) i32 value.
-        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
-        let mut req = Vec::new();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
-        req.extend_from_slice(&[1u8, 2u8]);
-
-        let (fatal, registered, reply) = run_process_init(1, 700, &req, order).await;
-        assert!(
-            fatal,
-            "a malformed PROCESS INIT pvRequest value must be connection-fatal"
-        );
-        assert!(
-            !registered,
-            "a malformed PROCESS INIT pvRequest value must not register the IOID"
-        );
-        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
-    }
-
-    /// Regression: a PROCESS INIT with no decodable pvRequest descriptor
-    /// (empty body after subcmd) is a peer wire-decode fault —
-    /// connection-fatal, not registered, no reply (pvxs faults the buffer
-    /// and `bev.reset()`s).
-    #[epics_macros_rs::epics_test]
-    async fn bfr8_process_init_missing_descriptor_rejected_and_unregistered() {
-        let order = ByteOrder::Little;
-        let (fatal, registered, reply) = run_process_init(1, 701, &[], order).await;
-        assert!(
-            fatal,
-            "a PROCESS INIT with no pvRequest descriptor must be connection-fatal"
-        );
-        assert!(
-            !registered,
-            "a PROCESS INIT with no pvRequest descriptor must not register the IOID"
-        );
-        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
-    }
-
-    /// Control: a well-formed PROCESS INIT pvRequest (the Rust
-    /// client's shape — descriptor + value) is accepted, registers the
-    /// IOID, and replies `Status::ok()`. Guards against the rejection
-    /// path over-firing on valid input.
-    #[epics_macros_rs::epics_test]
-    async fn bfr8_process_init_valid_pvrequest_registers_op() {
-        let order = ByteOrder::Little;
-        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
-        let mut req = Vec::new();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
-        crate::pvdata::encode::encode_pv_field(
-            &PvField::Scalar(crate::pvdata::ScalarValue::Int(7)),
-            &desc,
-            order,
-            &mut req,
-        );
-
-        let (fatal, registered, reply) = run_process_init(1, 702, &req, order).await;
-        assert!(!fatal, "a valid PROCESS INIT must not be connection-fatal");
-        assert!(registered, "a valid PROCESS INIT must register the IOID");
-        assert_eq!(
-            reply,
-            Some(true),
-            "a valid PROCESS INIT must reply Status::ok()"
-        );
-    }
-
-    /// Regression: a PROCESS INIT carrying a non-null descriptor that needs
-    /// value bytes (scalar Int) but ENDS before them — a descriptor-only
-    /// frame — is the `from_wire_type_value` -> `!M.good()` wire fault
-    /// (`dataencode.cpp:747-752`, `serverget.cpp:371-375`): connection-fatal,
-    /// not registered, no reply. The prior cursor-exhausted short-circuit to
-    /// `Ok(None)` accepted it and registered the op with `Status::ok()`.
-    #[epics_macros_rs::epics_test]
-    async fn process_init_descriptor_only_value_rejected_and_unregistered() {
-        let order = ByteOrder::Little;
-        // Scalar Int descriptor, no value bytes.
-        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
-        let mut req = Vec::new();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
-
-        let (fatal, registered, reply) = run_process_init(1, 703, &req, order).await;
-        assert!(
-            fatal,
-            "a descriptor-only PROCESS INIT (value bytes absent) must be connection-fatal"
-        );
-        assert!(
-            !registered,
-            "a descriptor-only PROCESS INIT must not register the IOID"
-        );
-        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
     }
 
     /// build a ChannelArray INIT frame `sid + ioid + 0x08 +
@@ -21131,7 +20363,7 @@ mod tests {
         order: ByteOrder,
     ) -> (bool, bool, bool) {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-        let mut channels = process_channels_no_op(sid, source.clone());
+        let mut channels = channels_no_op(sid, source.clone());
         let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -21419,92 +20651,6 @@ mod tests {
         .expect("readback value");
         let (a, _, _) = three_field_extract(&readback);
         assert_eq!(a, 55, "readback must reflect the merged PUT (field a=55)");
-    }
-
-    /// The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`) on
-    /// a PROCESS data frame is the EPICS `lastRequest()` rider — the
-    /// ChannelProcess client sends `QOS_DESTROY` to mean "process this, then
-    /// destroy" (`clientContextImpl.cpp:548-570`). Pre-fix the handler treated
-    /// it as a pure destroy and returned before `process_checked` ran, so the
-    /// client received no processDone reply. The op must execute, reply, and
-    /// only then release its IOID via the deferred completion owner.
-    #[epics_macros_rs::epics_test]
-    async fn pva_process_last_request_executes_then_defers_destroy() {
-        let order = ByteOrder::Little;
-        let (sid, ioid) = (1u32, 700u32);
-        let src = AuthorityGatedSource::new();
-        let process_hits = std::sync::Arc::clone(&src.process_hits);
-        let source: DynSource = std::sync::Arc::new(src);
-
-        let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = test_srv_tx(16);
-        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        // PROCESS data frame carrying the last-request bit (QOS_DESTROY = 0x10).
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x10);
-        let frame = synth_frame(Command::Process, order, payload);
-
-        handle_process(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &exec_fin_tx,
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("handle_process ok");
-
-        // The process hook ran and a status reply was emitted — the
-        // last-request frame was NOT swallowed as a pure destroy.
-        let resp = rx
-            .recv()
-            .await
-            .expect("PROCESS reply emitted for a last-request frame");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(
-            status.is_success(),
-            "a last-request PROCESS must execute and reply success"
-        );
-        assert_eq!(
-            process_hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the process hook runs for a last-request PROCESS"
-        );
-
-        // IOID stays reserved until the reply completes, then the completion
-        // owner frees it (pvxs cleanup() after the reply).
-        assert!(
-            channels.get(&sid).unwrap().ops().contains_key(&ioid),
-            "the op is reserved until its reply is sent"
-        );
-        let fin = exec_fin_rx
-            .recv()
-            .await
-            .expect("process task signals completion");
-        apply_exec_finish(&mut channels, fin);
-        assert!(
-            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
-            "the last-request PROCESS op is freed after its reply"
-        );
     }
 
     /// Same lastRequest() rider for PUT_GET: the ChannelPutGet client sends

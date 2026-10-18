@@ -6,7 +6,7 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
-// RTEMS-EXEC-MODEL-ALLOW(25): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the exec-backend
 // suite.
 
 use epics_base_rs::types::RecordName;
@@ -743,27 +743,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .put_with_options(&pv, opts, atomic_override, &ctx.log)
                 .await
                 .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
-        }
-    }
-
-    /// pvxs `GroupSource` has no `onProcess`: neither a group nor a native
-    /// PVA PV has a processing chain, so a caller is refused rather than
-    /// handed the default's silent success.
-    fn process(
-        &self,
-        name: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let pva_pvs = self.pva_pvs.clone();
-        let name = RecordName::from(name);
-        async move {
-            let kind = if pva_pvs.read().contains_key(&name) {
-                "native PVA PV"
-            } else {
-                "group PV"
-            };
-            Err(OpError::failed(format!(
-                "PROCESS not supported for {kind} '{name}' (no record-level chain)"
-            )))
         }
     }
 
@@ -2852,70 +2831,19 @@ mod tests {
         assert_eq!(creds.method, "ca");
     }
 
-    /// PVA `PROCESS` against a QSRV-backed record actually
-    /// runs the record's processing chain (regression vs. the default
-    /// trait that silently returned Ok without processing). We verify
-    /// by counting the change in `processed_count` after PROCESS.
-    #[tokio::test]
-    async fn process_runs_record_processing_for_single_record_pvs() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_base_rs::server::records::ai::AiRecord;
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("TEST:proc_call", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        let provider = Arc::new(BridgeProvider::new(db.clone()));
-        let store = qsrv_composite(provider);
-
-        let before = {
-            let rec = db.get_record("TEST:proc_call").unwrap();
-            let inst = rec.read();
-            inst.common.time
-        };
-        // Sleep briefly so the post-process timestamp can be strictly
-        // greater than the pre-process timestamp on systems with a
-        // coarse clock granularity.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store
-            .process(b"TEST:proc_call")
-            .await
-            .expect("PROCESS must run");
-        let after = {
-            let rec = db.get_record("TEST:proc_call").unwrap();
-            let inst = rec.read();
-            inst.common.time
-        };
-        assert!(
-            after >= before,
-            "PROCESS must touch the record's TIME (post-process \
-             timestamp must be >= pre): before={before:?}, after={after:?}"
-        );
-        // If TIME is unchanged the clock granularity hid the
-        // processing; in that case the test cannot discriminate the
-        // fix from the silent-Ok bug. Treat that as a hard
-        // fail so a flaky clock doesn't silently lose the regression.
-        assert!(
-            after > before,
-            "TIME must strictly advance after PROCESS (clock too \
-             coarse to discriminate the fix): {before:?} -> {after:?}"
-        );
-    }
-
-    /// QSRV forced PUT (`record._options.process=true`) and QSRV
-    /// PROCESS must run the *link-aware* processing chain, not a
-    /// value-only local notification: a record whose FLNK targets a
-    /// second record must process that target before the operation
-    /// replies success. pvxs routes both through `dbProcess`
-    /// (iocsource.cpp:397-421), which runs FLNK / OUT links; the bare
+    /// QSRV forced PUT (`record._options.process=true`) must run the
+    /// *link-aware* processing chain, not a value-only local
+    /// notification: a record whose FLNK targets a second record must
+    /// process that target before the operation replies success. pvxs
+    /// routes it through `dbProcess` (iocsource.cpp:397-421), which runs
+    /// FLNK / OUT links; the bare
     /// `process_record` (process_local + notify) would skip them.
     ///
     /// Discriminator: B is processed only when A's FLNK chain fires,
     /// which advances B's `common.time`. With the pre-fix local-only
     /// path B's TIME would never move.
     #[tokio::test]
-    async fn forced_put_and_process_run_the_flnk_link_chain() {
+    async fn forced_put_runs_the_flnk_link_chain() {
         use epics_base_rs::server::database::PvDatabase;
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
@@ -2991,89 +2919,6 @@ mod tests {
             b_after_put > b_before,
             "forced PUT must run A's FLNK chain and process B \
              (B.TIME must advance): {b_before:?} -> {b_after_put:?}"
-        );
-
-        // --- PROCESS path ---
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store.process(b"FLNK:a").await.expect("PROCESS must run");
-        let b_after_process = b_time(db.clone()).await;
-        assert!(
-            b_after_process > b_after_put,
-            "PROCESS must run A's FLNK chain and process B \
-             (B.TIME must advance): {b_after_put:?} -> {b_after_process:?}"
-        );
-    }
-
-    /// PROCESS on a group PV / unknown PV must NOT pretend to
-    /// succeed — operators using PROCESS for side-effects need an
-    /// honest failure when the operation has no effect.
-    #[tokio::test]
-    async fn process_rejects_unknown_or_group_pv() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-
-        let err = store
-            .process(b"UNKNOWN:PV")
-            .await
-            .expect_err("PROCESS on unknown PV must error");
-        assert!(
-            err.message.contains("UNKNOWN:PV"),
-            "error must name the PV; got: {err}"
-        );
-    }
-
-    /// PROCESS on a name that is BOTH a record and a (shadowed) group must
-    /// process the record, not reject as a group PV. pvxs serves a
-    /// record-shadowed group name only as the record (`defineGroups`,
-    /// groupconfigprocessor.cpp:170-181). The prior PROCESS gate read the
-    /// raw group registry, so a shadowed name was rejected with
-    /// "PROCESS not supported for group PV" even though the record is
-    /// processable.
-    #[tokio::test]
-    async fn process_shadowed_group_processes_the_record() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_base_rs::server::records::ai::AiRecord;
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("SP:rec", Box::new(AiRecord::new(1.0)))
-            .await
-            .unwrap();
-        // `SP:grp`'s `+channel` must resolve, or the group is refused at
-        // creation and the shadow rule under test is never exercised.
-        db.add_record("OTHER", Box::new(AiRecord::new(2.0)))
-            .await
-            .unwrap();
-        let provider = Arc::new(BridgeProvider::new(db));
-        // "SP:rec" shadows the record; "SP:grp" has no backing record.
-        provider
-            .load_group_config(
-                r#"{
-                    "SP:rec": { "value": { "+channel": "SP:rec.VAL", "+type": "plain" } },
-                    "SP:grp": { "value": { "+channel": "OTHER.VAL",  "+type": "plain" } }
-                }"#,
-            )
-            .expect("load group");
-        let store = qsrv_composite(provider);
-
-        // The shadowed name processes through the record chain.
-        store
-            .process(b"SP:rec")
-            .await
-            .expect("PROCESS on a record-shadowed group name must process the record");
-
-        // The non-colliding group is still rejected as a group PV.
-        let err = store
-            .process(b"SP:grp")
-            .await
-            .expect_err("PROCESS on a real group PV must error");
-        assert!(
-            err.message.contains("group PV"),
-            "error must classify SP:grp as a group PV; got: {err}"
         );
     }
 

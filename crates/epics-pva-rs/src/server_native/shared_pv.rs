@@ -72,14 +72,6 @@ impl PutPolicy {
     }
 }
 
-/// User-provided process handler. Fired by the PVA `PROCESS` wire
-/// command (cmd 16) — processing is triggered with no value payload,
-/// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
-/// Returning `Err` makes the server reply with a non-success PROCESS
-/// status. When no handler is installed `process()` is a no-op
-/// success, mirroring a passive record's response to `.PROC`.
-pub type OnProcessFn = Arc<dyn Fn(&SharedPV) -> Result<(), String> + Send + Sync>;
-
 /// User-provided RPC handler. Mirrors pvxs `SharedPV::onRPC`. Handler
 /// receives `(request_desc, request_value)` and returns the reply or an
 /// error message. The reply is an [`RpcReply`], covering both pvxs
@@ -448,9 +440,6 @@ struct Inner {
     /// Optional user RPC handler; when None RPC returns "not
     /// supported". pvxs `onRPC` parity.
     on_rpc: Option<OnRpcFn>,
-    /// Optional user PROCESS handler; when None `process()` is a
-    /// no-op success (passive-record semantics).
-    on_process: Option<OnProcessFn>,
     /// Optional async RPC handler. Takes precedence over `on_rpc`
     /// when both are set. Used by the `service` framework
     /// (`#[pva_service]`) so dispatch can run on the calling task's
@@ -496,7 +485,6 @@ impl Default for Inner {
             high_watermark: 64,
             put_policy: PutPolicy::Reject,
             on_rpc: None,
-            on_process: None,
             on_rpc_async: None,
             channel_count: 0,
             on_first_connect: None,
@@ -1072,21 +1060,6 @@ impl SharedPV {
         }
     }
 
-    /// Trigger PROCESS on this PV. Runs the installed [`Self::on_process`]
-    /// handler; with no handler this is a no-op success (a passive
-    /// record returns OK to a `.PROC` write). Mirrors how pvxs would
-    /// route a `PROCESS` wire command into the underlying record.
-    pub fn process(&self) -> Result<(), String> {
-        if !self.is_open() {
-            return Err("SharedPV not open".into());
-        }
-        let on_process = self.inner.lock().on_process.clone();
-        match on_process {
-            Some(f) => f(self),
-            None => Ok(()),
-        }
-    }
-
     /// Async RPC dispatch. Tries the async handler first
     /// (registered via [`Self::on_rpc_async`]); falls back to the
     /// sync `on_rpc` handler when only that one is set; finally
@@ -1137,15 +1110,6 @@ impl SharedPV {
     {
         self.inner.lock().on_rpc =
             Some(Arc::new(move |pv, d, v| handler(pv, d, v).map(Into::into)));
-    }
-
-    /// Install a process handler. Pass `None` to clear (by re-installing).
-    /// Fired by the PVA `PROCESS` wire command — see [`OnProcessFn`].
-    pub fn on_process<F>(&self, handler: F)
-    where
-        F: Fn(&SharedPV) -> Result<(), String> + Send + Sync + 'static,
-    {
-        self.inner.lock().on_process = Some(Arc::new(handler));
     }
 
     /// Install an async RPC handler. Used by `#[pva_service]` so the
@@ -1694,20 +1658,6 @@ impl super::source::ChannelSource for SharedSource {
                     .rpc_async(request_desc, request_value)
                     .await
                     .map_err(OpError::failed),
-                None => Err(OpError::failed(format!("no such PV: {name}"))),
-            }
-        }
-    }
-
-    fn process(
-        &self,
-        name: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let pv = self.pvs.lock().get(name).cloned();
-        let name = RecordName::from(name);
-        async move {
-            match pv {
-                Some(p) => p.process().map_err(OpError::failed),
                 None => Err(OpError::failed(format!("no such PV: {name}"))),
             }
         }

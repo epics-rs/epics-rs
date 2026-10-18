@@ -62,6 +62,9 @@ mod pipeline_r1;
 #[path = "interop_pvxs_mods/pipeline_r20.rs"]
 mod pipeline_r20;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/process_cmd16.rs"]
+mod process_cmd16;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/put_cross_impl.rs"]
 mod put_cross_impl;
 #[cfg(unix)]

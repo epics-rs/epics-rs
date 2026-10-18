@@ -32,8 +32,8 @@ use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     MonitorConnEvent, MonitorEvent, MonitorEventMask, PutOp, RpcArg, SubscriptionHandle, op_get,
     op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
-    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
-    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
+    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_put, op_put_get,
+    op_rpc,
 };
 use super::search_engine::{ClientSearchConfig, SearchEngine};
 
@@ -1562,8 +1562,6 @@ impl PvaClient {
     /// (`src/conn.cpp:249-276` drains the frame at `default:`), and its own
     /// pvalink forward link is exactly this PUT
     /// (`ioc/pvalink_lset.cpp:691` -> `ioc/pvalink_channel.cpp:225-263`).
-    /// Prefer it over [`Self::pvprocess`] wherever the peer may be a pvxs
-    /// server; `pvprocess` stays for peers that do implement cmd 16.
     pub async fn pvput_empty_with_request(
         &self,
         pv_name: &str,
@@ -2354,47 +2352,6 @@ impl PvaClient {
         crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
         crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
         crate::client_native::ops_v2::op_get_put_with_request(&ch, &bytes, self.inner.timeout).await
-    }
-
-    /// PVA `PROCESS` (cmd 16) — trigger record processing without
-    /// transferring a value. The wire equivalent of an EPICS
-    /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing
-    /// failure surfaces as a [`PvaError::Protocol`].
-    ///
-    /// Sends the empty default pvRequest, matching EPICS base pvaClient
-    /// `createProcess("")`. Use [`Self::pvprocess_with_request`] to send a
-    /// provider-specific PROCESS request.
-    pub async fn pvprocess(&self, pv_name: &str) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process(&ch, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvprocess`] but sends a caller-supplied PROCESS
-    /// pvRequest (e.g. built via [`Self::request`] →
-    /// [`crate::pv_request::PvRequestExpr::encode`], or
-    /// `record[block=true]`). pvAccess serializes the request on PROCESS
-    /// INIT and the server provider can inspect it during
-    /// `createChannelProcess`. Mirrors pvaClient
-    /// `PvaClientChannel::createProcess(pvRequest)`.
-    pub async fn pvprocess_with_request(&self, pv_name: &str, pv_request: &[u8]) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process_with_request(&ch, pv_request, self.inner.timeout).await
-    }
-
-    /// Like [`Self::pvprocess_with_request`] but takes the PROCESS INIT
-    /// pvRequest as a decoded [`PvField`] value rather than pre-encoded
-    /// bytes; it is serialized in the connection's negotiated byte order.
-    /// A PVA-to-PVA gateway uses this to forward the downstream PROCESS
-    /// create-time pvRequest — preserved into `ChannelContext.pv_request`
-    /// — upstream, matching pva2pva `createChannelProcess(..., pvRequest)`
-    /// (channel.cpp:98-107).
-    pub async fn pvprocess_with_request_value(
-        &self,
-        pv_name: &str,
-        pv_request: &PvField,
-    ) -> PvaResult<()> {
-        let ch = self.channel(pv_name).await?;
-        op_process_with_request_value(&ch, pv_request, self.inner.timeout).await
     }
 
     /// ChannelArray `getArray` (cmd 14): read the `[offset, count, stride]`

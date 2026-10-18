@@ -1008,13 +1008,13 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 ///
 /// The one place a raw channel name becomes a record, a field and a
 /// [`FilterChain`], so every operation on the channel — create, read, put,
-/// process, monitor and the ASG lookup — agrees on what it addressed. It is
+/// monitor and the ASG lookup — agrees on what it addressed. It is
 /// C's `dbChannelCreate` ([`db_channel_create`]), whose NULL pvxs answers
 /// at create. `{}` is a valid no-filter request and yields an empty chain.
 ///
 /// Filters are read-side. C runs the pre/post chains from `dbChannelGet`
-/// and from the event queue, never from `dbChannelPut`, so the PUT and
-/// PROCESS paths resolve the name and drop the chain on the floor.
+/// and from the event queue, never from `dbChannelPut`, so the PUT path
+/// resolves the name and drops the chain on the floor.
 fn resolve_channel(db: &PvDatabase, name: &[u8]) -> Option<(ChannelName, FilterChain)> {
     let channel = db_channel_create(db, name).ok()?;
     Some((channel.name, channel.chain))
@@ -1570,49 +1570,6 @@ impl ChannelSource for PvDatabaseSource {
                 )),
             };
             put_record(&db, &checked, &ctx, &cn, &rec, put, &opts).await
-        }
-    }
-
-    fn process(
-        &self,
-        name: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let db = self.db.clone();
-        let name = RecordName::from(name);
-        async move {
-            // The WRITE-class gate ran in `process_checked` (trait
-            // default) before reaching here, so a failure below is
-            // operational, not a denial. pvxs serves PVA PROCESS by
-            // running the IOC processing chain (`iocsource.cpp:397-421`
-            // dbProcess / `singlesource.cpp:347-383`); the backing
-            // database already exposes that through
-            // `process_record_with_links` — the foreign-caller
-            // full-processing entry that is alias-aware, takes the
-            // record's advisory write gate, and runs
-            // INP -> process -> alarms -> OUT -> FLNK with cycle/depth
-            // guards. The previous no-op default returned success while
-            // the record never processed (alarms, monitors, OUT links and
-            // the FLNK chain all skipped).
-            let Some((cn, _filters)) = resolve_channel(&db, &name) else {
-                return Err(OpError::failed(format!("no record serves '{name}'")));
-            };
-            match channel_entry(&db, &cn).await {
-                Some(PvEntry::Record(_)) => {
-                    // PROCESS targets the whole record, not a field, so it
-                    // runs on the resolved record name.
-                    let mut visited = epics_base_rs::server::database::ProcStack::new();
-                    db.process_record_with_links(&cn.record, &mut visited)
-                        .await
-                        .map_err(|e| OpError::failed(e.to_string()))
-                }
-                // A simple/mailbox SharedPV has no record body to run;
-                // report PROCESS as unsupported rather than silently
-                // succeeding (no process hook exists for these).
-                Some(PvEntry::Simple(_)) => Err(OpError::failed(format!(
-                    "PROCESS not supported for simple PV '{name}'"
-                ))),
-                None => Err(OpError::failed(format!("no record serves '{name}'"))),
-            }
         }
     }
 
@@ -5275,61 +5232,6 @@ ASG(DEFAULT) {
             .expect("ASL=0 record must match RULE(2, WRITE)");
     }
 
-    /// PVA-61 regression: a record-backed PROCESS must run the record's
-    /// processing chain, not the no-op default success. A `CALC="5"`
-    /// record evaluates the expression into VAL on process, so VAL flips
-    /// from its unprocessed default (0) to 5 — proof the chain ran, which
-    /// the old no-op `Ok(())` could never produce.
-    #[epics_macros_rs::epics_test]
-    async fn process_runs_record_processing_not_noop() {
-        use epics_base_rs::server::records::calc::CalcRecord;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("CALC:PROC", Box::new(CalcRecord::new("5")))
-            .await
-            .unwrap();
-        let source = PvDatabaseSource::new(db.clone());
-        let ctx = make_ctx("localhost", "op", "ca");
-
-        // Unprocessed default.
-        let before = source
-            .get_value_ctx("CALC:PROC", ctx.clone())
-            .await
-            .expect("initial get");
-        assert_eq!(
-            extract_put_value_leaf(&before),
-            Some(PvField::Scalar(ScalarValue::Double(0.0))),
-            "VAL starts at the unprocessed default"
-        );
-
-        // PROCESS via the WRITE-gated checked path (no ACF → allowed).
-        let checked = source
-            .access()
-            .check(
-                "CALC:PROC",
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.method,
-                "",
-            )
-            .await;
-        source
-            .process_checked(checked, ctx.clone())
-            .await
-            .expect("PROCESS must succeed");
-
-        // The CALC expression was evaluated into VAL: the chain ran.
-        let after = source
-            .get_value_ctx("CALC:PROC", ctx.clone())
-            .await
-            .expect("post-process get");
-        assert_eq!(
-            extract_put_value_leaf(&after),
-            Some(PvField::Scalar(ScalarValue::Double(5.0))),
-            "record PROCESS must evaluate CALC into VAL, not no-op"
-        );
-    }
-
     /// An external PVA PUT on a record-backed channel owes C `dbPutField`,
     /// not `dbPut`: a PASSIVE record must process on the put. Routing it
     /// through `put_pv` landed the value but never processed — UDF stayed
@@ -6045,31 +5947,6 @@ ASG(DEFAULT) {
             .expect("stream open");
     }
 
-    /// A simple/mailbox PV has no record body; PROCESS reports unsupported
-    /// rather than silently succeeding.
-    #[epics_macros_rs::epics_test]
-    async fn process_simple_pv_is_unsupported() {
-        let db = Arc::new(PvDatabase::new());
-        db.add_pv("MAILBOX:PV", EpicsValue::Double(1.0))
-            .await
-            .unwrap();
-        let source = PvDatabaseSource::new(db.clone());
-        let ctx = make_ctx("localhost", "op", "ca");
-        let checked = source
-            .access()
-            .check(
-                "MAILBOX:PV",
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.method,
-                "",
-            )
-            .await;
-        assert!(
-            source.process_checked(checked, ctx).await.is_err(),
-            "PROCESS on a simple PV must be unsupported, not silent success"
-        );
-    }
     /// asTrapWrite parity: a PVA PUT served by the NATIVE source must
     /// fire the EPICS put-logging hook when the matched ACF rule carries
     /// `TRAPWRITE`, exactly as the QSRV bridge and the CA server already

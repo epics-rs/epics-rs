@@ -21,7 +21,7 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
-// RTEMS-EXEC-MODEL-ALLOW(18): checked to pass on the exec backend under
+// RTEMS-EXEC-MODEL-ALLOW(12): checked to pass on the exec backend under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
 // --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
 // seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
@@ -146,25 +146,6 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<Option<SourceRead>, OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
     }
-    // PROCESS mutates upstream record state — it is a WRITE-class op,
-    // so reject it here exactly the way `put_value` does. Without this
-    // override the trait-default `process` (`Ok(())`) would falsely
-    // report success and let a PROCESS slip past read-only mode.
-    async fn process(&self, _name: &[u8]) -> Result<(), OpError> {
-        Err(OpError::denied("read-only mode: PROCESS rejected"))
-    }
-    // Typed PROCESS — same WRITE-class rejection as `process` above.
-    // Without this override the trait-default `process_checked` would
-    // fall through to `process` (rejected) but only after the gate
-    // check; short-circuit here so a PROCESS never reaches the inner
-    // source under read-only mode.
-    async fn process_checked(
-        &self,
-        _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        Err(OpError::denied("read-only mode: PROCESS rejected"))
-    }
     async fn is_writable(&self, _name: &[u8]) -> bool {
         false
     }
@@ -270,7 +251,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // `createChannelRPC` under `p2pReadOnly` exactly the way it blocks
     // Put/Process/PutGet (`p2pApp/channel.cpp:140-149`, the `if(!p2pReadOnly)`
     // guard; only Get/Monitor are unconditional). Reject it here as
-    // PUT/PROCESS are, rather than forwarding to the inner source —
+    // PUT is, rather than forwarding to the inner source —
     // without this override a read-only gateway forwarded downstream
     // RPCs straight to the upstream server.
     async fn rpc(
@@ -684,19 +665,6 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.put_value(name, value).await
     }
-    // PROCESS mutates upstream record state — a WRITE-class op. Gate
-    // it by the layer's static allowlist BEFORE forwarding, exactly
-    // the way `put_value` is gated. Without this override the trait
-    // default `process` (`Ok(())`) bypasses the ACL entirely.
-    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
-        if !self.config.allowed(name) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                String::from_utf8_lossy(name)
-            )));
-        }
-        self.inner.process(name).await
-    }
     // type-state op variants gate by the layer's static
     // allowlist BEFORE delegating. The inner source still gets the
     // full AccessChecked + ctx and may apply its own ACF / per-
@@ -916,26 +884,9 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await
     }
-    // Typed PROCESS — gate by the static allowlist BEFORE forwarding,
-    // mirroring `rpc_checked` / `put_value_checked`. The inner source
-    // still gets the full AccessChecked + ctx and may apply its own
-    // ACF gate (PROCESS is WRITE-class) on top.
-    async fn process_checked(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner.process_checked(checked, ctx).await
-    }
     // ChannelArray: gate each sub-op by the static allowlist BEFORE
-    // forwarding to the inner, mirroring `put_*_checked` / `rpc_checked` /
-    // `process_checked`. Without these the trait default ("not supported")
+    // forwarding to the inner, mirroring `put_*_checked` / `rpc_checked`.
+    // Without these the trait default ("not supported")
     // would mask a wrapped inner's array support (the wrapper-severs-override
     // defect family). The inner source still gets the full AccessChecked +
     // ctx and applies its own ACF read/write gate on top.
@@ -1280,10 +1231,6 @@ pub enum AuditEventKind {
     Subscribe,
     /// RPC dispatch.
     Rpc,
-    /// PROCESS operation (PVA wire cmd 16) — record-state mutation
-    /// without a value payload. WRITE-class for ACF, always audited
-    /// alongside PUT.
-    Process,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1539,34 +1486,6 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
         self.sink
             .record(make_audit_event(&pv, &user, &host, &outcome));
-        result
-    }
-    // PROCESS is a record-state mutation — audit it with the same
-    // row shape as PUT (`AuditEventKind::Process`), then forward.
-    // Without this override the trait-default `process` would never
-    // reach the inner source and no audit row would be emitted.
-    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
-        let result = self.inner.process(name).await;
-        let mut ev = make_audit_event(name, "", "", &result);
-        ev.event = AuditEventKind::Process;
-        self.sink.record(ev);
-        result
-    }
-    // Typed PROCESS — emits a credential-aware audit row (mirroring
-    // `put_value_checked`) and forwards through the inner's
-    // gate-enforced `process_checked`.
-    async fn process_checked(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self.inner.process_checked(checked, ctx).await;
-        let mut ev = make_audit_event(&pv, &user, &host, &result);
-        ev.event = AuditEventKind::Process;
-        self.sink.record(ev);
         result
     }
     async fn get_value_checked(
@@ -1865,7 +1784,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // wrapper-severs-override defect family) and emit an audit row matching
     // the sub-op's class. The INIT descriptor probe carries no audit row
     // (like `has_pv`/`get_introspection`). putArray/setLength are WRITE-class
-    // → `AuditEventKind::Put` (always audited, alongside PUT/PROCESS).
+    // → `AuditEventKind::Put` (always audited, alongside PUT).
     // getArray/getLength are READ-class → `AuditEventKind::Get` (gated by
     // `audit_get`, like GET/MONITOR). There is no dedicated Array audit kind;
     // the Put/Get buckets capture the operation's mutate-vs-read intent,
@@ -2441,7 +2360,6 @@ mod tests {
     struct RecordingSource {
         delta_reached: Arc<AtomicBool>,
         value_reached: Arc<AtomicBool>,
-        process_reached: Arc<AtomicBool>,
     }
 
     impl ChannelSource for RecordingSource {
@@ -2478,14 +2396,6 @@ mod tests {
             _ctx: ChannelContext,
         ) -> Result<(), OpError> {
             self.delta_reached.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-        // Inner PROCESS sink. The trait-default `process_checked`
-        // applies the `allows_write()` gate then delegates here, so a
-        // wrapper that correctly forwards `process_checked` lands in
-        // this method and flips `process_reached`.
-        async fn process(&self, _name: &[u8]) -> Result<(), OpError> {
-            self.process_reached.store(true, Ordering::SeqCst);
             Ok(())
         }
         async fn is_writable(&self, _name: &[u8]) -> bool {
@@ -2527,7 +2437,6 @@ mod tests {
         let inner = RecordingSource {
             delta_reached: delta_reached.clone(),
             value_reached: value_reached.clone(),
-            process_reached: Arc::new(AtomicBool::new(false)),
         };
         let acl = AclLayer::new(AclConfig::default()).layer(inner);
 
@@ -2562,7 +2471,6 @@ mod tests {
         let inner = RecordingSource {
             delta_reached: delta_reached.clone(),
             value_reached: value_reached.clone(),
-            process_reached: Arc::new(AtomicBool::new(false)),
         };
         let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
         let acl = AclLayer::new(cfg).layer(inner);
@@ -2599,7 +2507,6 @@ mod tests {
         let inner = RecordingSource {
             delta_reached: delta_reached.clone(),
             value_reached: value_reached.clone(),
-            process_reached: Arc::new(AtomicBool::new(false)),
         };
         let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2647,7 +2554,6 @@ mod tests {
         let inner = RecordingSource {
             delta_reached: delta_reached.clone(),
             value_reached: value_reached.clone(),
-            process_reached: Arc::new(AtomicBool::new(false)),
         };
         let ro = ReadOnlyLayer.layer(inner);
 
@@ -2926,101 +2832,6 @@ mod tests {
         );
     }
 
-    // ── process / process_checked forwarding through the wrappers ────
-
-    /// A typed PROCESS through the `Acl` wrapper (allowed name) must
-    /// reach the inner source's PROCESS path. Pre-fix the trait
-    /// default `process_checked` → `process` (`Ok(())`) ran on the
-    /// `Acl` layer itself and never forwarded.
-    #[tokio::test]
-    async fn acl_forwards_process_checked_to_inner() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let acl = AclLayer::new(AclConfig::default()).layer(inner);
-
-        let res = acl
-            .process_checked(checked_for("X").await, test_ctx())
-            .await;
-        assert!(res.is_ok());
-        assert!(
-            process_reached.load(Ordering::SeqCst),
-            "Acl must route PROCESS to the inner source's process_checked"
-        );
-    }
-
-    /// An `Acl`-denied PROCESS must be rejected at the layer and never
-    /// reach the inner source.
-    #[tokio::test]
-    async fn acl_denied_process_checked_short_circuits() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
-        let acl = AclLayer::new(cfg).layer(inner);
-
-        let err = acl
-            .process_checked(checked_for("SECRET:KEY").await, test_ctx())
-            .await
-            .expect_err("ACL-denied PROCESS must fail at the layer");
-        assert_eq!(
-            err.kind,
-            OpErrorKind::Denied,
-            "ACL denial must classify as Denied: {err:?}"
-        );
-        assert!(err.message.contains("denied"));
-        assert!(
-            !process_reached.load(Ordering::SeqCst),
-            "ACL-denied PROCESS must not reach the inner source"
-        );
-    }
-
-    /// A PROCESS through the `ReadOnly` wrapper must be rejected at
-    /// the layer (WRITE-class op) and never reach the inner source.
-    #[tokio::test]
-    async fn read_only_rejects_process_checked() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let ro = ReadOnlyLayer.layer(inner);
-
-        let err = ro
-            .process_checked(checked_for("X").await, test_ctx())
-            .await
-            .expect_err("read-only PROCESS must be rejected");
-        assert_eq!(
-            err.kind,
-            OpErrorKind::Denied,
-            "read-only refusal must classify as Denied: {err:?}"
-        );
-        assert!(err.message.contains("read-only"));
-        assert!(
-            !process_reached.load(Ordering::SeqCst),
-            "read-only PROCESS must not reach the inner source"
-        );
-        // The ctx-less `process` is rejected the same way.
-        let err = ro
-            .process(b"X")
-            .await
-            .expect_err("read-only ctx-less PROCESS must be rejected");
-        assert_eq!(
-            err.kind,
-            OpErrorKind::Denied,
-            "read-only refusal must classify as Denied: {err:?}"
-        );
-        assert!(err.message.contains("read-only"));
-        assert!(!process_reached.load(Ordering::SeqCst));
-    }
-
     /// RPC through the `ReadOnly` wrapper must be rejected at the layer.
     /// pva2pva blocks `createChannelRPC` under `p2pReadOnly` the same way
     /// it blocks Put/Process (`p2pApp/channel.cpp:140-149`). The override
@@ -3032,7 +2843,6 @@ mod tests {
         let inner = RecordingSource {
             delta_reached: Arc::new(AtomicBool::new(false)),
             value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: Arc::new(AtomicBool::new(false)),
         };
         let ro = ReadOnlyLayer.layer(inner);
         let desc = FieldDesc::Scalar(ScalarType::Double);
@@ -3064,115 +2874,6 @@ mod tests {
             "read-only refusal must classify as Denied: {err:?}"
         );
         assert!(err.message.contains("read-only"), "err: {err}");
-    }
-
-    /// A PROCESS through the `Audited` wrapper must reach the inner
-    /// source and emit exactly one `Process` audit row carrying the
-    /// peer credentials.
-    #[tokio::test]
-    async fn audited_forwards_process_checked_and_records() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_sink = events.clone();
-        let audited = AuditLayer::new(ClosureAudit(move |ev| {
-            events_sink.lock().unwrap().push(ev);
-        }))
-        .layer(inner);
-
-        let res = audited
-            .process_checked(checked_for("X").await, test_ctx())
-            .await;
-        assert!(res.is_ok());
-        assert!(
-            process_reached.load(Ordering::SeqCst),
-            "Audited must route PROCESS to the inner source's process_checked"
-        );
-        let recorded = events.lock().unwrap();
-        assert_eq!(recorded.len(), 1, "exactly one audit row per PROCESS");
-        assert_eq!(recorded[0].event, AuditEventKind::Process);
-        assert_eq!(recorded[0].result, AuditResult::Ok);
-        assert_eq!(recorded[0].pv, "X");
-        assert_eq!(recorded[0].user, "alice");
-        assert_eq!(recorded[0].host, "host1");
-    }
-
-    /// The full production layer stack `Audited(Acl(inner))` (what
-    /// `PvaGateway::start` builds) must forward a PROCESS all the way
-    /// to the inner source — proving the fix is effective in the real
-    /// layered deployment, not just for a single wrapper. Pre-fix the
-    /// PROCESS hit `Audited`'s trait-default `process_checked` →
-    /// `process` (`Ok(())`) and never reached `Acl`, let alone the
-    /// inner source.
-    #[tokio::test]
-    async fn layered_audited_acl_forwards_process_to_inner() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_sink = events.clone();
-        let acl = AclLayer::new(AclConfig::default()).layer(inner);
-        let layered = AuditLayer::new(ClosureAudit(move |ev| {
-            events_sink.lock().unwrap().push(ev);
-        }))
-        .layer(acl);
-
-        let res = layered
-            .process_checked(checked_for("X").await, test_ctx())
-            .await;
-        assert!(res.is_ok());
-        assert!(
-            process_reached.load(Ordering::SeqCst),
-            "PROCESS through Audited(Acl(inner)) must reach the inner source"
-        );
-        assert_eq!(
-            events.lock().unwrap()[0].event,
-            AuditEventKind::Process,
-            "the layered PROCESS must still be audited"
-        );
-    }
-
-    /// In the layered stack, an ACL deny still short-circuits a
-    /// PROCESS at the `Acl` layer (the audit row records the denial).
-    #[tokio::test]
-    async fn layered_audited_acl_denies_process() {
-        let process_reached = Arc::new(AtomicBool::new(false));
-        let inner = RecordingSource {
-            delta_reached: Arc::new(AtomicBool::new(false)),
-            value_reached: Arc::new(AtomicBool::new(false)),
-            process_reached: process_reached.clone(),
-        };
-        let events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_sink = events.clone();
-        let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
-        let acl = AclLayer::new(cfg).layer(inner);
-        let layered = AuditLayer::new(ClosureAudit(move |ev| {
-            events_sink.lock().unwrap().push(ev);
-        }))
-        .layer(acl);
-
-        let err = layered
-            .process_checked(checked_for("SECRET:KEY").await, test_ctx())
-            .await
-            .expect_err("ACL-denied PROCESS must fail through the layered stack");
-        assert!(err.message.contains("denied"));
-        assert!(
-            !process_reached.load(Ordering::SeqCst),
-            "ACL-denied PROCESS must not reach the inner source"
-        );
-        let recorded = events.lock().unwrap();
-        assert_eq!(recorded[0].event, AuditEventKind::Process);
-        assert_eq!(recorded[0].result, AuditResult::Denied);
     }
 
     /// Regression: minimal source that records whether its

@@ -898,37 +898,6 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn process(
-        &self,
-        name: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = RecordName::from(name);
-        let this = self.snapshot();
-        async move {
-            for src in this {
-                if src.has_pv(&name).await {
-                    return src.process(&name).await;
-                }
-            }
-            Err(OpError::failed(format!("no source serves '{name}'")))
-        }
-    }
-
-    fn process_checked(
-        &self,
-        checked: AccessChecked,
-        ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().clone();
-        let this = self.snapshot();
-        async move {
-            match Self::resolve_checked(this, &name, &ctx).await {
-                Some((src, inner_checked)) => src.process_checked(inner_checked, ctx).await,
-                None => Err(OpError::failed(format!("no source serves '{name}'"))),
-            }
-        }
-    }
-
     // ChannelArray routed to the resolving owner. Without these the trait
     // default ("not supported") would mask a wrapped inner's array support
     // whenever a composite wraps it (e.g. the PVA gateway under a
@@ -936,7 +905,7 @@ impl ChannelSource for CompositeSource {
     // source) — the wrapper-severs-override defect family. INIT picks the
     // owner by credentialed existence (matching `resolve_owner`); the
     // sub-ops re-mint the access token through the owner's gate via
-    // `resolve_checked`, exactly as `put_get_checked` / `process_checked` do.
+    // `resolve_checked`, exactly as `put_get_checked` does.
     fn channel_array_init(
         &self,
         name: &[u8],

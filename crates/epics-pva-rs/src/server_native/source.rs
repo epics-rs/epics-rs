@@ -110,8 +110,7 @@ pub struct ChannelContext {
     /// the create-time pvRequest, kept distinct from the EXEC argument
     /// (`request_desc`/`request_value` of [`ChannelSource::rpc_checked`])
     /// so a source — or a gateway forwarding
-    /// `createChannelRPC(..., pvRequest)` — can inspect it. For PROCESS it
-    /// is the PROCESS INIT pvRequest (`record._options`).
+    /// `createChannelRPC(..., pvRequest)` — can inspect it.
     ///
     /// `None` for op kinds / paths where no pvRequest was captured (GET,
     /// where the request was consumed for masking) or when the wire
@@ -688,8 +687,7 @@ pub struct WatermarkEvent {
     pub kind: WatermarkKind,
 }
 
-/// Why a [`ChannelSource`] mutating op (`put_value*`, `process*`,
-/// `rpc*`) failed, carried as a typed value so audit / forwarding
+/// Why a [`ChannelSource`] mutating op (`put_value*`, `rpc*`) failed, carried as a typed value so audit / forwarding
 /// layers classify the outcome from a discriminant rather than
 /// substring-matching the human message. pvxs buckets the audit log
 /// into "Denied" (access-control refusal) vs "Failed" (everything
@@ -1378,8 +1376,8 @@ pub trait ChannelSource: Send + Sync + 'static {
     // The INIT pvRequest (which selects the array field) is threaded to
     // every sub-op through [`ChannelContext::pv_request`] — the wire layer
     // stashes it at INIT and re-supplies it on each get/put/length call —
-    // so the trait stays stateless per call, matching how PROCESS / PUT_GET
-    // forward their create-time `record._options`.
+    // so the trait stays stateless per call, matching how PUT_GET forwards
+    // its create-time `record._options`.
 
     /// ChannelArray INIT — bind the array-typed field this operation
     /// windows over and return its [`FieldDesc`] introspection (serialised
@@ -1782,50 +1780,6 @@ pub trait ChannelSource: Send + Sync + 'static {
             }
             self.rpc(checked.pv_name(), request_desc, request_value)
                 .await
-        }
-    }
-
-    /// Trigger record/PV **processing** without transferring a value
-    /// (PVA wire command `PROCESS`, cmd 16). Unlike PUT-with-
-    /// `record[process=true]`, this carries no value payload — it is
-    /// the wire equivalent of an EPICS `dbProcess` / `caput .PROC`.
-    ///
-    /// Default impl returns `Ok(())` — sources whose PVs have no
-    /// processing semantics (constant / mailbox PVs) treat PROCESS as
-    /// a no-op success, matching how a passive record handles a `.PROC`
-    /// write. Sources backed by a processable record (IOC database,
-    /// `SharedPV` with an `on_process` hook) override to actually run
-    /// the processing chain. An `Err` surfaces to the client as a
-    /// PROCESS error status.
-    fn process(
-        &self,
-        name: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let _ = name;
-        async move { Ok(()) }
-    }
-
-    /// Type-state-enforced PROCESS. pvxs treats `process()` as a
-    /// WRITE-class operation for ACF (it mutates record state), so a
-    /// non-`ReadWrite` token is refused with an error; on `ReadWrite`
-    /// it delegates to the ctx-less [`Self::process`]. Sources that
-    /// need credential-aware routing override this directly.
-    fn process_checked(
-        &self,
-        checked: AccessChecked,
-        ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        async move {
-            if !checked.allows_write() {
-                return Err(OpError::denied(format!(
-                    "PROCESS denied by access security: '{}' from {}/{}/{}",
-                    checked.pv_name(),
-                    ctx.creds.host,
-                    ctx.creds.account,
-                    ctx.creds.method,
-                )));
-            }
-            self.process(checked.pv_name()).await
         }
     }
 
@@ -2974,16 +2928,6 @@ pub trait ChannelSourceObj: Send + Sync {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
-    fn process<'a>(
-        &'a self,
-        name: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
-    /// Dyn forwarder for type-state PROCESS.
-    fn process_checked<'a>(
-        &'a self,
-        checked: AccessChecked,
-        ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext);
@@ -3348,19 +3292,6 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             request_value,
             ctx,
         ))
-    }
-    fn process<'a>(
-        &'a self,
-        name: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::process(self, name))
-    }
-    fn process_checked<'a>(
-        &'a self,
-        checked: AccessChecked,
-        ctx: ChannelContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
     fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         contain_callback_panic("notify_watermark", name, || {

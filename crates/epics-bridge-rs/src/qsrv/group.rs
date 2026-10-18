@@ -1586,64 +1586,16 @@ impl GroupChannel {
                 ProcessMode::Force => {
                     // Any PACT park this put releases replays on the cycle two
                     // lines down, from its tail — C's only restart owner.
+                    // `doPostProcessing` (iocsource.cpp:402-413): RPRO on an
+                    // active record, PUTF and dbProcess on an idle one.
                     puts.put_pv(record, field_name, value).map_err(to_err)?;
-                    let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
-                        .process_record_with_links_already_locked(record_name, &mut visited)
+                        .put_driven_process_already_locked(record_name)
                         .map_err(to_err)?;
                 }
             }
             Ok(())
         })
-    }
-
-    /// [`Self::apply_member_value_already_locked`]'s gate-acquiring twin —
-    /// the non-atomic per-member path. No member gate is held here, so every
-    /// write below takes the gate-acquiring entry and the trap bracket
-    /// awaits it.
-    async fn apply_member_value(
-        &self,
-        member: &MemberChannel,
-        value: epics_base_rs::types::EpicsValue,
-        process: super::channel::ProcessMode,
-        grant: super::provider::WriteGrant,
-    ) -> BridgeResult<()> {
-        use super::channel::ProcessMode;
-        let (record_name, field_name) = member.names();
-        let pv_name = [record_name, b".", field_name.as_bytes()].concat();
-        let pv_name = &pv_name[..];
-        let field_name = member.put_field();
-        let meta = super::trap_write::TrapWriteMeta {
-            pv_name,
-            user: self.access.creds.user.as_bytes(),
-            host: &self.access.creds.host,
-            peer: &self.access.creds.host,
-            dbr_type: value.dbr_type() as u16,
-        };
-        super::trap_write::put_with_trap(grant, meta, value, |value| async move {
-            let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
-            match process {
-                ProcessMode::Inhibit => {
-                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
-                }
-                ProcessMode::Passive => {
-                    self.db
-                        .put_record_field_from_ca_no_notify(record_name, field_name, value)
-                        .await
-                        .map_err(to_err)?;
-                }
-                ProcessMode::Force => {
-                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
-                    let mut visited = epics_base_rs::server::database::ProcStack::new();
-                    self.db
-                        .process_record_with_links(record_name, &mut visited)
-                        .await
-                        .map_err(to_err)?;
-                }
-            }
-            Ok(())
-        })
-        .await
     }
 
     /// group PUT with explicit per-operation options.
@@ -2071,19 +2023,34 @@ impl GroupChannel {
                             }
                         };
 
-                        // non-atomic per-member write — gate-acquiring variants.
-                        // The member's trap grant (resolved in the per-member
-                        // ACF pass) gates `asTrapWrite` emission for this write.
-                        self.apply_member_value(
-                            member,
-                            epics_val,
-                            opts.process,
-                            member_grants
-                                .get(member.def.field_name.as_str())
-                                .copied()
-                                .unwrap_or_default(),
-                        )
-                        .await?;
+                        // pvxs locks this member alone (`DBLocker F`,
+                        // groupsource.cpp:640-649) around the same
+                        // `putGroupField` the atomic loop runs, so the write
+                        // and its post-processing share one hold here too.
+                        let record = self
+                            .db
+                            .resolve_alias(&member.record)
+                            .unwrap_or_else(|| member.record.clone());
+                        let grant = member_grants
+                            .get(member.def.field_name.as_str())
+                            .copied()
+                            .unwrap_or_default();
+                        self.db.put_many_locked(
+                            std::slice::from_ref(&record),
+                            1,
+                            |puts| -> BridgeResult<()> {
+                                let locked =
+                                    puts.record(0).expect("slot 0 is the one record locked");
+                                self.apply_member_value_already_locked(
+                                    locked,
+                                    member,
+                                    epics_val,
+                                    opts.process,
+                                    grant,
+                                    puts,
+                                )
+                            },
+                        )?;
                     }
                 }
                 did_something = true;
@@ -6346,5 +6313,102 @@ mod tests {
             .expect("an update");
 
         mon.stop().await;
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - passes under EPICS_RS_BUILD_EXEC_BACKEND=thread.
+    /// pvxs `putGroupField` ends in `doPostProcessing` (iocsource.cpp:395-418),
+    /// which under `process=true` splits on PACT as `dbPutField` does: an
+    /// active member record takes RPRO and is not processed, an idle one takes
+    /// PUTF, which its FLNK target inherits through `processTarget`.
+    #[tokio::test]
+    async fn an_atomic_forced_member_write_takes_db_process_s_pact_split() {
+        forced_member_write_takes_db_process_s_pact_split(true).await;
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - passes under EPICS_RS_BUILD_EXEC_BACKEND=thread.
+    /// The non-atomic loop holds each member's lock across the same body
+    /// (`DBLocker F`, groupsource.cpp:640-649).
+    #[tokio::test]
+    async fn a_non_atomic_forced_member_write_takes_db_process_s_pact_split() {
+        forced_member_write_takes_db_process_s_pact_split(false).await;
+    }
+
+    async fn forced_member_write_takes_db_process_s_pact_split(atomic: bool) {
+        use super::super::channel::{ProcessMode, PutOptions};
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        {
+            let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+                .db_string(
+                    r#"
+record(calcout, "CO") { field(ODLY, "0.5") field(CALC, "1") }
+record(calc, "H") { field(FLNK, "T") }
+record(calcout, "T") { field(ODLY, "0.5") field(CALC, "1") }
+"#,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            db.process_record_with_links(
+                "CO",
+                &mut epics_base_rs::server::database::ProcStack::new(),
+            )
+            .await
+            .unwrap();
+            let cfg = r#"{ "F:GRP": {
+                "co": {"+type":"plain","+channel":"CO.A","+putorder":0},
+                "h": {"+type":"plain","+channel":"H.A","+putorder":1}
+            } }"#;
+            let def = super::super::group_config::parse_group_config(cfg)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let channel = GroupChannel::new(db.clone(), def);
+            let mut value = PvStructure::new("structure");
+            value
+                .fields
+                .push(("co".into(), PvField::Scalar(ScalarValue::Double(2.0))));
+            value
+                .fields
+                .push(("h".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+            channel
+                .put_with_options(
+                    &value,
+                    PutOptions {
+                        process: ProcessMode::Force,
+                        block: false,
+                    },
+                    Some(atomic),
+                    &RemoteLog::default(),
+                )
+                .await
+                .expect("group PUT");
+
+            {
+                let co = db.get_record("CO").unwrap();
+                let co = co.read();
+                assert!(co.is_processing(), "ODLY holds CO PACT (atomic={atomic})");
+                assert_eq!(
+                    co.common.rpro, 1,
+                    "an active member takes RPRO (atomic={atomic})"
+                );
+                assert_eq!(
+                    co.common.lcnt, 0,
+                    "doPostProcessing does not call dbProcess (atomic={atomic})"
+                );
+            }
+            let t = db.get_record("T").unwrap();
+            let t = t.read();
+            assert!(
+                t.is_processing(),
+                "H's FLNK started T's ODLY (atomic={atomic})"
+            );
+            assert!(
+                t.common.putf,
+                "processTarget copied H's PUTF (atomic={atomic})"
+            );
+        }
     }
 }

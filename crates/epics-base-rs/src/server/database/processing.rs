@@ -2768,19 +2768,6 @@ impl PvDatabase {
         self.process_record_with_links(name, &mut visited).await
     }
 
-    /// `process_record` variant for a caller that already
-    /// owns the record's advisory write gate — the QSRV atomic group
-    /// PUT applying a `+proc` member. The gate is not
-    /// reentrant; the atomic group path MUST use this entry. See
-    /// [`crate::server::database::PvDatabase::lock_records`].
-    pub async fn process_record_already_locked(&self, name: impl AsRef<[u8]>) -> CaResult<()> {
-        let name = name.as_ref();
-        // Same delegation as [`Self::process_record`], but to the gate-held
-        // engine entry since the caller already owns the advisory write gate.
-        let mut visited = ProcStack::new();
-        self.process_record_with_links_already_locked(name, &mut visited)
-    }
-
     /// Process a record with full link handling (INP -> process -> alarms -> OUT -> FLNK).
     /// Uses the visited set for cycle detection.
     ///

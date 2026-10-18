@@ -50,7 +50,7 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass on the exec backend under
+// RTEMS-EXEC-MODEL-ALLOW(15): checked to pass on the exec backend under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
 // --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
 // seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
@@ -534,34 +534,6 @@ impl ChannelSource for ControlSource {
         }
     }
 
-    /// Reject PROCESS. The `ChannelSource` default `process` returns
-    /// `Ok(())` — for this source that would silently swallow a PVA
-    /// PROCESS (`caput -c` / `pvcall .PROC`) and falsely report
-    /// success. Neither the diagnostic PVs (read-only) nor the
-    /// control PVs (RPC targets) have processing semantics, so a
-    /// PROCESS is refused the same way `put_value` refuses a PUT.
-    /// `process_checked`'s default delegates here after its WRITE
-    /// gate, so this one override covers both entry points.
-    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
-        // All operational (wrong method / read-only / not found) — Failed.
-        if self.is_control(name) {
-            Err(OpError::failed(format!(
-                "control PV '{}' is invoked via RPC (pvcall), not PROCESS",
-                String::from_utf8_lossy(name)
-            )))
-        } else if self.is_diag(name) {
-            Err(OpError::failed(format!(
-                "'{}' is a read-only diagnostic PV — PROCESS not supported",
-                String::from_utf8_lossy(name)
-            )))
-        } else {
-            Err(OpError::failed(format!(
-                "unknown control PV '{}'",
-                String::from_utf8_lossy(name)
-            )))
-        }
-    }
-
     /// B6: writable control surface. RPC is gated by the operator
     /// credential predicate; `rpc` (the ctx-less path) carries no
     /// identity and so can never be allowed — only `rpc_checked`,
@@ -798,14 +770,6 @@ mod tests {
             .await
     }
 
-    /// MINOR regression: `ControlSource` must reject a PVA PROCESS.
-    /// The `ChannelSource` default `process` returns `Ok(())`, which
-    /// would silently swallow a `caput -c` / `pvcall .PROC` and
-    /// falsely report success. Neither the diagnostic PVs nor the
-    /// control PVs have processing semantics — PROCESS is refused the
-    /// same way `put_value` refuses a PUT. `process_checked`'s default
-    /// delegates to `process` after its WRITE gate, so the single
-    /// `process` override covers both entry points.
     /// Control diagnostics and cache admin
     /// must span EVERY upstream tenant of a multi-tenant downstream,
     /// not just the first. Only the SECOND tenant's cache is populated
@@ -930,43 +894,6 @@ mod tests {
         assert!(
             report.contains("subscribers="),
             "report exposes per-channel subscriber count"
-        );
-    }
-
-    #[tokio::test]
-    async fn control_process_is_rejected() {
-        let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw);
-
-        // Control PV (RPC target).
-        let err = ctrl
-            .process(b"gw:flush")
-            .await
-            .expect_err("PROCESS of a control PV must be rejected");
-        assert!(
-            err.message.contains("not PROCESS"),
-            "control PV reason: {err:?}"
-        );
-
-        // Diagnostic PV (read-only).
-        let err = ctrl
-            .process(b"gw:cacheSize")
-            .await
-            .expect_err("PROCESS of a diagnostic PV must be rejected");
-        assert!(
-            err.message.contains("PROCESS not supported"),
-            "diag PV reason: {err:?}"
-        );
-
-        // process_checked (WRITE-granted token) still rejects because
-        // the default delegates to the overridden `process`.
-        let err = ctrl
-            .process_checked(checked("gw:flush").await, ctx("ops", "ca"))
-            .await
-            .expect_err("process_checked must reject even with a WRITE token");
-        assert!(
-            err.message.contains("not PROCESS"),
-            "process_checked reason: {err:?}"
         );
     }
 

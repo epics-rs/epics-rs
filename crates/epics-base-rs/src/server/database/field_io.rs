@@ -3997,10 +3997,15 @@ impl PvDatabase {
             // Through the one install owner. Assigning the slot here instead
             // would drop the prior client's Sender, and its receiver then wakes
             // with the RecvError the CA dispatcher reads as success.
-            match guard.install_or_queue_notify(completion) {
+            let notify = match guard.install_or_queue_notify(completion) {
                 Some(notify) => notify,
                 None => return Ok(NotifyInstall::Queued),
+            };
+            // C `if (first) precord->putf = TRUE;` (dbNotify.c:252-255).
+            if matches!(arrival, NotifyArrival::Fresh) {
+                guard.common.putf = true;
             }
+            notify
         };
         let mut visited = crate::server::database::ProcStack::new();
         self.process_record_with_links_already_locked(record_name, &mut visited)

@@ -8,7 +8,7 @@
 //! through a per-entry tokio broadcast channel so multiple downstream
 //! clients share one upstream subscription.
 
-// RTEMS-EXEC-MODEL-ALLOW(24): checked to pass on the exec backend under
+// RTEMS-EXEC-MODEL-ALLOW(22): checked to pass on the exec backend under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
 // --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
 // seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
@@ -374,7 +374,7 @@ pub struct GatewayChannelSource {
     /// identity when evaluating its own ACF rules. Anonymous /
     /// empty-account peers fall through to the shared `cache`.
     /// Parallels `upstream_pool` which already provides per-credential
-    /// routing for PUT / RPC / PROCESS.
+    /// routing for PUT / RPC.
     ///
     /// keyed by account, method, host, AND authority — see
     /// [`UpstreamIdentityKey`].
@@ -602,7 +602,7 @@ impl GatewayChannelSource {
     /// `ctx`. Credentialed peers get a per-(account, method) cache backed
     /// by their own upstream PvaClient; anonymous peers reuse the shared
     /// `cache`. Parallels `upstream_client_for` which does the same for
-    /// PUT/RPC/PROCESS.
+    /// PUT/RPC.
     fn upstream_cache_for(&self, ctx: &ChannelContext) -> Arc<ChannelCache> {
         if ctx.creds.account.is_empty() || ctx.creds.method == "anonymous" {
             return self.cache.clone();
@@ -1101,7 +1101,7 @@ impl ChannelSource for GatewayChannelSource {
         // event look "not found", and poisoned the negative cache on a slow
         // first frame. The connect runs without a monitor (pvxs
         // `Context::connect`); the client's pool reuses the connection for
-        // the GET/PUT/RPC/PROCESS that follow.
+        // the GET/PUT/RPC that follow.
         //
         // Route the admission through the gateway-owned cache rather than
         // calling the client directly, so the connected channel is counted
@@ -1503,93 +1503,18 @@ impl ChannelSource for GatewayChannelSource {
         }
     }
 
-    /// Forward a PVA PROCESS (wire cmd 16) to the upstream PV. The
-    /// `ChannelSource` default returns `Ok(())` — for a proxying
-    /// gateway that silently swallows the PROCESS and falsely reports
-    /// success, so a downstream `caput -c` / `pvcall .PROC` never
-    /// actually triggers the upstream record. This override forwards
-    /// `pvprocess` through the shared client, which connects on demand.
-    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
-        let name = upstream_name_op(name)?;
-        // No monitor-gated preflight (see `put_value`): PROCESS forwards
-        // through the shared client, which connects on demand and surfaces
-        // the upstream error itself.
-        self.cache
-            .client()
-            .pvprocess(name)
-            .await
-            .map_err(upstream_op_error)
-    }
-
-    /// Credential-aware PROCESS. pvxs treats PROCESS as a WRITE-class
-    /// operation for ACF (it mutates record state), so a non-write
-    /// token is refused with a gateway-identifying error. On allow
-    /// the request is forwarded through the per-(account, method)
-    /// upstream client pool — the same identity-preserving routing
-    /// `put_value_checked` uses.
-    async fn process_checked(
-        &self,
-        checked: AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !checked.allows_write() {
-            tracing::debug!(
-                pv = %checked.pv_name(),
-                account = %ctx.creds.account,
-                method = %ctx.creds.method,
-                "pva-gateway: PROCESS denied by gateway ACF"
-            );
-            return Err(OpError::denied(format!(
-                "PROCESS denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-        let name = upstream_name_op(checked.pv_name())?;
-        // no shared-cache preflight (see put_value_checked).
-        // PROCESS runs through the per-credential client, which resolves
-        // existence and returns the upstream error itself.
-        let client = self.upstream_client_for(&ctx);
-        // Forward the downstream PROCESS INIT pvRequest — captured into
-        // `ctx.pv_request` at PROCESS INIT — upstream, matching pva2pva
-        // createChannelProcess(..., pvRequest) (p2pApp/channel.cpp:98-107).
-        // The prior code validated but discarded it, so an upstream
-        // provider that interprets PROCESS `record._options` saw the
-        // gateway's default request. Fall back to the default empty
-        // pvRequest when the downstream sent none.
-        //
-        // The relay sends cmd 16, not the empty-PUT spelling
-        // (`Context::pvput_empty_with_request`), even though pvxs has no PROCESS handler
-        // and an upstream pvxs IOC drains the frame at `conn.cpp:249-253`'s
-        // `default:` without replying. pva2pva forwards the request
-        // unchanged (`p2pApp/channel.cpp:98-107`), and translating it here
-        // would show the upstream ACF and put-log a PUT where the client
-        // asked for PROCESS. The upstream silence is bounded rather than
-        // rewritten: the client's op timeout turns it into
-        // `PvaError::Timeout`, which `upstream_op_error` reports downstream.
-        // Measured in `epics-pva-rs/tests/process_drained_by_pvxs_peer.rs`.
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => client.pvprocess_with_request_value(name, req).await,
-            None => client.pvprocess(name).await,
-        };
-        result.map_err(upstream_op_error)
-    }
-
     // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
     //
     // pva2pva `GWChannel::createChannelArray` (`p2pApp/channel.cpp:226-232`)
     // forwards the array op to the upstream channel with the downstream's
     // pvRequest unchanged. We mirror that: every sub-op runs through the
     // per-credential client (so the upstream IOC sees the real downstream
-    // identity, like `put_value_checked` / `rpc_checked` / `process_checked`)
+    // identity, like `put_value_checked` / `rpc_checked`)
     // and carries the downstream INIT pvRequest — captured in
     // `ctx.pv_request` — so the upstream resolves the same bound array field
     // the downstream selected. Each forward is one upstream
     // INIT+sub-op+DESTROY (the gateway holds no upstream array op state),
-    // matching the stateless one-shot forward the other write/process paths
+    // matching the stateless one-shot forward the other write paths
     // use. ACF is applied per sub-op by the read/write gate below, mirroring
     // pvAccessCPP's per-sub-op gating (`responseHandlers.cpp` gates each
     // ChannelArray request, not the create).
@@ -1807,7 +1732,7 @@ impl ChannelSource for GatewayChannelSource {
         // Forward a real upstream ChannelGet through the per-credential
         // client so the upstream IOC sees the real downstream identity and
         // owns GET freshness — the same identity-preserving routing
-        // `put_value_checked` / `rpc_checked` / `process_checked` already use.
+        // `put_value_checked` / `rpc_checked` already use.
         // pva2pva `p2pApp/channel.cpp:109-115` forwards createChannelGet
         // rather than replaying the monitor cache; the snapshot path
         // returned stale cache state and never ran the upstream GET-side
@@ -2516,59 +2441,6 @@ ASG(DEFAULT) {
             assert!(
                 !msg.message.contains("denied by gateway access security"),
                 "no-ACF PUT must NOT be ACL-denied: {msg:?}",
-            );
-            assert_eq!(
-                msg.kind,
-                OpErrorKind::Failed,
-                "forwarded upstream error must classify as Failed, not a gateway denial: {msg:?}"
-            );
-        }
-    }
-
-    /// MINOR (PVA PROCESS forwarding): `process_checked` gates on the
-    /// gateway ACF as a WRITE-class op. Pre-fix the gateway used the
-    /// trait default `process` (`Ok(())`), silently swallowing every
-    /// PROCESS and reporting false success. A non-write token must be
-    /// refused with a gateway-identifying error.
-    #[tokio::test]
-    async fn process_checked_denied_when_acf_no_write() {
-        let src = make_source();
-        let cfg = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) }"#).unwrap();
-        src.set_acf(Some(cfg)).await;
-
-        let ctx = make_ctx("anyhost", "intruder", "anonymous");
-        let token = check(&src, "some:pv", &ctx).await;
-        let err = src
-            .process_checked(token, ctx)
-            .await
-            .expect_err("PROCESS must be denied for a non-write peer");
-        assert_eq!(
-            err.kind,
-            OpErrorKind::Denied,
-            "PROCESS gateway ACF denial must classify as Denied: {err:?}"
-        );
-        assert!(
-            err.message
-                .contains("PROCESS denied by gateway access security"),
-            "denial must name the gateway as enforcer: {err:?}",
-        );
-    }
-
-    /// MINOR: with WRITE granted the `process_checked` ACL passes and
-    /// the call reaches the upstream forward (which fails in-test with
-    /// a lookup/timeout, never the ACL denial).
-    #[tokio::test]
-    async fn process_checked_passes_acl_when_write_granted() {
-        let src = make_source();
-        let cfg = parse_acf(r#"ASG(DEFAULT) { RULE(1, READ) RULE(1, WRITE) }"#).unwrap();
-        src.set_acf(Some(cfg)).await;
-
-        let ctx = make_ctx("anyhost", "anyone", "anonymous");
-        let token = check(&src, "some:pv", &ctx).await;
-        if let Err(msg) = src.process_checked(token, ctx).await {
-            assert!(
-                !msg.message.contains("denied by gateway access security"),
-                "WRITE-granted PROCESS must NOT be ACL-denied: {msg:?}",
             );
             assert_eq!(
                 msg.kind,

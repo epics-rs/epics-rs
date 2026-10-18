@@ -178,8 +178,20 @@ fn kept(out: &[u8]) -> Vec<String> {
 }
 
 /// A logged bus answer the test plays: `StreamCore::lockCallback(rec,
-/// StreamIoSuccess)` and the like.
+/// StreamIoSuccess)` and the like, or the bus's own error line.
 fn play(line: &str) -> Option<Answer> {
+    // AsynDriverInterface's "rec connectToAsynPort: ...", printed by the mock
+    if let Some((client, _)) = line.split_once(": ")
+        && client
+            .strip_prefix("rec ")
+            .is_some_and(|f| f.bytes().all(|b| b.is_ascii_alphanumeric()))
+    {
+        return Some(Answer::BusError(line.to_string()));
+    }
+    if let Some(rest) = line.strip_prefix("StreamCore::connectCallback(rec, ") {
+        let (status, _) = rest.split_once(") activeCommand: ")?;
+        return Some(Answer::Connect(io_status(status)?));
+    }
     let rest = line.strip_prefix("StreamCore::")?;
     let (callback, args) = rest.split_once("(rec, ")?;
     let args = args.strip_suffix(')')?;
@@ -190,14 +202,7 @@ fn play(line: &str) -> Option<Answer> {
         }
         None => (args, None),
     };
-    let status = match status {
-        "StreamIoSuccess" => StreamIoStatus::StreamIoSuccess,
-        "StreamIoTimeout" => StreamIoStatus::StreamIoTimeout,
-        "StreamIoNoReply" => StreamIoStatus::StreamIoNoReply,
-        "StreamIoEnd" => StreamIoStatus::StreamIoEnd,
-        "StreamIoFault" => StreamIoStatus::StreamIoFault,
-        _ => return None,
-    };
+    let status = io_status(status)?;
     match (callback, input) {
         ("lockCallback", None) => Some(Answer::Lock(status)),
         ("writeCallback", None) => Some(Answer::Write(status)),
@@ -206,10 +211,23 @@ fn play(line: &str) -> Option<Answer> {
     }
 }
 
+fn io_status(status: &str) -> Option<StreamIoStatus> {
+    Some(match status {
+        "StreamIoSuccess" => StreamIoStatus::StreamIoSuccess,
+        "StreamIoTimeout" => StreamIoStatus::StreamIoTimeout,
+        "StreamIoNoReply" => StreamIoStatus::StreamIoNoReply,
+        "StreamIoEnd" => StreamIoStatus::StreamIoEnd,
+        "StreamIoFault" => StreamIoStatus::StreamIoFault,
+        _ => return None,
+    })
+}
+
 enum Answer {
     Lock(StreamIoStatus),
     Write(StreamIoStatus),
     Read(StreamIoStatus, Vec<u8>),
+    Connect(StreamIoStatus),
+    BusError(String),
 }
 
 impl Answer {
@@ -219,6 +237,10 @@ impl Answer {
             Answer::Write(status) => client.write_callback(status),
             Answer::Read(status, input) => {
                 client.read_callback(status, &input);
+            }
+            Answer::Connect(status) => client.connect_callback(status),
+            Answer::BusError(line) => {
+                stream_rs::error::stream_error(format!("{line}\n").as_bytes())
             }
         }
     }
@@ -533,4 +555,5 @@ cases!(
     twice,
     tpro,
     si_ok,
+    connect_fault,
 );

@@ -27,3 +27,4 @@ wait_timer	longin	l.proto w P	0	GET\r\n=>7\r\n	-
 twice	longin	l.proto p P	0	GET\r\n=>7\r\n	twice
 tpro	longin	l.proto p P	0	GET\r\n=>7\r\n	tpro
 si_ok	stringin	l.proto s P	0	S\r\n=>hello\r\n	noval
+connect_fault	longin	l.proto c P	0	-	-

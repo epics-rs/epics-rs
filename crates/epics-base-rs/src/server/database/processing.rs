@@ -102,7 +102,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult, DbResult, DbStatus};
-use crate::server::recgbl::alarm_status;
 use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
@@ -389,14 +388,14 @@ impl DeviceDone {
             .store(band_index(prio), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Hand the write's outcome to the record and queue the completing pass on
-    /// `priority`. `Err` is a full band, which C's caller ignores as well.
+    /// Queue the pass that completes an asynchronous write on `priority`. The
+    /// write's alarm is the device's own, read through `last_alarm` on that
+    /// pass. `Err` is a full band, which C's caller ignores as well.
     pub fn complete(
         &self,
         priority: crate::runtime::task::CallbackPriority,
-        outcome: CaResult<()>,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        self.owe(priority, Completion::Write(outcome.map_err(Box::new)))
+        self.owe(priority, Completion::Write)
     }
 
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
@@ -454,14 +453,22 @@ impl DeviceDone {
 /// outstanding. The oldest sits apart, so the one-pass run takes it as a
 /// single slot and `behind` allocates only when two are owed at once;
 /// `next.is_none()` implies `behind` is empty.
-#[derive(Default)]
-struct Owed {
-    next: Option<Completion>,
-    behind: std::collections::VecDeque<Completion>,
+struct Owed<T = Completion> {
+    next: Option<T>,
+    behind: std::collections::VecDeque<T>,
 }
 
-impl Owed {
-    fn push(&mut self, completion: Completion) {
+impl<T> Default for Owed<T> {
+    fn default() -> Self {
+        Self {
+            next: None,
+            behind: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<T> Owed<T> {
+    fn push(&mut self, completion: T) {
         if self.next.is_none() {
             self.next = Some(completion);
         } else {
@@ -469,7 +476,7 @@ impl Owed {
         }
     }
 
-    fn pop(&mut self) -> Option<Completion> {
+    fn pop(&mut self) -> Option<T> {
         let completion = self.next.take()?;
         self.next = self.behind.pop_front();
         Some(completion)
@@ -478,9 +485,8 @@ impl Owed {
 
 /// Which pass a [`DeviceDone`] request runs.
 enum Completion {
-    /// The tail after an asynchronous write, with its outcome; the error
-    /// boxed so a success owes a pointer-sized entry, not a `CaError`.
-    Write(Result<(), Box<CaError>>),
+    /// The tail after an asynchronous write.
+    Write,
     /// The record's `process()` re-entered after an asynchronous read.
     Read,
 }
@@ -588,8 +594,8 @@ impl crate::runtime::background::CallbackBody for DeviceReentry {
             // Counted after it was pushed, so the run owed a pass finds it.
             let completion = self.owed.lock().unwrap().pop().expect("a pass owed");
             match completion {
-                Completion::Write(outcome) => {
-                    let _ = db.complete_async_write(&self.name, outcome.map_err(|e| *e));
+                Completion::Write => {
+                    let _ = db.complete_async_write(&self.name);
                 }
                 Completion::Read => {
                     if let Some(rec) = db.get_record_no_resolve(&self.name) {
@@ -6342,7 +6348,6 @@ impl PvDatabase {
                             Ok(_) => dev.read(&mut *instance.record),
                             Err(e) => Err(e),
                         };
-                        let read_failed = read.is_err();
                         match read {
                             Ok(read_outcome) => {
                                 let status = read_outcome.status;
@@ -6385,12 +6390,7 @@ impl PvDatabase {
                         // An input's device raises its alarm in `readValue`,
                         // ahead of the record body.
                         if !plan.output_stage {
-                            raise_transfer_alarm(
-                                instance,
-                                read_failed,
-                                alarm_status::READ_ALARM,
-                                is_soft,
-                            );
+                            apply_device_alarm(instance, is_soft);
                         }
                     }
                 }
@@ -7410,7 +7410,7 @@ impl PvDatabase {
                             // output stage on callback cycles like any other C `dbProcess`:
                             // the motor record's retry / backlash / NTM-stop commands are
                             // emitted on exactly these passes.
-                            raise_transfer_alarm(instance, false, alarm_status::WRITE_ALARM, false);
+                            apply_device_alarm(instance, false);
                             None
                         } else if !record_should_output {
                             // OOPT gating for hardware outputs (longout DTYP=...).
@@ -7453,12 +7453,7 @@ impl PvDatabase {
                                     cycle_status.io(Err(DbStatus::FAILED));
                                 }
                                 instance.device = Some(dev);
-                                raise_transfer_alarm(
-                                    instance,
-                                    write_failed,
-                                    alarm_status::WRITE_ALARM,
-                                    false,
-                                );
+                                apply_device_alarm(instance, false);
                             }
                             None
                         }
@@ -8647,28 +8642,12 @@ impl PvDatabase {
         name: &'a (impl AsRef<[u8]> + ?Sized),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         let name = name.as_ref();
-        self.complete_async_record_with_outcome(name, Ok(()))
+        Box::pin(async move { self.complete_async_write(name) })
     }
 
-    /// [`Self::complete_async_record`] for an async device write, carrying
-    /// the write's outcome: an `Err` raises `WRITE_ALARM`/`INVALID` on the
-    /// completing pass, as the synchronous `write()` branch raises it in
-    /// place and as C's `processCallbackOutput` carries `result.status` to
-    /// the record's re-entry (devAsynFloat64.c:668). The only way to end an
-    /// async write cycle is through here, so a failed write cannot complete
-    /// `NO_ALARM`.
-    pub fn complete_async_record_with_outcome<'a>(
-        &'a self,
-        name: &'a (impl AsRef<[u8]> + ?Sized),
-        outcome: CaResult<()>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
-        let name = name.as_ref();
-        Box::pin(async move { self.complete_async_write(name, outcome) })
-    }
-
-    /// [`Self::complete_async_record_with_outcome`] on the calling thread: a
+    /// [`Self::complete_async_record`] on the calling thread: a
     /// [`DeviceDone`]'s callback band runs it.
-    fn complete_async_write(&self, name: &[u8], outcome: CaResult<()>) -> CaResult<()> {
+    fn complete_async_write(&self, name: &[u8]) -> CaResult<()> {
         if !self.accepts_reentry() {
             return Ok(());
         }
@@ -8697,19 +8676,13 @@ impl PvDatabase {
         };
         let record_gate = FrameGate::Taken(self.lock_instance(&rec));
         let mut visited = ProcStack::new();
-        self.complete_async_record_inner(
-            canonical,
-            record_gate.frame(&rec),
-            outcome.err(),
-            &mut visited,
-        )
+        self.complete_async_record_inner(canonical, record_gate.frame(&rec), &mut visited)
     }
 
     fn complete_async_record_inner(
         &self,
         canonical: RecordName,
         rec: InFrame<'_>,
-        write_error: Option<CaError>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         // Seed the cycle guard with this record's own name — mirrors
@@ -8830,12 +8803,7 @@ impl PvDatabase {
                 // The device's alarm is raised inside `writeValue`, after the
                 // test above, and only on a cycle that drives the output.
                 if !skip_out {
-                    raise_transfer_alarm(
-                        &mut instance,
-                        write_error.is_some(),
-                        alarm_status::WRITE_ALARM,
-                        is_soft,
-                    );
+                    apply_device_alarm(&mut instance, is_soft);
                 }
 
                 // OEVT: queue the output event when the output fires — same
@@ -10879,34 +10847,20 @@ fn invalid_output_action(instance: &mut RecordInstance, first_pass: bool) -> boo
 /// `processXxx` (a PENDING raise that this cycle's `monitor()` commits).
 ///
 /// C's record raises nothing on a failed `read_ai`/`write_ao` (aiRecord.c:482,
-/// aoRecord.c:565): the device's own alarm is the failure's, so devAsyn's
-/// COMM for asynDisconnected survives. `fallback`/INVALID stands in only for
-/// a device that failed and reported none; raised first, it took
-/// `recGblSetSevr`'s INVALID tie and outranked a lesser device alarm.
+/// aoRecord.c:565): the device's own alarm is the failure's, and a device
+/// that reports none leaves the record unalarmed.
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn raise_transfer_alarm(instance: &mut RecordInstance, failed: bool, fallback: u16, is_soft: bool) {
-    let reported = apply_device_alarm(instance, is_soft);
-    if failed && !reported {
-        crate::server::recgbl::rec_gbl_set_sevr(
-            &mut instance.common,
-            fallback,
-            crate::server::record::AlarmSeverity::Invalid,
-        );
+fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
+    if !is_soft {
+        apply_hard_device_alarm(instance);
     }
-}
-
-/// The alarm a device support's last transfer left, raised into the record;
-/// whether there was one.
-#[cfg_attr(not(debug_assertions), inline(always))]
-fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) -> bool {
-    !is_soft && apply_hard_device_alarm(instance)
 }
 
 /// [`apply_device_alarm`] for a device that is not soft, out of line so a
 /// soft record pays a branch and not this frame.
-fn apply_hard_device_alarm(instance: &mut RecordInstance) -> bool {
+fn apply_hard_device_alarm(instance: &mut RecordInstance) {
     let Some(alarm) = instance.device.as_ref().and_then(|d| d.last_alarm()) else {
-        return false;
+        return;
     };
     crate::server::recgbl::rec_gbl_set_sevr_msg(
         &mut instance.common,
@@ -10914,7 +10868,6 @@ fn apply_hard_device_alarm(instance: &mut RecordInstance) -> bool {
         crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
         alarm.msg,
     );
-    true
 }
 
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of
@@ -11638,32 +11591,29 @@ mod write_done_prio_tests {
 
 #[cfg(test)]
 mod owed_tests {
-    use super::{Completion, Owed};
-    use crate::error::CaError;
+    use super::Owed;
 
-    fn tag(n: u8) -> Completion {
-        Completion::Write(Err(Box::new(CaError::Protocol(n.to_string()))))
-    }
+    /// A pass, by number; `0` stands for a read.
+    type Tagged = Owed<u8>;
 
-    fn drain(owed: &mut Owed) -> Vec<String> {
+    fn drain(owed: &mut Tagged) -> Vec<String> {
         std::iter::from_fn(|| owed.pop())
-            .map(|c| match c {
-                Completion::Write(Err(e)) => e.to_string(),
-                Completion::Read => "read".into(),
-                Completion::Write(Ok(())) => unreachable!(),
+            .map(|n| match n {
+                0 => "read".into(),
+                n => format!("write {n}"),
             })
             .collect()
     }
 
     #[test]
     fn an_empty_owed_pops_nothing() {
-        assert!(Owed::default().pop().is_none());
+        assert!(Tagged::default().pop().is_none());
     }
 
     #[test]
     fn a_single_pass_leaves_nothing_behind_it() {
-        let mut owed = Owed::default();
-        owed.push(Completion::Read);
+        let mut owed = Tagged::default();
+        owed.push(0);
         assert!(owed.pop().is_some());
         assert!(owed.next.is_none());
         assert!(owed.pop().is_none());
@@ -11671,33 +11621,28 @@ mod owed_tests {
 
     #[test]
     fn every_pass_is_owed_in_order_however_many_are_outstanding() {
-        let mut owed = Owed::default();
+        let mut owed = Tagged::default();
         for n in 1..=64 {
-            owed.push(tag(n));
+            owed.push(n);
         }
-        let want: Vec<String> = (1..=64).map(|n| format!("protocol error: {n}")).collect();
+        let want: Vec<String> = (1..=64).map(|n| format!("write {n}")).collect();
         assert_eq!(drain(&mut owed), want);
     }
 
     #[test]
     fn a_pass_owed_after_a_pop_runs_after_the_ones_before_it() {
-        let mut owed = Owed::default();
-        owed.push(tag(1));
-        owed.push(Completion::Read);
-        owed.push(tag(2));
+        let mut owed = Tagged::default();
+        owed.push(1);
+        owed.push(0);
+        owed.push(2);
         assert!(owed.pop().is_some());
         for n in 3..=6 {
-            owed.push(tag(n));
+            owed.push(n);
         }
         assert_eq!(
             drain(&mut owed),
             [
-                "read",
-                "protocol error: 2",
-                "protocol error: 3",
-                "protocol error: 4",
-                "protocol error: 5",
-                "protocol error: 6"
+                "read", "write 2", "write 3", "write 4", "write 5", "write 6"
             ]
         );
     }

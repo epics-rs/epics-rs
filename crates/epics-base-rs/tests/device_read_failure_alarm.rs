@@ -5,7 +5,7 @@
 //! COMM, asynEpicsUtils.c:234-266). `recGblSetSevr` keeps the first raise
 //! unless a later one is strictly more severe, so a READ/INVALID raised ahead
 //! of the device's alarm took the INVALID tie and outranked a MAJOR one.
-//! READ/INVALID stands in only for a device that failed and reported none.
+//! A device that failed and reported none leaves the record unalarmed.
 //! The device raises inside `readValue`, ahead of the record body, so a body
 //! raise of equal severity in the same cycle loses to it.
 
@@ -109,9 +109,9 @@ async fn a_failed_read_keeps_the_device_s_own_lesser_alarm() {
 }
 
 #[epics_macros_rs::epics_test]
-async fn a_failed_read_with_no_device_alarm_is_read_alarm() {
+async fn a_failed_read_with_no_device_alarm_raises_nothing() {
     let alarm = read_once(None).await;
-    assert_eq!(alarm, (alarm_status::READ_ALARM, AlarmSeverity::Invalid));
+    assert_eq!(alarm, (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm));
 }
 
 #[epics_macros_rs::epics_test]

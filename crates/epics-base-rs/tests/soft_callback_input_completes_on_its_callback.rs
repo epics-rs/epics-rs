@@ -102,7 +102,7 @@ async fn an_async_soft_input_completes_on_the_band_its_prio_names_now() {
 
     // PRIO moves while the read is in flight.
     db.get_record("AI").unwrap().write().set_prio(2);
-    std::thread::spawn(move || done.complete(band, Ok(())).unwrap())
+    std::thread::spawn(move || done.complete(band).unwrap())
         .join()
         .unwrap();
 

@@ -101,7 +101,7 @@ async fn completes_on(prio: i16) -> Vec<String> {
         .expect("the write was submitted");
     std::thread::Builder::new()
         .name("port".into())
-        .spawn(move || done.complete(band, Ok(())).unwrap())
+        .spawn(move || done.complete(band).unwrap())
         .unwrap()
         .join()
         .unwrap();
@@ -154,7 +154,7 @@ async fn a_completion_after_the_scan_stopped_processes_nothing() {
         .unwrap();
     db.scan_control().stop();
     let (done, band) = pending.lock().unwrap().take().expect("submitted");
-    std::thread::spawn(move || done.complete(band, Ok(())).unwrap())
+    std::thread::spawn(move || done.complete(band).unwrap())
         .join()
         .unwrap();
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;

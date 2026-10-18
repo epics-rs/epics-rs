@@ -52,16 +52,12 @@ pub struct AsynLink {
 /// `processMbbi:1268-1270`, `processLi:1057-1060` (devAsynInt32.c). Kept here
 /// rather than on `DeviceReadOutcome` so the framework's constructors never
 /// grow a form that infers UDF from the value half.
-/// C processCommon's alarm for an output's result: the result's own, or the
-/// failed status mapped with the WRITE_ALARM default (devAsynOctet.c:806-809,
-/// devAsynInt32.c:494-500).
-fn write_alarm(ran: &AsynResult<RequestResult>) -> (u16, u16) {
+/// An output transfer's alarm before its dset's default applies: the
+/// result's own, or the status it failed with.
+fn write_alarm(ran: &AsynResult<RequestResult>) -> Result<(u16, u16), AsynStatus> {
     match ran {
-        Ok(r) => (r.alarm_status, r.alarm_severity),
-        Err(e) => asyn_error_to_alarm_with_default(
-            e,
-            epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
-        ),
+        Ok(r) => Ok((r.alarm_status, r.alarm_severity)),
+        Err(e) => Err(e.status()),
     }
 }
 
@@ -972,7 +968,7 @@ impl AsynDeviceSupport {
             return Err(self.report_queue_refusal(e.into()));
         }
         match finish {
-            Finish::Complete => *self.device_job.wrote.lock() = None,
+            Finish::Complete => *self.device_job.wrote.lock() = false,
             Finish::Reprocess => *self.device_job.read.lock() = None,
         }
         *slot = Some((op, user, finish));
@@ -1456,7 +1452,7 @@ fn carries_buffer(op: &RequestOp) -> bool {
 /// How the record's cycle ends once its queued request has run.
 #[derive(Clone, Copy)]
 enum Finish {
-    /// A put's write: the framework runs the cycle's tail with its outcome.
+    /// A put's write: the framework runs the cycle's tail.
     Complete,
     /// An input's `process` re-enters with PACT set and consumes the result,
     /// as C's second `processAi` pass does (devAsynInt32.c:831-856).
@@ -1471,10 +1467,10 @@ enum Finish {
 #[derive(Default)]
 struct DeviceJob {
     request: parking_lot::Mutex<Option<(RequestOp, AsynUser, Finish)>>,
-    /// A put's write outcome until `done` completes the cycle with it.
-    wrote: parking_lot::Mutex<Option<AsynResult<()>>>,
+    /// A put's write ran and `done` has yet to complete the cycle.
+    wrote: parking_lot::Mutex<bool>,
     /// The last put's [`write_alarm`], which the completing pass raises.
-    write_alarm: parking_lot::Mutex<(u16, u16)>,
+    write_alarm: parking_lot::Mutex<Option<Result<(u16, u16), AsynStatus>>>,
     /// A read's result until the re-entered pass consumes it; apart from
     /// `wrote`, so a write never moves a `RequestResult`.
     read: parking_lot::Mutex<Option<AsynResult<RequestResult>>>,
@@ -1918,8 +1914,8 @@ impl DeviceJob {
     fn ran(&self, finish: Finish, ran: AsynResult<RequestResult>) {
         match finish {
             Finish::Complete => {
-                *self.write_alarm.lock() = write_alarm(&ran);
-                *self.wrote.lock() = Some(ran.map(|_| ()));
+                *self.write_alarm.lock() = Some(write_alarm(&ran));
+                *self.wrote.lock() = true;
             }
             Finish::Reprocess => *self.read.lock() = Some(ran),
         }
@@ -1992,14 +1988,14 @@ impl CellBody for DeviceJob {
     /// cleared this request's result rather than receiving it.
     fn done(self: Arc<Self>) {
         let _slot = self.request.lock();
-        let wrote = self.wrote.lock().take();
+        let wrote = std::mem::take(&mut *self.wrote.lock());
         let reentry = self.reentry.lock();
         let Some((reentry, prio)) = &*reentry else {
             *self.read.lock() = None;
             return;
         };
-        if let Some(result) = wrote {
-            let _ = reentry.complete(*prio, result.map_err(|e| CaError::Protocol(e.to_string())));
+        if wrote {
+            let _ = reentry.complete(*prio);
         } else if self.read.lock().is_some() {
             // The result stays for the re-entered pass's `read()`.
             let _ = reentry.reprocess(*prio);
@@ -2726,9 +2722,38 @@ impl AsynDeviceSupport {
     /// The one synchronous write. Both `write()` and the non-blocking branch
     /// of `write_begin` end here, so the trace line and the alarm mapping
     /// cannot differ between them.
+    /// C processCommon's alarm for an output transfer: its own, or the failed
+    /// status mapped with the dset's default — WRITE_ALARM (devAsynInt32.c:1009,
+    /// devAsynOctet.c:806-809), but READ_ALARM in the array dsets' one
+    /// `process()` (devAsynXXXArray.cpp:330-332).
+    fn output_alarm(&self, wrote: Result<(u16, u16), AsynStatus>) -> (u16, u16) {
+        use epics_base_rs::server::recgbl::alarm_status;
+        let default_stat = if self.iface_type.ends_with("Array") {
+            alarm_status::READ_ALARM
+        } else {
+            alarm_status::WRITE_ALARM
+        };
+        wrote.unwrap_or_else(|status| asyn_status_to_alarm_with_default(status, default_stat))
+    }
+
+    /// Whether `processCommon` never sees `e`: only the scalar dsets keep a
+    /// refused `queueRequest` in `result.status` (devAsynInt32.c:796).
+    /// devAsynOctet.c:719 and devAsynXXXArray.cpp:266 only report it, so their
+    /// process maps the asynSuccess the last one reset, which leaves the last
+    /// transfer's `result.alarmStatus` standing (asynEpicsUtils.c:238-240):
+    /// the alarm stays as the last transfer left it.
+    fn drop_refusal(&self, e: &AsynError) -> bool {
+        e.is_queue_refused() && matches!(self.dset, Dset::Octet | Dset::Array)
+    }
+
     fn write_now(&mut self, op: RequestOp) -> CaResult<()> {
         let ran = self.submit_traced(op);
-        (self.last_alarm_status, self.last_alarm_severity) = write_alarm(&ran);
+        if let Err(e) = &ran {
+            if self.drop_refusal(e) {
+                return Ok(());
+            }
+        }
+        (self.last_alarm_status, self.last_alarm_severity) = self.output_alarm(write_alarm(&ran));
         ran.map(|_| ()).map_err(asyn_to_ca_error)
     }
 
@@ -3440,9 +3465,12 @@ impl DeviceSupport for AsynDeviceSupport {
                     .map(|op| self.submit_traced(op)),
             };
             if let Some(ran) = ran {
-                // C callbackWfWrite/WriteBinary: writeIt, then processCommon
-                // raises the result's alarm (devAsynOctet.c:1071-1091).
-                (self.last_alarm_status, self.last_alarm_severity) = write_alarm(&ran);
+                if !matches!(&ran, Err(e) if self.drop_refusal(e)) {
+                    // C callbackWfWrite/WriteBinary: writeIt, then processCommon
+                    // raises the result's alarm (devAsynOctet.c:1071-1091).
+                    (self.last_alarm_status, self.last_alarm_severity) =
+                        self.output_alarm(write_alarm(&ran));
+                }
             }
             return Ok(DeviceReadOutcome::ok());
         }
@@ -3711,6 +3739,9 @@ impl DeviceSupport for AsynDeviceSupport {
                     self.last_alarm_severity = result.alarm_severity;
                     self.last_ts = result.timestamp.map(Into::into);
                 }
+                // `processCommon` succeeds, defining the record (devAsynOctet.c:816-818,
+                // devAsynXXXArray.cpp:334-336).
+                Err(e) if self.drop_refusal(&e) => read_outcome = stored(true),
                 Err(e) => {
                     // A failed octet read that still transferred bytes hands
                     // them to the record. C `devAsynOctet::readIt`
@@ -3881,6 +3912,11 @@ impl DeviceSupport for AsynDeviceSupport {
         }
         if let Err(e) = self.queue(op, user, Finish::Complete) {
             self.end_processing();
+            if self.drop_refusal(&e) {
+                return Ok(WriteStart::Completed);
+            }
+            // `processAo` raises the refusal's own status (devAsynInt32.c:1008).
+            (self.last_alarm_status, self.last_alarm_severity) = self.output_alarm(Err(e.status()));
             return Err(asyn_to_ca_error(e));
         }
         Ok(WriteStart::Pending)
@@ -3893,7 +3929,8 @@ impl DeviceSupport for AsynDeviceSupport {
     }
 
     fn async_write_completed(&mut self) {
-        (self.last_alarm_status, self.last_alarm_severity) = *self.device_job.write_alarm.lock();
+        let wrote = self.device_job.write_alarm.lock().unwrap_or(Ok((0, 0)));
+        (self.last_alarm_status, self.last_alarm_severity) = self.output_alarm(wrote);
         self.end_processing();
     }
 

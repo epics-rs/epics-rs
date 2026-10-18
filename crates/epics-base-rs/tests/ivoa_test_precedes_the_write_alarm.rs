@@ -72,10 +72,8 @@ impl DeviceSupport for Dev {
         if !self.pending {
             return Ok(WriteStart::Synchronous);
         }
-        let outcome = self.record_write(record);
-        done.device_done()
-            .complete(done.priority(), outcome)
-            .unwrap();
+        let _ = self.record_write(record);
+        done.device_done().complete(done.priority()).unwrap();
         Ok(WriteStart::Pending)
     }
 
@@ -84,7 +82,9 @@ impl DeviceSupport for Dev {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
-        (self.wrote && matches!(self.invalid, Invalid::DeviceAlarm)).then_some(DeviceAlarm {
+        // A failed write's alarm is the device's own, as devAsyn's.
+        let raises = matches!(self.invalid, Invalid::DeviceAlarm | Invalid::WriteFails);
+        (self.wrote && raises).then_some(DeviceAlarm {
             stat: alarm_status::WRITE_ALARM,
             sevr: 3,
             msg: "",

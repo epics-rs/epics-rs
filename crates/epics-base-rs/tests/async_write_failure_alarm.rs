@@ -1,14 +1,14 @@
-//! A failed async device write ends its cycle in `WRITE_ALARM`/`INVALID`,
-//! as the synchronous `write()` branch does and as C's `processCallbackOutput`
+//! A failed async device write ends its cycle in the device's alarm, as the
+//! synchronous `write()` branch does and as C's `processCallbackOutput`
 //! reports through `pPvt->result.status` (devAsynFloat64.c:668-671).
 //!
 //! The completion task used to drop the write's result and call
 //! `complete_async_record` with no outcome, so a write the driver refused on an
 //! `ASYN_CANBLOCK` port completed `NO_ALARM`.
 //!
-//! A device that reports its own alarm owns it: C `aoRecord` `writeValue`
-//! raises nothing on a failed `write_ao` (aoRecord.c:565), and devAsyn maps
-//! asynDisconnected to COMM (asynEpicsUtils.c:234-266).
+//! The alarm is the device's alone: C `aoRecord` `writeValue` raises nothing
+//! on a failed `write_ao` (aoRecord.c:565), so a device that reports none
+//! leaves the record unalarmed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,14 +51,7 @@ impl DeviceSupport for AsyncDevice {
             return Ok(WriteStart::Synchronous);
         }
         self.failed = self.fails.load(Ordering::SeqCst);
-        let outcome = if self.fails.load(Ordering::SeqCst) {
-            Err(CaError::Protocol("asynError".into()))
-        } else {
-            Ok(())
-        };
-        done.device_done()
-            .complete(done.priority(), outcome)
-            .unwrap();
+        done.device_done().complete(done.priority()).unwrap();
         Ok(WriteStart::Pending)
     }
     fn dtyp(&self) -> &str {
@@ -117,8 +110,8 @@ async fn put_and_complete(db: &PvDatabase) -> (u16, AlarmSeverity) {
 }
 
 #[epics_macros_rs::epics_test]
-async fn a_failed_async_write_completes_in_write_alarm() {
-    let db = build(true).await;
+async fn a_failed_async_write_completes_in_the_device_s_alarm() {
+    let db = build_with(true, Some(alarm_status::WRITE_ALARM), true).await;
     let (stat, sevr) = put_and_complete(&db).await;
     assert_eq!(sevr, AlarmSeverity::Invalid);
     assert_eq!(stat, alarm_status::WRITE_ALARM);
@@ -149,9 +142,14 @@ async fn a_failed_sync_write_keeps_the_device_s_own_alarm() {
 }
 
 #[epics_macros_rs::epics_test]
-async fn a_failed_sync_write_with_no_device_alarm_is_write_alarm() {
-    let db = build_with(true, None, false).await;
-    let (stat, sevr) = put_and_complete(&db).await;
-    assert_eq!(sevr, AlarmSeverity::Invalid);
-    assert_eq!(stat, alarm_status::WRITE_ALARM);
+async fn a_failed_write_with_no_device_alarm_raises_nothing() {
+    for async_write in [false, true] {
+        let db = build_with(true, None, async_write).await;
+        let alarm = put_and_complete(&db).await;
+        assert_eq!(
+            alarm,
+            (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+            "async_write={async_write}"
+        );
+    }
 }

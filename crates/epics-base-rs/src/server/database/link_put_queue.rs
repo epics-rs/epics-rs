@@ -183,7 +183,7 @@ impl PutCompletion {
             }
             Self::Record(done) => {
                 if let Some(done) = done.take() {
-                    let _ = done.complete(done.priority(), Ok(()));
+                    let _ = done.complete(done.priority());
                 }
             }
         }

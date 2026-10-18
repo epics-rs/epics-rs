@@ -93,8 +93,16 @@ impl ScopeSimulator {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            // testAsynPortDriver.cpp:52-53.
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::ENUM,
         );
 
         let p_run = base.create_param("P_Run", ParamType::Int32).unwrap();
@@ -629,5 +637,25 @@ async fn read_config_handle(
             .read_float64(idx.p_update_time, 0)
             .await
             .unwrap_or(DEFAULT_UPDATE_TIME),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// testAsynPortDriver.cpp:52-53; asynPortDriver adds Common itself.
+    #[test]
+    fn port_carries_the_c_interface_and_interrupt_masks() {
+        let driver = ScopeSimulator::new("scopeMasks", Arc::new(Notify::new()));
+        let interrupts = InterfaceMask::INT32
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM;
+        assert_eq!(driver.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            driver.base.interface_mask(),
+            interrupts | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
     }
 }

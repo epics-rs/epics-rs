@@ -978,8 +978,8 @@ impl ModbusPortDriver {
     /// freshly-polled block (on-change gated per C `readPoller`, each callback
     /// carrying the poll's `io_status` as its `auxStatus`), then advance the
     /// on-change baseline (`prev_data` / `prev_io_status`) and clear the
-    /// one-shot `force_callback`. A binding that cannot be decoded is skipped
-    /// by [`fire_binding`](Self::fire_binding), so the cycle always reaches
+    /// one-shot `force_callback`. A client that cannot be decoded does not
+    /// stop [`fire_client`](Self::fire_client), so the cycle always reaches
     /// the end of the interrupt list.
     ///
     /// The Modbus read itself happened in [`poll_cycle`](Self::poll_cycle); on a

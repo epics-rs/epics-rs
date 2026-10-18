@@ -1132,6 +1132,33 @@ mod tests {
         rt.shutdown();
     }
 
+    /// The client's connection, its CONNECT read. The listener's ephemeral
+    /// port is open to every process on the box, so a connection that closes
+    /// before its first packet is someone else's and is skipped; any other
+    /// first packet fails.
+    async fn accept_connect(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            if let Some(kind) = read_packet_type(&mut sock).await {
+                assert_eq!(kind, 1, "CONNECT");
+                return sock;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "CONNECT")]
+    async fn a_wrong_first_packet_fails_the_accept() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        // PINGREQ, and the connection stays open.
+        client.write_all(&[0xC0, 0x00]).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), accept_connect(&listener)).await;
+    }
+
     /// Read one MQTT control packet from `sock` and return its type nibble.
     /// Framing only — the variable header and payload are skipped, so a 0xE0
     /// byte *inside* a packet cannot be mistaken for a DISCONNECT.
@@ -1179,8 +1206,7 @@ mod tests {
         // Minimal broker: CONNACK the CONNECT, then report the type of the next
         // packet the client sends (or None if it just closed the socket).
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+            let mut sock = accept_connect(&listener).await;
             // v5 CONNACK: session_present=0, reason=Success, 0 properties.
             sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
                 .await
@@ -1382,8 +1408,7 @@ mod tests {
 
         // First session, then the broker goes away entirely.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         wait_for(&path, "onConnectCb: Connected to broker").await;
         let booted = std::fs::read_to_string(&path).unwrap();
@@ -1397,8 +1422,7 @@ mod tests {
 
         // The broker is back.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         wait_for_n(&path, "onConnectCb: Reconnected.", 2).await;
 
@@ -1734,8 +1758,7 @@ mod tests {
         });
         start.notify_one();
 
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         let (kind, body) = read_packet(&mut sock).await.unwrap();
         assert_eq!(kind, 8, "SUBSCRIBE");
@@ -1876,8 +1899,7 @@ mod tests {
         });
         start.notify_one();
 
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         let log = || std::fs::read_to_string(&path).unwrap();
         let mut topics = HashSet::new();
@@ -2022,8 +2044,7 @@ mod tests {
 
         // First session: the SUBSCRIBE and one PUBLISH stay unacked, the
         // PUBLISH after it is acked.
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         assert_eq!(read_packet_type(&mut sock).await, Some(8), "SUBSCRIBE");
         publish("dev/owed");
@@ -2045,9 +2066,10 @@ mod tests {
             "the failures come before the loss:\n{lost}"
         );
 
-        // The broker is back: the new session fails nothing again.
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        // The broker is back: the new session fails nothing again. A stray
+        // connection queued ahead of the reconnect is not the client.
+        drop(tokio::net::TcpStream::connect(addr).await.unwrap());
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         let (kind, body) = read_packet(&mut sock).await.unwrap();
         assert_eq!(kind, 8, "SUBSCRIBE");
@@ -2137,8 +2159,7 @@ mod tests {
         });
         start.notify_one();
 
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         for i in 0..SENT {
             publish_tx
@@ -2229,8 +2250,7 @@ mod tests {
         });
         start.notify_one();
 
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         publish_tx
             .send(PublishRequest {
@@ -2459,8 +2479,7 @@ mod tests {
         });
         start.notify_one();
 
-        let (mut sock, _) = listener.accept().await.unwrap();
-        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
         let mut pkids = Vec::new();
         for topic in ["dev/a", "dev/b"] {

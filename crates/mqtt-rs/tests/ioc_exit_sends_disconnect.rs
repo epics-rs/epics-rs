@@ -125,22 +125,33 @@ fn broker_session(
     ready: &TcpListener,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
-    let mut sock = accept_before(broker, deadline)?;
-    sock.set_read_timeout(Some(Duration::from_secs(20)))
-        .map_err(|e| format!("set_read_timeout: {e}"))?;
-
-    match next_packet(&mut sock) {
-        Ok(CONNECT) => {}
-        Ok(other) => return Err(format!("first packet was type {other}, expected CONNECT")),
-        Err(e) => return Err(format!("no CONNECT from the IOC child: {e}")),
-    }
+    // Both listeners' ephemeral ports are open to every process on the box: a
+    // connection that ends before its first byte is someone else's, skipped.
+    let mut sock = loop {
+        let mut sock = accept_before(broker, deadline)?;
+        sock.set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|e| format!("set_read_timeout: {e}"))?;
+        match next_packet(&mut sock) {
+            Ok(CONNECT) => break sock,
+            Ok(other) => return Err(format!("first packet was type {other}, expected CONNECT")),
+            Err(e) if e == END => {}
+            Err(e) => return Err(format!("no CONNECT from the IOC child: {e}")),
+        }
+    };
 
     // v5 CONNACK: session_present=0, reason=Success, no properties.
     sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
         .and_then(|()| sock.flush())
         .map_err(|e| format!("send CONNACK: {e}"))?;
 
-    let mut go = accept_before(ready, deadline)?;
+    let mut go = loop {
+        let mut go = accept_before(ready, deadline)?;
+        match fill(&mut go, &mut [0u8; 1]) {
+            Ok(()) => break go,
+            Err(e) if e == END => {}
+            Err(e) => return Err(format!("no hello on the release socket: {e}")),
+        }
+    };
     go.write_all(b"g")
         .and_then(|()| go.flush())
         .map_err(|e| format!("release the child: {e}"))?;
@@ -228,11 +239,14 @@ fn next_packet(sock: &mut TcpStream) -> Result<u8, String> {
     Ok(header[0] >> 4)
 }
 
+/// [`fill`]'s error for a peer that closed.
+const END: &str = "end of session";
+
 fn fill(sock: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
         match sock.read(&mut buf[done..]) {
-            Ok(0) => return Err("end of session".to_string()),
+            Ok(0) => return Err(END.to_string()),
             Ok(n) => done += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(format!("read: {e}")),
@@ -276,10 +290,12 @@ fn be_the_ioc() -> ! {
                 // built here panics there. The socket lives on the runtime.
                 reactor
                     .spawn(async move {
-                        use tokio::io::AsyncReadExt;
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         let mut go = tokio::net::TcpStream::connect(("127.0.0.1", ready_port))
                             .await
                             .expect("connect to the release socket");
+                        // The hello that tells this connection from a stray.
+                        go.write_all(b"c").await.expect("say hello to the broker");
                         let mut b = [0u8; 1];
                         go.read_exact(&mut b)
                             .await

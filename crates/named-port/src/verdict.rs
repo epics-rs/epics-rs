@@ -108,8 +108,9 @@ pub fn held_texts() -> &'static [String] {
 /// ended before `iocRun`: softioc-rs binds in iocInit as C `rsrv_init` does.
 /// It prints C's [`PORT_WAS_TAKEN`] for the TCP listener and serves on a
 /// dynamic one as C does, or names the address its search responder could
-/// not bind and exits; realtime-ca-ioc names the port on either bind arm and
-/// exits 1. On the
+/// not bind and exits. realtime-ca-ioc takes the same TCP fallback and keeps
+/// running, so its console must be judged while it runs too; it names the
+/// port and exits 1 when a bind it cannot fall back from fails. On the
 /// lines that carry an error the cause must be one of [`held_texts`] and
 /// nothing else: realtime-ca-ioc's TCP arm also covers a `local_addr`
 /// failure, which is no steal.

@@ -96,9 +96,10 @@ mod exec_model {
     /// that the number the boot line named is the number served, which no
     /// kernel pick can express. So the number is a candidate, and losing it is
     /// a retry — see the `named-port` crate. [`rs_ioc_port_was_taken`] is the only
-    /// thing that retries; a panic, any other exit, and the budget expiring all
-    /// fail here, with the console, because none of them gets better on a
-    /// different port.
+    /// thing that retries, read while the child runs as well as after it exits:
+    /// a held TCP port leaves it serving on a dynamic one. A panic, any other
+    /// exit, and the budget expiring all fail here, with the console, because
+    /// none of them gets better on a different port.
     ///
     /// `argv` receives the candidate and puts it wherever the test's subject
     /// requires — an `.env()` in one case, a `NAME=VALUE` boot argument in the
@@ -108,7 +109,17 @@ mod exec_model {
         argv: impl Fn(&mut Command, u16),
         ready: impl Fn(&str) -> bool,
     ) -> Booted {
-        named_port::on_a_named_port(|port| {
+        boot_on_a_named_port_from(named_port::free_for_tcp_and_udp, dir, argv, ready)
+    }
+
+    /// [`boot_on_a_named_port`] with the candidates drawn by `pick`.
+    fn boot_on_a_named_port_from(
+        pick: impl FnMut() -> u16,
+        dir: &std::path::Path,
+        argv: impl Fn(&mut Command, u16),
+        ready: impl Fn(&str) -> bool,
+    ) -> Booted {
+        named_port::on_a_named_port_from(pick, |port| {
             // A log per candidate: a previous attempt's steal must not be
             // readable as this attempt's console.
             let log_path = dir.join(format!("console-{port}.log"));
@@ -131,6 +142,10 @@ mod exec_model {
             let deadline = Instant::now() + INIT_BUDGET;
             loop {
                 let console = booted.console();
+                // The warning precedes the boot report on the one console file.
+                if rs_ioc_port_was_taken(&console, port) {
+                    return None;
+                }
                 if ready(&console) {
                     return Some(booted);
                 }
@@ -139,7 +154,7 @@ mod exec_model {
                     "realtime-ca-ioc panicked during init:\n{console}"
                 );
                 if booted.child.0.try_wait().expect("poll the child").is_some() {
-                    if rs_ioc_port_was_taken(&console, port) {
+                    if rs_ioc_port_was_taken(&booted.console(), port) {
                         return None;
                     }
                     panic!("realtime-ca-ioc exited during init:\n{console}");
@@ -630,9 +645,15 @@ mod exec_model {
 
     /// `realtime-ca-ioc` serving one record, booted for a raw client.
     fn boot_one_record(dir: &std::path::Path) -> Booted {
+        boot_one_record_from(named_port::free_for_tcp_and_udp, dir)
+    }
+
+    /// [`boot_one_record`] with the candidates drawn by `pick`.
+    fn boot_one_record_from(pick: impl FnMut() -> u16, dir: &std::path::Path) -> Booted {
         let db = dir.join("one.db");
         std::fs::write(&db, "record(ai, \"MIS:A\") {}\n").expect("write the db");
-        boot_on_a_named_port(
+        boot_on_a_named_port_from(
+            pick,
             dir,
             |cmd, port| {
                 cmd.arg(format!("EPICS_CA_NAME_SERVERS=127.0.0.1:{}", closed_port()))
@@ -645,6 +666,39 @@ mod exec_model {
             },
             |console| boot_report(console).is_some(),
         )
+    }
+
+    /// A candidate whose TCP port is held when the IOC binds is spent, though
+    /// the IOC keeps running: it warns and serves TCP on a dynamically
+    /// assigned port as C does (`caservertask.c:583-591`), so a client
+    /// dialling the candidate is refused.
+    #[test]
+    fn a_candidate_whose_tcp_port_is_held_is_retried() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (held, thief) = loop {
+            let thief = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+            let port = thief.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                break (port, thief);
+            }
+        };
+        let mut first = Some(held);
+        let booted = boot_one_record_from(
+            || {
+                first
+                    .take()
+                    .unwrap_or_else(named_port::free_for_tcp_and_udp)
+            },
+            dir.path(),
+        );
+        drop(thief);
+        assert_ne!(booted.port, held, "booted on the held candidate");
+        let console = booted.console();
+        assert_eq!(
+            boot_report(&console).expect("a boot report").port,
+            booted.port,
+            "{console}"
+        );
     }
 
     fn ca_hdr(cmmd: u16, size: u16, dt: u16, count: u16, p1: u32, p2: u32) -> Vec<u8> {

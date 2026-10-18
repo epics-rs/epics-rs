@@ -2890,8 +2890,16 @@ impl PvDatabase {
             records.get(key).cloned()
         };
         if let Some(rec) = rec {
-            if let Some(dev) = rec.write().device.as_mut() {
-                dev.arm_readback_callback();
+            let mut instance = rec.write();
+            let Some(dev) = instance.device.as_mut() else {
+                return;
+            };
+            dev.arm_readback_callback();
+            // C `outputCallbackCallback` clears UDF before `dbProcess`
+            // (devAsynInt32.c:631), so a failed readback raises its
+            // WRITE_ALARM rather than `checkAlarms`' UDF_ALARM.
+            if dev.output_callback_readback() {
+                instance.common.udf = 0;
             }
         }
     }

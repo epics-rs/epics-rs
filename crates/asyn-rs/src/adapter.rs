@@ -398,6 +398,9 @@ pub struct AsynDeviceSupport {
     octet_cmd: Option<Vec<u8>>,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
+    /// C devAsynOctet's `isOutput`: the one initCommon that reads
+    /// `info(asyn:INITIAL_READBACK)` (devAsynOctet.c:357).
+    octet_output: bool,
     /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
     /// When set on an output record, the adapter activates the
     /// driver-callback path even when `SCAN != "I/O Intr"` so the
@@ -849,6 +852,7 @@ impl AsynDeviceSupport {
             record_name: String::new(),
             scan: ScanType::Passive,
             initial_readback: false,
+            octet_output: false,
             asyn_readback: false,
             write_only: false,
             octet_binary: false,
@@ -887,6 +891,31 @@ impl AsynDeviceSupport {
     fn init_user(&self) -> AsynUser {
         self.request_user(QueuePriority::Low)
             .locking_port(&self.handle)
+    }
+
+    /// C `pasyn<Xx>SyncIO->connect(port, addr, &user, userParam)`: given a
+    /// userParam it runs the port's `drvUserCreate` again on its own asynUser
+    /// (asynInt32SyncIO.c:94-110 and siblings), so the driver's create, and
+    /// its trace, happens once per connect. A failure is the dset's `goto bad`.
+    fn sync_io_connect(
+        &self,
+        drv_user: bool,
+        sync_io: &'static str,
+    ) -> Result<(), DeviceInitOutcome> {
+        if !drv_user {
+            return Ok(());
+        }
+        let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
+        match self.handle.drv_user_create_blocking(&req) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.dset.report(
+                    &self.record_name,
+                    &LinkRefusal::SyncIo(sync_io, drv_user_message(&e)),
+                );
+                Err(self.dset.bad())
+            }
+        }
     }
 
     fn request_user(&self, priority: QueuePriority) -> AsynUser {
@@ -2986,16 +3015,19 @@ impl DeviceSupport for AsynDeviceSupport {
         if self.handle.can_block() {
             self.request_cell();
         }
+        // C calls drvUser->create only when the port registered asynDrvUser
+        // **and** the record named a userParam (`if (pasynInterface &&
+        // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
+        // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
+        // A byte transport registers no asynDrvUser and has no parameter to
+        // name: the record binds at reason 0 — the port's own reason space —
+        // and that is not a bind failure. Ask the interface registry
+        // (`has_interface`), never a failed `create`.
+        let drv_user = !self.reason_set
+            && self.handle.has_interface(InterfaceType::DrvUser)
+            && !self.drv_info.is_empty();
         if !self.reason_set {
-            // C calls drvUser->create only when the port registered asynDrvUser
-            // **and** the record named a userParam (`if (pasynInterface &&
-            // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
-            // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
-            // A byte transport registers no asynDrvUser and has no parameter to
-            // name: the record binds at reason 0 — the port's own reason space —
-            // and that is not a bind failure. Ask the interface registry
-            // (`has_interface`), never a failed `create`.
-            if self.handle.has_interface(InterfaceType::DrvUser) && !self.drv_info.is_empty() {
+            if drv_user {
                 // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
                 // rejects an out-of-range offset here at bind time (C `drvUserCreate`
                 // `checkOffset`) instead of alarming on every I/O. Pass the record's
@@ -3027,6 +3059,11 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
             }
             self.reason_set = true;
+        }
+        if let Some(sync_io) = self.dset.sync_io() {
+            if let Err(dead) = self.sync_io_connect(drv_user, sync_io) {
+                return Ok(dead);
+            }
         }
 
         // asynOctetCmdResponse misconfiguration: C initCmdBuffer
@@ -3196,7 +3233,15 @@ impl DeviceSupport for AsynDeviceSupport {
         // C's `findInterface(asynEnumType) != NULL` gate — a driver without
         // an enum table makes EnumRead fail and the record keeps its .db
         // strings.
-        if let Some(shape) = EnumRecordShape::of_record(record) {
+        // C reads the table inside `if (findInterface(asynEnumType) &&
+        // maxEnums > 0)`, after an EnumSyncIO connect (devAsynInt32.c:300-311).
+        let enum_table = EnumRecordShape::of_record(record).filter(|_| {
+            self.dset.connects_enum_sync_io() && self.handle.has_interface(InterfaceType::Enum)
+        });
+        if let Some(shape) = enum_table {
+            if let Err(dead) = self.sync_io_connect(drv_user, "EnumSyncIO") {
+                return Ok(dead);
+            }
             let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
@@ -3217,6 +3262,13 @@ impl DeviceSupport for AsynDeviceSupport {
 
         let mut read_back = false;
         if self.initial_readback {
+            // devAsynOctet connects its SyncIO only for this read
+            // (devAsynOctet.c:361); the other dsets connected above.
+            if self.dset == Dset::Octet {
+                if let Err(dead) = self.sync_io_connect(drv_user, "octetSyncIO") {
+                    return Ok(dead);
+                }
+            }
             if let Some(op) = self.read_op(&*record) {
                 let user = self.init_user();
                 if let Ok(mut result) = self.handle.submit_blocking(op, user) {
@@ -3769,7 +3821,12 @@ impl DeviceSupport for AsynDeviceSupport {
         if let Some(raw) = info.get("asyn:READBACK") {
             self.set_asyn_readback(parse_info_bool(raw));
         }
-        if let Some(raw) = info.get("asyn:INITIAL_READBACK") {
+        // The scalar outputs read at init whatever it says, and no input or
+        // array dset reads at all.
+        if let Some(raw) = info
+            .get("asyn:INITIAL_READBACK")
+            .filter(|_| self.octet_output)
+        {
             self.set_initial_readback(parse_info_bool(raw));
         }
         // C parity: `info("asyn:FIFO", "<n>")` at
@@ -4558,7 +4615,28 @@ impl Dset {
                     ),
                 }
             }
+            LinkRefusal::SyncIo(sync_io, message) => (
+                format!("{record} {driver}::initCommon {sync_io}->connect failed {message}"),
+                false,
+            ),
         }
+    }
+
+    /// The SyncIO C `initCommon` connects right after `findInterface`.
+    fn sync_io(self) -> Option<&'static str> {
+        match self {
+            Self::Int32 { .. } => Some("Int32SyncIO"),
+            Self::Int64 => Some("Int64SyncIO"),
+            Self::UInt32Digital => Some("UInt32DigitalSyncIO"),
+            Self::Float64 => Some("Float64SyncIO"),
+            _ => None,
+        }
+    }
+
+    /// Whether C `initCommon` reads a driver enum table, through an
+    /// EnumSyncIO connect, for a record with enum states.
+    fn connects_enum_sync_io(self) -> bool {
+        matches!(self, Self::Int32 { .. } | Self::UInt32Digital)
     }
 }
 
@@ -4570,6 +4648,8 @@ enum LinkRefusal {
     NoPort(String),
     /// `drvUserCreate` failed with this `errorMessage`.
     DrvUser(String),
+    /// This SyncIO's `connect` failed with this `errorMessage`.
+    SyncIo(&'static str, String),
 }
 
 /// What `pasynUser->errorMessage` holds after a failed `drvUserCreate`.
@@ -4766,6 +4846,7 @@ pub fn universal_asyn_factory(
         adapter.time_series = Some(Arc::new(TimeSeriesState::new()));
     }
 
+    adapter.octet_output = is_output && dset == Dset::Octet;
     if is_output {
         if output_via_inp {
             // An output DTYP bound through INP sits on a waveform, an input
@@ -9389,7 +9470,11 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((req.drv_info.clone(), req.iface, param_type));
-                let reason = self.base_mut().create_param(&req.drv_info, param_type)?;
+                // A SyncIO connect creates the same drvInfo again: find it.
+                let reason = match self.base().find_param(&req.drv_info) {
+                    Some(reason) => reason,
+                    None => self.base_mut().create_param(&req.drv_info, param_type)?,
+                };
                 Ok(crate::port::DrvUserInfo::from_reason(reason))
             }
         }
@@ -9433,33 +9518,31 @@ mod tests {
         use epics_base_rs::server::records::longin::LonginRecord;
 
         // The same drvInfo bound by an `ai` with DTYP=asynFloat64: the driver
-        // must be told Float64 and create a Float64 parameter.
+        // must be told Float64 and create a Float64 parameter, on initCommon's
+        // create and again on its Float64SyncIO connect.
         let binds = bind("asynFloat64", |ads| {
             let mut rec = AiRecord::new(0.0);
             ads.init(&mut rec).unwrap();
         });
-        assert_eq!(
-            binds.lock().unwrap().as_slice(),
-            [(
-                "SYMBOL".to_string(),
-                Some(InterfaceType::Float64),
-                ParamType::Float64
-            )]
+        let float64 = (
+            "SYMBOL".to_string(),
+            Some(InterfaceType::Float64),
+            ParamType::Float64,
         );
+        assert_eq!(binds.lock().unwrap().as_slice(), [float64.clone(), float64]);
 
-        // The same drvInfo bound by a `longin` with DTYP=asynInt32: Int32.
+        // The same drvInfo bound by a `longin` with DTYP=asynInt32: Int32, on
+        // initCommon's create and again on its Int32SyncIO connect.
         let binds = bind("asynInt32", |ads| {
             let mut rec = LonginRecord::new(0);
             ads.init(&mut rec).unwrap();
         });
-        assert_eq!(
-            binds.lock().unwrap().as_slice(),
-            [(
-                "SYMBOL".to_string(),
-                Some(InterfaceType::Int32),
-                ParamType::Int32
-            )]
+        let int32 = (
+            "SYMBOL".to_string(),
+            Some(InterfaceType::Int32),
+            ParamType::Int32,
         );
+        assert_eq!(binds.lock().unwrap().as_slice(), [int32.clone(), int32]);
     }
 
     /// devBusyAsyn.c:245-260 — the busy module's device support registers the
@@ -9521,7 +9604,7 @@ mod tests {
     }
 
     /// C parity for `asynDbGetInfo(precord, "asyn:INITIAL_READBACK")`
-    /// at devAsynOctet.c:357 — info tag overrides the per-record
+    /// at devAsynOctet.c:357 — info tag overrides an octet output's
     /// default. Verifies the auto-parse path: the framework calls
     /// `apply_record_info`, which must flip `initial_readback`
     /// without the caller having to invoke `set_initial_readback`.
@@ -9533,6 +9616,10 @@ mod tests {
 
         let mut info = std::collections::HashMap::new();
         info.insert("asyn:INITIAL_READBACK".to_string(), "1".to_string());
+        // Only devAsynOctet's output reads the tag.
+        ads.apply_record_info(&info);
+        assert!(!ads.initial_readback, "a non-octet-output dset ignores it");
+        ads.octet_output = true;
         ads.apply_record_info(&info);
         assert!(ads.initial_readback, "info tag must enable readback");
 

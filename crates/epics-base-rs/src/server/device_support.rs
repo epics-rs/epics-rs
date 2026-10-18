@@ -1052,7 +1052,8 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// calls the output `write()` — re-writing would re-assert the setpoint
     /// and re-trigger the driver (the AD `Acquire` loop). Only device support
     /// implementing that contract (the [`Self::arm_readback_callback`] /
-    /// [`Self::reconcile_readback_callback`] pair) returns `true`.
+    /// [`Self::reconcile_readback_callback`] pair) returns `true`; such a
+    /// cycle starts with UDF cleared, as C's `outputCallbackCallback` does.
     ///
     /// Default `false`: a C `dbProcess` driven by a driver callback is a full
     /// record process, output stage included. `devMotorAsyn` has no readback

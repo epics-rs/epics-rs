@@ -561,8 +561,14 @@ mod tests {
         db.get_pv(pv).unwrap().to_f64().unwrap()
     }
 
-    /// The busy record's own reset, as its driver would make it.
+    /// The busy record's own reset, as its driver would make it. It waits for
+    /// the circuit's put to set B first: a reset served ahead of it would
+    /// leave the put pending for good.
     async fn release(db: &PvDatabase) {
+        assert!(
+            eventually(|| f64_of(db, "B") == 1.0).await,
+            "the put never set B"
+        );
         db.put_record_field_from_ca_no_notify("B", "VAL", EpicsValue::Short(0))
             .await
             .unwrap();
@@ -708,6 +714,7 @@ mod tests {
             Err(PvStat::Timeout),
             "check_pending times out on the pending put"
         );
+        q.flush().await;
         assert_eq!(f64_of(&db, "B"), 1.0, "the SYNC put was not issued");
         let resetter = db.clone();
         crate::runtime::task::spawn_background(

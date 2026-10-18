@@ -5,3 +5,5 @@ r { out "GET"; in "%d"; @init { out "I"; in "%d"; } }
 args { out "$1 $2"; }
 s { out "S"; in "%s"; }
 d { out "D"; in "%f"; }
+w { out "GET"; wait 100; in "%d"; }
+t { ReplyTimeout = 100; out "GET"; in "%d"; }

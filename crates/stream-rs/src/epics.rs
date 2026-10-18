@@ -23,30 +23,38 @@
 
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{AsyncDbHandle, DeviceDoneSource};
+use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
+use epics_base_rs::runtime::task::{
+    CallbackPriority, request_cell, sleep_background, spawn_background,
+};
+use epics_base_rs::server::database::{
+    AsyncDbHandle, DeviceDone, DeviceDoneSource, ProcessCallback,
+};
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart, WriteStart,
 };
 use epics_base_rs::server::recgbl::alarm_status::{
     CALC_ALARM, COMM_ALARM, NO_ALARM, READ_ALARM, TIMEOUT_ALARM, UDF_ALARM, WRITE_ALARM,
 };
+use epics_base_rs::server::recgbl::{alarm_condition_string, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, HwLink, ParsedLink, Record, parse_link_v2,
+    AlarmSeverity, CommonFields, HwLink, ParsedLink, Record, ScanType, parse_link_v2,
 };
 use parking_lot::Mutex;
 
 use crate::StreamBuffer;
 use crate::bus::StreamIoStatus;
 use crate::core::{
-    Entry, INIT_RUN, ProtocolResult, SCAN_TRIED, StartMode, StreamCore, StreamCoreHooks,
-    StreamCoreLock,
+    ABORTED, ACCEPT_INPUT, Entry, INIT_RUN, ProtocolResult, SCAN_TRIED, StartMode, StreamCore,
+    StreamCoreHooks, StreamCoreLock,
 };
-use crate::error::{STREAM_ERROR, stream_error};
+use crate::error::{STREAM_ERROR, stream_debug_print, stream_error};
 use crate::format::{DOUBLE_FORMAT, ENUM_FORMAT, SIGNED_FORMAT, StreamFormat, UNSIGNED_FORMAT};
 use crate::{cmsg, debug, protocol};
 
@@ -344,6 +352,20 @@ struct Shared {
     init_waiter: Mutex<Option<mpsc::Sender<Job>>>,
     /// `record->prio`, which the bus reads from its own thread.
     prio: AtomicI16,
+    /// The core, for the callbacks that enter it.
+    lock: OnceLock<Weak<StreamCoreLock<StreamHooks>>>,
+    /// The record type's entries: an output's completing pass calls its I/O
+    /// entry as C's `rset->process` does.
+    record_type: OnceLock<Arc<dyn StreamRecordType>>,
+    /// The completion the pass that started the protocol was given.
+    device_done: Mutex<Option<DeviceDone>>,
+    /// C's `processCallback`: [`RecordProcess`] on a callback band.
+    process_callback: OnceLock<Arc<CallbackCell<RecordProcess>>>,
+    /// The record's re-entry, an input's completing pass.
+    reprocess: OnceLock<ProcessCallback>,
+    /// The timer's current start; an earlier start's expiry is dropped, as
+    /// C's `epicsTimer::start` replaces it.
+    timer_start: AtomicU64,
 }
 
 impl Shared {
@@ -371,6 +393,142 @@ impl Shared {
         })
         .unwrap_or(0)
     }
+
+    /// `Stream::process()`, the record lent: whether the record goes on.
+    fn process(&self, lock: &StreamCoreLock<StreamHooks>) -> bool {
+        let core = lock.lock();
+        let hooks = &core.hooks;
+        let name = self.name.as_str();
+        debug!(format!("Stream::process({name})\n"));
+        let Some((completing, proc_field, tpro)) = self.slot.with(|_, common| {
+            (
+                hooks.pact.get() || common.scan == ScanType::IoIntr,
+                common.proc_field,
+                common.tpro,
+            )
+        }) else {
+            return false;
+        };
+        if completing {
+            // C's record clears PACT at the end of this pass.
+            hooks.pact.set(false);
+            let status = hooks.status.get();
+            self.slot.with(|_, common| {
+                common.proc_field = 0;
+                if status != NO_ALARM as i64 {
+                    rec_gbl_set_sevr(common, status as u16, AlarmSeverity::Invalid);
+                }
+            });
+            if status != NO_ALARM as i64 {
+                debug!(format!(
+                    "Stream::process({name}) error status={} ({status})\n",
+                    alarm_text(status)
+                ));
+                return false;
+            }
+            debug!(format!(
+                "Stream::process({name}) ready. {}\n",
+                convert_text(hooks.convert.get())
+            ));
+            return true;
+        }
+        debug!(format!("Stream::process({name}) start\n"));
+        hooks.status.set(NO_ALARM as i64);
+        hooks.convert.set(OK);
+        if tpro != 0 {
+            let msg = cmsg!(b"start protocol '", &*core.protocolname.borrow(), b"'\n");
+            stream_debug_print(Some(name), 0, &msg);
+        }
+        let init = proc_field == 2;
+        if !lock.start_protocol(if init {
+            StartMode::StartInit
+        } else {
+            StartMode::StartNormal
+        }) {
+            let status = hooks.status.get();
+            debug!(format!(
+                "Stream::process({name}): could not start {}protocol, status={} ({status})\n",
+                if init { "@init " } else { "" },
+                alarm_text(status)
+            ));
+            self.slot.with(|_, common| {
+                let stat = if status != 0 {
+                    status as u16
+                } else {
+                    UDF_ALARM
+                };
+                rec_gbl_set_sevr(common, stat, AlarmSeverity::Invalid);
+                common.proc_field = 0;
+            });
+            return false;
+        }
+        debug!(format!("Stream::process({name}): protocol started\n"));
+        hooks.pact.set(true);
+        true
+    }
+}
+
+/// `epicsAlarmConditionStrings[status]`, or "ERROR" outside it.
+fn alarm_text(status: i64) -> &'static str {
+    match u16::try_from(status).map(alarm_condition_string) {
+        Ok(text) if !text.is_empty() => text,
+        _ => "ERROR",
+    }
+}
+
+/// Whether the record converts the value it was given. C prints "convert"
+/// for DO_NOT_CONVERT and "don't convert" for the rest (StreamEpics.cc
+/// `initRecord` and `process`), the wrong way round.
+fn convert_text(convert: i64) -> &'static str {
+    if convert == DO_NOT_CONVERT {
+        "don't convert"
+    } else {
+        "convert"
+    }
+}
+
+/// C's `recordProcessCallback`, the body of the stream's `processCallback`.
+struct RecordProcess(Weak<Shared>);
+
+impl CallbackBody for RecordProcess {
+    fn run(&self) {
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
+        let name = shared.name.as_str();
+        // process record
+        // This will call streamReadWrite.
+        debug!(format!("recordProcessCallback({name}) processing record\n"));
+        let output = shared.record_type.get().is_some_and(|t| t.is_output());
+        if output {
+            // An output's pass ends with the device's completion, which runs
+            // no device code: the record type's I/O entry runs here.
+            let stream = shared
+                .lock
+                .get()
+                .and_then(Weak::upgrade)
+                .map(|lock| Stream {
+                    lock,
+                    shared: shared.clone(),
+                });
+            if let (Some(stream), Some(db), Some(record_type)) =
+                (stream, shared.db.get(), shared.record_type.get())
+            {
+                db.with_instance(name, |record, common| {
+                    record_type.read_write(&stream, record, common);
+                });
+            }
+            if let Some(done) = shared.device_done.lock().take() {
+                let prio = CallbackPriority::from_record_prio(shared.prio.load(Ordering::Relaxed));
+                let _ = done.complete(prio, Ok(()));
+            }
+        } else if let Some(reprocess) = shared.reprocess.get() {
+            reprocess.process_now();
+        }
+        debug!(format!(
+            "recordProcessCallback({name}) processing record done\n"
+        ));
+    }
 }
 
 /// `Stream`'s members, C's beside StreamCore's: the core's hooks.
@@ -388,6 +546,9 @@ pub struct StreamHooks {
     initialized: Cell<bool>,
     /// `initDone`, signalled by the finish of an `@init` run.
     init_done: Cell<bool>,
+    /// C's `record->pact` as `process` sets it: a protocol it started is
+    /// running.
+    pact: Cell<bool>,
 }
 
 impl StreamHooks {
@@ -397,12 +558,38 @@ impl StreamHooks {
 }
 
 impl StreamCoreHooks for StreamHooks {
+    fn input_hook(&self, core: &StreamCore<Self>, input: &[u8]) {
+        if self.with_record(|_, c| c.tpro).unwrap_or(0) > 1 {
+            let msg = cmsg!(
+                b"received \"",
+                StreamBuffer::from_bytes(input).expand(),
+                b"\"\n"
+            );
+            stream_debug_print(Some(core.name()), 0, &msg);
+        }
+    }
+
     fn protocol_finish_hook(&self, core: &StreamCore<Self>, result: ProtocolResult) {
         debug!(format!(
             "Stream::protocolFinishHook({}, {})\n",
             core.name(),
             result.to_str()
         ));
+        let pact = self.pact.get();
+        let (io_intr, proc_field, tpro) = self
+            .with_record(|_, c| (c.scan == ScanType::IoIntr, c.proc_field, c.tpro))
+            .unwrap_or((false, 0, 0));
+        if tpro != 0 {
+            let msg = cmsg!(
+                result.to_str(),
+                b". out=\"",
+                core.output_line.borrow().expand(),
+                b"\", in=\"",
+                core.input_line.borrow().expand(),
+                b"\"\n"
+            );
+            stream_debug_print(Some(core.name()), 0, &msg);
+        }
         let flags = core.flags.get();
         let status = match result {
             ProtocolResult::Success => {
@@ -424,19 +611,58 @@ impl StreamCoreHooks for StreamHooks {
             ProtocolResult::ReadTimeout => READ_ALARM,
             ProtocolResult::ScanError | ProtocolResult::FormatError => CALC_ALARM,
             ProtocolResult::Offline => COMM_ALARM,
-            ProtocolResult::Abort | ProtocolResult::Fault => UDF_ALARM,
+            ProtocolResult::Abort | ProtocolResult::Fault => {
+                if pact || io_intr {
+                    stream_error(&cmsg!(core.name(), b": Protocol aborted\n"));
+                }
+                UDF_ALARM
+            }
         };
         self.status.set(status as i64);
-        if flags & (INIT_RUN | crate::core::ABORTED) == INIT_RUN {
+        if flags & (INIT_RUN | ABORTED) == INIT_RUN && proc_field != 2 {
             debug!(format!(
                 "Stream::protocolFinishHook {}: signalling init done\n",
                 core.name()
             ));
             self.init_done.set(true);
+            return;
+        }
+        if result != ProtocolResult::Abort && io_intr {
+            // re-enable early input
+            core.flags.set(core.flags.get() | ACCEPT_INPUT);
+        }
+        if pact || io_intr {
+            // process record in callback thread to break possible recursion
+            if let Some(cell) = self.shared.process_callback.get() {
+                let prio =
+                    CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
+                let _ = request_cell(prio, cell);
+            }
         }
     }
 
-    fn start_timer(&self, _core: &StreamCore<Self>, _timeout_ms: u64) {}
+    fn start_timer(&self, core: &StreamCore<Self>, timeout_ms: u64) {
+        debug!(format!(
+            "Stream::startTimer(stream={}, timeout={timeout_ms}) = {:.6} seconds\n",
+            core.name(),
+            timeout_ms as f64 * 0.001
+        ));
+        let start = self.shared.timer_start.fetch_add(1, Ordering::AcqRel) + 1;
+        let Some(lock) = self.shared.lock.get().cloned() else {
+            return;
+        };
+        let shared = Arc::downgrade(&self.shared);
+        let prio = CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
+        drop(spawn_background(prio, async move {
+            sleep_background(Duration::from_millis(timeout_ms)).await;
+            let current = shared
+                .upgrade()
+                .is_some_and(|s| s.timer_start.load(Ordering::Acquire) == start);
+            if let (true, Some(lock)) = (current, lock.upgrade()) {
+                lock.timer_callback();
+            }
+        }));
+    }
 
     fn format_value(
         &self,
@@ -706,15 +932,27 @@ fn streams() -> &'static Mutex<Vec<Weak<StreamCoreLock<StreamHooks>>>> {
 
 impl Stream {
     /// `new Stream(record, ...)`
-    fn new(name: &str, prio: i16, db: Option<AsyncDbHandle>) -> Self {
-        let shared = Arc::new(Shared {
+    fn new(
+        name: &str,
+        prio: i16,
+        db: Option<AsyncDbHandle>,
+        record_type: Arc<dyn StreamRecordType>,
+    ) -> Self {
+        let shared = Arc::new_cyclic(|me: &Weak<Shared>| Shared {
             name: name.to_string(),
             slot: RecordSlot::default(),
             db: OnceLock::new(),
             init_waiter: Mutex::new(None),
             prio: AtomicI16::new(prio),
+            lock: OnceLock::new(),
+            record_type: OnceLock::from(record_type),
+            device_done: Mutex::new(None),
+            process_callback: OnceLock::from(CallbackCell::new(RecordProcess(me.clone()))),
+            reprocess: OnceLock::new(),
+            timer_start: AtomicU64::new(0),
         });
         if let Some(db) = db {
+            let _ = shared.reprocess.set(db.process_callback(name));
             let _ = shared.db.set(db);
         }
         let gate_shared = shared.clone();
@@ -730,9 +968,11 @@ impl Stream {
                 current_value_length: Cell::new(0),
                 initialized: Cell::new(false),
                 init_done: Cell::new(false),
+                pact: Cell::new(false),
             },
             Box::new(move |lock, entry| gate_shared.enter(lock, entry)),
         );
+        let _ = shared.lock.set(Arc::downgrade(&lock));
         streams().lock().push(Arc::downgrade(&lock));
         Self { lock, shared }
     }
@@ -896,15 +1136,9 @@ impl Stream {
             return ERROR;
         }
         let convert = core.hooks.convert.get();
-        // C prints "convert" for DO_NOT_CONVERT and "don't convert" for the
-        // rest (StreamEpics.cc initRecord), the wrong way round.
         debug!(format!(
             "Stream::initRecord {name}: initialized. {}\n",
-            if convert == DO_NOT_CONVERT {
-                "don't convert"
-            } else {
-                "convert"
-            }
+            convert_text(convert)
         ));
         convert
     }
@@ -918,17 +1152,26 @@ impl Stream {
         }
     }
 
-    /// `streamReadWrite(record)`
-    pub fn read_write(&self, _record: &mut dyn Record, common: &mut CommonFields) -> i64 {
+    /// `streamReadWrite(record)`, the dset's I/O entry.
+    pub fn read_write(&self, record: &mut dyn Record, common: &mut CommonFields) -> i64 {
         if self.lock.lock().hooks.status.get() == ERROR {
-            epics_base_rs::server::recgbl::rec_gbl_set_sevr(
-                common,
-                UDF_ALARM,
-                AlarmSeverity::Invalid,
-            );
+            rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid);
             return ERROR;
         }
-        ERROR
+        if self
+            .shared
+            .slot
+            .lend(record, common, || self.shared.process(&self.lock))
+        {
+            self.lock.lock().hooks.convert.get()
+        } else {
+            ERROR
+        }
+    }
+
+    /// A protocol `process` started is running: the record stays active.
+    fn active(&self) -> bool {
+        self.lock.lock().hooks.pact.get()
     }
 }
 
@@ -943,26 +1186,50 @@ fn c_alt_hex(v: i64) -> String {
 
 /// A record's `DTYP stream` device support: C's dset for the record type,
 /// whose `dpvt` is the [`Stream`].
-pub struct StreamDevice<T: StreamRecordType> {
-    record_type: T,
+pub struct StreamDevice {
+    record_type: Arc<dyn StreamRecordType>,
     stream: Option<Stream>,
     db: Option<AsyncDbHandle>,
     name: String,
+    /// What the pass's I/O entry returned, for the read that follows it.
+    status: i64,
 }
 
-impl<T: StreamRecordType> StreamDevice<T> {
-    pub fn new(record_type: T) -> Self {
+impl StreamDevice {
+    pub fn new(record_type: impl StreamRecordType) -> Self {
         Self {
-            record_type,
+            record_type: Arc::new(record_type),
             stream: None,
             db: None,
             name: String::new(),
+            status: ERROR,
         }
     }
 
     /// The record's stream, once the record was initialized.
     pub fn stream(&self) -> Option<&Stream> {
         self.stream.as_ref()
+    }
+
+    /// The pass's call of the dset's I/O entry. A protocol it started ends
+    /// the pass; the completion gets the record's `done`.
+    fn read_write(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+        done: &DeviceDoneSource<'_>,
+    ) -> bool {
+        let Some(stream) = self.stream.as_ref() else {
+            rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid);
+            self.status = ERROR;
+            return false;
+        };
+        self.status = self.record_type.read_write(stream, record, common);
+        let started = stream.active();
+        if started {
+            *stream.shared.device_done.lock() = Some(done.device_done());
+        }
+        started
     }
 }
 
@@ -971,16 +1238,14 @@ fn init_error(status: i64) -> CaError {
     CaError::InvalidValue(format!("init_record status {status:#x}"))
 }
 
-impl<T: StreamRecordType> DeviceSupport for StreamDevice<T> {
+impl DeviceSupport for StreamDevice {
     fn bind_database(&mut self, db: AsyncDbHandle) {
         self.db = Some(db);
     }
 
-    fn set_record_info(&mut self, name: &str, _scan: epics_base_rs::server::record::ScanType) {
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
         self.name = name.to_string();
     }
-
-    fn set_callback_priority(&mut self, _prio: epics_base_rs::runtime::task::CallbackPriority) {}
 
     fn init_common(
         &mut self,
@@ -999,7 +1264,12 @@ impl<T: StreamRecordType> DeviceSupport for StreamDevice<T> {
             debug!(format!(
                 "streamInitRecord({name}): create new Stream object\n"
             ));
-            self.stream = Some(Stream::new(&name, common.prio, self.db.clone()));
+            self.stream = Some(Stream::new(
+                &name,
+                common.prio,
+                self.db.clone(),
+                self.record_type.clone(),
+            ));
         } else if let Some(stream) = self.stream.as_ref() {
             // stop any running protocol
             debug!(format!("streamInitRecord({name}): stop running protocol\n"));
@@ -1017,46 +1287,48 @@ impl<T: StreamRecordType> DeviceSupport for StreamDevice<T> {
 
     fn read_begin_common(
         &mut self,
-        _record: &mut dyn Record,
-        _common: &mut CommonFields,
-        _done: &DeviceDoneSource<'_>,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        Ok(ReadStart::Synchronous)
+        Ok(if self.read_write(record, common, done) {
+            ReadStart::Pending
+        } else {
+            ReadStart::Synchronous
+        })
     }
 
     fn read_common(
         &mut self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
+        _record: &mut dyn Record,
+        _common: &mut CommonFields,
     ) -> CaResult<DeviceReadOutcome> {
-        let Some(stream) = self.stream.as_ref() else {
-            return Ok(DeviceReadOutcome::failed());
-        };
-        match self.record_type.read_write(stream, record, common) {
-            OK => Ok(DeviceReadOutcome::ok()),
-            DO_NOT_CONVERT => Ok(DeviceReadOutcome::computed(Default::default())),
-            _ => Ok(DeviceReadOutcome::failed()),
-        }
+        // The alarm of a failure is the stream's, raised in the pass.
+        Ok(match self.status {
+            OK => DeviceReadOutcome::ok(),
+            DO_NOT_CONVERT => DeviceReadOutcome::computed(Default::default()),
+            _ => DeviceReadOutcome::failed(),
+        })
     }
 
     fn write_begin_common(
         &mut self,
-        _record: &mut dyn Record,
-        _common: &mut CommonFields,
-        _done: &DeviceDoneSource<'_>,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        Ok(WriteStart::Synchronous)
-    }
-
-    fn write_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) -> CaResult<()> {
-        if let Some(stream) = self.stream.as_ref() {
-            self.record_type.read_write(stream, record, common);
-        }
-        Ok(())
+        // A failure's alarm is the stream's, raised in the pass, so it is
+        // Completed, never the framework's write failure: C's record raises
+        // nothing for the dset's ERROR.
+        Ok(if self.read_write(record, common, done) {
+            WriteStart::Pending
+        } else {
+            WriteStart::Completed
+        })
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
-        Ok(())
+        unreachable!("write_begin_common never asks for the write")
     }
 
     fn dtyp(&self) -> &str {

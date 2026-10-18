@@ -15,9 +15,10 @@
 # Options (a comma list, '-' for none): "intr" makes the record SCAN
 # "I/O Intr", not processed by the script; "noproc" processes nothing;
 # "proc2" puts PROC 2, not 1; "twice" processes a second time; "tpro"
-# sets TPRO 2; "reload" runs streamReload after the processing;
-# "report" runs streamReportRecord rec; "tointr" puts SCAN "I/O Intr"
-# after the processing, "topassive" puts it back to "Passive".
+# sets TPRO 2; "noval" leaves VAL out of the record, which then loads
+# with UDF 1; "reload" runs streamReload after the processing; "report"
+# runs streamReportRecord rec; "tointr" puts SCAN "I/O Intr" after the
+# processing, "topassive" puts it back to "Passive".
 # Arguments, if any, are the cases to run.
 set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
@@ -41,8 +42,10 @@ while IFS=$'\t' read -r c rtype link val table opts; do
     has noproc && proc=
     has proc2 && proc="dbpf rec.PROC 2"
     has tpro && tpro='field(TPRO, "2")'
-    printf 'record(%s, "rec") {\n  field(DTYP, "stream")\n  field(%s, "@%s")\n  field(VAL, "%s")\n  field(SCAN, "%s")\n  %s\n}\n' \
-        "$rtype" "$lf" "$link" "$val" "$scan" "$tpro" >"$work/$c.db"
+    valf="field(VAL, \"$val\")"
+    has noval && valf=
+    printf 'record(%s, "rec") {\n  field(DTYP, "stream")\n  field(%s, "@%s")\n  %s\n  field(SCAN, "%s")\n  %s\n}\n' \
+        "$rtype" "$lf" "$link" "$valf" "$scan" "$tpro" >"$work/$c.db"
     after=
     has twice && after="$after
 dbpf rec.PROC 1

@@ -20,3 +20,10 @@ link_bad_bus	longin	l.proto p Q	0	-	-
 init_ok	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	-
 init_fail	longin	l.proto r P	0	-	-
 init_proc2	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	proc2
+ai_ok	ai	l.proto d P	0	D\r\n=>3.5\r\n	noval
+ai_mismatch	ai	l.proto d P	0	D\r\n=>abc\r\n	noval
+reply_timeout	longin	l.proto t P	0	GET\r\n=>	-
+wait_timer	longin	l.proto w P	0	GET\r\n=>7\r\n	-
+twice	longin	l.proto p P	0	GET\r\n=>7\r\n	twice
+tpro	longin	l.proto p P	0	GET\r\n=>7\r\n	tpro
+si_ok	stringin	l.proto s P	0	S\r\n=>hello\r\n	noval

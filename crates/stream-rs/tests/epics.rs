@@ -24,11 +24,26 @@ use epics_base_rs::server::record::{
 use epics_base_rs::types::EpicsValue;
 use stream_rs::bus::StreamIoStatus;
 use stream_rs::epics::{
-    ERROR, Format, OK, Stream, StreamDevice, StreamIo, StreamIoFunction, StreamRecordType,
+    DO_NOT_CONVERT, ERROR, Format, OK, Stream, StreamDevice, StreamIo, StreamIoFunction,
+    StreamRecordType,
 };
 
 static LONGIN: [DevSup; 1] = [DevSup {
     name: "devlonginStream",
+    choice: "stream",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(5, &[2, 3, 4], false),
+}];
+
+static AI: [DevSup; 1] = [DevSup {
+    name: "devaiStream",
+    choice: "stream",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(6, &[2, 3, 4], false),
+}];
+
+static STRINGIN: [DevSup; 1] = [DevSup {
+    name: "devstringinStream",
     choice: "stream",
     link_type: DbLinkType::InstIo,
     dset: Dset::new(5, &[2, 3, 4], false),
@@ -56,14 +71,48 @@ fn longin_read(
     OK
 }
 
-/// devlonginStream.c / devlongoutStream.c: the record type, its link and
-/// its `readData` / `writeData`.
-struct Longx {
+/// devaiStream.c's `readData` for a `%f` format: the defaults' ASLO 1,
+/// AOFF 0 and SMOO 0 leave the value as read.
+fn ai_read(
+    io: &StreamIo<'_>,
+    record: &mut dyn Record,
+    _: &mut CommonFields,
+    format: &Format<'_>,
+) -> i64 {
+    let mut val = 0.0;
+    if io.scanf_double(format, &mut val) == ERROR {
+        return ERROR;
+    }
+    let _ = record.put_field("VAL", EpicsValue::Double(val));
+    DO_NOT_CONVERT
+}
+
+/// devstringinStream.c's `readData`, into the 40 bytes of VAL.
+fn stringin_read(
+    io: &StreamIo<'_>,
+    record: &mut dyn Record,
+    _: &mut CommonFields,
+    format: &Format<'_>,
+) -> i64 {
+    let mut val = [0u8; 40];
+    if io.scanf_string(format, &mut val) == ERROR as isize {
+        return ERROR;
+    }
+    let len = val.iter().position(|&b| b == 0).unwrap_or(val.len());
+    let text = String::from_utf8_lossy(&val[..len]).into_owned();
+    let _ = record.put_field("VAL", EpicsValue::String(text.into()));
+    OK
+}
+
+/// devlonginStream.c / devlongoutStream.c / devaiStream.c /
+/// devstringinStream.c: the record type,
+/// its link and its `readData` / `writeData`.
+struct RecordType {
     output: bool,
     read: Option<StreamIoFunction>,
 }
 
-impl StreamRecordType for Longx {
+impl StreamRecordType for RecordType {
     fn init_record(
         &self,
         stream: &Stream,
@@ -242,8 +291,11 @@ fn fields(db: &PvDatabase) -> Vec<String> {
     let rec = db.get_record("rec").unwrap();
     let r = rec.read();
     let c = &r.common;
+    // dbgf prints a long in decimal and hex
     let val = match r.record.get_field("VAL") {
-        Some(EpicsValue::Long(v)) => v,
+        Some(EpicsValue::Long(v)) => format!("{v} = {v:#x}"),
+        Some(EpicsValue::Double(v)) => format!("{v}"),
+        Some(EpicsValue::String(v)) => format!("\"{v}\""),
         v => panic!("VAL {v:?}"),
     };
     let sevr = match c.sevr {
@@ -254,7 +306,7 @@ fn fields(db: &PvDatabase) -> Vec<String> {
     };
     let pact = r.is_processing() as u8;
     vec![
-        format!("VAL {val} = {val:#x}"),
+        format!("VAL {val}"),
         format!("SEVR \"{sevr}\""),
         format!("STAT \"{}\"", alarm_condition_string(c.stat)),
         format!("UDF {} = {:#x}", c.udf, c.udf),
@@ -324,9 +376,9 @@ fn wait_lines(n: usize) -> Vec<String> {
     }
 }
 
-/// Run the case up to the end of the record's initialization, and, for a
-/// case that processes nothing, compare the fields too.
-async fn run_init(name: &str) {
+/// Run the case as run-epics.sh does: iocInit, the PROC put, and compare
+/// the kept lines and the fields after the run.
+async fn run_case(name: &str) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         common::setup();
@@ -341,21 +393,20 @@ async fn run_init(name: &str) {
     stream_rs::error::set_stream_debug(1);
 
     let mut want = expected(name);
-    let done = want
-        .iter()
-        .position(|l| l.starts_with("streamInitRecord(rec) done") || l.starts_with("rec: Empty"))
-        .unwrap();
-    let noproc = case.opts.iter().any(|o| o == "noproc");
-    let tail = want.split_off(done + 1);
-    let fields_want: Vec<String> = tail[tail.len() - 6..].to_vec();
+    let has = |o: &str| case.opts.iter().any(|x| x == o);
+    let fields_want = want.split_off(want.len() - 6);
+    // the driver's lines are printed by the first case only
+    let drv = if DRV_LINES.lock().is_empty() { 0 } else { 2 };
 
-    // the bus answers of the init run, played in the log's order
+    // the bus answers, played in the log's order
     let script = want.clone();
     let player = std::thread::spawn(move || {
         for (i, line) in script.iter().enumerate() {
             let Some(play) = play(line) else { continue };
-            // the driver's lines are printed by the first case only
-            let have = wait_lines(i.saturating_sub(2));
+            let have = wait_lines(i - drv);
+            if have.len() < i - drv {
+                return Err(format!("not reached {line:?}: {have:#?}"));
+            }
             let client = common::CLIENT.lock().clone().and_then(|c| c.upgrade());
             let Some(client) = client else {
                 return Err(format!("no client to play {line:?}: {have:#?}"));
@@ -368,21 +419,37 @@ async fn run_init(name: &str) {
     let output = case.rtype.ends_with("out");
     let field = if output { "OUT" } else { "INP" };
     let link = format!("@{}", case.link);
+    let val = if has("noval") {
+        String::new()
+    } else {
+        format!("field(VAL, \"{}\")", case.val)
+    };
+    let tpro = if has("tpro") {
+        "field(TPRO, \"2\")"
+    } else {
+        ""
+    };
     let db_text = format!(
-        "record({}, \"rec\") {{ field(DTYP, \"stream\") field({field}, \"{link}\") field(VAL, \"{}\") }}\n",
-        case.rtype, case.val
+        "record({}, \"rec\") {{ field(DTYP, \"stream\") field({field}, \"{link}\") {val} {tpro} }}\n",
+        case.rtype
     );
     let (db, _) = IocBuilder::new()
         .register_dynamic_device_support(
-            &[("longin", &LONGIN), ("longout", &LONGOUT)],
+            &[
+                ("longin", &LONGIN),
+                ("ai", &AI),
+                ("stringin", &STRINGIN),
+                ("longout", &LONGOUT),
+            ],
             |ctx: &DeviceSupportContext| {
-                let output = match (ctx.record_type, ctx.dtyp) {
-                    ("longin", "stream") => false,
-                    ("longout", "stream") => true,
+                let (output, read) = match (ctx.record_type, ctx.dtyp) {
+                    ("longin", "stream") => (false, Some(longin_read as StreamIoFunction)),
+                    ("ai", "stream") => (false, Some(ai_read as StreamIoFunction)),
+                    ("stringin", "stream") => (false, Some(stringin_read as StreamIoFunction)),
+                    ("longout", "stream") => (true, None),
                     _ => return None,
                 };
-                let read = (!output).then_some(longin_read as StreamIoFunction);
-                Some(Box::new(StreamDevice::new(Longx { output, read })) as _)
+                Some(Box::new(StreamDevice::new(RecordType { output, read })) as _)
             },
         )
         .db_string(&db_text, &HashMap::new())
@@ -390,7 +457,26 @@ async fn run_init(name: &str) {
         .build()
         .await
         .unwrap();
+    if !has("noproc") {
+        let proc = if has("proc2") { 2 } else { 1 };
+        // dbpf's put: a dbPutField
+        let _ = db
+            .put_record_field_from_ca_no_notify("rec", "PROC", EpicsValue::Long(proc))
+            .await;
+    }
+    if has("twice") {
+        // run-epics.sh puts again after its sleep, once the first run is done
+        let done = want
+            .iter()
+            .position(|l| l == "recordProcessCallback(rec) processing record done")
+            .unwrap();
+        wait_lines(done + 1 - drv);
+        let _ = db
+            .put_record_field_from_ca_no_notify("rec", "PROC", EpicsValue::Long(1))
+            .await;
+    }
     player.join().unwrap().unwrap();
+    wait_lines(want.len() - drv);
     stream_rs::error::set_stream_debug(0);
 
     let mut got = kept(&OUT.lock());
@@ -406,10 +492,8 @@ async fn run_init(name: &str) {
     for l in &mut got {
         *l = l.replace(&dir, "<dir>");
     }
-    if noproc {
-        want.extend(fields_want);
-        got.extend(fields(&db));
-    }
+    want.extend(fields_want);
+    got.extend(fields(&db));
     assert_eq!(got, want, "{name}");
 }
 
@@ -418,7 +502,7 @@ macro_rules! cases {
         #[test]
         fn $name() {
             let _run = RUN.lock();
-            epics_base_rs::runtime::task::test_block_on(run_init(stringify!($name)));
+            epics_base_rs::runtime::task::test_block_on(run_case(stringify!($name)));
         }
     )*};
 }
@@ -442,4 +526,11 @@ cases!(
     init_fail,
     init_proc2,
     link_spaces,
+    ai_ok,
+    ai_mismatch,
+    reply_timeout,
+    wait_timer,
+    twice,
+    tpro,
+    si_ok,
 );

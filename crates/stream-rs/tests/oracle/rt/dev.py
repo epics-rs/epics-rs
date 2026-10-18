@@ -2,7 +2,7 @@
 # (Python escapes) separated by ';;'. Whenever what it received since the last answer ends
 # with a request, it sends the reply; the reply to request '@' is sent on
 # connecting; a reply ending in '!close' closes the connection after the
-# rest is sent. Connections are served one at a time.
+# rest is sent, one ending in '!once' is sent the first time only. Connections are served one at a time.
 import socket, sys
 port = int(sys.argv[1])
 table = {}
@@ -20,11 +20,13 @@ while True:
         if not d: break
         buf += d
         close = False
-        for k, v in table.items():
+        for k, v in list(table.items()):
             if buf.endswith(k):
                 buf = b''
                 close = v.endswith(b'!close')
-                v = v.removesuffix(b'!close')
+                if v.endswith(b'!once'):
+                    del table[k]
+                v = v.removesuffix(b'!close').removesuffix(b'!once')
                 if v: c.sendall(v)
         if close: break
     c.close()

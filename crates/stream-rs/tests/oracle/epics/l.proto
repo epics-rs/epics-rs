@@ -11,3 +11,4 @@ c { connect 100; out "GET"; }
 i { in "V=%d"; }
 iw { wait 1000; in "V=%d"; }
 ri { in "V=%d"; @init { out "I"; in "%d"; wait 300; } }
+io { out "Q"; in "V=%d"; }

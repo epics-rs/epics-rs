@@ -1,0 +1,54 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto io P"
+Stream::initRecord rec: filename="l.proto" protocol="io" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "io")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x5fc203600a40, ioscanpvt=0x5fc203602590
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "Q<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::evalIn(rec): unlocking bus
+StreamCore::readCallback(rec, StreamIoSuccess input="V=5<0d><0a>", size=5)
+StreamCore::readCallback(rec) inputBuffer="V=5<0d><0a>", size 5
+StreamCore::readCallback(rec) inTerminator <0d><0a> at position 3
+StreamCore::readCallback(rec) input line: "V=5"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="5" value=5
+Stream::scan() currentValueLength=1
+Stream::matchValue(rec): success, 1 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) not bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. don't convert
+recordProcessCallback(rec) processing record done
+recordProcessCallback(rec) restart async protocol
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "Q<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="", size 0
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::evalIn(rec): unlocking bus
+VAL 5 = 0x5
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

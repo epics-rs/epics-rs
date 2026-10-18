@@ -34,3 +34,4 @@ intr_pause	longin	l.proto i P	0	x=>	intr,pauserun
 init_rerun	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	noproc,pauserun
 intr_init_rerun	longin	l.proto ri P	0	I\r\n=>5\r\n	intr,pauserun
 asyncconnect	longin	l.proto r P	0	I\r\n=>5\r\n!close	noproc,reconnect
+intr_out	longin	l.proto io P	0	Q\r\n=>V=5\r\n!once	intr

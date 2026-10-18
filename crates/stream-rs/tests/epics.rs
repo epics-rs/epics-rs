@@ -615,4 +615,5 @@ cases!(
     init_rerun,
     intr_init_rerun,
     asyncconnect,
+    intr_out,
 );

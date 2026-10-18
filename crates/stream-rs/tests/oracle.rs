@@ -141,6 +141,32 @@ fn normalize(code: &[u8], layout: Layout) -> String {
     out
 }
 
+/// compileNumber reports the line of the token after the number, which
+/// past the last argument C reads from beyond the value (StreamProtocol.cc
+/// compileNumber, getLineNumber(source)): stack garbage, as in the compiled
+/// code. Its line field is masked on both sides.
+fn mask_number_lines(text: &[u8]) -> Vec<u8> {
+    const MESSAGES: [&[u8]; 3] = [
+        b"Unsigned numeric value expected: ",
+        b"Garbage after numeric value: ",
+        b"Value ",
+    ];
+    let mut out = Vec::new();
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let masked = (|| {
+            let at = line.windows(6).position(|w| w == b" line ")? + 6;
+            let digits = line[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let rest = line[at + digits..].strip_prefix(b": ")?;
+            let number = MESSAGES.iter().any(|m| rest.starts_with(m))
+                && (!rest.starts_with(b"Value ")
+                    || rest.windows(14).any(|w| w == b" out of range "));
+            number.then(|| [&line[..at], b"?", &line[at + digits..]].concat())
+        })();
+        out.extend(masked.unwrap_or_else(|| line.to_vec()));
+    }
+    out
+}
+
 /// Undo `StreamBuffer::expand`: `<hh>` is a byte.
 fn unexpand(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -246,7 +272,7 @@ fn parser_errors_match_c() {
                 }
             }
         }
-        if got != want {
+        if mask_number_lines(&got) != mask_number_lines(&want) {
             failed.push(format!(
                 "{case}:\n  C:  {:?}\n  rs: {:?}",
                 String::from_utf8_lossy(&want),

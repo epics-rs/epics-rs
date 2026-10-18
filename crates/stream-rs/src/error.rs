@@ -91,6 +91,46 @@ pub fn take_captured() -> Vec<u8> {
     CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default()
 }
 
+/// Where every thread's stderr output goes while a [`ProcessCapture`] is
+/// alive, but for a thread's own [`capture_stderr`].
+static PROCESS_CAPTURE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// One [`ProcessCapture`] at a time, so two tests' lines never mix.
+static PROCESS_CAPTURE_OWNER: Mutex<()> = Mutex::new(());
+
+/// The stderr output of all threads, the bus's and the timers' included,
+/// for a test to compare; [`capture_process_stderr`] makes it. A test
+/// that holds one waits out any other, but a thread of a test that holds
+/// none still writes into it.
+pub struct ProcessCapture {
+    _owner: parking_lot::MutexGuard<'static, ()>,
+}
+
+/// Send the stderr output of every thread to one buffer until the
+/// capture is dropped, waiting until no other capture is alive.
+pub fn capture_process_stderr() -> ProcessCapture {
+    let owner = PROCESS_CAPTURE_OWNER.lock();
+    *PROCESS_CAPTURE.lock() = Some(Vec::new());
+    ProcessCapture { _owner: owner }
+}
+
+impl ProcessCapture {
+    /// What was written since the capture began or the last take.
+    pub fn take(&self) -> Vec<u8> {
+        PROCESS_CAPTURE
+            .lock()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ProcessCapture {
+    fn drop(&mut self) {
+        *PROCESS_CAPTURE.lock() = None;
+    }
+}
+
 fn write_stderr(bytes: &[u8]) {
     let captured = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
         Some(buf) => {
@@ -98,7 +138,13 @@ fn write_stderr(bytes: &[u8]) {
             true
         }
         None => false,
-    });
+    }) || match PROCESS_CAPTURE.lock().as_mut() {
+        Some(buf) => {
+            buf.extend_from_slice(bytes);
+            true
+        }
+        None => false,
+    };
     if !captured {
         let _ = std::io::stderr().write_all(bytes);
     }
@@ -334,6 +380,44 @@ mod tests {
         set_stream_error(1);
         stream_error(b"c\n");
         assert_eq!(take_captured(), b"b\nc\n".to_vec());
+    }
+
+    #[test]
+    fn a_process_capture_takes_a_spawned_threads_lines() {
+        let _switches = TEST_SWITCHES.lock();
+        set_stream_debug_colored(false);
+        set_stream_msg_time_stamped(0);
+        set_get_thread_name_function(None);
+        let capture = capture_process_stderr();
+        std::thread::spawn(|| {
+            stream_error(b"bus\n");
+            stream_debug_print(Some("asyn.rs"), 3, b"lock\n");
+        })
+        .join()
+        .unwrap();
+        stream_error(b"main\n");
+        assert_eq!(capture.take(), b"bus\nasyn.rs:3: lock\nmain\n".to_vec());
+        // a thread's own capture keeps its lines
+        capture_stderr();
+        stream_error(b"own\n");
+        assert_eq!(take_captured(), b"own\n".to_vec());
+        assert_eq!(capture.take(), Vec::<u8>::new());
+        drop(capture);
+
+        // the next capture waits for the one alive, and starts empty
+        let first = capture_process_stderr();
+        stream_error(b"first\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let capture = capture_process_stderr();
+            tx.send(()).unwrap();
+            capture.take()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(rx.try_recv().is_err(), "a second capture began early");
+        assert_eq!(first.take(), b"first\n".to_vec());
+        drop(first);
+        assert_eq!(second.join().unwrap(), Vec::<u8>::new());
     }
 
     #[test]

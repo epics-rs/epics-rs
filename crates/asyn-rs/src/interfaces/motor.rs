@@ -292,6 +292,8 @@ pub enum StatusWrite {
     HighHardLimit(bool),
     /// `motorAxisHomeSignal`, MSTA bit 3 RA_HOME.
     HomeSignal(bool),
+    /// `motorStatusHome_` / `motorAxisHomeEncoder`, MSTA bit 7 EA_HOME.
+    EncoderHome(bool),
     /// `motorAxisMoving`, MSTA bit 10 RA_MOVING (drvMotorAsyn.c:847-852).
     Moving(bool),
     /// `motorAxisLowHardLimit`, MSTA bit 13 RA_MINUS_LS.
@@ -325,6 +327,7 @@ impl StatusWrite {
             StatusWrite::Direction(v) => status.direction = v,
             StatusWrite::HighHardLimit(v) => status.high_limit = v,
             StatusWrite::HomeSignal(v) => status.home = v,
+            StatusWrite::EncoderHome(v) => status.encoder_home = v,
             StatusWrite::Moving(v) => status.msta_moving = v,
             StatusWrite::LowHardLimit(v) => status.low_limit = v,
             StatusWrite::CommsError(v) => status.comms_error = v,

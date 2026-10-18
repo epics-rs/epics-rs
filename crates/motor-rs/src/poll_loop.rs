@@ -1180,16 +1180,20 @@ impl Axis {
     /// forces `statusChanged_` (asynMotorController.cpp:217-221) while the
     /// background poller ignores the poll status (:658).
     fn failed_poll_status(&mut self, failed: FailedPoll) -> MotorStatus {
-        if let Some(left) = failed.left
+        // The bits are the driver's own sets after what it left, so C's
+        // status_ changes only if the two together differ from the last.
+        let raise = |mut status: MotorStatus| {
+            status.problem |= failed.bits.problem;
+            status.comms_error |= failed.bits.comms_error;
+            status
+        };
+        if let Some(left) = failed.left.map(raise)
             && self.last_status.as_ref() != Some(&left)
         {
             self.stage(&left);
             self.status_changed = true;
         }
-        let mut status = self.last_status.clone().unwrap_or_else(status_before_poll);
-        status.problem |= failed.bits.problem;
-        status.comms_error |= failed.bits.comms_error;
-        status
+        raise(self.last_status.clone().unwrap_or_else(status_before_poll))
     }
 
     /// C asynMotorPoller's "Force on poll at startup": fills the cache
@@ -1198,18 +1202,25 @@ impl Axis {
     /// controller lock across this poll, so init_record's read waits for it
     /// (asynMotorController.cpp:505-525, :630); taken while the poller is
     /// built, before the creating command returns, init reads it too.
+    /// The pass is C's ordinary one, so a poll that reaches its
+    /// `callParamCallbacks` clears `statusChanged_` as [`Self::notify`]
+    /// would; one returning before it leaves the flag for the next pass.
     fn prime_cache(&mut self, polled: &Polled) {
-        let status = self.poll_status(polled);
+        let (status, called_back) = match self.poll_result(polled) {
+            Ok(status) => (status, true),
+            Err(failed) => {
+                let raises = failed.bits.raises();
+                (self.failed_poll_status(failed), raises)
+            }
+        };
         if status.moving {
             self.power = Power::Moving;
         }
         self.hold(&status);
+        if called_back {
+            self.status_changed = false;
+        }
         self.subscribers.store(StampedStatus { seq: 1, status });
-    }
-
-    fn poll_status(&mut self, polled: &Polled) -> MotorStatus {
-        self.poll_result(polled)
-            .unwrap_or_else(|failure| self.failed_poll_status(failure))
     }
 
     fn poll_result(&mut self, polled_by: &Polled) -> Result<MotorStatus, FailedPoll> {
@@ -1943,6 +1954,7 @@ fn model2_param(write: StatusWrite) -> (i32, WriteValue) {
         StatusWrite::Done(v) => (12, bit(v)),
         StatusWrite::HighHardLimit(v) => (13, bit(v)),
         StatusWrite::HomeSignal(v) => (14, bit(v)),
+        StatusWrite::EncoderHome(v) => (18, bit(v)),
         StatusWrite::PowerOn(v) => (16, bit(v)),
         StatusWrite::Problem(v) => (20, bit(v)),
         StatusWrite::Moving(v) => (21, bit(v)),
@@ -2965,6 +2977,7 @@ mod tests {
             StatusWrite::Done(true),
             StatusWrite::HighHardLimit(false),
             StatusWrite::HomeSignal(true),
+            StatusWrite::EncoderHome(true),
             StatusWrite::Moving(false),
             StatusWrite::LowHardLimit(true),
         ];
@@ -2977,6 +2990,7 @@ mod tests {
             (12, WriteValue::Int32(1)),
             (13, WriteValue::Int32(0)),
             (14, WriteValue::Int32(1)),
+            (18, WriteValue::Int32(1)),
             (21, WriteValue::Int32(0)),
             (24, WriteValue::Int32(1)),
         ];
@@ -4213,6 +4227,54 @@ mod tests {
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         let posted = poll_loop.axes[0].last_status.clone().unwrap();
         assert!(posted.home && posted.comms_error && !posted.problem);
+    }
+
+    /// A dead controller's polls each set PROBLEM again and leave the same
+    /// status: only the first changes C's status_, so only it posts
+    /// (ImsMDrivePlusMotorAxis.cpp:483-501, asynMotorAxis.cpp:258-264).
+    #[test]
+    fn a_repeated_failure_leaving_the_same_status_posts_once() {
+        let left = MotorStatus {
+            done: false,
+            ..MotorStatus::default()
+        };
+        let mut poll_loop = failing_poller(vec![
+            Err((PollFailure::PROBLEM, Some(left.clone()))),
+            Err((PollFailure::PROBLEM, Some(left.clone()))),
+            Err((PollFailure::PROBLEM, Some(left))),
+        ]);
+        let seq = poll_loop.axes[0].status_seq;
+        now(poll_loop.poller_pass(false));
+        assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
+        now(poll_loop.poller_pass(false));
+        now(poll_loop.poller_pass(false));
+        assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
+    }
+
+    /// C's startup pass is an ordinary one: the dead controller's first
+    /// failure is called back to the not yet bound record and clears
+    /// statusChanged_, so the next equal failure posts nothing
+    /// (asynMotorController.cpp:630, asynMotorAxis.cpp:316-322).
+    #[test]
+    fn a_failure_the_startup_pass_called_back_does_not_post_again() {
+        let left = || {
+            Err((
+                PollFailure::PROBLEM,
+                Some(MotorStatus {
+                    done: false,
+                    ..MotorStatus::default()
+                }),
+            ))
+        };
+        let mut poll_loop = poller_on(Arc::new(Mutex::new(Failing {
+            polls: [left(), left()].into(),
+            failure: PollFailure::NONE,
+            left: None,
+        })));
+        let seq = poll_loop.axes[0].status_seq;
+        assert!(poll_loop.axes[0].last_status.as_ref().unwrap().problem);
+        now(poll_loop.poller_pass(false));
+        assert_eq!(poll_loop.axes[0].status_seq, seq);
     }
 
     /// C MM3000: MS answers and TP misses (RETRY, nothing posted), then MS

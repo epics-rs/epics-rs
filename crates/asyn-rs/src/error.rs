@@ -39,6 +39,14 @@ pub enum AsynError {
     #[error("asyn: {status:?} - {message}")]
     Status { status: AsynStatus, message: String },
 
+    /// A nonzero C `int` that names no `asynStatus`, returned as one: a
+    /// driver passing its controller's code through `(asynStatus)status`
+    /// (XPSAxis.cpp:793), or an OR of param errors past
+    /// asynParamInvalidList. C prints it as itself and its callers test it
+    /// only against asynSuccess. Built only by [`AsynError::from_c_status_code`].
+    #[error("asyn: status {code} - {message}")]
+    CStatus { code: i32, message: String },
+
     /// An octet read that failed *after* transferring bytes into the
     /// caller's buffer.
     ///
@@ -489,14 +497,13 @@ impl AsynError {
             AsynError::ParamIndexOutOfRange(_) => 9,
             AsynError::ParamUndefined(_) => 10,
             AsynError::ParamInvalidList(_) => 11,
+            AsynError::CStatus { code, .. } => *code,
             other => other.status() as i32,
         }
     }
 
-    /// C's `return (asynStatus)status` after `status |= ...` steps, with
-    /// the `errorMessage` the write leaves: [`Self::c_status_code`] gives
-    /// `code` back for 1-11. An OR past asynParamInvalidList (12-15) names no
-    /// status and is returned as asynError. `None` is success.
+    /// C's `return (asynStatus)status`, with the `errorMessage` the write
+    /// leaves: [`Self::c_status_code`] gives `code` back. `None` is success.
     pub fn from_c_status_code(code: i32, message: String) -> Option<AsynError> {
         let status = match code {
             0 => return None,
@@ -518,7 +525,8 @@ impl AsynError {
                 };
                 return Some(source.in_param_access(message));
             }
-            _ => AsynStatus::Error,
+            3 => AsynStatus::Error,
+            _ => return Some(AsynError::CStatus { code, message }),
         };
         Some(AsynError::Status { status, message })
     }
@@ -632,9 +640,9 @@ pub struct ErrorMessage<'a>(&'a AsynError);
 impl fmt::Display for ErrorMessage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
-                f.write_str(message)
-            }
+            AsynError::Status { message, .. }
+            | AsynError::QueueRefused { message, .. }
+            | AsynError::CStatus { message, .. } => f.write_str(message),
             AsynError::PartialRead { source, .. }
             | AsynError::PartialWrite { source, .. }
             | AsynError::OctetStep { source, .. } => source.message_display().fmt(f),
@@ -655,7 +663,19 @@ mod tests {
             assert_eq!(e.c_status_code(), code);
             assert_eq!(e.message(), format!("m{code}"));
         }
-        let e = AsynError::from_c_status_code(15, String::new()).unwrap();
+        let e = AsynError::from_c_status_code(3, String::new()).unwrap();
         assert_eq!(e.c_status_code(), 3);
+    }
+
+    /// C prints any other int a driver returns as `(asynStatus)status`
+    /// as itself, and its callers read it as a failure.
+    #[test]
+    fn a_driver_s_own_status_code_survives() {
+        for code in [-1, -17, 12, 15] {
+            let e = AsynError::from_c_status_code(code, format!("m{code}")).unwrap();
+            assert_eq!(e.c_status_code(), code);
+            assert_eq!(e.status(), AsynStatus::Error);
+            assert_eq!(e.message(), format!("m{code}"));
+        }
     }
 }

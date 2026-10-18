@@ -74,7 +74,9 @@ fn be_the_broker() {
     std::fs::write(
         &script,
         format!(
-            "mqttDriverConfigure(\"MQ4\", \"tcp://127.0.0.1:{broker_port}\", \"mq4-client\", 0)\n"
+            // A script without iocInit builds no IOC, as C's custom main
+            // does, so the driver would never connect.
+            "mqttDriverConfigure(\"MQ4\", \"tcp://127.0.0.1:{broker_port}\", \"mq4-client\", 0)\niocInit\n"
         ),
     )
     .expect("write the child's st.cmd");

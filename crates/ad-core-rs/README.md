@@ -80,7 +80,7 @@ iocInit()
 use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::ndarray::{NDArray, NDDataType};
 
-let mut driver = ADDriverBase::new("SIM1", 256, 256, 50_000_000).unwrap();
+let mut driver = ADDriverBase::new("SIM1", 1, 50_000_000, ASYN_CANBLOCK).unwrap();
 driver.connect_downstream(stats_handle.array_sender().clone());
 driver.publish_array(Arc::new(array)).unwrap();
 ```

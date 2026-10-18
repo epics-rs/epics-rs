@@ -41,8 +41,6 @@ impl SimDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            max_size_x,
-            max_size_y,
             max_memory,
             ASYN_NONE,
             // "No interfaces beyond those set in ADDriver.cpp" (:1036).
@@ -61,6 +59,9 @@ impl SimDetector {
         base.set_string_param(ad.params.base.sdk_version, 0, "2.11.0")?;
         base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
+        // C `:1102-1103`, after ADDriver's seed of 1.
+        base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.max_size_y, 0, max_size_y)?;
 
         // C `:1115` seeds the simDetectorConfig dataType argument.
         base.set_int32_param(ad.params.base.data_type, 0, data_type)?;

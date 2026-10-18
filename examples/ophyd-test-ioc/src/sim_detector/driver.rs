@@ -43,8 +43,6 @@ impl MovingDotDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            max_size_x,
-            max_size_y,
             max_memory,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -56,6 +54,9 @@ impl MovingDotDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Mini Beamline")?;
         base.set_string_param(ad.params.base.model, 0, "Moving Dot")?;
+        // simDetector.cpp:1102-1103, after ADDriver's seed of 1.
+        base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.max_size_y, 0, max_size_y)?;
 
         base.set_float64_param(ad.params.acquire_time, 0, 0.1)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.5)?;

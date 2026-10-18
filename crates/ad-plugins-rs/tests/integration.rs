@@ -66,8 +66,6 @@ fn test_driver_to_stats_pipeline() {
     let mut driver = ADDriverBase::new(
         "SIM1",
         1,
-        64,
-        64,
         10_000_000,
         ASYN_CANBLOCK,
         InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -135,8 +133,6 @@ fn test_driver_to_std_arrays_pipeline() {
     let mut driver = ADDriverBase::new(
         "SIM1",
         1,
-        32,
-        32,
         10_000_000,
         ASYN_CANBLOCK,
         InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -885,8 +881,6 @@ fn test_std_arrays_leaves_the_array_sizes_unset() {
     let mut driver = ad_core_rs::driver::ad_driver::ADDriverBase::new(
         "DRV1",
         1,
-        64,
-        48,
         1_000_000,
         ASYN_CANBLOCK,
         InterfaceMask::UNMIGRATED_SUBCLASS,

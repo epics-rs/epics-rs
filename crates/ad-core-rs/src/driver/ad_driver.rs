@@ -47,14 +47,13 @@ pub const AD_DRIVER_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
     .or(InterfaceMask::GENERIC_POINTER);
 
 impl ADDriverBase {
+    /// C `ADDriver::ADDriver` takes no sensor size: it seeds ADMaxSizeX/Y to
+    /// 1 and a detector that knows its size sets them afterwards.
     /// `interface_mask` / `interrupt_mask` are the detector's own, as C's
     /// `ADDriver` constructor arguments.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port_name: &str,
         max_addr: usize,
-        max_size_x: i32,
-        max_size_y: i32,
         max_memory: usize,
         asyn_flags: PortFlags,
         interface_mask: InterfaceMask,
@@ -88,8 +87,8 @@ impl ADDriverBase {
         // ADNumExposures, ADAcquireTime/Period and ADShutterMode are deliberately
         // absent: their records carry PINI="YES" with a DB default and are
         // restored by autosave. Seeding them here would clobber both.
-        port_base.set_int32_param(params.max_size_x, 0, max_size_x)?;
-        port_base.set_int32_param(params.max_size_y, 0, max_size_y)?;
+        port_base.set_int32_param(params.max_size_x, 0, 1)?;
+        port_base.set_int32_param(params.max_size_y, 0, 1)?;
         port_base.set_int32_param(params.status, 0, ADStatus::Idle as i32)?;
         port_base.set_int32_param(params.num_images_counter, 0, 0)?;
         port_base.set_int32_param(params.num_exposures_counter, 0, 0)?;
@@ -368,8 +367,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "TEST",
             1,
-            1024,
-            768,
             50_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -448,8 +445,6 @@ mod tests {
             ad: ADDriverBase::new(
                 "TEST",
                 1,
-                8,
-                8,
                 1_000_000,
                 ASYN_CANBLOCK,
                 InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -519,8 +514,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -551,8 +544,6 @@ mod tests {
             ADDriverBase::new(
                 "TEST",
                 1,
-                8,
-                8,
                 1_000_000,
                 ASYN_CANBLOCK,
                 InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -664,8 +655,6 @@ mod tests {
             ADDriverBase::new(
                 "TEST",
                 1,
-                8,
-                8,
                 1_000_000,
                 flags,
                 InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -684,8 +673,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "TEST",
             4,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -700,8 +687,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "TEST",
             1,
-            1024,
-            768,
             50_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -709,18 +694,18 @@ mod tests {
         )
         .unwrap();
         // C++ ADDriver.cpp:180-191 — the full set of parameters the constructor
-        // seeds, and nothing more.
+        // seeds, and nothing more. MaxSizeX/Y are 1 until the detector sets them.
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.max_size_x, 0)
                 .unwrap(),
-            1024
+            1
         );
         assert_eq!(
             ad.port_base
                 .get_int32_param(ad.params.max_size_y, 0)
                 .unwrap(),
-            768
+            1
         );
         assert_eq!(
             ad.port_base.get_int32_param(ad.params.status, 0).unwrap(),
@@ -767,8 +752,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "TEST",
             1,
-            1024,
-            768,
             50_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -841,8 +824,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -884,8 +865,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            256,
-            256,
             50_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -918,8 +897,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            64,
-            64,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -965,8 +942,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1006,8 +981,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1036,8 +1009,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1058,8 +1029,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1095,8 +1064,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1134,8 +1101,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1166,8 +1131,6 @@ mod tests {
         let ad = ADDriverBase::new(
             "ADRULEPORT",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1196,8 +1159,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1231,8 +1192,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1258,8 +1217,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1293,8 +1250,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1333,8 +1288,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             10_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1364,8 +1317,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             10_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1406,8 +1357,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             10_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1447,8 +1396,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1466,8 +1413,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1499,8 +1444,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
-            8,
-            8,
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,

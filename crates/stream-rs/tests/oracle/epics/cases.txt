@@ -33,3 +33,4 @@ intr_flip	longin	l.proto iw P	0	x=>	noproc,flip
 intr_pause	longin	l.proto i P	0	x=>	intr,pauserun
 init_rerun	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	noproc,pauserun
 intr_init_rerun	longin	l.proto ri P	0	I\r\n=>5\r\n	intr,pauserun
+asyncconnect	longin	l.proto r P	0	I\r\n=>5\r\n!close	noproc,reconnect

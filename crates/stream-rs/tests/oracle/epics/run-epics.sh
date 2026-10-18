@@ -20,7 +20,9 @@
 # runs streamReportRecord rec; "tointr" puts SCAN "I/O Intr" after the
 # processing, "topassive" puts it back to "Passive"; "flip" puts SCAN
 # "I/O Intr", 0.2 s later "Passive", 0.2 s later "I/O Intr" again, and
-# waits 1.5 s; "pauserun" runs iocPause, then iocRun 0.2 s later.
+# waits 1.5 s; "pauserun" runs iocPause, then iocRun 0.2 s later;
+# "reconnect" reads the port from another asyn user, which finds the
+# connection the device closed and has asyn connect again.
 # Arguments, if any, are the cases to run.
 set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
@@ -67,6 +69,10 @@ epicsThreadSleep 0.5"
 iocPause
 epicsThreadSleep 0.2
 iocRun
+epicsThreadSleep 0.5"
+    has reconnect && after="$after
+asynOctetConnect e P
+asynOctetRead e
 epicsThreadSleep 0.5"
     has flip && after="$after
 dbpf rec.SCAN \"I/O Intr\"

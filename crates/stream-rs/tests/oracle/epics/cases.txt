@@ -1,0 +1,22 @@
+# StreamEpics cases for run-epics.sh and tests/epics.rs, tab separated:
+# case  record  link  VAL  device-table  options
+# The device table is request=>reply pairs (Python escapes), '-' for no
+# device listening; pairs are separated by ';;'.
+link_plain	longin	l.proto p P	0	GET\r\n=>7\r\n	-
+link_spaces	longin	   l.proto    p    P    	0	GET\r\n=>7\r\n	-
+link_args	longout	l.proto args(A,B) P 0 x y	3	A B\r\n=>	-
+link_args_space	longout	l.proto args (A, B) P	3	A B\r\n=>	-
+link_args_nested	longout	l.proto args(A(1),B\)) P	3	-	-
+link_addr_hex	longin	l.proto p P 0x1f rest of it	0	-	noproc
+link_addr_octal	longin	l.proto p P 010 z	0	-	noproc
+link_addr_none	longin	l.proto p P abc	0	-	noproc
+link_addr_neg	longin	l.proto p P -3	0	-	noproc
+link_no_protocol	longin	l.proto	0	-	noproc
+link_no_bus	longin	l.proto p	0	-	noproc
+link_empty	longin	<empty>	0	-	noproc
+link_bad_protocol	longin	l.proto nosuch P	0	-	-
+link_bad_file	longin	nosuch.proto p P	0	-	-
+link_bad_bus	longin	l.proto p Q	0	-	-
+init_ok	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	-
+init_fail	longin	l.proto r P	0	-	-
+init_proc2	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	proc2

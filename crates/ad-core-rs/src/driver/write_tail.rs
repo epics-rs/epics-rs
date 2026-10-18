@@ -168,7 +168,7 @@ mod tests {
             max_addr,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let int = base.create_param("INT", ParamType::Int32).unwrap();
         let float = base.create_param("FLOAT", ParamType::Float64).unwrap();

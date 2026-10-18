@@ -167,6 +167,23 @@ impl MqttDriver {
     /// grammar cannot express (the Z2M builders' `normalize_on_off`). These are
     /// **not** created here; they are stored as an overlay that on-demand
     /// creation consults. Generic MQTT passes an empty vector.
+    /// drvMqtt's `Autoparam::DriverOpts()` masks (autoparamDriver.h:166-175):
+    /// interrupts on every value interface, Common and DrvUser on top.
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::INT64)
+        .or(InterfaceMask::UINT32_DIGITAL)
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET)
+        .or(InterfaceMask::INT8_ARRAY)
+        .or(InterfaceMask::INT16_ARRAY)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::INT64_ARRAY)
+        .or(InterfaceMask::FLOAT32_ARRAY)
+        .or(InterfaceMask::FLOAT64_ARRAY);
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::COMMON
+        .or(InterfaceMask::DRV_USER)
+        .or(Self::INTERRUPT_MASK);
+
     pub fn new(
         port_name: &str,
         config: &MqttConfig,
@@ -188,8 +205,8 @@ impl MqttDriver {
             port_name,
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            Self::INTERFACE_MASK,
+            Self::INTERRUPT_MASK,
         );
 
         // Create connection status param (0=disconnected, 1=connected)
@@ -1087,5 +1104,19 @@ mod tests {
         let topic_map = topic_map.lock().unwrap();
         assert_eq!(topic_map["test/shared"].len(), 2);
         assert_eq!(topic_map["test/other"].len(), 1);
+    }
+
+    /// drvMqtt takes `Autoparam::DriverOpts()`'s masks unchanged
+    /// (autoparamDriver.h:166-175): no Option, Enum or GenericPointer.
+    #[test]
+    fn the_port_registers_autoparam_driver_s_interfaces() {
+        let (driver, _rx) = make_driver(&[]);
+        assert_eq!(
+            (
+                driver.base().interface_mask().bits(),
+                driver.base().interrupt_mask().bits()
+            ),
+            (0xcffb, 0xcff8)
+        );
     }
 }

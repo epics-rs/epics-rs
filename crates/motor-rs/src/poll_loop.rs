@@ -132,6 +132,7 @@ pub(crate) enum Join {
         motor: Arc<Mutex<dyn AsynMotor>>,
         port: String,
         addr: i32,
+        poll: SharedControllerPoll,
     },
 }
 
@@ -140,7 +141,12 @@ impl Join {
     pub(crate) fn place(self, axes: &mut Vec<Axis>) {
         let axis = match self {
             Self::Axis(axis) => *axis,
-            Self::Mirror { motor, port, addr } => {
+            Self::Mirror {
+                motor,
+                port,
+                addr,
+                poll,
+            } => {
                 let Some(at) = axes
                     .iter()
                     .position(|a| std::ptr::addr_eq(Arc::as_ptr(&a.motor), Arc::as_ptr(&motor)))
@@ -148,7 +154,7 @@ impl Join {
                     return;
                 };
                 let mut axis = axes.remove(at);
-                axis.mirror_to(&port, addr);
+                axis.mirror_to(&port, addr, poll);
                 axis
             }
         };
@@ -169,6 +175,30 @@ pub type ControllerPoll = Box<dyn FnMut() -> PortSets + Send>;
 pub(crate) struct SharedControllerPoll {
     state: Arc<Mutex<ControllerPollState>>,
     lock: Arc<Mutex<()>>,
+    move_to_home: Arc<MoveToHomeEvent>,
+    queue: Arc<Mutex<PortQueue>>,
+    /// C `pollEventId_`, a binary event: a wakeup with no pass waiting is
+    /// kept for the next wait.
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// What was set on the controller port's parameters off its thread, in the
+/// order set. Only the port's thread applies it, first thing each time it
+/// takes the controller lock, so a write or poll there lands after
+/// everything set under the lock before it, as C's sets land in lock order.
+#[derive(Default)]
+struct PortQueue {
+    sets: Vec<(Option<i32>, Vec<PortSet>)>,
+    /// A request to apply `sets` is on the port's queue.
+    flush_queued: bool,
+}
+
+/// C `moveToHomeId_` and `moveToHomeAxis_`: a binary event and the one
+/// axis the last MOTOR_MOVE_HOME named.
+#[derive(Default)]
+struct MoveToHomeEvent {
+    axis: Mutex<Option<i32>>,
+    signalled: std::sync::Condvar,
 }
 
 /// C's controller lock, held across a poller pass (asynMotorController.cpp:
@@ -185,8 +215,16 @@ struct ControllerPollState {
     poll: Option<ControllerPoll>,
     /// The controller port, known once an axis on it is added.
     port: Option<String>,
-    /// What the polls set before the port was known.
-    pending: PortSets,
+    /// C `movingPollPeriod_` and `idlePollPeriod_`, which the poller reads
+    /// at the end of each pass and setMovingPollPeriod / setIdlePollPeriod
+    /// change at runtime.
+    periods: PollPeriods,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PollPeriods {
+    moving: Duration,
+    idle: Duration,
 }
 
 impl SharedControllerPoll {
@@ -205,32 +243,116 @@ impl SharedControllerPoll {
         self.state().poll = Some(poll);
     }
 
-    /// The controller port the poller applies the polls' sets on; the
-    /// startup pass can run before any axis names it.
+    /// C `asynMotorController::wakeupPoller`: the poller runs a pass now,
+    /// whether or not the controller has an axis yet.
+    pub(crate) fn wakeup(&self) {
+        self.wake.notify_one();
+    }
+
+    /// C `asynMotorController::setMovingPollPeriod`, less its wakeupPoller.
+    pub(crate) fn set_moving_period(&self, period: Duration) {
+        self.state().periods.moving = period;
+    }
+
+    /// C `asynMotorController::setIdlePollPeriod`, less its wakeupPoller.
+    pub(crate) fn set_idle_period(&self, period: Duration) {
+        self.state().periods.idle = period;
+    }
+
+    /// C `startPoller` on controller port `port`: this is its poller, which
+    /// setMovingPollPeriod and setIdlePollPeriod find by `port`.
+    pub(crate) fn name_port(&self, port: &str) {
+        self.set_port(port);
+        crate::devices::link_controller_poll(port, self);
+    }
+
+    /// The controller port the queued sets go to; the startup pass can run
+    /// before any axis names it.
     pub(crate) fn set_port(&self, port: &str) {
         let mut state = self.state();
         if state.port.is_some() {
             return;
         }
         state.port = Some(port.to_owned());
-        let pending = std::mem::take(&mut state.pending);
         drop(state);
-        apply_port_sets(port, None, pending);
+        let mut queue = self.queue();
+        if !queue.sets.is_empty() {
+            self.flush(port, &mut queue);
+        }
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, PortQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C's `setXxxParam` / `callParamCallbacks` on the controller port from
+    /// off its thread. An axis's status or wakeup goes to the poller at
+    /// once; a parameter set joins the queue the port's thread applies, so
+    /// nothing here waits on that thread, which may be waiting on the lock.
+    pub(crate) fn post_sets(&self, axis: Option<i32>, sets: PortSets) {
+        let port = self.state().port.clone();
+        let mut queued = Vec::new();
+        for set in sets {
+            match (&port, set) {
+                (Some(port), set @ (PortSet::Status { .. } | PortSet::WakeupPoller)) => {
+                    apply_axis_set(port, set)
+                }
+                (_, set) => queued.push(set),
+            }
+        }
+        if queued.is_empty() {
+            return;
+        }
+        let mut queue = self.queue();
+        queue.sets.push((axis, queued));
+        if let Some(port) = &port {
+            self.flush(port, &mut queue);
+        }
+    }
+
+    /// Queue on the port's thread a request that takes the lock and applies
+    /// the queued sets, unless one is queued already.
+    fn flush(&self, port: &str, queue: &mut PortQueue) {
+        if queue.flush_queued {
+            return;
+        }
+        let Some(handle) = crate::devices::controller_port_handle(port) else {
+            return;
+        };
+        let poll = self.clone();
+        let call = asyn_rs::request::DriverCall::new(move |driver| {
+            let held = poll.hold();
+            poll.drain_on_port(&held, driver.base_mut());
+        });
+        let op = asyn_rs::request::RequestOp::WithDriver(call);
+        queue.flush_queued = handle.try_submit(op, AsynUser::default()).is_ok();
+    }
+
+    /// Apply on the port's thread, under the lock, what was set off it.
+    pub(crate) fn drain_on_port(
+        &self,
+        _: &ControllerHeld<'_>,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) {
+        let sets = {
+            let mut queue = self.queue();
+            queue.flush_queued = false;
+            std::mem::take(&mut queue.sets)
+        };
+        for (axis, sets) in sets {
+            crate::controller_port::apply_port_sets(base, axis, sets);
+        }
     }
 
     /// Run the poll on the controller port's own thread and return its
     /// sets, for the port to apply on its base.
     pub(crate) fn run(&self, _: &ControllerHeld<'_>) -> PortSets {
         let mut state = self.state();
-        let mut sets = std::mem::take(&mut state.pending);
         let _forbid = state.port.clone().map(|p| forbid_blocking(&p));
-        if let Some(poll) = state.poll.as_mut() {
-            sets.append(poll());
-        }
-        sets
+        state.poll.as_mut().map(|poll| poll()).unwrap_or_default()
     }
 
-    /// Run the poll on the poller, its sets applied through the port.
+    /// Run the poll on the poller, its sets queued for the port.
     fn run_on_poller(&self, _: &ControllerHeld<'_>) {
         let mut state = self.state();
         let forbid = state.port.clone().map(|p| forbid_blocking(&p));
@@ -239,57 +361,85 @@ impl SharedControllerPoll {
         };
         let sets = poll();
         drop(forbid);
-        let Some(port) = state.port.clone() else {
-            state.pending.append(sets);
+        drop(state);
+        self.post_sets(None, sets);
+    }
+
+    /// C `moveToHomeAxis_ = axis; epicsEventSignal(moveToHomeId_)`; with no
+    /// moveToHome thread nothing waits on it.
+    pub(crate) fn signal_move_to_home(&self, axis: i32) {
+        *self
+            .move_to_home
+            .axis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(axis);
+        self.move_to_home.signalled.notify_one();
+    }
+
+    /// C `asynMotorController::startMoveToHomeThread`
+    /// (asynMotorController.cpp:703-710).
+    pub(crate) fn start_move_to_home_thread(&self) -> std::io::Result<()> {
+        let poll = self.clone();
+        std::thread::Builder::new()
+            .name("motorMoveToHome".into())
+            .spawn(move || {
+                loop {
+                    poll.move_to_home();
+                }
+            })
+            .map(drop)
+    }
+
+    /// One wake of C's `asynMotorMoveToHome` (asynMotorController.cpp:
+    /// 723-742): the axis's task is taken under the controller lock and run
+    /// without it, as C runs `doMoveToHome`.
+    fn move_to_home(&self) {
+        let event = &self.move_to_home;
+        let mut slot = event.axis.lock().unwrap_or_else(|e| e.into_inner());
+        let addr = loop {
+            if let Some(addr) = slot.take() {
+                break addr;
+            }
+            slot = event
+                .signalled
+                .wait(slot)
+                .unwrap_or_else(|e| e.into_inner());
+        };
+        drop(slot);
+        let Some(port) = self.state().port.clone() else {
             return;
         };
-        drop(state);
-        apply_port_sets(&port, None, sets);
-    }
-}
-
-/// A driver's [`PortSets`] through controller port `port`'s handle, in
-/// order: what the steps up to each `callParamCallbacks` set is posted
-/// with it.
-fn apply_port_sets(port: &str, axis: Option<i32>, sets: PortSets) {
-    if sets.is_empty() {
-        return;
-    }
-    if let Some(handle) = crate::devices::controller_port_handle(port) {
-        apply_port_sets_on(&handle, port, axis, sets);
-    }
-}
-
-/// [`apply_port_sets`] on `handle`; `axis` is the address a
-/// [`PortSet::Axis`] lands on, None for a controller poll's.
-pub(crate) fn apply_port_sets_on(
-    handle: &asyn_rs::port_handle::PortHandle,
-    port: &str,
-    axis: Option<i32>,
-    sets: PortSets,
-) {
-    let mut updates = Vec::new();
-    for set in sets {
-        match set {
-            PortSet::Set {
-                addr,
-                reason,
-                value,
-            } => updates.push(asyn_rs::request::ParamSetValue::new(reason, addr, value)),
-            PortSet::Axis { reason, value } => {
-                if let Some(addr) = axis {
-                    updates.push(asyn_rs::request::ParamSetValue::new(reason, addr, value));
-                }
-            }
-            PortSet::Callbacks(addr) => {
-                let set = std::mem::take(&mut updates);
-                let _ = handle.set_params_and_notify_blocking(addr, set);
-            }
-            other => apply_axis_set(port, other),
+        let Some(axis) = crate::devices::axis_at(&port, addr) else {
+            return;
+        };
+        let task = {
+            let held = self.hold();
+            let Some(mut motor) = lock_axis(axis.motor(), Some(&port), &held) else {
+                return;
+            };
+            motor.move_to_home_task(axis.referencing_mode_move())
+        };
+        let trace = MotorTrace::with_user(axis.address().clone());
+        let Some(task) = task else {
+            trace.print(
+                TraceMask::ERROR,
+                0,
+                format_args!("asynMotorAxis:doMoveToHome: Axis={addr} no implementation\n"),
+            );
+            return;
+        };
+        let under_lock = |sets: PortSets| {
+            let _held = self.hold();
+            self.post_sets(Some(addr), sets);
+        };
+        if task(&under_lock).is_err() {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={addr}\n"
+                ),
+            );
         }
-    }
-    if !updates.is_empty() {
-        let _ = handle.set_params_blocking(0, updates);
     }
 }
 
@@ -359,11 +509,16 @@ mod polled {
     /// polls an axis only after `pC->poll()`, on a poller pass
     /// (asynMotorController.cpp:652-656) and in `motorUpdateStatus_`
     /// (:217-221). Only [`after`] makes one.
-    pub(super) struct Polled<'a>(ControllerHeld<'a>);
+    pub(super) struct Polled<'a>(ControllerHeld<'a>, &'a SharedControllerPoll);
 
     impl<'a> Polled<'a> {
         pub(super) fn held(&self) -> &ControllerHeld<'a> {
             &self.0
+        }
+
+        /// The controller whose lock this holds.
+        pub(super) fn controller(&self) -> &'a SharedControllerPoll {
+            self.1
         }
     }
 
@@ -372,7 +527,7 @@ mod polled {
     pub(super) fn after(poll: &SharedControllerPoll) -> Polled<'_> {
         let held = poll.hold();
         poll.run_on_poller(&held);
-        Polled(held)
+        Polled(held, poll)
     }
 }
 use polled::Polled;
@@ -380,10 +535,9 @@ use polled::Polled;
 /// When the poll loop runs a pass.
 enum Schedule {
     /// C `asynMotorPoller` (asynMotorController.cpp:615-695): every axis,
-    /// at the moving or idle period, fast for a while after a wakeup.
+    /// at the controller's moving or idle period, fast for a while after a
+    /// wakeup.
     Poller {
-        moving: Duration,
-        idle: Duration,
         forced_fast_polls: u32,
         remaining: u32,
     },
@@ -396,6 +550,9 @@ enum Schedule {
 pub(crate) struct Axis {
     cmd_rx: mpsc::Receiver<PollCommand>,
     motor_cmd_rx: mpsc::UnboundedReceiver<ToAxis>,
+    /// Batches [`Self::post_written_before_poll`] took off `motor_cmd_rx`,
+    /// to run ahead of anything still on it.
+    batches: std::collections::VecDeque<CommandBatch>,
     motor: Arc<Mutex<dyn AsynMotor>>,
     subscribers: AxisSubscribers,
     pacing: Pacing,
@@ -427,6 +584,8 @@ pub(crate) struct Axis {
     woken: bool,
     /// The controller port and axis whose parameters mirror the status.
     controller: Option<(String, i32)>,
+    /// The controller whose queue the mirror's sets go through.
+    controller_poll: SharedControllerPoll,
     /// The status word last set in the controller port's parameters.
     mirrored_word: Option<u32>,
     /// [`AsynMotor::param_owned_msta_bits`]: bit params the driver owns.
@@ -575,6 +734,7 @@ impl Axis {
         Self {
             cmd_rx: inbox.poll,
             motor_cmd_rx: inbox.commands,
+            batches: std::collections::VecDeque::new(),
             motor,
             subscribers,
             pacing,
@@ -586,6 +746,7 @@ impl Axis {
             pulses: Pulses::new(),
             woken: false,
             controller: None,
+            controller_poll: SharedControllerPoll::default(),
             mirrored_word: None,
             owned_bits: 0,
             power: Power::Idle,
@@ -632,9 +793,12 @@ impl Axis {
         self.controller.as_ref().map(|(port, _)| port.as_str())
     }
 
-    /// Mirror each status into axis `addr` of controller port `port`.
-    pub(crate) fn mirror_to(&mut self, port: &str, addr: i32) {
+    /// Mirror each status into axis `addr` of controller port `port`, whose
+    /// lock and queue are `poll`'s.
+    pub(crate) fn mirror_to(&mut self, port: &str, addr: i32, poll: SharedControllerPoll) {
         self.controller = Some((port.to_owned(), addr));
+        poll.set_port(port);
+        self.controller_poll = poll;
         self.mirrored_word = None;
         if let Ok(motor) = self.motor.lock() {
             self.owned_bits = motor.param_owned_msta_bits();
@@ -646,6 +810,9 @@ impl Axis {
     }
 
     fn run_queued_commands(&mut self, controller_poll: &SharedControllerPoll) {
+        while let Some(batch) = self.batches.pop_front() {
+            self.execute(&batch, controller_poll);
+        }
         while let Ok(message) = self.motor_cmd_rx.try_recv() {
             self.receive(message, controller_poll);
         }
@@ -681,6 +848,19 @@ impl Axis {
         match message {
             ToAxis::Batch(batch) => self.execute(&batch, controller_poll),
             ToAxis::Written(written) => self.take_written(written),
+        }
+    }
+
+    /// Post what every controller-port write queued so far set on the axis,
+    /// before a poll under the controller lock: each write queued it inside
+    /// its own lock region, so a poll after it posts after it, as C's write
+    /// posts before it unlocks (asynMotorController.cpp:243, :417).
+    fn post_written_before_poll(&mut self, _: &Polled) {
+        while let Ok(message) = self.motor_cmd_rx.try_recv() {
+            match message {
+                ToAxis::Written(written) => self.take_written(written),
+                ToAxis::Batch(batch) => self.batches.push_back(batch),
+            }
         }
     }
 
@@ -779,13 +959,13 @@ impl Axis {
                 trace,
                 command,
                 &port,
-                |c, quiet| {
+                controller_poll,
+                |held, c, quiet| {
                     let own = trace.is_controller().then(|| trace.port());
-                    let held = controller_poll.hold();
                     if matches!(command, MotorCommand::Poll) {
-                        controller_poll.run_on_poller(&held);
+                        controller_poll.run_on_poller(held);
                     }
-                    let Some(mut motor) = lock_axis(&motor, own, &held) else {
+                    let Some(mut motor) = lock_axis(&motor, own, held) else {
                         poisoned = true;
                         return None;
                     };
@@ -971,25 +1151,26 @@ impl Axis {
         if updates.is_empty() {
             return;
         }
-        let Some((port, addr)) = &self.controller else {
+        let Some((_, addr)) = &self.controller else {
             return;
         };
-        if let Some(handle) = crate::devices::controller_port_handle(port) {
-            // C drivers ignore the status of setXxxParam and callParamCallbacks.
-            let _ = handle.set_params_blocking(*addr, axis_sets(*addr, updates));
+        let mut sets = PortSets::default();
+        for (reason, value) in updates {
+            sets.set(*addr, reason, value);
         }
+        self.controller_poll.post_sets(None, sets);
     }
 
     /// C's `callParamCallbacks` on the axis with no status to set: posts
     /// whatever was set on it since the last one, such as a
     /// [`WriteHook`](crate::controller_port::WriteHook)'s sets.
     fn call_param_callbacks(&self) {
-        let Some((port, addr)) = &self.controller else {
+        let Some((_, addr)) = &self.controller else {
             return;
         };
-        if let Some(handle) = crate::devices::controller_port_handle(port) {
-            let _ = handle.set_params_and_notify_blocking(*addr, Vec::new());
-        }
+        let mut sets = PortSets::default();
+        sets.call_param_callbacks(*addr);
+        self.controller_poll.post_sets(None, sets);
     }
 
     /// The status a failed poll leaves in the parameter library: the last
@@ -1031,7 +1212,8 @@ impl Axis {
             .unwrap_or_else(|failure| self.failed_poll_status(failure))
     }
 
-    fn poll_result(&mut self, polled: &Polled) -> Result<MotorStatus, FailedPoll> {
+    fn poll_result(&mut self, polled_by: &Polled) -> Result<MotorStatus, FailedPoll> {
+        self.post_written_before_poll(polled_by);
         let user = AsynUser::new(0);
         // An `Err` is the C driver poll bailing to its error label, which
         // raises what `poll_failure` names. A poisoned driver mutex has no C
@@ -1039,7 +1221,7 @@ impl Axis {
         // way, so a `STUP=BUSY` refresh cannot latch (record/status_update.rs
         // :48-58). C's poller ignores the poll status
         // (asynMotorController.cpp:658), so a failure prints nothing.
-        let Some(mut motor) = lock_axis(&self.motor, self.own_port(), polled.held()) else {
+        let Some(mut motor) = lock_axis(&self.motor, self.own_port(), polled_by.held()) else {
             return Err(FailedPoll::POISONED);
         };
         let polled = poll_driver(&mut *motor, &user);
@@ -1051,8 +1233,8 @@ impl Axis {
             self.params.set(reason, value);
         }
         drop(motor);
-        if let Some((port, addr)) = &self.controller {
-            apply_port_sets(port, Some(*addr), port_sets);
+        if let Some((_, addr)) = &self.controller {
+            polled_by.controller().post_sets(Some(*addr), port_sets);
         }
         polled
     }
@@ -1116,6 +1298,7 @@ impl Axis {
         let Some((record, cdir)) = mover else {
             return self.poll_result(polled);
         };
+        self.post_written_before_poll(polled);
         let before = *cdir;
         let polled = match lock_axis(&self.motor, self.own_port(), polled.held()) {
             Some(mut motor) => {
@@ -1250,9 +1433,11 @@ impl MotorPollLoop {
         forced_fast_polls: u32,
         controller_poll: SharedControllerPoll,
     ) -> Self {
-        let schedule = Schedule::Poller {
+        controller_poll.state().periods = PollPeriods {
             moving: moving_poll_interval,
             idle: idle_poll_interval,
+        };
+        let schedule = Schedule::Poller {
             forced_fast_polls,
             remaining: 0,
         };
@@ -1401,22 +1586,17 @@ impl MotorPollLoop {
     /// C's timeout choice (:686-694); a zero period waits on the event alone
     /// (:633-634).
     fn next_pass(&mut self, moving: bool) -> Option<Instant> {
-        let Schedule::Poller {
-            moving: moving_period,
-            idle,
-            remaining,
-            ..
-        } = &mut self.schedule
-        else {
+        let Schedule::Poller { remaining, .. } = &mut self.schedule else {
             return None;
         };
+        let periods = self.controller_poll.state().periods;
         let timeout = if *remaining > 0 {
             *remaining -= 1;
-            *moving_period
+            periods.moving
         } else if moving {
-            *moving_period
+            periods.moving
         } else {
-            *idle
+            periods.idle
         };
         (!timeout.is_zero()).then(|| Instant::now() + timeout)
     }
@@ -1454,6 +1634,9 @@ impl MotorPollLoop {
     ) -> std::task::Poll<Wake> {
         use std::task::Poll;
         for (index, axis) in axes.iter_mut().enumerate() {
+            if let Some(batch) = axis.batches.pop_front() {
+                return Poll::Ready(Wake::Batch(index, batch.into()));
+            }
             if let Poll::Ready(Some(batch)) = axis.motor_cmd_rx.poll_recv(cx) {
                 return Poll::Ready(Wake::Batch(index, batch));
             }
@@ -1474,6 +1657,17 @@ impl MotorPollLoop {
         Poll::Pending
     }
 
+    /// The pass a wakeup runs, and when the next is due.
+    async fn wakeup_pass(&mut self) -> Option<Instant> {
+        if self.is_motor_task() {
+            let tick = Instant::now();
+            self.query_task().await;
+            self.task_due(tick)
+        } else {
+            self.poller_pass(true).await
+        }
+    }
+
     async fn serve(mut self) {
         // The startup poll is a wakeup (asynMotorController.cpp:630).
         self.reload_forced_fast_polls();
@@ -1490,9 +1684,11 @@ impl MotorPollLoop {
             // non-move writes run on the port thread, beside the poller's
             // running event wait.
             let wait = due.map(|at| at.saturating_duration_since(Instant::now()));
+            let woken = self.controller_poll.wake.clone();
             let wake = tokio::select! {
                 biased;
                 wake = std::future::poll_fn(|cx| Self::inbox(&mut self.axes, &mut self.joining, cx)) => wake,
+                _ = woken.notified() => Wake::Wakeup,
                 _ = sleep_background(wait.unwrap_or_default()), if wait.is_some() => Wake::Due,
             };
             match wake {
@@ -1528,19 +1724,13 @@ impl MotorPollLoop {
                         let polled = polled::after(&self.controller_poll);
                         self.axes[index].poll_and_notify(true, &polled);
                     }
-                    Some(PollCommand::Wakeup) if self.is_motor_task() => {
-                        let tick = Instant::now();
-                        self.query_task().await;
-                        due = self.task_due(tick);
-                    }
-                    Some(PollCommand::Wakeup) => {
-                        due = self.poller_pass(true).await;
-                    }
+                    Some(PollCommand::Wakeup) => due = self.wakeup_pass().await,
                     Some(PollCommand::Post(status)) => self.axes[index].notify(status, false),
                     // C shutdownPoller ends the controller's one poller.
                     Some(PollCommand::Shutdown) | None => return,
                 },
                 Wake::Join(join) => self.join(*join),
+                Wake::Wakeup => due = self.wakeup_pass().await,
                 Wake::Due => {
                     due = self.timed_pass().await;
                 }
@@ -1554,6 +1744,8 @@ enum Wake {
     Batch(usize, ToAxis),
     Command(usize, Option<PollCommand>),
     Join(Box<Joining>),
+    /// [`SharedControllerPoll::wakeup`].
+    Wakeup,
     Due,
 }
 
@@ -1589,7 +1781,7 @@ pub(crate) fn c_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
         MotorCommand::SetEncoderRatio { .. } | MotorCommand::InitEncoderRatio { .. } => {
             (c::ENCODER_RATIO, Float64(cmd.encoder_ratio()?))
         }
-        MotorCommand::MoveToHome { .. } => (c::MOVE_TO_HOME, Int32(1)),
+        MotorCommand::MoveToHome => (c::MOVE_TO_HOME, Int32(1)),
         MotorCommand::SetPidGain { kind, gain } => match kind {
             PidGainKind::Proportional => (c::PGAIN, Float64(gain)),
             PidGainKind::Integral => (c::IGAIN, Float64(gain)),
@@ -1634,7 +1826,7 @@ fn drv_motor_asyn_reason(cmd: &MotorCommand) -> Option<i32> {
         },
         MotorCommand::SetClosedLoop { .. } => 8,
         MotorCommand::DeferMoves { .. } => 26,
-        MotorCommand::MoveToHome { .. } => 27,
+        MotorCommand::MoveToHome => 27,
         MotorCommand::SetVelocity { .. } => 100,
         MotorCommand::SetVelBase { .. } => 101,
         MotorCommand::SetAccel { .. } => 102,
@@ -1756,6 +1948,9 @@ fn model2_param(write: StatusWrite) -> (i32, WriteValue) {
         StatusWrite::Moving(v) => (21, bit(v)),
         StatusWrite::CommsError(v) => (23, bit(v)),
         StatusWrite::LowHardLimit(v) => (24, bit(v)),
+        StatusWrite::Homed(v) => (25, bit(v)),
+        StatusWrite::HasEncoder(v) => (19, bit(v)),
+        StatusWrite::GainSupport(v) => (22, bit(v)),
     }
 }
 
@@ -1769,16 +1964,6 @@ pub struct AxisWrite {
     params: Vec<(i32, WriteValue)>,
     /// The driver poll a GET_INFO ran.
     polled: Option<Result<MotorStatus, FailedPoll>>,
-}
-
-fn axis_sets(
-    axis: i32,
-    updates: Vec<(usize, asyn_rs::param::ParamValue)>,
-) -> Vec<asyn_rs::request::ParamSetValue> {
-    updates
-        .into_iter()
-        .map(|(reason, value)| asyn_rs::request::ParamSetValue::new(reason, axis, value))
-        .collect()
 }
 
 /// A failed driver poll: the bits its error label raises and the status it
@@ -2021,27 +2206,31 @@ pub fn execute_commands(
     on_write: &mut dyn FnMut(AxisWrite),
 ) {
     let port = PortCtx::of(trace);
+    let poll = match crate::devices::axis_at(trace.port(), trace.addr()) {
+        Some(axis) if trace.is_controller() => axis.controller_poll().clone(),
+        _ => SharedControllerPoll::default(),
+    };
     for cmd in commands {
         execute_command(
             trace,
             cmd,
             &port,
-            |c, quiet| Some(drive(&mut *motor, trace, cmd, c, quiet)),
+            &poll,
+            |_, c, quiet| Some(drive(&mut *motor, trace, cmd, c, quiet)),
             on_write,
         );
     }
 }
 
 /// The controller port a record's commands reach beside the driver: the
-/// subclass's [`WriteHook`], the parameters the base sets and the store
-/// the hook's sets go through. All `None` off a controller axis.
+/// subclass's [`WriteHook`] and whether the base sets parameters there.
+/// Neither off a controller axis.
 ///
 /// [`WriteHook`]: crate::controller_port::WriteHook
 #[derive(Default)]
 struct PortCtx {
     hook: Option<Arc<dyn crate::controller_port::WriteHook>>,
-    params: Option<asyn_rs::port_handle::PortHandle>,
-    store: Option<crate::controller_port::ParamStore>,
+    params: bool,
 }
 
 impl PortCtx {
@@ -2049,11 +2238,9 @@ impl PortCtx {
         if !trace.is_controller() {
             return Self::default();
         }
-        let port = trace.port();
         Self {
-            hook: crate::devices::write_hook(port),
-            params: crate::devices::controller_port_handle(port),
-            store: crate::devices::param_store(port),
+            hook: crate::devices::write_hook(trace.port()),
+            params: true,
         }
     }
 }
@@ -2077,21 +2264,37 @@ pub(crate) fn base_call(
     (c, quiet)
 }
 
-/// One record command: the subclass's check, the driver call `drive` makes
-/// under the axis's lock, then, with the lock released, the port's sets,
-/// the post, the base's closing line, the subclass's code after it and
-/// devMotorAsyn's reply. A GET_INFO's `drive` runs the controller poll
-/// first, as C `motorUpdateStatus_` runs `pC->poll()`
-/// (asynMotorController.cpp:217-221). `drive` returns `None` when the lock
-/// is poisoned: nothing more runs.
+/// One record command under `poll`'s controller lock, as C's whole
+/// `writeFloat64` runs under it: the subclass's check, the driver call
+/// `drive` makes under the axis's lock, then, with the axis's lock
+/// released, the port's sets, the post, the base's closing line, the
+/// subclass's code after it and devMotorAsyn's reply. A GET_INFO's `drive`
+/// runs the controller poll first, as C `motorUpdateStatus_` runs
+/// `pC->poll()` (asynMotorController.cpp:217-221). `drive` returns `None`
+/// when the lock is poisoned: nothing more runs.
 fn execute_command(
     trace: &MotorTrace,
     cmd: &MotorCommand,
     port: &PortCtx,
-    drive: impl FnOnce(Option<(i32, WriteValue)>, bool) -> Option<Driven>,
+    poll: &SharedControllerPoll,
+    drive: impl FnOnce(&ControllerHeld<'_>, Option<(i32, WriteValue)>, bool) -> Option<Driven>,
     on_write: &mut dyn FnMut(AxisWrite),
 ) {
+    if port.params {
+        poll.set_port(trace.port());
+    }
+    let held = poll.hold();
     let axis = trace.addr();
+    let store = |delta: crate::controller_port::ParamDelta| {
+        if !port.params {
+            return;
+        }
+        let mut sets = PortSets::default();
+        for (function, value) in delta.into_values() {
+            sets.set(axis, function, value);
+        }
+        poll.post_sets(Some(axis), sets);
+    };
     let hook = port.hook.as_ref();
     let (c, quiet) = base_call(trace, hook, cmd);
     let function = c.map_or(0, |(function, _)| function);
@@ -2110,9 +2313,7 @@ fn execute_command(
             &|mask, args| trace.print(mask, function, args),
         ));
         on_write(AxisWrite::default());
-        if let Some(store) = &port.store {
-            store(axis, outcome.delta);
-        }
+        store(outcome.delta);
         let status = outcome.status.unwrap_or(status);
         let failure = status.as_ref().err().map(|e| e.message_display());
         dev_motor_asyn_reply(
@@ -2125,37 +2326,38 @@ fn execute_command(
     }
     let Some(Driven {
         result,
-        write_status,
         write,
         port_sets,
-    }) = drive(c, quiet)
+    }) = drive(&held, c, quiet)
     else {
         return;
     };
-    if let (Some(params), Some((function, value))) = (&port.params, c) {
-        // The base sets the parameter whatever the driver returns
-        // (asynMotorController.cpp:204, :289); its callParamCallbacks
-        // closes the write.
-        let value = match value {
-            WriteValue::Float64(v) => asyn_rs::param::ParamValue::Float64(v),
-            WriteValue::Int32(v) => asyn_rs::param::ParamValue::Int32(v),
-        };
-        let set = asyn_rs::request::ParamSetValue::new(function as usize, axis, value);
-        let _ = params.set_params_and_notify_blocking(axis, vec![set]);
-    }
-    // The poll's or the write's own sets land at once, as C's paramLib.
-    if let Some(params) = &port.params {
-        apply_port_sets_on(params, trace.port(), Some(axis), port_sets);
+    if port.params {
+        let mut sets = PortSets::default();
+        if let Some((function, value)) = c {
+            // The base sets the parameter whatever the driver returns
+            // (asynMotorController.cpp:204, :289); its callParamCallbacks
+            // closes the write.
+            let value = match value {
+                WriteValue::Float64(v) => asyn_rs::param::ParamValue::Float64(v),
+                WriteValue::Int32(v) => asyn_rs::param::ParamValue::Int32(v),
+            };
+            sets.set(axis, function as usize, value);
+            sets.call_param_callbacks(axis);
+        }
+        // The poll's or the write's own sets, as C's paramLib.
+        sets.append(port_sets);
+        poll.post_sets(Some(axis), sets);
     }
     on_write(write);
 
     // The base closing line, which neither a drvMotorAsyn port nor a
     // subclass branch that skips the base prints.
     if let (false, Some((_, value))) = (quiet, c) {
-        let status = write_status.unwrap_or_else(|| match &result {
+        let status = match &result {
             Ok(()) => 0,
             Err(e) => e.c_status_code(),
-        });
+        };
         let print = |iface: &str, value: std::fmt::Arguments<'_>| {
             if status != 0 {
                 trace.print(
@@ -2184,37 +2386,17 @@ fn execute_command(
     // What the subclass's write returns instead of the base's status.
     let mut returned = None;
     if let (Some(hook), Some((function, value))) = (hook, c) {
-        // MoveToHome's write returned success; its thread reports.
-        let ok = Ok(());
-        let status = if write_status == Some(0) {
-            &ok
-        } else {
-            &result
-        };
         let outcome = hook.after_write(&FinishedWrite::new(
             axis,
             function as usize,
             value,
-            status,
+            &result,
             &|mask, args| trace.print(mask, function, args),
         ));
-        if let Some(store) = &port.store {
-            store(axis, outcome.delta);
-        }
+        store(outcome.delta);
         returned = outcome.status;
     }
 
-    if let (Err(_), MotorCommand::MoveToHome { .. }) = (&result, cmd) {
-        if !quiet {
-            trace.print_self(
-                TraceMask::ERROR,
-                format_args!(
-                    "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={axis}\n"
-                ),
-            );
-        }
-        return;
-    }
     let failure = match &returned {
         Some(status) => status
             .as_ref()
@@ -2236,9 +2418,6 @@ fn execute_command(
 /// it is released.
 pub(crate) struct Driven {
     pub(crate) result: asyn_rs::error::AsynResult<()>,
-    /// What the base's write returns when it is not the driver's status:
-    /// MoveToHome's, which hands the move to its thread.
-    write_status: Option<i32>,
     /// What it set on the axis, for the poller to post.
     pub(crate) write: AxisWrite,
     /// [`AsynMotor::take_port_sets`].
@@ -2268,7 +2447,6 @@ pub(crate) fn drive(
             trace.print(TraceMask::FLOW, function, args)
         }
     };
-    let mut write_status = None;
     let mut polled = None;
     let result = match *cmd {
         MotorCommand::MoveAbsolute {
@@ -2361,19 +2539,13 @@ pub(crate) fn drive(
         MotorCommand::ProfileExecute => motor.execute_profile(&user),
         MotorCommand::ProfileAbort => motor.abort_profile(&user),
         MotorCommand::ProfileReadback => motor.readback_profile(&user).map(|_| ()),
-        MotorCommand::MoveToHome {
-            position,
-            min_velocity,
-            velocity,
-            acceleration,
-        } => {
+        // The caller signals the moveToHome thread, which calls the driver
+        // (asynMotorController.cpp:236-242).
+        MotorCommand::MoveToHome => {
             flow(format_args!(
                 "asynMotorController:writeInt32:: Starting a move to home for axis {axis}\n"
             ));
-            // C hands the move to the moveToHome thread and writeInt32
-            // returns success; the thread reports a failure on its own.
-            write_status = Some(0);
-            motor.move_to_home(&user, position, min_velocity, velocity, acceleration)
+            Ok(())
         }
         MotorCommand::SetPidGain { kind, gain } => {
             let r = motor.set_pid_gain(&user, kind, gain);
@@ -2459,7 +2631,6 @@ pub(crate) fn drive(
     };
     Driven {
         result,
-        write_status,
         write: AxisWrite { polled, ..write },
         port_sets,
     }
@@ -2641,7 +2812,7 @@ pub(crate) mod drv_motor_asyn_stand_in {
                 1,
                 PortFlags::default(),
                 asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+                asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             motor,
             axis,
@@ -2673,14 +2844,17 @@ mod tests {
             asyn_rs::param::ParamValue::Float64(-1.0),
         );
         handle.set_params_blocking(0, vec![set]).unwrap();
-        let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(index::MOVE_REL),
-                addr: Some(0),
-                ..Default::default()
-            },
-            1,
-        );
+        let (_sub, mut rx) = handle
+            .interrupts()
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(index::MOVE_REL),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
         gate.set(true);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -3089,6 +3263,30 @@ mod tests {
         }
     }
 
+    /// What a C constructor set stays in the status a failed poll posts:
+    /// phytronAxis's HasEncoder (phytronAxisMotor.cpp:1352) under the
+    /// poll's PROBLEM, MSTA 0x300.
+    #[test]
+    fn a_failed_poll_keeps_what_the_constructor_set() {
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(CtorBailed(vec![
+            StatusWrite::HasEncoder(true),
+            StatusWrite::GainSupport(true),
+        ])));
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr: 0,
+        };
+        let axis = controller.axis(motor, user).axis;
+        let record = axis.attach();
+        let mut poll_loop = controller.build(SCAN, SCAN, 0);
+        now(poll_loop.poller_pass(false));
+        let status = poll_loop.axes[0].last_status.clone().unwrap();
+        assert!(status.has_encoder && status.gain_support && status.problem);
+        let init = record.device_state().lock().unwrap().init_status();
+        assert!(init.has_encoder && init.gain_support, "{init:?}");
+    }
+
     /// C readGenericPointer reads the parameters the constructor set
     /// (asynMotorController.cpp:505-525), so a record bound to an axis
     /// created after the poller started reads PROBLEM|COMM_ERR at init, and
@@ -3197,14 +3395,17 @@ mod tests {
         let mut poll_loop = controller.build(SCAN, SCAN, 0);
         open_past_boot_flush(&handle, &gate);
         let read = |reason| handle.read_float64_blocking(reason, 0).unwrap();
-        let (_sub, mut limits) = handle.interrupts().register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(index::HIGH_LIMIT),
-                addr: Some(0),
-                ..Default::default()
-            },
-            16,
-        );
+        let (_sub, mut limits) = handle
+            .interrupts()
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(index::HIGH_LIMIT),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                16,
+            )
+            .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -3502,7 +3703,8 @@ mod tests {
             SCAN,
             0,
         );
-        poll_loop.axes[0].mirror_to(port, 0);
+        let poll = poll_loop.controller_poll.clone();
+        poll_loop.axes[0].mirror_to(port, 0, poll);
         (poll_loop, handle, gate)
     }
 
@@ -3621,7 +3823,8 @@ mod tests {
             SCAN,
             0,
         );
-        poll_loop.axes[0].mirror_to(port, 0);
+        let poll = poll_loop.controller_poll.clone();
+        poll_loop.axes[0].mirror_to(port, 0, poll);
         now(poll_loop.poller_pass(false));
         assert_eq!(comms(&handle), Some(1), "the first post leaves it");
         now(poll_loop.poller_pass(false));
@@ -3634,12 +3837,11 @@ mod tests {
             .ok()
     }
 
-    /// Axis 0's COMMS_ERROR callbacks on controller port `port` from the
+    /// Axis 0's COMMS_ERROR callbacks on controller port `handle` from the
     /// moment `gate` opened and the port's one-shot flush ran. That flush is
     /// on its own thread, as C's `callbackThread::run` (asynPortDriver.cpp:
     /// 923-937), so it would post whatever was set by the time it got there.
     fn comms_posts(
-        port: &str,
         handle: &asyn_rs::port_handle::PortHandle,
         gate: &Gate,
     ) -> (
@@ -3648,17 +3850,27 @@ mod tests {
     ) {
         use crate::controller_port::index::STATUS_COMMS_ERROR;
         // A marker only that flush can post.
-        let mut marker = crate::controller_port::ParamDelta::default();
-        marker.set_int32(STATUS_COMMS_ERROR, 0);
-        crate::devices::param_store(port).unwrap()(0, marker);
-        let (sub, mut rx) = handle.interrupts().register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(STATUS_COMMS_ERROR),
-                addr: Some(0),
-                ..Default::default()
-            },
+        let marker = asyn_rs::request::ParamSetValue::new(
+            STATUS_COMMS_ERROR,
             0,
+            asyn_rs::param::ParamValue::Int32(0),
         );
+        handle.set_params_blocking(0, vec![marker]).unwrap();
+        // A callParamCallbacks already queued (the startup pass's flush,
+        // register_axis's) must run while the gate is shut, or its post is
+        // taken for the gate's flush, which then lands after the test's write.
+        settle(handle);
+        let (sub, mut rx) = handle
+            .interrupts()
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(STATUS_COMMS_ERROR),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
         gate.set(true);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -3707,7 +3919,7 @@ mod tests {
     fn a_hook_set_waits_for_the_next_poll_pass() {
         let (mut poll_loop, handle, gate) =
             hooked_poller("PLHOOKPASS", vec![MotorStatus::default()]);
-        let (_sub, mut rx) = comms_posts("PLHOOKPASS", &handle, &gate);
+        let (_sub, mut rx) = comms_posts(&handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKPASS");
         assert_eq!(posted(&handle, &mut rx), None, "set, not yet called back");
         assert_eq!(comms(&handle), Some(1), "set in the parameter library");
@@ -3715,11 +3927,119 @@ mod tests {
         assert_eq!(posted(&handle, &mut rx), Some(1));
     }
 
+    /// A driver whose move waits on the test and leaves OWN=1 on the port,
+    /// and whose poll leaves OWN=2.
+    struct Racing {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        own: i32,
+    }
+
+    impl AsynMotor for Racing {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            self.own = 1;
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            self.own = 2;
+            Ok(MotorStatus::default())
+        }
+        fn take_port_sets(&mut self) -> PortSets {
+            let mut sets = PortSets::default();
+            let own = crate::controller_port::BASE_PARAMS.len();
+            sets.axis(own, asyn_rs::param::ParamValue::Int32(self.own));
+            sets
+        }
+    }
+
+    struct Own;
+
+    impl crate::controller_port::ControllerParams for Own {
+        fn create_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> AsynResult<()> {
+            base.create_param("OWN", asyn_rs::param::ParamType::Int32)?;
+            Ok(())
+        }
+    }
+
+    /// A port poll that waits on the lock a poller's write holds runs after
+    /// the write's sets land, as C's lock orders them.
+    #[test]
+    fn a_port_poll_waiting_on_a_poller_write_lands_after_its_sets() {
+        let port = "PLWRITERACE";
+        let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+        let handle = crate::devices::register_controller_port(&gate, port, 1, Own).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Racing {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            own: 0,
+        }));
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let user = TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        };
+        crate::devices::register_axis(controller.axis(motor, user).axis).unwrap();
+        let mut poll_loop = controller.build(SCAN, SCAN, 0);
+        let writer = std::thread::spawn(move || {
+            let command = MotorCommand::MoveAbsolute {
+                position: 1.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            };
+            now(poll_loop.execute(
+                0,
+                ToAxis::from(CommandBatch {
+                    trace: Arc::new(MotorTrace::new(port, 0)),
+                    record: None,
+                    commands: vec![command],
+                }),
+            ));
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let update = {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                handle.write_int32_blocking(crate::controller_port::index::UPDATE_STATUS, 0, 1)
+            })
+        };
+        // The port's thread is now waiting on the write's lock.
+        std::thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        update.join().unwrap().unwrap();
+        let own = crate::controller_port::BASE_PARAMS.len();
+        assert_eq!(handle.read_int32_blocking(own, 0).unwrap(), 2);
+    }
+
     #[test]
     fn a_hook_set_rides_the_next_write_callback() {
         let (mut poll_loop, handle, gate) =
             hooked_poller("PLHOOKWRITE", vec![MotorStatus::default()]);
-        let (_sub, mut rx) = comms_posts("PLHOOKWRITE", &handle, &gate);
+        let (_sub, mut rx) = comms_posts(&handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKWRITE");
         write_stop(&mut poll_loop, "PLHOOKWRITE");
         assert_eq!(
@@ -3749,7 +4069,7 @@ mod tests {
             AxisSubscribers::new(),
         ))
         .unwrap();
-        let (_sub, mut rx) = comms_posts("PLHOOKPORT", &handle, &gate);
+        let (_sub, mut rx) = comms_posts(&handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKPORT");
         assert_eq!(posted(&handle, &mut rx), None);
         handle

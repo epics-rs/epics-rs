@@ -66,7 +66,7 @@ impl EnumPort {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices.into()).unwrap();

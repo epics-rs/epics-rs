@@ -1,2 +1,3 @@
 _main_ byte_range.proto line 2: Value 300 does not fit in byte
 _main_ in string variable 'interminator' in protocol file 'byte_range.proto' line 2
+_main_ while compiling protocol 'p' for 'rec0'

@@ -1,2 +1,3 @@
 _main_ bad_assignment.proto line 1: Unexpected '{' (missing ';' or '"' ?)
 _main_ bad_assignment.proto line 1: in variable assignment 'x = ...'
+_main_ while reading protocol 'p' for 'rec0'

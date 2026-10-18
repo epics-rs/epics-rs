@@ -273,6 +273,8 @@ static THROTTLE_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     rule: LinkRule::Locality,
     // C `throttleRecord.c:726`, `:732`.
     mask: EventMask::from_bits(EventMask::VALUE.bits() | EventMask::LOG.bits()),
+    repost_local: false,
+    in_cycle: true,
 };
 
 impl ThrottleRecord {
@@ -842,6 +844,8 @@ impl Record for ThrottleRecord {
         Some(LinkCheck {
             spec: &THROTTLE_LINK_CHECK,
             statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
             state: &mut self.link_check,
         })
     }

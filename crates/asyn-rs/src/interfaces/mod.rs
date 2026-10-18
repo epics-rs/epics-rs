@@ -291,10 +291,48 @@ impl InterfaceMask {
         .or(Self::ENUM)
         .or(Self::INT64);
 
+    /// The interrupt mask of a port not yet given its C driver's: every
+    /// interface may interrupt, as every one could before masks existed. Each
+    /// use is a site still to migrate.
+    pub const UNMIGRATED_INTERRUPTS: Self = Self::ALL;
+
+    /// Every bit: a mask that restricts nothing.
+    pub const ALL: Self = Self(u32::MAX);
+
+    /// The bit C names `iface` by, or `None` for a Rust-only interface.
+    pub const fn of(iface: InterfaceType) -> Option<Self> {
+        Some(match iface {
+            InterfaceType::Int32 => Self::INT32,
+            InterfaceType::Int64 => Self::INT64,
+            InterfaceType::Float64 => Self::FLOAT64,
+            InterfaceType::Octet => Self::OCTET,
+            InterfaceType::UInt32Digital => Self::UINT32_DIGITAL,
+            InterfaceType::Enum => Self::ENUM,
+            InterfaceType::GenericPointer => Self::GENERIC_POINTER,
+            InterfaceType::Int8Array => Self::INT8_ARRAY,
+            InterfaceType::Int16Array => Self::INT16_ARRAY,
+            InterfaceType::Int32Array => Self::INT32_ARRAY,
+            InterfaceType::Int64Array => Self::INT64_ARRAY,
+            InterfaceType::Float32Array => Self::FLOAT32_ARRAY,
+            InterfaceType::Float64Array => Self::FLOAT64_ARRAY,
+            InterfaceType::Gpib => Self::GPIB,
+            InterfaceType::Option => Self::OPTION,
+            InterfaceType::DrvUser => Self::DRV_USER,
+            InterfaceType::Common => Self::COMMON,
+            InterfaceType::UInt64 | InterfaceType::Motor => return None,
+        })
+    }
+
     /// A C subclass (an areaDetector driver or plugin) whose own masks, ORed
     /// into its base class's, are not yet carried over. Each use is a site
     /// still to migrate.
     pub const UNMIGRATED_SUBCLASS: Self = Self::NONE;
+
+    /// The interrupt mask of a C subclass not yet given its own: every
+    /// interface may interrupt, as with [`Self::UNMIGRATED_INTERRUPTS`], so
+    /// the port refuses none of the subclass's interrupt clients. Each use is
+    /// a site still to migrate.
+    pub const UNMIGRATED_SUBCLASS_INTERRUPTS: Self = Self::ALL;
 
     pub const fn or(self, other: Self) -> Self {
         Self(self.0 | other.0)

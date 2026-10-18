@@ -8,8 +8,9 @@
 //! what it needs into `info`, and returns the `StreamFormatType` of the
 //! value (`*_FORMAT` in [`crate::format`]), or 0 on a parse error or when
 //! the direction is not supported. The `print_*` / `scan_*` method matching
-//! the returned type is then called for each output / input; `scan_*`
-//! returns the number of input bytes consumed, or -1.
+//! the returned type is then called for each output / input, with that info
+//! in `fmt.info`; `scan_*` returns the number of input bytes consumed, or
+//! -1.
 //!
 //! The standard converters (`StdLongConverter` and on in
 //! `StreamFormatConverter.cc`) and the converter files are ported on top of

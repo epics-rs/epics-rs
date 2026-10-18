@@ -25,6 +25,7 @@ use epics_base_rs::runtime::interrupt_accept::InterruptGate;
 use crate::controller_port::{ControllerParams, WriteHook};
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::MissingAxis;
+use crate::poll_loop::SharedControllerPoll;
 use crate::trace::{MotorTrace, TraceUser};
 
 /// `device(motor,INST_IO,devMotorAsyn,"asynMotor")` (motorSupport.dbd:8).
@@ -183,18 +184,35 @@ pub(crate) fn write_hook(port: &str) -> Option<Arc<dyn WriteHook>> {
     lock(controller_ports()).get(port)?.hook.clone()
 }
 
-/// Controller port `port`'s store for a [`WriteHook`]'s sets.
-pub(crate) fn param_store(port: &str) -> Option<crate::controller_port::ParamStore> {
-    lock(controller_ports())
-        .get(port)
-        .map(|entry| entry.store.clone())
-}
-
 /// Controller port `port`'s parameter library, as its poller reads it.
 pub(crate) fn controller_params(port: &str) -> Option<crate::controller_port::ParamRead> {
     lock(controller_ports())
         .get(port)
         .map(|entry| entry.params.clone())
+}
+
+/// C `asynMotorController` is its port: the poller of controller port
+/// `port`, found by name as `findAsynPortDriver` finds the controller.
+fn controller_polls() -> &'static Mutex<HashMap<String, SharedControllerPoll>> {
+    static POLLS: OnceLock<Mutex<HashMap<String, SharedControllerPoll>>> = OnceLock::new();
+    POLLS.get_or_init(Default::default)
+}
+
+/// Name `poll` controller port `port`'s poller; a port has one.
+pub(crate) fn link_controller_poll(port: &str, poll: &SharedControllerPoll) {
+    if lock(controller_ports()).contains_key(port) {
+        lock(controller_polls())
+            .entry(port.to_owned())
+            .or_insert_with(|| poll.clone());
+    }
+}
+
+/// Controller port `port`'s poller: `None` when there is no such port,
+/// `Some(None)` before its poller is named.
+pub(crate) fn controller_poll(port: &str) -> Option<Option<SharedControllerPoll>> {
+    lock(controller_ports())
+        .contains_key(port)
+        .then(|| lock(controller_polls()).get(port).cloned())
 }
 
 /// Controller port `port` itself.

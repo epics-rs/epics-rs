@@ -53,7 +53,7 @@ fn configure(port: &str) -> Result<(), AsynError> {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Int32)?;
     let driver = HalfBuilt { base, init: false };

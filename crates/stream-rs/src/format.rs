@@ -35,9 +35,10 @@ pub const STREAM_FORMAT_TYPE_STR: [&str; 7] = [
 /// the info string that follows it. Here the struct is stored with
 /// [`StreamFormat::encode`] in a fixed [`StreamFormat::SIZE`], and `info` is
 /// the `infolen` bytes after it (its 0x00 terminator included), which
-/// [`StreamFormat::extract`] returns alongside.
+/// [`StreamFormat::extract`] points it at. While a converter's `parse` runs
+/// it is empty.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StreamFormat {
+pub struct StreamFormat<'a> {
     pub conv: u8,
     /// `StreamFormatType`, as returned by the converter's `parse`.
     pub type_: i32,
@@ -45,13 +46,16 @@ pub struct StreamFormat {
     pub prec: i64,
     pub width: u64,
     pub infolen: u64,
+    pub info: &'a [u8],
 }
 
-impl StreamFormat {
-    /// Bytes the encoded struct takes in compiled code.
-    pub const SIZE: usize = 1 + 4 + 2 + 8 + 8 + 8;
+const ENCODED_SIZE: usize = 1 + 4 + 2 + 8 + 8 + 8;
 
-    pub fn encode(&self) -> [u8; Self::SIZE] {
+impl<'a> StreamFormat<'a> {
+    /// Bytes the encoded struct takes in compiled code.
+    pub const SIZE: usize = ENCODED_SIZE;
+
+    pub fn encode(&self) -> [u8; ENCODED_SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0] = self.conv;
         b[1..5].copy_from_slice(&self.type_.to_ne_bytes());
@@ -62,8 +66,9 @@ impl StreamFormat {
         b
     }
 
-    pub fn decode(b: &[u8; Self::SIZE]) -> Self {
+    pub fn decode(b: &[u8; ENCODED_SIZE]) -> Self {
         Self {
+            info: &[],
             conv: b[0],
             type_: i32::from_ne_bytes(b[1..5].try_into().unwrap()),
             flags: u16::from_ne_bytes(b[5..7].try_into().unwrap()),
@@ -73,18 +78,19 @@ impl StreamFormat {
         }
     }
 
-    /// `extract<StreamFormat>(s)` and the info after it: steps `s` past both.
-    pub fn extract<'a>(s: &mut CPtr<'a>) -> (Self, &'a [u8]) {
+    /// `extract<StreamFormat>(s)`, `fmt.info = s` and `s += fmt.infolen`.
+    pub fn extract(s: &mut CPtr<'a>) -> Self {
         let mut b = [0u8; Self::SIZE];
         for (i, x) in b.iter_mut().enumerate() {
             *x = s.at(i);
         }
         s.advance(Self::SIZE);
-        let f = Self::decode(&b);
+        let mut f = Self::decode(&b);
         let start = s.offset().min(s.base().len());
         let end = (s.offset() + f.infolen as usize).min(s.base().len());
         s.advance(f.infolen as usize);
-        (f, &s.base()[start..end])
+        f.info = &s.base()[start..end];
+        f
     }
 }
 
@@ -101,13 +107,14 @@ mod tests {
             prec: -1,
             width: 12,
             infolen: 3,
+            info: &[],
         };
         let mut code = f.encode().to_vec();
         code.extend_from_slice(b"ab\0rest");
         let mut p = CPtr::new(&code);
-        let (g, info) = StreamFormat::extract(&mut p);
-        assert_eq!(g, f);
-        assert_eq!(info, b"ab\0");
+        let g = StreamFormat::extract(&mut p);
+        assert_eq!(g.info, b"ab\0");
+        assert_eq!(StreamFormat { info: &[], ..g }, f);
         assert_eq!(p.cstr(), b"rest");
     }
 }

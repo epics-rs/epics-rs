@@ -1,0 +1,472 @@
+rec0: BK9173B.proto getIDN(1,2,3,4,5,6,7,8,9) P
+getIDN {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "*IDN?";
+    in "%s";
+  }
+
+    out "*IDN?";
+    in "%s";
+}
+rec1: BK9173B.proto getError(1,2,3,4,5,6,7,8,9) P
+getError {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SYST:ERR?";
+    in "%39c";
+}
+rec2: BK9173B.proto getVmeas1(1,2,3,4,5,6,7,8,9) P
+getVmeas1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "MEAS:VOLT?";
+    in "%f";
+}
+rec3: BK9173B.proto getVmeas2(1,2,3,4,5,6,7,8,9) P
+getVmeas2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "MEAS:VOLT2?";
+    in "%f";
+}
+rec4: BK9173B.proto getImeas1(1,2,3,4,5,6,7,8,9) P
+getImeas1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "MEAS:CURR?";
+    in "%f";
+}
+rec5: BK9173B.proto getImeas2(1,2,3,4,5,6,7,8,9) P
+getImeas2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "MEAS:CURR2?";
+    in "%f";
+}
+rec6: BK9173B.proto getVset1(1,2,3,4,5,6,7,8,9) P
+getVset1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "VOLT?";
+    in "%f";
+}
+rec7: BK9173B.proto getVset2(1,2,3,4,5,6,7,8,9) P
+getVset2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "VOLT2?";
+    in "%f";
+}
+rec8: BK9173B.proto getIset1(1,2,3,4,5,6,7,8,9) P
+getIset1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "CURR?";
+    in "%f";
+}
+rec9: BK9173B.proto getIset2(1,2,3,4,5,6,7,8,9) P
+getIset2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "CURR2?";
+    in "%f";
+}
+rec10: BK9173B.proto getOut1State(1,2,3,4,5,6,7,8,9) P
+getOut1State {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:STAT?";
+    in "%s";
+}
+rec11: BK9173B.proto getOut2State(1,2,3,4,5,6,7,8,9) P
+getOut2State {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT2:STAT?";
+    in "%s";
+}
+rec12: BK9173B.proto getOut1OnOffState(1,2,3,4,5,6,7,8,9) P
+getOut1OnOffState {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT?";
+    in "%s";
+}
+rec13: BK9173B.proto getOut2OnOffState(1,2,3,4,5,6,7,8,9) P
+getOut2OnOffState {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT2?";
+    in "%s";
+}
+rec14: BK9173B.proto getCH1Vlim(1,2,3,4,5,6,7,8,9) P
+getCH1Vlim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:VOLT?";
+    in "%f";
+}
+rec15: BK9173B.proto getCH2Vlim(1,2,3,4,5,6,7,8,9) P
+getCH2Vlim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:VOLT2?";
+    in "%f";
+}
+rec16: BK9173B.proto getCH1Ilim(1,2,3,4,5,6,7,8,9) P
+getCH1Ilim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:CURR?";
+    in "%f";
+}
+rec17: BK9173B.proto getCH2Ilim(1,2,3,4,5,6,7,8,9) P
+getCH2Ilim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:CURR2?";
+    in "%f";
+}
+rec18: BK9173B.proto setCH1_On(1,2,3,4,5,6,7,8,9) P
+setCH1_On {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT 1";
+}
+rec19: BK9173B.proto setCH1_Off(1,2,3,4,5,6,7,8,9) P
+setCH1_Off {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT 0";
+}
+rec20: BK9173B.proto setCH2_On(1,2,3,4,5,6,7,8,9) P
+setCH2_On {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT2 1";
+}
+rec21: BK9173B.proto setCH2_Off(1,2,3,4,5,6,7,8,9) P
+setCH2_Off {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT2 0";
+}
+rec22: BK9173B.proto setCH1_V(1,2,3,4,5,6,7,8,9) P
+setCH1_V {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "VOLT %.3f";
+}
+rec23: BK9173B.proto setCH2_V(1,2,3,4,5,6,7,8,9) P
+setCH2_V {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "VOLT2 %.3f";
+}
+rec24: BK9173B.proto setCH1_I(1,2,3,4,5,6,7,8,9) P
+setCH1_I {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "CURR %.3f";
+}
+rec25: BK9173B.proto setCH2_I(1,2,3,4,5,6,7,8,9) P
+setCH2_I {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "CURR2 %.3f";
+}
+rec26: BK9173B.proto setCH1Vlim(1,2,3,4,5,6,7,8,9) P
+setCH1Vlim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:VOLT %.3f";
+}
+rec27: BK9173B.proto setCH2Vlim(1,2,3,4,5,6,7,8,9) P
+setCH2Vlim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:VOLT2 %.3f";
+}
+rec28: BK9173B.proto setCH1Ilim(1,2,3,4,5,6,7,8,9) P
+setCH1Ilim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:CURR %.3f";
+}
+rec29: BK9173B.proto setCH2Ilim(1,2,3,4,5,6,7,8,9) P
+setCH2Ilim {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUT:LIM:CURR2 %.3f";
+}

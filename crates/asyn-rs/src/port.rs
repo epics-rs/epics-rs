@@ -836,7 +836,7 @@ impl PortDriverBase {
             interface_mask: interface_mask | InterfaceMask::COMMON,
             interrupt_mask,
             params: ParamList::new(max_addr),
-            interrupts: InterruptManager::new(),
+            interrupts: InterruptManager::with_sources(interrupt_mask),
             // C `dpCommonInit` (asynManager.c:523): every port starts down and
             // comes up through its driver's connect, which registration queues.
             connected: Connection::Own(Arc::new(AtomicBool::new(false))),
@@ -874,6 +874,15 @@ impl PortDriverBase {
     /// The interfaces that can generate interrupts (asynPortDriver.cpp:4074-4086).
     pub fn interrupt_mask(&self) -> InterfaceMask {
         self.interrupt_mask
+    }
+
+    /// Replace the interrupt manager with one `gate` owns from construction,
+    /// keeping this port's interrupt sources — see [`InterruptManager::owned_by`].
+    pub fn own_interrupts(
+        &mut self,
+        gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    ) {
+        self.interrupts = InterruptManager::owned_by(gate, self.interrupt_mask);
     }
 
     /// The EOS entry the given `asynUser` addr selects — see [`eos_device_key`].
@@ -3715,7 +3724,7 @@ pub(crate) mod tests {
                 max_addr,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             assert_eq!(base.flags.multi_device, multi, "maxAddr {max_addr}");
         }
@@ -3738,7 +3747,7 @@ pub(crate) mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.octet_interrupt_process = true;
             base.init_connected(true);
@@ -3799,14 +3808,15 @@ pub(crate) mod tests {
 
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = seen.clone();
-        let _sub = drv.base().interrupts.register_sync_callback(
-            InterruptFilter::default(),
-            move |iv: &InterruptValue| {
+        let _sub = drv
+            .base()
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
                     seen_cb.lock().unwrap().push(s.to_vec());
                 }
-            },
-        );
+            })
+            .unwrap();
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
@@ -3844,14 +3854,15 @@ pub(crate) mod tests {
 
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = seen.clone();
-        let _sub = drv.base().interrupts.register_sync_callback(
-            InterruptFilter::default(),
-            move |iv: &InterruptValue| {
+        let _sub = drv
+            .base()
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
                 if let ParamValue::Octet(bytes) = &iv.value {
                     seen_cb.lock().unwrap().push(bytes.to_vec());
                 }
-            },
-        );
+            })
+            .unwrap();
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
@@ -3891,26 +3902,29 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(gate.clone());
+        base.own_interrupts(gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
 
         let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let _sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                addr: Some(0),
-                uint32_mask: None,
-                iface: None,
-            },
-            move |iv: &InterruptValue| {
-                if let ParamValue::Int32(v) = &iv.value {
-                    sink.lock().unwrap().push(*v);
-                }
-            },
-        );
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    addr: Some(0),
+                    uint32_mask: None,
+                    iface: None,
+                },
+                move |iv: &InterruptValue| {
+                    if let ParamValue::Int32(v) = &iv.value {
+                        sink.lock().unwrap().push(*v);
+                    }
+                },
+            )
+            .unwrap();
 
         // Pre-iocInit: interrupts not accepted. The subscriber exists (the
         // record registered), the driver seeds a read-only value, and its own
@@ -3956,9 +3970,9 @@ pub(crate) mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
-            base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+            base.own_interrupts(InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("TEMP", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -4074,7 +4088,7 @@ pub(crate) mod tests {
             2,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let own = base
             .create_param_in_list(0, "OWN", ParamType::Int32)
@@ -4304,7 +4318,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();
 
@@ -4351,9 +4365,9 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        base.own_interrupts(InterruptGate::opened());
         base.create_param("MODE", ParamType::Enum).unwrap();
         let mut rx = base.interrupts.subscribe_async(256, 4096);
 
@@ -4405,9 +4419,9 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        base.own_interrupts(InterruptGate::opened());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
         let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
         base.set_int32_param(plain, 0, 7).unwrap();
@@ -4439,7 +4453,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
 
@@ -4473,9 +4487,9 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        base.own_interrupts(InterruptGate::opened());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
         let mut rx = base.interrupts.subscribe_async(256, 4096);
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -4484,7 +4498,8 @@ pub(crate) mod tests {
             .interrupts
             .register_sync_callback(crate::interrupt::InterruptFilter::default(), move |iv| {
                 log.lock().push((iv.reason, iv.value.clone()))
-            });
+            })
+            .unwrap();
 
         struct GpDriver {
             base: PortDriverBase,
@@ -4668,7 +4683,7 @@ pub(crate) mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         };
 
@@ -4840,7 +4855,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
 
@@ -4866,7 +4881,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("BIG", ParamType::Int64).unwrap();
 
@@ -4895,7 +4910,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         struct BoundsDriver {
             base: PortDriverBase,
@@ -4926,7 +4941,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -4956,7 +4971,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -4971,7 +4986,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5005,9 +5020,9 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        base.own_interrupts(InterruptGate::opened());
         base.create_param("V", ParamType::Int32).unwrap();
         let mut rx = base.interrupts.subscribe_async(256, 4096);
 
@@ -5074,7 +5089,7 @@ pub(crate) mod tests {
                 destructible: false,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         match base.shutdown_lifecycle() {
             Err(AsynError::Status { message, .. }) => {
@@ -5100,7 +5115,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         assert!(base.is_enabled());
         assert!(!base.is_defunct());
@@ -5150,7 +5165,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -5175,7 +5190,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -5200,7 +5215,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5224,7 +5239,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5254,7 +5269,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let worker = base.exception_announcer();
         let table = base.device_table();
@@ -5291,7 +5306,7 @@ pub(crate) mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
@@ -5342,7 +5357,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -5376,7 +5391,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_auto_connect(false);
         base.set_connected(false);
@@ -5391,7 +5406,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_auto_connect(false);
         base.set_connected(false);
@@ -5404,7 +5419,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         base.set_auto_connect(true);
@@ -5422,7 +5437,7 @@ pub(crate) mod tests {
             2,
             multi,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         assert!(base.connect_retry_at.is_none());
@@ -5438,7 +5453,7 @@ pub(crate) mod tests {
             2,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         base.set_auto_connect_addr(1, true);
@@ -5458,7 +5473,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
 
         // No transition recorded yet => always permitted (C's
@@ -5488,7 +5503,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         assert!(base.last_connect_disconnect.is_none());
@@ -5515,7 +5530,7 @@ pub(crate) mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let t0 = Instant::now();
         base.connect_addr(1);
@@ -5547,7 +5562,7 @@ pub(crate) mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -5590,7 +5605,7 @@ pub(crate) mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -5643,7 +5658,7 @@ pub(crate) mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_addr_enabled(1, true).unwrap();
         assert!(base.device_states.lock().contains_key(&1));
@@ -5659,7 +5674,7 @@ pub(crate) mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.shutdown_lifecycle().unwrap();
         assert!(!base.dp_enabled(1));
@@ -5693,7 +5708,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let idx = base
             .params
@@ -5753,7 +5768,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let i32_idx = base.params.create_param("I32", ParamType::Int32).unwrap();
         let i64_idx = base.params.create_param("I64", ParamType::Int64).unwrap();
@@ -5863,7 +5878,7 @@ pub(crate) mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         for (name, t) in [
             ("I32", ParamType::Int32),
@@ -6118,7 +6133,7 @@ pub(crate) mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let n = base.params.create_param("N", ParamType::Int32).unwrap();
         let x = base.params.create_param("X", ParamType::Float64).unwrap();
@@ -6217,7 +6232,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         // See `a_single_device_port_collapses_every_addr_onto_one_eos`: the
         // EOS layer is what makes a terminator settable at all (R18-71).
@@ -6268,7 +6283,7 @@ pub(crate) mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         };
         drv.set_option(&mut AsynUser::default(), "baud", "9600")
@@ -6296,7 +6311,7 @@ pub(crate) mod tests {
             2,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -6360,7 +6375,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -6401,7 +6416,7 @@ pub(crate) mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -6442,7 +6457,7 @@ pub(crate) mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();

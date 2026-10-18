@@ -1,0 +1,235 @@
+rec0: Alicat_BC.proto setGas(1,2,3,4,5,6,7,8,9) P
+setGas {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1 GS";
+    in "1 %d";
+  }
+
+    out "1 GS %d";
+    in "1";
+}
+rec1: Alicat_BC.proto getRamp(1,2,3,4,5,6,7,8,9) P
+getRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 SR";
+    in "1%f";
+}
+rec2: Alicat_BC.proto setRamp(1,2,3,4,5,6,7,8,9) P
+setRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1 SR";
+    in "1%f";
+  }
+
+    out "1 SR %f 4";
+}
+rec3: Alicat_BC.proto getTemperature(1,2,3,4,5,6,7,8,9) P
+getTemperature {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1";
+    in "1 %f %(2)f %(3)f %(4)f %(5)f %(6)s%(7)40c";
+}
+rec4: Alicat_BC.proto setSetpoint(1,2,3,4,5,6,7,8,9) P
+setSetpoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "1";
+    in "1 %*f %*f %*f %f";
+  }
+
+    out "1 S %f";
+    in "1";
+}
+rec5: Alicat_BC.proto setSetpointSource(1,2,3,4,5,6,7,8,9) P
+setSetpointSource {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 LSS %{U|A}";
+    in "1";
+}
+rec6: Alicat_BC.proto getSetpointSource(1,2,3,4,5,6,7,8,9) P
+getSetpointSource {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 LSS";
+    in "1 %{U|A}";
+}
+rec7: Alicat_BC.proto setValve(1,2,3,4,5,6,7,8,9) P
+setValve {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 HPUR %f";
+    in "1";
+}
+rec8: Alicat_BC.proto setTotal(1,2,3,4,5,6,7,8,9) P
+setTotal {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 TB %f";
+    in "1";
+}
+rec9: Alicat_BC.proto resetTotal(1,2,3,4,5,6,7,8,9) P
+resetTotal {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 T";
+    in "1";
+}
+rec10: Alicat_BC.proto setRun(1,2,3,4,5,6,7,8,9) P
+setRun {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 C";
+    in "1";
+}
+rec11: Alicat_BC.proto getFirmware(1,2,3,4,5,6,7,8,9) P
+getFirmware {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 VE";
+    in "1 %80c";
+}
+rec12: Alicat_BC.proto getSerialNumber(1,2,3,4,5,6,7,8,9) P
+getSerialNumber {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 SN";
+    in "1 %80c";
+}
+rec13: Alicat_BC.proto getMaxFlow(1,2,3,4,5,6,7,8,9) P
+getMaxFlow {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "1 FPF 0";
+    in "1 %f %(2)s";
+}

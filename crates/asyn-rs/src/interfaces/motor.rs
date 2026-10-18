@@ -302,6 +302,15 @@ pub enum StatusWrite {
     /// param on its controller instead names it in
     /// [`AsynMotor::param_owned_msta_bits`].
     CommsError(bool),
+    /// `motorStatusHomed_` / `motorAxisHomed`, MSTA bit 14 RA_HOMED.
+    Homed(bool),
+    /// `motorStatusHasEncoder_` / `motorAxisHasEncoder`, MSTA bit 8
+    /// EA_PRESENT, which C axes set once in their constructor
+    /// (phytronAxisMotor.cpp:1352).
+    HasEncoder(bool),
+    /// `motorStatusGainSupport_` / `motorAxisHasClosedLoop`, MSTA bit 11
+    /// GAIN_SUPPORT.
+    GainSupport(bool),
 }
 
 impl StatusWrite {
@@ -319,6 +328,9 @@ impl StatusWrite {
             StatusWrite::Moving(v) => status.msta_moving = v,
             StatusWrite::LowHardLimit(v) => status.low_limit = v,
             StatusWrite::CommsError(v) => status.comms_error = v,
+            StatusWrite::Homed(v) => status.homed = v,
+            StatusWrite::HasEncoder(v) => status.has_encoder = v,
+            StatusWrite::GainSupport(v) => status.gain_support = v,
         }
     }
 }
@@ -597,21 +609,21 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         Ok(vec![])
     }
 
-    /// Move to a named "home" position defined by the controller.
-    /// Distinct from `home()` (limit-switch seek): this is an absolute move
-    /// to a pre-defined position, typical of model-3 controllers.
-    /// C: `a6f64591` + `5f421e9a` (2011-07).
-    fn move_to_home(
-        &mut self,
-        user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.move_absolute(user, position, min_velocity, velocity, acceleration)
+    /// C `doMoveToHome`, which the controller's moveToHome thread runs
+    /// without the controller lock (asynMotorController.cpp:723-742): taken
+    /// under the lock, run once it is released. None is C's default
+    /// `asynMotorAxis::doMoveToHome`, which only prints that the axis has
+    /// no implementation (asynMotorAxis.cpp:209-217). The argument is C's
+    /// `getReferencingModeMove()`, 0 until `asynMotorEnableMoveToHome`.
+    fn move_to_home_task(&mut self, _referencing_mode_move: i32) -> Option<MoveToHomeTask> {
+        None
     }
 }
+
+/// [`AsynMotor::move_to_home_task`]'s work. It applies sets on the
+/// controller port through its argument, which takes the controller lock as
+/// C's `pC_->lock(); setXxxParam(); callParamCallbacks(); pC_->unlock();`.
+pub type MoveToHomeTask = Box<dyn FnOnce(&dyn Fn(PortSets)) -> AsynResult<()> + Send>;
 
 // Position-compare output (PCO) is intentionally NOT part of this trait: the C
 // change adding `enablePCO`/PCO params to the base asynMotorAxis class

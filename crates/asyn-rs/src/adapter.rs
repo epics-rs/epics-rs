@@ -1018,6 +1018,24 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// C devAsyn's line for a `registerInterruptUser` the port refused
+    /// (`getInterruptPvt`, asynManager.c:2492-2497). C `printf`s it, except
+    /// devAsynXXXArray.cpp:245 and devAsynXXXTimeSeries.h:162, which print it
+    /// at `ASYN_TRACE_ERROR`.
+    #[cold]
+    fn report_register_refusal(&self, at: Register, e: &AsynError) {
+        let msg = e.message_display();
+        match self.dset.register_refusal_line(at, &self.record_name, &msg) {
+            (line, true) => self.dev_print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{line}\n"),
+            ),
+            (line, false) => println!("{line}"),
+        }
+    }
+
     /// The record's completion and the band its `PRIO` selects this pass, set
     /// before the request is queued.
     #[inline(always)]
@@ -2547,7 +2565,7 @@ impl AsynDeviceSupport {
     fn time_series_subscribe(
         &self,
         ts: Arc<TimeSeriesState>,
-    ) -> crate::interrupt::SyncCallbackSubscription {
+    ) -> Option<crate::interrupt::SyncCallbackSubscription> {
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.handle.param_list(self.addr)),
@@ -2625,6 +2643,8 @@ impl AsynDeviceSupport {
                     }
                 }
             })
+            .inspect_err(|e| self.report_register_refusal(Register::TimeSeries, e))
+            .ok()
     }
 
     fn bound_dset(&self, record_type: &str) -> Dset {
@@ -3422,7 +3442,11 @@ impl DeviceSupport for AsynDeviceSupport {
             // on 1->0 (devAsynXXXTimeSeries.h:155-176); the callback clearing
             // `st.busy` at buffer-full leaves it registered until then.
             if wf.busy != busy {
-                self.time_series_sub = busy.then(|| self.time_series_subscribe(ts.clone()));
+                self.time_series_sub = if busy {
+                    self.time_series_subscribe(ts.clone())
+                } else {
+                    None
+                };
             }
             wf.busy = busy;
             wf.rarm = 0;
@@ -4103,8 +4127,16 @@ impl DeviceSupport for AsynDeviceSupport {
                             let _ = tx.try_send(());
                         }
                     });
-                self.average_callback_sub = Some(sub);
-                return Some(rx);
+                return match sub {
+                    Ok(sub) => {
+                        self.average_callback_sub = Some(sub);
+                        Some(rx)
+                    }
+                    Err(e) => {
+                        self.report_register_refusal(Register::Average, &e);
+                        None
+                    }
+                };
             }
 
             // Mode 2 — periodic SCAN: accumulate every sample; the periodic
@@ -4138,7 +4170,10 @@ impl DeviceSupport for AsynDeviceSupport {
                         }
                     }
                 });
-            self.average_callback_sub = Some(sub);
+            match sub {
+                Ok(sub) => self.average_callback_sub = Some(sub),
+                Err(e) => self.report_register_refusal(Register::Average, &e),
+            }
             return None;
         }
 
@@ -4238,6 +4273,20 @@ impl DeviceSupport for AsynDeviceSupport {
                     let _ = tx.try_send(());
                 }
             });
+        let sub = match sub {
+            Ok(sub) => sub,
+            Err(e) => {
+                // C registers twice for a readback output on I/O Intr:
+                // `initCommon` first, then `getIoIntInfo`; each prints.
+                if self.asyn_readback {
+                    self.report_register_refusal(Register::ReadBack, &e);
+                }
+                if self.scan == ScanType::IoIntr {
+                    self.report_register_refusal(Register::IoIntr, &e);
+                }
+                return None;
+            }
+        };
         self.interrupt_sub = Some(sub);
         self.readback_wake = Some(wake_tx);
         Some(rx)
@@ -4351,11 +4400,17 @@ impl DeviceSupport for AsynDeviceSupport {
         // gate is read when the callback fires, in the mailbox write, not
         // when the task below drains it.
         let gate = self.gate.clone();
-        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user_when(
+        let (sub, mut intr_rx) = match self.handle.interrupts().register_interrupt_user_when(
             filter,
             MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
             move || gate.open(),
-        );
+        ) {
+            Ok(registered) => registered,
+            Err(e) => {
+                self.report_register_refusal(Register::Enum, &e);
+                return None;
+            }
+        };
         self.enum_interrupt_sub = Some(sub);
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -4468,6 +4523,22 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
 
 /// The C dset a record's DTYP binds, which names every line it prints: its
 /// `initCommon` refusals and the lines a request prints.
+/// Which devAsyn `registerInterruptUser` a registration is, for its
+/// failure line ([`AsynDeviceSupport::report_register_refusal`]).
+#[derive(Clone, Copy)]
+enum Register {
+    /// `initCommon`'s, for an `asyn:READBACK` output.
+    ReadBack,
+    /// `getIoIntInfo`'s, for an `I/O Intr` record.
+    IoIntr,
+    /// `initAiAverage`'s.
+    Average,
+    /// `initCommon`'s on asynEnum.
+    Enum,
+    /// The time-series `process`'s on BUSY 0->1.
+    TimeSeries,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dset {
     /// devAsynInt32.c:220-230 and devBusyAsyn.c:158-167: `parseLink`, then
@@ -4535,6 +4606,48 @@ impl Dset {
             Self::Octet => "devAsynOctet",
             Self::Array => "devAsynXXXArray",
             Self::TimeSeries(driver) => driver,
+        }
+    }
+
+    /// C's line for a refused `registerInterruptUser`, and whether C prints it
+    /// at `ASYN_TRACE_ERROR` (`true`) rather than with `printf`.
+    fn register_refusal_line(
+        self,
+        at: Register,
+        rec: &str,
+        msg: &dyn std::fmt::Display,
+    ) -> (String, bool) {
+        let driver = self.driver();
+        match (at, self) {
+            (Register::ReadBack, dset) => {
+                let at = match dset {
+                    Self::Float64 => "initRecord",
+                    Self::Array => "devAsynXXXArray",
+                    _ => "initCommon",
+                };
+                let line =
+                    format!("{rec} {driver}::{at} error calling registerInterruptUser {msg}");
+                (line, false)
+            }
+            (Register::IoIntr, Self::Octet | Self::Array) => (
+                format!("{rec} {driver}::getIoIntInfo error calling registerInterruptUser {msg}"),
+                self == Self::Array,
+            ),
+            (Register::IoIntr, _) => (
+                format!("{rec} {driver}::getIoIntInfo registerInterruptUser {msg}"),
+                false,
+            ),
+            (Register::Average, _) => (
+                format!("{rec} {driver}::initAiAverage registerInterruptUser {msg}"),
+                false,
+            ),
+            (Register::Enum, _) => (
+                format!("{rec} {driver}::initCommon enum registerInterruptUser {msg}"),
+                false,
+            ),
+            (Register::TimeSeries, _) => {
+                (format!("{rec} {driver} registerInterruptUser {msg}"), true)
+            }
         }
     }
 
@@ -5043,6 +5156,79 @@ pub fn register_asyn_device_support_for_builder(
 mod tests {
     use super::*;
     use crate::port_actor::ActorLink;
+
+    /// C's text for a refused `registerInterruptUser`, file by file
+    /// (devAsynInt32.c:339/:391/:875/:322, devAsynFloat64.c:228/:282,
+    /// devAsynOctet.c:439, devAsynXXXArray.cpp:182/:246,
+    /// devAsynXXXTimeSeries.h:163).
+    #[test]
+    fn a_refused_register_prints_cs_line() {
+        let msg =
+            "asynManager:getInterruptPvt Driver does not support interrupts on interface asynInt32";
+        let cases = [
+            (
+                Dset::Int32 { busy: false },
+                Register::IoIntr,
+                "R devAsynInt32::getIoIntInfo registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Int32 { busy: false },
+                Register::ReadBack,
+                "R devAsynInt32::initCommon error calling registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Int32 { busy: false },
+                Register::Average,
+                "R devAsynInt32::initAiAverage registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Int32 { busy: false },
+                Register::Enum,
+                "R devAsynInt32::initCommon enum registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Float64,
+                Register::ReadBack,
+                "R devAsynFloat64::initRecord error calling registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Octet,
+                Register::IoIntr,
+                "R devAsynOctet::getIoIntInfo error calling registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::Array,
+                Register::IoIntr,
+                "R devAsynXXXArray::getIoIntInfo error calling registerInterruptUser",
+                true,
+            ),
+            (
+                Dset::Array,
+                Register::ReadBack,
+                "R devAsynXXXArray::devAsynXXXArray error calling registerInterruptUser",
+                false,
+            ),
+            (
+                Dset::TimeSeries("devAsynInt32TimeSeries"),
+                Register::TimeSeries,
+                "R devAsynInt32TimeSeries registerInterruptUser",
+                true,
+            ),
+        ];
+        for (dset, at, head, trace) in cases {
+            assert_eq!(
+                dset.register_refusal_line(at, "R", &msg),
+                (format!("{head} {msg}"), trace),
+                "{head}"
+            );
+        }
+    }
 
     /// C asyn `init*` status per output record: 0 (convert) only where the
     /// dset returns it after a successful read back, 2 on every miss.
@@ -6314,7 +6500,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self { base }
@@ -6343,7 +6529,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -8269,7 +8455,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices).unwrap();
@@ -8840,7 +9026,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
@@ -8948,7 +9134,7 @@ mod tests {
             1,
             PortFlags::default(),
             crate::port::InterfaceMask::UNMIGRATED_ALL,
-            crate::port::InterfaceMask::UNMIGRATED_ALL,
+            crate::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("START_", ParamType::Int32).unwrap();
         let driver = ProgPort {
@@ -9018,7 +9204,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             )),
             RuntimeConfig::default(),
         )
@@ -9082,7 +9268,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -9164,7 +9350,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -9250,7 +9436,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9408,7 +9594,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             let msg = base.create_param("MSG", ParamType::Octet).unwrap();
             let arr = base.create_param("ARR", ParamType::Int32Array).unwrap();
@@ -9571,7 +9757,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 binds: Arc::clone(&binds),
             };
@@ -9985,7 +10171,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", param).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10139,7 +10325,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let fw = base.create_param("FW", ParamType::Octet).unwrap();
         base.params.set_string(fw, 0, text).unwrap();
@@ -10825,7 +11011,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 );
                 base.create_param("VAL", ParamType::Float64).unwrap();
                 Self { base }
@@ -11295,7 +11481,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             writes: writes.clone(),
             fail,
@@ -11559,7 +11745,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             writes: writes.clone(),
         };
@@ -11776,7 +11962,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             writes: writes.clone(),
             sequence: sequence.clone(),
@@ -11971,7 +12157,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ))),
             rx,
         );

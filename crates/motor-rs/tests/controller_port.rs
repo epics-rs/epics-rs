@@ -339,14 +339,16 @@ fn a_port_write_to_an_axis_is_posted_after_the_driver_call() {
     let port = register_controller_port(&gate, "CPPOSTW", 2, ()).unwrap();
     let mut ax = axis("CPPOSTW", 1);
     let subscribe = |reason| {
-        port.interrupts().register_interrupt_user(
-            InterruptFilter {
-                reason: Some(reason),
-                addr: Some(1),
-                ..Default::default()
-            },
-            16,
-        )
+        port.interrupts()
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(1),
+                    ..Default::default()
+                },
+                16,
+            )
+            .unwrap()
     };
     let (_c, mut closed_loop) = subscribe(index::CLOSED_LOOP);
     let (_m, mut move_abs) = subscribe(index::MOVE_ABS);
@@ -625,14 +627,16 @@ fn readback_profile_converts_each_axis_to_user_units_and_posts_it() {
     port.write_int32_blocking(index::PROFILE_NUM_READBACKS, 0, 2)
         .unwrap();
     let subscribe = |reason| {
-        port.interrupts().register_interrupt_user(
-            InterruptFilter {
-                reason: Some(reason),
-                addr: Some(1),
-                ..Default::default()
-            },
-            1024,
-        )
+        port.interrupts()
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(1),
+                    ..Default::default()
+                },
+                1024,
+            )
+            .unwrap()
     };
     let (_r, mut readbacks) = subscribe(index::PROFILE_READBACKS);
     let (_f, mut errors) = subscribe(index::PROFILE_FOLLOWING_ERRORS);

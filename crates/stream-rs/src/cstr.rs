@@ -281,9 +281,52 @@ pub fn fmt_alt_hex04(v: u32) -> String {
     }
 }
 
+/// printf `%#g`: six significant digits, trailing zeros and the point kept.
+pub fn fmt_c_alt_g(v: f64) -> String {
+    if !v.is_finite() {
+        let sign = if v.is_sign_negative() { "-" } else { "" };
+        return format!("{sign}{}", if v.is_nan() { "nan" } else { "inf" });
+    }
+    const P: i32 = 6;
+    // The exponent after rounding to P digits decides the style.
+    let e = format!("{:.*e}", (P - 1) as usize, v);
+    let (mantissa, exp) = e.split_once('e').unwrap();
+    let x: i32 = exp.parse().unwrap();
+    if !(-4..P).contains(&x) {
+        format!(
+            "{mantissa}e{}{:02}",
+            if x < 0 { '-' } else { '+' },
+            x.unsigned_abs()
+        )
+    } else {
+        let s = format!("{:.*}", (P - 1 - x) as usize, v);
+        if s.contains('.') { s } else { s + "." }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_g_matches_printf() {
+        for (v, want) in [
+            (0.0, "0.00000"),
+            (-0.0, "-0.00000"),
+            (1.0, "1.00000"),
+            (3.25, "3.25000"),
+            (123456.0, "123456."),
+            (1234567.0, "1.23457e+06"),
+            (999999.5, "1.00000e+06"),
+            (0.0001, "0.000100000"),
+            (0.00001, "1.00000e-05"),
+            (-2.5e-300, "-2.50000e-300"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(fmt_c_alt_g(v), want, "{v}");
+        }
+    }
 
     fn ul(s: &[u8], base: u32) -> (u64, usize) {
         c_strtoul(CPtr::new(s), base)

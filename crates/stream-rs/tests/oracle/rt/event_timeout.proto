@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "A"; event(1) 100; out "B"; }

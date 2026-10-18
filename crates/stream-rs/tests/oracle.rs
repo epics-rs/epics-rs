@@ -1,8 +1,10 @@
-//! Parser errors, byte for byte against C StreamDevice: each
-//! `tests/oracle/<case>.stderr` is what C printed for the case's records
-//! (see `tests/oracle/run-c.sh`). The `real_*` cases load every protocol
-//! of the device support files in `tests/proto`, where C prints nothing
-//! except for the two files whose protocols C rejects too.
+//! Protocol loading, byte for byte against C StreamDevice: each
+//! `tests/oracle/<case>.stderr` is what C's parser and `StreamCore::parse`
+//! printed for the case's records, and for the cases that compile,
+//! `<case>.compiled` and `<case>.report` are C's command lists and
+//! `printProtocol` output (see `tests/oracle/run-c.sh`). The `real_*` cases
+//! load every protocol of the device support files in `tests/proto`, where
+//! C prints nothing except for the two files whose protocols C rejects too.
 
 mod common;
 
@@ -188,6 +190,21 @@ fn unexpand(s: &str) -> Vec<u8> {
     out
 }
 
+/// The `printProtocol` block of each record in C's `streamReportRecord`
+/// output, by record number.
+fn c_reports(report: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for line in report.split_inclusive('\n') {
+        match line.strip_prefix("rec").and_then(|l| l.split_once(": ")) {
+            Some((n, _)) if !line.starts_with(' ') && n.parse::<usize>().is_ok() => {
+                out.push((n.parse().unwrap(), String::new()))
+            }
+            _ => out.last_mut().unwrap().1.push_str(line),
+        }
+    }
+    out
+}
+
 #[test]
 fn parser_errors_match_c() {
     common::setup();
@@ -208,21 +225,33 @@ fn parser_errors_match_c() {
     }
     let mut failed = Vec::new();
     let mut compiled_lists = 0;
+    let mut reported = 0;
     for case in &order {
         protocol::free();
-        let mut rec = common::Rec {
-            records: records
-                .iter()
-                .filter(|r| r.0 == *case && r.1 == "@record")
-                .map(|r| r.2.to_string())
-                .collect(),
-            ..Default::default()
-        };
+        let others: Vec<String> = records
+            .iter()
+            .filter(|r| r.0 == *case && r.1 == "@record")
+            .map(|r| r.2.to_string())
+            .collect();
         capture_stderr();
         let mut loaded = 0;
-        for (_, file, proto) in records.iter().filter(|r| r.0 == *case && r.1 != "@record") {
-            let compiled = common::load(file, proto, &mut rec).is_some();
-            loaded += compiled as usize;
+        let mut lists = Vec::new();
+        let mut reports = Vec::new();
+        for (n, (_, file, proto)) in records
+            .iter()
+            .filter(|r| r.0 == *case && r.1 != "@record")
+            .enumerate()
+        {
+            let (core, ok) = common::load(file, proto, &format!("rec{n}"), &others);
+            if ok {
+                loaded += 1;
+                lists.extend(common::compiled(&core));
+            }
+            // C reports a record whose protocol failed too, with what
+            // compile left in its lists.
+            let mut out = Vec::new();
+            core.lock().print_protocol(&mut out).unwrap();
+            reports.push((n, String::from_utf8(out).unwrap()));
         }
         let got = take_captured();
         let want = std::fs::read(format!("tests/oracle/{case}.stderr")).unwrap();
@@ -253,8 +282,7 @@ fn parser_errors_match_c() {
                 .filter(|(_, code)| !code.is_empty())
                 .map(|(h, code)| format!("{h}: {}", normalize(&unexpand(code), Layout::C)))
                 .collect();
-            let got: Vec<String> = rec
-                .compiled
+            let got: Vec<String> = lists
                 .iter()
                 .map(|(h, code)| format!("{h}: {}", normalize(code, Layout::Rs)))
                 .collect();
@@ -271,6 +299,29 @@ fn parser_errors_match_c() {
                     failed.push(format!("{case} compiled:\n  C:  {w}\n  rs: {g}"));
                 }
             }
+            let c_report = std::fs::read_to_string(format!("tests/oracle/{case}.report")).unwrap();
+            let mut want = c_reports(&c_report);
+            // C's StreamBuffer::print leaves the `\` of a truncated
+            // vsnprintf past `len`, grow's in-place move clears only `offs`
+            // bytes after it, and printProtocol reads up to a zero
+            // (StreamBuffer.cc print and grow): one stray byte the port
+            // does not copy. run-c.sh's block ends at the next `}` line,
+            // so this one also takes the blank line after it.
+            if *case == "real_PTC10" {
+                let r = &mut want[26].1;
+                *r = r.replacen("\";\n\\}\n\n", "\";\n}\n", 1);
+            }
+            reported += reports.len();
+            if reports.iter().map(|r| r.0).ne(want.iter().map(|r| r.0)) {
+                failed.push(format!("{case}: reported records differ from C's"));
+            }
+            for ((n, g), (_, w)) in reports.iter().zip(&want) {
+                if g != w {
+                    failed.push(format!(
+                        "{case} rec{n} printProtocol:\n  C:\n{w}\n  rs:\n{g}"
+                    ));
+                }
+            }
         }
         if mask_number_lines(&got) != mask_number_lines(&want) {
             failed.push(format!(
@@ -284,6 +335,7 @@ fn parser_errors_match_c() {
         compiled_lists > 700,
         "{compiled_lists} command lists compared"
     );
+    assert!(reported > 700, "{reported} printProtocol outputs compared");
     assert!(
         failed.is_empty(),
         "{} of {} cases differ:\n{}",

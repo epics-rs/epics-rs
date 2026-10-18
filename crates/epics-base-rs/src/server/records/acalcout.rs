@@ -226,6 +226,8 @@ static ACALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     rule: LinkRule::Locality,
     // C `aCalcoutRecord.c:1157`.
     mask: crate::server::recgbl::EventMask::VALUE,
+    repost_local: false,
+    in_cycle: true,
 };
 const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
@@ -1230,6 +1232,8 @@ impl Record for AcalcoutRecord {
         Some(LinkCheck {
             spec: &ACALCOUT_LINK_CHECK,
             statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
             state: &mut self.link_check,
         })
     }

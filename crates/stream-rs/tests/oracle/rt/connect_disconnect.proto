@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "A"; disconnect; connect 500; out "B"; }

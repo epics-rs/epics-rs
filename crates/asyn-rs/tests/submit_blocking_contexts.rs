@@ -80,7 +80,7 @@ impl PlainDriver {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }
@@ -182,7 +182,7 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Int32).unwrap();
     let driver = SelfCallingDriver {

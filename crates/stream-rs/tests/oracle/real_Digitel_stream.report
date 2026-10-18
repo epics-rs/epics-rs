@@ -1,0 +1,17 @@
+rec0: Digitel_stream.proto readVI(1,2,3,4,5,6,7,8,9) P
+readVI {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 1000; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "RD";
+    in "%*s";
+    in "%*9c%fV%(1_Current)fI%*7c";
+}

@@ -68,7 +68,7 @@ async fn ioc_gated(port: &str, can_block: bool, gate: Gate) -> PvDatabase {
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) =

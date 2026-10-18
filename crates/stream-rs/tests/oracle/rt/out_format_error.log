@@ -1,0 +1,5 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %d
+rec: Cannot format value with '%d'
+StreamCore::finishProtocol(rec, FormatError) not bus owner

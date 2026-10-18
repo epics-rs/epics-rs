@@ -1,0 +1,19 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "GET<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="C", size=1)
+StreamCore::readCallback(rec) inputBuffer="C", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input=" 7", size=2)
+StreamCore::readCallback(rec) inputBuffer="C 7", size 3
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "C 7"
+StreamCore::readCallback(rec) match failure
+StreamCore::finishProtocol(rec, ScanError) bus owner
+reparsing input "C 7"

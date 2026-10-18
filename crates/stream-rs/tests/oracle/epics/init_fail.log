@@ -1,0 +1,37 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto r P"
+Stream::initRecord rec: filename="l.proto" protocol="r" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "r")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+StreamCore::evalOut(rec): lockRequest failed. Device is offline.
+StreamCore::finishProtocol(rec, Offline) not bus owner
+Stream::protocolFinishHook(rec, Offline)
+Stream::protocolFinishHook rec: signalling init done
+rec: Can't start @init handler
+rec: Record initialization failed
+streamInitRecord(rec) done status=0xffffffffffffffff
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "GET<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::evalOut(rec): lockRequest failed. Device is offline.
+StreamCore::finishProtocol(rec, Offline) not bus owner
+Stream::protocolFinishHook(rec, Offline)
+Stream::process(rec): could not start protocol, status=COMM (9)
+VAL 0 = 0x0
+SEVR "INVALID"
+STAT "COMM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

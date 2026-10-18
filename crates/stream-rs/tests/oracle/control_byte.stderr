@@ -1,2 +1,3 @@
 _main_ Unexpected byte 0x09
 _main_ in string variable 'terminator' in protocol file 'control_byte.proto' line 1
+_main_ while compiling protocol 'p' for 'rec0'

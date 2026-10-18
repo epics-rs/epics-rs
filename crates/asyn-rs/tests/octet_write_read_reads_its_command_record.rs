@@ -59,7 +59,7 @@ fn port(
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let driver = Echo {
         base,

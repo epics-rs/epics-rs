@@ -191,6 +191,14 @@ struct Pi {
     done: bool,
     deferred: Vec<i32>,
     sets: PortSets,
+    gate: Option<Gate>,
+}
+
+/// Holds a deferred-move release, under the controller lock, until the
+/// test lets it go.
+struct Gate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl Pi {
@@ -200,6 +208,7 @@ impl Pi {
             done: true,
             deferred,
             sets: PortSets::default(),
+            gate: None,
         }
     }
 }
@@ -219,6 +228,10 @@ impl AsynMotor for Pi {
         Ok(())
     }
     fn set_deferred_moves(&mut self, _: &AsynUser, defer: bool) -> AsynResult<()> {
+        if let (false, Some(gate)) = (defer, &self.gate) {
+            gate.entered.send(()).unwrap();
+            gate.release.lock().unwrap().recv().unwrap();
+        }
         if !defer {
             for &addr in &self.deferred {
                 self.sets.status(addr, StatusWrite::Done(false));
@@ -300,6 +313,64 @@ fn a_deferred_move_release_posts_done_0_to_each_deferred_axis() {
     assert!(eventually(|| done(2) && done(3)));
     port.write_int32_blocking(index::DEFER_MOVES, 1, 0).unwrap();
     assert!(eventually(|| !done(2) && !done(3)));
+}
+
+/// A poller pass that waits on the lock a deferred-move release holds polls
+/// once the release has posted DONE=0, as C's release posts it before it
+/// unlocks: the pass's done=1 is the last word.
+#[test]
+fn a_pass_blocked_on_a_deferred_move_release_polls_after_its_done_0() {
+    use motor_rs::builder::ControllerAxis;
+    use motor_rs::poll_loop::PollCommand;
+    let port = register_controller_port(&open_owner(), "PSRACE", 4, Own).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (entered, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release) = std::sync::mpsc::channel();
+    let mut releaser = Pi::new(Arc::default(), vec![2, 3]);
+    releaser.gate = Some(Gate {
+        entered,
+        release: Mutex::new(release),
+    });
+    let mut controller = ControllerBuilder::new();
+    let mut wake = None;
+    for (addr, motor) in [
+        (1, releaser),
+        (2, Pi::new(Arc::default(), Vec::new())),
+        (3, Pi::new(Arc::default(), Vec::new())),
+    ] {
+        let ControllerAxis { axis, poll_cmd_tx } = controller.axis(
+            Arc::new(Mutex::new(motor)),
+            TraceUser::Asyn {
+                port: "PSRACE".into(),
+                addr,
+            },
+        );
+        register_axis(axis).unwrap();
+        wake = Some(poll_cmd_tx);
+    }
+    let period = Duration::from_secs(60);
+    rt.spawn(controller.build(period, period, 0).run());
+    let done = |addr| {
+        port.read_int32_blocking(index::STATUS, addr)
+            .is_ok_and(|word| word & 0x2 != 0)
+    };
+    for addr in [2, 3] {
+        port.write_int32_blocking(index::UPDATE_STATUS, addr, 1)
+            .unwrap();
+    }
+    assert!(eventually(|| done(2) && done(3)));
+    let writer = {
+        let port = port.clone();
+        std::thread::spawn(move || port.write_int32_blocking(index::DEFER_MOVES, 1, 0))
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    wake.unwrap().try_send(PollCommand::ForcePoll).unwrap();
+    // The pass is now waiting on the release's lock.
+    std::thread::sleep(Duration::from_millis(200));
+    release_tx.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(done(3), "DONE=0 after the forced poll's done=1");
 }
 
 /// One poll that sets OWN on its own address twice, first as a port set

@@ -1,0 +1,300 @@
+rec0: LakeShore335.proto getID(1,2,3,4,5,6,7,8,9) P
+getID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "*IDN?";
+    in "%s";
+  }
+
+    out "*IDN?";
+    in "%s";
+}
+rec1: LakeShore335.proto setSETP(1,2,3,4,5,6,7,8,9) P
+setSETP {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SETP 1,%f";
+    wait 100; # ms
+}
+rec2: LakeShore335.proto getSETP(1,2,3,4,5,6,7,8,9) P
+getSETP {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "SETP? 1";
+    in "%f";
+  }
+
+    out "SETP? 1";
+    in "%f";
+}
+rec3: LakeShore335.proto setMOUT(1,2,3,4,5,6,7,8,9) P
+setMOUT {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "MOUT 1,%f";
+    wait 100; # ms
+}
+rec4: LakeShore335.proto getMOUT(1,2,3,4,5,6,7,8,9) P
+getMOUT {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "MOUT? 1";
+    in "%f";
+  }
+
+    out "MOUT? 1";
+    in "%f";
+}
+rec5: LakeShore335.proto setOUTMODE(1,2,3,4,5,6,7,8,9) P
+setOUTMODE {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUTMODE 1,%(2:OUT1:Mode.RVAL)d,%(2:OUT1:Cntrl.VAL)d,0";
+    wait 100; # ms
+}
+rec6: LakeShore335.proto getOUTMODE(1,2,3,4,5,6,7,8,9) P
+getOUTMODE {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OUTMODE? 1";
+    in "%(2:OUT1:Mode_RBV.VAL)d,%(2:OUT1:Cntrl_RBV.VAL)d,%*d";
+}
+rec7: LakeShore335.proto setPID(1,2,3,4,5,6,7,8,9) P
+setPID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "PID 1,%(2:P1.VAL)f,%(2:I1.VAL)f,%(2:D1.VAL)f";
+    wait 100; # ms
+}
+rec8: LakeShore335.proto getPID(1,2,3,4,5,6,7,8,9) P
+getPID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "PID? 1";
+    in "%(2:P1_RBV.VAL)f,%(2:I1_RBV.VAL)f,%(2:D1_RBV.VAL)f";
+}
+rec9: LakeShore335.proto getInType(1,2,3,4,5,6,7,8,9) P
+getInType {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "INTYPE? %(2:OUT1:Cntrl_RBV.VAL)s";
+    in "%*d,%*d,%*d,%*d,%d";
+}
+rec10: LakeShore335.proto getInput(1,2,3,4,5,6,7,8,9) P
+getInput {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "%(2:IN1:Type_RBV.VAL)sRDG? %(2:OUT1:Cntrl_RBV.VAL)s";
+    in "%f";
+}
+rec11: LakeShore335.proto getInName(1,2,3,4,5,6,7,8,9) P
+getInName {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "INNAME? %(2:OUT1:Cntrl_RBV.VAL)s";
+    in "%[_a-zA-Z0-9 -]";
+}
+rec12: LakeShore335.proto getHeater(1,2,3,4,5,6,7,8,9) P
+getHeater {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "HTR? 1";
+    in "%f";
+}
+rec13: LakeShore335.proto getRange(1,2,3,4,5,6,7,8,9) P
+getRange {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "RANGE? 1";
+    in "%d";
+}
+rec14: LakeShore335.proto setRange(1,2,3,4,5,6,7,8,9) P
+setRange {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "RANGE 1,%d";
+    wait 100; # ms
+}
+rec15: LakeShore335.proto getAOutput(1,2,3,4,5,6,7,8,9) P
+getAOutput {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "AOUT? 1";
+    in "%f";
+}
+rec16: LakeShore335.proto setRamp(1,2,3,4,5,6,7,8,9) P
+setRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "RAMP 1,%(2:OnRamp1.VAL)d,%(2:RampR1.VAL)f";
+    wait 100; # ms
+}
+rec17: LakeShore335.proto getRamp(1,2,3,4,5,6,7,8,9) P
+getRamp {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 100; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 100; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "RAMP? 1";
+    in "%(2:OnRamp1_RBV.VAL)d,%(2:RampR1_RBV.VAL)f";
+}

@@ -15,6 +15,10 @@ use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Past the 0.5 s `checkLinksCallback` a put arms (`sseqRecord.c:1018`).
+const PASS: Duration = Duration::from_millis(600);
 
 const DB: &str = r#"
 record(ao, "T") {}
@@ -117,7 +121,7 @@ async fn sseq_link_status_event_counts_match_oracle_ioc() {
         db.put_record_field_from_ca("Q", field, value)
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(PASS).await;
         let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
         assert_eq!(got, want, "events after the {field} put, per {FIELDS:?}");
     }
@@ -159,7 +163,7 @@ async fn sseq_link_types_never_post() {
         db.put_record_field_from_ca("Q", field, value)
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(PASS).await;
         let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
         assert_eq!(got, [0; 6], "events after the {field} put, per {TYPES:?}");
     }
@@ -202,7 +206,7 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(PASS).await;
         assert_eq!(types(&db), short(want), "after the {field} put");
     }
 }
@@ -228,7 +232,8 @@ record(sseq, "Q") {
         .await
         .unwrap()
         .0;
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+    // Past init's 1 s pass, so each window holds one of the 0.5 s re-arms.
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(1100)).await;
     const STATUS: [&str; 3] = ["DOL1V", "LNK1V", "DOL2V"];
     let mut rxs: Vec<EventReader> = STATUS
         .iter()
@@ -249,7 +254,7 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::Short(1))
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(PASS).await;
         let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
         assert_eq!(got[..2], [0, 0], "CA status events after the {field} put");
         if field != "PROC" {

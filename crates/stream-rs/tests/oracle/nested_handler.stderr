@@ -1,3 +1,4 @@
 _main_ nested_handler.proto line 3: Handlers are not allowed in handlers: @mismatch
 _main_ nested_handler.proto line 2: in handler '@init'
 _main_ nested_handler.proto line 1: in protocol 'p'
+_main_ while reading protocol 'p' for 'rec0'

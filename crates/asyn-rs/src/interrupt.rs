@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use crate::error::AsynStatus;
-use crate::interfaces::InterfaceType;
+use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::{InterfaceMask, InterfaceType};
 use crate::param::ParamValue;
 
 /// Filter for selecting which interrupts to receive.
@@ -812,6 +812,10 @@ pub struct InterruptSharedState {
     /// the flush path reads it with one atomic load, takes no lock and
     /// frees nothing.
     owner: std::sync::OnceLock<Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>>,
+    /// The interfaces a client may register on: C's `interruptMask`, which
+    /// asynPortDriver turns into one `registerInterruptSource` per interface
+    /// (asynPortDriver.cpp:4074-4086).
+    sources: InterfaceMask,
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +842,14 @@ impl Default for InterruptManager {
 }
 
 impl InterruptManager {
+    /// A manager no port's mask restricts: every interface is a source.
     pub fn new() -> Self {
+        Self::with_sources(InterfaceMask::ALL)
+    }
+
+    /// A port's manager: clients register only on the interfaces in
+    /// `sources`, its C `interruptMask`.
+    pub fn with_sources(sources: InterfaceMask) -> Self {
         Self {
             state: Arc::new(InterruptSharedState {
                 async_rings: parking_lot::Mutex::new(Vec::new()),
@@ -847,6 +858,7 @@ impl InterruptManager {
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
                 owner: std::sync::OnceLock::new(),
+                sources,
             }),
         }
     }
@@ -862,8 +874,11 @@ impl InterruptManager {
     /// by hand with no registry: it replaces the base's own manager before
     /// anything subscribes. Such a manager is already owned, so
     /// `register_port` refuses its handle ([`crate::error::AsynError::PortAlreadyOwned`]).
-    pub fn owned_by(gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>) -> Self {
-        let this = Self::new();
+    pub fn owned_by(
+        gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+        sources: InterfaceMask,
+    ) -> Self {
+        let this = Self::with_sources(sources);
         let _ = this.state.owner.set(gate);
         this
     }
@@ -890,6 +905,25 @@ impl InterruptManager {
         self.state.owner.get().is_some_and(|g| g.is_open())
     }
 
+    /// C `getInterruptPvt` (asynManager.c:2460-2500): a client registering on
+    /// an interface that is not an interrupt source is refused. A filter that
+    /// names no interface, or a Rust-only one with no C mask bit, is not.
+    fn interrupt_pvt(&self, filter: &InterruptFilter) -> AsynResult<()> {
+        let Some(iface) = filter.iface else {
+            return Ok(());
+        };
+        match InterfaceMask::of(iface) {
+            Some(bit) if !self.state.sources.contains(bit) => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "asynManager:getInterruptPvt Driver does not support interrupts on interface {}",
+                    iface.asyn_name()
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Get the shared state for cross-manager sharing.
     pub fn shared_state(&self) -> Arc<InterruptSharedState> {
         self.state.clone()
@@ -908,7 +942,17 @@ impl InterruptManager {
     /// support runs (waveformRecord.c:94-95, aaiRecord.c:109-110,
     /// aaoRecord.c:112-113) and devAsynOctet.c:318-322 refuses a `valSize` of 0.
     pub fn subscribe_async(&self, ring_len: usize, payload_bytes: usize) -> AsyncInterruptReceiver {
-        self.subscribe_async_filtered(InterruptFilter::default(), ring_len, payload_bytes)
+        let ring = Arc::new(AsyncRing::new(
+            InterruptFilter::default(),
+            ring_len.max(1),
+            payload_bytes,
+        ));
+        self.state.async_rings.lock().push(ring.clone());
+        AsyncInterruptReceiver {
+            out: Vec::with_capacity(payload_bytes),
+            ring,
+            state: Arc::downgrade(&self.state),
+        }
     }
 
     /// [`subscribe_async`](Self::subscribe_async) for the values `filter`
@@ -919,14 +963,15 @@ impl InterruptManager {
         filter: InterruptFilter,
         ring_len: usize,
         payload_bytes: usize,
-    ) -> AsyncInterruptReceiver {
+    ) -> AsynResult<AsyncInterruptReceiver> {
+        self.interrupt_pvt(&filter)?;
         let ring = Arc::new(AsyncRing::new(filter, ring_len.max(1), payload_bytes));
         self.state.async_rings.lock().push(ring.clone());
-        AsyncInterruptReceiver {
+        Ok(AsyncInterruptReceiver {
             out: Vec::with_capacity(payload_bytes),
             ring,
             state: Arc::downgrade(&self.state),
-        }
+        })
     }
 
     /// Register a synchronous interrupt callback (averaging device support).
@@ -943,10 +988,11 @@ impl InterruptManager {
         &self,
         filter: InterruptFilter,
         callback: F,
-    ) -> SyncCallbackSubscription
+    ) -> AsynResult<SyncCallbackSubscription>
     where
         F: Fn(&InterruptValue) + Send + Sync + 'static,
     {
+        self.interrupt_pvt(&filter)?;
         let cb = Arc::new(SyncCallback {
             filter,
             callback: Box::new(callback),
@@ -957,10 +1003,10 @@ impl InterruptManager {
             let next: Arc<[Arc<SyncCallback>]> = list.iter().cloned().chain([cb.clone()]).collect();
             *list = next;
         }
-        SyncCallbackSubscription {
+        Ok(SyncCallbackSubscription {
             callback: cb,
             state: self.state.clone(),
-        }
+        })
     }
 
     /// Send an interrupt to all subscribers (sync callbacks, mailboxes and rings),
@@ -1063,7 +1109,7 @@ impl InterruptManager {
         &self,
         filter: InterruptFilter,
         payload_bytes: usize,
-    ) -> (InterruptSubscription, InterruptReceiver) {
+    ) -> AsynResult<(InterruptSubscription, InterruptReceiver)> {
         self.register_mailbox(filter, payload_bytes, None)
     }
 
@@ -1078,7 +1124,7 @@ impl InterruptManager {
         filter: InterruptFilter,
         payload_bytes: usize,
         accept: impl Fn() -> bool + Send + Sync + 'static,
-    ) -> (InterruptSubscription, InterruptReceiver) {
+    ) -> AsynResult<(InterruptSubscription, InterruptReceiver)> {
         self.register_mailbox(filter, payload_bytes, Some(Box::new(accept)))
     }
 
@@ -1087,7 +1133,8 @@ impl InterruptManager {
         filter: InterruptFilter,
         payload_bytes: usize,
         accept: Option<Box<dyn Fn() -> bool + Send + Sync>>,
-    ) -> (InterruptSubscription, InterruptReceiver) {
+    ) -> AsynResult<(InterruptSubscription, InterruptReceiver)> {
+        self.interrupt_pvt(&filter)?;
         let mailbox = Arc::new(SubscriptionMailbox {
             filter,
             latest: parking_lot::Mutex::new(Slot::new(payload_bytes)),
@@ -1096,7 +1143,7 @@ impl InterruptManager {
             accept,
         });
         self.state.mailboxes.lock().push(mailbox.clone());
-        (
+        Ok((
             InterruptSubscription {
                 mailbox: mailbox.clone(),
                 state: self.state.clone(),
@@ -1105,7 +1152,7 @@ impl InterruptManager {
                 mailbox,
                 out: Vec::with_capacity(payload_bytes),
             },
-        )
+        ))
     }
 
     /// The filter of every live interrupt client, for `asynReport` — C's
@@ -1224,6 +1271,52 @@ impl InterruptManager {
 mod tests {
     use crate::param::EnumEntry;
 
+    /// C `getInterruptPvt` (asynManager.c:2492-2497): only an interface the
+    /// port's `interruptMask` names takes a client.
+    #[test]
+    fn a_client_registers_only_on_an_interrupt_source() {
+        use super::{InterruptFilter, InterruptManager};
+        use crate::interfaces::{InterfaceMask, InterfaceType};
+        let im = InterruptManager::with_sources(InterfaceMask::OCTET);
+        let on = |iface| InterruptFilter {
+            iface,
+            ..InterruptFilter::default()
+        };
+        assert!(
+            im.register_sync_callback(on(Some(InterfaceType::Octet)), |_| {})
+                .is_ok()
+        );
+        assert!(
+            im.register_interrupt_user(on(None), 0).is_ok(),
+            "an untyped client"
+        );
+        assert!(
+            im.register_interrupt_user(on(Some(InterfaceType::UInt64)), 0)
+                .is_ok(),
+            "no C bit"
+        );
+        let refused = im
+            .register_interrupt_user(on(Some(InterfaceType::Int32)), 0)
+            .err()
+            .unwrap();
+        assert_eq!(
+            (refused.status(), refused.message_display().to_string()),
+            (
+                crate::error::AsynStatus::Error,
+                "asynManager:getInterruptPvt Driver does not support interrupts on interface asynInt32"
+                    .to_string()
+            )
+        );
+        assert!(
+            im.register_sync_callback(on(Some(InterfaceType::Float64Array)), |_| {})
+                .is_err()
+        );
+        assert!(
+            im.subscribe_async_filtered(on(Some(InterfaceType::Enum)), 1, 0)
+                .is_err()
+        );
+    }
+
     fn entry(s: &str, v: i32) -> EnumEntry {
         EnumEntry {
             string: s.into(),
@@ -1327,14 +1420,16 @@ mod tests {
     #[tokio::test]
     async fn test_register_interrupt_user_filter_by_reason() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(1),
-                addr: None,
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, mut rx) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(1),
+                    addr: None,
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         // Send reason 0 — should NOT be received
         im.notify(InterruptValue {
@@ -1371,14 +1466,16 @@ mod tests {
     #[tokio::test]
     async fn test_register_interrupt_user_filter_by_addr() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: None,
-                addr: Some(3),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, mut rx) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: None,
+                    addr: Some(3),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         im.notify(InterruptValue {
             reason: 0,
@@ -1407,7 +1504,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_interrupt_user_no_filter() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) = im.register_interrupt_user(InterruptFilter::default(), 4096);
+        let (_sub, mut rx) = im
+            .register_interrupt_user(InterruptFilter::default(), 4096)
+            .unwrap();
 
         im.notify(InterruptValue {
             reason: 5,
@@ -1429,7 +1528,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_interrupt_user_drop_unsubscribes() {
         let im = InterruptManager::new();
-        let (sub, mut rx) = im.register_interrupt_user(InterruptFilter::default(), 4096);
+        let (sub, mut rx) = im
+            .register_interrupt_user(InterruptFilter::default(), 4096)
+            .unwrap();
 
         // Drop subscription
         drop(sub);
@@ -1446,22 +1547,26 @@ mod tests {
     #[tokio::test]
     async fn test_register_interrupt_user_multiple_subscribers() {
         let im = InterruptManager::new();
-        let (_sub1, mut rx1) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: None,
-                ..Default::default()
-            },
-            4096,
-        );
-        let (_sub2, mut rx2) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(1),
-                addr: None,
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub1, mut rx1) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: None,
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
+        let (_sub2, mut rx2) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(1),
+                    addr: None,
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         im.notify(InterruptValue {
             reason: 0,
@@ -1509,13 +1614,15 @@ mod tests {
     #[tokio::test]
     async fn test_coalescing() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, mut rx) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         // Send 3 values without consumer reading — should coalesce to latest.
         im.notify(InterruptValue {
@@ -1565,13 +1672,15 @@ mod tests {
         let im2 = InterruptManager::from_shared_state(shared);
 
         // Subscribe via im2
-        let (_sub, mut rx) = im2.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, mut rx) = im2
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         // Notify via im1 — subscriber should receive because state is shared
         im1.notify(InterruptValue {
@@ -1606,7 +1715,9 @@ mod tests {
     #[tokio::test]
     async fn mailbox_burst_coalesces_no_drop() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) = im.register_interrupt_user(InterruptFilter::default(), 4096);
+        let (_sub, mut rx) = im
+            .register_interrupt_user(InterruptFilter::default(), 4096)
+            .unwrap();
 
         let n: usize = 1000;
         for i in 0..n {
@@ -1645,24 +1756,28 @@ mod tests {
     async fn notify_routes_typed_values_per_interface() {
         use crate::interfaces::InterfaceType;
         let im = InterruptManager::new();
-        let (_si, mut rx_int) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
-        let (_su, mut rx_uint) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: Some(0),
-                iface: Some(InterfaceType::UInt32Digital),
-                uint32_mask: Some(0xFF),
-            },
-            4096,
-        );
+        let (_si, mut rx_int) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
+        let (_su, mut rx_uint) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    uint32_mask: Some(0xFF),
+                },
+                4096,
+            )
+            .unwrap();
 
         // One reason fires two interface-typed values (the per-interface shape
         // `PortDriverBase::notify_interface_value` emits).
@@ -1754,6 +1869,7 @@ mod tests {
                 },
                 4096,
             )
+            .unwrap()
         };
         // Same addr as the read, but a REASON the read does not carry — C
         // delivers to it; the port used to drop it.
@@ -1763,15 +1879,17 @@ mod tests {
         // A different addr.
         let (_s_other_addr, mut rx_other_addr) = octet_sub(0, 3);
         // A non-octet interface never sees an octet value.
-        let (_s_int32, mut rx_int32) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_s_int32, mut rx_int32) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         let octet = |addr: i32, s: &str| InterruptValue {
             reason: 0,
@@ -1826,15 +1944,17 @@ mod tests {
         // No subscribers yet.
         assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
 
-        let (sub, _rx) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32Array),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (sub, _rx) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         // Present for the matching tuple; absent for a different iface/addr/reason.
         assert!(im.has_subscriber(0, 0, InterfaceType::Int32Array));
         assert!(!im.has_subscriber(0, 0, InterfaceType::Float64Array));
@@ -1842,13 +1962,15 @@ mod tests {
         assert!(!im.has_subscriber(1, 0, InterfaceType::Int32Array));
 
         // An untyped subscriber (no iface filter) is present for every iface.
-        let (sub2, _rx2) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(5),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (sub2, _rx2) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(5),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         assert!(im.has_subscriber(5, 99, InterfaceType::Float64Array));
 
         // Dropping the subscription unregisters it.
@@ -1865,15 +1987,17 @@ mod tests {
     fn has_subscriber_sees_a_sync_callback_binding() {
         use crate::interfaces::InterfaceType;
         let im = InterruptManager::new();
-        let sub = im.register_sync_callback(
-            InterruptFilter {
-                reason: Some(2),
-                addr: Some(41),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let sub = im
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(2),
+                    addr: Some(41),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
         assert!(im.has_subscriber(2, 41, InterfaceType::Int32));
         assert!(!im.has_subscriber(2, 41, InterfaceType::Int32Array));
         drop(sub);
@@ -1887,46 +2011,54 @@ mod tests {
         assert!(im.subscribed_bindings().is_empty());
 
         // Two ifaces on the SAME (reason, addr) collapse to one binding.
-        let (s_a, _r0) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(2),
-                addr: Some(7),
-                iface: Some(InterfaceType::Int32Array),
-                ..Default::default()
-            },
-            4096,
-        );
-        let (s_b, _r1) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(2),
-                addr: Some(7),
-                iface: Some(InterfaceType::Float64Array),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (s_a, _r0) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(2),
+                    addr: Some(7),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
+        let (s_b, _r1) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(2),
+                    addr: Some(7),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         // A distinct addr is its own binding.
-        let (s_other, _r2) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(2),
-                addr: Some(8),
-                iface: Some(InterfaceType::Int32Array),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (s_other, _r2) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(2),
+                    addr: Some(8),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut got = im.subscribed_bindings();
         got.sort();
         assert_eq!(got, vec![(2, 7), (2, 8)]);
 
         // A wildcard subscription (addr None) pins no offset and is skipped.
-        let (s_wild, _r3) = im.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(9),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (s_wild, _r3) = im
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(9),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut got = im.subscribed_bindings();
         got.sort();
         assert_eq!(got, vec![(2, 7), (2, 8)]);
@@ -1935,22 +2067,26 @@ mod tests {
         // too — they are record bindings, not observers. A sync callback at a
         // fresh (reason, addr) adds a binding; one co-located with a mailbox
         // binding dedups.
-        let sc_new = im.register_sync_callback(
-            InterruptFilter {
-                reason: Some(3),
-                addr: Some(1),
-                ..Default::default()
-            },
-            |_| {},
-        );
-        let sc_dup = im.register_sync_callback(
-            InterruptFilter {
-                reason: Some(2),
-                addr: Some(8),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let sc_new = im
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(3),
+                    addr: Some(1),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+        let sc_dup = im
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(2),
+                    addr: Some(8),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
         let mut got = im.subscribed_bindings();
         got.sort();
         assert_eq!(got, vec![(2, 7), (2, 8), (3, 1)]);
@@ -1989,11 +2125,15 @@ mod tests {
         let im = InterruptManager::new();
         let seen = Arc::new(AtomicU64::new(0));
         let hits = seen.clone();
-        let _sync = im.register_sync_callback(InterruptFilter::default(), move |iv| {
-            assert!(matches!(iv.value, ParamValue::GenericPointer(_)));
-            hits.fetch_add(1, Ordering::Relaxed);
-        });
-        let (_sub, mut mb) = im.register_interrupt_user(InterruptFilter::default(), 0);
+        let _sync = im
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                assert!(matches!(iv.value, ParamValue::GenericPointer(_)));
+                hits.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let (_sub, mut mb) = im
+            .register_interrupt_user(InterruptFilter::default(), 0)
+            .unwrap();
         let mut ring = im.subscribe_async(2, 0);
         let probe: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42i32);
         let weak = Arc::downgrade(&probe);
@@ -2069,8 +2209,9 @@ mod tests {
     #[test]
     fn a_queued_enum_table_holds_no_reference_to_the_notifiers_arc() {
         let im = InterruptManager::new();
-        let (_sub, mut mb) =
-            im.register_interrupt_user(InterruptFilter::default(), 2 * ENUM_ENTRY_BYTES);
+        let (_sub, mut mb) = im
+            .register_interrupt_user(InterruptFilter::default(), 2 * ENUM_ENTRY_BYTES)
+            .unwrap();
         let mut ring = im.subscribe_async(2, 2 * ENUM_ENTRY_BYTES);
         let mut weaks = Vec::new();
         for n in 0..3 {
@@ -2107,8 +2248,9 @@ mod tests {
     #[test]
     fn an_enum_table_is_clamped_to_the_registered_entries_and_c_string_size() {
         let im = InterruptManager::new();
-        let (_sub, mut rx) =
-            im.register_interrupt_user(InterruptFilter::default(), 2 * ENUM_ENTRY_BYTES + 5);
+        let (_sub, mut rx) = im
+            .register_interrupt_user(InterruptFilter::default(), 2 * ENUM_ENTRY_BYTES + 5)
+            .unwrap();
         let long = "0123456789012345678901234567890";
         let (v, _) = enum_fire(7, &[long, "B", "C"]);
         im.notify(v);
@@ -2138,15 +2280,17 @@ mod tests {
     #[test]
     fn a_ring_follows_the_octet_fan_out_rule_of_the_emitter() {
         let im = InterruptManager::new();
-        let mut ring = im.subscribe_async_filtered(
-            InterruptFilter {
-                reason: Some(1),
-                addr: Some(0),
-                ..Default::default()
-            },
-            8,
-            16,
-        );
+        let mut ring = im
+            .subscribe_async_filtered(
+                InterruptFilter {
+                    reason: Some(1),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                8,
+                16,
+            )
+            .unwrap();
         let octet = |reason| InterruptValue {
             reason,
             value: ParamValue::Octet(Arc::from(&b"x"[..])),

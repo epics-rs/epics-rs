@@ -92,8 +92,10 @@ impl RuntimeClient for InProcessClient {
         filter: EventFilter,
         ring: EventRing,
     ) -> Pin<Box<dyn Future<Output = Result<EventReceiver, TransportError>> + Send + '_>> {
-        let rx = EventReceiver {
-            ring: self.handle.interrupts().subscribe_async_filtered(
+        let rx = self
+            .handle
+            .interrupts()
+            .subscribe_async_filtered(
                 InterruptFilter {
                     reason: filter.reason,
                     addr: filter.addr,
@@ -101,10 +103,13 @@ impl RuntimeClient for InProcessClient {
                 },
                 ring.ring_len,
                 ring.payload_bytes,
-            ),
-            port_name: self.handle.port_name().to_string(),
-        };
-        Box::pin(async move { Ok(rx) })
+            )
+            .map(|ring| EventReceiver {
+                ring,
+                port_name: self.handle.port_name().to_string(),
+            })
+            .map_err(TransportError::from);
+        Box::pin(async move { rx })
     }
 
     fn connection_state(&self) -> ConnectionState {
@@ -144,7 +149,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();

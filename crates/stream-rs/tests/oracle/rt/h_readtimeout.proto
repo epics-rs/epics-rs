@@ -1,0 +1,3 @@
+Terminator = CR LF;
+ReadTimeout = 100;
+p { out "GET"; in "%d"; @readtimeout { out "RT"; } }

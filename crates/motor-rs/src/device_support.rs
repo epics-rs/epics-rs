@@ -84,6 +84,9 @@ pub struct MotorAxis {
     build_trans: Option<Arc<dyn BuildTrans>>,
     /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
     disables_ntm: bool,
+    /// C `asynMotorAxis::referencingModeMove_`, which
+    /// `asynMotorEnableMoveToHome` sets.
+    referencing_mode_move: Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl MotorAxis {
@@ -108,6 +111,7 @@ impl MotorAxis {
             report: None,
             build_trans: None,
             disables_ntm: false,
+            referencing_mode_move: Arc::default(),
         }
     }
 
@@ -137,7 +141,20 @@ impl MotorAxis {
             report: self.report.clone(),
             build_trans: self.build_trans.clone(),
             disables_ntm: self.disables_ntm,
+            referencing_mode_move: self.referencing_mode_move.clone(),
         }
+    }
+
+    /// C `getReferencingModeMove`.
+    pub(crate) fn referencing_mode_move(&self) -> i32 {
+        self.referencing_mode_move
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// C `setReferencingModeMove`.
+    pub(crate) fn set_referencing_mode_move(&self, distance: i32) {
+        self.referencing_mode_move
+            .store(distance, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The axis's model-2 parameter library.

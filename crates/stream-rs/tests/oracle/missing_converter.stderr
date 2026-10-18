@@ -2,3 +2,4 @@ _main_ Missing converter character
 _main_ missing_converter.proto line 2: in format string: "%"
 _main_ missing_converter.proto line 2: in command 'out'
 _main_ missing_converter.proto line 1: in protocol 'p'
+_main_ while compiling protocol 'p' for 'rec0'

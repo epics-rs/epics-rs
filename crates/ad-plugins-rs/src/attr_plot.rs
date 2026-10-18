@@ -427,8 +427,13 @@ impl AttrPlotState {
 
 impl NDPluginProcess for AttrPlotProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginAttrPlot.cpp:51-55, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::FLOAT64_ARRAY
+        .or(InterfaceMask::GENERIC_POINTER)
+        .or(InterfaceMask::INT32)
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 
@@ -551,7 +556,7 @@ mod tests {
             blocks.max(n_attributes),
             asyn_rs::port::PortFlags::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -641,7 +646,7 @@ mod tests {
             8,
             asyn_rs::port::PortFlags::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         let select = proc.state.lock().params.data_select.unwrap();

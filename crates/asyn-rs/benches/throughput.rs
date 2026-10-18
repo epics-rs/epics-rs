@@ -24,7 +24,7 @@ impl BenchPort {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("INT_VAL", ParamType::Int32).unwrap();
         base.create_param("F64_VAL", ParamType::Float64).unwrap();

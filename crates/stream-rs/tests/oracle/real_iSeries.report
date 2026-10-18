@@ -1,0 +1,159 @@
+rec0: iSeries.proto RGCmd(1,2,3,4,5,6,7,8,9) P
+RGCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*31";
+    in "31%2";
+}
+rec1: iSeries.proto RCmd(1,2,3,4,5,6,7,8,9) P
+RCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*R1";
+    in "R1%2";
+}
+rec2: iSeries.proto XCmd(1,2,3,4,5,6,7,8,9) P
+XCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*21";
+    in "21%f";
+}
+rec3: iSeries.proto U01Cmd(1,2,3,4,5,6,7,8,9) P
+U01Cmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*1U01";
+    in "1U01%{@|A|B|C}";
+}
+rec4: iSeries.proto U03Cmd(1,2,3,4,5,6,7,8,9) P
+U03Cmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*1U03";
+    in "1U03%s";
+}
+rec5: iSeries.proto WCmd(1,2,3,4,5,6,7,8,9) P
+WCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*3W1%02";
+}
+rec6: iSeries.proto DCmd(1,2,3,4,5,6,7,8,9) P
+DCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*2D1";
+    in "2D1";
+}
+rec7: iSeries.proto ECmd(1,2,3,4,5,6,7,8,9) P
+ECmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*2E1";
+    in "2E1";
+}
+rec8: iSeries.proto EDCmd(1,2,3,4,5,6,7,8,9) P
+EDCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*2%{D|E}1";
+    in "2%{D|E}1";
+}
+rec9: iSeries.proto ZCmd(1,2,3,4,5,6,7,8,9) P
+ZCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 400; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "*1Z02";
+    in "1Z02";
+}

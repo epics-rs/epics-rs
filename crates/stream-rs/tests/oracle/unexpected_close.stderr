@@ -1,1 +1,2 @@
 _main_ unexpected_close.proto line 2: Unexpected '}' (no matching '{') in global context
+_main_ while reading protocol 'p' for 'rec0'

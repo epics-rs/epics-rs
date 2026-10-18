@@ -40,19 +40,23 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
 
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
-    let _sub = rt.port_handle().interrupts().register_sync_callback(
-        InterruptFilter {
-            reason: None,
-            addr: Some(0),
-            uint32_mask: None,
-            iface: Some(InterfaceType::Octet),
-        },
-        move |iv| {
-            if let ParamValue::Octet(s) = &iv.value {
-                sink.lock().unwrap().push(s.to_vec());
-            }
-        },
-    );
+    let _sub = rt
+        .port_handle()
+        .interrupts()
+        .register_sync_callback(
+            InterruptFilter {
+                reason: None,
+                addr: Some(0),
+                uint32_mask: None,
+                iface: Some(InterfaceType::Octet),
+            },
+            move |iv| {
+                if let ParamValue::Octet(s) = &iv.value {
+                    sink.lock().unwrap().push(s.to_vec());
+                }
+            },
+        )
+        .unwrap();
 
     let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(2));
     let data = io.read_octet(0, 32).expect("read failed");

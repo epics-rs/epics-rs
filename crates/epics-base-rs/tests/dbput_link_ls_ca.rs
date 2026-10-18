@@ -1,8 +1,8 @@
 //! C `dbPutLinkLS` (`dbLink.c:527-538`) over a CA link: `dbGetLinkDBFtype`
-//! is the channel's native type (`dbCa.c:695-704`), so an lso into a
+//! is the channel's native type (`dbCa.c:666-675`), so an lso into a
 //! `DBF_DOUBLE` channel sends one `DBR_STRING` and into a `DBF_CHAR` one the
 //! characters. While the channel is down the type is -1 (`pcaGetCheck`,
-//! `dbCa.c:650-660`): nothing is put and no LINK alarm is raised. Both the
+//! `dbCa.c:621-631`): nothing is put and no LINK alarm is raised. Both the
 //! `ca://` form and a DB-spelled name this IOC does not hold.
 
 use std::collections::HashMap;

@@ -480,8 +480,12 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 
 impl NDPluginProcess for PosPluginProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPosPlugin.cpp:372-373, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     /// NDPosPlugin.cpp:203.
     const READ_ATTRIBUTES: bool = false;
 
@@ -859,7 +863,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -1252,7 +1256,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         let (file, valid, qty) = {
@@ -1336,7 +1340,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         (proc, base)

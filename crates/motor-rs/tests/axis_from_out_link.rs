@@ -49,7 +49,7 @@ fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandl
         num_axes,
         PortFlags::default(),
         asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
     ));
     let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
         &claim,

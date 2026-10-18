@@ -2217,7 +2217,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2274,7 +2274,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2300,7 +2300,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 input: input.to_vec(),
                 pos: 0,
@@ -3092,7 +3092,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 rec: rec.clone(),
             },
@@ -3204,7 +3204,7 @@ mod tests {
                         ..PortFlags::default()
                     },
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
             },
             &crate::registry::open_owner(),
@@ -3382,7 +3382,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 link: EchoingLink {
                     sizes: sizes.clone(),
@@ -3497,7 +3497,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 link: CountingLink {
                     sizes: sizes.clone(),
@@ -3656,7 +3656,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 reports: reports.clone(),
             },

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
-use asyn_rs::interfaces::motor::{PortSet, PortSets};
+use asyn_rs::interfaces::motor::PortSet;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -287,10 +287,6 @@ impl ParamDelta {
     /// `setDoubleParam(addr, function, value)`.
     pub fn set_float64(&mut self, function: usize, value: f64) {
         self.0.push((function, WriteValue::Float64(value)));
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub(crate) fn into_values(self) -> impl Iterator<Item = (usize, ParamValue)> {
@@ -872,7 +868,7 @@ impl<P: ControllerParams> ControllerPort<P> {
             num_axes.max(1) as usize,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         for &(name, param_type) in BASE_PARAMS {
             base.create_param(name, param_type)?;
@@ -951,6 +947,7 @@ impl<P: ControllerParams> ControllerPort<P> {
             },
             index::DEFER_MOVES => MotorCommand::DeferMoves { defer: value != 0 },
             index::CLOSED_LOOP => MotorCommand::SetClosedLoop { enable: value != 0 },
+            index::MOVE_TO_HOME if value == 1 => MotorCommand::MoveToHome,
             // C polls inside the write, before its callbacks and closing
             // line (asynMotorController.cpp:217-221, :245-254).
             index::UPDATE_STATUS => MotorCommand::Poll,
@@ -1355,12 +1352,13 @@ fn run_on_axis(
         })
         .flatten()
         .map(|secs| std::time::Duration::try_from_secs_f64(secs).unwrap_or_default());
+    let held = axis.controller_poll().hold();
+    axis.controller_poll().drain_on_port(&held, base);
+    // UPDATE_STATUS runs `poll()` before the axis's (:217-221).
+    if matches!(command, MotorCommand::Poll) {
+        apply_port_sets(base, None, axis.controller_poll().run(&held));
+    }
     let driven = {
-        let held = axis.controller_poll().hold();
-        // UPDATE_STATUS runs `poll()` before the axis's (:217-221).
-        if matches!(command, MotorCommand::Poll) {
-            apply_port_sets(base, None, axis.controller_poll().run(&held));
-        }
         let port = base.port_name.clone();
         let Some(mut motor) = crate::poll_loop::lock_axis(axis.motor(), Some(&port), &held) else {
             return Err(base_error());
@@ -1371,11 +1369,17 @@ fn run_on_axis(
         }
         crate::poll_loop::drive(&mut *motor, &trace, command, c, quiet)
     };
+    if matches!(command, MotorCommand::MoveToHome) {
+        axis.controller_poll().signal_move_to_home(addr);
+    }
+    // Queued before the lock goes, so a poller pass waiting on it posts
+    // them before its poll, as C's write posts before it unlocks.
     apply_port_sets(base, Some(addr), driven.port_sets);
     axis.post_written(Written::new(driven.write, on_delay.is_some()));
     if moves {
         axis.wakeup();
     }
+    drop(held);
     // C axis methods get the controller's asynUser, so the writer's
     // errorMessage is left as it was: empty.
     driven
@@ -1386,7 +1390,11 @@ fn run_on_axis(
 /// A driver's own-port steps on the port's thread, as C makes them: on the
 /// parameter library itself. `axis` is the address a [`PortSet::Axis`]
 /// lands on, None for a controller poll's.
-fn apply_port_sets(base: &mut PortDriverBase, axis: Option<i32>, sets: PortSets) {
+pub(crate) fn apply_port_sets(
+    base: &mut PortDriverBase,
+    axis: Option<i32>,
+    sets: impl IntoIterator<Item = PortSet>,
+) {
     for set in sets {
         let _ = match set {
             PortSet::Set {
@@ -1406,10 +1414,6 @@ fn apply_port_sets(base: &mut PortDriverBase, axis: Option<i32>, sets: PortSets)
         };
     }
 }
-
-/// What an axis's poller runs a [`WriteHook`]'s sets through:
-/// [`ControllerPort::store`] on the port's actor.
-pub(crate) type ParamStore = Arc<dyn Fn(i32, ParamDelta) + Send + Sync>;
 
 /// What an axis's poller reads the port's parameters through: C's
 /// getIntegerParam / getDoubleParam in one call on the port's actor, so a
@@ -1441,7 +1445,6 @@ pub(crate) struct Published {
     /// library the base writes as on the port.
     pub handle: PortHandle,
     pub hook: Option<Arc<dyn WriteHook>>,
-    pub store: ParamStore,
     pub params: ParamRead,
 }
 
@@ -1465,22 +1468,12 @@ pub(crate) fn publish<P: ControllerParams>(
         return Err(format!("motor port {port}: {e}"));
     }
     let port = handle.clone();
-    let store: ParamStore = Arc::new(move |addr, delta: ParamDelta| {
-        if delta.is_empty() {
-            return;
-        }
-        // C drivers ignore the status of setXxxParam.
-        let _ = port
-            .with_driver_blocking::<ControllerPort<P>, _>(move |driver| driver.store(addr, delta));
-    });
-    let port = handle.clone();
     let params = ParamRead(Arc::new(move |read: ParamCall| {
         port.with_driver_blocking::<ControllerPort<P>, _>(move |driver| read(&driver.base))
     }));
     Ok(Published {
         handle,
         hook,
-        store,
         params,
     })
 }

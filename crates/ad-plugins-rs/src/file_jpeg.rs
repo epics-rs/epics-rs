@@ -201,8 +201,9 @@ impl Default for JpegFileProcessor {
 
 impl NDPluginProcess for JpegFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDFileJPEG.cpp:303, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
@@ -471,7 +472,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();
@@ -492,7 +493,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();

@@ -160,7 +160,7 @@ fn blocking_port_record() -> (AsynRecord, epics_base_rs::server::database::PvDat
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         }),
         rx,
@@ -317,7 +317,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
             }),
             rx,
@@ -399,7 +399,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_enabled(false).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -465,7 +465,7 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
                 1,
                 flags,
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             )),
             RuntimeConfig::default(),
         )
@@ -593,7 +593,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 entered: entered_tx,
                 release: Mutex::new(release_rx),
@@ -696,7 +696,7 @@ fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (rt, _jh) = crate::runtime::create_port_runtime_unclaimed(
             Blocking { base },
@@ -746,7 +746,7 @@ fn a_dequeue_shares_the_port_name() {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let before = thread_allocs();
         let gate = base.queue_gate();

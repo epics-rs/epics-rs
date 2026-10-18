@@ -48,7 +48,7 @@ impl MovingDotDetector {
             max_memory,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let dot_params = MovingDotParams::create(&mut ad.port_base)?;
 

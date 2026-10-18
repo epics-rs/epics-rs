@@ -3867,6 +3867,8 @@ name = "stream-rs"
 version = "0.32.0"
 dependencies = [
  "chrono",
+ "epics-base-rs",
+ "libc",
  "parking_lot",
  "tempfile",
 ]

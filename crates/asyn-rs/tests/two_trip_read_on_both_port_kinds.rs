@@ -62,7 +62,7 @@ fn port(name: &str, can_block: bool) -> PortRuntimeHandle {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         ),
         n: 0,
     };

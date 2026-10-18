@@ -64,6 +64,8 @@ static CALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     rule: LinkRule::Volatile,
     // C `calcoutRecord.c:752`, `:757`.
     mask: crate::server::recgbl::EventMask::VALUE,
+    repost_local: false,
+    in_cycle: true,
 };
 
 /// Where CLCV's post sits in calcout's put-post table, after every link's.
@@ -848,6 +850,8 @@ impl Record for CalcoutRecord {
         Some(LinkCheck {
             spec: &CALCOUT_LINK_CHECK,
             statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
             state: &mut self.link_check,
         })
     }

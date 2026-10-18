@@ -42,8 +42,11 @@ impl GatherProcessor {
 
 impl NDPluginProcess for GatherProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginGather.cpp:46-47, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
         ProcessResult::forward(array, vec![])

@@ -309,7 +309,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = SimDetectorParams::create(&mut base).unwrap();
         assert!(base.find_param("SIM_GAIN_X").is_some());

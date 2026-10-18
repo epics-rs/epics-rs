@@ -1972,17 +1972,18 @@ mod tests {
     ) {
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let seen_cb = seen.clone();
-        let sub = srv.base().interrupts.register_sync_callback(
-            filter,
-            move |iv: &crate::interrupt::InterruptValue| {
+        let sub = srv
+            .base()
+            .interrupts
+            .register_sync_callback(filter, move |iv: &crate::interrupt::InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
                     seen_cb
                         .lock()
                         .unwrap()
                         .push(String::from_utf8_lossy(s).into_owned());
                 }
-            },
-        );
+            })
+            .unwrap();
         (seen, sub)
     }
 
@@ -2874,17 +2875,18 @@ mod tests {
 
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let seen_cb = seen.clone();
-        let _sub_cb = sub.base().interrupts.register_sync_callback(
-            InterruptFilter::default(),
-            move |iv: &InterruptValue| {
+        let _sub_cb = sub
+            .base()
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
                     seen_cb
                         .lock()
                         .unwrap()
                         .push(String::from_utf8_lossy(s).into_owned());
                 }
-            },
-        );
+            })
+            .unwrap();
 
         // The IEOS an st.cmd sets on the child port: `asynOctetSetInputEos
         // srv_eos:0 0 "\n"`.
@@ -3069,20 +3071,24 @@ mod tests {
 
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let seen_cb = seen.clone();
-        let _cb = srv.base().interrupts.register_sync_callback(
-            InterruptFilter {
-                addr: Some(3),
-                ..InterruptFilter::default()
-            },
-            move |iv: &InterruptValue| {
-                if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(s).into_owned());
-                }
-            },
-        );
+        let _cb = srv
+            .base()
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    addr: Some(3),
+                    ..InterruptFilter::default()
+                },
+                move |iv: &InterruptValue| {
+                    if let ParamValue::Octet(s) = &iv.value {
+                        seen_cb
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(s).into_owned());
+                    }
+                },
+            )
+            .unwrap();
 
         let client = ClientSock::bind("127.0.0.1:0").unwrap();
         client.send_to(b"telemetry", server_addr).unwrap();

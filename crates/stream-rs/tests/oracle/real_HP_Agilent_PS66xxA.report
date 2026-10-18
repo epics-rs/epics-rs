@@ -1,0 +1,306 @@
+rec0: HP_Agilent_PS66xxA.proto getOutVolt(1,2,3,4,5,6,7,8,9) P
+getOutVolt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "MEAS:VOLT?";
+    in "%E";
+  }
+
+    out "MEAS:VOLT?";
+    in "%E";
+}
+rec1: HP_Agilent_PS66xxA.proto setVoltLevel(1,2,3,4,5,6,7,8,9) P
+setVoltLevel {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "VOLT:LEVEL?";
+    in "%E";
+  }
+
+    out "VOLT:LEVEL %.3E";
+}
+rec2: HP_Agilent_PS66xxA.proto getVoltLevel(1,2,3,4,5,6,7,8,9) P
+getVoltLevel {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "VOLT:LEVEL?";
+    in "%E";
+  }
+
+    out "VOLT:LEVEL?";
+    in "%E";
+}
+rec3: HP_Agilent_PS66xxA.proto setVoltProt(1,2,3,4,5,6,7,8,9) P
+setVoltProt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "VOLT:PROT? ";
+    in "%E";
+  }
+
+    out "VOLT:PROT %.2E";
+}
+rec4: HP_Agilent_PS66xxA.proto getVoltProt(1,2,3,4,5,6,7,8,9) P
+getVoltProt {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "VOLT:PROT?";
+    in "%E";
+  }
+
+    out "VOLT:PROT?";
+    in "%E";
+}
+rec5: HP_Agilent_PS66xxA.proto getOutCurrent(1,2,3,4,5,6,7,8,9) P
+getOutCurrent {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "MEAS:CURR?";
+    in "%E";
+  }
+
+    out "MEAS:CURR?";
+    in "%E";
+}
+rec6: HP_Agilent_PS66xxA.proto setCurrentLevel(1,2,3,4,5,6,7,8,9) P
+setCurrentLevel {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "CURR:LEVEL?";
+    in "%E";
+  }
+
+    out "CURR:LEVEL %.2E";
+}
+rec7: HP_Agilent_PS66xxA.proto getCurrentLevel(1,2,3,4,5,6,7,8,9) P
+getCurrentLevel {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "CURR:LEVEL?";
+    in "%E";
+  }
+
+    out "CURR:LEVEL?";
+    in "%E";
+}
+rec8: HP_Agilent_PS66xxA.proto setOnOff(1,2,3,4,5,6,7,8,9) P
+setOnOff {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "OUTP?";
+    in "%d";
+  }
+
+    out "OUTP %{OFF|ON}";
+}
+rec9: HP_Agilent_PS66xxA.proto getOnOff(1,2,3,4,5,6,7,8,9) P
+getOnOff {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "OUTP?";
+    in "%d";
+  }
+
+    out "OUTP?";
+    in "%d";
+}
+rec10: HP_Agilent_PS66xxA.proto getID(1,2,3,4,5,6,7,8,9) P
+getID {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "*IDN?";
+    in "%s";
+  }
+
+    out "*IDN?";
+    in "%s";
+}
+rec11: HP_Agilent_PS66xxA.proto setReset(1,2,3,4,5,6,7,8,9) P
+setReset {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "*RST";
+}
+rec12: HP_Agilent_PS66xxA.proto setErrClr(1,2,3,4,5,6,7,8,9) P
+setErrClr {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "*CLS";
+    out "OUTP:PROT:CLE";
+}
+rec13: HP_Agilent_PS66xxA.proto getStatus(1,2,3,4,5,6,7,8,9) P
+getStatus {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "STAT:QUES:COND?";
+    in "%d";
+  }
+
+    out "STAT:QUES:COND?";
+    in "%d";
+}
+rec14: HP_Agilent_PS66xxA.proto setOverCurrOnOff(1,2,3,4,5,6,7,8,9) P
+setOverCurrOnOff {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "CURR:PROT:STAT?";
+    in "%d";
+  }
+
+    out "CURR:PROT:STAT %d";
+}
+rec15: HP_Agilent_PS66xxA.proto getOverCurrOnOff(1,2,3,4,5,6,7,8,9) P
+getOverCurrOnOff {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+  @Init {
+    out "CURR:PROT:STAT?";
+    in "%d";
+  }
+
+    out "CURR:PROT:STAT?";
+    in "%d";
+}

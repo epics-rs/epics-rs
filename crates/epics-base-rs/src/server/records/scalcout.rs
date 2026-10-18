@@ -694,6 +694,8 @@ static SCALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     rule: LinkRule::Locality,
     // C `sCalcoutRecord.c:1015`, `:1045`.
     mask: crate::server::recgbl::EventMask::VALUE,
+    repost_local: false,
+    in_cycle: true,
 };
 
 /// INAV..INLV — numeric-input connection-status field names (channel A..L).
@@ -796,6 +798,8 @@ impl Record for ScalcoutRecord {
         Some(LinkCheck {
             spec: &SCALCOUT_LINK_CHECK,
             statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
             state: &mut self.link_check,
         })
     }

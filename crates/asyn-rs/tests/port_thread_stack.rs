@@ -67,7 +67,7 @@ fn the_port_thread_takes_register_port_s_stack_size() {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let device = Device {
             base,
@@ -103,7 +103,7 @@ fn a_synchronous_port_s_stack_size_is_not_read() {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         ),
         stack: Arc::clone(&stack),
     };

@@ -505,6 +505,17 @@ impl ModbusParams {
     }
 }
 
+/// drvModbusAsyn.cpp:159-160: the interrupt mask is the interface mask less
+/// asynDrvUser.
+const MODBUS_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::UINT32_DIGITAL)
+    .or(InterfaceMask::INT64)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::OCTET);
+const MODBUS_INTERFACES: InterfaceMask = MODBUS_INTERRUPTS.or(InterfaceMask::DRV_USER);
+
 /// `drvModbusAsyn` as its constructor leaves it when a check after
 /// `registerPort` fails (drvModbusAsyn.cpp:259-305): registered, parameters
 /// created, `initialized_` false. Every `drvUserCreate` disables the caller and
@@ -521,13 +532,8 @@ impl ModbusHalfBuilt {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            port_name,
-            1,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
-        );
+        let mut base =
+            PortDriverBase::new(port_name, 1, flags, MODBUS_INTERFACES, MODBUS_INTERRUPTS);
         ModbusParams::create(&mut base, data_type)?;
         Ok(Self { base })
     }
@@ -660,8 +666,8 @@ impl ModbusPortDriver {
             port_name,
             engine.config().length.max(1),
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            MODBUS_INTERFACES,
+            MODBUS_INTERRUPTS,
         );
         let ModbusParams {
             reason_to_datatype,
@@ -2725,9 +2731,9 @@ mod tests {
         transport: Box<dyn OctetTransport>,
     ) -> AsynResult<ModbusPortDriver> {
         let mut driver = ModbusPortDriver::new(port_name, config, link_type, transport)?;
-        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_base_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        driver
+            .base
+            .own_interrupts(epics_base_rs::runtime::interrupt_accept::InterruptGate::opened());
         Ok(driver)
     }
 
@@ -2896,7 +2902,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 shared: Arc::clone(&shared),
             },
@@ -2990,7 +2996,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
             },
             RuntimeConfig::default(),
@@ -3082,7 +3088,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             pending,
             replies: std::collections::VecDeque::from(vec![fresh]),
@@ -3125,6 +3131,24 @@ mod tests {
         pdu.extend_from_slice(&first.to_be_bytes());
         pdu.resize(3 + length * 2, 0);
         pdu
+    }
+
+    /// drvModbusAsyn.cpp:157-160, for the constructed port and for the one a
+    /// failed constructor check leaves registered.
+    #[test]
+    fn the_port_registers_drv_modbus_asyn_s_interfaces() {
+        let c = (0x4A7B, 0x4A78);
+        let masks = |b: &PortDriverBase| (b.interface_mask().bits(), b.interrupt_mask().bits());
+        let built = test_driver(
+            "mbmask",
+            test_config(0, 1),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .unwrap();
+        assert_eq!(masks(&built.base), c);
+        let half = ModbusHalfBuilt::new("mbmaskhalf", ModbusDataType::Int16).unwrap();
+        assert_eq!(masks(&half.base), c);
     }
 
     /// A write-function port configured the way C's `pollMsec=0` ports are:
@@ -3200,7 +3224,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 chunks,
             },
@@ -3272,7 +3296,7 @@ mod tests {
                         1,
                         PortFlags::default(),
                         InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
                     ),
                     status,
                 },
@@ -3360,7 +3384,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 chunks: Arc::new(Mutex::new(chunks.into())),
                 reads: Arc::clone(&reads),
@@ -4253,7 +4277,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 replies: Default::default(),
@@ -4380,7 +4404,7 @@ mod tests {
                         1,
                         PortFlags::default(),
                         InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
                     ),
                     caps,
                 );
@@ -4483,7 +4507,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             replies: (0..64).map(|_| reply.clone()).collect(),
@@ -5636,15 +5660,19 @@ mod tests {
         // a full poll cycle (engine poll succeeds, bindings iterated). The
         // 4-word buffer has no index 100, so poll_cycle's bounds guard must skip
         // the binding rather than panic.
-        let (_sub, _rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(100),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(100),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         driver
             .poll_cycle()
             .expect("poll_cycle must skip the out-of-range subscriber binding, not error");
@@ -5677,25 +5705,33 @@ mod tests {
             .find_param(ModbusDataType::Int32Le.as_str())
             .expect("INT32_LE parameter must exist");
 
-        let (_good_sub, _good_rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(good),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_good_sub, _good_rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(good),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         // The last register of the block, read as a two-register type.
-        let (_narrow_sub, _narrow_rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(narrow),
-                addr: Some(3),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_narrow_sub, _narrow_rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(narrow),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver
@@ -5749,15 +5785,19 @@ mod tests {
             .base
             .find_param(ModbusDataType::Int32Le.as_str())
             .expect("INT32_LE parameter must exist");
-        let (_narrow_sub, _narrow_rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(narrow),
-                addr: Some(3),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_narrow_sub, _narrow_rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(narrow),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver.poll_cycle().unwrap();
@@ -5791,15 +5831,19 @@ mod tests {
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
         let read_reason = driver.read_reason;
-        let (_sub, _rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(good),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(good),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let path = std::env::temp_dir().join(format!(
@@ -5874,15 +5918,19 @@ mod tests {
         let _subs: Vec<_> = [3, 99]
             .into_iter()
             .map(|addr| {
-                driver.base.interrupts.register_interrupt_user(
-                    asyn_rs::interrupt::InterruptFilter {
-                        reason: Some(narrow),
-                        addr: Some(addr),
-                        iface: Some(InterfaceType::Int32),
-                        ..Default::default()
-                    },
-                    4096,
-                )
+                driver
+                    .base
+                    .interrupts
+                    .register_interrupt_user(
+                        asyn_rs::interrupt::InterruptFilter {
+                            reason: Some(narrow),
+                            addr: Some(addr),
+                            iface: Some(InterfaceType::Int32),
+                            ..Default::default()
+                        },
+                        4096,
+                    )
+                    .unwrap()
             })
             .collect();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
@@ -5934,15 +5982,19 @@ mod tests {
             .expect("INT32_LE parameter must exist");
         let read_reason = driver.read_reason;
         // The last register of the block, read as a two-register type.
-        let (_narrow_sub, _narrow_rx) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(narrow),
-                addr: Some(3),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_narrow_sub, _narrow_rx) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(narrow),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         // Distinct per case and per process: the sibling case above holds
         // the other constant, and the pid keeps a second run of this suite
@@ -6025,15 +6077,19 @@ mod tests {
         let _subs: Vec<_> = [(read_ok, 0), (good, 99)]
             .into_iter()
             .map(|(reason, addr)| {
-                driver.base.interrupts.register_interrupt_user(
-                    asyn_rs::interrupt::InterruptFilter {
-                        reason: Some(reason),
-                        addr: Some(addr),
-                        iface: Some(InterfaceType::Int32),
-                        ..Default::default()
-                    },
-                    4096,
-                )
+                driver
+                    .base
+                    .interrupts
+                    .register_interrupt_user(
+                        asyn_rs::interrupt::InterruptFilter {
+                            reason: Some(reason),
+                            addr: Some(addr),
+                            iface: Some(InterfaceType::Int32),
+                            ..Default::default()
+                        },
+                        4096,
+                    )
+                    .unwrap()
             })
             .collect();
 
@@ -6135,9 +6191,9 @@ mod tests {
     fn subscribe_opened(
         driver: &mut ModbusPortDriver,
     ) -> asyn_rs::interrupt::AsyncInterruptReceiver {
-        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_base_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        driver
+            .base
+            .own_interrupts(epics_base_rs::runtime::interrupt_accept::InterruptGate::opened());
         driver.base.interrupts.subscribe_async(256, 4096)
     }
 
@@ -6236,15 +6292,19 @@ mod tests {
         // subscription suffices to enumerate the binding — the per-interface
         // fan-out below is unconditional, so the broadcast observer sees all
         // four typed values regardless of this subscriber's own iface.
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
@@ -6333,24 +6393,32 @@ mod tests {
             .expect("INT32_LE parameter must exist");
 
         // --- Poll 1: array records ARE bound (mailbox subscribers present). ---
-        let (_sub_i, _rx_i) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32Array),
-                ..Default::default()
-            },
-            4096,
-        );
-        let (_sub_f, _rx_f) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Float64Array),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub_i, _rx_i) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
+        let (_sub_f, _rx_f) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
@@ -6455,15 +6523,19 @@ mod tests {
             .base
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::UInt32Digital),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
@@ -6526,24 +6598,32 @@ mod tests {
             .base
             .find_param(ModbusDataType::Int32Le.as_str())
             .expect("INT32_LE parameter must exist");
-        let (_si, _ri) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32Array),
-                ..Default::default()
-            },
-            4096,
-        );
-        let (_sf, _rf) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Float64Array),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_si, _ri) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
+        let (_sf, _rf) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         // Poll 1 (force): int32Array + float64Array + scalars all fire.
@@ -6633,15 +6713,19 @@ mod tests {
             .base
             .find_param(ModbusDataType::StringHigh.as_str())
             .expect("STRING_HIGH parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Octet),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Octet),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver.poll_cycle().expect("poll 1 must succeed");
@@ -6868,15 +6952,19 @@ mod tests {
             .base
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::UInt32Digital),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         driver.poll_cycle().expect("poll 1 must succeed");
@@ -6956,15 +7044,19 @@ mod tests {
             .expect("INT32_LE parameter must exist");
 
         // Good uInt32Digital binding at addr 0 (word = regs[0], always decodable).
-        let (_good, _rg) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(u16_reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::UInt32Digital),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_good, _rg) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(u16_reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
@@ -6986,15 +7078,19 @@ mod tests {
 
         // Bind an INT32_LE (rc=2) subscriber at addr 3: regs[3..] is one word, so
         // the per-offset read_int32 decode errors and aborts the cycle mid-loop.
-        let (sub_bad, _rb) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(i32_reason),
-                addr: Some(3),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (sub_bad, _rb) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(i32_reason),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
 
         // Poll 2: the tail binding is skipped, the rest of the cycle runs.
         driver
@@ -7409,15 +7505,19 @@ mod tests {
             .base
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
 
         // The Int32 fires this cycle produced, as (value, aux_status).
@@ -7506,20 +7606,24 @@ mod tests {
         )
         .expect("non-absolute config must build");
         let gate = InterruptGate::new();
-        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(gate.clone());
+        driver.base.own_interrupts(gate.clone());
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         let int32_fires = |rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver| {
             let mut out = Vec::new();
@@ -7626,20 +7730,24 @@ mod tests {
         let mut driver = test_driver("MB_POLLER_GATE", config, LinkType::Tcp, Box::new(transport))
             .expect("non-absolute config must build");
         let gate = InterruptGate::new();
-        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(gate.clone());
+        driver.base.own_interrupts(gate.clone());
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..Default::default()
-            },
-            4096,
-        );
+        let (_sub, _rx_sub) = driver
+            .base
+            .interrupts
+            .register_interrupt_user(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         let read_reason = driver.read_reason;
         let poll_delay = driver.poll_delay.clone();

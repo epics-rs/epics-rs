@@ -1,3 +1,4 @@
 _main_ dollar_eof.proto line 2: Unexpected end of file after '$' (looking for '}')
 _main_ dollar_eof.proto line 2: after command 'out'
 _main_ dollar_eof.proto line 1: in protocol 'p'
+_main_ while reading protocol 'p' for 'rec0'

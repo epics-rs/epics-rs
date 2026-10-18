@@ -1728,14 +1728,18 @@ mod tests {
         );
         trace.set_trace_mask(Some("MQSUBACK"), TraceMask::ERROR | TraceMask::IO_DRIVER);
         // An `I/O Intr` binding on the topic, so the ConnAck subscribes it.
-        let _binding = runtime.port_handle().interrupts().register_sync_callback(
-            InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _binding = runtime
+            .port_handle()
+            .interrupts()
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
 
         let port_handle = runtime.port_handle().clone();
         let start = Arc::new(Notify::new());
@@ -1867,14 +1871,18 @@ mod tests {
         let _bindings: Vec<_> = reasons
             .iter()
             .map(|&reason| {
-                runtime.port_handle().interrupts().register_sync_callback(
-                    InterruptFilter {
-                        reason: Some(reason),
-                        addr: Some(0),
-                        ..Default::default()
-                    },
-                    |_| {},
-                )
+                runtime
+                    .port_handle()
+                    .interrupts()
+                    .register_sync_callback(
+                        InterruptFilter {
+                            reason: Some(reason),
+                            addr: Some(0),
+                            ..Default::default()
+                        },
+                        |_| {},
+                    )
+                    .unwrap()
             })
             .collect();
 
@@ -1992,14 +2000,18 @@ mod tests {
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
         trace.set_trace_mask(Some("MQOWED"), TraceMask::ERROR | TraceMask::IO_DRIVER);
-        let _binding = runtime.port_handle().interrupts().register_sync_callback(
-            InterruptFilter {
-                reason: Some(reason),
-                addr: Some(0),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _binding = runtime
+            .port_handle()
+            .interrupts()
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
 
         let port_handle = runtime.port_handle().clone();
         let start = Arc::new(Notify::new());

@@ -1,5 +1,7 @@
 use crate::error::CaResult;
-use crate::server::record::{AlarmSeverity, ProcessAction, Record, RecordInstance, ScanType};
+use crate::server::record::{
+    AlarmSeverity, CommonFields, ProcessAction, Record, RecordInstance, ScanType,
+};
 
 /// Which of C's three built-in soft-channel dset families a DTYP names.
 ///
@@ -776,6 +778,15 @@ pub enum IoIntrAction {
     Skip,
 }
 
+/// C `get_ioint_info`'s `cmd`: which of `dbScan.c`'s two calls asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoIntrCmd {
+    /// `scanAdd`, `cmd` 0: the record joins the I/O Intr list.
+    Add = 0,
+    /// `scanDelete`, `cmd` 1: the record leaves it.
+    Delete = 1,
+}
+
 /// The alarm a device raises after a transfer: C's
 /// `recGblSetSevrMsg(prec, stat, sevr, msg)`, with an empty `msg` for a
 /// plain `recGblSetSevr`.
@@ -885,9 +896,9 @@ pub trait DeviceSupport: Send + Sync + 'static {
     }
 
     /// Called by the framework immediately before [`read()`](DeviceSupport::read)
-    /// to push a read-only snapshot of framework-owned `CommonFields`
-    /// state ([`crate::server::record::ProcessContext`]) that the device
-    /// support needs.
+    /// and every write to push a read-only snapshot of framework-owned
+    /// `CommonFields` state ([`crate::server::record::ProcessContext`]) that
+    /// the device support needs.
     ///
     /// `read()` receives only `&mut dyn Record`; it cannot reach
     /// `RecordInstance.common`. C device support reads `dbCommon`
@@ -1006,6 +1017,22 @@ pub trait DeviceSupport: Send + Sync + 'static {
         IoIntrAction::Process
     }
 
+    /// C's dset `get_ioint_info(cmd, precord, &piosh)`. `scanAdd` asks it
+    /// before it files the record on the list the call returns, `scanDelete`
+    /// before it takes the record off (dbScan.c:285, :343), each under the
+    /// record's lock set; the SCAN the record has is the one being joined or
+    /// left. `false` is C's nonzero return: `scanAdd` leaves the record
+    /// Passive. Default: accept, the pulse source being
+    /// [`io_intr_receiver`](Self::io_intr_receiver).
+    fn get_ioint_info(
+        &mut self,
+        _record: &mut dyn Record,
+        _common: &mut CommonFields,
+        _cmd: IoIntrCmd,
+    ) -> bool {
+        true
+    }
+
     /// Whether a pulse stands for the device's own `dbProcess` rather than
     /// `scanIoRequest`: devMotorAsyn's `statusCallback` gates on the
     /// `dbScanLockOK` it latched at `interruptAccept` (devMotorAsyn.c:159-162,
@@ -1063,6 +1090,57 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// command mailbox (DMOV stuck 0, MIP=RETRY|MOVE, later puts time out).
     fn output_callback_readback(&self) -> bool {
         false
+    }
+
+    // C's dset entries take `dbCommon*`. The framework calls only the
+    // `_common` forms below; each forwards to the form without `common` for
+    // a device that does not reach the record's common fields.
+
+    /// [`init`](Self::init) with the record's `dbCommon`.
+    fn init_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+    ) -> CaResult<DeviceInitOutcome> {
+        self.init(record)
+    }
+
+    /// [`read_begin`](Self::read_begin) with the record's `dbCommon`.
+    fn read_begin_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+        done: &crate::server::database::DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        self.read_begin(record, done)
+    }
+
+    /// [`read`](Self::read) with the record's `dbCommon`.
+    fn read_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+    ) -> CaResult<DeviceReadOutcome> {
+        self.read(record)
+    }
+
+    /// [`write_begin`](Self::write_begin) with the record's `dbCommon`.
+    fn write_begin_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+        done: &crate::server::database::DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        self.write_begin(record, done)
+    }
+
+    /// [`write`](Self::write) with the record's `dbCommon`.
+    fn write_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+    ) -> CaResult<()> {
+        self.write(record)
     }
 
     /// Begin the record's input read — C devAsyn's `queueRequest` on a
@@ -1212,7 +1290,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
     };
     dev.bind_database(instance.device_done.database());
     dev.set_callback_priority(instance.common.callback_priority());
-    let outcome = dev.init(&mut *instance.record);
+    let outcome = dev.init_common(&mut *instance.record, &mut instance.common);
     if let Some(saved) = saved.filter(|_| dev.has_init_record()) {
         instance.record.eoff_eslo_after_dset_init(saved);
     }

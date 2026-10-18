@@ -1,3 +1,4 @@
 _main_ value_open_brace.proto line 2: Unexpected '{' (missing ';' or '"' ?)
 _main_ value_open_brace.proto line 2: after command 'out'
 _main_ value_open_brace.proto line 1: in protocol 'p'
+_main_ while reading protocol 'p' for 'rec0'

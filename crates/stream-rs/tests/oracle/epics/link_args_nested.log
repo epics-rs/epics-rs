@@ -1,0 +1,28 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto args(A(1),B)) P"
+Stream::initRecord rec: filename="l.proto" protocol="args(A(1),B))" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "args(A(1),B))")
+StreamCore::parse "args(A(1),B))" -> "args<00>A(1)<00>B)"
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "$1 $2<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::evalOut(rec): lockRequest failed. Device is offline.
+StreamCore::finishProtocol(rec, Offline) not bus owner
+Stream::protocolFinishHook(rec, Offline)
+Stream::process(rec): could not start protocol, status=COMM (9)
+VAL 3 = 0x3
+SEVR "INVALID"
+STAT "COMM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

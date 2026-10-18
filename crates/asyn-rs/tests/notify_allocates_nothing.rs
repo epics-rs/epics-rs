@@ -85,14 +85,18 @@ fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
 
     let ring = Arc::new(AtomicUsize::new(0));
     let hits = ring.clone();
-    let _sync = im.register_sync_callback(filter(None), move |_| {
-        hits.fetch_add(1, Ordering::Relaxed);
-    });
-    let (_sub, _parked) = im.register_interrupt_user_when(
-        filter(Some(InterfaceType::Enum)),
-        asyn_rs::interrupt::MAX_ENUM_STATES * asyn_rs::interrupt::ENUM_ENTRY_BYTES,
-        || true,
-    );
+    let _sync = im
+        .register_sync_callback(filter(None), move |_| {
+            hits.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+    let (_sub, _parked) = im
+        .register_interrupt_user_when(
+            filter(Some(InterfaceType::Enum)),
+            asyn_rs::interrupt::MAX_ENUM_STATES * asyn_rs::interrupt::ENUM_ENTRY_BYTES,
+            || true,
+        )
+        .unwrap();
 
     let table: Arc<[EnumEntry]> = Arc::from(vec![entry("OFF", 0), entry("ON", 1)]);
     let fires: Vec<InterruptValue> = (0..N).map(|i| enum_fire(0, &table, i % 2)).collect();
@@ -128,35 +132,41 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
-    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+    base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
     let num = base.create_param("NUM", ParamType::Int32).unwrap();
 
     let seen = Arc::new(AtomicUsize::new(0));
     let hits = seen.clone();
-    let _sync = base.interrupts.register_sync_callback(
-        InterruptFilter {
-            reason: None,
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        move |_| {
-            hits.fetch_add(1, Ordering::Relaxed);
-        },
-    );
-    let (_sub, _parked) = base.interrupts.register_interrupt_user(
-        InterruptFilter {
-            reason: None,
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        4096,
-    );
+    let _sync = base
+        .interrupts
+        .register_sync_callback(
+            InterruptFilter {
+                reason: None,
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            move |_| {
+                hits.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+    let (_sub, _parked) = base
+        .interrupts
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: None,
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            4096,
+        )
+        .unwrap();
 
     // Warm: the first flush may size internal tables.
     base.set_string_param(msg, 0, "warm").unwrap();
@@ -195,7 +205,7 @@ fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() 
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let msg = pl.create_param("MSG", ParamType::Octet).unwrap();
     pl.set_string_param(msg, 0, "first value").unwrap();
@@ -231,7 +241,7 @@ fn setting_and_flushing_256_params_allocates_nothing() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let ids: Vec<usize> = (0..256)
         .map(|i| pl.create_param(&format!("P{i}"), ParamType::Int32).unwrap())
@@ -269,9 +279,9 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
-    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+    base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
     let num = base.create_param("NUM", ParamType::Int32).unwrap();
@@ -279,15 +289,17 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
     let _subs: Vec<_> = [msg, wave, num]
         .into_iter()
         .map(|r| {
-            base.interrupts.register_interrupt_user(
-                InterruptFilter {
-                    reason: Some(r),
-                    addr: Some(0),
-                    uint32_mask: None,
-                    iface: None,
-                },
-                256,
-            )
+            base.interrupts
+                .register_interrupt_user(
+                    InterruptFilter {
+                        reason: Some(r),
+                        addr: Some(0),
+                        uint32_mask: None,
+                        iface: None,
+                    },
+                    256,
+                )
+                .unwrap()
         })
         .collect();
 
@@ -328,15 +340,17 @@ async fn a_mailbox_clamps_a_payload_to_its_registered_size() {
     use asyn_rs::param::ParamValue;
 
     let im = InterruptManager::new();
-    let (_sub, mut rx) = im.register_interrupt_user(
-        InterruptFilter {
-            reason: Some(0),
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        16,
-    );
+    let (_sub, mut rx) = im
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(0),
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            16,
+        )
+        .unwrap();
     im.notify(InterruptValue {
         reason: 0,
         addr: 0,
@@ -374,15 +388,17 @@ async fn a_mailbox_registered_for_a_large_array_delivers_it_whole() {
     use asyn_rs::param::ParamValue;
 
     let im = InterruptManager::new();
-    let (_sub, mut rx) = im.register_interrupt_user(
-        InterruptFilter {
-            reason: Some(0),
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        100_000 * 8,
-    );
+    let (_sub, mut rx) = im
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(0),
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            100_000 * 8,
+        )
+        .unwrap();
     let src: Vec<f64> = (0..100_000).map(f64::from).collect();
     im.notify(InterruptValue {
         reason: 0,
@@ -413,9 +429,9 @@ fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
-    base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+    base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
     let num = base.create_param("NUM", ParamType::Int32).unwrap();

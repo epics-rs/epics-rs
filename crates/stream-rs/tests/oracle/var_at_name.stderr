@@ -1,1 +1,2 @@
 _main_ var_at_name.proto line 1: Variable name cannot start with '@': @x
+_main_ while reading protocol 'p' for 'rec0'

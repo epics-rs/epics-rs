@@ -11,6 +11,7 @@
 //! | `StreamFormatConverter.h` (+ base class) | [`converter`]          |
 //! | `StreamBusInterface.h/.cc`               | [`bus`]                |
 //! | `StreamCore.h`                           | [`core`]               |
+//! | `StreamEpics.cc`, `devStream.h`          | [`epics`]              |
 //!
 //! [`cstr`] holds the C string and `<stdlib.h>` behaviour the sources
 //! depend on.
@@ -20,6 +21,7 @@ pub mod bus;
 pub mod converter;
 pub mod core;
 pub mod cstr;
+pub mod epics;
 pub mod error;
 pub mod format;
 pub mod protocol;

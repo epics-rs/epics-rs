@@ -1,0 +1,16 @@
+rec0: USdigital_T7.proto get_all(1,2,3,4,5,6,7,8,9) P
+get_all {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "\x01\x01\x80";
+    in "%*r%*r%*r%(1:A1_raw.VAL)4r%(1:A2_raw.VAL)4r%(1:Angle_raw.VAL)4r%(1:T_raw.VAL)2r%(1:CS_raw.VAL)r";
+}

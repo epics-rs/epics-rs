@@ -301,6 +301,9 @@ impl CommonFields {
             time: self.time,
             soft: self.dtyp.soft(),
             callback_priority: self.callback_priority(),
+            scan: self.scan,
+            proc_field: self.proc_field,
+            tpro: self.tpro,
         }
     }
 

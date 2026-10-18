@@ -2635,7 +2635,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
@@ -2786,21 +2786,26 @@ mod tests {
             max_addr,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        base.own_interrupts(InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink = got.clone();
-        let sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                addr: Some(0),
-                uint32_mask: None,
-                iface: None,
-            },
-            move |iv: &InterruptValue| sink.lock().push((iv.addr, iv.value.as_int32().unwrap())),
-        );
+        let sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    addr: Some(0),
+                    uint32_mask: None,
+                    iface: None,
+                },
+                move |iv: &InterruptValue| {
+                    sink.lock().push((iv.addr, iv.value.as_int32().unwrap()))
+                },
+            )
+            .unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let driver = AddrDriver {
             base,
@@ -3057,7 +3062,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         eos_base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let tx = spawn_actor(EosObserver {
@@ -3175,7 +3180,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             flush_calls: flush_calls.clone(),
             write_calls: write_calls.clone(),
@@ -3240,7 +3245,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         };
         let tx = spawn_actor(drv);
@@ -3285,7 +3290,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         };
         let tx = spawn_actor(drv);
@@ -3607,7 +3612,7 @@ mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
@@ -3702,7 +3707,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(false);
         base.init_auto_connect(true);
@@ -3797,7 +3802,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         base.init_auto_connect(true);
@@ -3866,7 +3871,7 @@ mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -3939,7 +3944,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.params.set_int32(0, 1, 7).unwrap();
@@ -4060,7 +4065,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_auto_connect(true);
@@ -4157,7 +4162,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.init_auto_connect(true);
             base.set_connected(false);
@@ -4265,7 +4270,7 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -4345,7 +4350,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_auto_connect(false);
         base.init_connected(true);
@@ -4361,7 +4366,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_auto_connect(true);
         base.init_connected(true);
@@ -4384,7 +4389,7 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -4636,7 +4641,7 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let tx = spawn_actor(InterposeDriver { base });
 
@@ -4723,7 +4728,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
@@ -4839,7 +4844,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         // Down, enabled, auto-connect, and with no throttle window running
@@ -5143,25 +5148,26 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let _sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                ..InterruptFilter::default()
-            },
-            move |iv| {
-                recorder
-                    .lock()
-                    .push((iv.addr, iv.value.as_int32().unwrap()))
-            },
-        );
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    ..InterruptFilter::default()
+                },
+                move |iv| {
+                    recorder
+                        .lock()
+                        .push((iv.addr, iv.value.as_int32().unwrap()))
+                },
+            )
+            .unwrap();
         let tx = spawn_actor(TestDriverBase(base));
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -5200,21 +5206,22 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let _sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                ..InterruptFilter::default()
-            },
-            move |iv| recorder.lock().push(iv.timestamp),
-        );
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    ..InterruptFilter::default()
+                },
+                move |iv| recorder.lock().push(iv.timestamp),
+            )
+            .unwrap();
         let tx = spawn_actor(TestDriverBase(base));
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         for (n, time_stamp) in [(1, Some(ts)), (2, None)] {
@@ -5251,28 +5258,29 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let _sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                ..InterruptFilter::default()
-            },
-            move |iv| {
-                recorder.lock().push((
-                    iv.value.as_int32().unwrap(),
-                    iv.aux_status,
-                    iv.alarm_status,
-                    iv.alarm_severity,
-                ))
-            },
-        );
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    ..InterruptFilter::default()
+                },
+                move |iv| {
+                    recorder.lock().push((
+                        iv.value.as_int32().unwrap(),
+                        iv.aux_status,
+                        iv.alarm_status,
+                        iv.alarm_severity,
+                    ))
+                },
+            )
+            .unwrap();
         let tx = spawn_actor(TestDriverBase(base));
 
         let publish = |updates| {
@@ -5331,21 +5339,22 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        base.interrupts = crate::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let _sub = base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(val),
-                ..InterruptFilter::default()
-            },
-            move |iv| recorder.lock().push(iv.value.as_int32().unwrap()),
-        );
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(val),
+                    ..InterruptFilter::default()
+                },
+                move |iv| recorder.lock().push(iv.value.as_int32().unwrap()),
+            )
+            .unwrap();
         let tx = spawn_actor(TestDriverBase(base));
         let user = || AsynUser::new(val).with_timeout(Duration::from_secs(1));
         let set = |n| RequestOp::SetParams {
@@ -5490,7 +5499,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.init_auto_connect(true);
             base.init_connected(false);
@@ -5629,7 +5638,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.init_auto_connect(false);
             base.set_connected(connected);
@@ -5669,7 +5678,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         shut_down(&mut base);
         let tx = spawn_actor(ReportSpy {
@@ -5712,7 +5721,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.init_auto_connect(port_auto_connect);
             base.device_state(0);
@@ -5775,7 +5784,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -5832,15 +5841,19 @@ mod tests {
 
         // details >= 3: one line per interrupt client, and none below 3.
         let mut with_client = build(vec![Capability::Int32Read]);
-        let (_sub, _rx) = with_client.0.interrupts.register_interrupt_user(
-            InterruptFilter {
-                reason: Some(0),
-                addr: Some(0),
-                iface: Some(InterfaceType::Int32),
-                ..InterruptFilter::default()
-            },
-            4096,
-        );
+        let (_sub, _rx) = with_client
+            .0
+            .interrupts
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(0),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..InterruptFilter::default()
+                },
+                4096,
+            )
+            .unwrap();
         let mut out2 = String::new();
         with_client.report(&mut out2, 2);
         assert!(
@@ -5893,7 +5906,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_auto_connect(false);
         base.set_connected(false);
@@ -6339,7 +6352,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = CountingDriver {
@@ -6448,7 +6461,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             )),
             &crate::registry::open_owner(),
         )

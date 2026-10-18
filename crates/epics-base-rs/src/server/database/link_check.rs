@@ -7,19 +7,22 @@ use std::time::Duration;
 use super::PvDatabase;
 use crate::server::record::RecordInstance;
 use crate::server::records::link_status::{
-    LINK_EXT_NC, LINK_EXT_OK, LINK_RECHECK, link_is_external,
+    DBF_UNKNOWN, LINK_CON, LINK_EXT_NC, LINK_EXT_OK, LINK_LOC, LINK_RECHECK, dbf_static_code,
+    link_is_external,
 };
 
 impl PvDatabase {
     /// C `checkLinks` on the record `instance` holds: every link its rule
-    /// visits whose status reads `Ext PV` takes its `dbIsLinkConnected`, and
-    /// a status that moved posts. Returns whether it scheduled
+    /// visits whose status reads `Ext PV` takes its `dbIsLinkConnected` (and
+    /// its `dbGetLinkDBFtype`, for a record keeping one), and a status that
+    /// moved posts — a `Local PV` one too under `repost_local`. Returns whether it scheduled
     /// `checkLinksCallback` — an `Ext PV NC` remains and none was pending.
     pub(crate) fn check_links(&self, instance: &mut RecordInstance) -> bool {
         let Some(check) = instance.record.link_check() else {
             return false;
         };
         let spec = check.spec;
+        let typed = !check.field_types.is_empty();
         let due = check
             .statuses
             .iter()
@@ -27,6 +30,7 @@ impl PvDatabase {
             .filter(|(_, s)| link_is_external(**s))
             .fold(0u64, |due, (i, _)| due | 1 << i);
         let (mut visited, mut connected) = (0u64, 0u64);
+        let mut types = Vec::new();
         for (i, &(link, _)) in spec.links.iter().enumerate() {
             if due & 1 << i == 0 {
                 continue;
@@ -39,9 +43,13 @@ impl PvDatabase {
                 if self.link_connected(parsed) {
                     connected |= 1 << i;
                 }
+                if typed {
+                    let ft = self.external_link_dbf_type(parsed);
+                    types.push((i, ft.map_or(DBF_UNKNOWN, dbf_static_code)));
+                }
             }
         }
-        let Some(check) = instance.record.link_check() else {
+        let Some(mut check) = instance.record.link_check() else {
             return false;
         };
         let mut moved = 0u64;
@@ -59,12 +67,44 @@ impl PvDatabase {
                 moved |= 1 << i;
             }
         }
+        // C sets every link's type `DBF_unknown` before asking
+        // `dbGetLinkDBFtype` of the named ones (sseqRecord.c:881, :940); a
+        // local link's cannot have moved.
+        for (status, ft) in check.statuses.iter().zip(check.field_types.iter_mut()) {
+            if *status == LINK_CON {
+                *ft = DBF_UNKNOWN;
+            }
+        }
+        for (i, ft) in types {
+            check.field_types[i] = ft;
+        }
+        let local = if spec.repost_local {
+            check
+                .statuses
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| **s == LINK_LOC)
+                .fold(0u64, |local, (i, _)| local | 1 << i)
+        } else {
+            0
+        };
         check.state.ca_links = visited != 0;
         let arm = visited & !connected != 0 && !check.state.scheduled;
         check.state.scheduled |= arm;
+        let tail = check
+            .tail
+            .as_deref_mut()
+            .map(|tail| (tail.pass(check.statuses), tail.fields()));
         for (i, &(_, status)) in spec.links.iter().enumerate() {
-            if moved & 1 << i != 0 {
+            if (moved | local) & 1 << i != 0 {
                 instance.notify_field(status, spec.mask);
+            }
+        }
+        if let Some((moved, fields)) = tail {
+            for (i, field) in fields.iter().enumerate() {
+                if moved & 1 << i != 0 {
+                    instance.notify_field(field, spec.mask);
+                }
             }
         }
         arm
@@ -110,6 +150,27 @@ impl PvDatabase {
                 }
             },
         );
+    }
+
+    /// sseq's `if (!pending_checkLinksCB) callbackRequestDelayed(..., 0.5)`
+    /// (`sseqRecord.c:1018`, `:1073`, `:1092`): arm a pass after `delay`
+    /// unless one is pending, whatever the statuses read.
+    pub(crate) fn link_check_after(&self, record: &[u8], delay: Duration) {
+        let Some(rec) = self.get_record_no_resolve(record) else {
+            return;
+        };
+        let arm = {
+            let mut instance = rec.write();
+            let Some(check) = instance.record.link_check() else {
+                return;
+            };
+            let arm = !check.state.scheduled;
+            check.state.scheduled = true;
+            arm
+        };
+        if arm {
+            self.arm_link_check(record, delay);
+        }
     }
 
     /// After `init_record` or `special()` classified `record`'s links: an

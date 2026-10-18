@@ -789,7 +789,7 @@ impl LocalMonitor {
 }
 
 impl From<DbFieldType> for LinkDbfType {
-    /// C `getDBFtype`'s `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:666`).
+    /// C `getDBFtype`'s `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:672`).
     fn from(t: DbFieldType) -> Self {
         match t {
             DbFieldType::String => Self::String,

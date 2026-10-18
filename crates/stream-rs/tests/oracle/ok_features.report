@@ -1,0 +1,172 @@
+rec0: features.proto reference P
+reference {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "Shello world";
+    wait 100; # ms
+    in "%d";
+}
+rec1: features.proto nested P
+nested {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "Shello world";
+    wait 100; # ms
+    in "%d";
+    out "N";
+}
+rec2: features.proto params(A,B,C) P
+params {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+  @Init {
+    out "Shello world";
+    wait 100; # ms
+    in "%d";
+  }
+  @Mismatch {
+    out "mismatch $1";
+  }
+
+    out "$1:$2C";
+    in "${1}x%s";
+}
+rec3: features.proto escapes P
+escapes {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "\x41\x65\x1b\x07\x08\x66\x0a\x0d\x09\x76\x5c\x22\x27\x42\x42\x42\x43\xff\xff";
+}
+rec4: features.proto constants P
+constants {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "\x02a\x03\x04\x0d\x0a\x1b\x7f";
+    in "x\?y\?z";
+}
+rec5: features.proto percent P
+percent {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "\x25 100\x25";
+    in "%*d %?d %=s %#x %-5f %!3c";
+}
+rec6: features.proto fields P
+fields {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%(VAL)s %(X.VAL)d %(X.RVAL)i";
+    in "%(VAL)[a-z]";
+}
+rec7: features.proto spaces P
+spaces {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    in "a b  c\_";
+    out " lead";
+}
+rec8: features.proto locals P
+locals {
+  extraInput    = ignore;
+  lockTimeout   = 256; # ms
+  readTimeout   = 50; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 10; # bytes
+  inTerminator  = "";
+  outTerminator = "\n";
+  separator     = ",";
+
+    out "%d";
+    disconnect;
+    connect 1000; # ms
+    exec "echo %s";
+}
+rec9: features.proto binary P
+binary {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 2000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 2000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "%B\x00\xff %<sum8> %{a|b=c} %T(%Y)";
+    in "%[^,]%<xor>";
+}

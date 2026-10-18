@@ -1,2 +1,3 @@
 _main_ Value 'maybe' must be one of_main_  'error'_main_  or 'ignore'_main_ 
 in variable 'extrainput' in protocol file 'enum_value.proto' line 1
+_main_ while compiling protocol 'p' for 'rec0'

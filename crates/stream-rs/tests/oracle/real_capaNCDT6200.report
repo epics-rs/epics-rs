@@ -1,0 +1,495 @@
+rec0: capaNCDT6200.proto grabWelcomeText(1,2,3,4,5,6,7,8,9) P
+grabWelcomeText {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    in "%1[^\x0d\x0a]";
+}
+rec1: capaNCDT6200.proto queryVer(1,2,3,4,5,6,7,8,9) P
+queryVer {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$VER";
+    in "$VER%(1:version1M.VAL)[^;];%(1:version2M.VAL)[^OK]OK";
+}
+rec2: capaNCDT6200.proto querySampleTime(1,2,3,4,5,6,7,8,9) P
+querySampleTime {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$STI?";
+    in "$STI?%dOK";
+}
+rec3: capaNCDT6200.proto setSampleTime(1,2,3,4,5,6,7,8,9) P
+setSampleTime {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$STI%d";
+    in "$STI%d,%dOK";
+}
+rec4: capaNCDT6200.proto queryTrigMode(1,2,3,4,5,6,7,8,9) P
+queryTrigMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$TRG?";
+    in "$TRG?%dOK";
+}
+rec5: capaNCDT6200.proto setTrigMode(1,2,3,4,5,6,7,8,9) P
+setTrigMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$TRG%d";
+    in "$TRG%dOK";
+}
+rec6: capaNCDT6200.proto queryAvgTypeMode(1,2,3,4,5,6,7,8,9) P
+queryAvgTypeMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$AVT?";
+    in "$AVT?%dOK";
+}
+rec7: capaNCDT6200.proto setAvgTypeMode(1,2,3,4,5,6,7,8,9) P
+setAvgTypeMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$AVT%d";
+    in "$AVT%dOK";
+}
+rec8: capaNCDT6200.proto queryAvgNumMode(1,2,3,4,5,6,7,8,9) P
+queryAvgNumMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$AVN?";
+    in "$AVN?%dOK";
+}
+rec9: capaNCDT6200.proto setAvgNumMode(1,2,3,4,5,6,7,8,9) P
+setAvgNumMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$AVN%d";
+    in "$AVN%dOK";
+}
+rec10: capaNCDT6200.proto queryChanStatus(1,2,3,4,5,6,7,8,9) P
+queryChanStatus {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CHS";
+    in "$CHS%(1:chan1StatM.VAL)d,%(1:chan2StatM.VAL)d,%(1:chan3StatM.VAL)d,%(1:chan4StatM.VAL)dOK";
+}
+rec11: capaNCDT6200.proto queryChan1Info(1,2,3,4,5,6,7,8,9) P
+queryChan1Info {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CHI1";
+    in "$CHI1:ANO%(1:chan1ANO.VAL)d,NAM%(1:chan1NAM.VAL)[^,\x73],SNO%(1:chan1SNO.VAL)d,OFS%(1:chan1OFS.VAL)d,RNG%(1:chan1RNG.VAL)d,UNT%(1:chan1UNT.VAL)[^OK]";
+}
+rec12: capaNCDT6200.proto queryChan2Info(1,2,3,4,5,6,7,8,9) P
+queryChan2Info {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CHI2";
+    in "$CHI2:ANO%(1:chan2ANO.VAL)d,NAM%(1:chan2NAM.VAL)[^,\x73],SNO%(1:chan2SNO.VAL)d,OFS%(1:chan2OFS.VAL)d,RNG%(1:chan2RNG.VAL)d,UNT%(1:chan2UNT.VAL)[^OK]";
+}
+rec13: capaNCDT6200.proto queryChan3Info(1,2,3,4,5,6,7,8,9) P
+queryChan3Info {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CHI3";
+    in "$CHI3:ANO%(1:chan3ANO.VAL)d,NAM%(1:chan3NAM.VAL)[^,\x73],SNO%(1:chan3SNO.VAL)d,OFS%(1:chan3OFS.VAL)d,RNG%(1:chan3RNG.VAL)d,UNT%(1:chan3UNT.VAL)[^OK]";
+}
+rec14: capaNCDT6200.proto queryChan4Info(1,2,3,4,5,6,7,8,9) P
+queryChan4Info {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CHI4";
+    in "$CHI4:ANO%(1:chan4ANO.VAL)d,NAM%(1:chan4NAM.VAL)[^,\x73],SNO%(1:chan4SNO.VAL)d,OFS%(1:chan4OFS.VAL)d,RNG%(1:chan4RNG.VAL)d,UNT%(1:chan4UNT.VAL)[^OK]";
+}
+rec15: capaNCDT6200.proto queryLinMode(1,2,3,4,5,6,7,8,9) P
+queryLinMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$LIN?";
+    in "$LIN?%(1:chan1LinModeM.VAL)d,%(1:chan2LinModeM.VAL)d,%(1:chan3LinModeM.VAL)d,%(1:chan4LinModeM.VAL)dOK";
+}
+rec16: capaNCDT6200.proto setCh1LinearMode(1,2,3,4,5,6,7,8,9) P
+setCh1LinearMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$LIN1:%d";
+    in "$LIN1:%dOK";
+}
+rec17: capaNCDT6200.proto setCh2LinearMode(1,2,3,4,5,6,7,8,9) P
+setCh2LinearMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$LIN2:%d";
+    in "$LIN2:%dOK";
+}
+rec18: capaNCDT6200.proto setCh3LinearMode(1,2,3,4,5,6,7,8,9) P
+setCh3LinearMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$LIN3:%d";
+    in "$LIN3:%dOK";
+}
+rec19: capaNCDT6200.proto setCh4LinearMode(1,2,3,4,5,6,7,8,9) P
+setCh4LinearMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$LIN4:%d";
+    in "$LIN4:%dOK";
+}
+rec20: capaNCDT6200.proto clearMathFunc(1,2,3,4,5,6,7,8,9) P
+clearMathFunc {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$CMF%d";
+    in "$CMF%dOK";
+}
+rec21: capaNCDT6200.proto queryStatus(1,2,3,4,5,6,7,8,9) P
+queryStatus {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$STS";
+    in "$STS%(1:chan1StatM.VAL)d,%(1:chan2StatM.VAL)d,%(1:chan3StatM.VAL)d,%(1:chan4StatM.VAL)dOK";
+}
+rec22: capaNCDT6200.proto queryDataPort(1,2,3,4,5,6,7,8,9) P
+queryDataPort {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$GDP";
+    in "$GDP%dOK";
+}
+rec23: capaNCDT6200.proto setDataPort(1,2,3,4,5,6,7,8,9) P
+setDataPort {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$SDP%d";
+    in "$SDP%dOK";
+}
+rec24: capaNCDT6200.proto queryMeasData(1,2,3,4,5,6,7,8,9) P
+queryMeasData {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$GMD";
+    in "$GMDOK%d";
+}
+rec25: capaNCDT6200.proto setCh1LinearPoint(1,2,3,4,5,6,7,8,9) P
+setCh1LinearPoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$SLP1:%d";
+    in "$SLP1:%dOK";
+}
+rec26: capaNCDT6200.proto setCh2LinearPoint(1,2,3,4,5,6,7,8,9) P
+setCh2LinearPoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$SLP2:%d";
+    in "$SLP2:%dOK";
+}
+rec27: capaNCDT6200.proto setCh3LinearPoint(1,2,3,4,5,6,7,8,9) P
+setCh3LinearPoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$SLP3:%d";
+    in "$SLP3:%dOK";
+}
+rec28: capaNCDT6200.proto setCh4LinearPoint(1,2,3,4,5,6,7,8,9) P
+setCh4LinearPoint {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$SLP4:%d";
+    in "$SLP4:%dOK";
+}
+rec29: capaNCDT6200.proto queryAnalogFilter(1,2,3,4,5,6,7,8,9) P
+queryAnalogFilter {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$ALP?";
+    in "$ALP?%dOK";
+}
+rec30: capaNCDT6200.proto setAnalogFilter(1,2,3,4,5,6,7,8,9) P
+setAnalogFilter {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "$ALP%d";
+    in "$ALP%dOK";
+}

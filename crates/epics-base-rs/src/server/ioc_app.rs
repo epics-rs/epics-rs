@@ -3165,13 +3165,10 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: Option
     let Some(rec_arc) = db.get_record(name) else {
         return;
     };
-    let result = {
-        let mut inst = rec_arc.write();
-        if inst.common.scan != record::ScanType::IoIntr {
-            return;
-        }
-        inst.set_scan(record::ScanType::Passive)
-    };
+    let result = rec_arc.write().demote_io_intr_scan();
+    if matches!(result, record::CommonFieldPutResult::NoChange) {
+        return;
+    }
     if let record::CommonFieldPutResult::ScanChanged {
         old_scan,
         new_scan,
@@ -3252,6 +3249,20 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         };
         dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
         dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
+        // `scanAdd`'s `if (get_ioint_info(0, precord, &piosh))`
+        // (dbScan.c:285): a refusal demotes silently.
+        let held = &mut *inst;
+        if on_io_intr
+            && !dev.get_ioint_info(
+                &mut *held.record,
+                &mut held.common,
+                crate::server::device_support::IoIntrCmd::Add,
+            )
+        {
+            inst.device = Some(dev);
+            demote.push((name, None));
+            continue;
+        }
         if let Some(mut intr_rx) = dev.io_intr_receiver() {
             let db_clone = db.clone();
             let rec_name = name.clone();

@@ -1494,6 +1494,11 @@ mod link_cache {
         /// took off the record (`dbAccess.c:1192`).
         pub(super) dpvt: crate::server::device_support::Dpvt,
         pub(super) retired_dpvt: crate::server::device_support::Dpvt,
+        /// C's saved `scan` was I/O Intr and `scanDelete` ran
+        /// (`dbAccess.c:1155-1158`): the put still owes its scan exit.
+        pub(super) left_io_intr: bool,
+        /// The scan-list move that exit left, for the database to file.
+        pub(super) scan_moved: crate::server::record::CommonFieldPutResult,
     }
 
     pub(crate) enum NewDset {
@@ -1650,6 +1655,8 @@ mod link_cache {
                 retired: None,
                 dpvt,
                 retired_dpvt: crate::server::device_support::Dpvt::Null,
+                left_io_intr: false,
+                scan_moved: crate::server::record::CommonFieldPutResult::NoChange,
             });
         }
 
@@ -9885,22 +9892,55 @@ impl RecordInstance {
     /// the record lock is down; [`CommonFieldPutResult::NoChange`] when the scan
     /// did not move.
     pub fn set_scan(&mut self, new_scan: ScanType) -> CommonFieldPutResult {
+        use crate::server::device_support::IoIntrCmd;
         let old_scan = self.common.scan;
-        self.common.scan = new_scan;
         if old_scan == new_scan {
             return CommonFieldPutResult::NoChange;
         }
         // C `scanDelete`/`scanAdd` call the record's device support
         // `get_ioint_info(1)` / `get_ioint_info(0)`. Only a change of I/O Intr
         // *membership* reaches those; a Passive→"1 second" move calls neither.
+        // `scanDelete` asks with the old SCAN still in place, `scanAdd` with
+        // the new one, and a refusal there leaves the record Passive.
         let was_io_intr = old_scan == ScanType::IoIntr;
-        let is_io_intr = new_scan == ScanType::IoIntr;
+        let mut is_io_intr = new_scan == ScanType::IoIntr;
+        if was_io_intr && !is_io_intr {
+            if let Some(dev) = self.device.as_mut() {
+                dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Delete);
+            }
+        }
+        self.common.scan = new_scan;
+        if is_io_intr && !was_io_intr {
+            if let Some(dev) = self.device.as_mut() {
+                if !dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Add) {
+                    self.common.scan = ScanType::Passive;
+                    is_io_intr = false;
+                }
+            }
+        }
         if was_io_intr != is_io_intr {
             self.record.set_io_intr_scan(is_io_intr);
         }
+        let new_scan = self.common.scan;
         CommonFieldPutResult::ScanChanged {
             old_scan,
             new_scan,
+            phas: self.common.phas,
+        }
+    }
+
+    /// C `scanAdd`'s failure exits, `precord->scan = menuScanPassive`
+    /// (dbScan.c:272-293): the record never joined the I/O Intr list, so no
+    /// `scanDelete` and no `get_ioint_info(1)` runs.
+    pub fn demote_io_intr_scan(&mut self) -> CommonFieldPutResult {
+        if self.common.scan != ScanType::IoIntr {
+            return CommonFieldPutResult::NoChange;
+        }
+        self.common.scan = ScanType::Passive;
+        self.record.set_io_intr_scan(false);
+        CommonFieldPutResult::ScanChanged {
+            old_scan: ScanType::IoIntr,
+            new_scan: ScanType::Passive,
             phas: self.common.phas,
         }
     }
@@ -10079,7 +10119,15 @@ impl RecordInstance {
                 self.gate_device_link_put(link)?;
             }
         }
-        self.put_common_field_with(name, value, bound, &mut link)
+        let put = self.put_common_field_with(name, value, bound, &mut link);
+        let scan = match link.as_mut() {
+            Some(link) => self.take_link_scan(link),
+            None => CommonFieldPutResult::NoChange,
+        };
+        match put {
+            Ok(CommonFieldPutResult::NoChange) => Ok(scan),
+            put => put,
+        }
     }
 
     /// The common-field writer for a runtime put whose `dbCommon` link text
@@ -10175,6 +10223,7 @@ impl RecordInstance {
         // C restarts a queued put-notify at a cycle's completion, not at this
         // store, so the token has no tail to reach.
         let _ = self.leave_pact();
+        self.finish_link_scan(prepared, true);
         Ok(passed)
     }
 
@@ -10208,7 +10257,12 @@ impl RecordInstance {
     /// object's `del_record` may still keep the link
     /// ([`crate::server::device_support::DeviceSupport::del_record`]); C's `restoreScan` then leaves the
     /// record as it found it.
-    pub(crate) fn gate_device_link_put(&mut self, link: &PreparedCommonLink) -> CaResult<()> {
+    ///
+    /// Between the two, an I/O Intr record leaves its list through
+    /// [`Self::set_scan`] while the old dset is still bound
+    /// (`dbAccess.c:1155-1158`); every exit of the put then reaches
+    /// [`Self::finish_link_scan`].
+    pub(crate) fn gate_device_link_put(&mut self, link: &mut PreparedCommonLink) -> CaResult<()> {
         if link.device_dtyp_moved(self) {
             return Err(CaError::NoSupport);
         }
@@ -10217,10 +10271,57 @@ impl RecordInstance {
         {
             return Err(CaError::NoSupport);
         }
-        match self.device.as_mut() {
-            Some(dev) => dev.del_record().map_err(CaError::BadLink),
-            None => Ok(()),
+        let Some(prepared) = link.device.as_mut() else {
+            return match self.device.as_mut() {
+                Some(dev) => dev.del_record().map_err(CaError::BadLink),
+                None => Ok(()),
+            };
+        };
+        if self.common.scan == ScanType::IoIntr {
+            let _ = self.set_scan(ScanType::Passive);
+            prepared.left_io_intr = true;
         }
+        let deleted = self.device.as_mut().map_or(Ok(()), |dev| dev.del_record());
+        if let Err(refusal) = deleted {
+            // `goto restoreScan`: the old dset goes back on the list.
+            self.finish_link_scan(prepared, true);
+            return Err(CaError::BadLink(refusal));
+        }
+        Ok(())
+    }
+
+    /// C `dbPutFieldLink`'s `restoreScan` and `postScanEvent` exits
+    /// (`dbAccess.c:1218-1225`) for a put whose `scanDelete` ran. `restore`
+    /// is `scanAdd` with the dset now bound, whose refusal leaves the record
+    /// Passive; a record that ends off I/O Intr posts SCAN and leaves the
+    /// move for [`Self::take_link_scan`].
+    fn finish_link_scan(&mut self, prepared: &mut link_cache::PreparedDevice, restore: bool) {
+        if !std::mem::take(&mut prepared.left_io_intr) {
+            return;
+        }
+        if restore {
+            let _ = self.set_scan(ScanType::IoIntr);
+        }
+        if self.common.scan != ScanType::IoIntr {
+            prepared.scan_moved = CommonFieldPutResult::ScanChanged {
+                old_scan: ScanType::IoIntr,
+                new_scan: self.common.scan,
+                phas: self.common.phas,
+            };
+            use crate::server::recgbl::EventMask;
+            self.notify_field("SCAN", EventMask::VALUE | EventMask::LOG);
+        }
+    }
+
+    /// The scan-list move a device-link put leaves, for the caller to file
+    /// once the hold is down. An exit no arm settled is a failure's
+    /// `postScanEvent`: the record stays Passive.
+    pub(crate) fn take_link_scan(&mut self, link: &mut PreparedCommonLink) -> CommonFieldPutResult {
+        let Some(prepared) = link.device.as_mut() else {
+            return CommonFieldPutResult::NoChange;
+        };
+        self.finish_link_scan(prepared, false);
+        std::mem::replace(&mut prepared.scan_moved, CommonFieldPutResult::NoChange)
     }
 
     /// A device-link put refused by `dbPutSpecial`'s SPC_NOMOD, which C
@@ -10243,7 +10344,7 @@ impl RecordInstance {
     /// `add_record` was reached (`:1192`); before that it stays as
     /// `del_record` left it. An I/O Intr record stays where the put's `scanDelete` left it,
     /// Passive (`:1155-1158`, posted at `:1231-1232`); only the success arm
-    /// restores it. The put's settle re-files its scan index.
+    /// restores it.
     fn refuse_device_link_put(
         &mut self,
         prepared: &mut link_cache::PreparedDevice,
@@ -10254,11 +10355,7 @@ impl RecordInstance {
         }
         self.common.dtyp.detach();
         self.enter_pact();
-        if self.common.scan == ScanType::IoIntr {
-            let _ = self.set_scan(ScanType::Passive);
-            use crate::server::recgbl::EventMask;
-            self.notify_field("SCAN", EventMask::VALUE | EventMask::LOG);
-        }
+        self.finish_link_scan(prepared, false);
     }
 
     /// C `dbPutFieldLink` on a link field that is not a device link

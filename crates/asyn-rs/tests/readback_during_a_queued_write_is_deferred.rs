@@ -83,7 +83,7 @@ fn port(name: &str, db: &PvDatabase) -> PortRuntimeHandle {
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     for (param, ty) in [
         ("I32", ParamType::Int32),

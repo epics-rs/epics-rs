@@ -278,8 +278,9 @@ impl BadPixelProcessor {
 
 impl NDPluginProcess for BadPixelProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginBadPixel.cpp:52-53, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::OCTET.or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     /// C `NDPluginBadPixel::writeOctet` reads the file inside the write and
     /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322).
@@ -401,7 +402,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         let file = proc.file_name_idx.unwrap();

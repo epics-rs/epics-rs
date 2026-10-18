@@ -636,8 +636,9 @@ impl Default for TiffFileProcessor {
 
 impl NDPluginProcess for TiffFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDFileTIFF.cpp:614, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
@@ -917,17 +918,20 @@ mod tests {
         assert!(handle.wait_params_applied(Duration::from_secs(10)));
 
         let posts = log.clone();
-        let _monitor = up.interrupts().register_sync_callback(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(p.num_captured),
-                ..Default::default()
-            },
-            move |iv| {
-                if let asyn_rs::param::ParamValue::Int32(v) = iv.value {
-                    posts.lock().push(Seen::NumCaptured(v));
-                }
-            },
-        );
+        let _monitor = up
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(p.num_captured),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let asyn_rs::param::ParamValue::Int32(v) = iv.value {
+                        posts.lock().push(Seen::NumCaptured(v));
+                    }
+                },
+            )
+            .unwrap();
         for id in 1..=3 {
             let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
             arr.unique_id = id;
@@ -1342,7 +1346,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
         let mut proc = TiffFileProcessor::new();
@@ -1559,7 +1563,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
 

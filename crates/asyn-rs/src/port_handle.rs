@@ -1997,7 +1997,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
@@ -2237,7 +2237,7 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_addr_enabled(1, false).unwrap();
         let handle = make_handle(Log {
@@ -2303,7 +2303,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.set_auto_connect_addr(1, false);
             base.set_addr_connected(1, false);
@@ -2332,7 +2332,7 @@ mod tests {
                     ..PortFlags::default()
                 },
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.set_auto_connect_addr(1, false);
@@ -2534,7 +2534,7 @@ mod tests {
                         ..PortFlags::default()
                     },
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 entered: entered_tx,
                 release: std::sync::Mutex::new(release_rx),
@@ -2620,7 +2620,7 @@ mod tests {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         // The port comes back on its own retry timer (asynManager.c:3283-3314).
         base.seconds_between_port_connect = Duration::from_millis(20);
@@ -2875,7 +2875,7 @@ mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let dir = tempfile::tempdir().expect("fixture root");
         let trace_path = dir.path().join("lock_port_trace.txt");
@@ -3166,7 +3166,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
@@ -3252,7 +3252,7 @@ mod tests {
             32,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         )));
         handle.set_interfaces(vec![Capability::Gpib]);
         assert!(handle.has_interface(InterfaceType::Gpib), "findInterface");
@@ -3307,7 +3307,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
@@ -3372,7 +3372,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             delay,
             reads: reads.clone(),
@@ -3393,7 +3393,7 @@ mod tests {
                 1,
                 flags,
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             delay,
             reads: reads.clone(),
@@ -3425,7 +3425,7 @@ mod tests {
             1,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -3488,7 +3488,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -3841,7 +3841,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         // reason 0..=5, in the order pushed below.
         base.create_param("I64", ParamType::Int64).unwrap();
@@ -4133,7 +4133,7 @@ mod tests {
                 max_addr,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             disconnects: disconnects.clone(),
         });

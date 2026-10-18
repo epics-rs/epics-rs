@@ -129,7 +129,7 @@ async fn a_blocking_port_reentry_allocates_nothing() {
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let (rt, _jh) =
         create_port_runtime_unclaimed(Device { base }, RuntimeConfig::default()).unwrap();

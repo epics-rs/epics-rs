@@ -702,7 +702,7 @@ pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantI
 ///   (`devsCalcoutSoft.c:127-131`, `devaCalcoutSoft.c:78-79`); an
 ///   unresolvable name leaves the caller's initializers untouched.
 /// - `CA_LINK` — `dbCaGetLinkDBFtype` / `dbCaGetNelements`
-///   (`dbCa.c:662-704`), which both return `-1` on a disconnected link and
+///   (`dbCa.c:633-675`), which both return `-1` on a disconnected link and
 ///   likewise leave the initializers untouched.
 ///
 /// A record reproduces its C device support's buffer switch on this in
@@ -2986,6 +2986,14 @@ pub struct ProcessContext {
     /// [`crate::runtime::task::spawn_background`] rather than re-deriving a
     /// band from a raw menu index.
     pub callback_priority: crate::runtime::task::CallbackPriority,
+    /// `dbCommon.scan`: StreamEpics.cc `Stream::process` answers an I/O
+    /// Intr record's pass from the input it already has.
+    pub scan: crate::server::record::ScanType,
+    /// `dbCommon.proc`, the raw byte: StreamEpics.cc runs the `@init`
+    /// handler on a `PROC` put of 2.
+    pub proc_field: u8,
+    /// `dbCommon.tpro`, the raw byte.
+    pub tpro: u8,
 }
 
 /// C `epicsTime.h`: `epicsTimeEventDeviceTime` — the `TSE` sentinel
@@ -8834,9 +8842,11 @@ pub(crate) mod tests {
                 assert!(r.should_output(), "{record_type}");
                 assert!(r.output_event().is_none(), "{record_type}");
             }
-            if !hooks.has(CycleHooks::LINK_CHECK) {
-                assert!(r.link_check().is_none(), "{record_type}");
-            }
+            assert_eq!(
+                hooks.has(CycleHooks::LINK_CHECK),
+                r.link_check().is_some_and(|check| check.spec.in_cycle),
+                "{record_type}"
+            );
         }
     }
 

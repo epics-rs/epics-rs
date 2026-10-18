@@ -2,3 +2,4 @@ _main_ No converter registered for format '%,'
 _main_ KeyenceCL3000.proto line 86: in format string: "%(2:1:measType),1"
 _main_ KeyenceCL3000.proto line 86: in command 'out'
 _main_ KeyenceCL3000.proto line 85: in protocol 'startauto'
+_main_ while compiling protocol 'startAuto(1,2,3,4,5,6,7,8,9)' for 'rec11'

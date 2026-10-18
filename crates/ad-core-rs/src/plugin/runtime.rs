@@ -4483,7 +4483,7 @@ mod tests {
     impl NDPluginProcess for PassthroughProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4512,7 +4512,7 @@ mod tests {
     impl NDPluginProcess for ValidatingProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4761,7 +4761,7 @@ mod tests {
     impl NDPluginProcess for ServingProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4799,7 +4799,7 @@ mod tests {
     impl NDPluginProcess for SinkProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4941,7 +4941,7 @@ mod tests {
     impl NDPluginProcess for CodecPlugin {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
             if !self.produce {
                 return ProcessResult::forward(array, vec![]);
@@ -5020,7 +5020,7 @@ mod tests {
     impl NDPluginProcess for StampProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(
                 array,
@@ -5087,7 +5087,7 @@ mod tests {
     impl NDPluginProcess for MistypedStamp {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![ParamUpdate::float64(self.stamp, 1.5)])
         }
@@ -5265,7 +5265,7 @@ mod tests {
         impl NDPluginProcess for Restamp {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut out = NDArray::clone(array);
                 out.timestamp = crate::timestamp::EpicsTimestamp { sec: 9, nsec: 9 };
@@ -5570,9 +5570,8 @@ mod tests {
         )
         .unwrap();
         let (limit, twice, _, _) = *ids.lock();
-        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         for a in 0..2 {
             drv.base.params.take_changed(a).unwrap();
         }
@@ -5719,7 +5718,7 @@ mod tests {
     impl NDPluginProcess for Countdown {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -5779,24 +5778,27 @@ mod tests {
             wiring,
         )
         .unwrap();
-        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let (go, count) = *ids.lock();
         drv.base.set_int32_param(count, 0, 3).unwrap();
         drv.base.call_param_callbacks(0).unwrap();
         let log = seen.clone();
-        let _sync = drv.base.interrupts.register_sync_callback(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(count),
-                ..Default::default()
-            },
-            move |iv| {
-                if let ParamValue::Int32(v) = iv.value {
-                    log.lock().push(v)
-                }
-            },
-        );
+        let _sync = drv
+            .base
+            .interrupts
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(count),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let ParamValue::Int32(v) = iv.value {
+                        log.lock().push(v)
+                    }
+                },
+            )
+            .unwrap();
         drv.io_write_int32(&mut AsynUser::new(go), 1).unwrap();
         assert_eq!(*fired.lock(), [1, 2, 3], "each post fires before the next");
         assert_eq!(
@@ -5822,7 +5824,7 @@ mod tests {
         impl NDPluginProcess for Poster {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let count = *self.count.lock();
                 let mut post = PortPost::of(self.attributes.as_ref());
@@ -5895,7 +5897,7 @@ mod tests {
         impl NDPluginProcess for EvenOnly {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut result = ProcessResult::forward(array, vec![]);
                 result.counted = array.unique_id % 2 == 0;
@@ -5942,7 +5944,7 @@ mod tests {
     impl NDPluginProcess for ArraySide {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -6001,23 +6003,26 @@ mod tests {
             wiring,
         )
         .unwrap();
-        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let (go, series) = *ids.lock();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log = seen.clone();
-        let _sync = drv.base.interrupts.register_sync_callback(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(series),
-                ..Default::default()
-            },
-            move |iv| {
-                if let ParamValue::Float64Array(v) = &iv.value {
-                    log.lock().push((iv.addr, v.to_vec()))
-                }
-            },
-        );
+        let _sync = drv
+            .base
+            .interrupts
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(series),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let ParamValue::Float64Array(v) = &iv.value {
+                        log.lock().push((iv.addr, v.to_vec()))
+                    }
+                },
+            )
+            .unwrap();
         while rx.try_recv().is_ok() {}
         drv.io_write_int32(&mut AsynUser::new(go), 1).unwrap();
         assert_eq!(*seen.lock(), vec![(1, vec![1.0, 2.0])]);
@@ -6088,25 +6093,28 @@ mod tests {
             wiring,
         )
         .unwrap();
-        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let (limit, ..) = *ids.lock();
         drv.base.set_int32_param(limit, 0, 0).unwrap();
         drv.base.call_param_callbacks(0).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log = seen.clone();
-        let _sync = drv.base.interrupts.register_sync_callback(
-            asyn_rs::interrupt::InterruptFilter {
-                reason: Some(limit),
-                ..Default::default()
-            },
-            move |iv| {
-                if let ParamValue::Int32(v) = iv.value {
-                    log.lock().push(v)
-                }
-            },
-        );
+        let _sync = drv
+            .base
+            .interrupts
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(limit),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let ParamValue::Int32(v) = iv.value {
+                        log.lock().push(v)
+                    }
+                },
+            )
+            .unwrap();
         drv.io_write_int32(&mut AsynUser::new(limit), 6).unwrap();
         drv.base.call_param_callbacks(0).unwrap();
         assert_eq!(*seen.lock(), vec![6, 0]);
@@ -6247,9 +6255,8 @@ mod tests {
         )
         .unwrap();
         assert!(!drv.base.flags.multi_device);
-        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
-            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         drv.base.params.take_changed(0).unwrap();
         let number = drv.ndarray_params.file_number;
         drv.base.params.mark_changed(number, 0).unwrap();
@@ -6442,7 +6449,7 @@ mod tests {
         impl NDPluginProcess for Posting {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut result = ProcessResult::forward(array, vec![]);
                 result
@@ -6505,7 +6512,7 @@ mod tests {
         impl NDPluginProcess for Allocating {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
                 let out = pool.alloc(array.dims.clone(), NDDataType::UInt8).unwrap();
                 ProcessResult::arrays(vec![Arc::new(out)])
@@ -6555,7 +6562,7 @@ mod tests {
         impl NDPluginProcess for Gated {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
                 self.array_callbacks = Some(array_callbacks);
             }
@@ -6719,7 +6726,7 @@ mod tests {
         impl NDPluginProcess for Gathering {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::forward(array, vec![])
             }
@@ -6888,7 +6895,7 @@ mod tests {
         impl NDPluginProcess for OddOnly {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -7093,7 +7100,7 @@ mod tests {
     impl NDPluginProcess for PoolLess {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::arrays(vec![Arc::new(NDArray::new(
                 vec![NDDimension::new(self.0)],
@@ -7183,7 +7190,7 @@ mod tests {
     impl NDPluginProcess for Resized {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::arrays(vec![Arc::new(NDArray::new(
                 vec![NDDimension::new(self.0.load(Ordering::Acquire))],
@@ -7254,7 +7261,7 @@ mod tests {
     impl NDPluginProcess for RefusedThenSmall {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let out = |n| Arc::new(NDArray::new(vec![NDDimension::new(n)], NDDataType::UInt8));
             ProcessResult::arrays(vec![out(100), out(4)])
@@ -7300,7 +7307,7 @@ mod tests {
     impl NDPluginProcess for OversizedPost {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut result = ProcessResult::sink(vec![]);
             result.addressed = vec![(
@@ -7463,7 +7470,7 @@ mod tests {
         impl NDPluginProcess for ParamTracker {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -7513,7 +7520,7 @@ mod tests {
         impl NDPluginProcess for Echo {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -7718,7 +7725,7 @@ mod tests {
     impl NDPluginProcess for OverlapProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut inside = self.probe.inside.lock();
             *inside += 1;
@@ -7814,7 +7821,7 @@ mod tests {
     impl NDPluginProcess for StackProbe {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
             self.callback.lock().push(bytes.expect("stack readback"));
@@ -8634,7 +8641,7 @@ mod tests {
         impl NDPluginProcess for CompressProcessor {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut out = NDArray::clone(array);
                 out.codec = Some(crate::codec::Codec {
@@ -8835,7 +8842,7 @@ mod tests {
         impl NDPluginProcess for SlowProcessor {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
             fn process_array(&self, _a: &Arc<NDArray>, _p: &NDArrayPool) -> ProcessResult {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 ProcessResult::empty()
@@ -9089,7 +9096,7 @@ mod tests {
     impl NDPluginProcess for GatedProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
         const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.entered.fetch_add(1, Ordering::AcqRel);
             let mut open = self.open.lock();

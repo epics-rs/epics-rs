@@ -48,7 +48,7 @@ impl RawDeviceDriver {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.install_octet_interpose(Box::new(asyn_rs::interpose::eos::EosInterpose::default()));
         Self {

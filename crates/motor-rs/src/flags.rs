@@ -344,13 +344,9 @@ pub enum MotorCommand {
         velocity: f64,
         acceleration: f64,
     },
-    /// Absolute move to a controller-defined home position (C: a6f64591).
-    MoveToHome {
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    },
+    /// C `writeInt32(motorMoveToHome_, 1)`: the controller's moveToHome
+    /// thread runs the axis's `doMoveToHome` (asynMotorController.cpp:236-242).
+    MoveToHome,
     Stop {
         acceleration: f64,
     },

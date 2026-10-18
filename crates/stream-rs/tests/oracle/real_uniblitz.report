@@ -1,0 +1,95 @@
+rec0: uniblitz.proto checkSync(1,2,3,4,5,6,7,8,9) P
+checkSync {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "?";
+    in "%{K|J}";
+}
+rec1: uniblitz.proto setShutter(1,2,3,4,5,6,7,8,9) P
+setShutter {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+  @Init {
+    out "?";
+    in "%{K|J}";
+  }
+
+    out "%{A|@}";
+}
+rec2: uniblitz.proto setGate(1,2,3,4,5,6,7,8,9) P
+setGate {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "%{F|G}";
+}
+rec3: uniblitz.proto setAuxOut(1,2,3,4,5,6,7,8,9) P
+setAuxOut {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "%{D|E}";
+}
+rec4: uniblitz.proto setTrigger(1,2,3,4,5,6,7,8,9) P
+setTrigger {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "B";
+}
+rec5: uniblitz.proto setReset(1,2,3,4,5,6,7,8,9) P
+setReset {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\n";
+  outTerminator = "\n";
+  separator     = "";
+
+    out "C";
+}

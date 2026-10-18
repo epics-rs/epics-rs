@@ -133,7 +133,7 @@ mod tests {
             4,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -152,7 +152,7 @@ mod tests {
             1,
             Default::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         assert!(Arc::ptr_eq(&base.trace, PortServices::global().trace()));
         assert!(

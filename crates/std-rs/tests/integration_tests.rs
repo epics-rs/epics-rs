@@ -1366,6 +1366,9 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
                 time: epics_base_rs::types::WallTime::UNIX_EPOCH,
                 soft: inst.common.dtyp.soft(),
                 callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+                scan: epics_base_rs::server::record::ScanType::Passive,
+                proc_field: 0,
+                tpro: 0,
             });
         inst.record.pre_input_link_actions(false, &mut inst.dpvt);
         let writes = inst

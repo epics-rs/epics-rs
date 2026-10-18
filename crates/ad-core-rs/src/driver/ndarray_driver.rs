@@ -1815,7 +1815,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         assert_eq!(drv.port_base.max_addr, 3);
@@ -1829,7 +1829,7 @@ pub(crate) mod tests {
             4_194_304,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
@@ -1852,7 +1852,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let (acquire, busy, wait, queued) = (
@@ -1882,7 +1882,7 @@ pub(crate) mod tests {
     /// never runs its callbacks from the updater.
     #[test]
     fn the_updater_posts_only_after_a_change() {
-        use asyn_rs::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
+        use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
         use asyn_rs::registry::PortRegistry;
         use asyn_rs::runtime::config::RuntimeConfig;
         use asyn_rs::runtime::port::create_port_runtime;
@@ -1903,19 +1903,23 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
-        drv.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        drv.port_base.own_interrupts(InterruptGate::opened());
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen_cb = seen.clone();
-        let _sub = drv.port_base.interrupts.register_sync_callback(
-            InterruptFilter {
-                addr: Some(0),
-                ..Default::default()
-            },
-            move |iv: &InterruptValue| seen_cb.lock().push(iv.reason),
-        );
+        let _sub = drv
+            .port_base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv: &InterruptValue| seen_cb.lock().push(iv.reason),
+            )
+            .unwrap();
         let num_queued_arrays = drv.params.num_queued_arrays;
         let queued = drv.owner.queued().clone();
         let claim = PortRegistry::new().claim("NDQUEUEDIDLE").unwrap();
@@ -1957,7 +1961,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let p = drv.params;
@@ -2024,7 +2028,7 @@ pub(crate) mod tests {
             64,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let pool = drv.pool.clone();
@@ -2075,7 +2079,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let counter = Arc::downgrade(drv.owner.queued());
@@ -2115,7 +2119,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.read_nd_attributes_file().unwrap();
@@ -2138,7 +2142,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         assert!(
@@ -2156,7 +2160,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let arr = drv
@@ -2186,7 +2190,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let arr = drv
@@ -2224,7 +2228,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2252,7 +2256,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2290,7 +2294,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let tmp = std::env::temp_dir();
@@ -2345,7 +2349,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2415,7 +2419,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         // The platform temp dir exists on every OS; a hard-coded `/tmp`
@@ -2437,7 +2441,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2456,7 +2460,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let mut arr = drv
@@ -2527,7 +2531,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let mut arr = drv
@@ -2580,7 +2584,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2642,7 +2646,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -2684,7 +2688,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2781,7 +2785,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2835,7 +2839,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -2904,7 +2908,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -2954,7 +2958,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -2989,7 +2993,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3023,7 +3027,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         // Register a function whose return value changes on each call.
@@ -3074,7 +3078,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3099,7 +3103,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.owner
@@ -3125,7 +3129,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         drv.port_base
@@ -3153,7 +3157,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let manager = PortServices::global().trace().clone();
@@ -3205,7 +3209,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let file_name = drv.params.file_name;
@@ -3248,7 +3252,7 @@ pub(crate) mod tests {
             1_000_000,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let base = std::env::temp_dir().join(format!(

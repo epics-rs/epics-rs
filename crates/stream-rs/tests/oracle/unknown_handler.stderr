@@ -1,1 +1,2 @@
 _main_ Unknown handler @foo defined in protocol file 'unknown_handler.proto' line 2
+_main_ while compiling protocol 'p' for 'rec0'

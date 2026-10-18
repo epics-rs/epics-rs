@@ -280,6 +280,15 @@ impl ProcessCallback {
     ) -> Result<(), crate::runtime::background::CallbackError> {
         crate::runtime::task::request_cell(priority, &self.0)
     }
+
+    /// C `ProcessCallback`'s body on the calling thread (`callback.c:379-387`):
+    /// the record's `process()` under its lock set, for a callback that has
+    /// more to do once it returns (StreamEpics.cc `recordProcessCallback`
+    /// restarts an I/O Intr protocol). The caller holds no lock set.
+    pub fn process_now(&self) {
+        use crate::runtime::background::CallbackBody;
+        self.0.body().run();
+    }
 }
 
 /// The body of a [`ProcessCallback`].
@@ -928,6 +937,13 @@ impl AsyncDbHandle {
         }
     }
 
+    /// See `PvDatabase::link_check_after`.
+    pub fn link_check_after(&self, record: impl AsRef<[u8]>, delay: std::time::Duration) {
+        if let Some(db) = self.db() {
+            db.link_check_after(record.as_ref(), delay);
+        }
+    }
+
     /// Schedule a record's link-status classification — see
     /// `PvDatabase::schedule_record_init`. This is the ONE owner every
     /// record's `refresh_link_status` goes through: during the LOAD phase the
@@ -1043,6 +1059,26 @@ impl AsyncDbHandle {
         let mut instance = rec.write();
         f(&mut *instance.record);
         super::field_io::emit_cycle_posts(&mut instance);
+    }
+
+    /// [`with_record`](Self::with_record) with the record's `dbCommon` as
+    /// well, for device support that reads or raises it from a driver thread
+    /// (StreamEpics.cc's bus callbacks). `SCAN` and `PRIO` change only through
+    /// a put. `None` if the record or the database is gone.
+    pub fn with_instance<R>(
+        &self,
+        name: impl AsRef<[u8]>,
+        f: impl FnOnce(
+            &mut dyn crate::server::record::Record,
+            &mut crate::server::record::CommonFields,
+        ) -> R,
+    ) -> Option<R> {
+        let rec = self.db()?.get_record(name.as_ref())?;
+        let mut instance = rec.write();
+        let instance = &mut *instance;
+        let r = f(&mut *instance.record, &mut instance.common);
+        super::field_io::emit_cycle_posts(instance);
+        Some(r)
     }
 
     /// Arm a put-notify wait-set — see [`PvDatabase::new_put_notify`].
@@ -6315,7 +6351,11 @@ impl PvDatabase {
                         } else {
                             DeviceDoneSource::new(&instance.device_done)
                         };
-                        let mut begun = dev.read_begin(&mut *instance.record, &done);
+                        let mut begun = dev.read_begin_common(
+                            &mut *instance.record,
+                            &mut instance.common,
+                            &done,
+                        );
                         // C mca's next `send_msg` after one whose callback ran
                         // inline: each runs its own nested pass, siblings in
                         // this one (mcaRecord.c:630, then the status read).
@@ -6333,7 +6373,11 @@ impl PvDatabase {
                                 &instance.device_done,
                                 instance.is_processing(),
                             );
-                            begun = dev.read_begin(&mut *instance.record, &done);
+                            begun = dev.read_begin_common(
+                                &mut *instance.record,
+                                &mut instance.common,
+                                &done,
+                            );
                         }
                         if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
                             instance.enter_pact();
@@ -6350,7 +6394,7 @@ impl PvDatabase {
                             return Ok(());
                         }
                         let read = match begun {
-                            Ok(_) => dev.read(&mut *instance.record),
+                            Ok(_) => dev.read_common(&mut *instance.record, &mut instance.common),
                             Err(e) => Err(e),
                         };
                         match read {
@@ -6697,8 +6741,10 @@ impl PvDatabase {
                     let mut instance = rec.write();
                     if !is_soft {
                         if let Some(mut dev) = instance.device.take() {
-                            let _ = dev.write(&mut *instance.record);
-                            instance.device = Some(dev);
+                            let inst = &mut *instance;
+                            dev.set_process_context(&inst.common.process_context());
+                            let _ = dev.write_common(&mut *inst.record, &mut inst.common);
+                            inst.device = Some(dev);
                         }
                     }
                     let inst = &mut *instance;
@@ -7426,34 +7472,40 @@ impl PvDatabase {
                             None
                         } else {
                             if let Some(mut dev) = instance.device.take() {
+                                // C device support reads `dbCommon` on a write
+                                // too (StreamEpics.cc `Stream::process`).
+                                dev.set_process_context(&instance.common.process_context());
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
                                 let done = DeviceDoneSource::new(&instance.device_done);
-                                let write_failed =
-                                    match dev.write_begin(&mut *instance.record, &done) {
-                                        Ok(WriteStart::Pending) => {
-                                            // Async write submitted -- set PACT, return early.
-                                            // The device's `DeviceDone` re-enters the record
-                                            // on a callback band when the write lands, and
-                                            // `complete_async_write` ends the cycle there.
-                                            instance.enter_pact();
-                                            instance.device = Some(dev);
-                                            // Not an end: `complete_async_record_inner`
-                                            // owns this cycle's tail now, and mints its own
-                                            // token from the record when the write lands.
-                                            cycle_end.hand_off_to_async_completion();
-                                            return Ok(());
-                                        }
-                                        // The value is at the device; the cycle goes on
-                                        // as after a synchronous write.
-                                        Ok(WriteStart::Completed) => false,
-                                        // C prints nothing for a failed `write_ao`
-                                        // (`aoRecord.c:565`, `dbAccess.c:612`).
-                                        Ok(WriteStart::Synchronous) => {
-                                            dev.write(&mut *instance.record).is_err()
-                                        }
-                                        Err(_) => true,
-                                    };
+                                let write_failed = match dev.write_begin_common(
+                                    &mut *instance.record,
+                                    &mut instance.common,
+                                    &done,
+                                ) {
+                                    Ok(WriteStart::Pending) => {
+                                        // Async write submitted -- set PACT, return early.
+                                        // The device's `DeviceDone` re-enters the record
+                                        // on a callback band when the write lands, and
+                                        // `complete_async_write` ends the cycle there.
+                                        instance.enter_pact();
+                                        instance.device = Some(dev);
+                                        // Not an end: `complete_async_record_inner`
+                                        // owns this cycle's tail now, and mints its own
+                                        // token from the record when the write lands.
+                                        cycle_end.hand_off_to_async_completion();
+                                        return Ok(());
+                                    }
+                                    // The value is at the device; the cycle goes on
+                                    // as after a synchronous write.
+                                    Ok(WriteStart::Completed) => false,
+                                    // C prints nothing for a failed `write_ao`
+                                    // (`aoRecord.c:565`, `dbAccess.c:612`).
+                                    Ok(WriteStart::Synchronous) => dev
+                                        .write_common(&mut *instance.record, &mut instance.common)
+                                        .is_err(),
+                                    Err(_) => true,
+                                };
                                 if write_failed {
                                     cycle_status.io(Err(DbStatus::FAILED));
                                 }

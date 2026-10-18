@@ -4567,21 +4567,6 @@ fn test_vbas_unsupported_clear_by_default() {
     assert!(!rec.stat.vbas_unsupported);
 }
 
-// --- moveToHome (C: a6f64591 + 5f421e9a 2011-07) ---
-
-#[test]
-fn test_move_to_home_defaults_to_move_absolute() {
-    use asyn_rs::interfaces::motor::AsynMotor;
-    use asyn_rs::user::AsynUser;
-    let mut sim = motor_rs::sim_motor::SimMotor::new();
-    let user = AsynUser::new(0);
-    // move_to_home's default impl delegates to move_absolute(position=3.0).
-    sim.move_to_home(&user, 3.0, 0.0, 1.0, 0.5).unwrap();
-    let status = sim.poll(&user).unwrap();
-    // The move cleared Done at once; Moving waits for the sim's next step.
-    assert!(!status.done, "move_to_home should start a move");
-}
-
 // Position-compare output (PCO) tests were removed with the framework PCO
 // surface: the C base-class PCO change (05b25c1d, motor PR #248) is an open,
 // unmerged PR, so PCO is driver-private (see asyn-rs interfaces/motor.rs).

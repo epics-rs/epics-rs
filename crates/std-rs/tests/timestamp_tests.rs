@@ -283,6 +283,9 @@ fn ctx_with_tse(tse: i16) -> ProcessContext {
         time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+        scan: epics_base_rs::server::record::ScanType::Passive,
+        proc_field: 0,
+        tpro: 0,
     }
 }
 

@@ -1,0 +1,127 @@
+rec0: XIA_pfcu_filters.proto setMode(1,2,3,4,5,6,7,8,9) P
+setMode {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 {4|2}";
+    in "\x25PFCU1 OK Shutter Mode %{Disabled|Enabled} DONE\x3b";
+}
+rec1: XIA_pfcu_filters.proto stateRead(1,2,3,4,5,6,7,8,9) P
+stateRead {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    in "\x25PFCU1 OK %(2filter1_RBV)1s%(2filter2_RBV)1s%(2filter3_RBV)1s%(2filter4_RBV)1s DONE\x3b";
+}
+rec2: XIA_pfcu_filters.proto setState(1,2,3,4,5,6,7,8,9) P
+setState {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 W %4.4s";
+    in "\x25PFCU1 OK %(2filter1_RBV)1s%(2filter2_RBV)1s%(2filter3_RBV)1s%(2filter4_RBV)1s DONE\x3b";
+}
+rec3: XIA_pfcu_filters.proto getState(1,2,3,4,5,6,7,8,9) P
+getState {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 P";
+    in "\x25PFCU1 OK %(2filter1_RBV)1s%(2filter2_RBV)1s%(2filter3_RBV)1s%(2filter4_RBV)1s DONE\x3b";
+}
+rec4: XIA_pfcu_filters.proto setControl(1,2,3,4,5,6,7,8,9) P
+setControl {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 {L|U}";
+    in "\x25PFCU1 OK %{Locked|Unlocked} DONE\x3b";
+}
+rec5: XIA_pfcu_filters.proto sysReport(1,2,3,4,5,6,7,8,9) P
+sysReport {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 S";
+    in "\x25PFCU1 OK %100c";
+}
+rec6: XIA_pfcu_filters.proto fault(1,2,3,4,5,6,7,8,9) P
+fault {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 F";
+    in "\x25PFCU1 OK %(2filter1_RBV)1s%(2filter2_RBV)1s%(2filter3_RBV)1s%(2filter4_RBV)1s DONE\x3b";
+}
+rec7: XIA_pfcu_filters.proto clear(1,2,3,4,5,6,7,8,9) P
+clear {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "!PFCU1 Z";
+    in "\x25PFCU1 OK %(2filter1_RBV)1s%(2filter2_RBV)1s%(2filter3_RBV)1s%(2filter4_RBV)1s DONE\x3b";
+}

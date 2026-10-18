@@ -52,7 +52,7 @@ async fn a_put_on_a_non_blocking_port_writes_the_driver_once() {
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) = create_port_runtime_unclaimed(

@@ -1,1 +1,2 @@
 _main_ brace_without_name.proto line 2: Expect protocol name before '{'
+_main_ while reading protocol 'p' for 'rec0'

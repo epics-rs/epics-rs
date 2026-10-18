@@ -2198,6 +2198,18 @@ impl PvDatabase {
         .is_some()
     }
 
+    /// C `dbCaGetLinkDBFtype` (`dbCa.c:665-675`) of an external link: the
+    /// connected channel's type, `None` (C -1) while it is down.
+    pub(crate) fn external_link_dbf_type(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<DbFieldType> {
+        let external = link.external()?;
+        self.external_link_metadata(external.name)?
+            .dbf_type
+            .map(link_dbf_to_field_type)
+    }
+
     /// C `doResolveLinks`' `openLink` (`iocInit.c:535-559`) for each
     /// external link of `rec_arc`, once per record
     /// ([`RecordCell::claim_link_opens`]); a link its lset opens without one
@@ -3438,7 +3450,7 @@ impl PvDatabase {
     /// What an OUT put sends over an external link. A long string is C
     /// `dbPutLinkLS`'s (`dbLink.c:527-538`), whose `dbGetLinkDBFtype` is the
     /// channel's native type, or -1 while it is down (`pcaGetCheck`,
-    /// `dbCa.c:650-660`): then nothing is put and the status is 0. A
+    /// `dbCa.c:621-631`): then nothing is put and the status is 0. A
     /// `DBF_CHAR`/`DBF_UCHAR` channel takes the characters; any other one
     /// `DBR_STRING`.
     fn external_put_value(

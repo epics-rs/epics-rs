@@ -108,10 +108,10 @@ async fn main() {
     // 8. Change vertical gain to x10
     println!("\nSwitching vertical gain to x10...");
     let vgs_idx = port_handle
-        .drv_user_create(&DrvUserRequest::new("P_VertGainSelect", 0))
+        .drv_user_create(&DrvUserRequest::new("SCOPE_VERT_GAIN_SELECT", 0))
         .await
         .unwrap();
-    port_handle.write_int32(vgs_idx, 0, 3).await.unwrap(); // x10
+    port_handle.write_int32(vgs_idx, 0, 10).await.unwrap(); // x10
 
     // Receive 2 more updates
     let mut update_count = 0;

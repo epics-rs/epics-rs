@@ -1,0 +1,300 @@
+rec0: Metis_M322.proto getErrorStatus(1,2,3,4,5,6,7,8,9) P
+getErrorStatus {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1fs";
+    in "%02d";
+}
+rec1: Metis_M322.proto getBuffMode(1,2,3,4,5,6,7,8,9) P
+getBuffMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1bum";
+    in "%{00|01|02}";
+}
+rec2: Metis_M322.proto setBuffMode(1,2,3,4,5,6,7,8,9) P
+setBuffMode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1bum";
+    in "%{00|01|02}";
+  }
+
+    out "1bum%{00|01|02}";
+    in "ok";
+}
+rec3: Metis_M322.proto getBuff00Data(1,2,3,4,5,6,7,8,9) P
+getBuff00Data {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1bup";
+    in "%04x";
+}
+rec4: Metis_M322.proto getBuff01Data(1,2,3,4,5,6,7,8,9) P
+getBuff01Data {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1bup";
+    in "%04x%(2:temp2Raw)04x%(2:temp2cRaw)04x";
+}
+rec5: Metis_M322.proto getBuff02Data(1,2,3,4,5,6,7,8,9) P
+getBuff02Data {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1bup";
+    in "%04x%(2:temp2Raw)04x%(2:temp2cRaw)04x%(2:rampSp)04x%(2:ao)04x%(2:signal)04x%(2:stat0)02x%(2:stat1)02x%(2:stat2)02x%(2:stat3)02x";
+}
+rec6: Metis_M322.proto getMeasDist(1,2,3,4,5,6,7,8,9) P
+getMeasDist {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1moa";
+    in "%04x";
+}
+rec7: Metis_M322.proto setMeasDist(1,2,3,4,5,6,7,8,9) P
+setMeasDist {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1moa";
+    in "%04x";
+  }
+
+    out "1moa%04x";
+    in "ok";
+}
+rec8: Metis_M322.proto getUnit(1,2,3,4,5,6,7,8,9) P
+getUnit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1fh";
+    in "%d";
+}
+rec9: Metis_M322.proto setUnit(1,2,3,4,5,6,7,8,9) P
+setUnit {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1fh";
+    in "%d";
+  }
+
+    out "1fh%d";
+    in "ok";
+}
+rec10: Metis_M322.proto getDeviceTemp(1,2,3,4,5,6,7,8,9) P
+getDeviceTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1tsc0";
+    in "%04x";
+}
+rec11: Metis_M322.proto getDeviceAddress(1,2,3,4,5,6,7,8,9) P
+getDeviceAddress {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "99ga";
+    in "%02d";
+}
+rec12: Metis_M322.proto setDispTemp(1,2,3,4,5,6,7,8,9) P
+setDispTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1an%d";
+    in "ok";
+}
+rec13: Metis_M322.proto getDispTemp(1,2,3,4,5,6,7,8,9) P
+getDispTemp {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1ar";
+    in "%d";
+}
+rec14: Metis_M322.proto setAo1Range(1,2,3,4,5,6,7,8,9) P
+setAo1Range {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1as%d";
+    in "ok";
+}
+rec15: Metis_M322.proto getAo1Range(1,2,3,4,5,6,7,8,9) P
+getAo1Range {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1as";
+    in "%d";
+}
+rec16: Metis_M322.proto setAo2Range(1,2,3,4,5,6,7,8,9) P
+setAo2Range {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1ar%d";
+    in "ok";
+}
+rec17: Metis_M322.proto getAo2Range(1,2,3,4,5,6,7,8,9) P
+getAo2Range {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 500; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1ar";
+    in "%d";
+}

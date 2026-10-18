@@ -1,0 +1,16 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto"
+Stream::initRecord rec: filename="l.proto" protocol="" bus="" addr=0 params=""
+rec: Missing protocol name
+rec: Record initialization failed
+streamInitRecord(rec) done status=0x202000b
+VAL 0 = 0x0
+SEVR "NO_ALARM"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

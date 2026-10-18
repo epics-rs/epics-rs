@@ -1132,7 +1132,7 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let reason = base.create_param("OUTPUT", ParamType::Float64).unwrap();
     // Preload the output port's present value (the real DAC output).
@@ -1493,6 +1493,9 @@ fn ctx_with_udf(udf: u8) -> ProcessContext {
         time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+        scan: epics_base_rs::server::record::ScanType::Passive,
+        proc_field: 0,
+        tpro: 0,
     }
 }
 
@@ -1506,6 +1509,9 @@ fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
         time: epics_base_rs::types::WallTime::UNIX_EPOCH,
         soft: epics_base_rs::server::device_support::classify_soft(dtyp),
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+        scan: epics_base_rs::server::record::ScanType::Passive,
+        proc_field: 0,
+        tpro: 0,
     }
 }
 

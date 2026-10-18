@@ -1,0 +1,217 @@
+rec0: caen_N8031.proto read_voltages(1,2,3,4,5,6,7,8,9) P
+read_voltages {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:VMON";
+    in "#CMD:OK,VAL:%(1CH0:Voltage_RBV)f;%(1CH1:Voltage_RBV)f;%(1CH2:Voltage_RBV)f;%(1CH3:Voltage_RBV)f;%(1CH4:Voltage_RBV)f;%(1CH5:Voltage_RBV)f;%(1CH6:Voltage_RBV)f;%(1CH7:Voltage_RBV)f";
+}
+rec1: caen_N8031.proto read_currents(1,2,3,4,5,6,7,8,9) P
+read_currents {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:IMON";
+    in "#CMD:OK,VAL:%(1CH0:Current_RBV)f;%(1CH1:Current_RBV)f;%(1CH2:Current_RBV)f;%(1CH3:Current_RBV)f;%(1CH4:Current_RBV)f;%(1CH5:Current_RBV)f;%(1CH6:Current_RBV)f;%(1CH7:Current_RBV)f";
+}
+rec2: caen_N8031.proto read_power_states(1,2,3,4,5,6,7,8,9) P
+read_power_states {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:PW";
+    in "#CMD:OK,VAL:%(1CH0:Power_RBV){OFF|ON};%(1CH1:Power_RBV){OFF|ON};%(1CH2:Power_RBV){OFF|ON};%(1CH3:Power_RBV){OFF|ON};%(1CH4:Power_RBV){OFF|ON};%(1CH5:Power_RBV){OFF|ON};%(1CH6:Power_RBV){OFF|ON};%(1CH7:Power_RBV){OFF|ON}";
+}
+rec3: caen_N8031.proto read_ramp_up_rates(1,2,3,4,5,6,7,8,9) P
+read_ramp_up_rates {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:RUP";
+    in "#CMD:OK,VAL:%(1CH0:RampUpRate_RBV)d;%(1CH1:RampUpRate_RBV)d;%(1CH2:RampUpRate_RBV)d;%(1CH3:RampUpRate_RBV)d;%(1CH4:RampUpRate_RBV)d;%(1CH5:RampUpRate_RBV)d;%(1CH6:RampUpRate_RBV)d;%(1CH7:RampUpRate_RBV)d";
+}
+rec4: caen_N8031.proto read_ramp_down_rates(1,2,3,4,5,6,7,8,9) P
+read_ramp_down_rates {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:RDWN";
+    in "#CMD:OK,VAL:%(1CH0:RampDownRate_RBV)d;%(1CH1:RampDownRate_RBV)d;%(1CH2:RampDownRate_RBV)d;%(1CH3:RampDownRate_RBV)d;%(1CH4:RampDownRate_RBV)d;%(1CH5:RampDownRate_RBV)d;%(1CH6:RampDownRate_RBV)d;%(1CH7:RampDownRate_RBV)d";
+}
+rec5: caen_N8031.proto read_power_down_modes(1,2,3,4,5,6,7,8,9) P
+read_power_down_modes {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:PDWN";
+    in "#CMD:OK,VAL:%(1CH0:PowerDownMode_RBV){RAMP|KILL};%(1CH1:PowerDownMode_RBV){RAMP|KILL};%(1CH2:PowerDownMode_RBV){RAMP|KILL};%(1CH3:PowerDownMode_RBV){RAMP|KILL};%(1CH4:PowerDownMode_RBV){RAMP|KILL};%(1CH5:PowerDownMode_RBV){RAMP|KILL};%(1CH6:PowerDownMode_RBV){RAMP|KILL};%(1CH7:PowerDownMode_RBV){RAMP|KILL}";
+}
+rec6: caen_N8031.proto read_imon_ranges(1,2,3,4,5,6,7,8,9) P
+read_imon_ranges {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:MON,CH:8,PAR:IMRANGE";
+    in "#CMD:OK,VAL:%(1CH0:IMonRange_RBV){HIGH|LOW};%(1CH1:IMonRange_RBV){HIGH|LOW};%(1CH2:IMonRange_RBV){HIGH|LOW};%(1CH3:IMonRange_RBV){HIGH|LOW};%(1CH4:IMonRange_RBV){HIGH|LOW};%(1CH5:IMonRange_RBV){HIGH|LOW};%(1CH6:IMonRange_RBV){HIGH|LOW};%(1CH7:IMonRange_RBV){HIGH|LOW}";
+}
+rec7: caen_N8031.proto set_power(1,2,3,4,5,6,7,8,9) P
+set_power {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:PW,VAL:%{OFF|ON}";
+}
+rec8: caen_N8031.proto set_voltage(1,2,3,4,5,6,7,8,9) P
+set_voltage {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:VSET,VAL:%f";
+}
+rec9: caen_N8031.proto set_current(1,2,3,4,5,6,7,8,9) P
+set_current {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:VSET,VAL:%f";
+}
+rec10: caen_N8031.proto set_ramp_up(1,2,3,4,5,6,7,8,9) P
+set_ramp_up {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:RUP,VAL:%d";
+}
+rec11: caen_N8031.proto set_ramp_down(1,2,3,4,5,6,7,8,9) P
+set_ramp_down {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:RDWN,VAL:%d";
+}
+rec12: caen_N8031.proto set_power_down_mode(1,2,3,4,5,6,7,8,9) P
+set_power_down_mode {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:PDWN,VAL:%{RAMP|KILL}";
+}
+rec13: caen_N8031.proto set_imon_range(1,2,3,4,5,6,7,8,9) P
+set_imon_range {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "$CMD:SET,CH:1,PAR:IMRANGE,VAL:%{HIGH|LOW}";
+}

@@ -44,7 +44,7 @@ fn unregistered(name: &str) -> PortHandle {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Int32).unwrap();
     let (runtime, _join) =
@@ -195,17 +195,20 @@ async fn held_while_both_build() {
 fn count_deliveries(handle: &PortHandle) -> (Arc<std::sync::atomic::AtomicUsize>, impl Sized) {
     let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sink = n.clone();
-    let sub = handle.interrupts().register_sync_callback(
-        asyn_rs::interrupt::InterruptFilter {
-            reason: Some(0),
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        move |_| {
-            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        },
-    );
+    let sub = handle
+        .interrupts()
+        .register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(0),
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            move |_| {
+                sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .unwrap();
     (n, sub)
 }
 

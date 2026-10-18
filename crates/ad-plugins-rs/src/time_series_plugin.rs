@@ -558,8 +558,11 @@ impl TimeSeriesState {
 
 impl NDPluginProcess for TimeSeriesProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginTimeSeries.cpp:52-53, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::FLOAT64
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     /// C `NDPluginTimeSeries::writeInt32` (NDPluginTimeSeries.cpp:441-490):
     /// its branch runs inside the write, before `callParamCallbacks`. It keeps
@@ -822,7 +825,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -924,7 +927,7 @@ mod tests {
             3,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
@@ -950,7 +953,7 @@ mod tests {
             max_signals + 1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -1027,7 +1030,7 @@ mod tests {
             3,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (acquire, series) = {
             let st = proc.state.lock();
@@ -1090,7 +1093,7 @@ mod tests {
             2,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = proc.state.lock().p.clone();
         proc.state.lock().averaging_time_actual = 1.0;
@@ -1144,7 +1147,7 @@ mod tests {
             2,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = proc.state.lock().p.clone();
         let out = proc.validate_float64(
@@ -1188,7 +1191,7 @@ mod tests {
             2,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         // make_proc numbers the TS params from 0; this is none of them.
         const BASE: usize = 1000;

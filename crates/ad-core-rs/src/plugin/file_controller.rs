@@ -2767,7 +2767,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let mut c = FilePluginController::new(MockWriter::new(true));
@@ -3131,7 +3131,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let mut c = FilePluginController::new(GateWriter(Arc::clone(&gate)));

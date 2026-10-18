@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "A"; wait 50; out "B"; }

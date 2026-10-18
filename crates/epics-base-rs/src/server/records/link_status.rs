@@ -206,7 +206,7 @@ pub enum LinkRole {
 /// (`DBF_ENUM` = 11) — the same kind of collapse [`DBF_UNKNOWN`] documents
 /// for `DBF_NOACCESS`. The match is exhaustive so a new `DbFieldType` variant
 /// forces a deliberate code assignment here rather than a silent default.
-fn dbf_static_code(ft: DbFieldType) -> i16 {
+pub(crate) fn dbf_static_code(ft: DbFieldType) -> i16 {
     match ft {
         DbFieldType::String => 0,  // DBF_STRING
         DbFieldType::Char => 1,    // DBF_CHAR
@@ -276,6 +276,13 @@ pub struct LinkCheckSpec {
     pub rule: LinkRule,
     /// The record's own `db_post_events` mask for a status.
     pub mask: crate::server::recgbl::EventMask,
+    /// sseq's `checkLinks` re-posts a `Local PV` status every pass
+    /// (`sseqRecord.c:874`, `:910`); the calcs leave one alone.
+    pub repost_local: bool,
+    /// The record's `process()` runs `checkLinks` (`calcoutRecord.c:234`), so
+    /// it takes `CycleHooks::LINK_CHECK`; sseq's runs it only from its
+    /// callback.
+    pub in_cycle: bool,
 }
 
 /// C's `caLinkStat != NO_CA_LINKS` and `cbScheduled`.
@@ -290,7 +297,20 @@ pub struct LinkCheckState {
 pub struct LinkCheck<'a> {
     pub spec: &'static LinkCheckSpec,
     pub statuses: &'a mut [i16],
+    /// The `dbGetLinkDBFtype` of link `i`, written silently, for a record
+    /// that keeps one (sseq `DTn`/`LTn`); empty otherwise.
+    pub field_types: &'a mut [i16],
     pub state: &'a mut LinkCheckState,
+    pub tail: Option<&'a mut dyn LinkCheckTail>,
+}
+
+/// The rest of a record's `checkLinks` pass once the statuses are read: sseq's
+/// `waitConfigErr` (`sseqRecord.c:912-933`).
+pub trait LinkCheckTail {
+    /// Recompute from the pass's `statuses`; bit `i` set means
+    /// [`Self::fields`]`[i]` moved and posts.
+    fn pass(&mut self, statuses: &[i16]) -> u64;
+    fn fields(&self) -> &'static [&'static str];
 }
 
 /// Classify one DOL/LNK/INP/OUT link string into its connection-status menu

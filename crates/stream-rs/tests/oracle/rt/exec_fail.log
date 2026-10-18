@@ -1,0 +1,9 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = exec
+StreamCore::formatOutput(rec): format = %d
+StreamCore::printValue(rec, %d, 3 = 0x3): "nosuchcommand 3"
+StreamCore::evalExec: command = "nosuchcommand 3"
+StreamCore::execCallback(rec, StreamIoFault) activeCommand: exec
+rec: Shell command "nosuchcommand 3" failed
+StreamCore::finishProtocol(rec, Fault) not bus owner
+rec: Protocol aborted

@@ -73,7 +73,7 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0), entry("ON", 1)].into())
@@ -111,17 +111,20 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
     // A ring-style synchronous client beside the record's enum client.
     let ring = Arc::new(AtomicUsize::new(0));
     let seen = ring.clone();
-    let _ring = handle.interrupts().register_sync_callback(
-        InterruptFilter {
-            reason: Some(0),
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        move |_| {
-            seen.fetch_add(1, Ordering::Relaxed);
-        },
-    );
+    let _ring = handle
+        .interrupts()
+        .register_sync_callback(
+            InterruptFilter {
+                reason: Some(0),
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
 
     // Distinct tables, so each one is a change the client must hold.
     let fires: Vec<InterruptValue> = (0..N)

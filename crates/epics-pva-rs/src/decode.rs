@@ -117,6 +117,76 @@ pub fn try_parse_frame_role(buf: &[u8], role: PeerRole) -> PvaResult<Option<(Fra
     Ok(Some((Frame { header, payload }, needed)))
 }
 
+/// One circuit's segment reassembly, the state pvxs `ConnBase::bevRead`
+/// keeps per connection (`expectSeg`/`segCmd`/`segBuf`, conn.cpp:228-244).
+/// Every circuit's read loop owns one and feeds it each application frame,
+/// so no circuit dispatches a segment as if it were a whole message.
+#[derive(Default)]
+pub(crate) struct SegmentAssembler {
+    buf: Vec<u8>,
+    cmd: u8,
+    flags: HeaderFlags,
+    expect: bool,
+}
+
+impl SegmentAssembler {
+    /// `Ok(Some)` is a whole message (segment bits clear) to dispatch,
+    /// `Ok(None)` waits for the next segment, and `Err` must close the
+    /// circuit. `cap` bounds the reassembled size; `None` is pvxs's uncapped
+    /// receive.
+    pub(crate) fn push(&mut self, frame: Frame, cap: Option<usize>) -> PvaResult<Option<Frame>> {
+        let seg = frame.header.flags.0 & HeaderFlags::SEGMENT_MASK;
+        let continuation = seg & HeaderFlags::SEGMENT_LAST != 0;
+        if continuation ^ self.expect || (continuation && frame.header.command != self.cmd) {
+            return Err(PvaError::Protocol(format!(
+                "PVA segmentation violation: expect_seg={} continuation={} cmd 0x{:02x} vs saved 0x{:02x}",
+                self.expect, continuation, frame.header.command, self.cmd
+            )));
+        }
+        // On the whole message, not the frame: a frame already complete in
+        // the read buffer skips the reader's header peek, and each segment
+        // can be under the cap while their sum is not. `buf` is empty
+        // unless a message is in progress.
+        if let Some(cap) = cap {
+            if self.buf.len().saturating_add(frame.payload.len()) > cap {
+                return Err(PvaError::Protocol(format!(
+                    "segmented PVA message exceeds max_message_size ({} > {})",
+                    self.buf.len() + frame.payload.len(),
+                    cap
+                )));
+            }
+        }
+        if seg == 0 {
+            return Ok(Some(frame));
+        }
+        if seg == HeaderFlags::SEGMENT_FIRST {
+            self.expect = true;
+            self.cmd = frame.header.command;
+            self.flags = HeaderFlags(frame.header.flags.0 & !HeaderFlags::SEGMENT_MASK);
+            self.buf.clear();
+        }
+        crate::peer_buf::try_extend(
+            &mut self.buf,
+            &frame.payload,
+            "the segment-reassembly buffer",
+        )?;
+        if seg != HeaderFlags::SEGMENT_LAST {
+            return Ok(None);
+        }
+        self.expect = false;
+        let payload = std::mem::take(&mut self.buf);
+        Ok(Some(Frame {
+            header: PvaHeader {
+                version: frame.header.version,
+                flags: self.flags,
+                command: self.cmd,
+                payload_length: payload.len() as u32,
+            },
+            payload,
+        }))
+    }
+}
+
 // ─── Search response ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

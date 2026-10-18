@@ -112,6 +112,10 @@ impl MotorBuilder {
         let model1 = matches!(self.user, TraceUser::Model1 { .. });
         if !model1 {
             let mut controller = ControllerBuilder::new();
+            // A controller of one axis is its port's poller.
+            if let TraceUser::Asyn { port, .. } = &self.user {
+                controller = controller.port(port);
+            }
             let ControllerAxis { axis, poll_cmd_tx } = controller.axis_with(
                 self.motor,
                 self.user,
@@ -259,6 +263,14 @@ impl Default for ControllerAxes {
 }
 
 impl ControllerAxes {
+    /// C `startMoveToHomeThread`: a MOTOR_MOVE_HOME write then runs the
+    /// axis's [`AsynMotor::move_to_home_task`] on this controller's
+    /// `motorMoveToHome` thread. Without it the write only signals.
+    pub fn start_move_to_home_thread(&self) -> std::io::Result<()> {
+        let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        axes.poll.start_move_to_home_thread()
+    }
+
     /// Add an axis; on a running poller, return once the poller has taken
     /// it, to be polled from its next pass. A `motor`
     /// added before is not polled twice: `user` reaches the same axis.
@@ -304,7 +316,16 @@ impl ControllerAxes {
                 (Some((port, addr)), None) => {
                     opened.mirror = Some((port.clone(), addr));
                     let motor = motor.clone();
-                    (Join::Mirror { motor, port, addr }, added)
+                    let poll = axes.poll.clone();
+                    (
+                        Join::Mirror {
+                            motor,
+                            port,
+                            addr,
+                            poll,
+                        },
+                        added,
+                    )
                 }
             }
         } else {
@@ -319,7 +340,7 @@ impl ControllerAxes {
             });
             let mut polled = Axis::polled(inbox, motor.clone(), subscribers, axis.params().clone());
             if let Some((port, addr)) = mirror {
-                polled.mirror_to(&port, addr);
+                polled.mirror_to(&port, addr, axes.poll.clone());
             }
             (
                 Join::Axis(Box::new(polled)),
@@ -382,6 +403,15 @@ impl ControllerBuilder {
     ) -> Self {
         let axes = self.axes.0.lock().unwrap_or_else(|e| e.into_inner());
         axes.poll.set(Box::new(move || poll().into()));
+        drop(axes);
+        self
+    }
+
+    /// The controller port this poller is, so setMovingPollPeriod and
+    /// setIdlePollPeriod reach it before any axis on the port names it.
+    pub fn port(self, port: &str) -> Self {
+        let axes = self.axes.0.lock().unwrap_or_else(|e| e.into_inner());
+        axes.poll.name_port(port);
         drop(axes);
         self
     }

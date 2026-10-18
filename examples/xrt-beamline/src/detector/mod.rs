@@ -53,7 +53,7 @@ impl XrtDetector {
             max_memory,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let xrt_params = XrtDetectorParams::create(&mut ad.port_base)?;
         let motor_param_set = xrt_params.motor_params();

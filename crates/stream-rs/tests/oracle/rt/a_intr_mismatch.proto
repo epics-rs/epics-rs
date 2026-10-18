@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { in "V=%d"; }

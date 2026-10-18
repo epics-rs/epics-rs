@@ -555,8 +555,11 @@ impl CircularBuffProcessor {
 
 impl NDPluginProcess for CircularBuffProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginCircularBuff.cpp:400-401, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     /// C `NDPluginCircularBuff::writeInt32` drops the base class status
     /// (`status = (asynStatus) callParamCallbacks();`, NDPluginCircularBuff.cpp:303): a refused NDPluginDriver write keeps
@@ -917,7 +920,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -947,7 +950,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let mut proc = CircularBuffProcessor::new(100, 100, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -983,7 +986,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let mut proc = CircularBuffProcessor::new(5, 7, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -1547,7 +1550,7 @@ mod tests {
             1,
             Default::default(),
             asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         proc.register_params(&mut base).unwrap();
         (proc, base)
@@ -1954,7 +1957,7 @@ mod tests {
                 1,
                 Default::default(),
                 asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+                asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
             );
             p.validate_int32(
                 20,

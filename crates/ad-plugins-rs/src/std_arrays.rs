@@ -42,8 +42,14 @@ impl Default for StdArraysProcessor {
 
 impl NDPluginProcess for StdArraysProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    // NDPluginStdArrays.cpp:324-328, the same mask for both.
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT8_ARRAY
+        .or(InterfaceMask::INT16_ARRAY)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::INT64_ARRAY)
+        .or(InterfaceMask::FLOAT32_ARRAY)
+        .or(InterfaceMask::FLOAT64_ARRAY);
+    const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // The frame goes on as it is; the runtime files it in `latest_data`.
         ProcessResult::forward(array, vec![])

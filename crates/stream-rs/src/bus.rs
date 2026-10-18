@@ -196,7 +196,9 @@ pub fn find(
 }
 
 /// The client side helpers (`busSupportsEvent` ...), on the client's
-/// optional bus: each is false / a no-op while no bus is attached.
+/// optional bus: each is false / a no-op while no bus is attached. The
+/// client calls them on its own reference to the bus, so a callback that
+/// comes from inside the request finds the client's bus slot unborrowed.
 pub trait ClientBus {
     fn bus_supports_event(&self) -> bool;
     fn bus_supports_async_read(&self) -> bool;
@@ -219,7 +221,7 @@ pub trait ClientBus {
     fn bus_print_status(&self, buffer: &mut StreamBuffer);
 }
 
-impl ClientBus for Option<BusInterface> {
+impl ClientBus for Option<Arc<BusInterface>> {
     fn bus_supports_event(&self) -> bool {
         self.as_ref().is_some_and(|b| b.bus.supports_event())
     }
@@ -346,7 +348,7 @@ mod tests {
         });
         let client: Arc<dyn Client> = rec.clone();
         assert!(find(&client, "other", 0, "").is_none());
-        let mut bus = find(&client, "sync", 3, "").map(Some).unwrap();
+        let mut bus = find(&client, "sync", 3, "").map(Arc::new);
         assert_eq!(bus.as_ref().unwrap().name(), "sync 3");
         assert_eq!(find(&client, "sync", -1, "").unwrap().name(), "sync");
         assert!(bus.bus_lock_request(100));

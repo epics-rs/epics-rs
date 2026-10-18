@@ -106,7 +106,7 @@ fn a_port_thread_s_first_contended_lock_allocates_nothing() {
                 ..PortFlags::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         // Disconnected, so registration hands the thread a connect before it
         // ever idles: tokio's idle park would otherwise build the park state.

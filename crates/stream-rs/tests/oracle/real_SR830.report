@@ -1,0 +1,182 @@
+rec0: SR830.proto snap(1,2,3,4,5,6,7,8,9) P
+snap {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SNAP?1,2,3,4,9";
+    in "%(1:X.VAL)f,%(1:Y.VAL)f,%(1:R.VAL)f,%(1:TH.VAL)f,%(1:REF.VAL)f";
+}
+rec1: SR830.proto snap_aux(1,2,3,4,5,6,7,8,9) P
+snap_aux {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "SNAP?5,6,7,8";
+    in "%(1:ADC1.VAL)f,%(1:ADC2.VAL)f,%(1:ADC3.VAL)f,%(1:ADC4.VAL)f";
+}
+rec2: SR830.proto disp1(1,2,3,4,5,6,7,8,9) P
+disp1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "DDEF 1,%(1:DispCh1)d,%(1:RatioCh1)d";
+}
+rec3: SR830.proto disp2(1,2,3,4,5,6,7,8,9) P
+disp2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "DDEF 2,%(1:DispCh2)d,%(1:RatioCh2)d";
+}
+rec4: SR830.proto oexp1(1,2,3,4,5,6,7,8,9) P
+oexp1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OEXP 1,%(1:OffsetCh1)f,%(1:ExpandCh1)d";
+}
+rec5: SR830.proto oexp2(1,2,3,4,5,6,7,8,9) P
+oexp2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "OEXP 2,%(1:OffsetCh2)f,%(1:ExpandCh2)d";
+}
+rec6: SR830.proto fpop1(1,2,3,4,5,6,7,8,9) P
+fpop1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "FPOP 1,%(1:OutputCh1)d";
+}
+rec7: SR830.proto fpop2(1,2,3,4,5,6,7,8,9) P
+fpop2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "FPOP 2,%(1:OutputCh2)d";
+}
+rec8: SR830.proto auxv1(1,2,3,4,5,6,7,8,9) P
+auxv1 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "AUXV 1,%(1:AuxOutCh1)f";
+}
+rec9: SR830.proto auxv2(1,2,3,4,5,6,7,8,9) P
+auxv2 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "AUXV 2,%(1:AuxOutCh2)f";
+}
+rec10: SR830.proto auxv3(1,2,3,4,5,6,7,8,9) P
+auxv3 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "AUXV 3,%(1:AuxOutCh3)f";
+}
+rec11: SR830.proto auxv4(1,2,3,4,5,6,7,8,9) P
+auxv4 {
+  extraInput    = ignore;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "";
+  outTerminator = "";
+  separator     = "";
+
+    out "AUXV 4,%(1:AuxOutCh4)f";
+}

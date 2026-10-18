@@ -194,11 +194,21 @@ fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
 /// renderers of one C routine would be two answers to "what does an unset
 /// stamp look like".
 pub fn epics_time_to_strftime(format: &str, ts: WallTime) -> String {
+    epics_time_to_strftime_in(STRINGIN_VAL_BYTES, format, ts)
+}
+
+/// [`epics_time_to_strftime`] into a caller's `char[buf_length]`, for C
+/// callers with another buffer (NDPluginOverlay passes 63): the result is
+/// at most `buf_length - 1` bytes.
+pub fn epics_time_to_strftime_in(buf_length: usize, format: &str, ts: WallTime) -> String {
     let (sec_past_epoch, nsec) = epics_time_parts(ts);
     let mut out = String::new();
-    // C `bufLength` = `sizeof prec->val` = STRINGIN_VAL_BYTES; `bufLenLeft`
-    // counts the NUL slot. `bufLength == 0` cannot occur here.
-    let mut buf_len_left = STRINGIN_VAL_BYTES;
+    // C `epicsTime.cpp:171`.
+    if buf_length == 0 {
+        return out;
+    }
+    // `bufLenLeft` counts the NUL slot.
+    let mut buf_len_left = buf_length;
 
     // C `epicsTime.cpp:176`: an epoch (uninitialized) stamp formats to the
     // literal sentinel.
@@ -411,6 +421,9 @@ mod tests {
             time,
             soft: None,
             callback_priority: crate::runtime::task::CallbackPriority::Low,
+            scan: crate::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 
@@ -563,6 +576,18 @@ mod tests {
         assert!(epics_time_to_strftime("%S.%9f", t).ends_with(".250000000"));
         // width 1: round(2.5) → 3 (0.25 s to 1 digit, C +div/2 rounds up)
         assert!(epics_time_to_strftime("%S.%1f", t).ends_with(".3"));
+    }
+
+    /// The caller's buffer bounds the result to `buf_length - 1` bytes: six
+    /// 9-digit fields fit 63 and the seventh becomes the overflow stars.
+    #[test]
+    fn strftime_in_bounds_to_the_callers_buffer() {
+        let t = fixed_device_time();
+        let fmt = "%9f".repeat(7);
+        let wide = epics_time_to_strftime_in(63, &fmt, t);
+        assert_eq!(wide, format!("{}{}", "250000000".repeat(6), "*".repeat(8)));
+        assert_eq!(epics_time_to_strftime(&fmt, t).len(), 39);
+        assert_eq!(epics_time_to_strftime_in(0, &fmt, t), "");
     }
 
     /// C `epicsTimeToStrftime` writes into a fixed 40-byte buffer, so its

@@ -753,6 +753,22 @@ fn gate_link(
     refused
 }
 
+/// The scan-list move a device-link put left
+/// ([`RecordInstance::take_link_scan`]), filed by the put once its hold is
+/// down, on every exit.
+fn take_link_scan(
+    instance: &mut RecordInstance,
+    via: &mut PutVia<'_>,
+) -> crate::server::record::CommonFieldPutResult {
+    match via {
+        PutVia::DbPutField { common, .. } => match common.as_mut() {
+            Some(link) => instance.take_link_scan(link),
+            None => crate::server::record::CommonFieldPutResult::NoChange,
+        },
+        PutVia::DbPut => crate::server::record::CommonFieldPutResult::NoChange,
+    }
+}
+
 /// Move the work a `special(_, true)` left for after the gate into the put's
 /// slot.
 fn collect_after_gate(instance: &mut RecordInstance, tail: &mut PutTail) {
@@ -2943,6 +2959,9 @@ impl PvDatabase {
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);
             set_refused_processes(&mut via, rec, &instance, field);
+            let link_scan = take_link_scan(&mut instance, &mut via);
+            drop(instance);
+            self.apply_common_put_result(name, link_scan);
             return Err(e);
         }
         special_before_put(&mut instance, field);
@@ -3036,7 +3055,9 @@ impl PvDatabase {
         if status.is_ok() && links.0.is_empty() {
             finish_put(&mut instance, field, at, &old_nord, origin, &mut burst);
         }
+        let link_scan = take_link_scan(&mut instance, &mut via);
         drop(instance);
+        self.apply_common_put_result(name, link_scan);
         if status.is_ok() {
             self.apply_common_put_result(name, common_result);
         }
@@ -3460,12 +3481,6 @@ impl PvDatabase {
                 .is_some_and(|rec| rec.read().link_unadded(field));
         if ok && rec.is_some() || removed {
             self.relink_cp_link(record_name, field);
-        }
-        // `RecordInstance::refuse_device_link_put` left an I/O Intr record
-        // Passive; the index is re-filed from its live SCAN.
-        if removed && rec.is_some_and(|rec| rec.read().is_device_link(field)) {
-            use crate::server::record::ScanType;
-            self.update_scan_index(record_name, ScanType::IoIntr, ScanType::Passive, 0, 0);
         }
         if let Some(work) = tail.after {
             work.run(self);

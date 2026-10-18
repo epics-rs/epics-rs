@@ -1,0 +1,248 @@
+rec0: teled_d.proto ping(1,2,3,4,5,6,7,8,9) P
+ping {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "\x0d1R %0<nsum>";
+    in "R %0<nsum>";
+}
+rec1: teled_d.proto getModel(1,2,3,4,5,6,7,8,9) P
+getModel {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R008IDENTIFY%0<nsum>";
+    in "R0\?\?%#s";
+}
+rec2: teled_d.proto setRem(1,2,3,4,5,6,7,8,9) P
+setRem {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006REMOTE%0<nsum>";
+    in "R %0<nsum>";
+}
+rec3: teled_d.proto setLoc(1,2,3,4,5,6,7,8,9) P
+setLoc {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005LOCAL%0<nsum>";
+    in "R %0<nsum>";
+}
+rec4: teled_d.proto setRun(1,2,3,4,5,6,7,8,9) P
+setRun {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R004RUN2%0<nsum>";
+    in "R %0<nsum>";
+}
+rec5: teled_d.proto setStop(1,2,3,4,5,6,7,8,9) P
+setStop {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005STOP2%0<nsum>";
+    in "R %0<nsum>";
+}
+rec6: teled_d.proto getVol(1,2,3,4,5,6,7,8,9) P
+getVol {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R004VOL2%0<nsum>";
+    in "R0\?\?VOL2=%f %0<nsum>";
+}
+rec7: teled_d.proto getSetPress(1,2,3,4,5,6,7,8,9) P
+getSetPress {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R009SETPRESS2%0<nsum>";
+    in "R0\?\?PRESS2=%f %0<nsum>";
+}
+rec8: teled_d.proto setPress(1,2,3,4,5,6,7,8,9) P
+setPress {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1R009SETPRESS2%0<nsum>";
+    in "R0\?\?PRESS2=%f %0<nsum>";
+  }
+
+    out "1R00FPRESS2=%08.4f%0<nsum>";
+    in "R %0<nsum>";
+}
+rec9: teled_d.proto getPress(1,2,3,4,5,6,7,8,9) P
+getPress {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006PRESS2%0<nsum>";
+    in "R0\?\?PRESS2=%f %0<nsum>";
+}
+rec10: teled_d.proto getFlow(1,2,3,4,5,6,7,8,9) P
+getFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R005FLOW2%0<nsum>";
+    in "R0\?\?FLOW2= %f %0<nsum>";
+}
+rec11: teled_d.proto getMFlow(1,2,3,4,5,6,7,8,9) P
+getMFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R006MFLOW2%0<nsum>";
+    in "R0\?\?FLOW2= %f %0<nsum>";
+}
+rec12: teled_d.proto setMFlow(1,2,3,4,5,6,7,8,9) P
+setMFlow {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+  @Init {
+    out "1R006MFLOW2%0<nsum>";
+    in "R0\?\?FLOW2= %f %0<nsum>";
+  }
+
+    out "1R00FMFLOW2=%08.4f%0<nsum>";
+    in "R %0<nsum>";
+}
+rec13: teled_d.proto getStatus(1,2,3,4,5,6,7,8,9) P
+getStatus {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R007STATUS2%0<nsum>";
+    in "R0\?\?STATUS=%#s";
+}
+rec14: teled_d.proto sendCmd(1,2,3,4,5,6,7,8,9) P
+sendCmd {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r";
+  outTerminator = "\r";
+  separator     = "";
+
+    out "1R0%s%0<nsum>";
+    in "R0\?\?%#s";
+}

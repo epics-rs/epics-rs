@@ -78,15 +78,15 @@ use tracing::warn;
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    Command, PVA_VERSION, PvaHeader, ReadExt, decode_size, decode_string,
+    Command, ControlCommand, PVA_VERSION, PvaHeader, ReadExt, decode_size, decode_string,
     ip_from_bytes_allow_unspec,
 };
 
 use super::beacon_throttle::{BeaconAction, BeaconTracker};
-use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
+use super::decode::{PeerRole, SegmentAssembler, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
-    build_client_connection_validation, heartbeat_timeout, read_handshake_init, select_client_auth,
-    wait_for_validated,
+    accept_connection_validated, answer_connection_validation, heartbeat_timeout,
+    read_handshake_init, wait_for_validated,
 };
 
 /// Search retry intervals in seconds.
@@ -3018,18 +3018,18 @@ async fn ns_run_once(
     // identity a regular server connection presents, instead of forced anonymous.
     // `None` message cap = pvxs-parity unbounded; the read is deadlined by
     // `tcp_timeout`.
-    let (byte_order, _server_buf, _server_reg, auth_methods) =
+    let (mut byte_order, validation) =
         read_handshake_init(&mut reader, &mut rx_buf, tcp_timeout, None)
             .await
             .map_err(std::io::Error::other)?;
-    let negotiated_auth = select_client_auth(&auth_methods);
-    let reply = build_client_connection_validation(
+    let reply = answer_connection_validation(
+        ns_addr,
+        &validation,
         byte_order,
-        negotiated_auth,
         user.as_bytes(),
         host.as_bytes(),
-        &super::server_conn::auth_groups(negotiated_auth),
-    );
+    )
+    .map_err(std::io::Error::other)?;
     ns_write_all(&mut writer, &reply, tcp_timeout).await?;
     wait_for_validated(ns_addr, &mut reader, &mut rx_buf, tcp_timeout, None)
         .await
@@ -3075,6 +3075,7 @@ async fn ns_run_once(
     let mut echo_tick = interval(echo_interval);
     echo_tick.tick().await; // `interval` fires immediately; skip that one
     let mut last_rx = Instant::now();
+    let mut reassembly = SegmentAssembler::default();
 
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
     loop {
@@ -3095,8 +3096,8 @@ async fn ns_run_once(
                 // `Header{CMD_ECHO, 0u, 0u}` (clientconn.cpp:494). A *control*
                 // EchoRequest would be drained and ignored by a pvxs peer
                 // (conn.cpp:180-194), so it would not refresh `last_rx`.
-                // `byte_order` is the order latched by the handshake, the same
-                // one every other frame this circuit writes uses.
+                // `byte_order` is the order the last SetEndian latched, the
+                // same one every other frame this circuit writes uses.
                 let h = PvaHeader::application(false, byte_order, Command::Echo.code(), 0);
                 let mut bytes = Vec::with_capacity(PvaHeader::SIZE);
                 h.write_into(&mut bytes);
@@ -3135,24 +3136,50 @@ async fn ns_run_once(
                     &mut rx_buf, &tmp[..n], "the name-server receive buffer"
                 )
                 .map_err(std::io::Error::other)?;
+                // The same frame rules as every other circuit (pvxs
+                // `ConnBase::bevRead`): direction bit, 8-byte control frames,
+                // a SetEndian re-latching the send order, segment reassembly.
                 let mut pos = 0;
-                while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
-                    let Ok(hdr) =
-                        PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[pos..]))
+                while let Some((frame, used)) =
+                    try_parse_frame_role(&rx_buf[pos..], PeerRole::Client)
+                        .map_err(std::io::Error::other)?
+                {
+                    pos += used;
+                    if frame.header.flags.is_control() {
+                        if frame.header.command == ControlCommand::SetByteOrder.code() {
+                            byte_order = frame.order();
+                        }
+                        continue;
+                    }
+                    let Some(frame) =
+                        reassembly.push(frame, None).map_err(std::io::Error::other)?
                     else {
-                        break;
+                        continue;
                     };
-                    let frame_end = pos + PvaHeader::SIZE + hdr.payload_length as usize;
-                    if rx_buf.len() < frame_end {
-                        break;
-                    }
-                    if !hdr.flags.is_control()
-                        && hdr.command == Command::SearchResponse.code()
-                    {
-                        let frame_bytes = rx_buf[pos..frame_end].to_vec();
+                    if frame.header.command == Command::SearchResponse.code() {
+                        let mut frame_bytes =
+                            Vec::with_capacity(PvaHeader::SIZE + frame.payload.len());
+                        frame.header.write_into(&mut frame_bytes);
+                        frame_bytes.extend_from_slice(&frame.payload);
                         let _ = response_tx.try_send((frame_bytes, ns_addr));
+                    } else if frame.header.command == Command::ConnectionValidation.code() {
+                        // A name server is an ordinary circuit: pvxs answers
+                        // a re-validation on it too (clientconn.cpp:215-288).
+                        let reply = answer_connection_validation(
+                            ns_addr,
+                            &frame,
+                            byte_order,
+                            user.as_bytes(),
+                            host.as_bytes(),
+                        )
+                        .map_err(std::io::Error::other)?;
+                        ns_write_all(&mut writer, &reply, tcp_timeout).await?;
+                    } else if frame.header.command == Command::ConnectionValidated.code() {
+                        accept_connection_validated(ns_addr, &frame)
+                            .map_err(std::io::Error::other)?;
+                        // `if(nameserver) context->poke()` (clientconn.cpp:315-318).
+                        let _ = ready_tx.try_send(());
                     }
-                    pos = frame_end;
                 }
                 rx_buf.drain(..pos);
             }
@@ -3166,9 +3193,9 @@ fn _suppress(_: PvaHeader) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::Frame;
+    use crate::proto::HeaderFlags;
     use crate::proto::{ByteOrder, WriteExt, encode_string_into};
-    // Used only by the gated TCP-name-server tests (stage 3).
-    use crate::proto::ControlCommand;
     use serial_test::serial;
 
     // ---- name-server dedup (pvxs split_addr_into sort+unique) ----
@@ -6111,6 +6138,261 @@ mod tests {
             payload.windows(b"myhost".len()).any(|w| w == b"myhost"),
             "CA reply must carry the configured host"
         );
+    }
+
+    /// A name-server circuit is an ordinary pvxs Connection: a mid-stream
+    /// CONNECTION_VALIDATION is answered (clientconn.cpp:215-288) and the
+    /// CONNECTION_VALIDATED after it pokes the searches (:315-318).
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP name server).
+    #[tokio::test]
+    async fn a_name_server_answers_a_mid_stream_validation_and_pokes() {
+        use crate::client_native::server_conn::tests::{
+            read_validation_reply, validated, validation_request,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ns_addr = listener.local_addr().unwrap();
+        let (_search_tx, mut search_rx) = mpsc::channel(4);
+        let (response_tx, _response_rx) = mpsc::channel(4);
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (ready, queued) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let params = NsConnParams {
+            user: "op".into(),
+            host: "box".into(),
+            tcp_timeout: Duration::from_secs(30),
+        };
+        let client = ns_run_once(
+            ns_addr,
+            &mut search_rx,
+            &response_tx,
+            &ready_tx,
+            &ready,
+            &queued,
+            &params,
+        );
+        let server = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut first = Vec::new();
+            PvaHeader::control(
+                true,
+                ByteOrder::Little,
+                ControlCommand::SetByteOrder.code(),
+                0,
+            )
+            .write_into(&mut first);
+            first.extend_from_slice(&validation_request(&["anonymous"]));
+            sock.write_all(&first).await.unwrap();
+            assert_eq!(read_validation_reply(&mut sock).await, "anonymous");
+            sock.write_all(&validated(&[0xFF])).await.unwrap();
+            ready_rx.recv().await.unwrap();
+            sock.write_all(&validation_request(&["ca"])).await.unwrap();
+            let auth =
+                tokio::time::timeout(Duration::from_secs(5), read_validation_reply(&mut sock))
+                    .await
+                    .expect("no reply to a mid-stream CONNECTION_VALIDATION");
+            sock.write_all(&validated(&[0xFF])).await.unwrap();
+            let poked = tokio::time::timeout(Duration::from_secs(5), ready_rx.recv())
+                .await
+                .is_ok();
+            (auth, poked)
+        };
+        let (auth, poked) = tokio::select! {
+            r = server => r,
+            r = client => panic!("the name-server circuit ended: {r:?}"),
+        };
+        assert_eq!((auth.as_str(), poked), ("ca", true));
+    }
+
+    /// Runs `script` as a name server whose circuit has finished its first
+    /// handshake (LE), against a live [`ns_run_once`]. Ends with whichever
+    /// side finishes first.
+    async fn drive_ns_circuit<F, Fut, T>(script: F) -> Result<T, std::io::Result<()>>
+    where
+        F: FnOnce(tokio::net::TcpStream, mpsc::Receiver<(Vec<u8>, SocketAddr)>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        use crate::client_native::server_conn::tests::{
+            read_validation_reply, validated, validation_request,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ns_addr = listener.local_addr().unwrap();
+        let (_search_tx, mut search_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let (ready, queued) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let params = NsConnParams {
+            user: "op".into(),
+            host: "box".into(),
+            tcp_timeout: Duration::from_secs(30),
+        };
+        let client = ns_run_once(
+            ns_addr,
+            &mut search_rx,
+            &response_tx,
+            &ready_tx,
+            &ready,
+            &queued,
+            &params,
+        );
+        let server = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut first = Vec::new();
+            PvaHeader::control(
+                true,
+                ByteOrder::Little,
+                ControlCommand::SetByteOrder.code(),
+                0,
+            )
+            .write_into(&mut first);
+            first.extend_from_slice(&validation_request(&["anonymous"]));
+            sock.write_all(&first).await.unwrap();
+            assert_eq!(read_validation_reply(&mut sock).await, "anonymous");
+            sock.write_all(&validated(&[0xFF])).await.unwrap();
+            ready_rx.recv().await.unwrap();
+            script(sock, response_rx).await
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                r = server => Ok(r),
+                r = client => Err(r),
+            }
+        })
+        .await
+        .expect("neither the name server script nor the circuit finished in 5 s")
+    }
+
+    /// `frame` (one whole LE application frame) re-cut into a FIRST and a
+    /// LAST segment, the body split at `cut`.
+    fn ns_segmented(frame: &[u8], cut: usize) -> Vec<u8> {
+        let (head, body) = frame.split_at(PvaHeader::SIZE);
+        let mut out = Vec::new();
+        for (seg, part) in [
+            (HeaderFlags::SEGMENT_FIRST, &body[..cut]),
+            (HeaderFlags::SEGMENT_LAST, &body[cut..]),
+        ] {
+            out.extend_from_slice(&[head[0], head[1], head[2] | seg, head[3]]);
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    /// The client's next CONNECTION_VALIDATION frame off `sock`.
+    async fn ns_next_validation_reply(sock: &mut tokio::net::TcpStream) -> Frame {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            while let Ok(Some((frame, n))) = try_parse_frame_role(&buf, PeerRole::Server) {
+                buf.drain(..n);
+                if !frame.header.flags.is_control()
+                    && frame.header.command == Command::ConnectionValidation.code()
+                {
+                    return frame;
+                }
+            }
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "client closed before a CONNECTION_VALIDATION");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// The name-server circuit reads frames as pvxs `ConnBase::bevRead`
+    /// does for every circuit (conn.cpp:147-244): a mid-stream SetEndian
+    /// re-latches the send order, and a control frame is 8 bytes whatever
+    /// its data word says. Here a SetEndian(BE) carrying a nonzero data
+    /// word precedes a re-validation, whose reply must then be BE.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP name server).
+    #[tokio::test]
+    async fn a_name_server_set_byte_order_mid_stream_relatches_the_send_order() {
+        use crate::client_native::server_conn::tests::validation_request;
+        let reply = drive_ns_circuit(|mut sock, _| async move {
+            let mut bytes = Vec::new();
+            PvaHeader::control(
+                true,
+                ByteOrder::Big,
+                ControlCommand::SetByteOrder.code(),
+                0x100,
+            )
+            .write_into(&mut bytes);
+            bytes.extend_from_slice(&validation_request(&["ca"]));
+            sock.write_all(&bytes).await.unwrap();
+            ns_next_validation_reply(&mut sock).await
+        })
+        .await
+        .expect("the name-server circuit ended");
+        assert_eq!(reply.order(), ByteOrder::Big);
+        let auth = decode_string(&mut Cursor::new(&reply.payload[8..]), ByteOrder::Big)
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth, "ca");
+    }
+
+    /// Segments are reassembled before dispatch (conn.cpp:228-244): a
+    /// re-validation is answered, and a SEARCH_RESPONSE reaches the engine
+    /// as one unsegmented frame.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP name server).
+    #[tokio::test]
+    async fn a_name_server_reassembles_segmented_messages() {
+        use crate::client_native::server_conn::tests::validation_request;
+        // The circuit forwards the response bytes opaquely.
+        let body: Vec<u8> = (0u8..20).collect();
+        let mut response = Vec::new();
+        PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::SearchResponse.code(),
+            body.len() as u32,
+        )
+        .write_into(&mut response);
+        response.extend_from_slice(&body);
+        let sent = response.clone();
+        let (auth, forwarded) = drive_ns_circuit(|mut sock, mut response_rx| async move {
+            sock.write_all(&ns_segmented(&validation_request(&["ca"]), 3))
+                .await
+                .unwrap();
+            let reply = ns_next_validation_reply(&mut sock).await;
+            let auth = decode_string(&mut Cursor::new(&reply.payload[8..]), reply.order())
+                .unwrap()
+                .unwrap();
+            sock.write_all(&ns_segmented(&sent, 5)).await.unwrap();
+            (auth, response_rx.recv().await.unwrap().0)
+        })
+        .await
+        .expect("the name-server circuit ended");
+        assert_eq!(auth, "ca");
+        assert_eq!(forwarded, response);
+    }
+
+    /// Every fault pvxs answers with a forced disconnect (conn.cpp:157-165,
+    /// 230-236) ends the name-server circuit too.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (hand-built test runtime, mock TCP name server).
+    #[tokio::test]
+    async fn a_name_server_header_or_segment_fault_closes_the_circuit() {
+        use crate::client_native::server_conn::tests::validated;
+        let mut wrong_direction = validated(&[0xFF]);
+        wrong_direction[2] &= !HeaderFlags::SERVER;
+        let mut bad_magic = validated(&[0xFF]);
+        bad_magic[0] = 0xCB;
+        let mut stray_last = validated(&[0xFF]);
+        stray_last[2] |= HeaderFlags::SEGMENT_LAST;
+        let mut first_then_other = ns_segmented(&validated(&[0xFF, 0xFF]), 1);
+        first_then_other[PvaHeader::SIZE + 1 + 3] = Command::SearchResponse.code();
+        for (case, bytes) in [
+            ("Server bit clear", wrong_direction),
+            ("bad magic", bad_magic),
+            ("continuation with no first segment", stray_last),
+            ("continuation of another command", first_then_other),
+        ] {
+            let end = drive_ns_circuit(|mut sock, _| async move {
+                sock.write_all(&bytes).await.unwrap();
+                std::future::pending::<()>().await
+            })
+            .await;
+            assert!(matches!(end, Err(Err(_))), "{case}: {end:?}");
+        }
     }
 
     // ---- search_targets: AUTO_ADDR_LIST gating (pvxs expandAddrList) ----

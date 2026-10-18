@@ -78,7 +78,7 @@ fn port(name: &str, can_block: bool, db: &PvDatabase) -> (PortRuntimeHandle, Arc
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     for (param, ty) in [
         ("I32", ParamType::Int32),

@@ -1,0 +1,25 @@
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "GET<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="1", size=1)
+StreamCore::readCallback(rec) inputBuffer="1", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoTimeout input="2", size=1)
+StreamCore::readCallback(rec) inputBuffer="12", size 2
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+rec: Timeout after reading 2 bytes "12"
+StreamCore::readCallback(rec) input line: "12"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="12" value=12
+StreamCore::finishProtocol(rec, ReadTimeout) bus owner
+starting exception handler
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "RT<0d><0a>"
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner

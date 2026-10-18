@@ -1,0 +1,2 @@
+Terminator = CR LF;
+p { out "%+05d|%-4d|%x"; }

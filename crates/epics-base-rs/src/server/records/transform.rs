@@ -61,6 +61,8 @@ static TRANSFORM_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
         crate::server::recgbl::EventMask::VALUE.bits()
             | crate::server::recgbl::EventMask::LOG.bits(),
     ),
+    repost_local: false,
+    in_cycle: true,
 };
 
 /// `transformRecord.c:208` `POSTFIX_SIZE`, `SCALC_INFIX_TO_POSTFIX_SIZE(120)`.
@@ -660,6 +662,8 @@ impl Record for TransformRecord {
         Some(LinkCheck {
             spec: &TRANSFORM_LINK_CHECK,
             statuses: &mut self.link_status,
+            field_types: &mut [],
+            tail: None,
             state: &mut self.link_check,
         })
     }

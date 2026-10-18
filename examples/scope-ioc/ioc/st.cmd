@@ -16,7 +16,7 @@ epicsEnvSet("PORT",   "scopeSim")
 scopeSimulatorConfig("$(PORT)")
 
 # Load the scope database
-dbLoadRecords("$(SCOPE_IOC)/db/scopeSimulator.db", "P=$(PREFIX),R=$(PORT):,PORT=$(PORT)")
+dbLoadRecords("$(SCOPE_IOC)/db/scopeSimulator.db", "P=$(PREFIX),R=$(PORT):,PORT=$(PORT),ADDR=0,TIMEOUT=1,NPOINTS=1000")
 
 iocInit()
 
@@ -27,6 +27,6 @@ iocInit()
 #   dbpf SCOPE:scopeSim:Run 1                   # Start acquisition
 #   dbgf SCOPE:scopeSim:MeanValue_RBV           # Read mean value
 #   dbpf SCOPE:scopeSim:NoiseAmplitude 0.2      # Set noise
-#   dbpf SCOPE:scopeSim:VertGainSelect 3        # x10 gain
+#   dbpf SCOPE:scopeSim:VertGainSelect 10       # gain 10
 #   dbpf SCOPE:scopeSim:Run 0                   # Stop
 #   scopeSimulatorReport                        # Show driver status

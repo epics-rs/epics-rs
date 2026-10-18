@@ -34,7 +34,7 @@ fn the_boot_flush_posts_a_seeded_scalar_and_no_seeded_array() {
         1,
         PortFlags::default(),
         asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let val = base.create_param("VAL", ParamType::Float64).unwrap();
     let arr = base.create_param("ARR", ParamType::Float64Array).unwrap();
@@ -47,15 +47,19 @@ fn the_boot_flush_posts_a_seeded_scalar_and_no_seeded_array() {
 
     let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
-    let _sub = rt.port_handle().interrupts().register_sync_callback(
-        InterruptFilter {
-            reason: None,
-            addr: Some(0),
-            uint32_mask: None,
-            iface: None,
-        },
-        move |iv| sink.lock().unwrap().push(iv.reason),
-    );
+    let _sub = rt
+        .port_handle()
+        .interrupts()
+        .register_sync_callback(
+            InterruptFilter {
+                reason: None,
+                addr: Some(0),
+                uint32_mask: None,
+                iface: None,
+            },
+            move |iv| sink.lock().unwrap().push(iv.reason),
+        )
+        .unwrap();
 
     let gate = InterruptGate::new();
     asyn_rs::registry::register_port("BOOTARR", rt.port_handle().clone(), &gate).unwrap();

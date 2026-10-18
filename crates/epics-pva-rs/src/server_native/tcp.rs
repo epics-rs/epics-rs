@@ -37,8 +37,8 @@ use crate::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::peer_buf::try_extend;
 use crate::proto::{
-    BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
-    QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
+    BitSet, ByteOrder, Command, ControlCommand, MessageType, PVA_VERSION, PvaHeader, QosFlags,
+    Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_into,
@@ -4734,24 +4734,7 @@ pub(super) async fn handle_connection_io(
     let mut rx_type_cache = TypeCache::new();
 
     let max_msg_size = config.max_message_size;
-    // segmented-message reassembly state. pvxs conn.cpp:228-291
-    // accumulates SegFirst..SegMiddle..SegLast bodies into `segBuf`
-    // before dispatching. Without this, our server would treat every
-    // segment as a fresh message, decode garbage, and likely return
-    // a Decode error mid-payload. Sites that put bulk values
-    // (NTTable, large NTNDArray, multi-MiB NTScalarArray) over PVA
-    // hit segmented frames whenever the message exceeds the peer's
-    // buffer-size hint negotiated in CONNECTION_VALIDATION.
-    let mut seg_buf: Vec<u8> = Vec::new();
-    let mut seg_cmd: u8 = 0;
-    // Byte order of the message's initiating (SegFirst) frame. The
-    // reassembled synthetic frame must carry this order, not the server's
-    // configured outbound order, so downstream handlers decode the payload
-    // with the peer's actual order (pvxs latches `peerBE` once per logical
-    // message, conn.cpp:195-198). Seeded with `order` but always overwritten
-    // on the first segment before any synthetic frame is built.
-    let mut seg_order = order;
-    let mut expect_seg = false;
+    let mut reassembly = crate::decode::SegmentAssembler::default();
     // CREATE_CHANNEL resolution. `decode_create_channel` turns each frame
     // into per-name requests that wait in `pending_creates` until the
     // `cc_req_tx.reserve()` arm below hands them to this connection's
@@ -5238,69 +5221,8 @@ pub(super) async fn handle_connection_io(
             continue;
         }
 
-        // segmentation gate. Mirrors pvxs conn.cpp:228-244.
-        //   continuation = SegLast bit set (true for mid OR last)
-        //   * Violation when (continuation XOR expect_seg) — peer
-        //     interleaved a fresh first/unsegmented frame inside a
-        //     pending segmented message, OR sent a continuation when
-        //     none was pending.
-        //   * Violation when continuation && cmd != saved_cmd.
-        // Either case → drop connection (decode would be undefined).
-        let raw_seg = frame.header.flags.0 & HeaderFlags::SEGMENT_MASK;
-        let continuation = raw_seg & HeaderFlags::SEGMENT_LAST != 0;
-        if continuation ^ expect_seg || (continuation && frame.header.command != seg_cmd) {
-            return Err(PvaError::Protocol(format!(
-                "PVA segmentation violation: expect_seg={} continuation={} cmd 0x{:02x} vs saved 0x{:02x}",
-                expect_seg, continuation, frame.header.command, seg_cmd
-            )));
-        }
-        if raw_seg == 0 || raw_seg == HeaderFlags::SEGMENT_FIRST {
-            // Start of a new logical message — reset the accumulator
-            // (in unsegmented case both reset and dispatch happen
-            // below).
-            expect_seg = true;
-            seg_cmd = frame.header.command;
-            seg_order = frame.order();
-            seg_buf.clear();
-        }
-        // Cap reassembly on the *accumulated* size. read_frame enforces
-        // `max_message_size` per frame; without this an adversary streams
-        // SegFirst → SegMiddle … forever, every segment individually legal,
-        // and seg_buf grows without bound. The server's default is a ceiling
-        // (`config::DEFAULT_MAX_MESSAGE_SIZE`); `None` is the explicit opt-out
-        // to pvxs's uncapped RX, and only then does this guard stand down.
-        if let Some(cap) = max_msg_size {
-            if seg_buf.len().saturating_add(frame.payload.len()) > cap {
-                return Err(PvaError::Protocol(format!(
-                    "segmented PVA message exceeds max_message_size ({} > {})",
-                    seg_buf.len() + frame.payload.len(),
-                    cap
-                )));
-            }
-        }
-        try_extend(&mut seg_buf, &frame.payload, "the segment-reassembly buffer")?;
-        if raw_seg != 0 && raw_seg != HeaderFlags::SEGMENT_LAST {
-            // SegFirst (with following segments) or SegMiddle: keep
-            // accumulating, do not dispatch yet.
+        let Some(frame) = reassembly.push(frame, max_msg_size)? else {
             continue;
-        }
-        // Reaching here means: unsegmented (raw_seg==0) OR SegLast.
-        expect_seg = false;
-        // Build a synthetic Frame whose payload is the reassembled
-        // body; dispatch path inspects only `header.command` and
-        // `payload`, plus byte-order via `frame.order()`.
-        let frame = if raw_seg == 0 {
-            frame
-        } else {
-            Frame {
-                header: PvaHeader {
-                    version: frame.header.version,
-                    flags: HeaderFlags::new(false, false, seg_order),
-                    command: seg_cmd,
-                    payload_length: seg_buf.len() as u32,
-                },
-                payload: std::mem::take(&mut seg_buf),
-            }
         };
 
         // Pre-handshake: only CONNECTION_VALIDATION (1) is meaningful; client

@@ -12520,7 +12520,7 @@ record(ai, "ACB") { field(DTYP, "Async Soft Channel") field(INP, "SRC") }"#,
         let mut link = crate::server::record::PreparedCommonLink::for_put("INP", &text());
         link.as_mut().unwrap().ask_add_record(&db, &rec);
         rec.write().common.dtyp.set_name("Soft Channel");
-        let put = rec.write().gate_device_link_put(link.as_ref().unwrap());
+        let put = rec.write().gate_device_link_put(link.as_mut().unwrap());
         assert!(
             matches!(put, Err(crate::error::CaError::NoSupport)),
             "{put:?}"

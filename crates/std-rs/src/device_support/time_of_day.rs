@@ -237,6 +237,9 @@ mod tests {
             time: WallTime::UNIX_EPOCH,
             soft: None,
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            scan: epics_base_rs::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 
@@ -253,6 +256,9 @@ mod tests {
             time,
             soft: None,
             callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            scan: epics_base_rs::server::record::ScanType::Passive,
+            proc_field: 0,
+            tpro: 0,
         }
     }
 

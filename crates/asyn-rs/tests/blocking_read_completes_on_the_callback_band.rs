@@ -91,7 +91,7 @@ fn port(name: &str, can_block: bool, calls: &Calls) -> PortRuntimeHandle {
             ..PortFlags::default()
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     base.create_param("MSG", ParamType::Octet).unwrap();

@@ -159,15 +159,28 @@ pub fn register_device_menu(record_type: &str, menu: &'static [DevSup]) {
     publish_rows(record_type, menu);
 }
 
-/// A row only a loaded `.dbd`'s `device()` line added, and the choice of the
-/// row whose dset it names. C's `dbDevice` stores just the dset NAME and
-/// `initDevSup` finds the dset by it (`iocInit.c:453`); here every dset with
-/// support already has a row of its own, since each registration brings one
-/// before the startup script runs, so the name finds that row or nothing.
+/// A row only a loaded `.dbd`'s `device()` line added, and what its dset
+/// name found. C's `dbDevice` stores just the dset NAME and `initDevSup`
+/// finds the dset by it in the global registry (`iocInit.c:453`); here every
+/// dset with support already has a row of its own, since each registration
+/// brings one before the startup script runs, so the name finds that row or
+/// nothing.
 #[derive(Clone, Copy)]
 struct LoadedRow {
     row: &'static DevSup,
-    served_by: Option<&'static str>,
+    bound: Bound,
+}
+
+#[derive(Clone, Copy)]
+enum Bound {
+    /// The dset serves this record type under this choice.
+    Choice(&'static str),
+    /// The dset is registered for another record type. C binds it anyway and
+    /// a record using the choice crashes in it; here the choice serves
+    /// nothing.
+    OtherType,
+    /// No dset has the name: `device support %s not found`.
+    Missing,
 }
 
 /// The loaded rows by record type in C's `recordTypeList` order (`strcmp`,
@@ -186,17 +199,17 @@ fn loaded() -> Option<&'static Loaded> {
 /// menu as C's `dbDevice` appends it to `devList`, a choice already listed
 /// skipped.
 pub(crate) fn load_dbd_device(record_type: &str, link_type: DbLinkType, dset: &str, choice: &str) {
-    let declared = super::dbd_generated::devices(record_type).unwrap_or_default();
-    let named = declared
-        .iter()
-        .chain(menus_of(record_type).iter().flat_map(|menu| menu.iter()))
-        .find(|row| row.name == dset);
-    let served_by = named.map(|row| served_choice(record_type, row.choice));
+    let named = registered_dset(dset);
+    let bound = match named {
+        Some((rt, row)) if rt == record_type => Bound::Choice(served_choice(rt, row.choice)),
+        Some(_) => Bound::OtherType,
+        None => Bound::Missing,
+    };
     let row: &'static DevSup = Box::leak(Box::new(DevSup {
         name: Box::leak(dset.into()),
         choice: Box::leak(choice.into()),
         link_type,
-        dset: named.map_or(Dset::new(0, &[], false), |row| row.dset),
+        dset: named.map_or(Dset::new(0, &[], false), |(_, row)| row.dset),
     }));
     if !publish_rows(record_type, std::slice::from_ref(row)) {
         return;
@@ -205,8 +218,35 @@ pub(crate) fn load_dbd_device(record_type: &str, link_type: DbLinkType, dset: &s
     let mut next = loaded().cloned().unwrap_or_default();
     next.entry(Box::leak(record_type.into()))
         .or_default()
-        .push(LoadedRow { row, served_by });
+        .push(LoadedRow { row, bound });
     LOADED.store(Box::into_raw(Box::new(next)), Ordering::Release);
+}
+
+/// C `registryDeviceSupportFind(name)`: the record type and row of the dset
+/// called `name`, of any record type. A loaded row is no registration of its
+/// own.
+fn registered_dset(name: &str) -> Option<(&'static str, &'static DevSup)> {
+    let loaded_rows: Vec<&DevSup> = loaded()
+        .into_iter()
+        .flat_map(|loaded| loaded.values().flatten())
+        .map(|r| r.row)
+        .collect();
+    let declared = super::dbd_generated::DEVICE_MENU_RECORD_TYPES
+        .iter()
+        .flat_map(|&rt| {
+            let rows = super::dbd_generated::devices(rt).unwrap_or_default();
+            rows.iter().map(move |row| (rt, row))
+        });
+    let contributed = contributed().iter().flat_map(|(rt, menus)| {
+        menus
+            .iter()
+            .flat_map(|menu| menu.iter())
+            .map(move |row| (*rt, row))
+    });
+    declared
+        .chain(contributed)
+        .filter(|(_, row)| !loaded_rows.iter().any(|l| std::ptr::eq(*l, *row)))
+        .find(|(_, row)| row.name == name)
 }
 
 /// The choice whose support serves `dtyp` on `record_type`: `dtyp` itself,
@@ -215,7 +255,10 @@ pub(crate) fn served_choice<'a>(record_type: &str, dtyp: &'a str) -> &'a str {
     loaded()
         .and_then(|loaded| loaded.get(record_type))
         .and_then(|rows| rows.iter().find(|r| r.row.choice == dtyp))
-        .and_then(|r| r.served_by)
+        .and_then(|r| match r.bound {
+            Bound::Choice(choice) => Some(choice),
+            Bound::OtherType | Bound::Missing => None,
+        })
         .unwrap_or(dtyp)
 }
 
@@ -225,7 +268,7 @@ pub(crate) fn unserved_dsets() -> Vec<&'static str> {
     loaded()
         .into_iter()
         .flat_map(|loaded| loaded.values().flatten())
-        .filter(|r| r.served_by.is_none())
+        .filter(|r| matches!(r.bound, Bound::Missing))
         .map(|r| r.row.name)
         .collect()
 }

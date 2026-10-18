@@ -163,6 +163,34 @@ device(aSub,CONSTANT,devAS,"AS")
 /// `dbDevice` stores the dset NAME and `initDevSup` finds the dset by it, so
 /// a new choice naming a dset the IOC already has is that support: a soft
 /// one, a builtin one, and only the name nothing registered is reported.
+/// `registryDeviceSupportFind` is one registry for every record type, so a
+/// dset named for another type is found and `initDevSup` says nothing.
+/// softIoc then crashes in a record using the choice; that is not copied.
+#[test]
+fn a_dset_of_another_record_type_is_found() {
+    const DBD: &str = r#"device(ao,CONSTANT,devAiSoft,"X")
+device(ai,CONSTANT,devNope,"Y")
+device(bo,CONSTANT,devNope,"Z")
+device(longin,CONSTANT,devTimestampAI,"T")
+"#;
+    let (_, stderr) = softioc(&[
+        ("x.dbd", DBD),
+        ("st.cmd", "dbLoadDatabase x.dbd\niocInit\n"),
+    ]);
+    let named: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("device support "))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            "device support devNope not found",
+            "device support devNope not found",
+        ],
+        "{stderr}"
+    );
+}
+
 #[test]
 fn a_new_choice_naming_a_known_dset_binds_it() {
     const DBD: &str = r#"device(ai,CONSTANT,devAiSoft,"MySoft")

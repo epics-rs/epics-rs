@@ -1865,7 +1865,7 @@ impl<'a> ValueCow<'a> {
 /// Flatten 0xFD/0xFE markers embedded in `any` payloads of a bitset-gated
 /// value of type `desc`, starting at `value_start` in `src`. `bitset` is the
 /// changed-field set (pvData §5.4 numbering, root = bit 0). Used for
-/// GET/PUT/MONITOR/PUT_GET DATA values.
+/// GET/PUT/MONITOR DATA values.
 ///
 /// Returns the cursor position at the end of the value and, when a marker
 /// was actually rewritten, the replacement bytes for `src[value_start..end]`.

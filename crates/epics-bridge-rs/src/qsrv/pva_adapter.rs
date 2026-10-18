@@ -589,7 +589,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 
     /// The framed read: the value from `get_value_checked` plus the
     /// leaves QSRV actually assigned into it (`read_marks`). Without this
-    /// the GET reply, the PUT_GET readback and the monitor seed all framed
+    /// the GET reply, the PUT readback and the monitor seed all framed
     /// EVERY leaf the request selected — including the seven the port's NT
     /// carries but pvxs's `getProperties` never assigns.
     fn read_checked(
@@ -643,7 +643,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             //
             // the group arm previously called `other.put(&pv)`,
             // which re-parses options from the data-phase value — so a
-            // native PVA group PUT/PUT_GET whose `record._options.atomic`
+            // native PVA group PUT whose `record._options.atomic`
             // lives only in the INIT pvRequest was silently ignored.
             // Route the group through `put_with_options` with the same
             // INIT-pvRequest-derived options, matching pvxs
@@ -673,7 +673,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
-    /// BitSet-delta PUT (PVA PUT / PUT_GET data phase).
+    /// BitSet-delta PUT (PVA PUT data phase).
     ///
     /// The generic default (`source.rs` `put_delta_checked`) reads the
     /// PV's current full value and overlays the marked leaves

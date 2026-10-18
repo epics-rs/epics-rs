@@ -29,6 +29,9 @@ mod interop_helpers;
 #[path = "interop_pvxs_mods/access_denied.rs"]
 mod access_denied;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/array_cmd14.rs"]
+mod array_cmd14;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/asg_cross_impl.rs"]
 mod asg_cross_impl;
 #[cfg(unix)]
@@ -67,6 +70,9 @@ mod process_cmd16;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/put_cross_impl.rs"]
 mod put_cross_impl;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/put_get_cmd12.rs"]
+mod put_get_cmd12;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/reverse_complex_types.rs"]
 mod reverse_complex_types;

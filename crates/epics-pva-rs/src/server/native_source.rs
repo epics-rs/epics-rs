@@ -955,7 +955,7 @@ fn fill_timestamp(v: &mut PvField, at: &EventLeaves, time: WallTime, utag: i32) 
 }
 
 /// The leaves one QSRV read assigns into its `cloneEmpty()` — the exact set
-/// a GET reply / PUT_GET readback / monitor seed frames.
+/// a GET reply / PUT readback / monitor seed frames.
 ///
 /// pvxs runs `IOCSource::initialize` then `IOCSource::get(…, Everything, …)`
 /// for every single-record read (`singlesource.cpp:283`), which is:
@@ -1371,7 +1371,7 @@ impl ChannelSource for PvDatabaseSource {
     /// The value half of [`Self::read_checked`], for the trait's value-only
     /// consumers: `put_delta_checked`'s prior-value merge and
     /// `CompositeSource`'s owner-resolving forward. No wire reply is framed
-    /// from it — GET, the PUT_GET readback and the monitor seed all take
+    /// from it — GET, the PUT readback and the monitor seed all take
     /// `read_checked` and frame its marks.
     ///
     /// Delegating instead of snapshotting again leaves this source one READ
@@ -4486,7 +4486,7 @@ ASG(LOCKED) {
 
     /// The same denial on the path the wire actually takes.
     ///
-    /// Every native GET, PUT_GET readback and monitor seed calls
+    /// Every native GET, PUT readback and monitor seed calls
     /// `read_checked` ([`crate::server_native::tcp`] `:5079`, `:7365`,
     /// `:7506`), never `get_value_checked`; the wire layer mints the
     /// `AccessChecked` and hands it over without inspecting it, so the token

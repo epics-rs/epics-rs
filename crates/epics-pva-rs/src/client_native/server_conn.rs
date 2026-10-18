@@ -125,7 +125,7 @@ pub(crate) enum IoidSlot {
     /// delete the `Reusable` slot the next GET reply is routed to.
     TwoShot(VecDeque<oneshot::Sender<Frame>>),
     /// Multi-frame ops whose frame count the op itself bounds (GetField,
-    /// PUT sequences, RPC, PUT_GET, ARRAY, PROCESS): unbounded channel.
+    /// PUT sequences, RPC): unbounded channel.
     Stream(mpsc::UnboundedSender<Frame>),
     /// MONITOR: the server-driven stream, bounded at the subscription's
     /// `queueSize` with pvxs's tail squash
@@ -187,8 +187,7 @@ pub struct ServerConn {
     /// because IOID alone is enough to find a registered sink.
     ioid_to_cmd: Arc<DashMap<u32, u8>>,
     /// Per-IOID introspection captured by the reader task from each op's
-    /// INIT response (Get/Put/Monitor → the single descriptor; PUT_GET →
-    /// getIF). The reader consults it to value-flatten 0xFD/0xFE markers
+    /// INIT response (Get/Put/Monitor → the single descriptor). The reader consults it to value-flatten 0xFD/0xFE markers
     /// embedded in an `any` DATA value (see
     /// [`flatten_type_cache_markers`](crate::client_native::decode::flatten_type_cache_markers)).
     /// Inserted on INIT, dropped on MONITOR FINISH and on
@@ -999,7 +998,7 @@ impl ServerConn {
                                     &mut reader_type_cache,
                                     &op_introspection_reader,
                                 );
-                                route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
+                                route_frame(dispatch_frame, target, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
                             }
                         }
                         Err(_) => break,
@@ -1308,7 +1307,7 @@ impl ServerConn {
 
     /// Register a stream of frames matching a particular ioid, for an op
     /// whose reply count the op itself bounds (GetField, the PUT
-    /// sequences, RPC, PUT_GET, ARRAY, PROCESS).
+    /// sequences, RPC).
     ///
     /// NOT for MONITOR — see `Self::register_ioid_monitor`.
     pub fn register_ioid_stream(
@@ -1615,6 +1614,7 @@ struct FrameFault(String);
 #[allow(clippy::too_many_arguments)]
 fn route_frame(
     frame: Frame,
+    peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
@@ -1627,6 +1627,7 @@ fn route_frame(
     let cmd = frame.header.command;
     if let Err(FrameFault(reason)) = route_frame_checked(
         frame,
+        peer,
         by_ioid,
         by_cid,
         by_sid_close,
@@ -1647,6 +1648,7 @@ fn route_frame(
 #[allow(clippy::too_many_arguments)]
 fn route_frame_checked(
     frame: Frame,
+    peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
@@ -1773,21 +1775,43 @@ fn route_frame_checked(
         }
     }
 
-    // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
-    // Every one of those pvxs handlers reads the IOID off the wire first and
+    // Nothing but an op reply routes by IOID. pvxs's client reaches no
+    // handler for any other command: the listed ones hit the base no-op
+    // `handle_X`, the rest the `default:` that logs and drains
+    // (conn.cpp:248-251), whatever IOID the body would carry.
+    if !is_op_reply(cmd) {
+        let listed = matches!(
+            Command::from_code(cmd),
+            Some(
+                Command::Echo
+                    | Command::ConnectionValidation
+                    | Command::ConnectionValidated
+                    | Command::Search
+                    | Command::SearchResponse
+                    | Command::AuthNZ
+                    | Command::PutGet
+                    | Command::DestroyRequest
+                    | Command::CancelRequest
+            )
+        );
+        if !listed {
+            crate::pvxs_log::log(
+                crate::pvxs_log::TCP_IO,
+                crate::pvxs_log::Level::Debug,
+                format_args!("Server {peer} Ignore unexpected command 0x{cmd:02x}"),
+            );
+        }
+        return Ok(());
+    }
+
+    // Every op reply handler reads the IOID off the wire first and
     // disconnects when the payload cannot carry it (`!M.good()` →
     // "sends invalid op%02x. Disconnecting...", clientget.cpp:490-494;
-    // clientmon.cpp / clientintrospect.cpp do the same). Any OTHER command
-    // stays ignorable: pvxs's dispatch switch drains an unexpected command's
-    // body and continues, for forward compatibility (conn.cpp:250-252).
+    // clientmon.cpp / clientintrospect.cpp do the same).
     let Some(ioid) = peek_u32(&frame.payload, 0, order) else {
-        return if is_op_reply(cmd) {
-            Err(FrameFault(format!(
-                "op reply payload too short for IOID (cmd {cmd})"
-            )))
-        } else {
-            Ok(())
-        };
+        return Err(FrameFault(format!(
+            "op reply payload too short for IOID (cmd {cmd})"
+        )));
     };
     {
         // Attribute this reply's wire length to the owning channel's
@@ -1842,18 +1866,15 @@ fn route_frame_checked(
         }
     }
     // An IOID with no dispatch slot drops silently (the op completed or was
-    // cancelled; Beacons/SearchResponse are handled out-of-band by the search
-    // engine, not here).
+    // cancelled).
     Ok(())
 }
 
 /// Commands whose client-side pvxs handler routes by a leading IOID and
-/// disconnects on a decode fault. Anything else the server sends is
-/// forward-compatible filler that pvxs drains and ignores (conn.cpp:250-252).
+/// disconnects on a decode fault.
 fn is_op_reply(cmd: u8) -> bool {
     cmd == Command::Get.code()
         || cmd == Command::Put.code()
-        || cmd == Command::PutGet.code()
         || cmd == Command::Monitor.code()
         || cmd == Command::Rpc.code()
         || cmd == Command::GetField.code()
@@ -2358,6 +2379,11 @@ mod tests {
         );
     }
 
+    const ROUTER_PEER: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        5075,
+    ));
+
     /// Build a fresh set of router DashMaps + cancel token + writer_tx
     /// for unit tests. The writer receiver is leaked (Drop'd) so any
     /// destroy frames the route emits during the test go to /dev/null
@@ -2419,6 +2445,7 @@ mod tests {
             PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2447,6 +2474,7 @@ mod tests {
                 header: header2,
                 payload: payload2,
             },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2486,6 +2514,7 @@ mod tests {
 
         route_frame(
             frame,
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2538,6 +2567,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2591,6 +2621,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2642,6 +2673,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2722,6 +2754,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2776,6 +2809,7 @@ mod tests {
         let header = PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -2796,6 +2830,92 @@ mod tests {
         );
     }
 
+    /// pvxs's client handles nothing outside its dispatch list, whatever IOID
+    /// the body carries: `conn.cpp:250` logs "Ignore unexpected command" for
+    /// those, and a listed command with no client handler (the base no-op
+    /// `handle_X`) is dropped without a line.
+    #[test]
+    fn unhandled_server_commands_log_as_pvxs_and_keep_the_circuit() {
+        use epics_base_rs::runtime::log;
+        let order = ByteOrder::Little;
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push(line.trim_end().to_string());
+            }
+        });
+        crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Debug);
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        // An open GET at IOID 7: an unhandled command naming it must not be
+        // taken for its reply.
+        let (tx, mut rx) = oneshot::channel();
+        by_ioid.insert(7, IoidSlot::TwoShot(VecDeque::from([tx])));
+        ioid_to_cmd.insert(7, Command::Get.code());
+        let mut payload = Vec::new();
+        payload.put_u32(7, order);
+        payload.put_u8(0x08);
+        for cmd in [
+            Command::Array.code(),
+            Command::Beacon.code(),
+            Command::AclChange.code(),
+            Command::Process.code(),
+            Command::MultipleData.code(),
+            Command::OriginTag.code(),
+            0x30,
+            Command::Echo.code(),
+            Command::ConnectionValidation.code(),
+            Command::ConnectionValidated.code(),
+            Command::Search.code(),
+            Command::SearchResponse.code(),
+            Command::AuthNZ.code(),
+            Command::PutGet.code(),
+            Command::DestroyRequest.code(),
+            Command::CancelRequest.code(),
+        ] {
+            let header = PvaHeader::application(true, order, cmd, payload.len() as u32);
+            route_frame(
+                Frame {
+                    header,
+                    payload: payload.clone(),
+                },
+                ROUTER_PEER,
+                &by_ioid,
+                &by_cid,
+                &by_sid_close,
+                &ioid_to_sid,
+                &ioid_to_cmd,
+                &Arc::new(DashMap::new()),
+                &writer_tx,
+                &cancel,
+            );
+        }
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Warn);
+        let heard: Vec<String> = heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(&format!("Server {ROUTER_PEER} ")))
+            .cloned()
+            .collect();
+        let line = |cmd: u8| {
+            format!("DEBUG pvxs.tcp.io Server {ROUTER_PEER} Ignore unexpected command 0x{cmd:02x}")
+        };
+        assert_eq!(
+            heard,
+            [0x0e, 0x00, 0x06, 0x10, 0x13, 0x16, 0x30].map(line),
+            "one line per command outside pvxs's dispatch list, none for the listed ones"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "an unhandled command keeps the circuit"
+        );
+        assert!(rx.try_recv().is_err(), "the open GET got no reply");
+    }
+
     /// pvxs tears the circuit down for every server frame it cannot decode:
     /// `handle_MESSAGE` throws on `!M.good()` (clientconn.cpp:454-455) and the
     /// dispatch catch calls `bev.reset()` (conn.cpp:277-281); CREATE_CHANNEL
@@ -2813,6 +2933,7 @@ mod tests {
             let header = PvaHeader::application(true, order, cmd, payload.len() as u32);
             route_frame(
                 Frame { header, payload },
+                ROUTER_PEER,
                 &by_ioid,
                 &by_cid,
                 &by_sid_close,
@@ -2863,7 +2984,6 @@ mod tests {
         for cmd in [
             Command::Get.code(),
             Command::Put.code(),
-            Command::PutGet.code(),
             Command::Monitor.code(),
             Command::Rpc.code(),
             Command::GetField.code(),
@@ -2875,11 +2995,14 @@ mod tests {
         }
 
         // Forward compatibility: an unknown command with a short payload is
-        // drained and ignored, exactly as pvxs's dispatch default does.
-        assert!(
-            !route(Command::MultipleData.code(), vec![0x00]),
-            "an unhandled command must stay ignorable, not close the circuit"
-        );
+        // drained and ignored, exactly as pvxs's dispatch default does. The
+        // client's PUT_GET handler is ConnBase's no-op, so it drains too.
+        for cmd in [Command::MultipleData, Command::Array, Command::PutGet] {
+            assert!(
+                !route(cmd.code(), vec![0x00]),
+                "an unhandled command ({cmd:?}) must stay ignorable, not close the circuit"
+            );
+        }
     }
 
     /// Same per-frame-order requirement for CREATE_CHANNEL CID routing —
@@ -2905,6 +3028,7 @@ mod tests {
         );
         route_frame(
             Frame { header, payload },
+            ROUTER_PEER,
             &by_ioid,
             &by_cid,
             &by_sid_close,
@@ -3919,6 +4043,7 @@ mod tests {
         let route = |frame: Frame| {
             route_frame(
                 frame,
+                ROUTER_PEER,
                 &by_ioid,
                 &by_cid,
                 &by_sid_close,

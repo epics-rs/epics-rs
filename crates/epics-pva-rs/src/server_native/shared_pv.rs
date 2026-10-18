@@ -852,7 +852,7 @@ impl SharedPV {
 
     /// Apply a **BitSet-delta PUT** atomically.
     ///
-    /// PVA PUT/PUT_GET data frames carry only the changed fields plus
+    /// PVA PUT data frames carry only the changed fields plus
     /// a changed-BitSet (pvData spec §5.4). Applying such a delta
     /// requires read-merge-write: read the PV's current "complete"
     /// value, overlay the marked fields from `delta`, store the

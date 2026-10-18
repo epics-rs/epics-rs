@@ -876,8 +876,8 @@ struct ParkCtx<'a> {
 /// The single owner of the port's `pending`/`mpending` (pvxs
 /// `sharedpv.cpp:239-249`, `:259-275`): every INIT that needs a prototype
 /// comes here when the channel has none, whatever the command, so a PV
-/// opened after a client connected serves GET, PUT, MONITOR, PUT_GET and
-/// PROCESS alike — `SharedPV::open` completes them all at once
+/// opened after a client connected serves GET, PUT and MONITOR
+/// alike — `SharedPV::open` completes them all at once
 /// (`:348-384`), and the search that let the client connect never
 /// consulted the open state either (`:478-488`).
 ///
@@ -1068,7 +1068,7 @@ fn apply_monitor_finish(channels: &mut ChannelTable, fin: MonitorFinished) {
     }
 }
 
-/// in-flight state of a non-monitor (GET/PUT/RPC/PUT_GET/PROCESS)
+/// in-flight state of a non-monitor (GET/PUT/RPC)
 /// data-phase op. pvxs models this as `ServerOp::state`
 /// (`serverget.cpp:467-476`, `:511-514`): a data-phase EXEC runs only when
 /// the op is `Idle`, flips it to `Executing`, and the op returns to `Idle`
@@ -1124,8 +1124,8 @@ struct ExecFinished {
     /// For a GPR op (GET/PUT/RPC) the read-loop owner cleans up a
     /// `last_request` op ONLY after success; an error reply returns the op to
     /// `Idle` with the marker preserved for a later EXEC (pvxs
-    /// `ServerGPR::doReply`, `serverget.cpp:86-116`). For one-shot /
-    /// pvAccessCPP-modeled kinds (GET_FIELD, PUT_GET, PROCESS, ARRAY) the owner
+    /// `ServerGPR::doReply`, `serverget.cpp:86-116`). For the one-shot
+    /// GET_FIELD the owner
     /// ignores this flag and removes a `last_request` op on every terminal
     /// reply (see [`apply_exec_finish`]); those tasks leave it `false`.
     ///
@@ -1134,7 +1134,7 @@ struct ExecFinished {
     /// exit that does not go through [`ExecFinishGuard::reply`] with `true` —
     /// error replies, panics, and aborts all leave it as built.
     success: bool,
-    /// PUT/PUT_GET decode scratch travelling back to its channel
+    /// PUT decode scratch travelling back to its channel
     /// ([`ChannelState::put_scratch`]) once the source call released its
     /// borrow. `None` for every other op kind, and for exec exits (panic,
     /// abort) that lost the value. A stale-`op_id` signal may still return
@@ -1258,12 +1258,11 @@ impl Drop for ExecFinishGuard {
 ///   returns the op to `Idle` (`:89-90`, `:114-115`) WITHOUT touching
 ///   `last_request` — the sticky marker survives an error for a later EXEC.
 ///   So removal requires `last_request && success`; otherwise return to Idle.
-/// - one-shot / pvAccessCPP-modeled (`GetField`/`PutGet`/`Process`/`Array`):
+/// - one-shot (`GetField`):
 ///   `GET_FIELD` is a `ServerIntrospect` removed on EVERY terminal reply,
 ///   success or error (`serverintrospect.cpp:47-49`; the Rust slow path always
-///   reserves it as `last_request`); `PUT_GET`/`PROCESS`/`ARRAY` follow the
-///   pvAccessCPP destroy-after-reply lifecycle. These keep the unconditional
-///   `last_request` rule and ignore `success`.
+///   reserves it as `last_request`). It keeps the unconditional
+///   `last_request` rule and ignores `success`.
 ///
 /// In every case the reply has already been sent, so this is where the IOID —
 /// kept reserved until exactly this point so a re-INIT racing a slow source
@@ -1292,7 +1291,7 @@ fn apply_exec_finish(channels: &mut ChannelTable, fin: ExecFinished) {
         // successful reply; an error reply keeps the op Idle with the sticky
         // last_request marker for a later EXEC.
         OpKind::Get | OpKind::Put | OpKind::Rpc => last_request && fin.success,
-        // GET_FIELD one-shot + pvAccessCPP PUT_GET/PROCESS/ARRAY: removed once
+        // GET_FIELD one-shot: removed once
         // the single reserved reply is out, regardless of status.
         _ => last_request,
     };
@@ -1390,7 +1389,7 @@ mod chan_table {
         /// is exactly what pvxs's `conn->onClose` erase does.
         parked: ParkedOps,
         /// Reusable PUT-delta decode scratch, keyed by the op intro it was
-        /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
+        /// built for (`Arc::ptr_eq`). A PUT EXEC takes it, decodes
         /// the marked fields in place ([`super::decode_pv_field_with_bitset_into`])
         /// and the exec body returns it through [`super::ExecFinished`] once the
         /// source call is done. Channel-level (not per-op) because a pvput
@@ -1687,7 +1686,7 @@ fn data_phase_owner_sid(
 /// becomes a recoverable `Err` instead of unwinding the spawned exec task.
 ///
 /// Each data-phase exec task builds and sends its single client reply *after*
-/// awaiting the handler (GET/PUT/PUT_GET/PROCESS/RPC). An uncaught panic would
+/// awaiting the handler (GET/PUT/RPC). An uncaught panic would
 /// skip that reply: [`ExecFinishGuard`] still returns the op to `Idle`, but the
 /// client receives no response and waits out its full operation timeout. By
 /// mapping the panic to `Err`, the caller routes it into the same
@@ -1720,16 +1719,8 @@ struct OpState {
     monitor_abort: Option<Arc<HostedAbort>>,
     /// Field mask derived from the client's pvRequest at INIT time.
     /// Drives the changed-bitset and partial-value encoding so the
-    /// server only emits what was requested. For a PUT_GET op this is
-    /// the GET-leg (`getField`) mask — the readback projection used by
-    /// `putGet` and `getGet`.
+    /// server only emits what was requested.
     mask: BitSet,
-    /// PUT-leg (`putField`) mask for a PUT_GET op, used by the `getPut`
-    /// sub-command to project the put-side structure's current value
-    /// (pvDatabaseCPP `ChannelPutGetLocal` builds separate putField /
-    /// getField copies, channelLocal.cpp). `None` for every other op
-    /// kind, which has a single selection mask in [`Self::mask`].
-    put_mask: Option<BitSet>,
     /// Pipeline credit window. pvxs `MonitorOp::window` —
     /// when pipeline mode is active, the server emits at most this
     /// many events before pausing until the client sends a
@@ -1817,7 +1808,7 @@ struct OpState {
     /// transparently across a shared upstream monitor.
     monitor_options: crate::server_native::source::MonitorOptions,
     /// abort guard for the spawned data-phase task (GET /
-    /// PUT / RPC / PUT_GET / PROCESS exec). When a DESTROY_REQUEST
+    /// PUT / RPC exec). When a DESTROY_REQUEST
     /// arrives, dropping the Op removes this Arc; once the last clone
     /// is dropped, `AbortOnDrop::drop()` fires and the task is
     /// cancelled, preventing a stale response from reaching the
@@ -1832,8 +1823,8 @@ struct OpState {
     /// fires the terminal `notify_monitor_start(false)` iff still
     /// executing.
     monitor_start_ctl: Option<Arc<MonitorStartControl>>,
-    /// in-flight EXEC state for non-monitor (GET/PUT/RPC/PUT_GET/
-    /// PROCESS) ops. `Idle` at INIT; flipped to `Executing` by [`begin_exec`]
+    /// in-flight EXEC state for non-monitor (GET/PUT/RPC)
+    /// ops. `Idle` at INIT; flipped to `Executing` by [`begin_exec`]
     /// when a data-phase EXEC is accepted, and back to `Idle` by
     /// [`apply_exec_finish`] when the spawned task's response is sent. A
     /// second EXEC while `Executing` is ignored rather than aborting the
@@ -3233,13 +3224,6 @@ enum OpKind {
     Put,
     Monitor,
     Rpc,
-    /// PVA `PUT_GET` (cmd 12): atomic put-then-get round trip.
-    PutGet,
-    /// PVA `ARRAY` (cmd 14): ChannelArray windowed-array operation
-    /// (INIT binds an array field, then get/put a `[offset,count,stride]`
-    /// slice or get/set its length). pvAccessCPP
-    /// `responseHandlers.cpp:2115-2208`.
-    Array,
     /// PVA `GET_FIELD` (cmd 17): one-shot introspection. pvxs models this
     /// as a real `ServerIntrospect` op in `opByIOID`
     /// (serverintrospect.cpp:141-178); the Rust slow path reserves its
@@ -3256,8 +3240,6 @@ impl OpKind {
             OpKind::Put => Command::Put,
             OpKind::Monitor => Command::Monitor,
             OpKind::Rpc => Command::Rpc,
-            OpKind::PutGet => Command::PutGet,
-            OpKind::Array => Command::Array,
             OpKind::GetField => Command::GetField,
         }
     }
@@ -4796,7 +4778,7 @@ pub(super) async fn handle_connection_io(
     // so the guard's sync `Drop` never loses a signal; the queue holds at
     // most one entry per live op.
     let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
-    // a spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase task signals
+    // a spawned GET/PUT/RPC data-phase task signals
     // here when its response is sent so the owner can return the op to `Idle`
     // (see [`ExecFinished`]/[`apply_exec_finish`]). Same unbounded-so-Drop-
     // never-loses rationale as `mon_fin_tx`.
@@ -5052,7 +5034,7 @@ pub(super) async fn handle_connection_io(
                 continue;
             }
             exec_opt = exec_fin_rx.recv() => {
-                // a GET/PUT/RPC/PUT_GET/PROCESS data-phase task sent
+                // a GET/PUT/RPC data-phase task sent
                 // its response and ended. Return the op to `Idle` through the
                 // owner so a later explicit re-EXEC is accepted, gated on the
                 // op-instance id so a stale signal cannot flip a re-INIT'd op
@@ -5098,45 +5080,24 @@ pub(super) async fn handle_connection_io(
                 // channel — reads a real prototype.
                 ch.introspection = Some(desc);
                 let frame = parked.frame;
-                match parked.kind {
-                    OpKind::PutGet => {
-                        handle_put_get(
-                            &reactor,
-                            &frame,
-                            &tx,
-                            &mut channels,
-                            order,
-                            &config,
-                            &mut encode_type_cache,
-                            &mut rx_type_cache,
-                            peer,
-                            &cred,
-                            &exec_fin_tx,
-                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
-                        )
-                        .await?;
-                    }
-                    kind => {
-                        handle_op(
-                            &reactor,
-                            &frame,
-                            &tx,
-                            &mut channels,
-                            order,
-                            &out_order,
-                            kind,
-                            &config,
-                            &mut encode_type_cache,
-                            &mut rx_type_cache,
-                            peer,
-                            &cred,
-                            &mon_fin_tx,
-                            &exec_fin_tx,
-                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
-                        )
-                        .await?;
-                    }
-                }
+                handle_op(
+                    &reactor,
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    &out_order,
+                    parked.kind,
+                    &config,
+                    &mut encode_type_cache,
+                    &mut rx_type_cache,
+                    peer,
+                    &cred,
+                    &mon_fin_tx,
+                    &exec_fin_tx,
+                    &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
+                )
+                .await?;
                 continue;
             }
             permit = cc_req_tx.reserve(), if !pending_creates.is_empty() => {
@@ -5514,55 +5475,6 @@ pub(super) async fn handle_connection_io(
             Some(Command::Message) => {
                 handle_message(&frame, &channels, &peer)?;
             }
-            Some(Command::PutGet) => {
-                // atomic put-then-get. The PVA wire spec defines
-                // PUT_GET as a separate command (cmd 12). pvxs leaves
-                // `handle_PUT_GET` empty, but we implement the full
-                // INIT/PUT/GET/DESTROY lifecycle on the Rust side so
-                // a PUT_GET-capable client gets a real round trip.
-                peer_entry.op_init();
-                handle_put_get(
-                    &reactor,
-                    &frame,
-                    &tx,
-                    &mut channels,
-                    order,
-                    &config,
-                    &mut encode_type_cache,
-                    &mut rx_type_cache,
-                    peer,
-                    &cred,
-                    &exec_fin_tx,
-                    &park,
-                )
-                .await?;
-            }
-            Some(Command::Array) => {
-                // ChannelArray windowed-array op (PVA cmd 14). Full
-                // INIT / getArray / putArray / setLength / getLength /
-                // DESTROY lifecycle routed through the source's
-                // `channel_array_*` methods (READ/WRITE-class ACF gates).
-                // Pre-fix this command had no arm and the frame fell
-                // through to the silent default — a ChannelArray client
-                // hung waiting for the INIT reply. The default source
-                // impl rejects with a protocol `Status` error so the
-                // client always gets an answer.
-                peer_entry.op_init();
-                handle_channel_array(
-                    &reactor,
-                    &frame,
-                    &tx,
-                    &mut channels,
-                    order,
-                    &config,
-                    &mut encode_type_cache,
-                    &mut rx_type_cache,
-                    peer,
-                    &cred,
-                    &exec_fin_tx,
-                )
-                .await?;
-            }
             Some(Command::Echo) => {
                 // Echo back the same frame.
                 let mut buf = Vec::new();
@@ -5599,8 +5511,14 @@ pub(super) async fn handle_connection_io(
                 )
                 .await?;
             }
-            // In pvxs `ConnBase::bevRead`'s switch with a no-op handler.
-            Some(Command::SearchResponse | Command::AuthNZ | Command::ConnectionValidated) => {}
+            // In pvxs `ConnBase::bevRead`'s switch with a no-op handler
+            // (PUT_GET's is `ServerConn::handle_PUT_GET() {}`).
+            Some(
+                Command::SearchResponse
+                | Command::AuthNZ
+                | Command::ConnectionValidated
+                | Command::PutGet,
+            ) => {}
             // Its `default:` (conn.cpp:248-251): logged, dropped, no reply.
             _ => crate::pvxs_log::log(
                 crate::pvxs_log::TCP_IO,
@@ -5670,8 +5588,7 @@ fn decode_init_pv_request_value(
 }
 
 /// Decode an INIT pvRequest (`type + full value`) — the single owner of the
-/// INIT pvRequest wire shape for every op kind (GET / PUT / MONITOR / RPC /
-/// PUT_GET / PROCESS / ARRAY).
+/// INIT pvRequest wire shape for every op kind (GET / PUT / MONITOR / RPC).
 ///
 /// pvxs `from_wire_type_value` (`dataencode.cpp:747-753`):
 ///
@@ -5772,7 +5689,7 @@ fn decode_rpc_exec_arg(
 }
 
 /// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
-/// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
+/// RPC). The monitor-specific fields are all defaulted
 /// to inert values — these ops never spawn a subscriber task.
 fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> OpState {
     OpState {
@@ -5781,7 +5698,6 @@ fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> Op
         monitor_started: false,
         monitor_abort: None,
         mask,
-        put_mask: None,
         monitor_window: None,
         monitor_window_notify: None,
         monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5796,867 +5712,6 @@ fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> Op
         monitor_start_ctl: None,
         exec_state: ExecState::Idle,
         last_request: false,
-    }
-}
-
-/// PVA `PUT_GET` (cmd 12) handler — atomic put-then-get.
-///
-/// Sub-command lifecycle, mirroring the GET / PUT handlers:
-/// - INIT  (`subcmd & 0x08`): decode the pvRequest, register the op,
-///   reply `ioid + subcmd + status + putIF + getIF`. We serve a
-///   single channel introspection for both the put and the get
-///   structure (the common NT case where the put and readback types
-///   are identical).
-/// - PUT-GET (`subcmd & 0x08 == 0`): decode `changed bitset + put
-///   value`, run the WRITE-gated `put_value_checked`, then the
-///   READ-gated `read_checked`, and reply
-///   `ioid + subcmd + status + getBitset + getValue`.
-///   The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`)
-///   is the EPICS `lastRequest()` rider — the ChannelPutGet client sends
-///   `QOS_DESTROY` to mean "run this, then destroy the op"
-///   (`clientContextImpl.cpp:1262-1288`), NOT a standalone destroy. It must
-///   still execute and reply; the op is freed only after the reply, via the
-///   same `finish_exec_data_task` path GET/PUT/RPC use. Standalone op
-///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
-///
-/// pvxs leaves `handle_PUT_GET` empty; this implements the operation
-/// properly per the wire spec so a PUT_GET-capable client works.
-#[allow(clippy::too_many_arguments)]
-async fn handle_put_get(
-    reactor: &epics_base_rs::runtime::task::Reactor,
-    frame: &Frame,
-    tx: &SrvTx,
-    channels: &mut ChannelTable,
-    order: ByteOrder,
-    config: &PvaServerConfig,
-    encode_cache: &mut EncodeTypeCache,
-    // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
-    decode_cache: &mut TypeCache,
-    peer: std::net::SocketAddr,
-    cred: &Arc<ClientCredentials>,
-    // data-phase-completion sender (see [`handle_op`]). The spawned
-    // PUT_GET exec task installs an `ExecFinishGuard` so the owner returns
-    // the op to `Idle` when its readback reply is sent.
-    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
-    // Where an INIT goes when the channel has no descriptor yet — the
-    // port's `pending`/`mpending`. See [`park_op_for_intro`].
-    park: &ParkCtx<'_>,
-) -> PvaResult<()> {
-    // Inbound payload decodes with the frame's own header order (pvxs
-    // latches `peerBE` per received message, conn.cpp:195-198); `order`
-    // (config) is used only for outbound reply frames.
-    let inbound_order = frame.order();
-    let mut cur = frame.cursor();
-    let sid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let ioid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-
-    // PUT_GET (cmd 12) is a Rust extension — pvxs leaves `handle_PUT_GET`
-    // an empty stub (serverconn.cpp:259-260) and its client never sends
-    // cmd 12 (clientimpl.h:143). `serve_put_get` (default true) gates
-    // whether this server serves the operation; a deployment that wants
-    // strict pvxs-compatible behavior sets it false and every cmd-12
-    // frame — putGet, getGet, getPut — is answered with a deterministic
-    // error `Status` rather than the Rust round trip. We reply with an
-    // explicit error (not pvxs's silent drop) so the policy is visible at
-    // the wire level and a client fails fast instead of waiting out its
-    // `op_timeout`. Gated before the channel borrow, like the unknown-sid
-    // path below, so it needs no resolved channel.
-    if !config.serve_put_get {
-        send_op_error(
-            tx,
-            OpKind::PutGet,
-            ioid,
-            subcmd,
-            Status::error("PUT_GET not served (serve_put_get disabled for pvxs compatibility)"),
-            order,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
-    // evaluated before the per-channel borrow below.
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
-
-    // Data-phase frames resolve their channel via the connection-wide op
-    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
-    // PUT_GET is a single request-response op (GPR-like), so the frame SID
-    // is not re-validated; INIT keeps the frame's channel.
-    let sid = if subcmd & QosFlags::INIT != 0 {
-        sid
-    } else {
-        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
-    };
-
-    let mut ch = match channels.get_mut(&sid) {
-        Some(c) => c,
-        None => {
-            send_op_error(
-                tx,
-                OpKind::PutGet,
-                ioid,
-                subcmd,
-                Status::error("unknown channel sid"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    // Attribute the inbound PUT_GET frame to the channel and route every
-    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
-    // `handle_op`).
-    ch.stat.add_op_rx(frame);
-    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
-
-    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
-    // (pvxs serverchan.cpp:70-112 / src/server.cpp:100-112; see `handle_op`).
-    let source = ch.source.clone();
-    let source = &source;
-
-    if subcmd & QosFlags::INIT != 0 {
-        // duplicate INIT on a live IOID is connection-fatal
-        // (mirror of `handle_op`; connection-wide scope per pvxs `opByIOID`).
-        if dup_ioid {
-            return Err(PvaError::Decode(format!(
-                "duplicate PUT_GET INIT on live IOID {ioid}"
-            )));
-        }
-        // PUT_GET also requires a descriptor — park until one exists.
-        let intro = match ch.introspection.clone() {
-            Some(d) => d,
-            None => {
-                park_op_for_intro(
-                    reactor,
-                    &mut ch,
-                    frame,
-                    OpKind::PutGet,
-                    subcmd,
-                    sid,
-                    ioid,
-                    park,
-                );
-                return Ok(());
-            }
-        };
-        // pvRequest: `type + value` (pvxs clientget.cpp). Translate to
-        // a field mask the GET leg consults.
-        // A peer wire-decode fault of the INIT pvRequest type/value is
-        // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
-        // a per-op Status — the empty-mask case below stays op-level.
-        let (req_desc, req_value) =
-            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(PvaError::Decode(format!("PUT_GET INIT pvRequest: {e}")));
-                }
-            };
-        // ChannelPutGet negotiates TWO field selections at INIT: the
-        // put-leg (`putField`) and the get-leg (`getField`). pvDatabaseCPP
-        // `ChannelPutGetLocal::create` builds a separate PVCopy for each
-        // (modules/pvDatabase/src/pvAccess/channelLocal.cpp), so `getPut`
-        // reads back the put-leg structure and `putGet`/`getGet` the
-        // get-leg structure. We derive both masks here. When the pvRequest
-        // carries no putField/getField the pvAccess `getRequestedStructure`
-        // fallback collapses both to the common `field` selection
-        // (modules/pvAccess/testApp/remote/testServer.cpp), so the common NT
-        // round trip is unchanged. An empty selection is an INIT error.
-        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, req_desc.as_ref())
-        {
-            Ok(masks) => masks,
-            Err(e) => {
-                send_chan_op_error(
-                    &chan_tx,
-                    OpKind::PutGet,
-                    ioid,
-                    subcmd,
-                    Status::error(format!("invalid pvRequest mask: {e}")),
-                    order,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-
-        // stash the INIT pvRequest so the data phase can
-        // forward `record._options` (process/block, group `atomic`)
-        // through `ChannelContext.pv_request` to the source. The
-        // dedicated PUT_GET path otherwise dropped it, so QSRV group
-        // PUT_GET could not honor INIT options on the native wire.
-        //
-        // The get-leg mask is the op's primary selection mask (`OpState.mask`,
-        // drives the putGet/getGet readback); the put-leg mask rides in
-        // `OpState.put_mask` for getPut.
-        let mut put_get_op = non_monitor_op_state(intro.clone(), OpKind::PutGet, get_mask);
-        put_get_op.put_mask = Some(put_mask);
-        put_get_op.pv_request = req_value;
-        ch.insert_op(ioid, put_get_op);
-
-        // INIT response: ioid + subcmd + status + putIF + getIF.
-        // pvAccessJava protocol defines PUT_GET INIT with two type
-        // descriptors (put-request structure, then get-response structure).
-        // pvxs never implements PUT_GET (`handle_PUT_GET` is an empty stub
-        // in serverconn.cpp). We serve the same channel introspection for
-        // both legs.
-        let mut payload = Vec::new();
-        payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
-        Status::ok().write_into(order, &mut payload);
-        if config.emit_type_cache {
-            encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
-            encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
-        } else {
-            encode_type_desc(&intro, order, &mut payload);
-            encode_type_desc(&intro, order, &mut payload);
-        }
-        let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
-        let mut buf = Vec::new();
-        h.write_into(&mut buf);
-        buf.extend_from_slice(&payload);
-        let _ = chan_tx.send(buf).await;
-        return Ok(());
-    }
-
-    // PUT-GET data phase.
-    let op = ch.ops().get(&ioid).cloned();
-    let (intro, mask, put_mask, init_pv_request) = match op {
-        Some(o) => {
-            // the data-phase command must match the operation
-            // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
-            // the connection when an IOID is driven by the wrong
-            // operation class. Without this check a client could INIT
-            // an IOID as a GET/PUT/MONITOR and then drive a dedicated
-            // PUT_GET data frame through it, performing a
-            // write/readback with a descriptor + mask the operation
-            // never negotiated as a PUT_GET. Mirror the generic
-            // handler's protocol-error policy (tcp.rs data-phase
-            // kind guard).
-            if o.kind != OpKind::PutGet {
-                return Err(PvaError::Decode(format!(
-                    "PUT_GET data-phase frame for IOID {ioid} initialised as {:?} \
-                     (pvxs serverget.cpp:421-436 protocol error)",
-                    o.kind
-                )));
-            }
-            (o.intro, o.mask, o.put_mask, o.pv_request)
-        }
-        None => {
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::PutGet,
-                ioid,
-                subcmd,
-                Status::error("operation not initialised"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let pv_name = ch.name.clone();
-
-    // EPICS ChannelPutGet has three data-phase subcommands sharing the
-    // PUT_GET command byte (pvAccess remote.h:78-82): the default putGet
-    // (0x00) writes then reads back, getGet (`QOS_GET`, 0x40) reads the
-    // current get-side data, and getPut (`QOS_GET_PUT`, 0x80) reads the
-    // current put-side data. Only putGet carries a put payload —
-    // clientContextImpl.cpp:1100-1112 serializes the put BitSet + value
-    // solely for the default branch and sends nothing for getGet/getPut.
-    // Decoding a BitSet/value for those payload-less frames is what made
-    // the operation fail, so gate both the decode and the write leg on the
-    // subcommand.
-    let read_only = subcmd & (QosFlags::GET | QosFlags::GET_PUT) != 0;
-
-    // The two read-back legs project distinct structures: getPut returns the
-    // put-leg (`putField`) structure's current value, putGet/getGet the
-    // get-leg (`getField`) structure's value (pvDatabaseCPP
-    // `ChannelPutGetLocal::getPut`/`getGet`,
-    // modules/pvDatabase/src/pvAccess/channelLocal.cpp). Both read the same
-    // backing value but mask it by their own selection — the INIT serves the
-    // full introspection for both descriptors, so the leg is carried by the
-    // changed-bitset rather than a projected type (uniform with GET/PUT/
-    // MONITOR). `mask` is the get-leg mask; `put_mask` the put-leg mask (set
-    // for every PUT_GET op at INIT, falling back to `mask` defensively).
-    let readback_mask = if subcmd & QosFlags::GET_PUT != 0 {
-        put_mask.unwrap_or_else(|| mask.clone())
-    } else {
-        mask.clone()
-    };
-
-    // Decode the put payload inline (cursor is borrowed from the stack
-    // frame) only for the write/readback putGet path.
-    let put_payload = if read_only {
-        None
-    } else {
-        let changed =
-            BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
-        // Same scratch reuse as the PUT EXEC path: decode marked fields
-        // in place, lend to the source, return via `ExecFinished`.
-        let mut put_delta = match ch.put_scratch.take() {
-            Some((d, v)) if Arc::ptr_eq(&d, &intro) => v,
-            _ => crate::pvdata::encode::default_value_for(&intro),
-        };
-        decode_pv_field_with_bitset_into(
-            &mut put_delta,
-            &intro,
-            &changed,
-            0,
-            &mut cur,
-            inbound_order,
-            decode_cache,
-        )
-        .map_err(|e| PvaError::Decode(format!("PUT_GET requires a value payload: {e}")))?;
-        Some((changed, put_delta))
-    };
-
-    let ctx = crate::server_native::source::ChannelContext {
-        peer,
-        creds: cred.clone(),
-        pv_request: init_pv_request,
-        log: Default::default(),
-    };
-
-    let src = source.clone();
-    let tx_clone = chan_tx.clone();
-    // run this PUT_GET exec only when the op is `Idle`, and ignore a
-    // second EXEC while the first is in flight rather than aborting it (pvxs
-    // `serverget.cpp:467-476`/`:511-514`).
-    let op_id = match begin_exec(&mut ch, ioid) {
-        Some(id) => id,
-        None => {
-            debug!(ioid, "PUT_GET EXEC ignored: op already executing");
-            return Ok(());
-        }
-    };
-    let exec_fin = ExecFinished {
-        sid,
-        ioid,
-        op_id,
-        success: false,
-        scratch: None,
-    };
-    let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(reactor, async move {
-        // return this op to `Idle` (via the read-loop owner) when the
-        // task ends so a later explicit re-EXEC is accepted.
-        let mut exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
-        let mut payload = Vec::new();
-        payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
-        // The source's `RemoteLogger` sink for this op, kept alive past the
-        // moves below so its diagnostics can be flushed before the reply.
-        let op_log = ctx.log.clone();
-
-        // putGet (0x00) is the atomic WRITE+READ round trip; getGet/getPut
-        // (read-only) carry no put payload and only read back. The default
-        // `put_get_checked` composes put_delta_checked + read_checked
-        // over the same backing store, but a remote-fronting source (the
-        // pva-gateway) overrides it to issue ONE upstream PUT_GET so the
-        // put-then-get stays atomic upstream (pva2pva
-        // `p2pApp/channel.cpp:129-138`) instead of a local put plus a
-        // separately-read cached get. The read-only legs stay a plain
-        // READ-gated `read_checked`. A panic in either user handler
-        // becomes an error reply instead of skipping the reply below.
-        // The error slot holds the `Status` this reply will carry, not text:
-        // a source fronting a remote (the gateway) reports its upstream's own
-        // Status, and rendering it to a string here is what put a Rust `{:?}`
-        // dump on the wire (R18-27).
-        let read_value: Result<Option<crate::server_native::source::SourceRead>, Status> =
-            if let Some((changed, put_delta)) = put_payload {
-                let checked = src
-                    .access_gate()
-                    .check_with_roles(
-                        &pv_name,
-                        &ctx.creds.host,
-                        &ctx.creds.account,
-                        &ctx.creds.roles,
-                        &ctx.creds.method,
-                        &ctx.creds.authority,
-                    )
-                    .await;
-                let outcome = match catch_handler_panic(src.put_get_checked(
-                    checked,
-                    intro.clone(),
-                    changed,
-                    &put_delta,
-                    ctx.clone(),
-                ))
-                .await
-                {
-                    Ok(Ok(v)) => Ok(v),
-                    Ok(Err(e)) => Err(e.wire_status()),
-                    Err(panic) => Err(Status::error(panic)),
-                };
-                // Source borrow released — send the scratch home with the
-                // completion signal (every later exit goes through the
-                // guard's Drop).
-                exec_fin_guard.set_scratch((intro.clone(), put_delta));
-                outcome
-            } else {
-                let read_checked = src
-                    .access_gate()
-                    .check_with_roles(
-                        &pv_name,
-                        &ctx.creds.host,
-                        &ctx.creds.account,
-                        &ctx.creds.roles,
-                        &ctx.creds.method,
-                        &ctx.creds.authority,
-                    )
-                    .await;
-                catch_handler_panic(src.read_checked(read_checked, ctx))
-                    .await
-                    .map_err(Status::error)
-            };
-
-        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
-
-        match read_value {
-            Ok(Some(read)) => {
-                Status::ok().write_into(order, &mut payload);
-                // Project the read-back value by this leg's selection mask
-                // (getPut → put-leg, putGet/getGet → get-leg). See the
-                // `readback_mask` derivation above), narrowed to the leaves
-                // the source actually assigned — pvxs `to_wire_valid(R, value,
-                // &pvMask)` frames the readback exactly like a GET reply.
-                let wire_changed =
-                    read_changed_bitset(&intro, &readback_mask, read.marked.as_deref());
-                wire_changed.write_into(order, &mut payload);
-                crate::pvdata::encode::encode_pv_field_with_bitset(
-                    &read.value,
-                    &intro,
-                    &wire_changed,
-                    0,
-                    order,
-                    &mut payload,
-                );
-            }
-            Ok(None) => {
-                Status::ok().write_into(order, &mut payload);
-                let empty = BitSet::with_capacity(intro.total_bits());
-                empty.write_into(order, &mut payload);
-            }
-            Err(status) => status.write_into(order, &mut payload),
-        }
-        let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
-        let mut buf = Vec::new();
-        h.write_into(&mut buf);
-        buf.extend_from_slice(&payload);
-        // PUT_GET is one-shot: `apply_exec_finish` removes a `last_request` op
-        // on every terminal reply regardless of status, so the flag is `false`.
-        exec_fin_guard.reply(&tx_clone, buf, false).await;
-    });
-    // Store the abort guard and, when this PUT_GET frame carried the
-    // last-request bit (`subcmd & 0x10`), defer the op's removal until its
-    // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
-    // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
-    Ok(())
-}
-
-/// One decoded ChannelArray data-phase sub-operation, selected by the
-/// `subcmd` QOS bits (pvAccessCPP `responseHandlers.cpp:2148-2207`). The
-/// windowing parameters and put value are decoded from the frame *before*
-/// the exec task is spawned, so the task moves owned values rather than
-/// borrowing the frame cursor.
-enum ChannelArraySubOp {
-    /// `getArray` (`QOS_GET`): read the `[offset, count, stride]` slice.
-    Get {
-        offset: u32,
-        count: u32,
-        stride: u32,
-    },
-    /// `putArray` (no get/length bits): splice `value` at `offset`/`stride`.
-    Put {
-        offset: u32,
-        stride: u32,
-        value: PvField,
-    },
-    /// `setLength` (`QOS_GET_PUT`): resize to `length`.
-    SetLength { length: u32 },
-    /// `getLength` (`QOS_PROCESS`): query the current element count.
-    GetLength,
-}
-
-/// The success body a ChannelArray sub-op contributes to its reply after
-/// the leading `ioid + subcmd + Status` (pvAccessCPP
-/// `responseHandlers.cpp:2368-2385`).
-enum ChannelArrayReply {
-    /// `putArray` / `setLength`: status only, no trailing body.
-    Empty,
-    /// `getArray`: the sliced array value, serialised full (no BitSet).
-    Value(PvField),
-    /// `getLength`: the element count as a PVA `Size`.
-    Length(u32),
-}
-
-/// PVA `ARRAY` (cmd 14) handler — ChannelArray windowed-array operation.
-///
-/// Sub-command lifecycle (QOS bits, pvAccessCPP
-/// `responseHandlers.cpp:2115-2208` request decode /
-/// `:2347-2393` reply encode; client `clientContextImpl.cpp:1567-1666`):
-/// - INIT (`QOS_INIT 0x08`): decode the pvRequest selecting the array
-///   field, call [`ChannelSource::channel_array_init`](crate::server_native::ChannelSource::channel_array_init), and reply
-///   `ioid + subcmd + status [+ array introspection]`. The default source
-///   refuses with a protocol `Status` error — the client always gets an
-///   answer, never the pre-fix silent drop.
-/// - getArray (`QOS_GET 0x40`): `offset + count + stride` → READ-gated
-///   [`ChannelSource::channel_array_get`](crate::server_native::ChannelSource::channel_array_get) → `status + array value`.
-/// - setLength (`QOS_GET_PUT 0x80`): `length` → WRITE-gated
-///   [`ChannelSource::channel_array_set_length`](crate::server_native::ChannelSource::channel_array_set_length) → `status`.
-/// - getLength (`QOS_PROCESS 0x04`): no payload → READ-gated
-///   [`ChannelSource::channel_array_get_length`](crate::server_native::ChannelSource::channel_array_get_length) → `status + length`.
-/// - putArray (no get/length bits): `offset + stride + array value` →
-///   WRITE-gated [`ChannelSource::channel_array_put`](crate::server_native::ChannelSource::channel_array_put) → `status`.
-///
-/// The op stays alive across sub-ops (pvAccessCPP keeps one
-/// `ChannelArray`), reusing the same `begin_exec` / `ExecFinishGuard` /
-/// `finish_exec_data_task` completion owner GET/PUT/PROCESS use; a
-/// `QOS_DESTROY 0x10` rider on any sub-op frees the op after its reply.
-/// The INIT pvRequest is stashed in the op state and re-supplied on every
-/// sub-op through `ChannelContext.pv_request`, so the source knows which
-/// array field to act on without the trait holding per-op state.
-#[allow(clippy::too_many_arguments)]
-async fn handle_channel_array(
-    reactor: &epics_base_rs::runtime::task::Reactor,
-    frame: &Frame,
-    tx: &SrvTx,
-    channels: &mut ChannelTable,
-    order: ByteOrder,
-    config: &PvaServerConfig,
-    encode_cache: &mut EncodeTypeCache,
-    decode_cache: &mut TypeCache,
-    peer: std::net::SocketAddr,
-    cred: &Arc<ClientCredentials>,
-    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
-) -> PvaResult<()> {
-    // Inbound payload decodes with the frame's own header order; `order`
-    // (config) drives only outbound reply frames.
-    let inbound_order = frame.order();
-    let mut cur = frame.cursor();
-    let sid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let ioid = cur
-        .get_u32(inbound_order)
-        .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
-
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
-
-    // Data-phase frames resolve their channel via the connection-wide op
-    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
-    // ChannelArray is a single request-response op (GPR-like), so the frame
-    // SID is not re-validated; INIT keeps the frame's channel.
-    let sid = if subcmd & QosFlags::INIT != 0 {
-        sid
-    } else {
-        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
-    };
-
-    let mut ch = match channels.get_mut(&sid) {
-        Some(c) => c,
-        None => {
-            send_op_error(
-                tx,
-                OpKind::Array,
-                ioid,
-                subcmd,
-                Status::error("unknown channel sid"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    ch.stat.add_op_rx(frame);
-    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
-
-    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry.
-    let source = ch.source.clone();
-    let source = &source;
-    let pv_name = ch.name.clone();
-
-    if subcmd & QosFlags::INIT != 0 {
-        if dup_ioid {
-            return Err(PvaError::Decode(format!(
-                "duplicate ARRAY INIT on live IOID {ioid}"
-            )));
-        }
-        // Decode the pvRequest selecting the array field, through the same
-        // structured boundary as GET/PUT/PROCESS INIT. A malformed
-        // descriptor, or a non-null descriptor that needs value bytes but
-        // ends before them, is a connection-fatal peer wire fault (pvxs
-        // `from_wire_type_value`); only the all-empty-structs default
-        // selector (and the NULL `0xFF` descriptor) legitimately has a
-        // 0-byte value body.
-        let (_req_desc, req_value) =
-            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest: {e}")));
-                }
-            };
-        let ctx = crate::server_native::source::ChannelContext {
-            peer,
-            creds: cred.clone(),
-            pv_request: req_value.clone(),
-            log: Default::default(),
-        };
-        // INIT resolves the array field's introspection (or refuses). No
-        // access check here — pvAccessCPP gates per sub-op, not at create.
-        match source.channel_array_init(&pv_name, ctx).await {
-            Ok(array_desc) => {
-                let mask = BitSet::all_set(array_desc.total_bits());
-                let mut array_op =
-                    non_monitor_op_state(Arc::new(array_desc.clone()), OpKind::Array, mask);
-                array_op.pv_request = req_value;
-                ch.insert_op(ioid, array_op);
-
-                let mut payload = Vec::new();
-                payload.put_u32(ioid, order);
-                payload.put_u8(subcmd);
-                Status::ok().write_into(order, &mut payload);
-                // INIT reply carries the array introspection
-                // (pvAccessCPP `cachedSerialize(_pvArray->getArray())`).
-                if config.emit_type_cache {
-                    encode_type_desc_cached(&array_desc, order, encode_cache, &mut payload);
-                } else {
-                    encode_type_desc(&array_desc, order, &mut payload);
-                }
-                let h = PvaHeader::application(
-                    true,
-                    order,
-                    Command::Array.code(),
-                    payload.len() as u32,
-                );
-                let mut buf = Vec::new();
-                h.write_into(&mut buf);
-                buf.extend_from_slice(&payload);
-                let _ = chan_tx.send(buf).await;
-            }
-            Err(e) => {
-                // Not supported / resolution failure: reply with the error
-                // Status on the INIT frame (pvAccessCPP `send`: a creation
-                // error still answers QOS_INIT). No op registered.
-                send_chan_op_error(
-                    &chan_tx,
-                    OpKind::Array,
-                    ioid,
-                    subcmd,
-                    e.wire_status(),
-                    order,
-                )
-                .await?;
-            }
-        }
-        return Ok(());
-    }
-
-    // Data phase. Bind to the INIT-registered op (kind must match).
-    let init_pv_request = match ch.ops().get(&ioid) {
-        None => {
-            // No op registered for this IOID at the data phase. pvAccessCPP —
-            // the only ChannelArray server reference (pvxs has no ARRAY
-            // handler) — answers with a CMD_ARRAY error frame (badIOIDStatus,
-            // responseHandlers.cpp:2157), NOT a silent drop, so a client
-            // awaiting the sub-op callback does not block until timeout.
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::Array,
-                ioid,
-                subcmd,
-                Status::error("bad request id"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-        Some(o) => {
-            if o.kind != OpKind::Array {
-                return Err(PvaError::Decode(format!(
-                    "ARRAY data-phase frame for IOID {ioid} initialised as {:?} \
-                     (pvxs serverget.cpp:421-436 protocol error)",
-                    o.kind
-                )));
-            }
-            o.pv_request.clone()
-        }
-    };
-    // Array introspection bound at INIT — drives the put-value decode and
-    // the get-value encode.
-    let array_desc = ch
-        .ops()
-        .get(&ioid)
-        .map(|o| o.intro.clone())
-        .expect("op present");
-
-    // Decode the sub-op + its windowing params from the frame body now,
-    // before the borrow of `cur` ends and the exec task is spawned. A
-    // truncated size / value is a connection-fatal wire fault.
-    let sub_op = if subcmd & QosFlags::GET != 0 {
-        let offset = read_array_size(&mut cur, inbound_order, "getArray offset")?;
-        let count = read_array_size(&mut cur, inbound_order, "getArray count")?;
-        let stride = read_array_size(&mut cur, inbound_order, "getArray stride")?;
-        ChannelArraySubOp::Get {
-            offset,
-            count,
-            stride,
-        }
-    } else if subcmd & QosFlags::GET_PUT != 0 {
-        let length = read_array_size(&mut cur, inbound_order, "setLength length")?;
-        ChannelArraySubOp::SetLength { length }
-    } else if subcmd & QosFlags::PROCESS != 0 {
-        ChannelArraySubOp::GetLength
-    } else {
-        let offset = read_array_size(&mut cur, inbound_order, "putArray offset")?;
-        let stride = read_array_size(&mut cur, inbound_order, "putArray stride")?;
-        let value = decode_pv_field_cached(&array_desc, &mut cur, inbound_order, decode_cache)
-            .map_err(|e| PvaError::Decode(format!("ARRAY putArray value: {e}")))?;
-        ChannelArraySubOp::Put {
-            offset,
-            stride,
-            value,
-        }
-    };
-
-    let ctx = crate::server_native::source::ChannelContext {
-        peer,
-        creds: cred.clone(),
-        // INIT pvRequest re-supplied so the source knows the bound field.
-        pv_request: init_pv_request,
-        log: Default::default(),
-    };
-    let src = source.clone();
-    let tx_clone = chan_tx.clone();
-    // Run this sub-op only when the op is `Idle`. A second sub-op arriving
-    // while one is in flight is a protocol error: pvAccessCPP `startRequest`
-    // returns false and the server answers with a CMD_ARRAY error frame
-    // (otherRequestPendingStatus, responseHandlers.cpp:2164) rather than
-    // ignoring it. The in-flight op is left running, not aborted.
-    let op_id = match begin_exec(&mut ch, ioid) {
-        Some(id) => id,
-        None => {
-            debug!(ioid, "ARRAY sub-op rejected: op already executing");
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::Array,
-                ioid,
-                subcmd,
-                Status::error("other request pending"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let exec_fin = ExecFinished {
-        sid,
-        ioid,
-        op_id,
-        success: false,
-        scratch: None,
-    };
-    let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(reactor, async move {
-        let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
-        let checked = src
-            .access_gate()
-            .check_with_roles(
-                &pv_name,
-                &ctx.creds.host,
-                &ctx.creds.account,
-                &ctx.creds.roles,
-                &ctx.creds.method,
-                &ctx.creds.authority,
-            )
-            .await;
-        // A panic in the (user / gateway) source handler becomes an error
-        // reply instead of a skipped reply.
-        let op_log = ctx.log.clone();
-        let result: Result<ChannelArrayReply, OpError> = match sub_op {
-            ChannelArraySubOp::Get {
-                offset,
-                count,
-                stride,
-            } => catch_handler_panic(src.channel_array_get(checked, offset, count, stride, ctx))
-                .await
-                .map_err(OpError::failed)
-                .and_then(|r| r)
-                .map(ChannelArrayReply::Value),
-            ChannelArraySubOp::Put {
-                offset,
-                stride,
-                value,
-            } => catch_handler_panic(src.channel_array_put(checked, offset, stride, value, ctx))
-                .await
-                .map_err(OpError::failed)
-                .and_then(|r| r)
-                .map(|()| ChannelArrayReply::Empty),
-            ChannelArraySubOp::SetLength { length } => {
-                catch_handler_panic(src.channel_array_set_length(checked, length, ctx))
-                    .await
-                    .map_err(OpError::failed)
-                    .and_then(|r| r)
-                    .map(|()| ChannelArrayReply::Empty)
-            }
-            ChannelArraySubOp::GetLength => {
-                catch_handler_panic(src.channel_array_get_length(checked, ctx))
-                    .await
-                    .map_err(OpError::failed)
-                    .and_then(|r| r)
-                    .map(ChannelArrayReply::Length)
-            }
-        };
-        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
-
-        let mut payload = Vec::new();
-        payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
-        match result {
-            Ok(reply) => {
-                Status::ok().write_into(order, &mut payload);
-                match reply {
-                    ChannelArrayReply::Empty => {}
-                    ChannelArrayReply::Value(v) => {
-                        encode_pv_field(&v, &array_desc, order, &mut payload);
-                    }
-                    ChannelArrayReply::Length(n) => {
-                        encode_size_into(n, order, &mut payload);
-                    }
-                }
-            }
-            Err(e) => e.wire_status().write_into(order, &mut payload),
-        }
-        let h = PvaHeader::application(true, order, Command::Array.code(), payload.len() as u32);
-        let mut buf = Vec::new();
-        h.write_into(&mut buf);
-        buf.extend_from_slice(&payload);
-        // ARRAY is one-shot (see the PUT_GET reply): the flag is unread.
-        exec_fin_guard.reply(&tx_clone, buf, false).await;
-    });
-    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
-    Ok(())
-}
-
-/// Read one PVA `Size` from a ChannelArray data-phase body, mapping the
-/// null marker / truncation to a connection-fatal decode error (a
-/// ChannelArray offset/count/stride/length is never the nullable form).
-fn read_array_size(
-    cur: &mut std::io::Cursor<&[u8]>,
-    order: ByteOrder,
-    what: &str,
-) -> PvaResult<u32> {
-    match crate::proto::decode_size(cur, order) {
-        Ok(Some(n)) => Ok(n),
-        Ok(None) => Err(PvaError::Decode(format!("ARRAY {what}: null size marker"))),
-        Err(e) => Err(PvaError::Decode(format!("ARRAY {what}: {e}"))),
     }
 }
 
@@ -7197,7 +6252,7 @@ fn handle_cancel_request(frame: &Frame, channels: &mut ChannelTable) -> PvaResul
                 ctl.set(false);
             }
         } else if op.exec_state == ExecState::Executing {
-            // Non-monitor (GET/PUT/RPC/PUT_GET/PROCESS) in flight. pvxs
+            // Non-monitor (GET/PUT/RPC) in flight. pvxs
             // sets the op `Idle`, after which a late reply is dropped
             // because the op is no longer Executing (`serverget.cpp:37-49`
             // names remote Cancel as the cause) and a subsequent EXEC is
@@ -7655,7 +6710,7 @@ async fn handle_op(
         // emit loop — mpsc backpressure remains the only limiter.
         //
         // pvxs reads `record._options.{pipeline,queueSize,ackAny}` only inside
-        // `handle_MONITOR` (`servermon.cpp:523-582`); GET/PUT/PUT_GET/RPC never
+        // `handle_MONITOR` (`servermon.cpp:523-582`); GET/PUT/RPC never
         // look at them. Parse them for MONITOR only, so every outcome of the
         // reader — including the `NoConvert` throw below — is scoped to the one
         // command pvxs parses them for.
@@ -7934,7 +6989,6 @@ async fn handle_op(
                 monitor_started: false,
                 monitor_abort: None,
                 mask,
-                put_mask: None,
                 monitor_window,
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -8013,7 +7067,7 @@ async fn handle_op(
         let cmd = kind.command();
 
         // pvxs derives the INIT reply subcommand from operation STATE, not by
-        // echoing the request byte. GET/PUT/RPC/PUT_GET replies echo the
+        // echoing the request byte. GET/PUT/RPC replies echo the
         // stored `op->subcmd` (`serverget.cpp:83`), which for an INIT request
         // is exactly `0x08`. The MONITOR reply path differs: `doReply` sets
         // `subcmd = 0x08` unconditionally for the Creating→Idle INIT frame
@@ -8487,7 +7541,7 @@ async fn handle_op(
                 // `replied_ok` mirrors the single status word written below:
                 // pvxs `ServerGPR::doReply` decides the op disposition from
                 // `sts.isSuccess()` (serverget.cpp:86-116). A successful
-                // last_request PUT/PUT_GET is cleaned up by the completion
+                // last_request PUT is cleaned up by the completion
                 // owner; an error reply keeps the op Idle with the sticky
                 // marker for a later EXEC.
                 // This is the EXEC-only leg: the 0x40 readback returned at
@@ -8809,13 +7863,10 @@ async fn handle_op(
             });
             finish_exec_data_task(&mut ch, ioid, subcmd, abort);
         }
-        // PUT_GET / ARRAY / GET_FIELD have dedicated handlers
-        // (`handle_put_get`, `handle_channel_array`, `handle_get_field`) and
-        // are never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Array | OpKind::GetField => {
-            unreachable!(
-                "PUT_GET / ARRAY / GET_FIELD are routed to their own handlers, not handle_op"
-            )
+        // GET_FIELD has its own handler (`handle_get_field`) and is never
+        // dispatched into `handle_op`.
+        OpKind::GetField => {
+            unreachable!("GET_FIELD is routed to its own handler, not handle_op")
         }
     }
     Ok(())
@@ -8996,7 +8047,7 @@ async fn handle_get_field(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        // GET_FIELD is one-shot (see the PUT_GET reply): the flag is unread.
+        // GET_FIELD is one-shot: the flag is unread.
         exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
     // Install the abort guard on the reserved op so DESTROY_REQUEST /
@@ -9006,35 +8057,10 @@ async fn handle_get_field(
     Ok(())
 }
 
-async fn send_op_error(
-    tx: &SrvTx,
-    kind: OpKind,
-    ioid: u32,
-    // the reply's sub-command byte. pvxs writes the operation's
-    // current subcmd into EVERY GET/PUT/RPC reply (`serverget.cpp:82-84`),
-    // recording the data-phase subcmd on the op before the callback runs
-    // (`serverget.cpp:475`). An error therefore preserves the request's
-    // phase: an INIT-negotiation failure echoes the INIT subcmd (`0x08`),
-    // a data-phase failure echoes the request's data subcmd (`0x00` for a
-    // GET exec, `0x40` for a PUT readback). Every caller passes its
-    // in-scope request `subcmd`, exactly as the success-reply paths do
-    // (`payload.put_u8(subcmd)`). Hardcoding `0x08` here mis-framed every
-    // data-phase error as an INIT response, so a client waiting for GET
-    // data saw an unexpected INIT instead of the failure status.
-    subcmd: u8,
-    status: Status,
-    order: ByteOrder,
-) -> PvaResult<()> {
-    let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
-    let _ = tx.send(buf).await;
-    Ok(())
-}
-
 /// Per-channel op error reply. pvxs charges every error reply to the
 /// owning channel's counter too (the reply leaves via the same
 /// `enqueueTxBody` → `chan->statTx` primitive as the success reply),
-/// so any error path on a resolved channel must go through `chan_tx`
-/// — the unknown-SID path has no channel and uses [`send_op_error`].
+/// so any error path on a resolved channel must go through `chan_tx`.
 async fn send_chan_op_error(
     chan_tx: &ChannelTx,
     kind: OpKind,
@@ -9049,9 +8075,8 @@ async fn send_chan_op_error(
 }
 
 /// Encode a single op error reply frame (`kind` command, `ioid`,
-/// `subcmd`, error `Status`). Shared by the connection-level
-/// [`send_op_error`] and the per-channel [`send_chan_op_error`] so the
-/// two cannot drift on framing.
+/// `subcmd`, error `Status`), shared by [`send_chan_op_error`] and
+/// [`ExecFinishGuard::reply_error`] so the two cannot drift on framing.
 fn build_op_error_frame(
     kind: OpKind,
     ioid: u32,
@@ -9126,8 +8151,8 @@ use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
 
 /// **The one wire changed-bitset rule**, shared by every framed value the
-/// server sends — MONITOR data, the MONITOR seed, the GET reply, the PUT_GET
-/// readback. pvxs frames all of them with the identical call,
+/// server sends — MONITOR data, the MONITOR seed, the GET reply, the PUT
+/// get (0x40) reply. pvxs frames all of them with the identical call,
 /// `to_wire_valid(R, value, &pvMask)` (`servermon.cpp:174`,
 /// `serverget.cpp:104`): the leaves the source ASSIGNED, intersected with the
 /// request mask.
@@ -15517,7 +14542,6 @@ mod tests {
                 monitor_started: true,
                 monitor_abort: None,
                 mask: BitSet::new(),
-                put_mask: None,
                 monitor_window: Some(window),
                 monitor_window_notify: Some(Arc::new(tokio::sync::Notify::new())),
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -16527,7 +15551,6 @@ mod tests {
                 monitor_started: true,
                 monitor_abort: Some(abort.clone()),
                 mask: BitSet::new(),
-                put_mask: None,
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: paused.clone(),
@@ -17028,7 +16051,7 @@ mod tests {
 
     /// R15-33: one framing rule for every value the server sends with a
     /// changed-bitset — MONITOR data, the MONITOR seed, the GET reply, the
-    /// PUT_GET readback. pvxs frames all four with the same call,
+    /// PUT get (0x40) reply. pvxs frames all four with the same call,
     /// `to_wire_valid(R, value, &pvMask)` (`servermon.cpp:174`,
     /// `serverget.cpp:104`), over a value the source only partially assigned
     /// (`IOCSource::initialize` + `IOCSource::get` into a `cloneEmpty()`).
@@ -18202,12 +17225,12 @@ mod tests {
 
     #[cfg(tokio_backend)]
     /// pvxs `serverget.cpp:83` echoes the request `subcmd` byte in the
-    /// PUT data response. The PUT_GET (readback) case sets bit 0x40 in
+    /// PUT data response. The PUT get (readback) case sets bit 0x40 in
     /// the client subcmd; pvxs `clientget.cpp:362-370` dispatches the
     /// reply decode based on that bit. A server response that hardcodes
     /// 0x00 makes the client decode the wrong shape: the bitset + value
     /// bytes carried in the frame are misread as trailing garbage and
-    /// the PUT_GET readback is silently lost.
+    /// the PUT readback is silently lost.
     #[epics_macros_rs::epics_test]
     async fn put_get_response_echoes_request_subcmd() {
         use crate::pvdata::FieldDesc;
@@ -18300,7 +17323,7 @@ mod tests {
         // Drain INIT response — not the focus of this test.
         let _init_resp = rx.try_recv().expect("INIT response emitted");
 
-        // PUT EXEC with subcmd=0x40 (PUT_GET readback): sid + ioid +
+        // PUT EXEC with subcmd=0x40 (PUT get readback): sid + ioid +
         // subcmd + bitset + value.
         let new_val = {
             let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -18311,7 +17334,7 @@ mod tests {
         let mut exec_payload = Vec::new();
         exec_payload.put_u32(sid, order);
         exec_payload.put_u32(ioid, order);
-        exec_payload.put_u8(0x40); // PUT_GET readback
+        exec_payload.put_u8(0x40); // PUT get readback
         let bs = BitSet::all_set(intro.total_bits());
         bs.write_into(order, &mut exec_payload);
         crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
@@ -18347,7 +17370,7 @@ mod tests {
         let resp_subcmd = resp[PvaHeader::SIZE + 4];
         assert_eq!(
             resp_subcmd, 0x40,
-            "PUT_GET reply subcmd must echo the 0x40 readback bit (pvxs serverget.cpp:83)"
+            "PUT reply subcmd must echo the 0x40 readback bit (pvxs serverget.cpp:83)"
         );
     }
 
@@ -19555,168 +18578,6 @@ mod tests {
         );
     }
 
-    #[cfg(tokio_backend)]
-    /// Regression (Defect 1, PUT_GET path): same as the PUT delta
-    /// test but via the dedicated `handle_put_get` (Command::PutGet,
-    /// cmd 12). A 3-field structure PUT_GET where only field `c`
-    /// (bit 3) changed must apply exactly `c` and leave `a`/`b`
-    /// intact, and the readback must reflect the merged value.
-    #[epics_macros_rs::epics_test]
-    async fn put_get_delta_multi_field_applies_only_changed_field() {
-        use crate::server_native::SharedSource;
-        use crate::server_native::runtime::PvaServerConfig;
-        use crate::server_native::shared_pv::SharedPV;
-        use crate::server_native::tcp::ClientCredentials;
-        use std::sync::Arc;
-
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 400;
-
-        let intro = three_field_intro();
-        let pv = SharedPV::build_mailbox();
-        pv.open(intro.clone(), three_field_value(10, 20, 30))
-            .unwrap();
-
-        let shared = SharedSource::new();
-        shared.add("dut", pv);
-        let source: DynSource = Arc::new(shared);
-
-        let mut channels = ChannelTable::new();
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro.clone())),
-                source: source.clone(),
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            }),
-        );
-
-        let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
-
-        // PUT_GET INIT (subcmd 0x08).
-        let req_desc = FieldDesc::Structure {
-            struct_id: String::new(),
-            fields: vec![].into(),
-        };
-        let req_val = PvField::Structure(PvStructure::new(""));
-        let mut init_payload = Vec::new();
-        init_payload.put_u32(sid, order);
-        init_payload.put_u32(ioid, order);
-        init_payload.put_u8(0x08);
-        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
-        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
-        let init_frame = synth_frame(Command::PutGet, order, init_payload);
-        handle_put_get(
-            &crate::test_reactor(),
-            &init_frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &cred,
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("PUT_GET INIT ok");
-        let _ = rx.try_recv().expect("INIT resp");
-
-        // PUT_GET data phase — delta with only field `c` (bit 3).
-        let bit_c = intro.bit_for_path("c").expect("c has a bit");
-        assert_eq!(bit_c, 3, "field c must occupy bit 3 (pvData §5.4)");
-        let mut changed = BitSet::new();
-        changed.set(bit_c);
-        let delta = three_field_value(0, 0, 77);
-        let mut data_payload = Vec::new();
-        data_payload.put_u32(sid, order);
-        data_payload.put_u32(ioid, order);
-        data_payload.put_u8(0x00);
-        changed.write_into(order, &mut data_payload);
-        crate::pvdata::encode::encode_pv_field_with_bitset(
-            &delta,
-            &intro,
-            &changed,
-            0,
-            order,
-            &mut data_payload,
-        );
-        let data_frame = synth_frame(Command::PutGet, order, data_payload);
-        handle_put_get(
-            &crate::test_reactor(),
-            &data_frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &cred,
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("PUT_GET data ok");
-        let resp = rx.recv().await.expect("PUT_GET data response emitted");
-
-        // Server-side state: only `c` changed.
-        let stored = source.get_value(b"dut").await.expect("PV value present");
-        assert_eq!(
-            three_field_extract(&stored),
-            (10, 20, 77),
-            "PUT_GET delta must change only field c; a and b must be untouched"
-        );
-
-        // Readback: decode the PUT_GET response payload directly
-        // (`decode_op_response` rejects Command::PutGet — cmd 12 is
-        // not in its Get/Put/Monitor/Rpc set). The GET-leg success
-        // path emits `ioid + subcmd + status + mask + value`.
-        let (frame, _consumed) = try_parse_frame(&resp)
-            .expect("readback frame parses")
-            .expect("complete frame");
-        assert_eq!(
-            frame.header.command,
-            Command::PutGet.code(),
-            "readback is a PUT_GET reply"
-        );
-        let mut cur = frame.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(status.is_success(), "PUT_GET readback status ok");
-        let mask = BitSet::decode(&mut cur, order).expect("readback bitset");
-        let readback =
-            crate::pvdata::encode::decode_pv_field_with_bitset(&intro, &mask, 0, &mut cur, order)
-                .expect("readback value");
-        // The readback mask is the op's field mask (all fields here),
-        // so every field is present and reflects the merged state.
-        assert_eq!(
-            three_field_extract(&readback),
-            (10, 20, 77),
-            "PUT_GET readback must carry the merged value"
-        );
-    }
-
     /// Regression (Defect 2): concurrent BitSet-delta PUTs with
     /// DISJOINT changed-fields must not lose updates.
     ///
@@ -19843,91 +18704,6 @@ mod tests {
             );
             assert_eq!(b, 0, "trial {trial}: field b was never written");
         }
-    }
-
-    /// Test source for the Defect-1 AUTHORITY-gating regression.
-    ///
-    /// Carries a `Required` AccessGate whose ASG has:
-    /// `RULE(0, READ)` — unconditional read; and
-    /// `RULE(1, WRITE) { AUTHORITY("MyCA") }` — WRITE only for a
-    /// peer whose `authority` (x509 root-CA CommonName) is `"MyCA"`.
-    ///
-    /// The bug: `handle_put_get`'s GET leg passed a literal `""` as the
-    /// authority to `AccessGate::check`, so even a peer presenting
-    /// `authority="MyCA"` failed `authority_match` and was wrongly denied.
-    struct AuthorityGatedSource {
-        gate: epics_base_rs::server::access_security::AccessGate,
-        value: std::sync::Arc<parking_lot::Mutex<i32>>,
-    }
-
-    impl AuthorityGatedSource {
-        fn new() -> Self {
-            use epics_base_rs::server::access_security::{AsgAslResolver, parse_acf};
-            let acf = parse_acf(
-                "ASG(DEFAULT) {\n\
-                 \x20   RULE(0, READ)\n\
-                 \x20   RULE(1, WRITE) { AUTHORITY(\"MyCA\") }\n\
-                 }\n",
-            )
-            .expect("acf parse");
-            let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
-            // Resolve every PV to ASG DEFAULT, ASL 1 — so the
-            // ASL-1-scoped WRITE rule applies.
-            let resolver: AsgAslResolver =
-                std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 1u8) }));
-            Self {
-                gate: epics_base_rs::server::access_security::AccessGate::required(cell, resolver),
-                value: std::sync::Arc::new(parking_lot::Mutex::new(7)),
-            }
-        }
-    }
-
-    impl crate::server_native::source::ChannelSource for AuthorityGatedSource {
-        fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
-            &self.gate
-        }
-        async fn list_pvs(&self) -> Vec<RecordName> {
-            vec!["dut".into()]
-        }
-        fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
-            let n = RecordName::from(n);
-            async move { n == "dut" }
-        }
-        async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
-            Some(three_field_intro())
-        }
-        fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
-            let v = *self.value.lock();
-            async move { Some(three_field_value(v, v, v)) }
-        }
-        fn put_value(
-            &self,
-            _: &[u8],
-            value: PvField,
-        ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-            let (a, _, _) = three_field_extract(&value);
-            *self.value.lock() = a;
-            async { Ok(()) }
-        }
-        async fn is_writable(&self, _: &[u8]) -> bool {
-            true
-        }
-        async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
-            None
-        }
-    }
-
-    /// Credentials for the `x509` method carrying a chosen root-CA
-    /// authority. `ClientCredentials` fields are all `pub`.
-    #[cfg(test)]
-    fn x509_cred(authority: &str) -> Arc<ClientCredentials> {
-        Arc::new(ClientCredentials {
-            method: "x509".into(),
-            account: "operator".into(),
-            host: "h.example".into(),
-            authority: authority.into(),
-            roles: Vec::new(),
-        })
     }
 
     /// A1: the ACF host identity must come from the socket, never the wire.
@@ -20286,488 +19062,6 @@ mod tests {
         );
     }
 
-    /// Build a channel whose `ioid` op was initialised as `kind`,
-    /// so a wrong-kind data frame can be driven against it.
-    #[cfg(test)]
-    fn primed_channels_with_kind(
-        sid: u32,
-        ioid: u32,
-        kind: OpKind,
-        source: DynSource,
-    ) -> ChannelTable {
-        let intro = three_field_intro();
-        let mask = BitSet::all_set(intro.total_bits());
-        let mut ops = HashMap::new();
-        ops.insert(
-            ioid,
-            non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, mask),
-        );
-        let mut channels = ChannelTable::new();
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro)),
-                source,
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            })
-            .with_ops(ops),
-        );
-        channels
-    }
-
-    /// a (sid → ChannelState) map with introspection but NO
-    /// registered ops, so an INIT frame exercises the INIT
-    /// pvRequest decode + registration path.
-    #[cfg(test)]
-    fn channels_no_op(sid: u32, source: DynSource) -> ChannelTable {
-        let intro = three_field_intro();
-        let mut channels = ChannelTable::new();
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro)),
-                source,
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            }),
-        );
-        channels
-    }
-
-    /// build a ChannelArray INIT frame `sid + ioid + 0x08 +
-    /// pv_request_bytes`.
-    #[cfg(test)]
-    fn array_init_frame(sid: u32, ioid: u32, pv_request: &[u8], order: ByteOrder) -> Frame {
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x08); // INIT
-        payload.extend_from_slice(pv_request);
-        synth_frame(Command::Array, order, payload)
-    }
-
-    /// drive `handle_channel_array` for an INIT frame and return
-    /// `(connection_fatal, ops contains ioid, an op reply was emitted)`.
-    #[cfg(test)]
-    async fn run_array_init(
-        sid: u32,
-        ioid: u32,
-        pv_request: &[u8],
-        order: ByteOrder,
-    ) -> (bool, bool, bool) {
-        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-        let mut channels = channels_no_op(sid, source.clone());
-        let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
-        let frame = array_init_frame(sid, ioid, pv_request, order);
-
-        let result = handle_channel_array(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-        )
-        .await;
-        let fatal = result.is_err();
-        let registered = channels.get(&sid).unwrap().ops().contains_key(&ioid);
-        let replied = rx.try_recv().is_ok();
-        (fatal, registered, replied)
-    }
-
-    /// Regression: a ChannelArray INIT carrying a non-null descriptor that
-    /// needs value bytes (scalar Int) but ENDS before them is the
-    /// `from_wire_type_value` wire fault — connection-fatal, not registered,
-    /// no reply. The decode runs before `channel_array_init`, so the fault
-    /// fires at the wire boundary exactly as pvxs `bev.reset()` does.
-    #[epics_macros_rs::epics_test]
-    async fn array_init_descriptor_only_value_rejected_and_unregistered() {
-        let order = ByteOrder::Little;
-        // Scalar Int descriptor, no value bytes.
-        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
-        let mut req = Vec::new();
-        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
-
-        let (fatal, registered, replied) = run_array_init(1, 704, &req, order).await;
-        assert!(
-            fatal,
-            "a descriptor-only ARRAY INIT (value bytes absent) must be connection-fatal"
-        );
-        assert!(
-            !registered,
-            "a descriptor-only ARRAY INIT must not register the IOID"
-        );
-        assert!(!replied, "the bev.reset() path emits no op reply");
-    }
-
-    /// Regression: the dedicated `handle_put_get` data phase must
-    /// reject a frame whose IOID was initialised as a different
-    /// operation class (here a GET). Before the fix it extracted
-    /// `(intro, mask)` from whatever op existed and performed a
-    /// write/readback the operation never negotiated as a PUT_GET.
-    #[epics_macros_rs::epics_test]
-    async fn ex_r5_put_get_data_rejects_get_initialised_ioid() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 602;
-        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let intro = three_field_intro();
-
-        // PUT_GET data frame: sid + ioid + subcmd(0x00) + bitset + value.
-        let mut changed = BitSet::new();
-        changed.set(2);
-        let delta = three_field_value(0, 99, 0);
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        changed.write_into(order, &mut payload);
-        crate::pvdata::encode::encode_pv_field_with_bitset(
-            &delta,
-            &intro,
-            &changed,
-            0,
-            order,
-            &mut payload,
-        );
-        let frame = synth_frame(Command::PutGet, order, payload);
-
-        let res = handle_put_get(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await;
-        assert!(
-            res.is_err(),
-            "PUT_GET data against a GET-initialised IOID must be a protocol error"
-        );
-    }
-
-    /// Regression: `handle_put_get` must also reject a PUT_GET
-    /// data frame against a PUT-initialised IOID.
-    #[epics_macros_rs::epics_test]
-    async fn ex_r5_put_get_data_rejects_put_initialised_ioid() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 603;
-        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put, source.clone());
-        let (tx, _rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let intro = three_field_intro();
-
-        let mut changed = BitSet::new();
-        changed.set(2);
-        let delta = three_field_value(0, 99, 0);
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        changed.write_into(order, &mut payload);
-        crate::pvdata::encode::encode_pv_field_with_bitset(
-            &delta,
-            &intro,
-            &changed,
-            0,
-            order,
-            &mut payload,
-        );
-        let frame = synth_frame(Command::PutGet, order, payload);
-
-        let res = handle_put_get(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await;
-        assert!(
-            res.is_err(),
-            "PUT_GET data against a PUT-initialised IOID must be a protocol error"
-        );
-    }
-
-    /// Regression (Defect 1, PUT_GET GET-leg readback): the PUT_GET
-    /// GET-leg re-check passed a literal `""` as the authority. With
-    /// a READ rule scoped by `AUTHORITY("MyCA")`, a peer presenting
-    /// the matching CA would have its readback wrongly suppressed
-    /// (empty zero-field bitset instead of the value). Here the READ
-    /// rule is unconditional and only WRITE is AUTHORITY-scoped, so
-    /// the peer with the matching CA gets BOTH a successful PUT leg
-    /// and a non-empty readback — exercising the fixed GET-leg
-    /// `&ctx.creds.authority` forwarding.
-    #[epics_macros_rs::epics_test]
-    async fn put_get_readback_honors_authority() {
-        let order = ByteOrder::Little;
-        let sid: u32 = 1;
-        let ioid: u32 = 502;
-        let src = AuthorityGatedSource::new();
-        let source: DynSource = std::sync::Arc::new(src);
-
-        let intro = three_field_intro();
-        let mut channels = ChannelTable::new();
-        let mask = BitSet::all_set(intro.total_bits());
-        let mut ops = HashMap::new();
-        ops.insert(
-            ioid,
-            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
-        );
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro.clone())),
-                source: source.clone(),
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            })
-            .with_ops(ops),
-        );
-
-        let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        // PUT_GET data-phase frame, default putGet subcommand 0x00 (write
-        // then read back). 0x40/0x80 are the read-only getGet/getPut
-        // subcommands that carry no put payload, so the write+readback
-        // this test exercises uses 0x00 — the subcommand op_put_get sends.
-        // sid + ioid + subcmd + changed-bitset + delta(field a → 55).
-        let bit_a = intro.bit_for_path("a").expect("a has a bit");
-        let mut changed = BitSet::new();
-        changed.set(bit_a);
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x00);
-        changed.write_into(order, &mut payload);
-        crate::pvdata::encode::encode_pv_field_with_bitset(
-            &three_field_value(55, 0, 0),
-            &intro,
-            &changed,
-            0,
-            order,
-            &mut payload,
-        );
-        let frame = synth_frame(Command::PutGet, order, payload);
-
-        handle_put_get(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &discard_exec_fin(),
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("handle_put_get ok");
-
-        let resp = rx.recv().await.expect("PUT_GET response emitted");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let _subcmd = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(status.is_success(), "PUT_GET status must be success");
-        let readback_mask = BitSet::decode(&mut cur, order).expect("readback bitset");
-        assert!(
-            readback_mask.count() > 0,
-            "PUT_GET GET-leg readback must carry fields for a peer with \
-             READ access — an empty bitset means the authority check \
-             wrongly suppressed the readback"
-        );
-        let readback = crate::pvdata::encode::decode_pv_field_with_bitset(
-            &intro,
-            &readback_mask,
-            0,
-            &mut cur,
-            order,
-        )
-        .expect("readback value");
-        let (a, _, _) = three_field_extract(&readback);
-        assert_eq!(a, 55, "readback must reflect the merged PUT (field a=55)");
-    }
-
-    /// Same lastRequest() rider for PUT_GET: the ChannelPutGet client sends
-    /// `QOS_DESTROY` (here with the `0x40` readback bit, `subcmd = 0x50`) to
-    /// mean "run this, then destroy" (`clientContextImpl.cpp:1262-1288`).
-    /// Pre-fix the handler treated the bit as a pure destroy, so the client
-    /// got no write, no readback, and no status reply. The op must execute,
-    /// reply, and only then release its IOID.
-    #[epics_macros_rs::epics_test]
-    async fn pva_put_get_last_request_executes_then_defers_destroy() {
-        let order = ByteOrder::Little;
-        let (sid, ioid) = (1u32, 701u32);
-        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-
-        let intro = three_field_intro();
-        let mask = BitSet::all_set(intro.total_bits());
-        let mut ops = HashMap::new();
-        ops.insert(
-            ioid,
-            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
-        );
-        let mut channels = ChannelTable::new();
-        channels.insert(
-            sid,
-            ChannelState::new(ChannelOpen {
-                name: "dut".into(),
-                cid: 0,
-                sid,
-                introspection: Some(std::sync::Arc::new(intro.clone())),
-                source: source.clone(),
-                stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-            })
-            .with_ops(ops),
-        );
-
-        let (tx, mut rx) = test_srv_tx(16);
-        let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
-        let config = PvaServerConfig::default();
-        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-
-        // PUT_GET last-request: readback (0x40) | QOS_DESTROY (0x10) = 0x50.
-        let bit_a = intro.bit_for_path("a").expect("a has a bit");
-        let mut changed = BitSet::new();
-        changed.set(bit_a);
-        let mut payload = Vec::new();
-        payload.put_u32(sid, order);
-        payload.put_u32(ioid, order);
-        payload.put_u8(0x50);
-        changed.write_into(order, &mut payload);
-        crate::pvdata::encode::encode_pv_field_with_bitset(
-            &three_field_value(55, 0, 0),
-            &intro,
-            &changed,
-            0,
-            order,
-            &mut payload,
-        );
-        let frame = synth_frame(Command::PutGet, order, payload);
-
-        handle_put_get(
-            &crate::test_reactor(),
-            &frame,
-            &tx,
-            &mut channels,
-            order,
-            &config,
-            &mut encode_cache,
-            &mut TypeCache::new(),
-            peer,
-            &x509_cred("MyCA"),
-            &exec_fin_tx,
-            &ParkCtx {
-                peer,
-                cred: &Arc::new(ClientCredentials::anonymous(peer)),
-                ready_tx: &discard_intro_ready(),
-            },
-        )
-        .await
-        .expect("handle_put_get ok");
-
-        let resp = rx
-            .recv()
-            .await
-            .expect("PUT_GET reply emitted for a last-request frame");
-        let (rframe, _) = try_parse_frame(&resp)
-            .expect("frame parses")
-            .expect("complete frame");
-        let mut cur = rframe.cursor();
-        let _ioid = cur.get_u32(order).expect("ioid");
-        let rsub = cur.get_u8().expect("subcmd");
-        let status = Status::decode(&mut cur, order).expect("status");
-        assert!(
-            status.is_success(),
-            "a last-request PUT_GET must execute and reply success"
-        );
-        assert_eq!(
-            rsub, 0x50,
-            "the reply echoes the last-request PUT_GET subcmd"
-        );
-
-        assert!(
-            channels.get(&sid).unwrap().ops().contains_key(&ioid),
-            "the op is reserved until its reply is sent"
-        );
-        let fin = exec_fin_rx
-            .recv()
-            .await
-            .expect("put_get task signals completion");
-        apply_exec_finish(&mut channels, fin);
-        assert!(
-            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
-            "the last-request PUT_GET op is freed after its reply"
-        );
-    }
-
     /// pvxs `serverintrospect.cpp:159`: GET_FIELD's guard is the
     /// composite `if(!chan || opByIOID.find(ioid)!=opByIOID.end())`.
     /// Both arms log and silently return. Our prior fix only
@@ -20799,7 +19093,6 @@ mod tests {
                 monitor_started: false,
                 monitor_abort: None,
                 mask: BitSet::new(),
-                put_mask: None,
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -21001,7 +19294,7 @@ mod tests {
     /// Owner math for per-channel inbound op-RX accounting: `add_op_rx` must
     /// charge the FULL framed length `PvaHeader::SIZE + body`, matching
     /// pvxs `rxlen = 8u + evbuffer_get_length(segBuf)`. Every op handler
-    /// (PUT_GET / PROCESS / ARRAY / GET / PUT / MONITOR / RPC / GET_FIELD)
+    /// (GET / PUT / MONITOR / RPC / GET_FIELD)
     /// funnels its inbound frame through this one method, so a body-only
     /// charge (the pre-fix `add_rx(frame.payload.len())`) would 8-byte
     /// under-count every op reported under a live channel. Driving the

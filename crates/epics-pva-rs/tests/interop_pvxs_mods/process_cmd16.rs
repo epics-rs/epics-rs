@@ -40,7 +40,7 @@ fn ignore_lines(peer: SocketAddr) -> Vec<String> {
         .collect()
 }
 
-fn send(stream: &mut TcpStream, command: Command, order: ByteOrder, payload: &[u8]) {
+pub(super) fn send(stream: &mut TcpStream, command: Command, order: ByteOrder, payload: &[u8]) {
     let mut frame = Vec::with_capacity(PvaHeader::SIZE + payload.len());
     PvaHeader::application(false, order, command.code(), payload.len() as u32)
         .write_into(&mut frame);
@@ -49,7 +49,7 @@ fn send(stream: &mut TcpStream, command: Command, order: ByteOrder, payload: &[u
 }
 
 /// The next application frame's command and body; control frames are skipped.
-fn next_app_frame(stream: &mut TcpStream, order: ByteOrder) -> (u8, Vec<u8>) {
+pub(super) fn next_app_frame(stream: &mut TcpStream, order: ByteOrder) -> (u8, Vec<u8>) {
     loop {
         let mut hdr = [0u8; PvaHeader::SIZE];
         stream.read_exact(&mut hdr).expect("read frame header");
@@ -68,7 +68,7 @@ fn next_app_frame(stream: &mut TcpStream, order: ByteOrder) -> (u8, Vec<u8>) {
 
 /// SET_BYTE_ORDER, CONNECTION_VALIDATION with `anonymous` and a null
 /// credential, CONNECTION_VALIDATED.
-fn handshake(stream: &mut TcpStream) -> ByteOrder {
+pub(super) fn handshake(stream: &mut TcpStream) -> ByteOrder {
     let mut prelude = [0u8; PvaHeader::SIZE];
     stream
         .read_exact(&mut prelude)

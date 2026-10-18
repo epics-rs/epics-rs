@@ -132,20 +132,6 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
     }
-    // A PUT_GET writes — reject it exactly as `put_delta_checked` does, so
-    // a PUT_GET never reaches the inner source under read-only mode. The
-    // trait default would call `put_delta_checked` (which rejects), but make
-    // the rejection explicit and skip the wasted readback path.
-    async fn put_get_checked(
-        &self,
-        _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _desc: std::sync::Arc<FieldDesc>,
-        _changed: epics_pva_rs::proto::BitSet,
-        _delta: &PvField,
-        _ctx: ChannelContext,
-    ) -> Result<Option<SourceRead>, OpError> {
-        Err(OpError::denied("read-only mode: PUT rejected"))
-    }
     async fn is_writable(&self, _name: &[u8]) -> bool {
         false
     }
@@ -166,7 +152,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     }
     // Every layer that forwards `get_value_checked` MUST forward
     // `read_checked` the same way: the read-FRAMING path (GET reply,
-    // PUT_GET readback, monitor seed) goes through `read_checked`, and its
+    // PUT readback, monitor seed) goes through `read_checked`, and its
     // trait default re-derives the value from THIS layer's
     // `get_value_checked` as `marked: None` — discarding the marked leaves
     // the inner source declared and framing a full mask over them. For the
@@ -270,62 +256,6 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _ctx: ChannelContext,
     ) -> Result<RpcReply, OpError> {
         Err(OpError::denied("read-only mode: RPC rejected"))
-    }
-    // ChannelArray: forward the read-class sub-ops (INIT descriptor probe,
-    // getArray, getLength) to the inner so a wrapped gateway source still
-    // serves them; reject the write-class sub-ops (putArray, setLength)
-    // exactly as `put_*_checked` reject PUT. Without these overrides the
-    // trait default ("not supported") would mask a wrapped inner's array
-    // support entirely (the wrapper-severs-override defect family). This is
-    // stricter than pva2pva, whose `createChannelArray` lacks the
-    // `p2pReadOnly` guard its Put/PutGet/Process/RPC creates carry
-    // (`p2pApp/channel.cpp:226-232` vs the `if(!p2pReadOnly)` guards at
-    // `:103`, `:123`, `:134`, `:145`) and so leaks array writes under
-    // read-only mode; putArray/setLength mutate upstream array state and are
-    // WRITE-class here, so a read-only gateway must refuse them.
-    async fn channel_array_init(
-        &self,
-        name: &[u8],
-        ctx: ChannelContext,
-    ) -> Result<FieldDesc, OpError> {
-        self.inner.channel_array_init(name, ctx).await
-    }
-    async fn channel_array_get(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        offset: u32,
-        count: u32,
-        stride: u32,
-        ctx: ChannelContext,
-    ) -> Result<PvField, OpError> {
-        self.inner
-            .channel_array_get(checked, offset, count, stride, ctx)
-            .await
-    }
-    async fn channel_array_get_length(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<u32, OpError> {
-        self.inner.channel_array_get_length(checked, ctx).await
-    }
-    async fn channel_array_put(
-        &self,
-        _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _offset: u32,
-        _stride: u32,
-        _value: PvField,
-        _ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        Err(OpError::denied("read-only mode: ARRAY putArray rejected"))
-    }
-    async fn channel_array_set_length(
-        &self,
-        _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _length: u32,
-        _ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        Err(OpError::denied("read-only mode: ARRAY setLength rejected"))
     }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
@@ -683,7 +613,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         self.inner.get_value_checked(checked, ctx).await
     }
     /// Same allowlist gate as `get_value_checked`, on the read-FRAMING path
-    /// (GET reply / PUT_GET readback / monitor seed). Without this override
+    /// (GET reply / PUT readback / monitor seed). Without this override
     /// the trait default would re-read through this layer's
     /// `get_value_checked` and drop the inner's marked leaves — see the note
     /// on `ReadOnlyLayer::read_checked`.
@@ -734,30 +664,6 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner
             .put_delta_checked(checked, desc, changed, delta, ctx)
-            .await
-    }
-    // A PUT_GET writes — gate it by the same static allowlist as
-    // `put_value_checked`/`put_delta_checked`, then forward to the inner's
-    // atomic `put_get_checked`. Without this override the trait default
-    // decomposes into `put_delta_checked` + `read_checked` on THIS layer,
-    // bypassing the inner source's single-op PUT_GET (the gateway's
-    // one-upstream-PUT_GET forward).
-    async fn put_get_checked(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: std::sync::Arc<FieldDesc>,
-        changed: epics_pva_rs::proto::BitSet,
-        delta: &PvField,
-        ctx: ChannelContext,
-    ) -> Result<Option<SourceRead>, OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner
-            .put_get_checked(checked, desc, changed, delta, ctx)
             .await
     }
     async fn is_writable(&self, name: &[u8]) -> bool {
@@ -883,90 +789,6 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         self.inner
             .rpc_checked(checked, request_desc, request_value, ctx)
             .await
-    }
-    // ChannelArray: gate each sub-op by the static allowlist BEFORE
-    // forwarding to the inner, mirroring `put_*_checked` / `rpc_checked`.
-    // Without these the trait default ("not supported")
-    // would mask a wrapped inner's array support (the wrapper-severs-override
-    // defect family). The inner source still gets the full AccessChecked +
-    // ctx and applies its own ACF read/write gate on top.
-    async fn channel_array_init(
-        &self,
-        name: &[u8],
-        ctx: ChannelContext,
-    ) -> Result<FieldDesc, OpError> {
-        if !self.config.allowed(name) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                String::from_utf8_lossy(name)
-            )));
-        }
-        self.inner.channel_array_init(name, ctx).await
-    }
-    async fn channel_array_get(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        offset: u32,
-        count: u32,
-        stride: u32,
-        ctx: ChannelContext,
-    ) -> Result<PvField, OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner
-            .channel_array_get(checked, offset, count, stride, ctx)
-            .await
-    }
-    async fn channel_array_put(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        offset: u32,
-        stride: u32,
-        value: PvField,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner
-            .channel_array_put(checked, offset, stride, value, ctx)
-            .await
-    }
-    async fn channel_array_set_length(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        length: u32,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner
-            .channel_array_set_length(checked, length, ctx)
-            .await
-    }
-    async fn channel_array_get_length(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<u32, OpError> {
-        if !self.config.allowed(checked.pv_name().as_bytes()) {
-            return Err(OpError::denied(format!(
-                "ACL: PV '{}' denied",
-                checked.pv_name()
-            )));
-        }
-        self.inner.channel_array_get_length(checked, ctx).await
     }
     /// SEARCH advertisement is gated by the same static allowlist as
     /// [`Self::has_pv`] and [`Self::list_pvs`] — a denied name must not be
@@ -1459,35 +1281,6 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .record(make_audit_event(&pv, &user, &host, &result));
         result
     }
-    // Atomic PUT_GET writes the record — audit it with the same Put row
-    // shape as `put_delta_checked` and forward through the inner's
-    // `put_get_checked` so the inner's single-op PUT_GET (the pva-gateway's
-    // one-upstream-PUT_GET forward) is preserved. Without this override the
-    // trait default decomposes into `put_delta_checked` + `read_checked` on
-    // THIS layer, bypassing that atomic forward (and recording a Put plus a
-    // Get audit row instead of one Put).
-    async fn put_get_checked(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: std::sync::Arc<FieldDesc>,
-        changed: epics_pva_rs::proto::BitSet,
-        delta: &PvField,
-        ctx: ChannelContext,
-    ) -> Result<Option<SourceRead>, OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self
-            .inner
-            .put_get_checked(checked, desc, changed, delta, ctx)
-            .await;
-        // Audit the write outcome (the readback payload is not logged),
-        // preserving the Denied/Failed bucket the inner reported.
-        let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
-        self.sink
-            .record(make_audit_event(&pv, &user, &host, &outcome));
-        result
-    }
     async fn get_value_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -1514,7 +1307,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    /// The read-FRAMING path (GET reply / PUT_GET readback / monitor seed)
+    /// The read-FRAMING path (GET reply / PUT readback / monitor seed)
     /// carries the same Get audit row as `get_value_checked` and forwards the
     /// inner's marked leaves. Without this override the trait default would
     /// re-read through this layer's `get_value_checked` — one extra upstream
@@ -1777,101 +1570,6 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             ev.event = AuditEventKind::Rpc;
             self.sink.record(ev);
         }
-        result
-    }
-    // ChannelArray: forward every sub-op through the inner (so a wrapped
-    // gateway source's array support survives the audit layer — the
-    // wrapper-severs-override defect family) and emit an audit row matching
-    // the sub-op's class. The INIT descriptor probe carries no audit row
-    // (like `has_pv`/`get_introspection`). putArray/setLength are WRITE-class
-    // → `AuditEventKind::Put` (always audited, alongside PUT).
-    // getArray/getLength are READ-class → `AuditEventKind::Get` (gated by
-    // `audit_get`, like GET/MONITOR). There is no dedicated Array audit kind;
-    // the Put/Get buckets capture the operation's mutate-vs-read intent,
-    // which is what an audit log records.
-    async fn channel_array_init(
-        &self,
-        name: &[u8],
-        ctx: ChannelContext,
-    ) -> Result<FieldDesc, OpError> {
-        self.inner.channel_array_init(name, ctx).await
-    }
-    async fn channel_array_get(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        offset: u32,
-        count: u32,
-        stride: u32,
-        ctx: ChannelContext,
-    ) -> Result<PvField, OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self
-            .inner
-            .channel_array_get(checked, offset, count, stride, ctx)
-            .await;
-        if self.audit_get {
-            let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
-            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
-            ev.event = AuditEventKind::Get;
-            self.sink.record(ev);
-        }
-        result
-    }
-    async fn channel_array_get_length(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<u32, OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self.inner.channel_array_get_length(checked, ctx).await;
-        if self.audit_get {
-            let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
-            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
-            ev.event = AuditEventKind::Get;
-            self.sink.record(ev);
-        }
-        result
-    }
-    async fn channel_array_put(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        offset: u32,
-        stride: u32,
-        value: PvField,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self
-            .inner
-            .channel_array_put(checked, offset, stride, value, ctx)
-            .await;
-        let mut ev = make_audit_event(&pv, &user, &host, &result);
-        ev.event = AuditEventKind::Put;
-        self.sink.record(ev);
-        result
-    }
-    async fn channel_array_set_length(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        length: u32,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        let pv = checked.pv_name().to_string();
-        let user = ctx.creds.account.clone();
-        let host = ctx.creds.host.clone();
-        let result = self
-            .inner
-            .channel_array_set_length(checked, length, ctx)
-            .await;
-        let mut ev = make_audit_event(&pv, &user, &host, &result);
-        ev.event = AuditEventKind::Put;
-        self.sink.record(ev);
         result
     }
     // forward the per-PV watermark levels so the inner

@@ -2603,7 +2603,7 @@ mod tests {
         );
     }
 
-    /// R15-33 — a READ (GET reply, PUT_GET readback, monitor seed) frames
+    /// R15-33 — a READ (GET reply, PUT readback, monitor seed) frames
     /// what the source ASSIGNED, and QSRV's source assigns a strict subset
     /// of the NT.
     ///

@@ -91,14 +91,14 @@ arbitrary order, so they must never resolve markers against shared state.
 
 `flatten_type_cache_markers` (`src/decode.rs`) runs once per
 inbound application frame in the reader task. It rewrites **both** the
-leading `FieldDesc` region (INIT introspection, PUT_GET putIF/getIF,
+leading `FieldDesc` region (INIT introspection,
 GET_FIELD type, RPC data type) AND the `0xFD`/`0xFE` markers embedded
 inside `any` (Variant / VariantArray) value payloads of DATA frames into
 self-contained inline descriptors, against one reader-owned `TypeCache`.
 To walk a DATA value it needs that op's value type, so the reader also
 keeps a per-IOID introspection map (`ServerConn::op_introspection`,
 `DashMap<u32, FieldDesc>`): the descriptor is captured on INIT, used on
-DATA, and dropped on MONITOR/RPC/PUT_GET FINISH or on `unregister_ioid`.
+DATA, and dropped on MONITOR/RPC FINISH or on `unregister_ioid`.
 
 Because the routed frames are self-contained, per-op decoders call
 `decode_op_response(frame, introspection)` with an **empty** cache — they
@@ -107,10 +107,7 @@ This is the parity equivalent of pvxs' single per-connection `rxRegistry`
 (`clientget.cpp:410-451`, `dataencode.cpp:542`), with the single-owner
 resolution moved to the reader.
 
-ChannelArray is the one exception: its DATA layout is sub-op dependent
-and cannot be flattened from the frame alone, so `op_array_*` resolve
-markers against an op-local cache (INIT + DATA run on one task in wire
-order). Code: `client_native/server_conn.rs::ServerConn`,
+Code: `client_native/server_conn.rs::ServerConn`,
 `client_native/ops_v2.rs`.
 
 ## Format gotchas

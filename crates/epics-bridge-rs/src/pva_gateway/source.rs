@@ -43,7 +43,7 @@ use super::channel_cache::{
     CacheStatus, ChannelCache, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_ENTRIES,
 };
 
-/// An upstream read (GET or PUT_GET readback) as the downstream framing
+/// An upstream GET as the downstream framing
 /// contract sees it: the value plus the leaves the UPSTREAM marked.
 ///
 /// `MarkedRead::marked` is `None` when the upstream set the root bit — it
@@ -1287,9 +1287,7 @@ impl ChannelSource for GatewayChannelSource {
         // (p2pApp/channel.cpp:117-127); the prior `pvput_pv_field` reissued
         // the gateway default request, dropping process/block. The data leg
         // still targets the `value` bit (typed pass-through, see put_value).
-        // Atomic single-upstream PUT_GET / delta forwarding (one upstream op
-        // carrying the readback) is a separate, larger change. Falls back to
-        // the default request when the downstream sent none.
+        // Falls back to the default request when the downstream sent none.
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
@@ -1299,80 +1297,6 @@ impl ChannelSource for GatewayChannelSource {
             None => client.pvput_pv_field(name, &value).await,
         };
         result.map_err(upstream_op_error)
-    }
-
-    /// Credential-aware atomic **PUT_GET** — forward the whole operation
-    /// as ONE upstream PVA `ChannelPutGet` and return its upstream
-    /// readback, instead of the default's separate upstream round trips.
-    ///
-    /// pva2pva `p2pApp/channel.cpp:129-138` implements
-    /// `GWChannel::createChannelPutGet` by forwarding
-    /// `createChannelPutGet(..., pvRequest)` verbatim to the upstream
-    /// channel: the upstream IOC applies the put and produces the readback
-    /// atomically under the downstream's own pvRequest
-    /// (`record._options.process`/`block`). The default composes
-    /// `put_delta_checked` with `read_checked`, and neither leg of that is
-    /// local here: the merge reads the prior through this gateway's
-    /// `get_value_checked` and the readback through its `read_checked`, both
-    /// of which forward a fresh upstream ChannelGet. So the default costs
-    /// three upstream round trips and still loses the atomicity and the
-    /// original pvRequest that one `ChannelPutGet` keeps. Routing through the
-    /// per-(account, method) `upstream_client_for` keeps the downstream
-    /// identity, exactly as
-    /// `put_value_checked`/`get_value_checked`/`rpc_checked` do. The cached
-    /// monitor snapshot backs the MONITOR seed, not this path.
-    async fn put_get_checked(
-        &self,
-        checked: AccessChecked,
-        _desc: std::sync::Arc<FieldDesc>,
-        _changed: epics_pva_rs::proto::BitSet,
-        delta: &PvField,
-        ctx: ChannelContext,
-    ) -> Result<Option<SourceRead>, OpError> {
-        if !checked.allows_write() {
-            tracing::debug!(
-                pv = %checked.pv_name(),
-                account = %ctx.creds.account,
-                method = %ctx.creds.method,
-                "pva-gateway: PUT_GET denied by gateway ACF"
-            );
-            return Err(OpError::denied(format!(
-                "PUT_GET denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-
-        let name = upstream_name_op(checked.pv_name())?;
-        let client = self.upstream_client_for(&ctx);
-        tracing::debug!(
-            pv = %name,
-            account = %ctx.creds.account,
-            method = %ctx.creds.method,
-            "pva-gateway: forwarding PUT_GET with downstream credentials"
-        );
-        // One upstream PUT_GET carrying the downstream's preserved INIT
-        // pvRequest (process/block) and the put value; the value targets the
-        // `value` bit (typed pass-through, matching the plain-PUT path) and
-        // the upstream post-put readback is returned verbatim — INCLUDING the
-        // leaves the upstream marked in it (`MarkedRead::marked`), so the
-        // downstream reply frames the upstream's changed-bitset rather than a
-        // full mask over decoder-zero-filled leaves (pva2pva forwards the
-        // upstream readback's bitset, `p2pApp/channel.cpp:129-138`). Falls
-        // back to the default request when the downstream sent none.
-        let read = match ctx.pv_request.as_ref() {
-            Some(req) => {
-                client
-                    .pvput_get_pv_field_with_request_value_marked(name, req, delta)
-                    .await
-            }
-            None => client.pvput_get_pv_field_marked(name, delta).await,
-        };
-        read.map(|r| Some(upstream_read(r)))
-            .map_err(upstream_op_error)
     }
 
     async fn is_writable(&self, name: &[u8]) -> bool {
@@ -1503,161 +1427,6 @@ impl ChannelSource for GatewayChannelSource {
         }
     }
 
-    // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
-    //
-    // pva2pva `GWChannel::createChannelArray` (`p2pApp/channel.cpp:226-232`)
-    // forwards the array op to the upstream channel with the downstream's
-    // pvRequest unchanged. We mirror that: every sub-op runs through the
-    // per-credential client (so the upstream IOC sees the real downstream
-    // identity, like `put_value_checked` / `rpc_checked`)
-    // and carries the downstream INIT pvRequest — captured in
-    // `ctx.pv_request` — so the upstream resolves the same bound array field
-    // the downstream selected. Each forward is one upstream
-    // INIT+sub-op+DESTROY (the gateway holds no upstream array op state),
-    // matching the stateless one-shot forward the other write paths
-    // use. ACF is applied per sub-op by the read/write gate below, mirroring
-    // pvAccessCPP's per-sub-op gating (`responseHandlers.cpp` gates each
-    // ChannelArray request, not the create).
-
-    async fn channel_array_init(
-        &self,
-        name: &[u8],
-        ctx: ChannelContext,
-    ) -> Result<FieldDesc, OpError> {
-        let name = upstream_name_op(name)?;
-        // INIT only resolves the bound array field's introspection — no
-        // access check here, exactly as the native server gates per sub-op
-        // rather than at create. Forward an upstream describe carrying the
-        // downstream pvRequest so the reported descriptor is the upstream's.
-        let client = self.upstream_client_for(&ctx);
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => client.pvarray_describe_with_request_value(name, req).await,
-            None => client.pvarray_describe(name).await,
-        };
-        result.map_err(upstream_op_error)
-    }
-
-    async fn channel_array_get(
-        &self,
-        checked: AccessChecked,
-        offset: u32,
-        count: u32,
-        stride: u32,
-        ctx: ChannelContext,
-    ) -> Result<PvField, OpError> {
-        if !checked.allows_read() {
-            return Err(OpError::denied(format!(
-                "ARRAY getArray denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-        let name = upstream_name_op(checked.pv_name())?;
-        let client = self.upstream_client_for(&ctx);
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => {
-                client
-                    .pvarray_get_with_request_value(name, req, offset, count, stride)
-                    .await
-            }
-            None => client.pvarray_get(name, offset, count, stride).await,
-        };
-        result
-            .map(|(_desc, value)| value)
-            .map_err(upstream_op_error)
-    }
-
-    async fn channel_array_put(
-        &self,
-        checked: AccessChecked,
-        offset: u32,
-        stride: u32,
-        value: PvField,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !checked.allows_write() {
-            return Err(OpError::denied(format!(
-                "ARRAY putArray denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-        let name = upstream_name_op(checked.pv_name())?;
-        let client = self.upstream_client_for(&ctx);
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => {
-                client
-                    .pvarray_put_with_request_value(name, req, &value, offset, stride)
-                    .await
-            }
-            None => client.pvarray_put(name, &value, offset, stride).await,
-        };
-        result.map_err(upstream_op_error)
-    }
-
-    async fn channel_array_set_length(
-        &self,
-        checked: AccessChecked,
-        length: u32,
-        ctx: ChannelContext,
-    ) -> Result<(), OpError> {
-        if !checked.allows_write() {
-            return Err(OpError::denied(format!(
-                "ARRAY setLength denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-        let name = upstream_name_op(checked.pv_name())?;
-        let client = self.upstream_client_for(&ctx);
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => {
-                client
-                    .pvarray_set_length_with_request_value(name, req, length)
-                    .await
-            }
-            None => client.pvarray_set_length(name, length).await,
-        };
-        result.map_err(upstream_op_error)
-    }
-
-    async fn channel_array_get_length(
-        &self,
-        checked: AccessChecked,
-        ctx: ChannelContext,
-    ) -> Result<u32, OpError> {
-        if !checked.allows_read() {
-            return Err(OpError::denied(format!(
-                "ARRAY getLength denied by gateway access security: \
-                 PV '{pv}' from {host}/{account}/{method}",
-                pv = checked.pv_name(),
-                host = ctx.creds.host,
-                account = ctx.creds.account,
-                method = ctx.creds.method,
-            )));
-        }
-        let name = upstream_name_op(checked.pv_name())?;
-        let client = self.upstream_client_for(&ctx);
-        let result = match ctx.pv_request.as_ref() {
-            Some(req) => {
-                client
-                    .pvarray_get_length_with_request_value(name, req)
-                    .await
-            }
-            None => client.pvarray_get_length(name).await,
-        };
-        result.map_err(upstream_op_error)
-    }
-
     async fn subscribe_raw(
         &self,
         name: &[u8],
@@ -1686,7 +1455,7 @@ impl ChannelSource for GatewayChannelSource {
     /// served `entry.snapshot()` from the monitor cache, which returned
     /// stale cached state instead of forwarding a real upstream ChannelGet
     /// (see `get_value` for the pva2pva `p2pApp/channel.cpp:109-115`
-    /// rationale). The GET / PUT_GET-readback framing path: forward the
+    /// rationale). The GET framing path: forward the
     /// upstream read AND the leaves the upstream marked in it.
     ///
     /// The trait default wraps [`Self::get_value_checked`] as
@@ -1744,8 +1513,7 @@ impl ChannelSource for GatewayChannelSource {
         // `GWChannel::createChannelGet` does, forwarding the requester's
         // pvRequest to the upstream `createChannelGet`
         // (epics-base/modules/pva2pva/p2pApp/channel.cpp:109-115). Falls back
-        // to the default request when the downstream sent none, matching the
-        // PUT_GET readback path above.
+        // to the default request when the downstream sent none.
         let client = self.upstream_client_for(&ctx);
         match ctx.pv_request.as_ref() {
             Some(req) => client

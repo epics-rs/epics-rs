@@ -333,12 +333,12 @@ pub struct OpDataResponse {
     /// — the server sets bits for fields it coalesced/squashed because
     /// the client fell behind. Non-empty ⟹ a server-side squash
     /// occurred (pvxs `clientmon.cpp:549-558` sets `servSquash` when any
-    /// word is non-zero). Always empty for GET/PUT_GET/RPC, which carry
+    /// word is non-zero). Always empty for GET/PUT/RPC, which carry
     /// no overrun on the wire.
     pub overrun: BitSet,
     /// Response type descriptor — only populated for RPC, where the wire
     /// format carries its own type independent of any INIT-time
-    /// introspection. `None` for GET/MONITOR/PUT_GET (the caller already
+    /// introspection. `None` for GET/PUT/MONITOR (the caller already
     /// has the type from INIT).
     pub response_desc: Option<FieldDesc>,
 }
@@ -432,7 +432,7 @@ pub(crate) fn monitor_finish_body(
 }
 
 /// Offset of the `changed BitSet | value | [overrun]` region of an op DATA
-/// payload, or `None` when the frame carries no value body. GET/PUT/PUT_GET
+/// payload, or `None` when the frame carries no value body. GET/PUT
 /// put a `Status` before it (and a PUT without GetBack has no body at all),
 /// MONITOR DATA starts it right after `ioid + subcmd`, and a MONITOR FINISH
 /// defers to [`monitor_finish_body`].
@@ -611,7 +611,7 @@ pub fn decode_op_response_cached(
         PvaError::Protocol("data response without prior introspection".to_string())
     })?;
 
-    // GET data response and PUT_GET (PUT with subcmd & 0x40) begin with a
+    // GET data response and PUT readback (subcmd & 0x40) begin with a
     // Status; MONITOR data does not — except a FINISH-carried update, whose
     // (success) Status was consumed above by `monitor_finish_body`.
     let status = if let Some(s) = finish_status {
@@ -663,8 +663,8 @@ pub fn decode_op_response_cached(
 // ─── Type-cache marker flattening (reader-task owned) ───────────────────
 
 /// Resolve 0xFD/0xFE type-cache markers in an inbound op-response frame —
-/// both in the leading FieldDesc region (INIT introspection, PUT_GET
-/// putIF/getIF, GET_FIELD type, RPC data type) AND inside `any`
+/// both in the leading FieldDesc region (INIT introspection,
+/// GET_FIELD type, RPC data type) AND inside `any`
 /// (Variant / VariantArray) value payloads of DATA frames — rewriting the
 /// payload to carry self-contained inline descriptors.
 ///
@@ -690,15 +690,6 @@ pub fn decode_op_response_cached(
 /// The introspection entry is dropped on MONITOR FINISH here, and on any
 /// op's teardown via
 /// `ServerConn::unregister_ioid`.
-///
-/// ChannelArray (`Command::Array`) is intentionally NOT handled here: its
-/// DATA frame layout is sub-op dependent (getArray value vs getLength size
-/// vs empty) and cannot be determined from the frame alone, so its INIT and
-/// DATA legs resolve markers against an op-local cache in
-/// `op_array_data`. That op runs both legs
-/// on one task in wire order, so the op-local cache is correctly ordered;
-/// the narrow consequence is that an Array value may not resolve a slot a
-/// *different* op defined on the same connection.
 ///
 /// On any parse difficulty the frame payload is left untouched — the per-op
 /// decoder will then surface a precise error rather than this masking it.
@@ -770,26 +761,6 @@ pub fn flatten_type_cache_markers(
             // the frame; flatten it, then walk the fully-present value.
             flatten_rpc_data_value(frame, order, cache);
         }
-        Command::PutGet => {
-            let Some(subcmd) = peek_u8(&frame.payload, 4) else {
-                return;
-            };
-            if subcmd & 0x10 != 0 {
-                introspection.remove(&ioid);
-                return;
-            }
-            if subcmd & 0x08 != 0 {
-                // INIT: putIF + getIF. Capture getIF — the DATA value type.
-                if let Some(descs) = rewrite_after_status(frame, order, cache, 5, 2) {
-                    if let Some(get_if) = descs.into_iter().nth(1) {
-                        introspection.insert(ioid, get_if);
-                    }
-                }
-                return;
-            }
-            // DATA: ioid+subcmd+status+getChanged+getValue → flatten value.
-            flatten_op_data_value(frame, order, cache, cmd, subcmd, ioid, introspection);
-        }
         _ => {}
     }
 }
@@ -849,7 +820,7 @@ fn rewrite_after_status(
 }
 
 /// Flatten 0xFD/0xFE markers embedded in `any` payloads of a
-/// GET/PUT/MONITOR/PUT_GET DATA value, in place. `cmd`/`subcmd` select the
+/// GET/PUT/MONITOR DATA value, in place. `cmd`/`subcmd` select the
 /// frame layout (via [`op_data_body_start`], which also answers for a MONITOR
 /// FINISH that carries a trailing update); the value type is the introspection
 /// captured from the op's INIT. On any difficulty — including a frame with no

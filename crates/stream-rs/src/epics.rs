@@ -540,7 +540,7 @@ impl CallbackBody for RecordProcess {
             }
             if let Some(done) = shared.device_done.lock().take() {
                 let prio = CallbackPriority::from_record_prio(shared.prio.load(Ordering::Relaxed));
-                let _ = done.complete(prio, Ok(()));
+                let _ = done.complete(prio);
             }
         } else if let Some(reprocess) = shared.reprocess.get() {
             reprocess.process_now();

@@ -102,6 +102,7 @@ default-filter = """
   binary(wire_golden_ext) |
   binary(interop_pvxs) |
   binary(discovery_mdns) |
+  binary(attributes_file_over_ca) |
   binary(stress_load) |
   binary(calink_rights_match_softioc) |
   binary(local_cp_link_matches_softioc) |

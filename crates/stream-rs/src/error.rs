@@ -95,20 +95,30 @@ pub fn take_captured() -> Vec<u8> {
 /// alive, but for a thread's own [`capture_stderr`].
 static PROCESS_CAPTURE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
-/// One [`ProcessCapture`] at a time, so two tests' lines never mix.
+/// One [`ProcessCapture`] at a time.
 static PROCESS_CAPTURE_OWNER: Mutex<()> = Mutex::new(());
 
 /// The stderr output of all threads, the bus's and the timers' included,
-/// for a test to compare; [`capture_process_stderr`] makes it. A test
-/// that holds one waits out any other, but a thread of a test that holds
-/// none still writes into it.
+/// for a test to compare; [`capture_process_stderr`] makes it. Any
+/// thread of the process writes into it, a test's that holds none
+/// included, so it is made only under nextest's process-per-test mode.
 pub struct ProcessCapture {
     _owner: parking_lot::MutexGuard<'static, ()>,
 }
 
 /// Send the stderr output of every thread to one buffer until the
 /// capture is dropped, waiting until no other capture is alive.
+///
+/// # Panics
+///
+/// Outside `NEXTEST_EXECUTION_MODE=process-per-test`, where another
+/// test's threads would write into the capture.
 pub fn capture_process_stderr() -> ProcessCapture {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+        Ok("process-per-test"),
+        "capture_process_stderr needs a process per test: run under cargo nextest"
+    );
     let owner = PROCESS_CAPTURE_OWNER.lock();
     *PROCESS_CAPTURE.lock() = Some(Vec::new());
     ProcessCapture { _owner: owner }

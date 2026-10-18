@@ -670,6 +670,8 @@ pub enum PostRule {
     OnChange,
     /// Write, never post.
     Silent,
+    /// Neither write nor post.
+    Skip,
 }
 
 /// One field of an out-of-band post. A bare `(field, value)` posts
@@ -3677,7 +3679,9 @@ impl PvDatabase {
         for item in fields {
             let rule = item.rule();
             let (field, value) = item.into_parts();
-            if rule == PostRule::OnChange && inst.resolve_field(&field).as_ref() == Some(&value) {
+            if rule == PostRule::Skip
+                || rule == PostRule::OnChange && inst.resolve_field(&field).as_ref() == Some(&value)
+            {
                 continue;
             }
             self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;

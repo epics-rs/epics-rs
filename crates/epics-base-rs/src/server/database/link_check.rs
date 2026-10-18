@@ -173,6 +173,14 @@ impl PvDatabase {
         }
     }
 
+    /// C `checkLink(prec)` from inside `special()` on the record `instance`
+    /// holds (throttle's SYNC arm, throttleRecord.c:376-389).
+    pub(crate) fn link_check_held(&self, record: &[u8], instance: &mut RecordInstance) {
+        if self.check_links(instance) {
+            self.arm_link_check(record, LINK_RECHECK);
+        }
+    }
+
     /// After `init_record` or `special()` classified `record`'s links: an
     /// `Ext PV NC` sets `caLinkStat = CA_LINKS_NOT_OK`, and arms
     /// `checkLinksCallback` after `recheck` when the record's C schedules one

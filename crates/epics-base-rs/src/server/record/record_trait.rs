@@ -6084,6 +6084,15 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// True iff the C `special()` for a put to `put_field` calls the
+    /// record's `checkLink` before it acts on the link statuses — throttle's
+    /// SYNC arm (`throttleRecord.c:381-386`). The put owner (`field_io`)
+    /// runs [`Record::link_check`]'s check under the record lock ahead of
+    /// `special()`, which then reads the statuses it left. Default: false.
+    fn special_checks_links(&self, _put_field: &str) -> bool {
+        false
+    }
+
     /// Downcast to concrete type for device support init injection.
     /// Override in record types that need device support to inject state (e.g., MotorRecord).
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

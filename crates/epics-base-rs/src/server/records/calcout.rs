@@ -1851,10 +1851,11 @@ impl Record for CalcoutRecord {
         // `dbAddLink` (dbAccess.c:1181-1208), so the link has no `lset` yet and
         // `dbLinkIsConstant` holds for EVERY put: the status reads Constant
         // whatever the target, and `recGblInitConstantLink` loads nothing.
-        // Bumping the generation drops any classification still in flight.
+        // Taking the link's generation drops its classification still in
+        // flight; the other links' stand.
         if let Some(idx) = Self::link_index(field) {
             self.link_status[idx] = LINK_CON;
-            self.link_gen.next();
+            self.link_gen.next_for(1 << idx);
             self.put_posts = 0b11 << (2 * idx);
         }
         Ok(())

@@ -282,38 +282,41 @@ impl ThrottleRecord {
     /// `init_record`/`special` link management (throttleRecord.c:171-205,
     /// 339-374): CONSTANT→`Constant`, a PV on this IOC→`Local PV`,
     /// else→`Ext PV NC`, which `checkLinkCallback` re-reads after `recheck`
-    /// (throttleRecord.c:222, :370). C posts the statuses it classified,
-    /// bit 0 OV and bit 1 SIV of `posted`: both at init, the put link's alone
-    /// on an OUT/SINP `special()`. A no-op when the record is not registered
-    /// (no handle).
-    fn refresh_link_status(&self, posted: u64, recheck: Option<std::time::Duration>) {
+    /// (throttleRecord.c:222, :370). C classifies, and posts whatever its
+    /// value, bit 0 OV and bit 1 SIV of `links`: both at init, the put link's
+    /// alone on an OUT/SINP `special()`, which leaves the other status as it
+    /// stands. A no-op when the record is not registered (no handle).
+    fn refresh_link_status(&self, links: u64, recheck: Option<std::time::Duration>) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
         let name = name.clone();
         let handle = handle.clone();
-        let out = self.out.clone();
-        let sinp = self.sinp.clone();
-        // Stamp this refresh so a later re-point (an OUT/SINP `special()`)
-        // supersedes an init-time snapshot that finishes late.
-        let token = self.link_gen.next_forcing(posted);
+        let classified: Vec<(usize, &'static str, PvString, LinkRole)> = [
+            (0, "OV", self.out.clone(), LinkRole::Output),
+            (1, "SIV", self.sinp.clone(), LinkRole::Input),
+        ]
+        .into_iter()
+        .filter(|&(i, ..)| links & 1 << i != 0)
+        .collect();
+        // Stamp this refresh so a later re-point of the same link (an
+        // OUT/SINP `special()`) supersedes an init-time snapshot that
+        // finishes late.
+        let token = self.link_gen.next_for(links);
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
         let init_key = name.clone();
         sched.schedule_record_init(&init_key, async move {
             let rule = THROTTLE_LINK_CHECK.rule;
-            let (ov, _) = classify_link(&handle, &out, LinkRole::Output, rule);
-            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input, rule);
-            token.post_forced(
-                &handle,
-                &name,
-                vec![
-                    ("OV".to_string(), EpicsValue::Short(ov)),
-                    ("SIV".to_string(), EpicsValue::Short(siv)),
-                ],
-                THROTTLE_LINK_CHECK.mask,
-            );
+            let fields = classified
+                .into_iter()
+                .map(|(i, field, link, role)| {
+                    let (status, _) = classify_link(&handle, &link, role, rule);
+                    (i, field.to_string(), EpicsValue::Short(status))
+                })
+                .collect();
+            token.post_each(&handle, &name, fields, THROTTLE_LINK_CHECK.mask);
             handle.link_check_classified(&name, recheck);
         });
     }
@@ -613,16 +616,14 @@ impl Record for ThrottleRecord {
             // (OV for OUT, SIV for SINP) — CONSTANT→`Constant`, a PV on
             // this IOC→`Local PV`, else→`Ext PV NC`. The new link string the
             // put just stored is classified off-thread (needs an async DB
-            // lookup, C `dbNameToAddr`). Both are classified under one
-            // generation; only the put link's status posts.
+            // lookup, C `dbNameToAddr`). The other link's status stands.
             "OUT" => self.refresh_link_status(1, Some(LINK_RECHECK)),
             "SINP" => self.refresh_link_status(1 << 1, Some(LINK_RECHECK)),
             // C `special()` SYNC case (throttleRecord.c:376-389): a put of
             // `SYNC=Process` triggers `valueSync` — read SINP into VAL and
-            // post (NO OUT write, NO process). C gates on `siv`: an
-            // unconnected external SINP (`EXT_NC`) is NOT synced (its
-            // `checkLink` can never connect here — no CA client), so SYNC
-            // is left in `Process`, matching C leaving it pending.
+            // post (NO OUT write, NO process) — unless SIV still reads
+            // `Ext PV NC` after the `checkLink` that `special_checks_links`
+            // ran.
             "SYNC" if self.sync == THROTTLE_SYNC_PROCESS && self.link_status[1] != LINK_EXT_NC => {
                 let mut actions = std::mem::take(&mut self.special_actions);
                 self.value_sync(&mut actions);
@@ -838,6 +839,11 @@ impl Record for ThrottleRecord {
         CycleHooks::CONTEXT
             .union(CycleHooks::PROCESS_POSTED)
             .union(CycleHooks::HAND_POSTED_OWN_STAMP)
+    }
+
+    /// C runs `checkLink` only for an `Ext PV NC` SINP (throttleRecord.c:381).
+    fn special_checks_links(&self, put_field: &str) -> bool {
+        put_field == "SYNC" && self.sync != THROTTLE_SYNC_IDLE && self.link_status[1] == LINK_EXT_NC
     }
 
     fn link_check(&mut self) -> Option<LinkCheck<'_>> {

@@ -454,8 +454,8 @@ pub struct SseqRecord {
     /// classifies a *snapshot* of the `DOLn`/`LNKn`/`WAITn` link state
     /// off-thread; a later refresh (a `special()` `DOLn`/`LNKn` re-point)
     /// must win over an earlier one regardless of which spawned task finishes
-    /// first. The shared `LinkStatusGen` gate enforces the invariant — only
-    /// the latest classification may be published.
+    /// first. The shared `LinkStatusGen` gate enforces it per link
+    /// ([`link_ix`]): only the latest classification of a link is published.
     link_gen: LinkStatusGen,
     /// `DOLnV`/`LNKnV` at [`link_ix`], what C's `checkLinks` and
     /// `init_record`/`special` classify.
@@ -1118,11 +1118,14 @@ impl SseqRecord {
                 (s.dol.clone(), s.lnk.clone())
             })
             .collect();
-        // Stamp this refresh. A concurrent later refresh (a runtime DOLn/LNKn
-        // re-point through `special()`) issues a newer token; this task then
-        // sees its token is stale and drops its post so an init-time snapshot
-        // finishing late cannot clobber the newer classification.
-        let token = self.link_gen.next();
+        // Claim the links C classifies in this pass, so a later put's refresh
+        // supersedes only its own link: `special()` classifies the put link
+        // alone (sseqRecord.c:987-1079).
+        let claim = match trigger {
+            LinkPass::Init => (0..2 * NUM_STEPS).fold(0, |c, i| c | 1 << i),
+            LinkPass::Special { step, lnk } => 1 << link_ix(step, lnk),
+        };
+        let token = self.link_gen.next_for(claim);
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
@@ -1139,9 +1142,9 @@ impl SseqRecord {
             let not_ok = class
                 .iter()
                 .any(|&(ds, _, ls, _)| ds == LNKV_EXT_NC || ls == LNKV_EXT_NC);
-            let mut fields: Vec<(String, EpicsValue, PostRule)> = Vec::new();
-            let mut push = |f: &str, v: EpicsValue, r: PostRule| {
-                fields.push((f.to_string(), v, r));
+            let mut fields: Vec<(usize, String, EpicsValue, PostRule)> = Vec::new();
+            let mut push = |link: usize, f: &str, v: EpicsValue, r: PostRule| {
+                fields.push((link, f.to_string(), v, r));
             };
             let status = |s: i16| EpicsValue::Enum(s as u16);
             let recheck = match trigger {
@@ -1150,23 +1153,35 @@ impl SseqRecord {
                     // constant DOL `DBF_NOACCESS` (:206).
                     for (i, &(ds, dt, ls, lt)) in class.iter().enumerate() {
                         let dt = if ds == LNKV_CON { DBF_NOACCESS } else { dt };
-                        push(DOLV_FIELDS[i], status(ds), PostRule::Always);
-                        push(DT_FIELDS[i], EpicsValue::Short(dt), PostRule::Silent);
-                        push(LNKV_FIELDS[i], status(ls), PostRule::Always);
-                        push(LT_FIELDS[i], EpicsValue::Short(lt), PostRule::Silent);
+                        let (d, l) = (link_ix(i, false), link_ix(i, true));
+                        push(d, DOLV_FIELDS[i], status(ds), PostRule::Always);
+                        push(d, DT_FIELDS[i], EpicsValue::Short(dt), PostRule::Silent);
+                        push(l, LNKV_FIELDS[i], status(ls), PostRule::Always);
+                        push(l, LT_FIELDS[i], EpicsValue::Short(lt), PostRule::Silent);
                     }
                     None
                 }
                 LinkPass::Special { step, lnk } => {
                     // sseqRecord.c:1005-1011 (DOLn), :1047-1057 (LNKn).
                     let (ds, dt, ls, lt) = class[step];
+                    let link = link_ix(step, lnk);
                     let put = if lnk {
-                        push(LNKV_FIELDS[step], status(ls), PostRule::Always);
-                        push(LT_FIELDS[step], EpicsValue::Short(lt), PostRule::Silent);
+                        push(link, LNKV_FIELDS[step], status(ls), PostRule::Always);
+                        push(
+                            link,
+                            LT_FIELDS[step],
+                            EpicsValue::Short(lt),
+                            PostRule::Silent,
+                        );
                         ls
                     } else {
-                        push(DOLV_FIELDS[step], status(ds), PostRule::Always);
-                        push(DT_FIELDS[step], EpicsValue::Short(dt), PostRule::Silent);
+                        push(link, DOLV_FIELDS[step], status(ds), PostRule::Always);
+                        push(
+                            link,
+                            DT_FIELDS[step],
+                            EpicsValue::Short(dt),
+                            PostRule::Silent,
+                        );
                         ds
                     };
                     // `special` runs before `dbAddLink` (dbAccess.c:1181,
@@ -1176,9 +1191,9 @@ impl SseqRecord {
                     Some((put != LNKV_CON || not_ok).then_some(LINK_RECHECK))
                 }
             };
-            // Publish only if no newer refresh was issued meanwhile, at
-            // C's literal `DBE_VALUE`.
-            token.post(
+            // Publish each link no newer refresh claimed, at C's literal
+            // `DBE_VALUE`.
+            token.post_each_ruled(
                 &handle,
                 &name,
                 fields,

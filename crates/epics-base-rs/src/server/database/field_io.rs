@@ -847,6 +847,12 @@ fn special_after_put(
     burst: &mut PostBurst,
     tail: &mut PutTail,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
+    // C's `checkLink(prec)` inside `special()`: it needs the database, which
+    // the record does not hold, so it runs here first.
+    if instance.record.special_checks_links(field) {
+        let name = instance.name.clone();
+        db.link_check_held(name.as_bytes(), instance);
+    }
     let mut status = instance.record.special(field, true);
     collect_after_gate(instance, tail);
     collect_put_report(instance, status.is_err(), tail);

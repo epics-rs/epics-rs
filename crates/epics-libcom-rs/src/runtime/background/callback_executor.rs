@@ -2708,6 +2708,37 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst));
     }
 
+    /// `callbackStop` on a band whose workers were told to exit (the
+    /// `run_facility_loop` exit path's `request_shutdown`) seals it on the
+    /// count alone: the shutdown bit is not part of the drain test.
+    #[test]
+    fn a_stop_seals_a_shut_down_band() {
+        let pool = CallbackPool::with_config(8, 1);
+        let ran = Arc::new(AtomicBool::new(false));
+        pool.request(CallbackPriority::Medium, runs(&ran)).unwrap();
+        let band = Arc::clone(&pool.queues[CallbackPriority::Medium.index()]);
+        let finished = || -> u64 {
+            band.finished
+                .iter()
+                .map(|f| f.0.load(Ordering::Acquire))
+                .sum()
+        };
+        while finished() != 1 {
+            std::thread::yield_now();
+        }
+        band.request_shutdown();
+        let (done, stopped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            pool.stop();
+            let _ = done.send(());
+        });
+        assert!(
+            stopped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "callbackStop spun on the shut-down band"
+        );
+        assert_eq!(band.state(), band_state::STOPPED);
+    }
+
     /// After `callbackStop` a request is taken (`Ok`) and never run: C's
     /// ring outlives its workers until `callbackCleanup`.
     #[test]

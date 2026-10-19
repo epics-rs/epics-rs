@@ -2693,12 +2693,10 @@ impl PvDatabase {
             }
         };
         // C `iocBuild` calls `dbCaLinkInit()` between its two halves
-        // (`iocInit.c:216`), so the `dbCaLink` worker is up before the record
-        // init passes of `iocBuild_2` — and before anything they wire can
-        // stage a link. Here rather than in `ioc_app`'s lifecycle because this
-        // barrier is the one point every bring-up path crosses: the
-        // `IocApplication` walk and `CaServer::run` both reach it, and only
-        // one of them runs that lifecycle.
+        // (`iocInit.c:216`), before the record init passes of `iocBuild_2`;
+        // every `IocBuilder` build path does so there. The `ca_link_init`
+        // below starts the worker for a database that reaches this barrier
+        // with no build behind it.
         // C's `initDatabase` per-record init pass — bind each LOAD-deferred
         // record's dset and run its `init_record`. The build lifecycle drains
         // this explicitly BEFORE `setup_io_intr` (C's `scanInit`), so a record's

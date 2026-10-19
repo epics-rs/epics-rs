@@ -662,6 +662,8 @@ impl BuildSteps for () {
         db: &Arc<PvDatabase>,
         installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
     ) {
+        // `dbCaLinkInit` precedes `initDatabase` here too (`iocInit.c:216`).
+        db.ca_link_init();
         crate::server::ioc_app::install_link_sets(db, installers).await;
     }
 }

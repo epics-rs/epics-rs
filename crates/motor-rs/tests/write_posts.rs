@@ -147,8 +147,8 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         subscribers.attach(state.clone(), io_intr_tx, Default::default());
         Bound { io_intr, state }
     };
-    let (record, observer) = (bind(), bind());
-    let poll_loop = MotorPollLoop::new(
+    let (mut record, mut observer) = (bind(), bind());
+    let mut poll_loop = MotorPollLoop::new(
         PollerInbox {
             poll,
             commands: commands_rx,
@@ -159,6 +159,11 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         Duration::from_secs(1),
         0,
     );
+    // The records are bound before the poller starts, so its startup pass
+    // posts to them.
+    poll_loop.run_startup_pass();
+    record.passes();
+    observer.passes();
     Rig {
         poll_loop,
         commands,

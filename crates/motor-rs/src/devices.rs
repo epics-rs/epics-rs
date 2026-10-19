@@ -198,13 +198,13 @@ fn controller_polls() -> &'static Mutex<HashMap<String, SharedControllerPoll>> {
     POLLS.get_or_init(Default::default)
 }
 
-/// Name `poll` controller port `port`'s poller; a port has one.
+/// Name `poll` controller port `port`'s poller; a port has one. The port
+/// may be registered later (simMotorCreate names its poller first), so the
+/// name holds until then and [`controller_poll`] gates on the port.
 pub(crate) fn link_controller_poll(port: &str, poll: &SharedControllerPoll) {
-    if lock(controller_ports()).contains_key(port) {
-        lock(controller_polls())
-            .entry(port.to_owned())
-            .or_insert_with(|| poll.clone());
-    }
+    lock(controller_polls())
+        .entry(port.to_owned())
+        .or_insert_with(|| poll.clone());
 }
 
 /// Controller port `port`'s poller: `None` when there is no such port,
@@ -213,6 +213,13 @@ pub(crate) fn controller_poll(port: &str) -> Option<Option<SharedControllerPoll>
     lock(controller_ports())
         .contains_key(port)
         .then(|| lock(controller_polls()).get(port).cloned())
+}
+
+/// [`crate::builder::ControllerAxes::first_polls_pending`] of controller
+/// port `port`'s poller, 0 before one is named; `None` when there is no
+/// such port.
+pub fn first_polls_pending(port: &str) -> Option<usize> {
+    controller_poll(port).map(|poll| poll.map_or(0, |poll| poll.first_polls_pending()))
 }
 
 /// Controller port `port` itself.

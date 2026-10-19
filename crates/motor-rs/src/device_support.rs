@@ -601,18 +601,13 @@ impl DeviceSupport for MotorDeviceSupport {
         // process_motor_info(initcall) and the drive sync, all before any
         // process. Each of its commands is a transaction of its own
         // (motordevCom.cc:327-343).
-        let request_poll = record
+        if let Some(rec) = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-            .map(|rec| {
-                let effects = rec.initial_readback(&status);
-                for command in effects.commands {
-                    rec.send_special(vec![command]);
-                }
-                effects.request_poll
-            });
-        if request_poll == Some(true) {
-            self.port.send_poll(PollCommand::ForcePoll);
+        {
+            for command in rec.initial_readback(&status).commands {
+                rec.send_special(vec![command]);
+            }
         }
 
         // C init_record 717-718 ("Reset limits in case database values

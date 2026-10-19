@@ -659,7 +659,7 @@ async fn two_asyn_records_on_one_axis_both_follow_its_poller() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let db = boot(
         r##"
 record(motor, "K:a") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") field(MRES, "0.001") field(VELO, "100") }
@@ -749,7 +749,7 @@ async fn a_move_completes_while_the_ioc_is_paused() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let db = boot(
         r##"
 record(motor, "P:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(PAUSED,0)") field(MRES, "0.001") field(VELO, "1") field(FLNK, "P:n") }
@@ -794,7 +794,7 @@ async fn a_record_stop_reads_no_move_speeds() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let path = std::env::temp_dir().join(format!("motor-out-STOPRD0-{}", std::process::id()));
     let file = std::fs::File::create(&path).unwrap();
     let manager = PortManager::global();
@@ -852,7 +852,7 @@ async fn the_poller_reads_params_through_the_param_library() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let path = std::env::temp_dir().join(format!("motor-out-PARAMRD0-{}", std::process::id()));
     let file = std::fs::File::create(&path).unwrap();
     let manager = PortManager::global();
@@ -912,7 +912,7 @@ async fn a_put_before_scan_run_completes_its_move() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let db = boot(
         r##"
 record(motor, "E:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(EARLY,0)") field(MRES, "0.001") field(VELO, "1") }

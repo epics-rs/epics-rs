@@ -64,7 +64,7 @@ fn polls_after(port: &str, forced: u32, cmd: CommandDef) -> usize {
     let hour = Duration::from_secs(3600);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
-    rt.spawn(controller.build(hour, hour, forced).run());
+    rt.spawn(controller.build(hour, hour, forced).start());
     // The startup pass.
     std::thread::sleep(Duration::from_millis(100));
     let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
@@ -108,7 +108,7 @@ fn set_idle_poll_period_reaches_a_poller_with_no_axes() {
     let hour = Duration::from_secs(3600);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
-    rt.spawn(controller.build(hour, hour, 0).run());
+    rt.spawn(controller.build(hour, hour, 0).start());
     std::thread::sleep(Duration::from_millis(100));
     let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
     let cmd = motor_rs::ioc::set_idle_poll_period_command();
@@ -139,7 +139,7 @@ fn set_idle_poll_period_reaches_a_one_axis_controller() {
     register_axis(setup.axis).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
-    rt.spawn(setup.poll_loop.run());
+    rt.spawn(setup.poll_loop.start());
     std::thread::sleep(Duration::from_millis(100));
     let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
     let cmd = motor_rs::ioc::set_idle_poll_period_command();

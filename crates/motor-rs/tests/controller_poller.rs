@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use asyn_rs::error::AsynResult;
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
-use motor_rs::builder::{ControllerAxis, ControllerBuilder};
+use motor_rs::builder::{ControllerAxes, ControllerAxis, ControllerBuilder};
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::trace::TraceUser;
 
@@ -72,7 +72,7 @@ async fn run_controller() -> Vec<(&'static str, Instant)> {
         );
         senders.push(poll_cmd_tx);
     }
-    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
     tokio::time::sleep(SLOW * 4).await;
     senders[1].send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
@@ -144,7 +144,14 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
     let axes = controller.axes();
     // No timed pass: each pass below is one a Wakeup asks for.
     let idle = Duration::from_secs(3600);
-    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
+    let poller = tokio::spawn(controller.build(idle, idle, 0).start());
+    // The startup pass runs on the poller thread and would poll A0 or not
+    // by when the add lands, as C's may: add after it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while axes.first_polls_pending() > 0 {
+        assert!(Instant::now() < deadline, "the startup pass never ended");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let (motor, user) = axis("A0", 0);
     // Held: a dropped axis ends the poller.
     let _a0 = tokio::task::spawn_blocking(move || axes.add(motor, user))
@@ -257,16 +264,18 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
         seen: seen.clone(),
     };
     let a1 = controller.axis(Arc::new(Mutex::new(watching)), user(1));
-    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
     tokio::time::sleep(PERIOD * 8).await;
     a1.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
     drop(a0);
     let seen = seen.lock().unwrap().clone();
     assert!(seen.len() >= 3, "{seen:?}");
-    // The startup poll posts nothing; every later poll of axis 0 does.
-    for &(polls, pulses) in &seen[1..] {
-        assert_eq!(pulses, polls - 1, "{seen:?}");
+    // Every poll of axis 0 posts, the startup pass's too: its record is
+    // bound before the poller starts, as ANF2StartPoller's after iocInit
+    // (asynMotorController.cpp:630, :658; asynMotorAxis.cpp:318-320).
+    for &(polls, pulses) in &seen {
+        assert_eq!(pulses, polls, "{seen:?}");
     }
 }
 
@@ -281,10 +290,14 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
         .controller_poll(move || controller_log.lock().unwrap().push(("C", Instant::now())));
     let axes = controller.axes();
     let idle = Duration::from_secs(60);
-    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
+    let poller = tokio::spawn(controller.build(idle, idle, 0).start());
     let names = |log: &Log| -> Vec<&'static str> {
         log.lock().unwrap().iter().map(|(name, _)| *name).collect()
     };
+    // Created after the startup pass, not merely after the spawn.
+    while names(&log).is_empty() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let mut joined = Vec::new();
     for (addr, name) in ["A0", "A1", "A2"].into_iter().enumerate() {
         let motor = Axis {
@@ -391,7 +404,7 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
         (m0, record)
     };
     let idle = Duration::from_secs(60);
-    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
+    let poller = tokio::spawn(controller.build(idle, idle, 0).start());
     tokio::time::sleep(PERIOD * 4).await;
     tokio::task::spawn_blocking(move || port.write_float64_blocking(index::MOVE_ABS, 1, 3.0))
         .await
@@ -405,8 +418,11 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
     poller.await.unwrap();
     let seen = seen.lock().unwrap().clone();
     // At the startup pass, the pass the move woke and the forced poll: m1's
+    // startup post to its record bound before the poller started (C's
+    // startup pass ends each axis poll in callParamCallbacks,
+    // asynMotorController.cpp:630, :658; asynMotorAxis.cpp:318-320), its
     // move post (DMOV 0), then its poll's (MOVN 1).
-    assert_eq!(seen, [0, 1, 2]);
+    assert_eq!(seen, [0, 2, 3]);
 }
 
 /// At each poll, the pulses another axis's record had received.
@@ -441,4 +457,437 @@ impl AsynMotor for MoveWatcher {
         self.seen.lock().unwrap().push(self.pulses);
         Ok(MotorStatus::default())
     }
+}
+
+/// The startup pass runs on the poller thread (asynMotorController.cpp:630),
+/// so `start` counts it pending until every axis in it has polled.
+#[tokio::test]
+async fn a_started_poller_is_pending_until_its_startup_pass_ends() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let axes = controller.axes();
+    let mut senders = Vec::new();
+    for (addr, (name, delay)) in [("A0", SLOW), ("A1", Duration::ZERO)]
+        .into_iter()
+        .enumerate()
+    {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay,
+        };
+        let ControllerAxis { poll_cmd_tx, .. } = controller.axis(
+            Arc::new(Mutex::new(motor)),
+            TraceUser::Asyn {
+                port: String::new(),
+                addr: addr as i32,
+            },
+        );
+        senders.push(poll_cmd_tx);
+    }
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    assert_eq!(axes.first_polls_pending(), 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while axes.first_polls_pending() > 0 {
+        assert!(Instant::now() < deadline, "the startup pass never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["A0", "A1"]);
+    senders[1].send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let axis = |name, addr| {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr,
+        };
+        (
+            Arc::new(Mutex::new(motor)) as Arc<Mutex<dyn AsynMotor>>,
+            user,
+        )
+    };
+    let (motor, user) = axis("A2", 2);
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    let first = axes.clone();
+    let settle = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.first_polls_pending() > 0 {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    settle();
+    let (motor, user) = axis("A0", 0);
+    let _a0 = tokio::task::spawn_blocking(move || axes.add(motor, user))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.first_polls_pending(), 1);
+    poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
+    settle();
+    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["A2", "A0", "A2"]);
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+// C builds an MVP2001 axis under pC->lock() (MVP2001Driver.cpp:222-224): a
+// pass due meanwhile waits on the lock and then polls the new axis
+// (asynMotorController.cpp:648-658).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_axis_built_under_the_lock_is_polled_by_the_pass_that_waited() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let axis = |name, addr| {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr,
+        };
+        (
+            Arc::new(Mutex::new(motor)) as Arc<Mutex<dyn AsynMotor>>,
+            user,
+        )
+    };
+    let (motor, user) = axis("B2", 2);
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    let first = axes.clone();
+    let settle = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.first_polls_pending() > 0 {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    settle();
+    let (motor, user) = axis("B0", 0);
+    let wake = poll_cmd_tx.clone();
+    let _b0 = tokio::task::spawn_blocking(move || {
+        axes.add_built(user, || {
+            wake.blocking_send(PollCommand::Wakeup).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            Ok::<_, String>((motor, ()))
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    settle();
+    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["B2", "B0", "B2"]);
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+// pmacCreateAxes builds every axis under one pC->lock()
+// (pmacController.cpp:974-979): a pass due during the first build waits out
+// the whole batch, then polls the new axes.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_pass_polls_between_two_builds_of_one_batch() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let axis = |name, addr| {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr,
+        };
+        (
+            Arc::new(Mutex::new(motor)) as Arc<Mutex<dyn AsynMotor>>,
+            user,
+        )
+    };
+    let (motor, user) = axis("C3", 3);
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    let first = axes.clone();
+    let settle = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.first_polls_pending() > 0 {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    settle();
+    let builds = [("C1", 1, "built C1"), ("C2", 2, "built C2")].map(|(name, addr, built)| {
+        let (motor, user) = axis(name, addr);
+        let wake = poll_cmd_tx.clone();
+        let log = log.clone();
+        let build = move || {
+            wake.blocking_send(PollCommand::Wakeup).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            log.lock().unwrap().push((built, Instant::now()));
+            Ok::<_, String>((motor, ()))
+        };
+        (user, build)
+    });
+    // The pause before the second build is where a hold per build would
+    // let the waiting pass in.
+    let builds = builds.into_iter().enumerate().map(|(i, build)| {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        build
+    });
+    let (added, done) = tokio::task::spawn_blocking(move || axes.add_built_all(builds))
+        .await
+        .unwrap();
+    done.unwrap();
+    assert_eq!(added.len(), 2);
+    settle();
+    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names[..4], ["C3", "built C1", "built C2", "C1"]);
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+// A build that fails ends the batch: the axes built before it stay added
+// and are polled from the next pass, the builds after it never run, and the
+// failed axis can be added again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_build_ends_the_batch_and_keeps_the_axes_before_it() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let axis = |name, addr| {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr,
+        };
+        (
+            Arc::new(Mutex::new(motor)) as Arc<Mutex<dyn AsynMotor>>,
+            user,
+        )
+    };
+    let (motor, user) = axis("C3", 3);
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    let first = axes.clone();
+    let settle = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.first_polls_pending() > 0 {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    settle();
+    type Build = Box<dyn FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, ()), String> + Send>;
+    let built = |name, label: &'static str, addr, fails| -> (TraceUser, Build) {
+        let (motor, user) = axis(name, addr);
+        let wake = poll_cmd_tx.clone();
+        let log = log.clone();
+        let build = move || {
+            log.lock().unwrap().push((label, Instant::now()));
+            if fails {
+                return Err(format!("{name} failed"));
+            }
+            wake.blocking_send(PollCommand::Wakeup).unwrap();
+            Ok((motor, ()))
+        };
+        (user, Box::new(build))
+    };
+    let builds = vec![
+        built("C1", "build C1", 1, false),
+        built("C2", "build C2", 2, true),
+        built("C4", "build C4", 4, false),
+    ];
+    let batch = axes.clone();
+    let (added, done) = tokio::task::spawn_blocking(move || batch.add_built_all(builds))
+        .await
+        .unwrap();
+    assert_eq!(done, Err("C2 failed".to_string()));
+    assert_eq!(added.len(), 1);
+    settle();
+    let (user, build) = built("C2", "build C2", 2, false);
+    tokio::task::spawn_blocking(move || axes.add_built(user, build))
+        .await
+        .unwrap()
+        .unwrap();
+    // C2's first poll ends before the pass reaches C3.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log.lock().unwrap().len() < 9 {
+        assert!(
+            Instant::now() < deadline,
+            "the pass after the retry never ended"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        names[..9],
+        [
+            "C3", "build C1", "build C2", "C1", "C3", "build C2", "C1", "C2", "C3"
+        ]
+    );
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+/// An axis whose poll fails, reporting C's `*moving` past the failure.
+struct Unreachable {
+    log: Log,
+}
+
+impl AsynMotor for Unreachable {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        self.log.lock().unwrap().push(("U", Instant::now()));
+        Err(asyn_rs::error::AsynError::Status {
+            status: asyn_rs::error::AsynStatus::Timeout,
+            message: "unreachable".into(),
+        })
+    }
+    fn failed_poll_moving(&self) -> Option<bool> {
+        Some(true)
+    }
+}
+
+// C's poller paces on what a failed poll reports as moving: phytron's
+// `!motorStatusDone_` keeps an unreachable controller at the moving period
+// (phytronAxisMotor.cpp:1868-1869, asynMotorController.cpp:686-692).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_poll_reporting_moving_keeps_the_moving_period() {
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let motor = Unreachable { log: log.clone() };
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(
+        Arc::new(Mutex::new(motor)),
+        TraceUser::Asyn {
+            port: String::new(),
+            addr: 0,
+        },
+    );
+    let poller = controller
+        .build(PERIOD, Duration::from_secs(3600), 0)
+        .start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let polls = log.lock().unwrap().len();
+    assert!(polls > 5, "{polls} polls in 200 ms at a 5 ms moving period");
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+/// A controller built without `.port()` is its axis's port's poller once
+/// the axis names the port, so the port counts the controller's first pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_named_by_its_axis_counts_the_controllers_first_poll() {
+    use asyn_rs::registry::open_owner;
+    use motor_rs::devices::{first_polls_pending, register_controller_port};
+
+    let port = "pollerNamedByAxis";
+    register_controller_port(&open_owner(), port, 1, ()).unwrap();
+    let log = Log::default();
+    let mut controller = ControllerBuilder::new();
+    let motor = Axis {
+        name: "A0",
+        log: log.clone(),
+        delay: SLOW,
+    };
+    let user = TraceUser::Asyn {
+        port: port.into(),
+        addr: 0,
+    };
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(Arc::new(Mutex::new(motor)), user);
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    assert_eq!(axes.first_polls_pending(), 1);
+    assert_eq!(first_polls_pending(port), Some(1));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while axes.first_polls_pending() > 0 {
+        assert!(Instant::now() < deadline, "the startup pass never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(first_polls_pending(port), Some(0));
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+/// simMotorCreate names its poller before it registers the port; the port
+/// still counts that poller's first pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_registered_after_its_poller_counts_the_first_poll() {
+    use asyn_rs::registry::open_owner;
+    use motor_rs::devices::{first_polls_pending, register_controller_port};
+
+    let port = "pollerBeforePort";
+    let mut controller = ControllerBuilder::new().port(port);
+    let motor = Axis {
+        name: "A0",
+        log: Log::default(),
+        delay: SLOW,
+    };
+    let user = TraceUser::Asyn {
+        port: port.into(),
+        addr: 0,
+    };
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(Arc::new(Mutex::new(motor)), user);
+    register_controller_port(&open_owner(), port, 1, ()).unwrap();
+    let axes = controller.axes();
+    let idle = Duration::from_secs(3600);
+    let poller = controller.build(idle, idle, 0).start();
+    assert_eq!(axes.first_polls_pending(), 1);
+    assert_eq!(first_polls_pending(port), Some(1));
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await;
+}
+
+/// A driver's own poller thread counts its first pass the same way, on its
+/// own controller alone.
+#[test]
+fn a_held_first_poll_counts_until_it_drops() {
+    let (axes, other) = (ControllerAxes::default(), ControllerAxes::default());
+    let first = axes.first_poll_pending();
+    assert_eq!(axes.first_polls_pending(), 1);
+    assert_eq!(other.first_polls_pending(), 0);
+    drop(first);
+    assert_eq!(axes.first_polls_pending(), 0);
 }

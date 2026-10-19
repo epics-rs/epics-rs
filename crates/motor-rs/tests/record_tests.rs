@@ -4504,6 +4504,7 @@ fn test_accs_cascade_consistent_with_move_accel_under_vbas_unsupported() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
     rec.process_motor_info(&MotorStatus {
+        done: true,
         vbas_supported: false,
         ..Default::default()
     });
@@ -4525,6 +4526,7 @@ fn test_move_accel_vbas_unsupported_treats_vbas_as_zero() {
     // Driver advertises VBAS unsupported: accel math ignores VBAS.
     let mut rec = MotorRecord::new();
     rec.process_motor_info(&MotorStatus {
+        done: true,
         vbas_supported: false,
         ..Default::default()
     });

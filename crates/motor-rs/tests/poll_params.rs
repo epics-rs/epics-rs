@@ -68,12 +68,14 @@ fn a_poll_sets_the_axis_status_in_the_controller_ports_params() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Axis(status.clone())));
     // The startup poll lands in the port once the axis mirrors it.
     let build = || {
-        MotorBuilder::new(motor.clone())
+        let mut setup = MotorBuilder::new(motor.clone())
             .trace_user(TraceUser::Asyn {
                 port: "pollParams".into(),
                 addr: 1,
             })
-            .build_axis()
+            .build_axis();
+        setup.poll_loop.run_startup_pass();
+        setup
     };
     let _setup = build();
     assert_eq!(port.read_float64_blocking(index::POSITION, 1).unwrap(), 3.5);
@@ -201,6 +203,7 @@ fn a_records_get_info_polls_and_posts_an_unchanged_status() {
         Duration::from_secs(1),
         0,
     );
+    poll_loop.run_startup_pass();
     let seq = |state: &motor_rs::device_state::SharedDeviceState| {
         state.lock().unwrap().latest_status.as_ref().map(|s| s.seq)
     };

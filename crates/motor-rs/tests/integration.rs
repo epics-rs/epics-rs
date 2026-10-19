@@ -67,7 +67,7 @@ async fn test_full_move_via_mailbox() {
     setup.device_support.init(&mut setup.record).unwrap();
 
     // Spawn poll loop
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
 
     // Consume startup event
     setup.record.process().unwrap();
@@ -108,7 +108,7 @@ async fn test_stop_during_move() {
     let mut setup = make_builder(motor).build();
 
     setup.device_support.init(&mut setup.record).unwrap();
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
 
     // Consume startup event
     setup.record.process().unwrap();
@@ -179,7 +179,7 @@ async fn test_delay_via_poll_loop() {
         .build();
 
     setup.device_support.init(&mut setup.record).unwrap();
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
 
     // Consume startup event
     setup.record.process().unwrap();
@@ -241,7 +241,7 @@ async fn test_backlash_via_mailbox() {
         .build();
 
     setup.device_support.init(&mut setup.record).unwrap();
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
 
     // Consume startup event
     setup.record.process().unwrap();
@@ -303,7 +303,7 @@ async fn test_poll_loop_lifecycle() {
         0,
     );
 
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
 
     // Start polling
     poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
@@ -360,7 +360,7 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
         Duration::ZERO,
         0,
     );
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
 
     // Continuously drain io_intr so a (would-be) busy-spin is NOT throttled by
     // channel backpressure — without draining, a spin stalls on the full
@@ -372,7 +372,9 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
     // Give any erroneous busy-spin a 100ms window to accumulate polls.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // seq starts at 1 (init), +1 for the single ForcePoll poll → 2.
+    // seq starts at 1 (init), +1 for the startup pass's post of its changed
+    // status to the record already bound (asynMotorController.cpp:630,
+    // asynMotorAxis.cpp:318-320), +1 for the single ForcePoll poll → 3.
     // A busy-spin would drive it into the hundreds/thousands.
     let seq = device_state
         .lock()
@@ -382,7 +384,7 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
         .map(|s| s.seq)
         .unwrap_or(0);
     assert_eq!(
-        seq, 2,
+        seq, 3,
         "zero idle interval must poll once on ForcePoll then block (event-only), got seq {seq}"
     );
 
@@ -421,7 +423,7 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
         Duration::from_millis(5),
         0,
     );
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
 
     // Drain io_intr so a (would-be) re-post spree is not throttled by the
     // channel and is observable through the seq.
@@ -436,22 +438,24 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
             .unwrap_or(0)
     };
 
-    // ForcePoll forces one post → seq 1→2.
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(
-        seq(&device_state),
-        2,
-        "a stationary axis must not re-post on every idle poll (change-gated)"
-    );
-
-    // A second ForcePoll is a FORCED poll → re-posts even though the status
-    // is byte-identical → seq 2→3.
+    // The startup pass posts its changed status to the bound record
+    // (asynMotorController.cpp:630, asynMotorAxis.cpp:318-320; seq 1→2);
+    // ForcePoll forces one more → 3.
     poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         seq(&device_state),
         3,
+        "a stationary axis must not re-post on every idle poll (change-gated)"
+    );
+
+    // A second ForcePoll is a FORCED poll → re-posts even though the status
+    // is byte-identical → seq 3→4.
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        seq(&device_state),
+        4,
         "a forced poll must post even when status is unchanged (STUP/GET_INFO ack)"
     );
 
@@ -478,7 +482,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
     setup
         .device_support
         .bind_dev_sup_gate(&epics_base_rs::runtime::interrupt_accept::InterruptGate::opened());
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
 
     // Startup pass.
     setup.record.process().unwrap();
@@ -587,6 +591,8 @@ async fn init_does_not_clobber_live_controller_position() {
     // The controller (SimMotor) kept its true position 5.0 across the restart.
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
     let mut setup = make_builder(motor.clone()).build();
+    // The poller's startup pass ran before init.
+    setup.poll_loop.run_startup_pass();
     setup.record.conv.mres = 1.0; // dial == raw for a clean assertion
     setup.record.conv.rstm = RestoreMode::NearZero;
     setup.record.retry.rdbd = 0.05;
@@ -856,7 +862,7 @@ async fn failed_poll_posts_comms_error_status() {
         Duration::from_millis(5),
         0,
     );
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
 
     // A healthy poll first, so the failure has a last-known status to carry
     // forward (C's parameter library keeps every field the failed poll never
@@ -999,6 +1005,12 @@ impl FailingAxis {
         ds.latest_status.clone()
     }
 
+    /// The poller thread's startup pass has posted: the bind's seed is
+    /// seq 1.
+    fn startup_posted(&mut self) -> bool {
+        self.latest().is_some_and(|s| s.seq > 1)
+    }
+
     async fn shutdown(self) {
         let _ = self.poll.send(PollCommand::Shutdown).await;
         let _ = self.task.await;
@@ -1038,7 +1050,7 @@ fn failing_poll_loop(
         state: device_state,
         io_intr,
         poll: poll_cmd_tx,
-        task: tokio::spawn(poll_loop.run()),
+        task: tokio::spawn(poll_loop.start()),
     }
 }
 
@@ -1049,7 +1061,7 @@ fn failing_poll_loop(
 async fn a_problem_only_failure_from_boot_raises_problem_on_a_zeroed_status() {
     use asyn_rs::interfaces::motor::PollFailure;
     let mut axis = failing_poll_loop(PollFailure::PROBLEM, true);
-    assert!(wait_until(Duration::from_secs(2), || axis.latest().is_some()).await);
+    assert!(wait_until(Duration::from_secs(2), || axis.startup_posted()).await);
     let status = axis.latest().unwrap().status;
     assert!(status.problem);
     assert!(
@@ -1066,7 +1078,7 @@ async fn a_problem_only_failure_from_boot_raises_problem_on_a_zeroed_status() {
 async fn a_problem_only_failure_keeps_the_last_status() {
     use asyn_rs::interfaces::motor::PollFailure;
     let mut axis = failing_poll_loop(PollFailure::PROBLEM, false);
-    assert!(wait_until(Duration::from_secs(2), || axis.latest().is_some()).await);
+    assert!(wait_until(Duration::from_secs(2), || axis.startup_posted()).await);
     axis.offline
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(
@@ -1294,7 +1306,7 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
-    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    let poll_handle = tokio::spawn(setup.poll_loop.start());
     dead.store(true, Ordering::SeqCst);
 
     // Poll path: the forced poll sits in the dead read while the runtime
@@ -1332,16 +1344,14 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     let _ = poll_handle.await;
 }
 
-/// The IOC starts the poller with `ctx.bridge().spawn(poll_loop.run())`, from
-/// the iocsh thread; on the exec backend that lands on a cbMedium worker with
-/// no tokio runtime. The poller must serve a move and keep its timed polls
-/// there, on either backend.
-#[tokio::test(flavor = "multi_thread")]
-async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
+/// The IOC starts the poller from the iocsh thread, as C's `startPoller`
+/// does, and the thread exists on return: it serves a move and keeps its
+/// timed polls while the caller's current-thread runtime is blocked.
+#[tokio::test]
+async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
     use asyn_rs::error::AsynError;
     use asyn_rs::interfaces::motor::MotorStatus;
     use asyn_rs::user::AsynUser;
-    use epics_base_rs::runtime::task::BlockingBridge;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -1397,10 +1407,9 @@ async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    let bridge = BlockingBridge::capture();
     let poll_loop = setup.poll_loop;
     std::thread::spawn(move || {
-        drop(bridge.spawn(poll_loop.run()));
+        drop(poll_loop.start());
     })
     .join()
     .unwrap();
@@ -1447,7 +1456,7 @@ async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
             .poll_interval(Duration::from_millis(5))
             .build();
         setup.device_support.init(&mut setup.record).unwrap();
-        let poll_handle = tokio::spawn(setup.poll_loop.run());
+        let poll_handle = tokio::spawn(setup.poll_loop.start());
 
         let msta = |rec: &motor_rs::record::MotorRecord| match rec.get_field("MSTA") {
             Some(EpicsValue::ULong(v)) => v,
@@ -1468,19 +1477,30 @@ async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
     }
 }
 
-/// C init_record reads the poller's startup poll, which holds the controller
-/// lock init's read waits on (asynMotorController.cpp:505-525, :630): init
-/// reads the driver's status with the poller not yet running.
+/// C init_record reads the poller's startup poll once the poller thread has
+/// run it (asynMotorController.cpp:505-525, :630).
 #[tokio::test]
-async fn init_reads_the_startup_poll_before_the_poller_runs() {
+async fn init_reads_the_startup_poll_once_the_poller_ran_it() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
     let mut setup = MotorBuilder::new(motor).build();
+    setup.poll_loop.run_startup_pass();
     setup.device_support.init(&mut setup.record).unwrap();
     assert_eq!(
         setup.record.get_field("MSTA"),
         Some(EpicsValue::ULong(2)),
         "RA_DONE from the startup poll"
     );
+}
+
+/// The poll runs on the poller's own thread (asynMotorController.cpp:572-575,
+/// :630), so an init_record ahead of it reads `status_` as the axis
+/// constructor left it: all 0 (asynMotorAxis.cpp:46).
+#[tokio::test]
+async fn init_ahead_of_the_poller_reads_the_constructor_status() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = MotorBuilder::new(motor).build();
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert_eq!(setup.record.get_field("MSTA"), Some(EpicsValue::ULong(0)));
 }
 
 /// C `asynMotorPoller` polls on its period from start-up and nothing a
@@ -1507,7 +1527,7 @@ async fn the_axis_polls_with_no_record_request() {
         Duration::from_millis(5),
         0,
     );
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
     tokio::time::sleep(Duration::from_millis(30)).await;
     while io_intr.try_recv().is_ok() {}
 
@@ -1598,7 +1618,7 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
         Duration::from_secs(60),
         5,
     );
-    let poll_handle = tokio::spawn(poll_loop.run());
+    let poll_handle = tokio::spawn(poll_loop.start());
     let settled = |n: usize| {
         let polls = polls.clone();
         async move {

@@ -112,8 +112,8 @@ impl SimMotorHolder {
                 )?;
                 crate::devices::register_axis(axis)?;
 
-                // Spawn poll loop on the tokio runtime (starts idle)
-                ctx.bridge().spawn(poll_loop.run());
+                // The motorPoller thread, as C startPoller creates it.
+                poll_loop.start();
 
                 holder
                     .poll_senders

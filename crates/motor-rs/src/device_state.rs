@@ -244,10 +244,7 @@ impl MotorDeviceState {
     pub fn init_status(&mut self) -> MotorStatus {
         let stamped = self.latest_status.get_or_insert_with(|| StampedStatus {
             seq: 1,
-            status: MotorStatus {
-                done: false,
-                ..Default::default()
-            },
+            status: MotorStatus::default(),
         });
         self.consumed_seq = stamped.seq;
         stamped.status.clone()

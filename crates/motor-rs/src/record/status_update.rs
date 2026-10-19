@@ -366,11 +366,6 @@ impl MotorRecord {
         // skips URIP RDBL scaling and seeds the readback from motor position.
         self.process_motor_info_initcall(status, true);
 
-        if status.moving {
-            // At startup, the poll loop may not be active yet — request it.
-            effects.request_poll = true;
-        }
-
         // motordevCom sends INIT before anything else (motordevCom.cc:
         // 309-327); devMotorAsyn has no INIT, and its drivers ignore it.
         if !self.links.init.is_empty() {

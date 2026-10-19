@@ -91,7 +91,7 @@ async fn a_port_write_waits_out_the_poller_s_pass() {
     );
     register_axis(axis).unwrap();
     let period = Duration::from_millis(5);
-    let _poller = tokio::spawn(controller.build(period, period, 0).run());
+    let _poller = tokio::spawn(controller.build(period, period, 0).start());
     armed.store(true, Ordering::SeqCst);
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
         .await

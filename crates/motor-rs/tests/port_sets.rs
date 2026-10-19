@@ -110,14 +110,14 @@ fn a_port_write_applies_the_axis_s_own_port_sets_on_the_port() {
 #[test]
 fn a_poll_s_own_port_sets_reach_the_port() {
     let port = register_controller_port(&open_owner(), "PSPOLL", 2, Own).unwrap();
-    // The startup poll.
-    let _setup = axis(
+    let mut setup = axis(
         "PSPOLL",
         Posting {
             on_poll: true,
             ..Posting::default()
         },
     );
+    setup.poll_loop.run_startup_pass();
     assert_eq!(port.read_int32_blocking(own(), 0).unwrap(), 101);
 }
 
@@ -131,7 +131,9 @@ fn a_controller_poll_s_sets_before_any_axis_reach_the_port_with_the_first() {
     });
     let axes = builder.axes();
     // Its startup pass, with no axis to name the port.
-    drop(builder.build(Duration::from_secs(60), Duration::from_secs(60), 0));
+    let mut poller = builder.build(Duration::from_secs(60), Duration::from_secs(60), 0);
+    poller.run_startup_pass();
+    drop(poller);
     assert!(port.read_int32_blocking(own(), 0).is_err());
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Posting::default()));
     let user = TraceUser::Asyn {
@@ -179,7 +181,9 @@ fn a_driver_call_to_its_own_port_from_under_the_axis_lock_panics() {
             port: "PSGUARD".into(),
             addr: 1,
         })
-        .build_axis();
+        .build_axis()
+        .poll_loop
+        .run_startup_pass();
 }
 
 /// PI's axis: its `setPosition` wakes the poller (PIasynAxis.cpp:357), and
@@ -265,7 +269,7 @@ fn pi_axis(rt: &tokio::runtime::Runtime, port: &str, addr: i32, motor: Pi) {
         .poll_interval(Duration::from_secs(60))
         .build_axis();
     register_axis(setup.axis).unwrap();
-    rt.spawn(setup.poll_loop.run());
+    rt.spawn(setup.poll_loop.start());
 }
 
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
@@ -349,7 +353,7 @@ fn a_pass_blocked_on_a_deferred_move_release_polls_after_its_done_0() {
         wake = Some(poll_cmd_tx);
     }
     let period = Duration::from_secs(60);
-    rt.spawn(controller.build(period, period, 0).run());
+    rt.spawn(controller.build(period, period, 0).start());
     let done = |addr| {
         port.read_int32_blocking(index::STATUS, addr)
             .is_ok_and(|word| word & 0x2 != 0)
@@ -408,20 +412,21 @@ impl AsynMotor for Ordered {
 
 fn ordered_axis(port: &str) {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Ordered));
-    let setup = MotorBuilder::new(motor)
+    let mut setup = MotorBuilder::new(motor)
         .trace_user(TraceUser::Asyn {
             port: port.into(),
             addr: 1,
         })
         .poll_interval(Duration::from_secs(60))
         .build_axis();
+    // The startup poll runs on the poller.
+    setup.poll_loop.run_startup_pass();
     register_axis(setup.axis).unwrap();
 }
 
 #[test]
 fn a_poll_s_port_set_then_axis_param_land_in_that_order_on_the_poller() {
     let port = register_controller_port(&open_owner(), "PSORDP", 2, Own).unwrap();
-    // The startup poll runs on the poller.
     ordered_axis("PSORDP");
     assert_eq!(port.read_int32_blocking(own(), 1).unwrap(), 2);
 }

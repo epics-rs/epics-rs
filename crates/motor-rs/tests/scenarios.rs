@@ -557,7 +557,7 @@ fn startup_syncs_positions_from_driver() {
 }
 
 #[test]
-fn startup_moving_starts_polling() {
+fn startup_moving_waits_for_the_poller() {
     let mut rec = make_record();
 
     let status = MotorStatus {
@@ -573,7 +573,9 @@ fn startup_moving_starts_polling() {
     assert!(rec.stat.dmov);
     assert!(!rec.stat.movn);
     assert!(!rec.stat.mip.contains(MipFlags::EXTERNAL));
-    assert!(effects.request_poll);
+    // Nor does it queue a GET_INFO: the poller posts the move once its
+    // status changes.
+    assert!(!effects.request_poll);
 
     // The next pass sees the move and takes it as external.
     rec.process_motor_info(&status);

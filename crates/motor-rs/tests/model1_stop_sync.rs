@@ -82,7 +82,7 @@ async fn a_stop_of_a_move_with_a_still_readback_ends_at_the_stopped_position() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let (name, factory) = motor_rs::motor_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)

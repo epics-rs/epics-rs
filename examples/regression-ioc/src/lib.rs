@@ -119,7 +119,7 @@ impl RegressionIoc {
             (),
         )?;
         motor_rs::devices::register_axis(axis)?;
-        tokio::spawn(poll_loop.run());
+        tokio::spawn(poll_loop.start());
         let (motor_type, motor_record_factory) = motor_rs::motor_record_factory();
 
         // dbCa, which every C IOC links.

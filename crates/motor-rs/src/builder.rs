@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use crate::device_state::AxisSubscribers;
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::{
-    Axis, Join, Joining, MotorPollLoop, PollCommand, PollerInbox, SharedControllerPoll,
+    Axis, FirstPollPending, Join, Joining, MotorPollLoop, PollCommand, PollerInbox,
+    SharedControllerPoll,
 };
 use crate::record::MotorRecord;
 use crate::trace::TraceUser;
@@ -262,7 +263,31 @@ impl Default for ControllerAxes {
     }
 }
 
+/// An axis [`ControllerAxes::queue`] placed or sent to the running poller.
+struct Queued {
+    added: ControllerAxis,
+    /// The motor sent to the running poller, and the signal it took it.
+    joined: Option<(Arc<Mutex<dyn AsynMotor>>, std::sync::mpsc::Receiver<()>)>,
+}
+
 impl ControllerAxes {
+    /// Count a first poll pending on this controller until the guard drops:
+    /// a driver's own poller thread (omsBaseController's omsPoller) holds
+    /// one over its first pass.
+    pub fn first_poll_pending(&self) -> FirstPollPending {
+        let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        axes.poll.first_poll_pending()
+    }
+
+    /// This controller's startup pass if it has not ended, the axes added to
+    /// its running poller and not yet polled, and the [`FirstPollPending`]s
+    /// its driver holds. These polls run on the poller thread, as C's do, so
+    /// a reader that wants what they set waits for this to reach 0.
+    pub fn first_polls_pending(&self) -> usize {
+        let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        axes.poll.first_polls_pending()
+    }
+
     /// C `startMoveToHomeThread`: a MOTOR_MOVE_HOME write then runs the
     /// axis's [`AsynMotor::move_to_home_task`] on this controller's
     /// `motorMoveToHome` thread. Without it the write only signals.
@@ -282,6 +307,66 @@ impl ControllerAxes {
         self.add_with(motor, user, DEFAULT_TIMEOUT, DEFAULT_POLL_CHANNEL_CAPACITY)
     }
 
+    /// [`Self::add`] for a driver whose C constructs the axis under
+    /// `pC->lock()` (MVP2001Driver.cpp:222-224): `build` runs under the
+    /// controller lock, so a pass that comes due meanwhile waits for it and
+    /// then polls the new axis.
+    pub fn add_built<T, E: From<String>>(
+        &self,
+        user: TraceUser,
+        build: impl FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, T), E>,
+    ) -> Result<(ControllerAxis, T), E> {
+        let (mut added, done) = self.add_built_all([(user, build)]);
+        done?;
+        Ok(added.pop().expect("the one build succeeded"))
+    }
+
+    /// [`Self::add_built`] for every `(user, build)` under one hold of the
+    /// controller lock, as pmacCreateAxes builds its axes
+    /// (pmacController.cpp:974-979): no pass polls between two builds. The
+    /// axes added, then what stopped the batch: a build's error ends it, the
+    /// axes built before it staying added.
+    pub fn add_built_all<T, E: From<String>, F>(
+        &self,
+        builds: impl IntoIterator<Item = (TraceUser, F)>,
+    ) -> (Vec<(ControllerAxis, T)>, Result<(), E>)
+    where
+        F: FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, T), E>,
+    {
+        let poll = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll
+            .clone();
+        let held = poll.hold();
+        let mut queued = Vec::new();
+        let mut done = Ok(());
+        for (user, build) in builds {
+            let queue = build().and_then(|(motor, built)| {
+                let q = self.queue(motor, user, DEFAULT_TIMEOUT, DEFAULT_POLL_CHANNEL_CAPACITY)?;
+                Ok((q, built))
+            });
+            match queue {
+                Ok(q) => queued.push(q),
+                Err(e) => {
+                    done = Err(e);
+                    break;
+                }
+            }
+        }
+        drop(held);
+        let mut added = Vec::new();
+        for (q, built) in queued {
+            match self.confirm(q) {
+                Ok(axis) => added.push((axis, built)),
+                Err(e) if done.is_ok() => done = Err(e.into()),
+                Err(_) => {}
+            }
+        }
+        (added, done)
+    }
+
     fn add_with(
         &self,
         motor: Arc<Mutex<dyn AsynMotor>>,
@@ -289,6 +374,20 @@ impl ControllerAxes {
         timeout: Duration,
         capacity: usize,
     ) -> Result<ControllerAxis, String> {
+        let queued = self.queue(motor, user, timeout, capacity)?;
+        self.confirm(queued)
+    }
+
+    /// Place the axis, or send it to the running poller. The controller
+    /// lock, if the caller holds it, must be released before
+    /// [`Self::confirm`]: the poller takes it to place the axis.
+    fn queue(
+        &self,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        user: TraceUser,
+        timeout: Duration,
+        capacity: usize,
+    ) -> Result<Queued, String> {
         let mirror = match &user {
             TraceUser::Asyn { port, addr } => Some((port.clone(), *addr)),
             _ => None,
@@ -300,14 +399,24 @@ impl ControllerAxes {
         }
         // Recorded before the poller confirms, so a concurrent add of the
         // same motor finds it.
-        let (join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
+        let (mut join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
             let added = ControllerAxis {
                 axis: opened.axis.at(user),
                 poll_cmd_tx: opened.poll_cmd_tx.clone(),
             };
             match (mirror, &opened.mirror) {
-                (None, _) => return Ok(added),
-                (Some(to), Some(had)) if &to == had => return Ok(added),
+                (None, _) => {
+                    return Ok(Queued {
+                        added,
+                        joined: None,
+                    });
+                }
+                (Some(to), Some(had)) if &to == had => {
+                    return Ok(Queued {
+                        added,
+                        joined: None,
+                    });
+                }
                 (Some((port, addr)), Some((had_port, had_addr))) => {
                     return Err(format!(
                         "the axis is at port {had_port} address {had_addr}, not {port} {addr}"
@@ -347,27 +456,39 @@ impl ControllerAxes {
                 ControllerAxis { axis, poll_cmd_tx },
             )
         };
+        let poll = axes.poll.clone();
         let joined = match &mut axes.list {
             AxisList::Pending(axes) => {
                 join.place(axes);
                 None
             }
             AxisList::Running(poller) => {
+                if let Join::Axis(axis) = &mut join {
+                    axis.first_poll = Some(poll.first_poll_pending());
+                }
                 let (joined, taken) = std::sync::mpsc::sync_channel(1);
                 let _ = poller.send(Joining { join, joined });
                 Some(taken)
             }
         };
-        drop(axes);
-        if let Some(taken) = joined
+        Ok(Queued {
+            added,
+            joined: joined.map(|taken| (motor, taken)),
+        })
+    }
+
+    /// Wait for the running poller to take a queued axis.
+    fn confirm(&self, queued: Queued) -> Result<ControllerAxis, String> {
+        if let Some((motor, taken)) = queued.joined
             && taken.recv().is_err()
         {
             // No poller took it: a later add must not get its senders.
             let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            axes.opened.retain(|o| !same(o));
+            axes.opened
+                .retain(|o| !std::ptr::addr_eq(Arc::as_ptr(&o.motor), Arc::as_ptr(&motor)));
             return Err("the controller's poller has ended".to_string());
         }
-        Ok(added)
+        Ok(queued.added)
     }
 
     /// The axes so far, and the channel later ones join the poller by.
@@ -411,7 +532,7 @@ impl ControllerBuilder {
     /// setIdlePollPeriod reach it before any axis on the port names it.
     pub fn port(self, port: &str) -> Self {
         let axes = self.axes.0.lock().unwrap_or_else(|e| e.into_inner());
-        axes.poll.name_port(port);
+        axes.poll.set_port(port);
         drop(axes);
         self
     }
@@ -627,7 +748,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let running = tokio::spawn(task.run());
+            let running = tokio::spawn(task.start());
             for ControllerAxis { axis, .. } in &axes {
                 axis.send(MotorCommand::MoveAbsolute {
                     position: 1.0,
@@ -711,15 +832,16 @@ mod tests {
         // No timed pass within the test.
         let idle = Duration::from_secs(60);
         let poller = controller.build(idle, idle, 0);
-        log.lock().unwrap().clear();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         let settle = Duration::from_millis(50);
         let (forced, info) = rt.block_on(async {
-            let running = tokio::spawn(poller.run());
+            let running = tokio::spawn(poller.start());
             tokio::time::sleep(settle).await;
+            // The startup pass.
+            log.lock().unwrap().clear();
             poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
             tokio::time::sleep(settle).await;
             let forced = std::mem::take(&mut *log.lock().unwrap());
@@ -757,13 +879,15 @@ mod tests {
         assert_eq!(second.axis.address(), &interface);
         let idle = Duration::from_secs(60);
         let poller = controller.build(idle, idle, 0);
-        assert_eq!(std::mem::take(&mut *log.lock().unwrap()), ["A", "B"]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         let polled = rt.block_on(async {
-            let running = tokio::spawn(poller.run());
+            let running = tokio::spawn(poller.start());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let startup = std::mem::take(&mut *log.lock().unwrap());
+            assert_eq!(startup, ["A", "B"], "the startup pass");
             second
                 .poll_cmd_tx
                 .send(PollCommand::ForcePoll)
@@ -797,7 +921,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let running = tokio::spawn(poller.run());
+            let running = tokio::spawn(poller.start());
             first.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
             running.await.unwrap();
         });

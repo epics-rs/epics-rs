@@ -40,7 +40,7 @@ async fn a_pini_move_completes_before_scan_run() {
         .poll_interval(Duration::from_millis(10))
         .build_axis();
     register_axis(axis).unwrap();
-    tokio::spawn(poll_loop.run());
+    tokio::spawn(poll_loop.start());
     let (name, factory) = motor_rs::motor_record_factory();
     let ioc = IocBuilder::new()
         .register_record_type(name, factory)

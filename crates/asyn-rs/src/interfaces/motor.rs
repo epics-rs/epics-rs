@@ -192,7 +192,7 @@ impl Default for MotorStatus {
             position: 0.0,
             encoder_position: 0.0,
             velocity: 0.0,
-            done: true,
+            done: false,
             moving: false,
             msta_moving: false,
             high_limit: false,
@@ -558,6 +558,13 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         None
     }
 
+    /// After a failed poll, the `*moving` C's poll still reports, which
+    /// paces the poller: phytronAxis::poll's `!motorStatusDone_`
+    /// (phytronAxisMotor.cpp:1868-1869). None paces on the last status.
+    fn failed_poll_moving(&self) -> Option<bool> {
+        None
+    }
+
     /// The status fields the write method just called set, in order. The
     /// poller drains this after every write and posts the result when it
     /// changed the status, as `callParamCallbacks` ends every C
@@ -677,5 +684,12 @@ mod tests {
         let any: &mut dyn std::any::Any = motor;
         any.downcast_mut::<Axis>().unwrap().0 = 5.0;
         assert_eq!(axis.0, 5.0);
+    }
+
+    /// asynMotorAxis.cpp:46 zeroes `status_`, so a status no poll has set
+    /// is not done.
+    #[test]
+    fn the_status_before_any_poll_is_not_done() {
+        assert!(!MotorStatus::default().done);
     }
 }

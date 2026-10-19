@@ -49,23 +49,6 @@ fn test_get_put_limits() {
 }
 
 #[test]
-fn test_read_only_fields() {
-    let mut rec = ThrottleRecord::default();
-    assert!(rec.put_field("OVAL", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("SENT", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("OSENT", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("WAIT", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("DRVLS", EpicsValue::Short(1)).is_err());
-    assert!(
-        rec.put_field("VER", EpicsValue::String("x".into()))
-            .is_err()
-    );
-    assert!(rec.put_field("STS", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("OV", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("SIV", EpicsValue::Short(1)).is_err());
-}
-
-#[test]
 fn test_type_mismatch() {
     let mut rec = ThrottleRecord::default();
     assert!(

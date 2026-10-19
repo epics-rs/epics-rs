@@ -64,17 +64,6 @@ fn test_get_put_gains() {
 }
 
 #[test]
-fn test_read_only_fields() {
-    let mut rec = EpidRecord::default();
-    assert!(rec.put_field("CVAL", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("OVAL", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("P", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("D", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("ERR", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("FBOP", EpicsValue::Short(1)).is_err());
-}
-
-#[test]
 fn test_i_is_writable() {
     // I is writable for bumpless initialization
     let mut rec = EpidRecord::default();

@@ -146,6 +146,10 @@ name = "asyn_specials_under_the_hold"
 required-features = ["epics"]
 
 [[test]]
+name = "errs_put_is_refused_by_the_gate"
+required-features = ["epics"]
+
+[[test]]
 name = "asyn_reentry_allocates_nothing"
 required-features = ["epics"]
 

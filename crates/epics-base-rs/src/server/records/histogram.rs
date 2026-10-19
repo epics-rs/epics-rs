@@ -1154,13 +1154,9 @@ mod tests {
         rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
         assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
 
-        // OLDSIMM is special(SPC_NOMOD), and lives in the common fields (the
-        // simulation-mode owner's latch) — readable, not client-writable.
-        let mut inst = RecordInstance::new("HIST:SIM", rec);
-        assert!(matches!(
-            inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
-            Err(CaError::ReadOnlyField(_))
-        ));
+        // OLDSIMM lives in the common fields (the simulation-mode owner's
+        // latch); its SPC_NOMOD refusal is the database gate's.
+        let inst = RecordInstance::new("HIST:SIM", rec);
         assert_eq!(inst.get_common_field("OLDSIMM"), Some(EpicsValue::Short(0)));
 
         // SIMS (menuAlarmSevr) and OLDSIMM (menuSimm) resolve centrally.

@@ -6,7 +6,7 @@
 //! - get_field() retrieves typed values
 //! - put_field() sets typed values
 //! - Field type mappings (Double, String, Short, Long, Float)
-//! - read_only fields reject writes
+//! - read_only fields store like any other (the NOMOD gate refuses a client)
 //! - snake_case -> UPPER_CASE field name conversion
 //! - Type mismatch error handling
 //! - Unknown field error handling
@@ -337,21 +337,16 @@ fn put_field_long() {
 // read_only fields
 // ---------------------------------------------------------------------------
 
+/// `SPC_NOMOD` is the database gate's alone: a `.db` load stores the member.
 #[test]
-fn put_field_read_only_rejected() {
+fn put_field_read_only_stores() {
     let mut ao = AoRecord {
         val: 0.0,
         rval: 0,
         init: 0,
     };
-    let result = ao.put_field("INIT", EpicsValue::Short(1));
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        CaError::ReadOnlyField(field) => assert_eq!(field, "INIT"),
-        other => panic!("expected ReadOnlyField, got: {other:?}"),
-    }
-    // Value should be unchanged
-    assert_eq!(ao.init, 0);
+    ao.put_field("INIT", EpicsValue::Short(1)).unwrap();
+    assert_eq!(ao.init, 1);
 }
 
 #[test]
@@ -365,7 +360,7 @@ fn get_field_read_only_still_works() {
 }
 
 #[test]
-fn put_field_read_only_in_calc() {
+fn put_field_read_only_in_calc_stores() {
     let mut calc = CalcRecord {
         val: 0.0,
         a: 0.0,
@@ -373,12 +368,8 @@ fn put_field_read_only_in_calc() {
         calc_expr: String::new(),
         la: 0.0,
     };
-    let result = calc.put_field("LA", EpicsValue::Double(5.0));
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        CaError::ReadOnlyField(field) => assert_eq!(field, "LA"),
-        other => panic!("expected ReadOnlyField, got: {other:?}"),
-    }
+    calc.put_field("LA", EpicsValue::Double(5.0)).unwrap();
+    assert_eq!(calc.la, 5.0);
 }
 
 // ---------------------------------------------------------------------------

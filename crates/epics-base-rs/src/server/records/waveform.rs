@@ -2999,13 +2999,9 @@ mod array_kind_tests {
             );
             rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
             assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
-            // OLDSIMM is special(SPC_NOMOD) and lives in the common fields
-            // (the simulation owner's latch) — readable, not client-writable.
-            let mut inst = RecordInstance::new("WF:OLDSIMM", rec);
-            assert!(matches!(
-                inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
-                Err(crate::error::CaError::ReadOnlyField(_))
-            ));
+            // OLDSIMM lives in the common fields (the simulation owner's
+            // latch); its SPC_NOMOD refusal is the database gate's.
+            let inst = RecordInstance::new("WF:OLDSIMM", rec);
             assert_eq!(inst.get_common_field("OLDSIMM"), Some(EpicsValue::Short(0)));
         }
 

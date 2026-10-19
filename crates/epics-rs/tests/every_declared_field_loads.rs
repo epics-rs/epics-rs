@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use epics_base_rs::error::CaResult;
+use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::RecordFactory;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{
@@ -217,6 +217,61 @@ async fn every_declared_field_loads_and_reads_back() {
     assert!(
         failures.is_empty(),
         "{} loads of a declared field failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// `SPC_NOMOD` has one owner, the database's gate: C refuses only in
+/// `dbPutSpecial` pass 0 (`dbAccess.c:122-127`). It refuses a client put to
+/// every declared NOMOD value field of every record type.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_nomod_field_is_refused_by_the_gate() {
+    let mut failures = Vec::new();
+    let mut cases = 0usize;
+    for (record_types, fields) in tables() {
+        for &record_type in record_types {
+            let nomod: Vec<&str> = fields(record_type)
+                .unwrap_or_else(|| panic!("{record_type}: no table"))
+                .iter()
+                .filter(|f| {
+                    f.read_only
+                        && !matches!(
+                            f.declared_dbf,
+                            DbfCode::NoAccess
+                                | DbfCode::Inlink
+                                | DbfCode::Outlink
+                                | DbfCode::Fwdlink
+                        )
+                })
+                .map(|f| f.name)
+                .collect();
+            let mut builder = IocBuilder::new();
+            for (name, factory) in factories() {
+                builder = builder.register_record_type(name, factory);
+            }
+            let db = builder
+                .db_string(
+                    &format!("record({record_type}, \"nomod\") {{\n}}\n"),
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+            for field in nomod {
+                cases += 1;
+                match db.check_external_put_preconditions("nomod", field).await {
+                    Err(CaError::ReadOnlyField(_)) => {}
+                    other => failures.push(format!("{record_type}.{field}: {other:?}")),
+                }
+            }
+        }
+    }
+    eprintln!("{cases} NOMOD fields");
+    assert!(
+        failures.is_empty(),
+        "{} NOMOD fields the gate let through:\n{}",
         failures.len(),
         failures.join("\n")
     );

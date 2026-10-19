@@ -664,24 +664,6 @@ impl Record for ThrottleRecord {
         }
     }
 
-    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
-    /// `.db` file, as C's `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("OVAL", EpicsValue::Double(v)) => self.oval = v,
-            ("SENT", EpicsValue::Double(v)) => self.sent = v,
-            ("OSENT", EpicsValue::Double(v)) => self.osent = v,
-            ("WAIT", EpicsValue::Short(v)) => self.wait = v,
-            ("DRVLS", EpicsValue::Short(v)) => self.drvls = v,
-            ("VER", EpicsValue::String(v)) => self.ver = v,
-            ("STS", EpicsValue::Short(v)) => self.sts = v,
-            ("OV", EpicsValue::Short(v)) => self.link_status[0] = v,
-            ("SIV", EpicsValue::Short(v)) => self.link_status[1] = v,
-            (name, value) => return self.put_field(name, value),
-        }
-        Ok(())
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
@@ -782,10 +764,69 @@ impl Record for ThrottleRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // Read-only fields
-            "OVAL" | "SENT" | "OSENT" | "WAIT" | "DRVLS" | "VER" | "STS" | "OV" | "SIV" => {
-                Err(CaError::ReadOnlyField(name.into()))
-            }
+            "OVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.oval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SENT" => match value {
+                EpicsValue::Double(v) => {
+                    self.sent = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OSENT" => match value {
+                EpicsValue::Double(v) => {
+                    self.osent = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "WAIT" => match value {
+                EpicsValue::Short(v) => {
+                    self.wait = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DRVLS" => match value {
+                EpicsValue::Short(v) => {
+                    self.drvls = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "VER" => match value {
+                EpicsValue::String(v) => {
+                    self.ver = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "STS" => match value {
+                EpicsValue::Short(v) => {
+                    self.sts = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OV" => match value {
+                EpicsValue::Short(v) => {
+                    self.link_status[0] = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SIV" => match value {
+                EpicsValue::Short(v) => {
+                    self.link_status[1] = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }

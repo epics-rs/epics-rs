@@ -596,22 +596,6 @@ impl Record for MbboDirectRecord {
         }
     }
 
-    /// The `SPC_NOMOD` MLST and OBIT that `put_field` refuses, stored raw from a
-    /// `.db` as `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("MLST", EpicsValue::Long(v)) => {
-                self.mlst = v as u32;
-                Ok(())
-            }
-            ("OBIT", EpicsValue::Long(v)) => {
-                self.obit = v as u32;
-                Ok(())
-            }
-            (name, value) => self.put_field(name, value),
-        }
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
@@ -619,6 +603,14 @@ impl Record for MbboDirectRecord {
                 EpicsValue::Short(v) => self.val = v as u32,
                 EpicsValue::Char(v) => self.val = v as u32,
                 _ => return Err(CaError::TypeMismatch("VAL".into())),
+            },
+            "MLST" => match value {
+                EpicsValue::Long(v) => self.mlst = v as u32,
+                _ => return Err(CaError::TypeMismatch("MLST".into())),
+            },
+            "OBIT" => match value {
+                EpicsValue::Long(v) => self.obit = v as u32,
+                _ => return Err(CaError::TypeMismatch("OBIT".into())),
             },
             // RVAL/RBV/MASK are DBF_ULONG: accept the native ULong and
             // tolerate the legacy signed Long (device support / autosave).

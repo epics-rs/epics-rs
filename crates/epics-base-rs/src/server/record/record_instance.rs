@@ -10728,12 +10728,6 @@ impl RecordInstance {
         // for them, so the stamp is bumped here and not per arm.
         self.invalidate_plan_for(&name);
         match &*name {
-            // `special(SPC_NOMOD)`: C `dbPutSpecial` refuses the runtime put
-            // with `S_db_noMod` (dbAccess.c:123-127); `dbPutString` at load has
-            // no such gate, so a `.db` value is stored. PUTF and PACT likewise.
-            "OLDSIMM" | "PUTF" | "PACT" if matches!(bound, MenuBound::DbPut) => {
-                return Err(CaError::ReadOnlyField(name.into_owned()));
-            }
             "OLDSIMM" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.oldsimm = v;
@@ -11138,7 +11132,7 @@ impl RecordInstance {
             "HIHI" | "HIGH" | "LOW" | "LOLO" | "HHSV" | "HSV" | "LSV" | "LLSV"
                 if self.common.analog_alarm.is_none() =>
             {
-                return self.put_declared_override(&name, value, bound);
+                return self.put_declared_override(&name, value);
             }
             "HIHI" => {
                 if let (Some(v), Some(a)) = (
@@ -11223,7 +11217,7 @@ impl RecordInstance {
             // reflects it. `put_declared_override` still returns
             // `unknown_field_error` for a name with no `dbFldDes`, so a
             // misspelled field is refused exactly as before.
-            _ => return self.put_declared_override(&name, value, bound),
+            _ => return self.put_declared_override(&name, value),
         }
         self.record.on_put(&name);
         // C `dbPut` (dbAccess.c:1399-1405) returns the after-put
@@ -11273,12 +11267,6 @@ impl RecordInstance {
     ///   this record type at all. C resolves nothing and `dbPutField` reports
     ///   `S_dbLib_fieldNotFound`; return [`Self::unknown_field_error`] (which
     ///   also renders `NAME`/`RTYP` as the read-only attributes they are).
-    /// * `special(SPC_NOMOD)` — a declared field that is immutable
-    ///   ([`Self::is_no_mod`]: the `.dbd` `read_only`/attribute bit or the
-    ///   record's runtime `field_no_mod`). C refuses the put with `S_db_noMod`;
-    ///   the runtime dispatch already gates this via `field_io::check_no_mod`,
-    ///   but the db-load path does not, so enforce it here too — never store an
-    ///   SPC_NOMOD field in the override map.
     /// * [`FieldDesc::runtime_typed`] — a field whose served type C's
     ///   `cvt_dbaddr` re-derives from record state (`waveform.VAL` from `FTVL`,
     ///   `aSub.A` from `FTA`). Such a field is record-owned by definition, so
@@ -11306,28 +11294,12 @@ impl RecordInstance {
         &mut self,
         name: &str,
         value: EpicsValue,
-        bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
         let Some(desc) = self.field_desc(name) else {
             return Err(self.unknown_field_error(name.to_string()));
         };
         if desc.runtime_typed {
             return Err(self.unknown_field_error(name.to_string()));
-        }
-        if matches!(bound, MenuBound::DbPut) && self.is_no_mod(name) {
-            // C `dbPutSpecial` pass 0 refuses SPC_NOMOD with `S_db_noMod`
-            // (dbAccess.c:123-127) — and `dbPutSpecial` is reached only from
-            // `dbPutField`/`dbPut`, the RUNTIME path. `dbLoadRecords` writes
-            // through dbStatic's `dbPutString` (dbStaticLib.c:2570), which
-            // consults `special` for `SPC_CALC` alone; SPC_NOMOD appears in
-            // that layer only as a filter on `dbLexRoutines.c:1285`'s
-            // misspelled-field guesser, never as a refusal of a field the
-            // `.db` names outright. Refusing both paths dropped every
-            // `field(<SPC_NOMOD>,…)` directive with a stderr line —
-            // `mca`'s SIOL/SIML, `sub`'s LA..LU, `sel`'s LA..NLST,
-            // `scalcout`'s PA..MLST, `asyn`'s AINP/NORD/ERRS and `swait`'s
-            // VERS — so a simulated `mca` could not be given a SIOL at all.
-            return Err(CaError::ReadOnlyField(name.to_string()));
         }
         // The override is the WRITABLE TWIN of `declared_default`, and
         // `declared_default` is `resolve_field`'s fallback ONLY when the record

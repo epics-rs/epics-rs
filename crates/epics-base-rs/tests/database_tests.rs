@@ -4961,19 +4961,21 @@ async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
     db.add_record("ATTRFLD", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
-    let rec = db.get_record("ATTRFLD").unwrap();
-    let mut inst = rec.write();
-
     for field in ["NAME", "RTYP"] {
-        let err = inst
-            .put_common_field(field, EpicsValue::String("hijack".into()))
+        let err = db
+            .put_record_field_from_ca("ATTRFLD", field, EpicsValue::String("hijack".into()))
+            .await
             .expect_err("an attribute write must not report success");
         assert!(
             matches!(err, CaError::ReadOnlyField(ref f) if f == field),
             "{field}: expected ReadOnlyField (S_db_noMod), got {err:?}"
         );
     }
-    assert_eq!(inst.name, "ATTRFLD", "NAME must be unchanged");
+    assert_eq!(
+        db.get_pv("ATTRFLD.NAME").unwrap(),
+        EpicsValue::String("ATTRFLD".into()),
+        "NAME must be unchanged"
+    );
 }
 
 /// R6-9 boundary — `OUTN` exists only on `swait` (it aliases `common.text.out`
@@ -7276,11 +7278,12 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read();
         assert_eq!(inst.get_common_field("PUTF"), Some(EpicsValue::Char(0)));
     }
-    {
-        let mut inst = rec.write();
-        let result = inst.put_common_field("PUTF", EpicsValue::Char(1));
-        assert!(result.is_err());
-    }
+    assert!(matches!(
+        db.put_record_field_from_ca("REC", "PUTF", EpicsValue::Char(1))
+            .await,
+        Err(CaError::ReadOnlyField(_))
+    ));
+    assert_eq!(db.get_pv("REC.PUTF").unwrap(), EpicsValue::Char(0));
 
     {
         let inst = rec.read();

@@ -723,10 +723,6 @@ impl Record for MotorRecord {
         field_access::motor_get_field(self, name)
     }
 
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        field_access::motor_load_field(self, name, value)
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         field_access::motor_put_field(self, name, value)
     }

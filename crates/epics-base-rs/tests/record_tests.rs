@@ -618,8 +618,9 @@ fn test_read_only_field() {
         other => panic!("expected String, got {:?}", other),
     }
 
-    let result = rec.put_field("NAME", EpicsValue::String("changed".into()));
-    assert!(result.is_err());
+    rec.put_field("NAME", EpicsValue::String("changed".into()))
+        .unwrap();
+    assert_eq!(rec.name, "changed");
 
     rec.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
     match rec.get_field("VAL") {
@@ -628,9 +629,9 @@ fn test_read_only_field() {
     }
 
     // No `field_list()` assertion here: `#[derive(EpicsRecord)]` is not a
-    // declaration source. `#[field(read_only)]` drives this record's own
-    // `put_field` refusal (asserted above); the wire-visible SPC_NOMOD
-    // declaration comes from the `.dbd`, not from the derive.
+    // declaration source. `#[field(read_only)]` refuses nothing in
+    // `put_field`; the SPC_NOMOD declaration and its refusal come from the
+    // `.dbd` and the database's NOMOD gate.
 }
 
 #[test]
@@ -1724,13 +1725,6 @@ fn test_pact_reads_zero_when_idle() {
         Some(EpicsValue::Char(0)) => {}
         other => panic!("expected Char(0), got {:?}", other),
     }
-}
-
-#[test]
-fn test_pact_write_rejected() {
-    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
-    let result = instance.put_common_field("PACT", EpicsValue::Char(1));
-    assert!(matches!(result, Err(CaError::ReadOnlyField(_))));
 }
 
 #[test]

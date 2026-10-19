@@ -2946,49 +2946,6 @@ impl Record for TableRecord {
         }
     }
 
-    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
-    /// `.db` file, as C's `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("VERS", EpicsValue::Float(v)) => self.vers = v,
-            ("AXL", EpicsValue::Double(v)) => self.axl = v,
-            ("AYL", EpicsValue::Double(v)) => self.ayl = v,
-            ("AZL", EpicsValue::Double(v)) => self.azl = v,
-            ("XL", EpicsValue::Double(v)) => self.xl = v,
-            ("YL", EpicsValue::Double(v)) => self.yl = v,
-            ("ZL", EpicsValue::Double(v)) => self.zl = v,
-            ("AXRB", EpicsValue::Double(v)) => self.axrb = v,
-            ("AYRB", EpicsValue::Double(v)) => self.ayrb = v,
-            ("AZRB", EpicsValue::Double(v)) => self.azrb = v,
-            ("XRB", EpicsValue::Double(v)) => self.xrb = v,
-            ("YRB", EpicsValue::Double(v)) => self.yrb = v,
-            ("ZRB", EpicsValue::Double(v)) => self.zrb = v,
-            ("EAX", EpicsValue::Double(v)) => self.eax = v,
-            ("EAY", EpicsValue::Double(v)) => self.eay = v,
-            ("EAZ", EpicsValue::Double(v)) => self.eaz = v,
-            ("EX", EpicsValue::Double(v)) => self.ex = v,
-            ("EY", EpicsValue::Double(v)) => self.ey = v,
-            ("EZ", EpicsValue::Double(v)) => self.ez = v,
-            ("HLAX", EpicsValue::Double(v)) => self.hlax = v,
-            ("HLAY", EpicsValue::Double(v)) => self.hlay = v,
-            ("HLAZ", EpicsValue::Double(v)) => self.hlaz = v,
-            ("HLX", EpicsValue::Double(v)) => self.hlx = v,
-            ("HLY", EpicsValue::Double(v)) => self.hly = v,
-            ("HLZ", EpicsValue::Double(v)) => self.hlz = v,
-            ("LLAX", EpicsValue::Double(v)) => self.llax = v,
-            ("LLAY", EpicsValue::Double(v)) => self.llay = v,
-            ("LLAZ", EpicsValue::Double(v)) => self.llaz = v,
-            ("LLX", EpicsValue::Double(v)) => self.llx = v,
-            ("LLY", EpicsValue::Double(v)) => self.lly = v,
-            ("LLZ", EpicsValue::Double(v)) => self.llz = v,
-            ("TORAD", EpicsValue::Double(v)) => self.torad = v,
-            ("LVIO", EpicsValue::Short(v)) => self.lvio = v,
-            ("MMAP", EpicsValue::ULong(v)) => self.mmap = v,
-            (name, value) => return self.put_field_internal(name, value),
-        }
-        Ok(())
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         macro_rules! put_double {
             ($field:expr) => {
@@ -3057,15 +3014,88 @@ impl Record for TableRecord {
         }
 
         match name {
-            // Read-only fields
-            "VERS" | "AXL" | "AYL" | "AZL" | "XL" | "YL" | "ZL" | "AXRB" | "AYRB" | "AZRB"
-            | "XRB" | "YRB" | "ZRB" | "EAX" | "EAY" | "EAZ" | "EX" | "EY" | "EZ" | "HLAX"
-            | "HLAY" | "HLAZ" | "HLX" | "HLY" | "HLZ" | "LLAX" | "LLAY" | "LLAZ" | "LLX"
-            | "LLY" | "LLZ" | "M0X" | "M0Y" | "M1Y" | "M2X" | "M2Y" | "M2Z" | "R0X" | "R0Y"
-            | "R1Y" | "R2X" | "R2Y" | "R2Z" | "E0X" | "E0Y" | "E1Y" | "E2X" | "E2Y" | "E2Z"
-            | "V0X" | "V0Y" | "V1Y" | "V2X" | "V2Y" | "V2Z" | "H0X" | "H0Y" | "H1Y" | "H2X"
-            | "H2Y" | "H2Z" | "L0X" | "L0Y" | "L1Y" | "L2X" | "L2Y" | "L2Z" | "LVIO" | "MMAP"
-            | "TORAD" => Err(CaError::ReadOnlyField(name.into())),
+            "VERS" => match value {
+                EpicsValue::Float(v) => {
+                    self.vers = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "AXL" => put_double!(self.axl),
+            "AYL" => put_double!(self.ayl),
+            "AZL" => put_double!(self.azl),
+            "XL" => put_double!(self.xl),
+            "YL" => put_double!(self.yl),
+            "ZL" => put_double!(self.zl),
+            "AXRB" => put_double!(self.axrb),
+            "AYRB" => put_double!(self.ayrb),
+            "AZRB" => put_double!(self.azrb),
+            "XRB" => put_double!(self.xrb),
+            "YRB" => put_double!(self.yrb),
+            "ZRB" => put_double!(self.zrb),
+            "EAX" => put_double!(self.eax),
+            "EAY" => put_double!(self.eay),
+            "EAZ" => put_double!(self.eaz),
+            "EX" => put_double!(self.ex),
+            "EY" => put_double!(self.ey),
+            "EZ" => put_double!(self.ez),
+            "HLAX" => put_double!(self.hlax),
+            "HLAY" => put_double!(self.hlay),
+            "HLAZ" => put_double!(self.hlaz),
+            "HLX" => put_double!(self.hlx),
+            "HLY" => put_double!(self.hly),
+            "HLZ" => put_double!(self.hlz),
+            "LLAX" => put_double!(self.llax),
+            "LLAY" => put_double!(self.llay),
+            "LLAZ" => put_double!(self.llaz),
+            "LLX" => put_double!(self.llx),
+            "LLY" => put_double!(self.lly),
+            "LLZ" => put_double!(self.llz),
+            "TORAD" => put_double!(self.torad),
+            "LVIO" => put_short!(self.lvio),
+            "MMAP" => match value {
+                EpicsValue::ULong(v) => {
+                    self.mmap = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "M0X" => put_double!(self.m0x),
+            "M0Y" => put_double!(self.m0y),
+            "M1Y" => put_double!(self.m1y),
+            "M2X" => put_double!(self.m2x),
+            "M2Y" => put_double!(self.m2y),
+            "M2Z" => put_double!(self.m2z),
+            "R0X" => put_double!(self.r0x),
+            "R0Y" => put_double!(self.r0y),
+            "R1Y" => put_double!(self.r1y),
+            "R2X" => put_double!(self.r2x),
+            "R2Y" => put_double!(self.r2y),
+            "R2Z" => put_double!(self.r2z),
+            "E0X" => put_double!(self.e0x),
+            "E0Y" => put_double!(self.e0y),
+            "E1Y" => put_double!(self.e1y),
+            "E2X" => put_double!(self.e2x),
+            "E2Y" => put_double!(self.e2y),
+            "E2Z" => put_double!(self.e2z),
+            "V0X" => put_double!(self.v0x),
+            "V0Y" => put_double!(self.v0y),
+            "V1Y" => put_double!(self.v1y),
+            "V2X" => put_double!(self.v2x),
+            "V2Y" => put_double!(self.v2y),
+            "V2Z" => put_double!(self.v2z),
+            "H0X" => put_double!(self.h0x),
+            "H0Y" => put_double!(self.h0y),
+            "H1Y" => put_double!(self.h1y),
+            "H2X" => put_double!(self.h2x),
+            "H2Y" => put_double!(self.h2y),
+            "H2Z" => put_double!(self.h2z),
+            "L0X" => put_double!(self.l0x),
+            "L0Y" => put_double!(self.l0y),
+            "L1Y" => put_double!(self.l1y),
+            "L2X" => put_double!(self.l2x),
+            "L2Y" => put_double!(self.l2y),
+            "L2Z" => put_double!(self.l2z),
 
             "VAL" => put_double!(self.val),
             "LX" => put_double!(self.lx),
@@ -3196,60 +3226,6 @@ impl Record for TableRecord {
             "PPO1" => put_dbaddr_array!(self.ppo1.iter_mut()),
             "PPO2" => put_dbaddr_array!(self.ppo2.iter_mut()),
             _ => Err(CaError::FieldNotFound(name.into())),
-        }
-    }
-
-    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        // Allow the framework to write read-only motor/encoder/limit/speed fields
-        macro_rules! put_double_internal {
-            ($field:expr) => {
-                match value {
-                    EpicsValue::Double(v) => {
-                        $field = v;
-                        Ok(())
-                    }
-                    _ => Err(CaError::TypeMismatch(name.into())),
-                }
-            };
-        }
-        match name {
-            "M0X" => put_double_internal!(self.m0x),
-            "M0Y" => put_double_internal!(self.m0y),
-            "M1Y" => put_double_internal!(self.m1y),
-            "M2X" => put_double_internal!(self.m2x),
-            "M2Y" => put_double_internal!(self.m2y),
-            "M2Z" => put_double_internal!(self.m2z),
-            "R0X" => put_double_internal!(self.r0x),
-            "R0Y" => put_double_internal!(self.r0y),
-            "R1Y" => put_double_internal!(self.r1y),
-            "R2X" => put_double_internal!(self.r2x),
-            "R2Y" => put_double_internal!(self.r2y),
-            "R2Z" => put_double_internal!(self.r2z),
-            "E0X" => put_double_internal!(self.e0x),
-            "E0Y" => put_double_internal!(self.e0y),
-            "E1Y" => put_double_internal!(self.e1y),
-            "E2X" => put_double_internal!(self.e2x),
-            "E2Y" => put_double_internal!(self.e2y),
-            "E2Z" => put_double_internal!(self.e2z),
-            "V0X" => put_double_internal!(self.v0x),
-            "V0Y" => put_double_internal!(self.v0y),
-            "V1Y" => put_double_internal!(self.v1y),
-            "V2X" => put_double_internal!(self.v2x),
-            "V2Y" => put_double_internal!(self.v2y),
-            "V2Z" => put_double_internal!(self.v2z),
-            "H0X" => put_double_internal!(self.h0x),
-            "H0Y" => put_double_internal!(self.h0y),
-            "H1Y" => put_double_internal!(self.h1y),
-            "H2X" => put_double_internal!(self.h2x),
-            "H2Y" => put_double_internal!(self.h2y),
-            "H2Z" => put_double_internal!(self.h2z),
-            "L0X" => put_double_internal!(self.l0x),
-            "L0Y" => put_double_internal!(self.l0y),
-            "L1Y" => put_double_internal!(self.l1y),
-            "L2X" => put_double_internal!(self.l2x),
-            "L2Y" => put_double_internal!(self.l2y),
-            "L2Z" => put_double_internal!(self.l2z),
-            _ => self.put_field(name, value),
         }
     }
 
@@ -4144,11 +4120,11 @@ mod tests {
         t.put_field("AX", EpicsValue::Double(1.5)).unwrap();
         assert_eq!(t.get_field("AX"), Some(EpicsValue::Double(1.5)));
 
-        // Read-only field
-        assert!(t.put_field("AXRB", EpicsValue::Double(1.0)).is_err());
-
-        // put_field_internal bypasses read-only
-        assert!(t.put_field_internal("R0X", EpicsValue::Double(3.0)).is_ok());
+        // A SPC_NOMOD field is stored; the database's gate refuses a client put.
+        t.put_field("AXRB", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!(t.get_field("AXRB"), Some(EpicsValue::Double(1.0)));
+        t.put_field_internal("R0X", EpicsValue::Double(3.0))
+            .unwrap();
         assert_eq!(t.get_field("R0X"), Some(EpicsValue::Double(3.0)));
 
         // Field not found

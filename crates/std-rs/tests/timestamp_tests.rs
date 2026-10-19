@@ -234,13 +234,6 @@ fn test_val_truncated_to_39_visible_bytes() {
 }
 
 #[test]
-fn test_oval_is_read_only() {
-    let mut rec = TimestampRecord::default();
-    let result = rec.put_field("OVAL", EpicsValue::String("test".into()));
-    assert!(result.is_err());
-}
-
-#[test]
 fn test_unknown_field() {
     let rec = TimestampRecord::default();
     assert!(rec.get_field("NONEXISTENT").is_none());

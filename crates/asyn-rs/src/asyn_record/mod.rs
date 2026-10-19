@@ -3284,6 +3284,22 @@ impl AsynRecord {
         self.report_errs(status, Errs::format(msg));
     }
 
+    /// A raw ERRS store, as C's `reportError` writes `pasynRec->errs`
+    /// (asynRecord.c:2037); it posts nothing.
+    fn store_errs(&mut self, value: EpicsValue) -> CaResult<()> {
+        self.errs = match &value {
+            EpicsValue::CharArray(bytes) => {
+                // Drop the `ERR_SIZE` NUL padding `get_field` adds: C's buffer
+                // is fixed-size but the text in it ends at the first NUL
+                // (`:2037`).
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                Errs::from_bytes_lossy(&bytes[..end])
+            }
+            other => Errs::format(format_args!("{other}")),
+        };
+        Ok(())
+    }
+
     /// [`Self::report_error`] of a text already formatted, for a message that
     /// reads the record itself.
     fn set_errs(&mut self, errs: Errs) {
@@ -4875,17 +4891,9 @@ impl Record for AsynRecord {
             "VAL" => {
                 self.val = to_i32(&value);
             }
-            // `cvt_dbaddr` marks ERRS `SPC_NOMOD` (asynRecord.c:962), so
-            // `dbPut` refuses a client put outright. `report_error` /
-            // `reset_error` remain the only writers.
-            // `cvt_dbaddr` marks ERRS `SPC_NOMOD` (asynRecord.c:962), so
-            // `dbPut` refuses a client put outright. `report_error` /
-            // `reset_error` remain the only writers, and the post owner's
-            // write-back reaches the field through `put_field_internal`, which
-            // the trait defines as the path that bypasses read-only checks.
-            "ERRS" => {
-                return Err(CaError::ReadOnlyField("ERRS".to_string()));
-            }
+            // `cvt_dbaddr` marks ERRS `SPC_NOMOD` (asynRecord.c:962); the
+            // database's NOMOD gate refuses a client put.
+            "ERRS" => self.store_errs(value)?,
             "AQR" => {
                 self.aqr = to_i32(&value);
             }
@@ -5415,25 +5423,12 @@ impl Record for AsynRecord {
         }
     }
 
-    /// ERRS is `SPC_NOMOD` to a client (see [`Record::put_field`]) but not to
-    /// the record itself: C `reportError` stores straight into `pasynRec->errs`
-    /// and then posts it (asynRecord.c:2043-2048). `post_fields_with_mask`
-    /// writes the posted value back through this path, which the trait defines
-    /// as the one that bypasses read-only checks — so the store lives here and
-    /// the refusal stays on the client path.
+    /// `post_fields_with_mask` writes a posted ERRS back through this path;
+    /// it goes straight to [`Self::store_errs`], since the default's coercion
+    /// would allocate the `ERR_SIZE` buffer `get_field` serves.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if name == "ERRS" {
-            self.errs = match &value {
-                EpicsValue::CharArray(bytes) => {
-                    // Drop the `ERR_SIZE` NUL padding `get_field` adds: C's buffer
-                    // is fixed-size but the text in it ends at the first NUL
-                    // (`:2037`).
-                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    Errs::from_bytes_lossy(&bytes[..end])
-                }
-                other => Errs::format(format_args!("{other}")),
-            };
-            return Ok(());
+            return self.store_errs(value);
         }
         epics_base_rs::server::record::put_field_internal_default(self, name, value)
     }
@@ -5812,7 +5807,7 @@ mod tests {
     /// clipped a 68-character connect diagnostic at 39 characters and handed
     /// the client `DBR_STRING` for a field C declares `DBR_CHAR`.
     #[test]
-    fn errs_is_a_hundred_byte_char_array_a_client_cannot_write() {
+    fn errs_is_a_hundred_byte_char_array() {
         let mut rec = AsynRecord::default();
 
         // The connect-error shape the row names.
@@ -5840,18 +5835,12 @@ mod tests {
         assert_eq!(rec.errs, "y".repeat(ERR_SIZE - 2).as_str());
         rec.report_error(AsynStatus::Success, format_args!("{}", "x".repeat(250)));
 
-        // SPC_NOMOD: a client put is refused outright.
-        assert!(matches!(
-            rec.put_field("ERRS", EpicsValue::String("operator text".into())),
-            Err(CaError::ReadOnlyField(_))
-        ));
-        assert_eq!(
-            rec.errs.len(),
-            ERR_SIZE - 1,
-            "the refused put changed nothing"
-        );
+        // put_field stores ERRS; the database's NOMOD gate refuses a client.
+        rec.put_field("ERRS", EpicsValue::String("operator text".into()))
+            .unwrap();
+        assert_eq!(rec.errs, "operator text");
 
-        // The record's own post owner still writes through the internal path.
+        // The record's own post owner writes through the internal path.
         rec.put_field_internal("ERRS", errs_on_the_wire("Read error, timeout"))
             .unwrap();
         assert_eq!(rec.errs, "Read error, timeout");

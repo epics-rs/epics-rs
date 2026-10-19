@@ -337,7 +337,9 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   sectioned `slot_map!`, so a declared field neither a `#[field]` nor named
 ///   here does not compile. `spill()` when there are none.
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
-/// - `#[field(type = "Double", read_only)]` — marks a field as read-only
+/// - `#[field(type = "Double", read_only)]` — a `SPC_NOMOD` member:
+///   `put_field` stores it, it gets a `slot_ref` only, and the database's
+///   NOMOD gate refuses a client put
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
 ///   `DBF_MENU` field served as `DBR_ENUM`; `SELM_CHOICES` resolves to a
 ///   `&'static [&'static str]` choice table and is emitted through
@@ -550,21 +552,11 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         .map(|fi| {
             let epics_name = &fi.epics_name;
             let ident = &fi.ident;
-            // Under `spill(...)` a read-only field is a member like any other:
-            // `SPC_NOMOD` is the runtime put gate's.
-            if fi.read_only && attrs.spill.is_none() {
-                quote! {
-                    #epics_name => {
-                        return Err(#krate::error::CaError::ReadOnlyField(
-                            #epics_name.to_string()
-                        ));
-                    }
-                }
-            } else {
-                let extraction = value_from_epics(&krate, &fi.dbf_type, ident);
-                quote! {
-                    #epics_name => { #extraction }
-                }
+            // A `read_only` member is stored like any other: `SPC_NOMOD` is
+            // refused to a client by the database's `check_no_mod` alone.
+            let extraction = value_from_epics(&krate, &fi.dbf_type, ident);
+            quote! {
+                #epics_name => { #extraction }
             }
         })
         .collect();

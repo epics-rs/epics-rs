@@ -432,18 +432,6 @@ impl Record for MbbiDirectRecord {
         }
     }
 
-    /// The `SPC_NOMOD` MLST that `put_field` refuses, stored raw from a
-    /// `.db` as `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("MLST", EpicsValue::Long(v)) => {
-                self.mlst = v as u32;
-                Ok(())
-            }
-            (name, value) => self.put_field(name, value),
-        }
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
@@ -451,6 +439,10 @@ impl Record for MbbiDirectRecord {
                 EpicsValue::Short(v) => self.val = v as u32,
                 EpicsValue::Char(v) => self.val = v as u32,
                 _ => return Err(CaError::TypeMismatch("VAL".into())),
+            },
+            "MLST" => match value {
+                EpicsValue::Long(v) => self.mlst = v as u32,
+                _ => return Err(CaError::TypeMismatch("MLST".into())),
             },
             // RVAL/MASK are DBF_ULONG: accept the native ULong and tolerate
             // the legacy signed Long (device support / autosave).

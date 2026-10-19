@@ -781,30 +781,6 @@ impl Record for EpidRecord {
         }
     }
 
-    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
-    /// `.db` file, as C's `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("CVAL", EpicsValue::Double(v)) => self.cval = v,
-            ("CVLP", EpicsValue::Double(v)) => self.cvlp = v,
-            ("OVAL", EpicsValue::Double(v)) => self.oval = v,
-            ("OVLP", EpicsValue::Double(v)) => self.ovlp = v,
-            ("P", EpicsValue::Double(v)) => self.p = v,
-            ("PP", EpicsValue::Double(v)) => self.pp = v,
-            ("D", EpicsValue::Double(v)) => self.d = v,
-            ("DP", EpicsValue::Double(v)) => self.dp = v,
-            ("DTP", EpicsValue::Double(v)) => self.dtp = v,
-            ("ERR", EpicsValue::Double(v)) => self.err = v,
-            ("ERRP", EpicsValue::Double(v)) => self.errp = v,
-            ("LALM", EpicsValue::Double(v)) => self.lalm = v,
-            ("ALST", EpicsValue::Double(v)) => self.alst = v,
-            ("MLST", EpicsValue::Double(v)) => self.mlst = v,
-            ("FBOP", EpicsValue::Short(v)) => self.fbop = v,
-            (name, value) => return self.put_field(name, value),
-        }
-        Ok(())
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
@@ -1045,9 +1021,111 @@ impl Record for EpidRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // Read-only fields
-            "CVAL" | "CVLP" | "OVAL" | "OVLP" | "P" | "PP" | "D" | "DP" | "ERR" | "ERRP"
-            | "DTP" | "FBOP" | "LALM" | "ALST" | "MLST" => Err(CaError::ReadOnlyField(name.into())),
+            "CVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.cval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "CVLP" => match value {
+                EpicsValue::Double(v) => {
+                    self.cvlp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.oval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "OVLP" => match value {
+                EpicsValue::Double(v) => {
+                    self.ovlp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "P" => match value {
+                EpicsValue::Double(v) => {
+                    self.p = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "PP" => match value {
+                EpicsValue::Double(v) => {
+                    self.pp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "D" => match value {
+                EpicsValue::Double(v) => {
+                    self.d = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DP" => match value {
+                EpicsValue::Double(v) => {
+                    self.dp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "DTP" => match value {
+                EpicsValue::Double(v) => {
+                    self.dtp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "ERR" => match value {
+                EpicsValue::Double(v) => {
+                    self.err = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "ERRP" => match value {
+                EpicsValue::Double(v) => {
+                    self.errp = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "LALM" => match value {
+                EpicsValue::Double(v) => {
+                    self.lalm = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "ALST" => match value {
+                EpicsValue::Double(v) => {
+                    self.alst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "MLST" => match value {
+                EpicsValue::Double(v) => {
+                    self.mlst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "FBOP" => match value {
+                EpicsValue::Short(v) => {
+                    self.fbop = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }

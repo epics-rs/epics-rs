@@ -1267,24 +1267,6 @@ impl Record for ScalerRecord {
         None
     }
 
-    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
-    /// `.db` file, as C's `dbPutString` does.
-    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match (name, value) {
-            ("PCNT", EpicsValue::Short(v)) => self.pcnt = v,
-            ("SS", EpicsValue::Short(v)) => self.ss = v,
-            ("US", EpicsValue::Short(v)) => self.us = v,
-            ("NCH", EpicsValue::Short(v)) => self.nch = v,
-            ("T", EpicsValue::Double(v)) => self.t = v,
-            ("VERS", EpicsValue::Float(v)) => self.vers = v,
-            (name, value) if parse_indexed_field(name, "S").is_some() => {
-                return self.put_field_internal(name, value);
-            }
-            (name, value) => return self.put_field(name, value),
-        }
-        Ok(())
-    }
-
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {
@@ -1392,7 +1374,48 @@ impl Record for ScalerRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            "PCNT" | "SS" | "US" | "NCH" | "T" | "VERS" => Err(CaError::ReadOnlyField(name.into())),
+            "PCNT" => match value {
+                EpicsValue::Short(v) => {
+                    self.pcnt = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SS" => match value {
+                EpicsValue::Short(v) => {
+                    self.ss = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "US" => match value {
+                EpicsValue::Short(v) => {
+                    self.us = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "NCH" => match value {
+                EpicsValue::Short(v) => {
+                    self.nch = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "T" => match value {
+                EpicsValue::Double(v) => {
+                    self.t = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "VERS" => match value {
+                EpicsValue::Float(v) => {
+                    self.vers = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             _ => {
                 if let Some(i) = parse_indexed_field(name, "NM") {
                     match value {
@@ -1433,33 +1456,25 @@ impl Record for ScalerRecord {
                         }
                         _ => Err(CaError::TypeMismatch(name.into())),
                     }
-                } else if parse_indexed_field(name, "S").is_some() {
-                    Err(CaError::ReadOnlyField(name.into()))
+                } else if let Some(i) = parse_indexed_field(name, "S") {
+                    // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649):
+                    // accept the native ULong and tolerate the legacy signed
+                    // Long carrier.
+                    match value {
+                        EpicsValue::ULong(v) => {
+                            self.s[i] = v;
+                            Ok(())
+                        }
+                        EpicsValue::Long(v) => {
+                            self.s[i] = v as u32;
+                            Ok(())
+                        }
+                        _ => Err(CaError::TypeMismatch(name.into())),
+                    }
                 } else {
                     Err(CaError::FieldNotFound(name.into()))
                 }
             }
-        }
-    }
-
-    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        // Allow framework to write S1-S64 (read-only) from device support read.
-        // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649): accept the
-        // native ULong and tolerate the legacy signed Long carrier.
-        if let Some(i) = parse_indexed_field(name, "S") {
-            match value {
-                EpicsValue::ULong(v) => {
-                    self.s[i] = v;
-                    Ok(())
-                }
-                EpicsValue::Long(v) => {
-                    self.s[i] = v as u32;
-                    Ok(())
-                }
-                _ => Err(CaError::TypeMismatch(name.into())),
-            }
-        } else {
-            self.put_field(name, value)
         }
     }
 

@@ -1096,51 +1096,6 @@ pub(crate) fn motor_put_field(
 
 /// A raw field write: the whole put at load, and the put of every field
 /// with no special() case at runtime.
-/// A `.db` value for a field: the `SPC_NOMOD` fields `put_field` refuses
-/// are still stored, as C's `dbPutString` does.
-pub(crate) fn motor_load_field(
-    rec: &mut MotorRecord,
-    name: &str,
-    value: EpicsValue,
-) -> CaResult<()> {
-    match (name, value) {
-        ("VERS", EpicsValue::Float(v)) => rec.internal.vers = v,
-        ("CARD", EpicsValue::Short(v)) => rec.links.card = v,
-        ("HLS", EpicsValue::Short(v)) => rec.limits.hls = v,
-        ("LLS", EpicsValue::Short(v)) => rec.limits.lls = v,
-        ("RHLS", EpicsValue::Short(v)) => rec.limits.rhls = v,
-        ("RLLS", EpicsValue::Short(v)) => rec.limits.rlls = v,
-        ("LVIO", EpicsValue::Short(v)) => rec.limits.lvio = v,
-        ("RCNT", EpicsValue::Short(v)) => rec.retry.rcnt = v,
-        ("MISS", EpicsValue::Short(v)) => rec.retry.miss = v,
-        ("LSPG", EpicsValue::Short(v)) => rec.internal.lspg = SpmgMode::from_i16(v),
-        ("LVAL", EpicsValue::Double(v)) => rec.internal.lval = v,
-        ("LDVL", EpicsValue::Double(v)) => rec.internal.ldvl = v,
-        ("LRVL", EpicsValue::Long(v)) => rec.internal.lrvl = v,
-        ("LRLV", EpicsValue::Double(v)) => rec.internal.lrlv = v,
-        ("PP", EpicsValue::Short(v)) => rec.internal.pp = v,
-        ("RBV", EpicsValue::Double(v)) => rec.pos.rbv = v,
-        ("DRBV", EpicsValue::Double(v)) => rec.pos.drbv = v,
-        ("DIFF", EpicsValue::Double(v)) => rec.pos.diff = v,
-        ("RDIF", EpicsValue::Long(v)) => rec.pos.rdif = v,
-        ("RRBV", EpicsValue::Long(v)) => rec.pos.rrbv = v,
-        ("RMP", EpicsValue::Long(v)) => rec.pos.rmp = v,
-        ("REP", EpicsValue::Long(v)) => rec.pos.rep = v,
-        ("CDIR", EpicsValue::Short(v)) => rec.stat.cdir = v,
-        ("DMOV", EpicsValue::Short(v)) => rec.stat.dmov = v,
-        ("MOVN", EpicsValue::Short(v)) => rec.stat.movn = v,
-        ("TDIR", EpicsValue::Short(v)) => rec.stat.tdir = v,
-        ("ATHM", EpicsValue::Short(v)) => rec.stat.athm = v,
-        ("RVEL", EpicsValue::Long(v)) => rec.stat.rvel = v,
-        ("MSTA", EpicsValue::ULong(v)) => rec.stat.msta = MstaFlags::from_bits_retain(v),
-        ("MIP", EpicsValue::UShort(v)) => rec.stat.mip = MipFlags::from_bits_retain(v),
-        ("MMAP", EpicsValue::ULong(v)) => rec.internal.mmap = v,
-        ("NMAP", EpicsValue::ULong(v)) => rec.internal.nmap = v,
-        (name, value) => return motor_put_field(rec, name, value),
-    }
-    Ok(())
-}
-
 fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> CaResult<()> {
     match name {
         // A position write keeps its source: was_position_restored reads
@@ -1491,6 +1446,231 @@ fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> Ca
         "LOPR" => match value {
             EpicsValue::Double(v) => {
                 rec.disp.lopr = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // SPC_NOMOD: stored here, refused to a client by the database gate.
+        "VERS" => match value {
+            EpicsValue::Float(v) => {
+                rec.internal.vers = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "CARD" => match value {
+            EpicsValue::Short(v) => {
+                rec.links.card = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.hls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.lls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RHLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.rhls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RLLS" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.rlls = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LVIO" => match value {
+            EpicsValue::Short(v) => {
+                rec.limits.lvio = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RCNT" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.rcnt = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MISS" => match value {
+            EpicsValue::Short(v) => {
+                rec.retry.miss = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LSPG" => match value {
+            EpicsValue::Short(v) => {
+                rec.internal.lspg = SpmgMode::from_i16(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LVAL" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.lval = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LDVL" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.ldvl = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LRVL" => match value {
+            EpicsValue::Long(v) => {
+                rec.internal.lrvl = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LRLV" => match value {
+            EpicsValue::Double(v) => {
+                rec.internal.lrlv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "PP" => match value {
+            EpicsValue::Short(v) => {
+                rec.internal.pp = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RBV" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.rbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DRBV" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.drbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DIFF" => match value {
+            EpicsValue::Double(v) => {
+                rec.pos.diff = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RDIF" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rdif = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RRBV" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rrbv = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RMP" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rmp = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "REP" => match value {
+            EpicsValue::Long(v) => {
+                rec.pos.rep = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "CDIR" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.cdir = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "DMOV" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.dmov = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MOVN" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.movn = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "TDIR" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.tdir = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ATHM" => match value {
+            EpicsValue::Short(v) => {
+                rec.stat.athm = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "RVEL" => match value {
+            EpicsValue::Long(v) => {
+                rec.stat.rvel = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MSTA" => match value {
+            EpicsValue::ULong(v) => {
+                rec.stat.msta = MstaFlags::from_bits_retain(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MIP" => match value {
+            EpicsValue::UShort(v) => {
+                rec.stat.mip = MipFlags::from_bits_retain(v);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "MMAP" => match value {
+            EpicsValue::ULong(v) => {
+                rec.internal.mmap = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "NMAP" => match value {
+            EpicsValue::ULong(v) => {
+                rec.internal.nmap = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

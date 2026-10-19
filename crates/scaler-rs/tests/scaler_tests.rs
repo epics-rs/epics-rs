@@ -86,17 +86,6 @@ fn test_get_put_scalar_fields() {
     );
 }
 
-#[test]
-fn test_read_only_scalar_fields() {
-    let mut rec = ScalerRecord::default();
-    assert!(rec.put_field("PCNT", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("SS", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("US", EpicsValue::Short(1)).is_err());
-    assert!(rec.put_field("NCH", EpicsValue::Short(8)).is_err());
-    assert!(rec.put_field("T", EpicsValue::Double(1.0)).is_err());
-    assert!(rec.put_field("VERS", EpicsValue::Float(1.0)).is_err());
-}
-
 // ============================================================
 // Field access — indexed fields (S1-S64, PR1-PR64, etc.)
 // ============================================================
@@ -104,12 +93,13 @@ fn test_read_only_scalar_fields() {
 #[test]
 fn test_get_put_indexed_s() {
     let rec = ScalerRecord::default();
-    // S fields are read-only and DBF_ULONG (scalerRecord.dbd:1334-1649).
+    // S fields are DBF_ULONG (scalerRecord.dbd:1334-1649).
     assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(0)));
     assert_eq!(rec.get_field("S64"), Some(EpicsValue::ULong(0)));
 
     let mut rec = rec;
-    assert!(rec.put_field("S1", EpicsValue::ULong(100)).is_err());
+    rec.put_field("S1", EpicsValue::ULong(100)).unwrap();
+    assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(100)));
 }
 
 #[test]

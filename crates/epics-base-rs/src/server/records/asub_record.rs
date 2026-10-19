@@ -647,6 +647,17 @@ impl Record for ASubRecord {
         asub_output_event_fields()
     }
 
+    /// C `initFields` (`aSubRecord.c:118-121`, `:176-206`): pass 0 runs before
+    /// any SNAM early return, so `ONVx` is `NOVx` even when init fails.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.nea = self.noa;
+            self.neva = self.nova;
+            self.onva = self.neva;
+        }
+        Ok(())
+    }
+
     fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         // C `init_record`'s tail (`aSubRecord.c:164-171`).
         self.ovla = self.vala.clone();

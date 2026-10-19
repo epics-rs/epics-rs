@@ -388,6 +388,16 @@ pub fn classify_link(
     if matches!(parsed.link_type(), LinkType::Empty | LinkType::Constant) {
         return (LINK_CON, DBF_UNKNOWN);
     }
+    // Base calcout asks the lset (`dbLink.c:220-235`): a hardware link has
+    // none, so it is constant; a state link's is neither constant nor
+    // volatile (`lnkState.c:213-214`), so it is local.
+    if rule == LinkRule::Volatile {
+        match &parsed {
+            ParsedLink::Hw(_) => return (LINK_CON, DBF_UNKNOWN),
+            ParsedLink::State(_) => return (LINK_LOC, DBF_UNKNOWN),
+            _ => {}
+        }
+    }
     let local = match &parsed {
         ParsedLink::Db(_) => handle.parsed_link_target_field_type(&parsed),
         // `dbNameToAddr(pvname)`, the modifier aside.

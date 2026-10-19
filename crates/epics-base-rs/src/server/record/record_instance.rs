@@ -5151,6 +5151,10 @@ pub struct RecordInstance {
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
 /// the lines a cycle does read sit closer together.
 struct RecordCold {
+    /// The process actions of a cycle that handed off to an async output
+    /// completion: C runs the code past `writeValue` (bo's HIGH arm,
+    /// `boRecord.c:263-268`) on the completing pass, so that pass runs them.
+    async_tail_actions: super::ProcessActions,
     /// The cell holding this instance — none for one not yet in a cell — for
     /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
     cell: std::sync::Weak<RecordCell>,
@@ -6623,6 +6627,16 @@ fn walk_skip_term(field: &str, deadband_field: &str, event_posted: &[&str]) -> b
 }
 
 impl RecordInstance {
+    /// Keep a handed-off cycle's process actions for its completing pass.
+    pub(crate) fn defer_async_tail_actions(&mut self, actions: super::ProcessActions) {
+        self.cold.async_tail_actions = actions;
+    }
+
+    /// The handed-off cycle's process actions, for the completing pass to run.
+    pub(crate) fn take_async_tail_actions(&mut self) -> super::ProcessActions {
+        std::mem::take(&mut self.cold.async_tail_actions)
+    }
+
     /// Name what the next cycle reads past the cell into `hints`: the OUT
     /// link's parse and `DbLink`, and the first two monitors' queue slots.
     #[inline(always)]
@@ -7595,6 +7609,7 @@ impl RecordInstance {
             #[cfg(test)]
             ran_arm: CyclePlan::General,
             cold: Box::new(RecordCold {
+                async_tail_actions: super::ProcessActions::default(),
                 cell: std::sync::Weak::new(),
                 init_subroutines: None,
                 db: Default::default(),

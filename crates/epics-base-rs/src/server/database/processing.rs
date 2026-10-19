@@ -7473,6 +7473,7 @@ impl PvDatabase {
                                                 instance.record.after_output_decision();
                                             }
                                             instance.enter_pact();
+                                            instance.defer_async_tail_actions(process_actions);
                                             cycle_end.hand_off_to_async_completion();
                                             return Ok(());
                                         }
@@ -7546,6 +7547,7 @@ impl PvDatabase {
                                         // `complete_async_write` ends the cycle there.
                                         instance.enter_pact();
                                         instance.device = Some(dev);
+                                        instance.defer_async_tail_actions(process_actions);
                                         // Not an end: `complete_async_record_inner`
                                         // owns this cycle's tail now, and mints its own
                                         // token from the record when the write lands.
@@ -9075,6 +9077,12 @@ impl PvDatabase {
         // `dbScanPassive` for a DB target, → lset `scanForward` for an
         // external one).
         self.scan_forward_target(rec, &flnk_name, visited);
+
+        // The handed-off cycle's actions, after the FLNK as on the sync tail.
+        let tail = rec.write().take_async_tail_actions();
+        if !tail.is_empty() {
+            self.execute_process_actions_in(name, rec, tail, visited);
+        }
 
         // RPRO: C `recGblFwdLink` consumes a pending reprocess via
         // `scanOnce` — queued, not recursed. Mirror the synchronous

@@ -1,6 +1,7 @@
 //! `C_PLUGIN_ASYN_FLAGS` against ADCore: each row's flags are the `asynFlags`
 //! argument of its plugin's constructor call, every registered `*Configure`
-//! command has a row, and the port each command registers has those flags.
+//! command has a row, and the port each command registers has those flags and
+//! its file's PluginType.
 #![cfg(tokio_backend)]
 #![cfg(feature = "ioc")]
 
@@ -155,7 +156,7 @@ fn port_flags(port: &str) -> (bool, bool, bool) {
 }
 
 /// Each command's port is can-block, multi-device and destructible exactly
-/// where its C `asynFlags` say, so only the six NDFile* get a port thread.
+/// where its C `asynFlags` say, so only the seven NDFile* get a port thread.
 /// Destructible is NDROIConfigure's own `ASYN_DESTRUCTIBLE`
 /// (NDPluginROI.cpp:363-364), the one `pluginSrc` file that names it.
 /// Multi-device also follows a `maxAddr` above 1, which asynPortDriver turns
@@ -233,4 +234,37 @@ fn a_negative_priority_on_a_synchronous_plugin_does_not_stop_the_ioc() {
     assert!(ioc.mgr().plugin("NPST").is_some());
     // Multi-device by NDStats' maxAddr 2 (NDPluginStats.cpp:777).
     assert_eq!(port_flags("NPST"), (false, true, false));
+}
+
+/// The PluginType each row's file sets (`setStringParam(NDPluginDriverPluginType,
+/// "...")`) is what the port it registers reads back. NDFileHDF5 sets it from a
+/// variable built with the HDF5 version (NDFileHDF5.cpp:2392) and is skipped.
+#[test]
+fn each_configure_command_s_port_has_c_s_plugin_type() {
+    const SET: &str = "setStringParam(NDPluginDriverPluginType, \"";
+    let (ioc, shell) = ad_ioc_with_driver("PTUP");
+    let mut checked = 0;
+    for (i, (name, file, _)) in C_PLUGIN_ASYN_FLAGS.iter().enumerate() {
+        let source = std::fs::read_to_string(reference_path(
+            ReferenceTree::Modules,
+            &format!("ADCore/ADApp/pluginSrc/{file}"),
+        ))
+        .unwrap();
+        let Some(at) = source.find(SET) else {
+            continue;
+        };
+        let rest = &source[at + SET.len()..];
+        let want = &rest[..rest.find('"').unwrap()];
+        let port = format!("PT{i}");
+        run(&shell, &configure_line(&ioc, name, &port, "PTUP"));
+        let handle = asyn_rs::registry::get_port(&port).unwrap().handle;
+        let reason = handle
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("PLUGIN_TYPE", 0))
+            .unwrap()
+            .reason;
+        let got = handle.get_string_param_blocking(reason, 0, 64).unwrap();
+        assert_eq!(String::from_utf8_lossy(&got), want, "{name} ({file})");
+        checked += 1;
+    }
+    assert_eq!(checked, C_PLUGIN_ASYN_FLAGS.len() - 1);
 }

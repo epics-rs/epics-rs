@@ -40,7 +40,7 @@ impl NDPluginProcess for PassthroughProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         // Plugin-specific params based on plugin type
-        if self.plugin_type.as_str() == "NDPvaConfigure" {
+        if matches!(self.plugin_type.as_str(), "NDPluginPva" | "NDPluginPvxs") {
             base.create_param("PV_NAME", ParamType::Octet)?;
         }
         Ok(())

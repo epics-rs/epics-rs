@@ -237,6 +237,7 @@ pub fn create_attribute_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: std::sync::Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
     max_attributes: i32,
@@ -254,7 +255,15 @@ pub fn create_attribute_runtime(
     let processor = AttributeProcessor::new(num_channels);
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        claim, processor, max_memory, queue_size, source, wiring, num_addr, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        num_addr,
+        threads,
     );
 
     (handle, data_jh)

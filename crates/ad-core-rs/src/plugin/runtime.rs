@@ -2363,6 +2363,7 @@ impl PluginPortDriver {
         port_name: &str,
         plugin_type_name: &str,
         queue_size: i32,
+        blocking_callbacks: i32,
         source: &ArraySource,
         max_addr: usize,
         param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
@@ -2408,9 +2409,18 @@ impl PluginPortDriver {
         base.set_int32_param(plugin_params.queue_use, 0, queue_size)?;
         base.set_int32_param(plugin_params.max_threads, 0, PLUGIN_MAX_THREADS)?;
         base.set_int32_param(plugin_params.num_threads, 0, PLUGIN_NUM_THREADS)?;
-        // C `:160` sets its `blockingCallbacks` constructor argument here;
-        // `PluginManager::add_plugin` writes it once the port runs.
-        base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
+        base.set_int32_param(plugin_params.blocking_callbacks, 0, blocking_callbacks)?;
+        // C `:164-166`: only a non-blocking plugin starts its threads here.
+        let callback_threads = blocking_callbacks == 0;
+        if callback_threads {
+            let settled =
+                create_callback_threads(PLUGIN_NUM_THREADS, PLUGIN_MAX_THREADS, queue_size);
+            for line in &settled.lines {
+                base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+            }
+            base.set_int32_param(plugin_params.queue_size, 0, settled.queue_size)?;
+            base.set_int32_param(plugin_params.queue_use, 0, settled.queue_size)?;
+        }
 
         base.set_string_param(plugin_params.plugin_type, 0, plugin_type_name)?;
 
@@ -2452,7 +2462,7 @@ impl PluginPortDriver {
             validator: processor.clone(),
             hand_on: Arc::default(),
             owner,
-            callback_threads: false,
+            callback_threads,
         };
         Ok((driver, processor, pool))
     }
@@ -3174,16 +3184,6 @@ impl PluginRuntimeHandle {
         );
     }
 
-    /// C `setIntegerParam(BlockingCallbacks, blockingCallbacks)`
-    /// (NDPluginDriver.cpp:160).
-    pub fn set_blocking_callbacks(&self, blocking_callbacks: i32) {
-        let _ = self.port_runtime.port_handle().write_int32_blocking(
-            self.plugin_params.blocking_callbacks,
-            0,
-            blocking_callbacks,
-        );
-    }
-
     pub fn port_name(&self) -> &str {
         &self.port_name
     }
@@ -3274,12 +3274,21 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     processor: P,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     create_plugin_runtime_multi_addr(
-        claim, processor, max_memory, queue_size, source, wiring, 1, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        1,
+        threads,
     )
 }
 
@@ -3291,6 +3300,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     processor: P,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     max_addr: usize,
@@ -3320,6 +3330,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         port_name,
         &plugin_type_name,
         queue_size,
+        blocking_callbacks,
         &source,
         max_addr,
         param_tx,
@@ -3357,7 +3368,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
 
     // Shared mode flags
     let enabled = Arc::new(AtomicBool::new(false));
-    let blocking_mode = Arc::new(AtomicBool::new(false));
+    let blocking_mode = Arc::new(AtomicBool::new(blocking_callbacks != 0));
 
     // Shared processor (accessible from data thread)
     let array_outputs: Vec<_> = (0..max_addr.max(1))
@@ -4348,6 +4359,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     processor: P,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     output: NDArrayOutput,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
@@ -4373,6 +4385,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         port_name,
         &plugin_type_name,
         queue_size,
+        blocking_callbacks,
         &source,
         1,
         param_tx,
@@ -4400,7 +4413,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let (array_sender, array_rx) = ndarray_channel(port_name, queue_size.max(1) as usize);
 
     let enabled = Arc::new(AtomicBool::new(false));
-    let blocking_mode = Arc::new(AtomicBool::new(false));
+    let blocking_mode = Arc::new(AtomicBool::new(blocking_callbacks != 0));
 
     let array_outputs = vec![Arc::new(parking_lot::Mutex::new(output))];
     // B13: register this plugin's output so the WiringRegistry is the single
@@ -4715,6 +4728,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -4735,6 +4749,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -4768,6 +4783,7 @@ mod tests {
             },
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -4995,6 +5011,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5062,6 +5079,7 @@ mod tests {
                 CodecPlugin { produce },
                 1_000_000,
                 10,
+                0,
                 output,
                 "",
                 test_wiring(),
@@ -5129,6 +5147,7 @@ mod tests {
             StampProcessor { stamp: 0 },
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5192,6 +5211,7 @@ mod tests {
             MistypedStamp { stamp: 0 },
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5259,6 +5279,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5298,6 +5319,7 @@ mod tests {
             },
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5324,6 +5346,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5361,6 +5384,7 @@ mod tests {
             Restamp,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5406,6 +5430,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5448,6 +5473,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5473,6 +5499,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5507,6 +5534,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5567,6 +5595,7 @@ mod tests {
             "BASELINES",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -5638,6 +5667,7 @@ mod tests {
             "POSTADDR",
             "Validating",
             10,
+            0,
             &"UP".into(),
             2,
             tx,
@@ -5674,6 +5704,7 @@ mod tests {
             processor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5703,6 +5734,7 @@ mod tests {
             processor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5737,6 +5769,7 @@ mod tests {
             processor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5767,6 +5800,7 @@ mod tests {
             processor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -5847,6 +5881,7 @@ mod tests {
             "COUNTDOWN",
             "Countdown",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -5944,6 +5979,7 @@ mod tests {
             poster,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -5993,6 +6029,7 @@ mod tests {
             EvenOnly,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -6072,6 +6109,7 @@ mod tests {
             "ARRSIDE",
             "ArraySide",
             10,
+            0,
             &"UP".into(),
             2,
             tx,
@@ -6126,6 +6164,7 @@ mod tests {
             processor,
             1_000_000,
             10,
+            0,
             "",
             wiring.clone(),
             2,
@@ -6162,6 +6201,7 @@ mod tests {
             "BUSY",
             "Validating",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6212,6 +6252,7 @@ mod tests {
             "OCTETNUL",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6241,6 +6282,7 @@ mod tests {
             "ADDRLIST0",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6279,6 +6321,7 @@ mod tests {
             "ADDRDONE",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6323,6 +6366,7 @@ mod tests {
             "ADDRLIST",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6364,6 +6408,7 @@ mod tests {
             "FILEPATH",
             "Passthrough",
             10,
+            0,
             &"UP".into(),
             1,
             tx,
@@ -6414,6 +6459,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             wiring,
             DEFAULT_PLUGIN_THREADS,
@@ -6432,6 +6478,86 @@ mod tests {
         assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 1);
     }
 
+    /// What `port`'s trace prints while `f` runs.
+    fn traced(port: &str, f: impl FnOnce()) -> String {
+        let log = std::env::temp_dir().join(format!("{port}-trace-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        asyn_rs::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some(port),
+                asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        f();
+        let trace = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        trace
+    }
+
+    /// C's constructor runs `createCallbackThreads` only for a non-blocking
+    /// plugin (NDPluginDriver.cpp:164-166), whoever builds it.
+    #[test]
+    fn the_constructor_floors_the_queue_only_when_non_blocking() {
+        const FLOOR: &str =
+            "NDPluginDriver::createCallbackThreads error, queueSize=0 must be >= 1, setting to 1";
+        for (port, blocking, size) in [("XCTOR0", 0, 1), ("XCTOR1", 1, 0)] {
+            let mut handle = None;
+            let trace = traced(port, || {
+                handle = Some(create_plugin_runtime(
+                    &asyn_rs::asyn_record::claim_port(port).unwrap(),
+                    PassthroughProcessor,
+                    1_000_000,
+                    0,
+                    blocking,
+                    "",
+                    test_wiring(),
+                    DEFAULT_PLUGIN_THREADS,
+                ));
+            });
+            let (handle, _jh) = handle.unwrap();
+            let port_handle = handle.port_runtime().port_handle();
+            let p = &handle.plugin_params;
+            let read = |r| port_handle.read_int32_blocking(r, 0).unwrap();
+            assert_eq!(read(p.blocking_callbacks), blocking, "{port}");
+            assert_eq!(
+                (read(p.queue_size), read(p.queue_use)),
+                (size, size),
+                "{port}"
+            );
+            assert_eq!(trace.contains(FLOOR), blocking == 0, "{port}:\n{trace}");
+        }
+    }
+
+    /// Once the threads exist, a BlockingCallbacks 1 then 0 does not run
+    /// `createCallbackThreads` again (`:715-717` tests `pThreads_.size()`),
+    /// so a NumThreads above a since-lowered MaxThreads stands.
+    #[test]
+    fn going_blocking_and_back_does_not_rerun_create_callback_threads() {
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("XRERUN").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            0,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.plugin_params;
+        port.write_int32_blocking(p.max_threads, 0, 4).unwrap();
+        port.write_int32_blocking(p.num_threads, 0, 4).unwrap();
+        port.write_int32_blocking(p.max_threads, 0, 2).unwrap();
+        let trace = traced("XRERUN", || {
+            port.write_int32_blocking(p.blocking_callbacks, 0, 1)
+                .unwrap();
+            port.write_int32_blocking(p.blocking_callbacks, 0, 0)
+                .unwrap();
+        });
+        assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 4);
+        assert!(!trace.contains("createCallbackThreads"), "{trace}");
+    }
+
     #[test]
     fn refused_plugin_writes_return_an_error() {
         let wiring = test_wiring();
@@ -6442,6 +6568,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "UP",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -6574,6 +6701,7 @@ mod tests {
             Posting,
             1_000_000,
             10,
+            0,
             "",
             wiring.clone(),
             2,
@@ -6635,6 +6763,7 @@ mod tests {
             Allocating,
             1_000_000,
             10,
+            0,
             "",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -6711,6 +6840,7 @@ mod tests {
             gated,
             1_000_000,
             10,
+            0,
             "",
             wiring.clone(),
             2,
@@ -6752,6 +6882,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             wiring.clone(),
             2,
@@ -6763,6 +6894,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             ("UP_SEED", 1),
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -6794,6 +6926,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             ("LATE_DRV", 2),
             wiring.clone(),
@@ -6852,6 +6985,7 @@ mod tests {
                 PassthroughProcessor,
                 1_000_000,
                 10,
+                0,
                 "",
                 wiring.clone(),
                 1,
@@ -6865,6 +6999,7 @@ mod tests {
             Gathering,
             1_000_000,
             10,
+            0,
             "UP_A",
             wiring.clone(),
             2,
@@ -6936,6 +7071,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -6960,6 +7096,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -6993,6 +7130,69 @@ mod tests {
         assert_eq!(received.unique_id, 2);
     }
 
+    /// A plugin built with blocking callbacks holds the caller until its
+    /// first frame is processed (NDPluginDriver.cpp:160, :419-422), with no
+    /// BlockingCallbacks write after the constructor.
+    #[test]
+    fn a_blocking_plugin_holds_the_caller_from_its_first_frame() {
+        struct Held {
+            started: std::sync::mpsc::SyncSender<()>,
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl NDPluginProcess for Held {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let _ = self.started.send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+                ProcessResult::arrays(vec![Arc::clone(array)])
+            }
+            fn plugin_type(&self) -> &str {
+                "Held"
+            }
+        }
+        let (started_tx, started) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (handle, _data_jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("BLK_CTOR").unwrap(),
+            Held {
+                started: started_tx,
+                release: parking_lot::Mutex::new(release_rx),
+            },
+            1_000_000,
+            10,
+            1,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let publisher = {
+            let returned = Arc::clone(&returned);
+            let sender = handle.array_sender().clone();
+            std::thread::spawn(move || {
+                send_array(&sender, make_test_array(1));
+                returned.store(true, Ordering::Release);
+            })
+        };
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !returned.load(Ordering::Acquire),
+            "the caller returned while its frame was still processing"
+        );
+        release.send(()).unwrap();
+        publisher.join().unwrap();
+    }
+
     /// A frame `processing_required` refuses is neither counted, posted nor
     /// handed on, on the callback thread or the caller's
     /// (NDPluginFile.cpp:724-725).
@@ -7022,6 +7222,7 @@ mod tests {
                 OddOnly,
                 1_000_000,
                 10,
+                0,
                 output,
                 "",
                 test_wiring(),
@@ -7059,6 +7260,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -7110,6 +7312,7 @@ mod tests {
             processor,
             1_000_000,
             8,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -7178,6 +7381,7 @@ mod tests {
             PassthroughProcessor,
             64,
             4,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -7230,6 +7434,7 @@ mod tests {
             PoolLess(4),
             1_000_000,
             4,
+            0,
             "",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -7260,6 +7465,7 @@ mod tests {
             PoolLess(100),
             1_000_000,
             4,
+            0,
             "",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -7321,6 +7527,7 @@ mod tests {
             Resized(size.clone()),
             1_000_000,
             4,
+            0,
             "",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -7388,6 +7595,7 @@ mod tests {
             RefusedThenSmall,
             1_000_000,
             4,
+            0,
             "",
             wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
@@ -7438,6 +7646,7 @@ mod tests {
             OversizedPost,
             1_000_000,
             4,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -7449,6 +7658,7 @@ mod tests {
             PassthroughProcessor,
             64,
             4,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -7490,6 +7700,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             4,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -7555,6 +7766,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -7595,6 +7807,7 @@ mod tests {
             ParamTracker,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -7648,6 +7861,7 @@ mod tests {
             Echo,
             1_000_000,
             10,
+            0,
             NDArrayOutput::new(),
             "",
             test_wiring(),
@@ -7782,6 +7996,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             20,
+            0,
             NDArrayOutput::new(),
             ("CTOR_UP", 3),
             test_wiring(),
@@ -7880,6 +8095,7 @@ mod tests {
             },
             1_000_000,
             10,
+            0,
             NDArrayOutput::new(),
             "",
             test_wiring(),
@@ -8000,6 +8216,7 @@ mod tests {
             probe.clone(),
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             plugin_threads(0, raw),
@@ -8085,6 +8302,7 @@ mod tests {
                     PassthroughProcessor,
                     1_000_000,
                     10,
+                    0,
                     NDArrayOutput::new(),
                     "",
                     test_wiring(),
@@ -8096,6 +8314,7 @@ mod tests {
                     PassthroughProcessor,
                     1_000_000,
                     10,
+                    0,
                     "",
                     test_wiring(),
                     plugin_threads(raw, 0),
@@ -8163,6 +8382,7 @@ mod tests {
             },
             1_000_000,
             10,
+            0,
             NDArrayOutput::new(),
             "",
             test_wiring(),
@@ -8192,6 +8412,7 @@ mod tests {
             PassthroughProcessor,
             2_097_152,
             20,
+            0,
             NDArrayOutput::new(),
             "",
             test_wiring(),
@@ -8287,6 +8508,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8342,6 +8564,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8424,6 +8647,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             NDArrayOutput::new(),
             "",
             test_wiring(),
@@ -8468,6 +8692,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -8526,6 +8751,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8590,6 +8816,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8631,6 +8858,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8689,6 +8917,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8776,6 +9005,7 @@ mod tests {
                 PassthroughProcessor,
                 1_000_000,
                 10,
+                0,
                 output,
                 "",
                 test_wiring(),
@@ -8805,6 +9035,7 @@ mod tests {
                 CompressProcessor,
                 1_000_000,
                 10,
+                0,
                 output,
                 "",
                 test_wiring(),
@@ -8849,6 +9080,7 @@ mod tests {
             PassthroughProcessor,
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8910,6 +9142,7 @@ mod tests {
             PassthroughProcessor, // compression_aware() defaults to false
             1_000_000,
             10,
+            0,
             output,
             "",
             test_wiring(),
@@ -8965,6 +9198,7 @@ mod tests {
             SlowProcessor,
             1_000_000,
             1,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9240,6 +9474,7 @@ mod tests {
             processor,
             1_000_000,
             2,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9300,6 +9535,7 @@ mod tests {
             processor,
             1_000_000,
             DEPTH,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9362,6 +9598,7 @@ mod tests {
             processor,
             1_000_000,
             DEPTH,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9437,6 +9674,7 @@ mod tests {
             processor,
             1_000_000,
             2,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9483,6 +9721,7 @@ mod tests {
             processor,
             1_000_000,
             8,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9534,6 +9773,7 @@ mod tests {
             processor,
             1_000_000,
             1,
+            0,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,

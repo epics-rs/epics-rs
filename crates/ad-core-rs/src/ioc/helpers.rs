@@ -156,8 +156,8 @@ pub struct PluginArgs {
     pub port_name: String,
     /// As written: the runtime applies C's floor (NDPluginDriver.cpp:989-995).
     pub queue_size: i32,
-    /// Handed to [`PluginManager::add_plugin`](crate::ioc::PluginManager::add_plugin),
-    /// which is where every configure command publishes its plugin.
+    /// Handed to the plugin's constructor, which starts its threads only
+    /// when this is 0 (NDPluginDriver.cpp:164-166).
     pub blocking_callbacks: i32,
     pub source: ArraySource,
 }

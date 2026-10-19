@@ -84,6 +84,7 @@ pub fn create_std_arrays_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
@@ -96,7 +97,14 @@ pub fn create_std_arrays_runtime(
     let data_handle = processor.data_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        claim, processor, max_memory, queue_size, source, wiring, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        threads,
     );
 
     (handle, data_handle, data_jh)
@@ -153,6 +161,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool.max_memory(),
             1,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -192,6 +201,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool.max_memory(),
             1,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -276,6 +286,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool.max_memory(),
             1,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -350,6 +361,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool.max_memory(),
             1,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -419,6 +431,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool.max_memory(),
             1,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

@@ -2380,6 +2380,7 @@ mod tests {
             CodecProcessor::new(CodecMode::Decompress),
             pool.max_memory(),
             10,
+            0,
             output,
             "",
             Arc::new(WiringRegistry::new()),

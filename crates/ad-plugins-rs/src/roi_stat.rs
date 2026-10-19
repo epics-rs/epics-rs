@@ -751,6 +751,7 @@ pub fn create_roi_stat_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     num_rois: usize,
@@ -765,7 +766,15 @@ pub fn create_roi_stat_runtime(
     let params_handle = processor.params_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        claim, processor, max_memory, queue_size, source, wiring, num_rois, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        num_rois,
+        threads,
     );
 
     let roi_stat_params = *params_handle.lock();
@@ -828,6 +837,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("RS_INIT").unwrap(),
             1_000_000,
             1,
+            0,
             "",
             Arc::new(WiringRegistry::new()),
             2,

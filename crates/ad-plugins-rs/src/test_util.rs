@@ -158,6 +158,7 @@ fn start<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
         processor,
         10_000_000,
         10,
+        0,
         output,
         "",
         std::sync::Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),

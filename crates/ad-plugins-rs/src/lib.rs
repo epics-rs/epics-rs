@@ -70,6 +70,7 @@ pub mod file_jpeg;
 pub mod file_magick;
 pub mod file_netcdf;
 pub mod file_nexus;
+pub mod file_null;
 pub mod file_tiff;
 pub mod gather;
 pub mod hdf5_layout;

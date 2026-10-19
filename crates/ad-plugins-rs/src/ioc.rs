@@ -34,22 +34,23 @@ use crate::attr_plot_args::{AttrPlotArgs, parse_attr_plot_args};
 /// `asynFlags` is `ASYN_DESTRUCTIBLE` where asyn defines it
 /// (NDPluginROI.cpp:361-368).
 /// C creates the port thread, at the line's `priority` and `stackSize`, only
-/// for the can-block six (asynManager.c:2074).
+/// for the can-block seven (asynManager.c:2074).
 ///
 /// | flags | commands |
 /// |---|---|
-/// | `ASYN_CANBLOCK` | NDFileTIFF, NDFileJPEG, NDFileHDF5, NDFileNetCDF, NDFileMagick, NDFileNexus |
+/// | `ASYN_CANBLOCK` | NDFileTIFF, NDFileJPEG, NDFileHDF5, NDFileNetCDF, NDFileMagick, NDFileNexus, NDFileNull |
 /// | `ASYN_MULTIDEVICE` | NDGather, NDProcess, NDROI, NDScatter, NDTransform, NDAttr, NDAttrPlot, NDOverlay, NDROIStat, NDTimeSeries, NDPosPlugin |
-/// | `0` | NDBadPixel, NDCodec, NDColorConvert, NDFFT, NDStats, NDStdArrays, NDPva, NDCircularBuff |
+/// | `0` | NDBadPixel, NDCodec, NDColorConvert, NDFFT, NDStats, NDStdArrays, NDPva, NDPvxs, NDCircularBuff |
 ///
 /// Each processor's `NDPluginProcess::ASYN_FLAGS` carries its row.
-pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 25] = [
+pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 27] = [
     ("NDFileTIFFConfigure", "NDFileTIFF.cpp", "ASYN_CANBLOCK"),
     ("NDFileJPEGConfigure", "NDFileJPEG.cpp", "ASYN_CANBLOCK"),
     ("NDFileHDF5Configure", "NDFileHDF5.cpp", "ASYN_CANBLOCK"),
     ("NDFileNetCDFConfigure", "NDFileNetCDF.cpp", "ASYN_CANBLOCK"),
     ("NDFileMagickConfigure", "NDFileMagick.cpp", "ASYN_CANBLOCK"),
     ("NDFileNexusConfigure", "NDFileNexus.cpp", "ASYN_CANBLOCK"),
+    ("NDFileNullConfigure", "NDFileNull.cpp", "ASYN_CANBLOCK"),
     (
         "NDGatherConfigure",
         "NDPluginGather.cpp",
@@ -112,6 +113,7 @@ pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 25] = [
     ("NDStatsConfigure", "NDPluginStats.cpp", "0"),
     ("NDStdArraysConfigure", "NDPluginStdArrays.cpp", "0"),
     ("NDPvaConfigure", "NDPluginPva.cpp", "0"),
+    ("NDPvxsConfigure", "NDPluginPvxs.cpp", "0"),
     ("NDCircularBuffConfigure", "NDPluginCircularBuff.cpp", "0"),
 ];
 
@@ -139,17 +141,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &claim,
                     max_memory_arg(args, 6),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -182,18 +182,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &claim,
                     max_memory_arg(args, 6),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
 
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -227,17 +225,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &claim,
                     max_memory_arg(args, 6),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -255,13 +251,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::process::{ProcessConfig, ProcessProcessor};
             create_plugin_runtime(
                 claim,
                 ProcessProcessor::new(ProcessConfig::default()),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -278,13 +275,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::pos_plugin::{PosMode, PosPluginProcessor};
             create_plugin_runtime(
                 claim,
                 PosPluginProcessor::new(PosMode::Discard),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -299,13 +297,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::transform::{TransformProcessor, TransformType};
             create_plugin_runtime(
                 claim,
                 TransformProcessor::new(TransformType::None),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -320,7 +319,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
             use ad_core_rs::color::{NDBayerPattern, NDColorMode};
             let config = ColorConvertConfig {
@@ -333,6 +332,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 ColorConvertProcessor::new(config),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -366,18 +366,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
                     max_memory_arg(args, 7),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     max_overlays,
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -395,13 +393,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::fft::FFTProcessor;
             create_plugin_runtime(
                 claim,
                 FFTProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -416,7 +415,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         None,
         PluginThreadArgs::Fixed(2_000_000),
-        |claim, queue_size, source, max_memory, wiring, threads, args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, args| {
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             // C `maxBuffers_` is the maxBuffers argument
             // (NDPluginCircularBuff.cpp:407, :466), absent 0.
@@ -429,6 +428,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 CircularBuffProcessor::new(100, 100, TriggerCondition::default(), max_buffers),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -443,7 +443,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::codec::{CodecMode, CodecProcessor};
             use ad_core_rs::codec::CodecName;
             create_plugin_runtime(
@@ -454,6 +454,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 }),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -468,13 +469,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         None,
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::scatter::ScatterProcessor;
             create_plugin_runtime(
                 claim,
                 ScatterProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -511,17 +513,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     crate::gather::GatherProcessor::new(max_ports),
                     max_memory_arg(args, 5),
                     queue_size,
+                    blocking_callbacks,
                     "",
                     m.wiring().clone(),
                     max_ports,
                     threads_arg(args, 7),
                 );
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 Ok(CommandOutcome::Continue)
@@ -595,17 +595,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     ),
                     usize::MAX,
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     max_addr,
                     threads_arg(args, 9),
                 );
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -623,13 +621,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_tiff::TiffFileProcessor;
             create_plugin_runtime(
                 claim,
                 TiffFileProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -644,13 +643,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
                 claim,
                 JpegFileProcessor::new(50),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -665,13 +665,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_hdf5::Hdf5FileProcessor;
             create_plugin_runtime(
                 claim,
                 Hdf5FileProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -686,13 +687,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_netcdf::NetcdfFileProcessor;
             create_plugin_runtime(
                 claim,
                 NetcdfFileProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -707,13 +709,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_magick::MagickFileProcessor;
             create_plugin_runtime(
                 claim,
                 MagickFileProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -750,17 +753,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &claim,
                     max_memory_arg(args, 7),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     max_attributes,
                     threads_arg(args, 9),
                 );
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -794,18 +795,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &claim,
                     max_memory_arg(args, 7),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     count_arg(args, 5),
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -828,13 +827,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         Some(6),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::bad_pixel::BadPixelProcessor;
             create_plugin_runtime(
                 claim,
                 BadPixelProcessor::new(vec![]),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -850,13 +850,36 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         None,
         None,
         PluginThreadArgs::Arg(6),
-        |claim, queue_size, source, max_memory, wiring, threads, _args| {
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
             use crate::file_nexus::NexusFileProcessor;
             create_plugin_runtime(
                 claim,
                 NexusFileProcessor::new(),
                 max_memory,
                 queue_size,
+                blocking_callbacks,
+                source,
+                wiring,
+                threads,
+            )
+        },
+    );
+    app = register_generic_plugin(
+        &mut app,
+        mgr,
+        "NDFileNullConfigure",
+        file_arg_defs(),
+        None,
+        None,
+        PluginThreadArgs::Arg(6),
+        |claim, queue_size, blocking_callbacks, source, max_memory, wiring, threads, _args| {
+            use crate::file_null::NullFileProcessor;
+            create_plugin_runtime(
+                claim,
+                NullFileProcessor::new(),
+                max_memory,
+                queue_size,
+                blocking_callbacks,
                 source,
                 wiring,
                 threads,
@@ -895,6 +918,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
                     max_memory_arg(args, 7),
                     queue_size,
+                    blocking_callbacks,
                     source,
                     m.wiring().clone(),
                     // C maxAddr = maxSignals + 1 (the 2-D array callback
@@ -904,12 +928,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_signals + 1,
                     threads,
                 );
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -920,11 +941,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         ));
     }
 
-    // --- NDPvaConfigure ---
+    // --- NDPvaConfigure, NDPvxsConfigure ---
     // C++ signature: NDPvaConfigure(portName, queueSize, blockingCallbacks,
     //   NDArrayPort, NDArrayAddr, pvName, maxBuffers, maxMemory, priority, stackSize)
     // args[5] = pvName is a STRING, unlike standard plugin_arg_defs which has Int there.
-    {
+    // NDPvxsConfigure takes the same arguments (NDPluginPvxs.cpp:159-179).
+    for (name, plugin_type) in [
+        ("NDPvaConfigure", "NDPluginPva"),
+        ("NDPvxsConfigure", "NDPluginPvxs"),
+    ] {
         let m = mgr.clone();
         let pva_arg_defs = {
             let mut defs = plugin_arg_defs();
@@ -938,10 +963,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             defs
         };
         app = app.register_startup_command(CommandDef::new(
-            "NDPvaConfigure",
+            name,
             pva_arg_defs,
-            "NDPvaConfigure portName queueSize blockingCallbacks NDArrayPort NDArrayAddr pvName"
-                .to_string(),
+            format!("{name} portName queueSize blockingCallbacks NDArrayPort NDArrayAddr pvName"),
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let PluginArgs {
                     port_name,
@@ -972,35 +996,36 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     // the qsrv adapter. Producer posts and server reads flow
                     // through one validating owner — a frame that does not
                     // match the descriptor never becomes the served value.
-                    let proc = crate::pva::PvaProcessor::new(pva_pv_name.clone());
+                    let proc = crate::pva::PvaProcessor::with_plugin_type(
+                        pva_pv_name.clone(),
+                        plugin_type,
+                    );
                     epics_bridge_rs::qsrv::register_pva_pv_global(&pva_pv_name, proc.handle());
                     proc
                 };
                 #[cfg(not(feature = "pva"))]
-                let processor = crate::passthrough::PassthroughProcessor::new("NDPvaConfigure");
+                let processor = crate::passthrough::PassthroughProcessor::new(plugin_type);
 
                 let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     processor,
                     max_memory_arg(args, 7),
                     queue_size,
+                    blocking_callbacks,
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 9),
                 );
-                if let Err(e) = m.add_plugin(
-                    claim,
-                    &handle,
-                    blocking_callbacks,
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
+                if let Err(e) =
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
+                {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDPvaConfigure: wiring failed: {e}");
+                    eprintln!("{name}: wiring failed: {e}");
                 }
                 #[cfg(not(feature = "pva"))]
-                println!("NDPvaConfigure: port={port_name} (stub — enable 'pva' feature)");
+                println!("{name}: port={port_name} (stub — enable 'pva' feature)");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -1057,6 +1082,7 @@ where
     F: Fn(
             &PortClaim,
             i32,
+            i32,
             &ArraySource,
             usize,
             Arc<WiringRegistry>,
@@ -1098,6 +1124,7 @@ where
             let (handle, _jh) = factory(
                 &claim,
                 queue_size,
+                blocking_callbacks,
                 &source,
                 max_memory,
                 m.wiring().clone(),
@@ -1107,12 +1134,7 @@ where
             if let Some(idx) = max_threads_idx {
                 handle.set_max_threads(max_threads_arg(args, idx));
             }
-            if let Err(e) = m.add_plugin(
-                claim,
-                &handle,
-                blocking_callbacks,
-                ctx.db().scan_control().interrupt_gate(),
-            ) {
+            if let Err(e) = m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate()) {
                 return Ok(ctx.cxx_error(e));
             }
             if let Err(e) = handle.connect_to_array_port(m.wiring()) {

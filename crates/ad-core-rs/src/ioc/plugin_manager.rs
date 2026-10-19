@@ -51,22 +51,17 @@ impl PluginManager {
     /// ([`asyn_rs::manager::claim_port_driver`]), in the global asyn port
     /// registry the universal asyn device support factory reads.
     ///
-    /// `blocking_callbacks` is the `*Configure` line's `blockingCallbacks`
-    /// argument, the `NDPluginDriver` constructor argument every plugin has.
-    ///
     /// `owner` is the gate of the database the plugin's records load into
     /// (the configure command's `ctx.db().scan_control().interrupt_gate()`).
     pub fn add_plugin(
         &self,
         claim: PortClaim,
         handle: &PluginRuntimeHandle,
-        blocking_callbacks: i32,
         owner: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
     ) -> Result<(), PortDriverRegisterFailed> {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
         debug_assert_eq!(claim.name(), port_name);
-        handle.set_blocking_callbacks(blocking_callbacks);
         claim
             .publish(port_handle, owner)
             .map_err(|_| report_port_driver_register_failure(&port_name))?;

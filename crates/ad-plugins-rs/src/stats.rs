@@ -2142,6 +2142,7 @@ pub fn create_stats_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
@@ -2157,7 +2158,15 @@ pub fn create_stats_runtime(
 
     // C maxAddr 2 (NDPluginStats.cpp:777): addr 1 carries the TS point.
     let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        claim, processor, max_memory, queue_size, source, wiring, 2, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        2,
+        threads,
     );
 
     let stats_params = *params_handle.lock();
@@ -2206,6 +2215,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("STATS_INIT").unwrap(),
             1_000_000,
             1,
+            0,
             "",
             Arc::new(WiringRegistry::new()),
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -3255,6 +3265,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("STATS_RT").unwrap(),
             pool.max_memory(),
             10,
+            0,
             "",
             wiring,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

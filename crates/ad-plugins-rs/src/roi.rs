@@ -668,6 +668,7 @@ pub fn create_roi_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
     queue_size: i32,
+    blocking_callbacks: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
@@ -678,7 +679,14 @@ pub fn create_roi_runtime(
 ) {
     let processor = ROIProcessor::new(ROIConfig::default());
     let (handle, jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        claim, processor, max_memory, queue_size, source, wiring, threads,
+        claim,
+        processor,
+        max_memory,
+        queue_size,
+        blocking_callbacks,
+        source,
+        wiring,
+        threads,
     );
     // Recreate param layout on a scratch PortDriverBase to get matching reasons.
     let params = {
@@ -803,6 +811,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("ROI_INIT").unwrap(),
             1_000_000,
             1,
+            0,
             "",
             Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

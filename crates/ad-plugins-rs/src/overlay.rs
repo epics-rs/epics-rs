@@ -1912,6 +1912,7 @@ mod tests {
             OverlayProcessor::new(2, vec![]),
             1_000_000,
             1,
+            0,
             "",
             Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
             2,

@@ -40,16 +40,24 @@ use epics_pva_rs::pvdata::{PvArray, PvField, ScalarValue, VariantValue};
 pub struct PvaProcessor {
     pv_name: String,
     handle: PvaPvHandle,
+    plugin_type: &'static str,
 }
 
 impl PvaProcessor {
     pub fn new(pv_name: String) -> Self {
+        Self::with_plugin_type(pv_name, "NDPluginPva")
+    }
+
+    /// `NDPluginPvxs` serves the same NTNDArray under its own PluginType
+    /// (NDPluginPvxs.cpp:139).
+    pub fn with_plugin_type(pv_name: String, plugin_type: &'static str) -> Self {
         // The producer always emits NTNDArray-shaped values; advertising
         // `nt_nd_array_desc()` lets `post` gate any malformed frame before
         // it can become the served snapshot.
         Self {
             pv_name,
             handle: PvaPvHandle::new(Some(nt_nd_array_desc())),
+            plugin_type,
         }
     }
 
@@ -93,7 +101,7 @@ impl NDPluginProcess for PvaProcessor {
     }
 
     fn plugin_type(&self) -> &str {
-        "NDPluginPva"
+        self.plugin_type
     }
 
     /// C `NDPluginPva` passes `compressionAware=true` to the base constructor
@@ -739,6 +747,7 @@ mod tests {
             processor,
             pool.max_memory(),
             10,
+            0,
             "",
             Arc::new(WiringRegistry::new()),
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

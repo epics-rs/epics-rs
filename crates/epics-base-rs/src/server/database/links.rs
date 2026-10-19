@@ -3584,13 +3584,21 @@ impl PvDatabase {
 
         let (scheme, body) = self.external_put_gate(name)?;
         // `dbCaPutLinkCallback` converts into `pputNative` on the record
-        // thread and returns that status (`dbCa.c:572-590`).
-        let value = match super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
-            lset.put_native(body)
-        }) {
-            Some((native, nelements)) => super::link_put_convert(body, value, native, nelements)
-                .map_err(ExternalPutRefusal::Unconvertible)?,
-            None => value,
+        // thread and returns that status (`dbCa.c:572-590`). Only a string
+        // can fail to convert, so only a string is converted here; the lset
+        // converts any other value when it sends it.
+        let value = if matches!(value, EpicsValue::String(_) | EpicsValue::StringArray(_)) {
+            match super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+                lset.put_native(body)
+            }) {
+                Some((native, nelements)) => {
+                    super::link_put_convert(body, value, native, nelements)
+                        .map_err(ExternalPutRefusal::Unconvertible)?
+                }
+                None => value,
+            }
+        } else {
+            value
         };
 
         let key = LinkKey {

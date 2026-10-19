@@ -457,10 +457,12 @@ impl LinkPutQueue {
         };
         let wake = {
             let mut inner = self.inner.lock();
-            if inner
-                .unsent
-                .remove(&site(&key))
-                .is_some_and(|install| install == key.link.install)
+            // Empty unless a put was dropped: no hashing on the hot path.
+            if !inner.unsent.is_empty()
+                && inner
+                    .unsent
+                    .remove(&site(&key))
+                    .is_some_and(|install| install == key.link.install)
             {
                 Self::supersede(&mut inner, &key, None);
             }

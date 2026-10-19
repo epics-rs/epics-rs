@@ -177,16 +177,18 @@ pub fn link_put_convert(
         }
     }
     if let Some(row) = NumericField::of(native) {
-        let field = String::from_utf8_lossy(name);
         let texts = match &value {
             EpicsValue::String(s) => std::slice::from_ref(s),
             EpicsValue::StringArray(a) => &a[..a.len().min(nelements)],
             _ => &[],
         };
+        let field = || String::from_utf8_lossy(name);
         let converted = match texts {
             [] => None,
-            [one] if nelements == 1 => Some(c_parse::put_string(&field, row, &one.as_str_lossy())),
-            many => Some(c_parse::put_string_elements(&field, row, many)),
+            [one] if nelements == 1 => {
+                Some(c_parse::put_string(&field(), row, &one.as_str_lossy()))
+            }
+            many => Some(c_parse::put_string_elements(&field(), row, many)),
         };
         // `Unchanged` keeps C's old buffer, which this port does not hold.
         if let Some(Converted::Stored(v)) = converted.transpose().map_err(|e| e.to_string())? {

@@ -564,7 +564,7 @@ impl LocalLink {
     }
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and
-    /// clamps to its element count (`dbCa.c:575-577`); a value staged
+    /// clamps to its element count (`dbCa.c:575-577`); a string staged
     /// through [`LinkSet::put_native`] is already converted.
     async fn write(
         &self,

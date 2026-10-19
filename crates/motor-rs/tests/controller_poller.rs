@@ -891,3 +891,21 @@ fn a_held_first_poll_counts_until_it_drops() {
     drop(first);
     assert_eq!(axes.first_polls_pending(), 0);
 }
+
+/// ANF2CreateController registers its port and ANF2StartPoller names the
+/// poller later: before then the port has no first poll pending, and only
+/// a port that does not exist reads `None`.
+#[test]
+fn a_port_reads_its_poller_s_first_polls_and_0_before_one_is_named() {
+    use motor_rs::devices::{first_polls_pending, register_controller_port};
+
+    const PORT: &str = "CPFIRSTPOLLS";
+    register_controller_port(&asyn_rs::registry::open_owner(), PORT, 1, ()).unwrap();
+    assert_eq!(first_polls_pending(PORT), Some(0));
+    assert_eq!(first_polls_pending("CPFIRSTPOLLSNONE"), None);
+    let controller = ControllerBuilder::new().port(PORT);
+    let first = controller.axes().first_poll_pending();
+    assert_eq!(first_polls_pending(PORT), Some(1));
+    drop(first);
+    assert_eq!(first_polls_pending(PORT), Some(0));
+}

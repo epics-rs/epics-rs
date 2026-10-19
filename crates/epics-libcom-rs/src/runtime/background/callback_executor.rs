@@ -294,8 +294,8 @@ pub enum CallbackError {
 mod band_state {
     /// C `cbRun`.
     pub(super) const RUN: u64 = 0;
-    /// Inside `callbackStop`: requests still run, until every band has run
-    /// all it was given.
+    /// Inside `callbackStop`: requests still run, until the band is found
+    /// with all it was given run.
     pub(super) const STOPPING: u64 = 1;
     /// C `cbInit`: requests are refused with `S_db_notInit`.
     pub(super) const INIT: u64 = 2;
@@ -581,10 +581,15 @@ impl PriorityQueue {
     }
 
     /// `STOPPING` to `STOPPED`, if every request the band was given has
-    /// run. The finishes are read first: a request made from a callback is
-    /// counted before that callback's finish, so it is seen with it; one
-    /// counted after the read fails the exchange.
+    /// run; true once the band is `STOPPED`, whoever sealed it. The finishes
+    /// are read first: a request made from a callback is counted before that
+    /// callback's finish, so it is seen with it; one counted after the read
+    /// fails the exchange.
     fn seal(&self) -> bool {
+        match self.word.load(Ordering::Acquire) & band_state::MASK {
+            band_state::STOPPING => {}
+            state => return state == band_state::STOPPED,
+        }
         let finished: u64 = self
             .finished
             .iter()
@@ -603,7 +608,7 @@ impl PriorityQueue {
                 Err(now) => word = now,
             }
         }
-        false
+        word & band_state::MASK == band_state::STOPPED
     }
 
     /// Deepen the high-water mark if `depth` — the ring's depth as the push
@@ -846,6 +851,10 @@ fn drain_band<const BATCHED: bool>(
             // callback.c:574-581 — give the slots back before sleeping, so a
             // band that has caught up is holding none of its ring.
             returns.flush();
+            // callback.c:217-226 — inside `callbackStop` a band is drained
+            // when its worker finds it empty. Left to `stop`'s polling, a
+            // steady requester could keep every sampled instant short of it.
+            pq.seal();
             if pq.is_shut_down(Ordering::SeqCst) {
                 return;
             }
@@ -1094,10 +1103,11 @@ impl CallbackPool {
     }
 
     /// C `callbackStop` (`callback.c:237-260`): from `cbRun` only, wait
-    /// until every band has run all it was given, a request made meanwhile
-    /// included, then refuse to run anything more. The workers stay up for
-    /// the spawned tasks they also carry. A band this thread works for is
-    /// not waited for: C's `callbackStop` would be joining itself.
+    /// until every band has been found with all it was given run, a request
+    /// made before then included, and refuse to run anything more. The
+    /// workers stay up for the spawned tasks they also carry. A band this
+    /// thread works for is not waited for: C's `callbackStop` would be
+    /// joining itself.
     pub fn stop(&self) {
         if !self.transition_all(band_state::RUN, band_state::STOPPING) {
             return;
@@ -2706,6 +2716,51 @@ mod tests {
         .unwrap();
         pool.stop();
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// C `callbackTask` leaves its drain the first time it finds its band
+    /// empty (`callback.c:217-226`), whatever another band is doing: a
+    /// band is not held open to requests while `callbackStop` waits on
+    /// another one.
+    #[test]
+    fn a_band_found_empty_is_sealed_while_the_stop_waits_on_another() {
+        let pool = Arc::new(CallbackPool::with_config(8, 1));
+        let (low_started_tx, low_started) = std::sync::mpsc::channel();
+        let (release_low, low_held) = std::sync::mpsc::channel::<()>();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || {
+                low_started_tx.send(()).unwrap();
+                let _ = low_held.recv();
+            }),
+        )
+        .unwrap();
+        low_started.recv_timeout(T).unwrap();
+        let medium = Arc::clone(&pool.queues[CallbackPriority::Medium.index()]);
+        let band = Arc::clone(&medium);
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || {
+                while band.state() != band_state::STOPPING {
+                    std::thread::yield_now();
+                }
+            }),
+        )
+        .unwrap();
+        let stopper = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || pool.stop())
+        };
+        let deadline = std::time::Instant::now() + T;
+        while medium.state() != band_state::STOPPED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Medium left open while the stop waits on Low"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release_low.send(()).unwrap();
+        stopper.join().unwrap();
     }
 
     /// `callbackStop` on a band whose workers were told to exit (the

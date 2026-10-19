@@ -1,0 +1,49 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/pcre/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=3
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "re.proto sg P"
+_main_	Stream::initRecord rec: filename="re.proto" protocol="sg" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("re.proto", "sg")
+_main_	Stream::initRecord rec: initialize the first time
+_main_	streamInitRecord(rec) done status=0x2
+_main_	Stream::process(rec)
+_main_	Stream::process(rec) start
+_main_	StreamCore::startProtocol(rec, startMode=StartNormal)
+_main_	StreamCore::evalCommand(rec): activeCommand = out
+_main_	StreamCore::evalOut: outputLine = "R<0d><0a>"
+_main_	StreamCore::evalOut(rec): lockRequest(5000)
+_main_	Stream::process(rec): protocol started
+P	StreamCore::lockCallback(rec, StreamIoSuccess)
+P	StreamCore::writeCallback(rec, StreamIoSuccess)
+P	StreamCore::evalCommand(rec): activeCommand = in
+P	StreamCore::readCallback(rec, StreamIoSuccess input="f", size=1)
+P	StreamCore::readCallback(rec) inputBuffer="f", size 1
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) wait for more input
+P	StreamCore::readCallback(rec, StreamIoEnd input="oo-bar", size=6)
+P	StreamCore::readCallback(rec) inputBuffer="foo-bar", size 7
+P	StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+P	StreamCore::readCallback(rec) end flag received
+P	StreamCore::readCallback(rec) input line: "foo-bar"
+P	StreamCore::matchInput(rec): format = "%#/(\x77+)-(\x77+)/\x552_\x01/"
+P	after rewrite delta=0
+P	StreamCore::matchInput(rec): format = "%s"
+P	StreamCore::scanValue(rec, format=%s, char*, size=8) input="BAR_foo" value="BAR_foo<00>"
+P	Stream::scan() currentValueLength=7
+P	Stream::matchValue(rec): success, 7 bytes consumed
+P	StreamCore::evalCommand(rec): activeCommand = end
+P	StreamCore::finishProtocol(rec, Success) bus owner
+P	Stream::protocolFinishHook(rec, Success)
+cbLow	recordProcessCallback(rec) processing record
+cbLow	Stream::process(rec)
+cbLow	Stream::process(rec) ready. don't convert
+cbLow	recordProcessCallback(rec) processing record done
+VAL "BAR_foo"
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

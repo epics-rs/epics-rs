@@ -1,0 +1,14 @@
+Terminator = CR LF;
+m { out "R"; in "id=%/[a-z]+/;"; }
+g { out "R"; in "%.2/(\w+)-(\w+)/"; }
+w { out "R"; in "%3/[a-z]+/%*s"; }
+t { out "R"; in "id=%+/[a-z]+/;"; }
+s { out "R"; in "%#/a/o/%s"; }
+sg { out "R"; in "%#/(\w+)-(\w+)/\U2_\1/%s"; }
+sw { out "R"; in "%#-3/a/o/%s"; }
+o { out "W%s%#/a/o/"; }
+n { out "R"; in "%/[0-9]+/"; }
+l { out "R"; in "%/(a+)+b/"; }
+e { out "R"; in "%/a(/"; }
+sn { out "R"; in "%#.2/(a)()/o/%s"; }
+sf { out "R"; in "%#+.2/(a)()/o/%s"; }

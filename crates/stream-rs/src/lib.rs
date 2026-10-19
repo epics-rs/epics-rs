@@ -26,6 +26,7 @@
 //! | `RawFloatConverter.cc`                   | [`raw_float_converter`] |
 //! | `DebugInterface.cc`                      | [`debug_interface`]    |
 //! | `DummyInterface.cc`                      | [`dummy`]              |
+//! | PCRE 8.45 (`pcre_*.c`)                   | [`pcre`]               |
 //!
 //! [`cstr`] holds the C string and `<stdlib.h>` behaviour the sources
 //! depend on, [`cprintf`] the glibc printf of the standard converters.
@@ -48,6 +49,7 @@ pub mod epics;
 pub mod error;
 pub mod format;
 pub mod mantissa_exponent_converter;
+pub mod pcre;
 pub mod protocol;
 pub mod raw_converter;
 pub mod raw_float_converter;

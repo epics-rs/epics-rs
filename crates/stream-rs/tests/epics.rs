@@ -7,13 +7,12 @@
 mod common;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -22,20 +21,21 @@ use epics_base_rs::server::recgbl::alarm_condition_string;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::{EpicsValue, PvString};
 use stream_rs::bus::{OwnedReadInput, StreamIoStatus};
+use stream_rs::error::ProcessCapture;
 
-/// The debug and error output, the debug file's: both go there.
+/// The debug and error output as run-epics.sh reads C's, from stderr: an
+/// error's "file line N: " goes there, not to a debug file.
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-struct Out;
+static STDERR: OnceLock<&'static ProcessCapture> = OnceLock::new();
 
-impl Write for Out {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        OUT.lock().extend_from_slice(b);
-        Ok(b.len())
+/// [`OUT`], with what stderr took since.
+fn out() -> MutexGuard<'static, Vec<u8>> {
+    let mut out = OUT.lock();
+    if let Some(stderr) = STDERR.get() {
+        out.extend(stderr.take());
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    out
 }
 
 fn oracle_dir() -> PathBuf {
@@ -534,14 +534,23 @@ fn fixed_convert_text(l: &str) -> String {
     l.to_string()
 }
 
-/// The field lines where the port fixes a C defect, C's line first. The
-/// `.log` stays C's.
-fn fixed_fields(name: &str) -> &'static [(&'static str, &'static str)] {
+/// The lines where the port fixes a C defect, C's line first. The `.log`
+/// stays C's.
+fn fixed_lines(name: &str) -> &'static [(&'static str, &'static str)] {
     match name {
         // devmbboStream.c:88 sets LALM before :89 compares it with VAL.
         "mbbo_init_cos" | "mbbo_init_cos_rerun" => &[
             ("NSEV \"NO_ALARM\"", "NSEV \"MINOR\""),
             ("NSTA \"NO_ALARM\"", "NSTA \"COS\""),
+        ],
+        // RegexpConverter.cc:287 finds the skipped match again, so C
+        // replaces the first a, not match number 2.
+        "re_subst_nth" => &[
+            (
+                "StreamCore::scanValue(rec, format=%s, char*, size=7) input=\"bonana\" value=\"bonana<00>\"",
+                "StreamCore::scanValue(rec, format=%s, char*, size=7) input=\"banona\" value=\"banona<00>\"",
+            ),
+            ("VAL \"bonana\"", "VAL \"banona\""),
         ],
         _ => &[],
     }
@@ -551,7 +560,7 @@ fn fixed_fields(name: &str) -> &'static [(&'static str, &'static str)] {
 fn wait_lines(n: usize) -> Vec<String> {
     let start = Instant::now();
     loop {
-        let lines = kept(&OUT.lock());
+        let lines = kept(&out());
         if lines.len() >= n || start.elapsed() > Duration::from_secs(5) {
             return lines;
         }
@@ -567,7 +576,9 @@ async fn run_case(name: &str) {
         common::setup();
         // SAFETY: set before any thread of this test binary reads it.
         unsafe { std::env::set_var("STREAM_PROTOCOL_PATH", oracle_dir()) };
-        stream_rs::error::set_stream_debug_file(Some(Box::new(Out)));
+        // C's stderr is the rig's file, not a terminal
+        stream_rs::error::set_stream_debug_colored(false);
+        STDERR.get_or_init(|| Box::leak(Box::new(stream_rs::error::capture_process_stderr())));
         epics_base_rs::runtime::log::errlog_add_listener(|m| {
             // as run-epics.sh keeps C's: the severity's lines last, the
             // others in place after the first debug line, iocInit's dropped
@@ -581,7 +592,7 @@ async fn run_case(name: &str) {
                     .any(|p| line.starts_with(p))
                     || line.starts_with("Starting iocInit")
                     || line.starts_with('#');
-                let mut out = OUT.lock();
+                let mut out = out();
                 if !out.is_empty() && !dropped {
                     out.extend_from_slice(line.as_bytes());
                 }
@@ -596,14 +607,19 @@ async fn run_case(name: &str) {
         mock.async_read = true;
     }
     *common::CLIENT.lock() = None;
-    OUT.lock().clear();
+    out().clear();
     epics_base_rs::runtime::log::errlog_flush();
     ERRLOG.lock().clear();
     stream_rs::error::set_stream_debug(1);
 
     let mut logged = expected(name);
+    for (c, port) in fixed_lines(name) {
+        let l = logged.iter_mut().find(|l| l.line == *c);
+        l.unwrap_or_else(|| panic!("{name}: C no longer shows its defect"))
+            .line = port.to_string();
+    }
     let has = |o: &str| case.opts.iter().any(|x| x == o);
-    let mut fields_want: Vec<String> = logged
+    let fields_want: Vec<String> = logged
         .split_off(logged.len() - 6 - case.dump.len())
         .into_iter()
         .map(|l| l.line)
@@ -748,7 +764,7 @@ async fn run_case(name: &str) {
     stream_rs::error::set_stream_debug(0);
     epics_base_rs::runtime::log::errlog_flush();
 
-    let mut got = kept(&OUT.lock());
+    let mut got = kept(&out());
     {
         let mut drv = DRV_LINES.lock();
         if drv.is_empty() {
@@ -762,10 +778,6 @@ async fn run_case(name: &str) {
         *l = masked(&l.replace(&dir, "<dir>"));
     }
     got.extend(ERRLOG.lock().drain(..));
-    for (c, port) in fixed_fields(name) {
-        let l = fields_want.iter_mut().find(|l| l == c);
-        *l.unwrap_or_else(|| panic!("{name}: C no longer shows its defect")) = port.to_string();
-    }
     let fields_got = fields(&db, &case.dump);
     if has("report") {
         stdout.extend(shell(&db, "streamReportRecord rec").await);
@@ -1486,3 +1498,21 @@ cases!(
 
 // devmbboDirectStream.c's `sevr = 0` before streamInitRecord's SEVR line
 cases!(mbbod_noinit_udf, mbbod_reload_sevr);
+
+// RegexpConverter.cc, on crate::pcre
+cases!(
+    re_match,
+    re_group,
+    re_width,
+    re_too_long,
+    re_truncate,
+    re_subst,
+    re_subst_groups,
+    re_subst_nth,
+    re_subst_first,
+    re_subst_last,
+    re_subst_out,
+    re_no_match,
+    re_limit,
+    re_bad,
+);

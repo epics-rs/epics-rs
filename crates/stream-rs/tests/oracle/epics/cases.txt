@@ -480,3 +480,17 @@ so_scan_charset	stringout	so.proto rc P	hello	Shello\r\n=>ab\r\n	-	-	OVAL
 so_scan_charset_x	stringout	so.proto rcw P	hello	Shello\r\n=>12y\r\n	-	-	OVAL
 mbbod_noinit_udf	mbboDirect	l.proto t P	1	-	noproc,noval	-	-
 mbbod_reload_sevr	mbboDirect	l.proto t P	1	GET\r\n=>	reload	-	-
+re_match	stringin	re.proto m P	0	R\r\n=>id=abc;\r\n	noval
+re_group	stringin	re.proto g P	0	R\r\n=>foo-bar\r\n	noval
+re_width	stringin	re.proto w P	0	R\r\n=>abcdef\r\n	noval
+re_too_long	stringin	re.proto m P	0	R\r\n=>id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;\r\n	noval
+re_truncate	stringin	re.proto t P	0	R\r\n=>id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;\r\n	noval
+re_subst	stringin	re.proto s P	0	R\r\n=>banana\r\n	noval
+re_subst_groups	stringin	re.proto sg P	0	R\r\n=>foo-bar\r\n	noval
+re_subst_nth	stringin	re.proto sn P	0	R\r\n=>banana\r\n	noval
+re_subst_first	stringin	re.proto sf P	0	R\r\n=>banana\r\n	noval
+re_subst_last	stringin	re.proto sw P	0	R\r\n=>banana\r\n	noval
+re_subst_out	stringout	re.proto o P	banana	Wbonono\r\n=>	-	-	OVAL
+re_no_match	stringin	re.proto n P	0	R\r\n=>abc\r\n	noval
+re_limit	stringin	re.proto l P	0	R\r\n=>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaacb\r\n	noval
+re_bad	stringin	re.proto e P	0	-	noval

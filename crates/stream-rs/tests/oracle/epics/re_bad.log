@@ -1,0 +1,23 @@
+-	drvStreamInit()
+-	StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/pcre/crates/stream-rs/tests/oracle/epics
+_main_	streamInitRecord(rec): SEVR=3
+_main_	streamInitRecord(rec): create new Stream object
+_main_	streamInitRecord(rec): calling initRecord
+_main_	Stream::initRecord rec: parse link string "re.proto e P"
+_main_	Stream::initRecord rec: filename="re.proto" protocol="e" bus="P" addr=0 params=""
+_main_	Stream::initRecord rec: attachBus("P", 0, "")
+_main_	Stream::initRecord rec: parse("re.proto", "e")
+_main_	missing ) after "a("
+_main_	re.proto line 12: in format string: "%/a(/"
+_main_	re.proto line 12: in command 'in'
+_main_	re.proto line 12: in protocol 'e'
+_main_	while compiling protocol 'e' for 'rec'
+_main_	rec: Protocol parse error
+_main_	rec: Record initialization failed
+_main_	streamInitRecord(rec) done status=0x1f70012
+VAL ""
+SEVR "INVALID"
+STAT "UDF"
+UDF 1 = 0x1
+PACT 0 = 0x0
+PROC 1 = 0x1

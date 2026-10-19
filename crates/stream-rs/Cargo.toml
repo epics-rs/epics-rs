@@ -15,7 +15,8 @@ chrono = "0.4"
 epics-base-rs = { workspace = true }
 libc = "0.2"
 parking_lot = "0.12"
-stream-pcre-sys = { workspace = true }
 
 [dev-dependencies]
+# The C PCRE, the oracle the tests/pcre rigs hold crate::pcre to.
+stream-pcre-sys = { workspace = true }
 tempfile = "3"

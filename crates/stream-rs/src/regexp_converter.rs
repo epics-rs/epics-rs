@@ -1,5 +1,5 @@
 //! `RegexpConverter.cc`: Perl regular expressions (PCRE) `%/regexp/` and
-//! `%#/regexp/subst/`, against PCRE 8.45 from [`stream_pcre_sys`].
+//! `%#/regexp/subst/`, against PCRE 8.45 ported in [`crate::pcre`].
 //!
 //! As in C, the pattern compiled in `parse` is never freed: it is not a
 //! run-time leak, and `info` holds its pointer for the life of the
@@ -18,71 +18,44 @@ use crate::format::*;
 
 /// The PCRE1 calls RegexpConverter.cc makes.
 mod pcre {
-    use std::ffi::{CStr, c_char, c_int};
-    use std::ptr;
-
-    use stream_pcre_sys as sys;
+    use crate::pcre::compile::pcre_compile2;
+    use crate::pcre::exec::pcre_exec;
+    use crate::pcre::fullinfo::{InfoValue, fullinfo};
+    use crate::pcre::internal::{PCRE_INFO_CAPTURECOUNT, Pcre};
 
     /// A compiled pattern; never freed.
-    pub(super) type Code = *mut sys::pcre;
+    pub(super) type Code = &'static Pcre;
 
     /// `pcre_compile(pattern, 0, &errormsg, &eoffset, NULL)`, with
     /// `pattern` ending in 0x00.
     pub(super) fn compile(pattern: &[u8]) -> Result<Code, (&'static [u8], i32)> {
         assert_eq!(pattern.last(), Some(&0));
-        let mut errormsg: *const c_char = ptr::null();
-        let mut eoffset: c_int = 0;
-        // SAFETY: `pattern` is NUL-terminated and outlives the call.
-        let code = unsafe {
-            sys::pcre_compile(
-                pattern.as_ptr().cast(),
-                0,
-                &mut errormsg,
-                &mut eoffset,
-                ptr::null(),
-            )
-        };
-        if code.is_null() {
-            // SAFETY: on failure PCRE points errormsg at one of its static
-            // message strings.
-            Err((unsafe { CStr::from_ptr(errormsg) }.to_bytes(), eoffset))
-        } else {
-            Ok(code)
+        match pcre_compile2(pattern, 0, None) {
+            Ok(re) => Ok(Box::leak(Box::new(re))),
+            Err(e) => Err((e.text.as_bytes(), e.offset)),
         }
     }
 
     /// `pcre_fullinfo(code, NULL, PCRE_INFO_CAPTURECOUNT, &n)`
     pub(super) fn capture_count(code: Code) -> i32 {
-        let mut n: c_int = 0;
-        // SAFETY: `code` came from `compile` and is never freed.
-        unsafe {
-            sys::pcre_fullinfo(
-                code,
-                ptr::null(),
-                sys::PCRE_INFO_CAPTURECOUNT,
-                (&raw mut n).cast(),
-            );
+        match fullinfo(Some(code), PCRE_INFO_CAPTURECOUNT) {
+            Ok(InfoValue::Int(n)) => n,
+            _ => 0,
         }
-        n
     }
 
     /// `pcre_exec(code, NULL, subject, length, 0, 0, ovector, 30)`
     pub(super) fn exec(code: Code, subject: &[u8], ovector: &mut [i32; 30]) -> i32 {
-        let length = c_int::try_from(subject.len()).expect("subject cut to INT_MAX");
-        // SAFETY: `code` came from `compile` and is never freed; PCRE reads
-        // `length` bytes of `subject` and writes at most 30 ints.
-        unsafe {
-            sys::pcre_exec(
-                code,
-                ptr::null(),
-                subject.as_ptr().cast(),
-                length,
-                0,
-                0,
-                ovector.as_mut_ptr(),
-                30,
-            )
-        }
+        let length = i32::try_from(subject.len()).expect("subject cut to INT_MAX");
+        pcre_exec(
+            Some(code),
+            Some(subject),
+            length,
+            0,
+            0,
+            Some(&mut ovector[..]),
+            30,
+        )
     }
 }
 
@@ -90,7 +63,8 @@ mod pcre {
 fn code(info: &[u8]) -> pcre::Code {
     let mut bytes = [0; size_of::<usize>()];
     bytes.copy_from_slice(&info[..size_of::<usize>()]);
-    usize::from_ne_bytes(bytes) as pcre::Code
+    // SAFETY: `parse` stored a pointer `pcre::compile` leaked, never freed.
+    unsafe { &*(usize::from_ne_bytes(bytes) as *const _) }
 }
 
 /// The `length` bytes at `input`. C reads them in place, on into the input
@@ -185,7 +159,7 @@ impl StreamFormatConverter for RegexpConverter {
             );
             return 0;
         }
-        info.append(&(code as usize).to_ne_bytes());
+        info.append(&(code as *const _ as usize).to_ne_bytes());
 
         if fmt.flags & ALT_FLAG != 0 {
             let mut subst = StreamBuffer::new();

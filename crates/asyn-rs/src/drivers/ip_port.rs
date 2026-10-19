@@ -1529,18 +1529,11 @@ impl DrvAsynIPPort {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        // HTTP connect-per-transaction: (re)open the socket if there isn't
-        // one. Gated on socket presence (`io.inner.is_none()`), NOT on
-        // `!connected`: an HTTP link stays *logically* connected across
-        // transactions (drop_connection releases only the socket), so the
-        // post-EOF reopen must key off the missing socket. `connect()` is
-        // edge-guarded — it no-ops `set_connected(true)` when already
-        // connected, so reopening does not flap the Connect exception.
-        // Surfacing the connect failure cause (DNS, refused, TLS reset) here
-        // rather than letting check_ready() mask it as a generic
-        // "port disconnected".
+        // HTTP connect-per-transaction: open the socket if there isn't one
+        // (C readIt, drvAsynIPPort.c:779-782). The link stays logically
+        // connected, so this keys off the socket, not `connected`.
         if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
-            self.connect(user)?;
+            self.connect_it(user)?;
         }
         let result = self.with_base_link(|link| link.read(user, buf));
         match result {
@@ -1931,21 +1924,12 @@ impl DrvAsynIPPort {
             line!(),
             format_args!("Opened connection OK to {}\n", self.io.host_info),
         );
-        self.set_link_connected(user, true);
         Ok(())
     }
-}
 
-impl PortDriver for DrvAsynIPPort {
-    fn base(&self) -> &PortDriverBase {
-        &self.base
-    }
-
-    fn base_mut(&mut self) -> &mut PortDriverBase {
-        &mut self.base
-    }
-
-    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+    /// Open the socket (C `connectIt`, drvAsynIPPort.c:406-593); raising the
+    /// connect edge is [`PortDriver::connect`]'s.
+    fn connect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         user.print(
             TraceMask::FLOW,
             file!(),
@@ -2006,22 +1990,36 @@ impl PortDriver for DrvAsynIPPort {
                     message: "AF_UNIX not available on this platform".into(),
                 });
             }
+            // HTTP opens its socket per transaction, from write_octet and
+            // read_octet_core.
             IpProtocol::Http => {
-                // C parity: HTTP uses TCP with connect-per-transaction
-                // semantics. The socket is opened here on the first connect
-                // and reopened lazily by write_octet/read_octet_core after
-                // each transaction's EOF (`drop_connection` releases the
-                // socket but keeps the link logically connected). C opens the
-                // socket lazily at the first write rather than at connect;
-                // opening it eagerly here is a benign divergence (the idle
-                // socket is reused by the first write, HTTP/1.0 servers wait
-                // for the request).
                 let stream = self.connect_tcp()?;
                 self.enable_nodelay(&stream)?;
                 IpIoInner::Tcp(stream)
             }
         };
         self.publish_transport(user, inner)
+    }
+}
+
+impl PortDriver for DrvAsynIPPort {
+    fn base(&self) -> &PortDriverBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.base
+    }
+
+    /// C `asynCommonConnect` (drvAsynIPPort.c:598-607): an HTTP port opens
+    /// no socket here, so it is connected whether or not the host answers
+    /// and a dead host fails each write instead.
+    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        if self.config.protocol != IpProtocol::Http {
+            self.connect_it(user)?;
+        }
+        self.set_link_connected(user, true);
+        Ok(())
     }
 
     fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -2067,16 +2065,14 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: (re)open the socket if there isn't
-        // one. Like the read path, gate on socket presence — an HTTP link
-        // stays logically connected across transactions, so the lazy reopen
-        // keys off `io.inner.is_none()`, not `!connected` (which would never
-        // fire post-EOF since `connected` is left `true`). This is the C
-        // `writeIt` lazy `connectIt` on `fd == INVALID_SOCKET`
-        // (drvAsynIPPort.c:636-653). Surface the connect failure cause
-        // rather than masking it.
+        // HTTP connect-per-transaction: open the socket if there isn't one
+        // (C writeIt, drvAsynIPPort.c:645-653, which replaces connectIt's
+        // message).
         if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
-            self.connect(user)?;
+            self.connect_it(user).map_err(|e| AsynError::Status {
+                status: e.status(),
+                message: format!("{} connect failed", self.io.host_info),
+            })?;
         }
         match self.with_base_link(|link| link.write(user, data)) {
             Ok(n) => Ok(n),
@@ -2480,6 +2476,32 @@ mod tests {
                  Characters written: 5\n       Characters read: 5\n"
             )
         );
+    }
+
+    /// C `asynCommonConnect` skips `connectIt` for HTTP (drvAsynIPPort.c:603):
+    /// the port connects without its host and the write fails with
+    /// asynError, not asynDisconnected.
+    #[test]
+    fn an_http_port_connects_without_its_host_and_the_write_fails() {
+        use crate::request::RequestOp;
+        use crate::runtime::config::RuntimeConfig;
+        use crate::runtime::port::create_port_runtime_unclaimed;
+
+        let drv = DrvAsynIPPort::new("httpdead", "127.0.0.1:1 HTTP").unwrap();
+        let (runtime, _) = create_port_runtime_unclaimed(drv, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle();
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let e = handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"X".to_vec(),
+                },
+                user,
+            )
+            .unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "127.0.0.1:1 HTTP connect failed");
+        assert!(handle.is_connected_blocking(0).unwrap());
     }
 
     #[test]

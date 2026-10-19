@@ -262,9 +262,6 @@ fn shell_eos_user(addr: i32) -> AsynUser {
         .queue_even_if_not_connected()
 }
 
-/// C `findInterface` (asynShellCommands.c:69-91): the port by name, refused
-/// with C's line when the name is missing, unknown (connectDevice's message,
-/// asynManager.c:1340-1341) or the port lacks `iface`.
 /// C `pasynManager->connectDevice` as a shell command meets it: the port, or
 /// the errorMessage it leaves (asynManager.c:1331-1343).
 fn shell_connect_device(
@@ -278,6 +275,9 @@ fn shell_connect_device(
         .map_err(|_| format!("asynManager:connectDevice port {port} not found"))
 }
 
+/// C `findInterface` (asynShellCommands.c:69-91): the port by name, refused
+/// with C's line when the name is missing, unknown (connectDevice's message,
+/// asynManager.c:1340-1341) or the port lacks `iface`.
 fn shell_find_interface(
     mgr: &PortManager,
     ctx: &CommandContext,
@@ -316,6 +316,9 @@ fn shell_request_failure(ctx: &CommandContext, ran: &str, e: &AsynError) {
     }
 }
 
+/// C `eosArgs.eos[10]` (asynShellCommands.c:189).
+const EOS_ARG_SIZE: usize = 10;
+
 /// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
 ///
 /// C parity: `asynShellCommands.c::asynSetEos` (:219-253) escape-decodes the
@@ -325,12 +328,9 @@ fn shell_request_failure(ctx: &CommandContext, ran: &str, e: &AsynError) {
 /// to pick the device's terminator. The addr is threaded here for the same
 /// reason: EOS is per device (see [`crate::port::eos_device_key`]).
 ///
-/// The driver enforces the 2-byte terminator limit and reports
-/// `illegal eoslen N`, so no length check is duplicated here (single owner of
-/// the limit).
-/// C `eosArgs.eos[10]` (asynShellCommands.c:189).
-const EOS_ARG_SIZE: usize = 10;
-
+/// The argument is refused here only when it does not fit C's `eos[10]`
+/// buffer (:229-233); the 2-byte terminator limit stays the driver's, which
+/// reports `illegal eoslen N`.
 fn asyn_set_eos(
     mgr: &Arc<PortManager>,
     ctx: &CommandContext,
@@ -1248,9 +1248,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     ));
                     return Ok(CommandOutcome::Continue);
                 }
-                if let Err(e) = handle.set_time_stamp_source_blocking(Some(&function)) {
-                    ctx.println(&e.message_display().to_string());
-                }
+                // C drops registerTimeStampSource's status (:1202).
+                let _ = handle.set_time_stamp_source_blocking(Some(&function));
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -1272,10 +1271,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     return Ok(CommandOutcome::Continue);
                 };
                 match mgr_r.find_port_handle(&port) {
+                    // C drops unregisterTimeStampSource's status (:1219).
                     Ok(handle) => {
-                        if let Err(e) = handle.set_time_stamp_source_blocking(None) {
-                            ctx.println(&e.message_display().to_string());
-                        }
+                        let _ = handle.set_time_stamp_source_blocking(None);
                     }
                     Err(_) => ctx.println(&format!(
                         "asynUnregisterTimeStampSource, cannot connect to port {port}"
@@ -1349,7 +1347,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 arg_type: ArgType::String,
             }],
             "Permanently disables the port and destroys the port driver,\n\
-             releasing its resources.",
+             releasing its resources.\n",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0)?;
                 if let Err(msg) = shell_connect_device(&mgr_r, port.as_deref()) {
@@ -1410,18 +1408,28 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // unbound user, then reads `pport->dpc.connected` explicitly
                 // (asynManager.c:3327-3342). `asynWaitConnect portName` names no
                 // device, and the link it waits for is the port's.
-                let connected =
-                    handle.is_connected_blocking(-1).unwrap_or(false) || waiter.wait(timeout);
-                handle.trace().print(
-                    Some(&port),
-                    None,
-                    0,
-                    TraceMask::FLOW,
-                    format_args!(
-                        "waitConnect: port={port} exit, isConnected={}\n",
+                let flow = |args: std::fmt::Arguments<'_>| {
+                    handle
+                        .trace()
+                        .print(Some(&port), None, 0, TraceMask::FLOW, args)
+                };
+                // The manager traces only a wait it actually does
+                // (asynManager.c:3354-3364).
+                let connected = handle.is_connected_blocking(-1).unwrap_or(false) || {
+                    flow(format_args!(
+                        "asynManager:waitConnect port={port} waiting for connection event\n"
+                    ));
+                    let connected = waiter.wait(timeout);
+                    flow(format_args!(
+                        "asynManager:waitConnect port={port} exit, isConnected={}\n",
                         i32::from(connected)
-                    ),
-                );
+                    ));
+                    connected
+                };
+                flow(format_args!(
+                    "waitConnect: port={port} exit, isConnected={}\n",
+                    i32::from(connected)
+                ));
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -2881,6 +2889,21 @@ mod tests {
         assert_eq!(names, expected);
     }
 
+    /// asynShutdownPortUsage verbatim (asynShellCommands.c:1312-1314).
+    #[test]
+    fn asyn_shutdown_port_usage_is_c_s() {
+        let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+        let def = cmds
+            .iter()
+            .find(|c| c.name == "asynShutdownPort")
+            .expect("registered");
+        assert_eq!(
+            def.usage,
+            "Permanently disables the port and destroys the port driver,\n\
+             releasing its resources.\n"
+        );
+    }
+
     /// R19-120: `asynSetTraceIOTruncateSize` routes `addr` the way every other
     /// trace setter does — device dpCommon when `addr >= 0`, port when `addr <
     /// 0` (C asynManager.c:2957-2984 via `findTracePvt`).
@@ -3194,11 +3217,17 @@ mod tests {
                 && global.contains("waitConnect: port=(null) error calling connectDevice\n"),
             "{global:?}"
         );
+        // The manager's two FLOW lines (asynManager.c:3354-3364), then the
+        // shell's (asynShellCommands.c:572-574).
         let port = std::fs::read_to_string(port_out.path()).unwrap();
-        assert!(
-            port.contains("waitConnect: port=wc2_never exit, isConnected=0\n"),
-            "{port:?}"
-        );
+        let at = |line: &str| {
+            port.find(line)
+                .unwrap_or_else(|| panic!("{line:?} in {port:?}"))
+        };
+        let waiting = at("asynManager:waitConnect port=wc2_never waiting for connection event\n");
+        let manager = at("asynManager:waitConnect port=wc2_never exit, isConnected=0\n");
+        let shell = at(" waitConnect: port=wc2_never exit, isConnected=0\n");
+        assert!(waiting < manager && manager < shell, "{port:?}");
     }
 
     /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly
@@ -4074,10 +4103,48 @@ mod tests {
             &crate::registry::open_owner(),
         )
         .unwrap();
+        // A shut-down port still connects in C (connectDevice has no defunct
+        // check) and the shell drops the register status (:1202, :1219), so
+        // neither command prints anything for it.
+        let mut base = shell_test_base("tss_gone");
+        base.flags.destructible = true;
+        mgr.register_port_unclaimed(TsPort { base }, &crate::registry::open_owner())
+            .unwrap();
+        crate::timestamp::register_time_stamp_source("tss_fn", std::time::SystemTime::now);
+        // The one way the swap can fail here: the port's actor is gone, so the
+        // request comes back as an error C never has to print.
+        struct DeadPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for DeadPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {
+                panic!("actor dies");
+            }
+        }
+        mgr.register_port_unclaimed(
+            DeadPort {
+                base: shell_test_base("tss_dead"),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let dead = mgr.find_port_handle("tss_dead").unwrap();
+        assert!(dead.report_blocking(1).is_err());
         assert_eq!(
             shell_output(
                 mgr,
                 &[
+                    r#"asynShutdownPort("tss_gone")"#,
+                    r#"asynRegisterTimeStampSource("tss_gone", "tss_fn")"#,
+                    r#"asynUnregisterTimeStampSource("tss_gone")"#,
+                    r#"asynRegisterTimeStampSource("tss_dead", "tss_fn")"#,
+                    r#"asynUnregisterTimeStampSource("tss_dead")"#,
                     r#"asynRegisterTimeStampSource("tss_port")"#,
                     r#"asynRegisterTimeStampSource("tss_nosuch", "tss_fn")"#,
                     r#"asynRegisterTimeStampSource("tss_port", "tss_no_such_fn")"#,

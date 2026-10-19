@@ -511,7 +511,7 @@ pub async fn run(
     let ph = format!("{}{}", config.prefix, config.hardware);
     let bk = config.bank.as_str();
     let queue = PutQueue::new(&db, "pf4");
-    let ch = |pv: &str| queue.pv(pv);
+    let ch = |var: &str, pv: &str| queue.pv(var, pv);
     let blade = |what: &str, k: usize| format!("{ph}{what}{}{bk}", k + 1);
     let names = Names {
         b: std::array::from_fn(|k| config.bit_pv(k)),
@@ -526,37 +526,54 @@ pub async fn run(
         other: std::array::from_fn(|k| blade("Other", k)),
         other_show: format!("{ph}OtherShow"),
     };
-    let ch_b: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.b[k]));
-    let ch_display_bit: [SeqPv; 4] = std::array::from_fn(|k| ch(&blade("displayBit", k)));
-    let ch_f: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.f[k]));
-    let ch_z: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.z[k]));
-    let ch_other: [SeqPv; 4] = std::array::from_fn(|k| ch(&names.other[k]));
-    let ch_other_legal: [SeqPv; 4] = std::array::from_fn(|k| ch(&blade("OtherLegal", k)));
-    let ch_label: [SeqPv; NUM_COMBINATIONS] = std::array::from_fn(|i| {
-        ch(&format!(
-            "{}.{}",
-            names.filpos,
-            super::filter_drive::MBBO_STATE_FIELDS[i]
-        ))
+    let ch_b: [SeqPv; 4] = std::array::from_fn(|k| ch(["b1", "b2", "b3", "b4"][k], &names.b[k]));
+    let ch_display_bit: [SeqPv; 4] = std::array::from_fn(|k| {
+        let var = ["displayBit1", "displayBit2", "displayBit3", "displayBit4"][k];
+        ch(var, &blade("displayBit", k))
     });
-    let ch_mono = ch(&names.mono);
-    let ch_display_energy = ch(&format!("{ph}displayEnergy"));
-    let ch_select = ch(&names.select);
-    let ch_local = ch(&names.local);
-    let ch_filter: [SeqPv; 3] =
-        ["filterAl", "filterTi", "filterGlass"].map(|n| ch(&format!("{ph}{n}")));
-    let ch_trans = ch(&format!("{ph}trans{bk}"));
-    let ch_invtrans = ch(&format!("{ph}invTrans{bk}"));
-    let ch_bitflg = ch(&format!("{ph}bitFlag{bk}"));
-    let ch_bitsts = ch(&format!("{ph}status{bk}"));
-    let ch_bankctl = ch(&names.bankctl);
-    let ch_filpos = ch(&names.filpos);
-    let ch_other_show = ch(&names.other_show);
-    let ch_num_show = ch(&format!("{ph}E.NELM"));
-    let show_records = [ch(&format!("{ph}E")), ch(&format!("{ph}T"))];
+    let ch_f: [SeqPv; 4] = std::array::from_fn(|k| ch(["f1", "f2", "f3", "f4"][k], &names.f[k]));
+    let ch_z: [SeqPv; 4] = std::array::from_fn(|k| ch(["z1", "z2", "z3", "z4"][k], &names.z[k]));
+    let ch_other: [SeqPv; 4] =
+        std::array::from_fn(|k| ch(["other1", "other2", "other3", "other4"][k], &names.other[k]));
+    let ch_other_legal: [SeqPv; 4] = std::array::from_fn(|k| {
+        let var = ["otherLegal1", "otherLegal2", "otherLegal3", "otherLegal4"][k];
+        ch(var, &blade("OtherLegal", k))
+    });
+    let ch_label: [SeqPv; NUM_COMBINATIONS] = std::array::from_fn(|i| {
+        ch(
+            &format!("a{i:02}"),
+            &format!(
+                "{}.{}",
+                names.filpos,
+                super::filter_drive::MBBO_STATE_FIELDS[i]
+            ),
+        )
+    });
+    let ch_mono = ch("monoenergy", &names.mono);
+    let ch_display_energy = ch("displayEnergy", &format!("{ph}displayEnergy"));
+    let ch_select = ch("selectenergy", &names.select);
+    let ch_local = ch("localenergy", &names.local);
+    let ch_filter: [SeqPv; 3] = [
+        ("filterAl", "filterAl"),
+        ("filterTi", "filterTi"),
+        ("filterGl", "filterGlass"),
+    ]
+    .map(|(var, n)| ch(var, &format!("{ph}{n}")));
+    let ch_trans = ch("trans", &format!("{ph}trans{bk}"));
+    let ch_invtrans = ch("invtrans", &format!("{ph}invTrans{bk}"));
+    let ch_bitflg = ch("bitflg", &format!("{ph}bitFlag{bk}"));
+    let ch_bitsts = ch("bitsts", &format!("{ph}status{bk}"));
+    let ch_bankctl = ch("bankctl", &names.bankctl);
+    let ch_filpos = ch("filpos", &names.filpos);
+    let ch_other_show = ch("otherShow", &names.other_show);
+    let ch_num_show = ch("numShow", &format!("{ph}E.NELM"));
+    let show_records = [
+        ch("showEnergy", &format!("{ph}E")),
+        ch("showTransmission", &format!("{ph}T")),
+    ];
     let debug = Debug {
         name: &config.name,
-        flag: ch(&names.debug),
+        flag: ch("debug_flag", &names.debug),
     };
     let mut monitor = DbMultiMonitor::new(&db, &names.all()).await;
 

@@ -15,7 +15,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
-use optics_rs::snl::kohzu_ctl::{self, KohzuConfig};
+use optics_rs::snl::kohzu_ctl::{self, HC, KohzuConfig, RAD_CONV};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -97,9 +97,14 @@ async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
 
 /// Wait until SeqMsg1 reads `msg1`, then let the rest of the pass land.
 async fn settled(ioc: &PvDatabase, msg1: &str) {
+    shown(ioc, msg1).await;
+    task::sleep(Duration::from_millis(500)).await;
+}
+
+/// Wait until SeqMsg1 reads `msg1`.
+async fn shown(ioc: &PvDatabase, msg1: &str) {
     for _ in 0..200 {
         if string_of(ioc, "K:KohzuSeqMsg1SI").await == msg1 {
-            task::sleep(Duration::from_millis(500)).await;
             return;
         }
         task::sleep(Duration::from_millis(50)).await;
@@ -108,6 +113,13 @@ async fn settled(ioc: &PvDatabase, msg1: &str) {
         "SeqMsg1 never read {msg1:?}; last {:?}",
         string_of(ioc, "K:KohzuSeqMsg1SI").await
     );
+}
+
+/// Wait until SeqMsg1 reads `msg1`, then until the sequencer waits for a
+/// command past its efClears, where a command put is taken.
+async fn ready(ioc: &PvDatabase, msg1: &str) {
+    shown(ioc, msg1).await;
+    idle(ioc, "K:KohzuOperAckBO", "K:KohzuSeqMsg1SI").await;
 }
 
 fn near(got: f64, want: f64) -> bool {
@@ -258,21 +270,15 @@ async fn a_zero_readback_holds_init_in_chk_motor_limits() {
 #[epics_base_rs::epics_test]
 async fn a_lattice_change_recomputes_e_and_lambda_for_the_standing_theta() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    // The OperAck pass blanks SeqMsg2, so the pass's own is the one read.
+    ready(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:BraggHAO")
         .put_f64_process(3.0)
         .await
         .unwrap();
-    settled(&ioc, "New d spacing").await;
-    assert_eq!(
-        string_of(&ioc, "K:KohzuSeqMsg2SI").await,
-        "Set to Manual Mode"
-    );
-    assert_eq!(f64_of(&ioc, "K:KohzuMoving").await, 1.0, "KohzuMoving");
-    assert_eq!(f64_of(&ioc, "K:KohzuAlertBO").await, 0.0, "KohzuAlertBO");
-    assert_eq!(f64_of(&ioc, "K:KohzuModeBO").await, 0.0, "KohzuModeBO");
-    for (pv, want) in [
+    shown(&ioc, "New d spacing").await;
+    let values = [
         ("K:Bragg2dSpacingAO", 3.27503),
         ("K:BraggThetaAO", 10.0),
         ("K:BraggEAO", 21.8012),
@@ -286,9 +292,24 @@ async fn a_lattice_change_recomputes_e_and_lambda_for_the_standing_theta() {
         ("K:KohzuZSetAO", 100.779),
         ("K:BraggThetaRdbkAO", 10.0),
         ("K:BraggERdbkAO", 21.8012),
-    ] {
-        assert_near(&ioc, pv, want).await;
-    }
+        ("K:KohzuMoving", 1.0),
+        ("K:KohzuAlertBO", 0.0),
+        ("K:KohzuModeBO", 0.0),
+    ];
+    eventually(|| async {
+        let msg2 = string_of(&ioc, "K:KohzuSeqMsg2SI").await;
+        if msg2 != "Set to Manual Mode" {
+            return Err(format!("SeqMsg2 {msg2:?}"));
+        }
+        for (pv, want) in values {
+            let got = f64_of(&ioc, pv).await;
+            if !near(got, want) {
+                return Err(format!("{pv}: {got}, C {want}"));
+            }
+        }
+        Ok(())
+    })
+    .await;
 }
 
 /// updatePsuedo echoes each motor field monitor on its own, so the echo
@@ -296,14 +317,14 @@ async fn a_lattice_change_recomputes_e_and_lambda_for_the_standing_theta() {
 #[epics_base_rs::epics_test]
 async fn the_echo_pvs_follow_the_motors_while_init_holds() {
     let ioc = boot([0.0, 0.0, 0.0]).await;
-    settled(&ioc, "Theta Readback of 0 not reasonable").await;
+    shown(&ioc, "Theta Readback of 0 not reasonable").await;
     let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:z.VELO")
         .put_f64_process(7.0)
         .await
         .unwrap();
     eventually_near(&ioc, "K:KohzuZVelAI", 7.0).await;
-    assert_eq!(f64_of(&ioc, "K:KohzuThetaDmovBI").await, 1.0);
+    eventually_near(&ioc, "K:KohzuThetaDmovBI", 1.0).await;
 }
 
 /// A theta move made outside kohzuCtl posts many readbacks; updateRdbk's
@@ -312,7 +333,7 @@ async fn the_echo_pvs_follow_the_motors_while_init_holds() {
 #[epics_base_rs::epics_test]
 async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    ready(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     // Each pass sets theta to the readback, which DRVH clamps to 89. SeqMsg1
     // cannot count passes: a string monitor is by-reference, so a slow reader
@@ -380,31 +401,35 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
 #[epics_base_rs::epics_test]
 async fn use_set_drives_the_motor_set_fields_at_connect() {
     let ioc = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&ioc).await, [0.0; 4]);
+    sets_reach(&ioc, [0.0; 4]).await;
     let ioc = boot_with([10.0, -17.77, 100.78], &[("K:KohzuUseSetBO", 1.0)]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&ioc).await, [1.0; 4]);
+    sets_reach(&ioc, [1.0; 4]).await;
+}
+
+async fn sets_reach(ioc: &PvDatabase, want: [f64; 4]) {
+    eventually(|| async {
+        match use_set_and_motor_sets(ioc).await {
+            sets if sets == want => Ok(()),
+            sets => Err(format!("UseSet and motor SETs {sets:?}, C {want:?}")),
+        }
+    })
+    .await;
 }
 
 /// A motor .SET put reaches UseSet, and UseSet the other two motors
 /// (C kohzuIoc oracle: y.SET=Set leaves all four Set).
 #[epics_base_rs::epics_test]
 async fn a_motor_set_put_drives_use_set_and_the_other_motors() {
-    let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    // updateSet's connect-time UseSet pass puts back a motor SET put before
+    // it: the preset th.SET it resets shows that pass has run.
+    let ioc = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
+    sets_reach(&ioc, [0.0; 4]).await;
     let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:y.SET")
         .put_f64_process(1.0)
         .await
         .unwrap();
-    eventually(|| async {
-        match use_set_and_motor_sets(&ioc).await {
-            [1.0, 1.0, 1.0, 1.0] => Ok(()),
-            sets => Err(format!("UseSet and motor SETs {sets:?}")),
-        }
-    })
-    .await;
+    sets_reach(&ioc, [1.0; 4]).await;
 }
 
 /// A tweak past its limit leaves the setpoint but still runs C's
@@ -419,7 +444,7 @@ async fn a_tweak_past_the_limit_moves_to_the_standing_setpoint() {
         ("K:BraggThetaTweakAI", "K:BraggThetaIncBO"),
     ] {
         let ioc = boot([10.0, -17.77, 100.78]).await;
-        settled(&ioc, "y offset changed to 17.500000").await;
+        ready(&ioc, "y offset changed to 17.500000").await;
         let db = PvDatabase::clone(&ioc);
         let put = |pv: &'static str, v: f64| {
             let db = db.clone();
@@ -489,36 +514,17 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     panic!("{ack} never taken");
 }
 
-/// Run `posts` while the sequencer is held past waitForCmndEnter's
-/// efClears (kohzuCtl.st:607-620): `ack` sends it there, the `echo` put is its
-/// first after them, and its next read blocks on K:y, locked here. A post
-/// that lands before the efClears is dropped, as in C.
-async fn post_while_held(db: &PvDatabase, ack: &str, echo: &str, posts: impl FnOnce(&PvDatabase)) {
-    let rbv = f64_of(db, "K:th.RBV").await;
+/// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
+/// (kohzuCtl.st:607-652): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// Its puts are queued, so no record lock can hold it inside the enter.
+async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:KohzuSeqMsg1SI").await;
-    db.get_record(echo)
-        .unwrap()
-        .write()
-        .record
-        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
-        .unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let y = db.get_record("K:y").unwrap();
-    let holder = std::thread::spawn(move || {
-        let _held = y.write();
-        locked_tx.send(()).unwrap();
-        let _ = release_rx.recv();
-    });
-    locked_rx.recv().unwrap();
     optics_rs::db_access::DbChannel::new(db, ack)
         .put_f64_process(1.0)
         .await
         .unwrap();
-    eventually_near(db, echo, rbv).await;
+    eventually_near(db, ack, 0.0).await;
     posts(db);
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
 }
 
 /// Post `v` to `pv`'s VAL with no processing.
@@ -534,20 +540,16 @@ fn post(db: &PvDatabase, pv: &str, v: EpicsValue) {
 #[epics_base_rs::epics_test]
 async fn two_queued_e_puts_take_the_later_value() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    shown(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
-    post_while_held(&db, "K:KohzuOperAckBO", "K:KohzuThetaRdbkAI", |db| {
+    post_after_enter(&db, "K:KohzuOperAckBO", |db| {
         for e in [12.0, 14.0] {
             post(db, "K:BraggEAO", EpicsValue::Double(e));
         }
     })
     .await;
     let two_d = f64_of(&ioc, "K:Bragg2dSpacingAO").await;
-    let theta = optics_rs::snl::kohzu_ctl::lambda_to_theta(
-        optics_rs::snl::kohzu_ctl::energy_to_lambda(14.0),
-        two_d,
-    )
-    .unwrap();
+    let theta = RAD_CONV * (HC / 14.0 / two_d).asin();
     eventually_near(&ioc, "K:BraggThetaAO", theta).await;
     assert_near(&ioc, "K:BraggEAO", 14.0).await;
 }
@@ -558,7 +560,7 @@ async fn two_queued_e_puts_take_the_later_value() {
 #[epics_base_rs::epics_test]
 async fn an_e_put_queued_after_auto_mode_moves() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    shown(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     db.get_record("K:y")
         .unwrap()
@@ -570,7 +572,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         .pos
         .val = 5.0;
     let e = f64_of(&ioc, "K:BraggEAO").await;
-    post_while_held(&db, "K:KohzuOperAckBO", "K:KohzuThetaRdbkAI", |db| {
+    post_after_enter(&db, "K:KohzuOperAckBO", |db| {
         post(db, "K:KohzuModeBO", EpicsValue::Enum(1));
         post(db, "K:BraggEAO", EpicsValue::Double(e + 1e-6));
     })
@@ -586,7 +588,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
 #[epics_base_rs::epics_test]
 async fn a_setpoint_put_during_a_move_is_dropped() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    ready(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     let put = |pv: &'static str, v: f64| {
         let db = db.clone();
@@ -597,18 +599,19 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
                 .unwrap();
         }
     };
-    // The test motors have no driver, so the test owns DMOV for all three.
+    // The test motors have no driver, so the test owns DMOV for all three,
+    // posting it as the record would: kohzuCtl reads its monitor.
     let set_dmov = |done: bool| {
         for motor in ["K:th", "K:y", "K:z"] {
-            db.get_record(motor)
-                .unwrap()
-                .write()
-                .record
+            let rec = db.get_record(motor).unwrap();
+            let mut inst = rec.write();
+            inst.record
                 .as_any_mut()
                 .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
                 .unwrap()
                 .stat
                 .dmov = done;
+            inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
         }
     };
     let drvh = f64_of(&ioc, "K:BraggThetaAO.DRVH").await;
@@ -636,4 +639,85 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
     eventually_near(&ioc, "K:KohzuMoving", 0.0).await;
     assert_near(&ioc, "K:th.VAL", 30.0).await;
     assert_near(&ioc, "K:BraggThetaAO", 20.0).await;
+}
+
+const CHILD: &str = "KOHZU_CTL_DEBUG_CHILD";
+
+/// `test` run again in a child whose stdout is not captured, and the
+/// kohzuCtl lines it printed.
+fn trace_of(test: &str) -> Vec<String> {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        // libtest's `test <name> ... ` heads the first line, unterminated.
+        .filter_map(|l| l.find("kohzuCtl:").map(|i| l[i..].to_string()))
+        .collect()
+}
+
+/// With kohzuCtlDebug set at boot, the boot passes print C's lines; the
+/// rolled-back moveKohzu arm prints none (kohzuCtl.st:1044-1050).
+#[epics_base_rs::epics_test]
+async fn debug_prints_c_lines() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("debug_prints_c_lines");
+        // busyChanged's line ends in " to Done" with no newline, so the next
+        // line is printed onto it (kohzuCtl.st:882).
+        assert_eq!(
+            trace,
+            [
+                "kohzuCtl:initSequence:initSeq=0",
+                "kohzuCtl:dInputChanged",
+                "kohzuCtl:thChanged",
+                "kohzuCtl:calcMovements",
+                "kohzuCtl:initSequence:initSeq=1",
+                "kohzuCtl:chkMotorLimits",
+                "kohzuCtl:chkMotorLimitsExit: OK",
+                "kohzuCtl:initSequence:initSeq=2",
+                "kohzuCtl:initSequence:initSeq=3",
+                "kohzuCtl:thChanged",
+                "kohzuCtl:calcMovements",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=1; kohzuDone=1",
+                "kohzuCtl:waitForCmndEnter: asserting 'done'.",
+                "kohzuCtl:waitForCmnd:thetaMotXxLim_mon",
+                "kohzuCtl:thetaLimits",
+                "kohzuCtl:checkDone: done",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=1; kohzuDone=1",
+                "kohzuCtl:waitForCmndEnter: asserting 'done'.",
+                "kohzuCtl:waitForCmnd:thetaMotRdbk_mon",
+                "kohzuCtl:updateRdbk:*Dmov (done=0,moving=0)",
+                "kohzuCtl:updateRdbk: done",
+                "kohzuCtl:thetaMotStopped:!causedMove (done=1,moving=0)",
+                "kohzuCtl:thChanged",
+                "kohzuCtl:calcMovements",
+                "kohzuCtl:moveKohzu",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=1; kohzuDone=1",
+                "kohzuCtl:waitForCmndEnter: asserting 'done'.",
+                "kohzuCtl:waitForCmnd:kMbusy",
+                "kohzuCtl:busyChanged",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=0; kohzuDone=0",
+                "kohzuCtl:waitForCmnd:yOffset_mon",
+                "kohzuCtl:calcMovements",
+                "kohzuCtl:moveKohzu",
+                "kohzuCtl:waitForCmndEnter:initSeqDone",
+                "kohzuCtl:waitForCmndEnter: kohzuMoving=0; kohzuDone=0",
+            ]
+        );
+        return;
+    }
+    let ioc = boot_with([10.0, -17.77, 100.78], &[("K:KohzuCtlDebug", 1.0)]).await;
+    settled(&ioc, "y offset changed to 17.500000").await;
 }

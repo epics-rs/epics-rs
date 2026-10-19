@@ -8,5 +8,6 @@ pub mod ml_mono_ctl;
 pub mod orient;
 pub mod pf4;
 pub mod qxbpm;
+pub(crate) mod vars;
 pub mod xia_slit;
 pub mod xiahsc;

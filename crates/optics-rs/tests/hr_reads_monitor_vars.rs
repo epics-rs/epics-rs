@@ -59,12 +59,7 @@ async fn boot() -> Arc<PvDatabase> {
             .pos
             .rbv = 200_000.0;
     }
-    // Its own thread: hrCtl's puts lock the record on the calling thread,
-    // and a test holds one (post_while_held).
-    let bridge = BlockingBridge::capture();
-    std::thread::spawn(move || {
-        bridge.block_on(hr_ctl::run(HrConfig::new("H:", "1", "p1", "p2"), db))
-    });
+    BlockingBridge::capture().spawn(hr_ctl::run(HrConfig::new("H:", "1", "p1", "p2"), db));
     // The boot phiLimits pass: theta1Hi = HLM in degrees.
     wait_near(&ioc, "H:HR1_Theta1AO.DRVH", 1.5e6 * UR2D).await;
     assert_eq!(
@@ -97,36 +92,17 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     panic!("{ack} never taken");
 }
 
-/// Run `posts` while the sequencer is held past waitForCmndEnter's
-/// efClears (hrCtl.st:603-627): OperAck sends it there, the phi1 readback
-/// echo is its first put after them, and the phi2 echo, locked here, its
-/// next. A post that lands before the efClears is dropped, as in C.
-async fn post_while_held(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
-    let rbv = f64_of(db, "H:p1.RBV").await;
+/// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
+/// (hrCtl.st:603-680): OperAck sends it there, and the enter's `opAck = 0` follows them.
+/// Its puts are queued, so no record lock can hold it inside the enter.
+async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
-    db.get_record("H:HR1_phi1RdbkAI")
-        .unwrap()
-        .write()
-        .record
-        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
-        .unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let echo2 = db.get_record("H:HR1_phi2RdbkAI").unwrap();
-    let holder = std::thread::spawn(move || {
-        let _held = echo2.write();
-        locked_tx.send(()).unwrap();
-        let _ = release_rx.recv();
-    });
-    locked_rx.recv().unwrap();
     optics_rs::db_access::DbChannel::new(db, "H:HR1_OperAckBO")
         .put_f64_process(1.0)
         .await
         .unwrap();
-    wait_near(db, "H:HR1_phi1RdbkAI", rbv).await;
+    wait_near(db, "H:HR1_OperAckBO", 0.0).await;
     posts(db);
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
 }
 
 /// Post `v` to `pv`'s VAL with no processing.
@@ -145,7 +121,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
     let db = PvDatabase::clone(&ioc);
     let e = f64_of(&ioc, "H:HR1_EAO").await;
     let before = f64_of(&ioc, "H:p1.VAL").await;
-    post_while_held(&db, |db| {
+    post_after_enter(&db, |db| {
         post(db, "H:HR1_ModeBO", EpicsValue::Enum(1));
         post(db, "H:HR1_EAO", EpicsValue::Double(e * 1.01));
     })
@@ -201,12 +177,12 @@ async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
     );
     assert_ne!(f64_of(&ioc, "H:HR1_EAO.DRVH").await, 0.0);
 
-    post_while_held(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(1))).await;
+    post_after_enter(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(1))).await;
     wait_near(&ioc, "H:HR1_Theta1AO.DRVH", 0.0).await;
     wait_near(&ioc, "H:HR1_EAO.DRVH", 0.0).await;
     wait_near(&ioc, "H:HR1_phi1AO.DRVH", 0.0).await;
 
-    post_while_held(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(0))).await;
+    post_after_enter(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(0))).await;
     wait_near(&ioc, "H:HR1_Theta1AO.DRVH", want).await;
 }
 
@@ -230,7 +206,7 @@ async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
     }
     wait_near(&ioc, "H:HR1_EAO.DRVL", -229.18127).await;
     let e = f64_of(&ioc, "H:HR1_EAO").await;
-    post_while_held(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(1))).await;
+    post_after_enter(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(1))).await;
     for _ in 0..100 {
         if string_of(&ioc, "H:HR1_SeqMsg1SI").await == "Wavelength > 2d spacing of crystal 1." {
             break;
@@ -270,4 +246,59 @@ async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
             wait_near(&ioc, echo, f64::from(dmov)).await;
         }
     }
+}
+
+const CHILD: &str = "HR_CTL_DEBUG_CHILD";
+
+/// `test` run again in a child whose stdout is not captured, and the
+/// hrCtl lines it printed.
+fn trace_of(test: &str) -> Vec<String> {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        // libtest's `test <name> ... ` heads the first line, unterminated.
+        .filter_map(|l| l.find("hrCtl:").map(|i| l[i..].to_string()))
+        .collect()
+}
+
+/// With hrCtlDebug set, an opMode change prints C's lines: each state's
+/// entry block and the clauses it takes (hrCtl.st:785-791, :1225-1312,
+/// :599-695).
+#[epics_base_rs::epics_test]
+async fn debug_prints_c_lines() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("debug_prints_c_lines");
+        assert_eq!(
+            trace,
+            [
+                "hrCtl:waitForCmnd: opMode event.",
+                "hrCtl:calcMovements: entry",
+                "hrCtl:calcMovements, USE",
+                "hrCtl:moveHR entry",
+                "hrCtl:moveHR: NOT putting to motors",
+                "hrCtl:waitForCmndEnter: entry",
+                "hrCtl:waitForCmdEnter: initSeqDone",
+                "hrCtl:waitForCmndEnter: Moving=0; Done=0",
+                "hrCtl:waitForCmnd: entry",
+            ]
+        );
+        return;
+    }
+    let ioc = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    post(&db, "H:HR1CtlDebug", EpicsValue::Long(1));
+    task::sleep(Duration::from_millis(200)).await;
+    post(&db, "H:HR1_Mode2MO", EpicsValue::Enum(1));
+    task::sleep(Duration::from_millis(500)).await;
 }

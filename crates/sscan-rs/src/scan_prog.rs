@@ -406,31 +406,33 @@ struct ProgressPvs {
 
 impl ProgressPvs {
     fn new(ss: StateSet, cfg: &ScanProgressConfig) -> Self {
-        let p = |n: &str| ss.pv(&cfg.pv(n));
-        let scan = |field: &str| std::array::from_fn(|n| ss.pv(&cfg.scan(n, field)));
+        let p = |var: &str, n: &str| ss.pv(var, &cfg.pv(n));
+        let scan = |vars: [&str; 4], field: &str| {
+            std::array::from_fn(|n| ss.pv(vars[n], &cfg.scan(n, field)))
+        };
         Self {
-            fraction_done: p("fractionDone"),
-            percent_done: p("percentDone"),
-            starting: p("startingTimeStr"),
-            ending: p("endingTimeStr"),
-            remaining: p("remainingTimeStr"),
-            pause_time: p("pauseTimeStr"),
-            total_elapsed: p("totalElapsedTimeStr"),
-            total_active: p("totalActiveTimeStr"),
-            pause_sec: p("pauseSec"),
-            remaining_sec: p("remainingSec"),
-            npts: p("Ntotal"),
-            cpt: p("Nfinished"),
-            running: p("running"),
-            npauses: p("Npauses"),
-            hung_sec: p("hungSec"),
-            hung_time: p("hungTimeStr"),
-            version: p("version"),
-            npts_n: scan("NPTS"),
-            cpt_n: scan("CPT"),
-            debug: p("debug"),
-            hang_wait_sec: p("hangWaitSec"),
-            busy_n: scan("BUSY"),
+            fraction_done: p("fractionDone", "fractionDone"),
+            percent_done: p("percentDone", "percentDone"),
+            starting: p("startingTimeStr", "startingTimeStr"),
+            ending: p("endingTimeStr", "endingTimeStr"),
+            remaining: p("remainingTimeStr", "remainingTimeStr"),
+            pause_time: p("pauseTimeStr", "pauseTimeStr"),
+            total_elapsed: p("totalElapsedTimeStr", "totalElapsedTimeStr"),
+            total_active: p("totalActiveTimeStr", "totalActiveTimeStr"),
+            pause_sec: p("pauseSec", "pauseSec"),
+            remaining_sec: p("remainingSec", "remainingSec"),
+            npts: p("npts", "Ntotal"),
+            cpt: p("cpt", "Nfinished"),
+            running: p("running", "running"),
+            npauses: p("Npauses", "Npauses"),
+            hung_sec: p("hungSec", "hungSec"),
+            hung_time: p("hungTimeStr", "hungTimeStr"),
+            version: p("version", "version"),
+            npts_n: scan(["npts1", "npts2", "npts3", "npts4"], "NPTS"),
+            cpt_n: scan(["cpt1", "cpt2", "cpt3", "cpt4"], "CPT"),
+            debug: p("scanProgressDebug", "debug"),
+            hang_wait_sec: p("hangWaitSec", "hangWaitSec"),
+            busy_n: scan(["busy1", "busy2", "busy3", "busy4"], "BUSY"),
             ss,
         }
     }
@@ -843,7 +845,7 @@ async fn scan_pause_update(
     ss: StateSet,
     shared: &Shared,
 ) {
-    let paused_pv = ss.pv(&cfg.pv("paused"));
+    let paused_pv = ss.pv("paused", &cfg.pv("paused"));
     let mut m = Monitored::connect(db, cfg).await;
     let mut almost_paused = false;
     let mut state = PauseState::Init;

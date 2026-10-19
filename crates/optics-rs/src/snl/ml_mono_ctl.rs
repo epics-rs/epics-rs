@@ -10,17 +10,17 @@
 //! puts included), and a state left only when one of its `when` clauses is
 //! true; `updatePsuedo` echoing the motor fields; `updateSet`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_base_rs::calc::engine::cvt::fmt_f;
-use epics_base_rs::runtime::task::Instant;
 use epics_base_rs::server::database::PvDatabase;
-use tokio::sync::Notify;
 
-use crate::db_access::{DbMultiMonitor, alloc_origin};
+use crate::db_access::alloc_origin;
 use crate::snl::kohzu_ctl::{HC, update_set};
+use crate::snl::vars::{
+    DOUBLE, DOUBLE_MON, DOUBLE_SYNC, Decl, Delays, EventFlag, SHORT, SHORT_MON, SHORT_SYNC, Vars,
+    ctl_debug,
+};
 use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 
 /// `radConv`, as C sets it in state `init` (ml_monoCtl.st:537).
@@ -173,247 +173,98 @@ const TH_TWEAK: usize = 72;
 const TH_INC: usize = 73;
 const TH_DEC: usize = 74;
 const Y_OFFSET: usize = 75;
-const N_VARS: usize = 76;
+const USE_SET: usize = 76;
+const DEBUG: usize = 77;
+const N_VARS: usize = 78;
 
-/// How C declares a variable: `short` or `double`, `monitor`ed, `sync`ed.
-#[derive(Clone, Copy)]
-struct Decl {
-    short: bool,
-    monitor: bool,
-    sync: bool,
-}
-
-const fn decl(short: bool, monitor: bool, sync: bool) -> Decl {
-    Decl {
-        short,
-        monitor,
-        sync,
-    }
-}
-
-/// Each variable's PV and declaration, by index (ml_monoCtl.st:26-512).
-fn table(cfg: &MlMonoConfig) -> Vec<(String, Decl)> {
+/// Each variable's name, PV and declaration, by index (ml_monoCtl.st:26-512).
+fn table(cfg: &MlMonoConfig) -> Vec<(&'static str, String, Decl)> {
     let m = |motor: &str, field: &str| cfg.motor_pv(motor, field);
     let (th, th2, z, y) = (&cfg.m_theta, &cfg.m_theta2, &cfg.m_z, &cfg.m_y);
-    let short = decl(true, false, false);
-    let short_mon = decl(true, true, false);
-    let short_sync = decl(true, true, true);
-    let dbl = decl(false, false, false);
-    let dbl_mon = decl(false, true, false);
-    let dbl_sync = decl(false, true, true);
+    let (short, short_mon, short_sync) = (SHORT, SHORT_MON, SHORT_SYNC);
+    let (dbl, dbl_mon, dbl_sync) = (DOUBLE, DOUBLE_MON, DOUBLE_SYNC);
     let t = vec![
-        (cfg.pv("Alert"), short),
-        (cfg.pv("OperAck"), short_mon),
-        (cfg.pv("Put"), short_mon),
-        (cfg.pv("Mode"), short_mon),
-        (cfg.pv("Mode2"), short_mon),
-        (cfg.pv("Moving"), short_mon),
-        (cfg.pv("Order"), dbl_sync),
-        (cfg.pv("D"), dbl_sync),
-        (cfg.pv("E"), dbl_sync),
-        (cfg.pv("E.DRVH"), dbl),
-        (cfg.pv("E.DRVL"), dbl),
-        (cfg.pv("ERdbk"), dbl),
-        (cfg.pv("Lambda"), dbl_sync),
-        (cfg.pv("Lambda.DRVH"), dbl),
-        (cfg.pv("Lambda.DRVL"), dbl),
-        (cfg.pv("LambdaRdbk"), dbl),
-        (cfg.pv("Theta"), dbl_sync),
-        (cfg.pv("Theta.DRVH"), dbl),
-        (cfg.pv("Theta.DRVL"), dbl),
-        (cfg.pv("ThetaRdbk"), dbl),
-        (cfg.pv("ThetaCmd"), dbl),
-        (cfg.pv("Theta2Cmd"), dbl),
-        (cfg.pv("ZCmd"), dbl),
-        (cfg.pv("ThetaRdbkEcho"), dbl),
-        (cfg.pv("Theta2RdbkEcho"), dbl),
-        (cfg.pv("ZRdbk"), dbl),
-        (cfg.pv("ThetaVel"), dbl),
-        (cfg.pv("Theta2Vel"), dbl),
-        (cfg.pv("ZVel"), dbl),
-        (cfg.pv("ThetaDmov"), short),
-        (cfg.pv("Theta2Dmov"), short),
-        (cfg.pv("ZDmov"), short),
-        (m(th, ".STOP"), short),
-        (m(th2, ".STOP"), short),
-        (m(z, ".STOP"), short),
-        (m(th, ".DMOV"), short_sync),
-        (m(th2, ".DMOV"), short_sync),
-        (m(z, ".DMOV"), short_sync),
-        (m(th, ".HLS"), short_mon),
-        (m(th, ".LLS"), short_mon),
-        (m(th2, ".HLS"), short_mon),
-        (m(th2, ".LLS"), short_mon),
-        (m(z, ".HLS"), short_mon),
-        (m(z, ".LLS"), short_mon),
-        (cfg.pv("ThetaSet"), dbl_mon),
-        (cfg.pv("Theta2Set"), dbl_mon),
-        (cfg.pv("ZSet"), dbl_mon),
-        (m(th, ".HLM"), dbl_sync),
-        (m(th, ".LLM"), dbl_sync),
-        (m(th2, ".HLM"), dbl_sync),
-        (m(th2, ".LLM"), dbl_sync),
-        (m(z, ".HLM"), dbl_mon),
-        (m(z, ".LLM"), dbl_mon),
-        (m(th, ""), dbl),
-        (m(th2, ""), dbl),
-        (m(z, ""), dbl),
-        (m(th, ""), dbl_sync),
-        (m(th2, ""), dbl_sync),
-        (m(z, ""), dbl_sync),
-        (m(th, ".VELO"), dbl_sync),
-        (m(th2, ".VELO"), dbl_sync),
-        (m(z, ".VELO"), dbl_sync),
-        (m(th, ".RBV"), dbl_sync),
-        (m(th2, ".RBV"), dbl_sync),
-        (m(z, ".RBV"), dbl_sync),
-        (m(y, ".RBV"), dbl_sync),
-        (cfg.pv("ETweak"), dbl_mon),
-        (cfg.pv("EInc"), short_mon),
-        (cfg.pv("EDec"), short_mon),
-        (cfg.pv("LambdaTweak"), dbl_mon),
-        (cfg.pv("LambdaInc"), short_mon),
-        (cfg.pv("LambdaDec"), short_mon),
-        (cfg.pv("ThetaTweak"), dbl_mon),
-        (cfg.pv("ThetaInc"), short_mon),
-        (cfg.pv("ThetaDec"), short_mon),
-        (cfg.pv("_yOffset"), dbl_sync),
+        ("opAlert", cfg.pv("Alert"), short),
+        ("opAck", cfg.pv("OperAck"), short_mon),
+        ("putVals", cfg.pv("Put"), short_mon),
+        ("autoMode", cfg.pv("Mode"), short_mon),
+        ("ccMode", cfg.pv("Mode2"), short_mon),
+        ("ml_monoMoving", cfg.pv("Moving"), short_mon),
+        ("Order", cfg.pv("Order"), dbl_sync),
+        ("D", cfg.pv("D"), dbl_sync),
+        ("E", cfg.pv("E"), dbl_sync),
+        ("EHi", cfg.pv("E.DRVH"), dbl),
+        ("ELo", cfg.pv("E.DRVL"), dbl),
+        ("ERdbk", cfg.pv("ERdbk"), dbl),
+        ("lambda", cfg.pv("Lambda"), dbl_sync),
+        ("lambdaHi", cfg.pv("Lambda.DRVH"), dbl),
+        ("lambdaLo", cfg.pv("Lambda.DRVL"), dbl),
+        ("lambdaRdbk", cfg.pv("LambdaRdbk"), dbl),
+        ("theta", cfg.pv("Theta"), dbl_sync),
+        ("thetaHi", cfg.pv("Theta.DRVH"), dbl),
+        ("thetaLo", cfg.pv("Theta.DRVL"), dbl),
+        ("thetaRdbk", cfg.pv("ThetaRdbk"), dbl),
+        ("thetaMotCmdEcho", cfg.pv("ThetaCmd"), dbl),
+        ("theta2MotCmdEcho", cfg.pv("Theta2Cmd"), dbl),
+        ("zMotCmdEcho", cfg.pv("ZCmd"), dbl),
+        ("thetaMotRdbkEcho", cfg.pv("ThetaRdbkEcho"), dbl),
+        ("theta2MotRdbkEcho", cfg.pv("Theta2RdbkEcho"), dbl),
+        ("zMotRdbkEcho", cfg.pv("ZRdbk"), dbl),
+        ("thetaMotVelEcho", cfg.pv("ThetaVel"), dbl),
+        ("theta2MotVelEcho", cfg.pv("Theta2Vel"), dbl),
+        ("zMotVelEcho", cfg.pv("ZVel"), dbl),
+        ("thetaDmovEcho", cfg.pv("ThetaDmov"), short),
+        ("theta2DmovEcho", cfg.pv("Theta2Dmov"), short),
+        ("zDmovEcho", cfg.pv("ZDmov"), short),
+        ("thetaMotStop", m(th, ".STOP"), short),
+        ("theta2MotStop", m(th2, ".STOP"), short),
+        ("zStop", m(z, ".STOP"), short),
+        ("thetaDmov", m(th, ".DMOV"), short_sync),
+        ("theta2Dmov", m(th2, ".DMOV"), short_sync),
+        ("zDmov", m(z, ".DMOV"), short_sync),
+        ("thetaHls", m(th, ".HLS"), short_mon),
+        ("thetaLls", m(th, ".LLS"), short_mon),
+        ("theta2Hls", m(th2, ".HLS"), short_mon),
+        ("theta2Lls", m(th2, ".LLS"), short_mon),
+        ("zHls", m(z, ".HLS"), short_mon),
+        ("zLls", m(z, ".LLS"), short_mon),
+        ("thetaMotDesired", cfg.pv("ThetaSet"), dbl_mon),
+        ("theta2MotDesired", cfg.pv("Theta2Set"), dbl_mon),
+        ("zMotDesired", cfg.pv("ZSet"), dbl_mon),
+        ("thetaMotHiLim", m(th, ".HLM"), dbl_sync),
+        ("thetaMotLoLim", m(th, ".LLM"), dbl_sync),
+        ("theta2MotHiLim", m(th2, ".HLM"), dbl_sync),
+        ("theta2MotLoLim", m(th2, ".LLM"), dbl_sync),
+        ("zMotHiLim", m(z, ".HLM"), dbl_mon),
+        ("zMotLoLim", m(z, ".LLM"), dbl_mon),
+        ("thetaMotCmd", m(th, ""), dbl),
+        ("theta2MotCmd", m(th2, ""), dbl),
+        ("zMotCmd", m(z, ""), dbl),
+        ("thetaMotCmdMon", m(th, ""), dbl_sync),
+        ("theta2MotCmdMon", m(th2, ""), dbl_sync),
+        ("zMotCmdMon", m(z, ""), dbl_sync),
+        ("thSpeed", m(th, ".VELO"), dbl_sync),
+        ("th2Speed", m(th2, ".VELO"), dbl_sync),
+        ("zSpeed", m(z, ".VELO"), dbl_sync),
+        ("thetaMotRdbk", m(th, ".RBV"), dbl_sync),
+        ("theta2MotRdbk", m(th2, ".RBV"), dbl_sync),
+        ("zMotRdbk", m(z, ".RBV"), dbl_sync),
+        ("yMotRdbk", m(y, ".RBV"), dbl_sync),
+        ("ETweakVal", cfg.pv("ETweak"), dbl_mon),
+        ("ETweakInc", cfg.pv("EInc"), short_mon),
+        ("ETweakDec", cfg.pv("EDec"), short_mon),
+        ("LTweakVal", cfg.pv("LambdaTweak"), dbl_mon),
+        ("LTweakInc", cfg.pv("LambdaInc"), short_mon),
+        ("LTweakDec", cfg.pv("LambdaDec"), short_mon),
+        ("thTweakVal", cfg.pv("ThetaTweak"), dbl_mon),
+        ("thTweakInc", cfg.pv("ThetaInc"), short_mon),
+        ("thTweakDec", cfg.pv("ThetaDec"), short_mon),
+        ("yOffset", cfg.pv("_yOffset"), dbl_sync),
+        ("useSetMode", cfg.pv("UseSet"), short_mon),
+        ("ml_monoCtlDebug", cfg.pv("CtlDebug"), short_mon),
     ];
     debug_assert_eq!(t.len(), N_VARS);
     t
-}
-
-/// One state set's view of the SNL variables: a `monitor`ed variable is
-/// written as its monitor arrives and raises the flag `sync`ed to it; the
-/// others hold what the program last assigned (0 until then).
-struct Vars {
-    chans: Vec<SeqPv>,
-    decls: Vec<Decl>,
-    val: [f64; N_VARS],
-    flag: [bool; N_VARS],
-    by_pv: HashMap<String, usize>,
-    monitor: DbMultiMonitor,
-}
-
-impl Vars {
-    /// Subscribe the monitored variables among `watch`. Their connect-time
-    /// monitors raise their flags, so each found starts raised.
-    async fn new(
-        db: &PvDatabase,
-        ss: &StateSet,
-        cfg: &MlMonoConfig,
-        origin: u64,
-        watch: &[usize],
-    ) -> Self {
-        let table = table(cfg);
-        let mut val = [0.0; N_VARS];
-        let mut flag = [false; N_VARS];
-        let mut by_pv = HashMap::new();
-        let mut names = Vec::new();
-        for &i in watch {
-            let (pv, d) = &table[i];
-            if !d.monitor {
-                continue;
-            }
-            // A PV that never connects delivers no monitor and raises nothing.
-            let Ok(seed) = db.get_pv(pv) else { continue };
-            val[i] = seed.to_f64().unwrap_or(0.0);
-            flag[i] = d.sync;
-            by_pv.insert(pv.clone(), i);
-            names.push(pv.clone());
-        }
-        Self {
-            chans: table
-                .iter()
-                .map(|(pv, _)| ss.pv_with_origin(pv, origin))
-                .collect(),
-            decls: table.iter().map(|(_, d)| *d).collect(),
-            val,
-            flag,
-            by_pv,
-            monitor: DbMultiMonitor::new(db, &names).await,
-        }
-    }
-
-    fn take(&mut self, pv: &str, v: f64) {
-        if let Some(&i) = self.by_pv.get(pv) {
-            self.val[i] = v;
-            self.flag[i] |= self.decls[i].sync;
-        }
-    }
-
-    /// Take every monitor already queued.
-    async fn poll(&mut self) {
-        while let Ok((pv, v)) = epics_base_rs::runtime::task::timeout(
-            std::time::Duration::ZERO,
-            self.monitor.wait_change(),
-        )
-        .await
-        {
-            self.take(&pv, v);
-        }
-    }
-
-    /// Wait for a monitor or `deadline`, whichever is first.
-    async fn wait(&mut self, deadline: Option<Instant>) {
-        let (pv, v) = match deadline {
-            Some(at) => tokio::select! {
-                r = self.monitor.wait_change() => r,
-                _ = epics_base_rs::runtime::task::sleep_until(at) => return,
-            },
-            None => self.monitor.wait_change().await,
-        };
-        self.take(&pv, v);
-    }
-
-    fn on(&self, i: usize) -> bool {
-        self.val[i] != 0.0
-    }
-
-    /// `pvPut(var)`.
-    async fn put(&self, i: usize) {
-        let v = self.val[i];
-        let _ = if self.decls[i].short {
-            self.chans[i].put_i16_process(v as i16).await
-        } else {
-            self.chans[i].put_f64_process(v).await
-        };
-    }
-
-    /// `var = v; pvPut(var);`
-    async fn set(&mut self, i: usize, v: f64) {
-        self.val[i] = v;
-        self.put(i).await;
-    }
-
-    /// `efTestAndClear`.
-    fn test_and_clear(&mut self, i: usize) -> bool {
-        std::mem::take(&mut self.flag[i])
-    }
-}
-
-/// `delay()` in a state's `when` clauses: counted from state entry.
-struct Delays {
-    entered: Instant,
-    next: Option<Instant>,
-}
-
-impl Delays {
-    fn new() -> Self {
-        Self {
-            entered: Instant::now(),
-            next: None,
-        }
-    }
-
-    fn delay(&mut self, secs: f64) -> bool {
-        let at = self.entered + epics_base_rs::runtime::time::duration_from_secs(secs);
-        if Instant::now() >= at {
-            return true;
-        }
-        self.next = Some(self.next.map_or(at, |n| n.min(at)));
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,26 +279,16 @@ pub async fn run(
     let queue = PutQueue::new(&db, "ml_monoCtl");
     let use_set_pv = config.pv("UseSet");
     let update_set_ss = queue.state_set("updateSet");
-    let use_set_mode = Arc::new(AtomicBool::new(
-        update_set_ss.pv(&use_set_pv).get_i16().await != 0,
-    ));
     // updateSet (ml_monoCtl.st:1262-1305).
     let update_set = update_set(
         db.clone(),
         update_set_ss,
         use_set_pv,
+        ["thetaMotSet", "theta2MotSet", "zMotSet"],
         [&config.m_theta, &config.m_theta2, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
-        use_set_mode.clone(),
     );
     let pseudo = Arc::new(Pseudo::default());
-    let main = MlMono::new(
-        &config,
-        &db,
-        &queue.state_set("ml_monoCtl"),
-        use_set_mode,
-        pseudo.clone(),
-    )
-    .await;
+    let main = MlMono::new(&config, &db, &queue.state_set("ml_monoCtl"), pseudo.clone()).await;
     let update_pseudo_ss = queue.state_set("updatePsuedo");
     tokio::select! {
         () = main.run() => Ok(()),
@@ -460,9 +301,8 @@ pub async fn run(
 /// ml_monoCtl, taken by updatePsuedo.
 #[derive(Default)]
 struct Pseudo {
-    theta: AtomicBool,
-    theta2: AtomicBool,
-    wake: Notify,
+    theta: EventFlag,
+    theta2: EventFlag,
 }
 
 /// ss updatePsuedo (ml_monoCtl.st:1191-1255).
@@ -482,7 +322,7 @@ async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, ss: &StateSet, pseud
         TH2_DMOV,
         Z_DMOV,
     ];
-    let mut v = Vars::new(db, ss, cfg, alloc_origin(), &watch).await;
+    let mut v = Vars::new(db, ss, &table(cfg), alloc_origin(), watch).await;
     let echoes = [
         (Z_RBV, Z_RDBK_ECHO),
         (Y_RBV, Y_OFFSET),
@@ -496,20 +336,25 @@ async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, ss: &StateSet, pseud
         (TH2_DMOV, TH2_DMOV_ECHO),
         (Z_DMOV, Z_DMOV_ECHO),
     ];
+    v.flush().await;
     loop {
-        v.poll().await;
-        let fired = if pseudo.theta.swap(false, Ordering::AcqRel) {
+        let fired = if pseudo.theta.test_and_clear() {
             Some((TH_RBV, TH_RDBK_ECHO))
-        } else if pseudo.theta2.swap(false, Ordering::AcqRel) {
+        } else if pseudo.theta2.test_and_clear() {
             Some((TH2_RBV, TH2_RDBK_ECHO))
         } else {
             echoes.into_iter().find(|&(from, _)| v.test_and_clear(from))
         };
         match fired {
-            Some((from, to)) => v.set(to, v.val[from]).await,
+            Some((from, to)) => {
+                let x = v.get(from);
+                v.set(to, x).await;
+                v.flush().await;
+            }
             None => tokio::select! {
                 () = v.wait(None) => {}
-                () = pseudo.wake.notified() => {}
+                () = pseudo.theta.raised() => {}
+                () = pseudo.theta2.raised() => {}
             },
         }
     }
@@ -544,7 +389,6 @@ struct MlMono {
     seq_msg2: SeqPv,
     mot_names: [(SeqPv, String); 4],
     y_off: f64,
-    use_set_mode: Arc<AtomicBool>,
     pseudo: Arc<Pseudo>,
     ml_mono_done: bool,
     two_d: f64,
@@ -559,29 +403,23 @@ struct MlMono {
 }
 
 impl MlMono {
-    async fn new(
-        cfg: &MlMonoConfig,
-        db: &PvDatabase,
-        ss: &StateSet,
-        use_set_mode: Arc<AtomicBool>,
-        pseudo: Arc<Pseudo>,
-    ) -> Self {
+    async fn new(cfg: &MlMonoConfig, db: &PvDatabase, ss: &StateSet, pseudo: Arc<Pseudo>) -> Self {
         let origin = alloc_origin();
-        let all: Vec<usize> = (0..N_VARS).collect();
-        let ch = |suffix: &str| ss.pv_with_origin(&cfg.pv(suffix), origin);
-        let name = |suffix: &str, motor: &str| (ch(suffix), format!("{}{}", cfg.prefix, motor));
+        let ch = |var: &str, suffix: &str| ss.pv_with_origin(var, &cfg.pv(suffix), origin);
+        let name = |var: &str, suffix: &str, motor: &str| {
+            (ch(var, suffix), format!("{}{}", cfg.prefix, motor))
+        };
         Self {
-            v: Vars::new(db, ss, cfg, origin, &all).await,
-            seq_msg1: ch("SeqMsg1"),
-            seq_msg2: ch("SeqMsg2"),
+            v: Vars::new(db, ss, &table(cfg), origin, 0..N_VARS).await,
+            seq_msg1: ch("seqMsg1", "SeqMsg1"),
+            seq_msg2: ch("seqMsg2", "SeqMsg2"),
             mot_names: [
-                name("ThetaPv", &cfg.m_theta),
-                name("Theta2Pv", &cfg.m_theta2),
-                name("ZPv", &cfg.m_z),
-                name("YPv", &cfg.m_y),
+                name("thetaMotName", "ThetaPv", &cfg.m_theta),
+                name("theta2MotName", "Theta2Pv", &cfg.m_theta2),
+                name("zMotName", "ZPv", &cfg.m_z),
+                name("yMotName", "YPv", &cfg.m_y),
             ],
             y_off: cfg.y_offset,
-            use_set_mode,
             pseudo,
             ml_mono_done: false,
             two_d: 0.0,
@@ -612,9 +450,9 @@ impl MlMono {
     async fn run(mut self) {
         let mut state = State::InitSequence;
         loop {
+            self.v.flush().await;
             let mut delays = Delays::new();
             state = loop {
-                self.v.poll().await;
                 if let Some(next) = self.step(state, &mut delays).await {
                     break next;
                 }
@@ -631,9 +469,10 @@ impl MlMono {
         match state {
             State::InitSequence => {
                 if self.init_seq == 0 {
-                    v.val[TH_STOP] = 1.0;
-                    v.val[TH2_STOP] = 1.0;
-                    v.val[Z_STOP] = 1.0;
+                    ctl_debug!(v, "ml_monoCtl:initSequence:initSeq=0");
+                    v.assign(TH_STOP, 1.0);
+                    v.assign(TH2_STOP, 1.0);
+                    v.assign(Z_STOP, 1.0);
                     v.set(PUT_VALS, 0.0).await;
                     v.set(AUTO_MODE, 0.0).await;
                     v.set(OP_ACK, 0.0).await;
@@ -645,27 +484,32 @@ impl MlMono {
                     return Some(State::DInputChanged);
                 }
                 if self.init_seq == 1 {
+                    ctl_debug!(v, "ml_monoCtl:initSequence:initSeq=1");
                     self.init_seq = 2;
                     return Some(State::ChkMotorLimits);
                 }
                 if self.init_seq == 2 {
+                    ctl_debug!(v, "ml_monoCtl:initSequence:initSeq=2");
                     self.init_seq = 3;
                     return Some(State::UpdateRdbk);
                 }
                 if self.init_seq == 3 && d.delay(1.0) {
+                    ctl_debug!(v, "ml_monoCtl:initSequence:initSeq=3");
                     self.msg1("ml_mono Control Ready").await;
                     self.msg2(" ").await;
                     self.init_seq_done = true;
                     let v = &mut self.v;
-                    v.set(THETA, v.val[TH_RBV]).await;
+                    let x = v.get(TH_RBV);
+                    v.set(THETA, x).await;
                     return Some(State::ThChanged);
                 }
                 None
             }
             State::WaitForCmndEnter => {
                 if self.init_seq_done && d.delay(0.1) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmndEnter:initSeqDone");
                     for i in [ORDER, D, E, LAMBDA, THETA] {
-                        v.flag[i] = false;
+                        v.clear(i);
                     }
                     for (to, from) in [
                         (TH_RDBK_ECHO, TH_RBV),
@@ -682,14 +526,22 @@ impl MlMono {
                         (TH2_DMOV_ECHO, TH2_DMOV),
                         (Z_DMOV_ECHO, Z_DMOV),
                     ] {
-                        v.set(to, v.val[from]).await;
+                        let x = v.get(from);
+                        v.set(to, x).await;
                     }
-                    if v.on(AUTO_MODE) || self.use_set_mode.load(Ordering::Acquire) {
+                    if v.on(AUTO_MODE) || v.on(USE_SET) {
                         self.put_rdbk().await;
                     }
                     let v = &mut self.v;
                     v.set(OP_ACK, 0.0).await;
+                    ctl_debug!(
+                        v,
+                        "ml_monoCtl:waitForCmndEnter: ml_monoMoving={}; ml_monoDone={}",
+                        v.get(MOVING) as i32,
+                        u8::from(self.ml_mono_done)
+                    );
                     if v.on(MOVING) && self.ml_mono_done {
+                        ctl_debug!(v, "ml_monoCtl:waitForCmndEnter: asserting 'done'.");
                         self.ml_mono_done = false;
                         v.set(MOVING, 0.0).await;
                     }
@@ -701,59 +553,91 @@ impl MlMono {
                 None
             }
             State::WaitForCmnd => {
-                if v.flag[ORDER] || v.flag[D] {
-                    v.flag[ORDER] = false;
-                    v.flag[D] = false;
+                if v.test(ORDER) || v.test(D) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:Order/D_mon");
+                    v.clear(ORDER);
+                    v.clear(D);
                     self.msg1("Layer Spacing Changed").await;
                     self.msg2(" ").await;
                     return Some(State::DInputChanged);
                 }
-                for (hi, lo, msg) in [
-                    (TH_HLM, TH_LLM, "Theta Motor Soft Limits Changed"),
-                    (TH2_HLM, TH2_LLM, "Theta2 Motor Soft Limits Changed"),
+                for (hi, lo, line, msg) in [
+                    (
+                        TH_HLM,
+                        TH_LLM,
+                        "ml_monoCtl:waitForCmnd:thetaMotXxLim_mon",
+                        "Theta Motor Soft Limits Changed",
+                    ),
+                    (
+                        TH2_HLM,
+                        TH2_LLM,
+                        "ml_monoCtl:waitForCmnd:theta2MotXxLim_mon",
+                        "Theta2 Motor Soft Limits Changed",
+                    ),
                 ] {
                     let v = &mut self.v;
-                    if v.flag[hi] || v.flag[lo] {
-                        v.flag[hi] = false;
-                        v.flag[lo] = false;
+                    if v.test(hi) || v.test(lo) {
+                        ctl_debug!(v, "{line}");
+                        v.clear(hi);
+                        v.clear(lo);
                         self.msg1(msg).await;
                         self.msg2(" ").await;
                         return Some(State::ThetaLimits);
                     }
                 }
                 let v = &mut self.v;
-                for (rbv, echo) in [(TH_RBV, TH_RDBK_ECHO), (TH2_RBV, TH2_RDBK_ECHO)] {
+                for (rbv, echo, line) in [
+                    (
+                        TH_RBV,
+                        TH_RDBK_ECHO,
+                        "ml_monoCtl:waitForCmnd:thetaMotRdbk_mon",
+                    ),
+                    (
+                        TH2_RBV,
+                        TH2_RDBK_ECHO,
+                        "ml_monoCtl:waitForCmnd:theta2MotRdbk_mon",
+                    ),
+                ] {
                     if v.test_and_clear(rbv) {
-                        v.set(echo, v.val[rbv]).await;
+                        ctl_debug!(v, "{line}");
+                        let x = v.get(rbv);
+                        v.set(echo, x).await;
                         return Some(State::UpdateRdbk);
                     }
                 }
                 if v.test_and_clear(E) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:E_mon");
                     return Some(State::EChanged);
                 }
                 if v.test_and_clear(LAMBDA) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:lambda_mon");
                     return Some(State::LChanged);
                 }
                 if v.test_and_clear(THETA) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:theta_mon");
                     return Some(State::ThChanged);
                 }
                 if v.on(PUT_VALS) && d.delay(0.1) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:putVals");
                     return Some(State::MoveMlMono);
                 }
                 if [E_INC, E_DEC, L_INC, L_DEC, TH_INC, TH_DEC]
                     .into_iter()
                     .any(|i| v.on(i))
                 {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:Tweak");
                     return Some(State::Tweak);
                 }
                 if v.test_and_clear(Y_OFFSET) && self.init_seq_done {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:yOffset_mon");
                     v.set(AUTO_MODE, 0.0).await;
-                    let msg = format!("y offset changed to {}", fmt_f(v.val[Y_OFFSET], 6));
+                    let msg = format!("y offset changed to {}", fmt_f(v.get(Y_OFFSET), 6));
                     self.msg1(&msg).await;
                     self.msg2("Set to Manual Mode").await;
                     return Some(State::CalcMovements);
                 }
                 if v.on(OP_ACK) {
+                    ctl_debug!(v, "ml_monoCtl:waitForCmnd:opAck");
                     v.set(OP_ALERT, 0.0).await;
                     self.msg1(" ").await;
                     self.msg2(" ").await;
@@ -762,8 +646,9 @@ impl MlMono {
                 None
             }
             State::Tweak => {
-                for (inc, dec, val, step, lo, hi, msg, next) in [
+                for (line, inc, dec, val, step, lo, hi, msg, next) in [
                     (
+                        "ml_monoCtl:tweak:E+",
                         E_INC,
                         E_DEC,
                         E,
@@ -774,6 +659,7 @@ impl MlMono {
                         State::EChanged,
                     ),
                     (
+                        "ml_monoCtl:tweak:L",
                         L_INC,
                         L_DEC,
                         LAMBDA,
@@ -784,6 +670,7 @@ impl MlMono {
                         State::LChanged,
                     ),
                     (
+                        "ml_monoCtl:tweak:th",
                         TH_INC,
                         TH_DEC,
                         THETA,
@@ -798,40 +685,46 @@ impl MlMono {
                     if !(v.on(inc) || v.on(dec)) {
                         continue;
                     }
+                    ctl_debug!(v, "{line}");
                     let sign = if v.on(inc) { 1.0 } else { -1.0 };
-                    let temp = v.val[val] + v.val[step] * sign;
-                    if (temp >= v.val[lo]) && (temp <= v.val[hi]) {
+                    let temp = v.get(val) + v.get(step) * sign;
+                    if (temp >= v.get(lo)) && (temp <= v.get(hi)) {
                         v.set(val, temp).await;
                     } else {
                         self.msg1(msg).await;
                         self.v.set(OP_ALERT, 1.0).await;
                     }
                     let v = &mut self.v;
-                    v.set(if v.on(inc) { inc } else { dec }, 0.0).await;
+                    let pressed = if v.on(inc) { inc } else { dec };
+                    v.set(pressed, 0.0).await;
                     return Some(next);
                 }
                 None
             }
             State::DInputChanged => {
+                ctl_debug!(v, "ml_monoCtl:dInputChanged");
                 v.set(AUTO_MODE, 0.0).await;
                 self.msg2("Set to Manual Mode").await;
-                let (two_d, alert, msg) = calc_2d_spacing(self.v.val[D], self.v.val[ORDER]);
+                let (two_d, alert, msg) = calc_2d_spacing(self.v.get(D), self.v.get(ORDER));
                 self.two_d = two_d;
-                self.v.val[OP_ALERT] = f64::from(u8::from(alert));
+                self.v.assign(OP_ALERT, f64::from(u8::from(alert)));
                 self.msg1(&msg).await;
                 self.put_e_lambda_limits().await;
                 self.v.put(OP_ALERT).await;
                 Some(State::ThChanged)
             }
             State::ThetaLimits => {
-                v.val[THETA_HI] = v.val[TH_HLM];
-                v.val[THETA_LO] = v.val[TH_LLM];
-                if v.val[THETA_HI] > 89.0 {
-                    v.val[THETA_HI] = 89.0;
+                ctl_debug!(v, "ml_monoCtl:thetaLimits");
+                let x = v.get(TH_HLM);
+                v.assign(THETA_HI, x);
+                let x = v.get(TH_LLM);
+                v.assign(THETA_LO, x);
+                if v.get(THETA_HI) > 89.0 {
+                    v.assign(THETA_HI, 89.0);
                     self.msg2("ThetaHiLim > 89 deg. (Using 89 deg.)").await;
                 }
-                if self.v.val[THETA_LO] < 0.1 {
-                    self.v.val[THETA_LO] = 0.1;
+                if self.v.get(THETA_LO) < 0.1 {
+                    self.v.assign(THETA_LO, 0.1);
                     self.msg2("ThetaLoLim < 0.1 deg. (Using 0.1 deg.)").await;
                 }
                 self.v.put(THETA_HI).await;
@@ -840,27 +733,33 @@ impl MlMono {
                 Some(State::CheckDone)
             }
             State::EChanged => {
-                v.set(LAMBDA, HC / v.val[E]).await;
+                ctl_debug!(v, "ml_monoCtl:eChanged");
+                let x = HC / v.get(E);
+                v.set(LAMBDA, x).await;
                 Some(State::LChanged)
             }
             State::LChanged => {
-                if v.val[LAMBDA] > self.two_d {
+                if v.get(LAMBDA) > self.two_d {
+                    ctl_debug!(v, "ml_monoCtl:lChanged: lambda>2*D");
                     self.msg1("Wavelength > 2d spacing.").await;
                     self.v.set(OP_ALERT, 1.0).await;
                 } else {
-                    let theta = RAD_CONV * (v.val[LAMBDA] / self.two_d).asin();
+                    ctl_debug!(v, "ml_monoCtl:lChanged");
+                    let theta = RAD_CONV * (v.get(LAMBDA) / self.two_d).asin();
                     v.set(THETA, theta).await;
                 }
                 Some(State::ThChanged)
             }
             State::ThChanged => {
-                if (v.val[THETA] <= v.val[THETA_LO]) || (v.val[THETA] >= v.val[THETA_HI]) {
+                ctl_debug!(v, "ml_monoCtl:thChanged");
+                if (v.get(THETA) <= v.get(THETA_LO)) || (v.get(THETA) >= v.get(THETA_HI)) {
                     self.msg1("Theta constrained to LIMIT").await;
                     self.v.set(OP_ALERT, 1.0).await;
                     self.v.set(AUTO_MODE, 0.0).await;
                     self.msg2("Set to Manual Mode").await;
                 }
-                let lambda = self.lambda_of(self.v.val[THETA]);
+                let theta = self.v.get(THETA);
+                let lambda = self.lambda_of(theta);
                 let v = &mut self.v;
                 v.set(LAMBDA, lambda).await;
                 v.set(E, HC / lambda).await;
@@ -868,13 +767,15 @@ impl MlMono {
                 Some(State::CalcMovements)
             }
             State::CalcMovements => {
-                let theta = v.val[THETA];
-                v.val[TH_DESIRED] = theta;
-                v.val[TH2_DESIRED] = theta;
+                ctl_debug!(v, "ml_monoCtl:calcMovements");
+                let theta = v.get(THETA);
+                v.assign(TH_DESIRED, theta);
+                v.assign(TH2_DESIRED, theta);
                 // geom is 1 whatever GEOM says (ml_monoCtl.st:593).
-                v.val[Z_DESIRED] = v.val[Y_OFFSET] / (2.0 * theta / RAD_CONV).tan();
-                let z = v.val[Z_DESIRED];
-                if v.val[CC_MODE] != MODE_FREEZE_Z && ((z < v.val[Z_LLM]) || (z > v.val[Z_HLM])) {
+                let x = v.get(Y_OFFSET) / (2.0 * theta / RAD_CONV).tan();
+                v.assign(Z_DESIRED, x);
+                let z = v.get(Z_DESIRED);
+                if v.get(CC_MODE) != MODE_FREEZE_Z && ((z < v.get(Z_LLM)) || (z > v.get(Z_HLM))) {
                     self.msg1("Z will exceed soft limits").await;
                     self.msg2("Setting to Manual Mode").await;
                     self.v.set(OP_ALERT, 1.0).await;
@@ -884,39 +785,43 @@ impl MlMono {
                 for i in [TH_DESIRED, TH2_DESIRED, Z_DESIRED] {
                     v.put(i).await;
                 }
-                self.old_th_speed = v.val[TH_SPEED];
-                self.old_th2_speed = v.val[TH2_SPEED];
-                self.old_z_speed = v.val[Z_SPEED];
-                let z_dist = (z - v.val[Z_RBV]).abs();
-                let th_dist = (theta - v.val[TH_RBV]).abs();
-                let mut z_time = z_dist / v.val[Z_SPEED];
-                let th_time = th_dist / v.val[TH_SPEED];
-                if v.val[CC_MODE] == MODE_FREEZE_Z {
+                self.old_th_speed = v.get(TH_SPEED);
+                self.old_th2_speed = v.get(TH2_SPEED);
+                self.old_z_speed = v.get(Z_SPEED);
+                let z_dist = (z - v.get(Z_RBV)).abs();
+                let th_dist = (theta - v.get(TH_RBV)).abs();
+                let mut z_time = z_dist / v.get(Z_SPEED);
+                let th_time = th_dist / v.get(TH_SPEED);
+                if v.get(CC_MODE) == MODE_FREEZE_Z {
                     z_time = 0.0;
                 }
                 if th_time >= z_time {
-                    self.new_th_speed = v.val[TH_SPEED];
+                    self.new_th_speed = v.get(TH_SPEED);
                     self.new_z_speed = z_dist / th_time;
                 } else {
                     self.new_th_speed = th_dist / z_time;
-                    self.new_z_speed = v.val[Z_SPEED];
+                    self.new_z_speed = v.get(Z_SPEED);
                 }
                 Some(State::MoveMlMono)
             }
             State::MoveMlMono => {
-                if v.on(AUTO_MODE) || v.on(PUT_VALS) || self.use_set_mode.load(Ordering::Acquire) {
-                    let normal = v.val[CC_MODE] == MODE_NORMAL;
-                    v.val[TH_SPEED] = self.new_th_speed;
-                    v.val[TH2_SPEED] = self.new_th_speed;
-                    v.val[Z_SPEED] = self.new_z_speed;
+                if v.on(AUTO_MODE) || v.on(PUT_VALS) || v.on(USE_SET) {
+                    ctl_debug!(v, "ml_monoCtl:move_ml_mono:auto|put");
+                    let normal = v.get(CC_MODE) == MODE_NORMAL;
+                    v.assign(TH_SPEED, self.new_th_speed);
+                    v.assign(TH2_SPEED, self.new_th_speed);
+                    v.assign(Z_SPEED, self.new_z_speed);
                     v.put(TH_SPEED).await;
                     v.put(TH2_SPEED).await;
                     if normal {
                         v.put(Z_SPEED).await;
                     }
-                    v.val[TH_CMD] = v.val[TH_DESIRED];
-                    v.val[TH2_CMD] = v.val[TH2_DESIRED];
-                    v.val[Z_CMD] = v.val[Z_DESIRED];
+                    let x = v.get(TH_DESIRED);
+                    v.assign(TH_CMD, x);
+                    let x = v.get(TH2_DESIRED);
+                    v.assign(TH2_CMD, x);
+                    let x = v.get(Z_DESIRED);
+                    v.assign(Z_CMD, x);
                     v.put(TH_CMD).await;
                     v.put(TH2_CMD).await;
                     if normal {
@@ -926,69 +831,98 @@ impl MlMono {
                     self.caused_move = true;
                     return Some(State::UpdateRdbk);
                 }
+                ctl_debug!(v, "ml_monoCtl:move_ml_mono");
                 Some(State::WaitForCmndEnter)
             }
             State::CheckDone => {
                 if v.on(TH_DMOV) && v.on(TH2_DMOV) && v.on(Z_DMOV) {
+                    ctl_debug!(v, "ml_monoCtl:checkDone: done");
                     self.ml_mono_done = true;
                     return Some(State::WaitForCmndEnter);
                 }
+                ctl_debug!(v, "ml_monoCtl:checkDone: not done");
                 Some(State::UpdateRdbk)
             }
             State::UpdateRdbk => {
                 let all_done = v.on(TH_DMOV) && v.on(TH2_DMOV) && v.on(Z_DMOV);
-                if v.val[TH_RBV] == 0.0 || v.val[TH2_RBV] == 0.0 {
+                if v.get(TH_RBV) == 0.0 || v.get(TH2_RBV) == 0.0 {
+                    ctl_debug!(v, "ml_monoCtl:updateRdbk:thetaMotRdbk==0");
                     self.msg1("Theta Motor Readback is 0 !").await;
                     self.msg2(" ").await;
                     self.v.set(OP_ALERT, 1.0).await;
                     return Some(State::WaitForCmndEnter);
                 }
                 if all_done {
+                    ctl_debug!(
+                        v,
+                        "ml_monoCtl:updateRdbk:*Dmov (done={},moving={})",
+                        u8::from(self.ml_mono_done),
+                        v.get(MOVING) as i32
+                    );
                     self.put_rdbk().await;
                     self.ml_mono_done = true;
-                    self.pseudo.theta.store(true, Ordering::Release);
-                    self.v.flag[TH_RBV] = false;
-                    self.pseudo.theta2.store(true, Ordering::Release);
-                    self.v.flag[TH2_RBV] = false;
-                    self.pseudo.wake.notify_one();
+                    self.pseudo.theta.set();
+                    self.v.clear(TH_RBV);
+                    self.pseudo.theta2.set();
+                    self.v.clear(TH2_RBV);
+                    ctl_debug!(self.v, "ml_monoCtl:updateRdbk: done");
                     return Some(State::ThetaMotStopped);
                 }
                 let v = &mut self.v;
                 if v.on(TH_HLS) || v.on(TH_LLS) || v.on(TH2_HLS) || v.on(TH2_LLS) {
+                    ctl_debug!(v, "ml_monoCtl:updateRdbk: Th limit switch");
                     self.limit_switch("Theta Motor hit a limit switch!").await;
                     return Some(State::StopMlMono);
                 }
-                if (v.val[CC_MODE] != MODE_FREEZE_Z) && (v.on(Z_HLS) || v.on(Z_LLS)) {
+                if (v.get(CC_MODE) != MODE_FREEZE_Z) && (v.on(Z_HLS) || v.on(Z_LLS)) {
+                    ctl_debug!(v, "ml_monoCtl:updateRdbk: Z limit switch");
                     self.limit_switch("Z Motor hit a limit switch!").await;
                     return Some(State::StopMlMono);
                 }
                 if d.delay(0.1) {
+                    if v.get(DEBUG) > 1.0 {
+                        println!("ml_monoCtl:updateRdbk:moving");
+                    }
                     self.put_rdbk().await;
                     let v = &mut self.v;
-                    v.set(TH_RDBK_ECHO, v.val[TH_RBV]).await;
-                    v.set(TH2_RDBK_ECHO, v.val[TH2_RBV]).await;
+                    let x = v.get(TH_RBV);
+                    v.set(TH_RDBK_ECHO, x).await;
+                    let x = v.get(TH2_RBV);
+                    v.set(TH2_RDBK_ECHO, x).await;
                     return Some(State::UpdateRdbk);
                 }
                 None
             }
             State::ThetaMotStopped => {
                 if self.caused_move {
-                    v.val[TH_SPEED] = self.old_th_speed;
-                    v.val[TH2_SPEED] = self.old_th2_speed;
-                    v.val[Z_SPEED] = self.old_z_speed;
+                    ctl_debug!(
+                        v,
+                        "ml_monoCtl:thetaMotStopped:causedMove (done={},moving={})",
+                        u8::from(self.ml_mono_done),
+                        v.get(MOVING) as i32
+                    );
+                    v.assign(TH_SPEED, self.old_th_speed);
+                    v.assign(TH2_SPEED, self.old_th2_speed);
+                    v.assign(Z_SPEED, self.old_z_speed);
                     for i in [TH_SPEED, TH2_SPEED, Z_SPEED] {
                         v.put(i).await;
                     }
                     self.caused_move = false;
                     return Some(State::WaitForCmndEnter);
                 }
+                ctl_debug!(
+                    v,
+                    "ml_monoCtl:thetaMotStopped:!causedMove (done={},moving={})",
+                    u8::from(self.ml_mono_done),
+                    v.get(MOVING) as i32
+                );
                 if self.init_seq_done {
                     v.set(OP_ALERT, 1.0).await;
                     self.msg1("Only Theta Motor Moved").await;
                     self.msg2("Hit MOVE to Adjust Z").await;
                     self.v.set(AUTO_MODE, 0.0).await;
                 }
-                let theta = self.v.val[TH_RBV];
+                let theta = self.v.get(TH_RBV);
                 self.v.set(THETA, theta).await;
                 let lambda = self.lambda_of(theta);
                 self.v.set(LAMBDA, lambda).await;
@@ -996,39 +930,39 @@ impl MlMono {
                 Some(State::ThChanged)
             }
             State::ChkMotorLimits => {
-                v.val[OP_ALERT] = 0.0;
+                ctl_debug!(v, "ml_monoCtl:chkMotorLimits");
+                v.assign(OP_ALERT, 0.0);
                 self.put_rdbk().await;
-                let v = &self.v;
-                let rbv = |i| v.val[i];
+                let v = &mut self.v;
                 let mut msgs = Vec::new();
-                if v.val[CC_MODE] != MODE_FREEZE_Z {
-                    if rbv(Z_RBV) == 0.0 {
+                if v.get(CC_MODE) != MODE_FREEZE_Z {
+                    if v.get(Z_RBV) == 0.0 {
                         msgs.push("Z Readback of 0 not reasonable");
                     }
-                    if (rbv(Z_RBV) < v.val[Z_LLM]) || (rbv(Z_RBV) > v.val[Z_HLM]) {
+                    if (v.get(Z_RBV) < v.get(Z_LLM)) || (v.get(Z_RBV) > v.get(Z_HLM)) {
                         msgs.push("Z Readback outside Motor Limits");
                     }
                 }
-                if rbv(Y_RBV) == 0.0 {
+                if v.get(Y_RBV) == 0.0 {
                     msgs.push("Y Readback of 0 not reasonable");
                 }
-                if rbv(TH_RBV) == 0.0 {
+                if v.get(TH_RBV) == 0.0 {
                     msgs.push("Theta Readback of 0 not reasonable");
                 }
-                if (rbv(TH_RBV) < v.val[TH_LLM]) || (rbv(TH_RBV) > v.val[TH_HLM]) {
+                if (v.get(TH_RBV) < v.get(TH_LLM)) || (v.get(TH_RBV) > v.get(TH_HLM)) {
                     msgs.push("Theta Readback outside Motor Limits");
                 }
-                if rbv(TH2_RBV) == 0.0 {
+                if v.get(TH2_RBV) == 0.0 {
                     msgs.push("Theta2 Readback of 0 not reasonable");
                 }
-                if (rbv(TH2_RBV) < v.val[TH2_LLM]) || (rbv(TH2_RBV) > v.val[TH2_HLM]) {
+                if (v.get(TH2_RBV) < v.get(TH2_LLM)) || (v.get(TH2_RBV) > v.get(TH2_HLM)) {
                     msgs.push("Theta2 Readback outside Motor Limits");
                 }
                 for msg in &msgs {
                     self.msg1(msg).await;
                 }
                 if !msgs.is_empty() {
-                    self.v.val[OP_ALERT] = 1.0;
+                    self.v.assign(OP_ALERT, 1.0);
                     self.v.put(OP_ALERT).await;
                     self.v.set(AUTO_MODE, 0.0).await;
                     self.msg2("Set to Manual Mode").await;
@@ -1037,11 +971,13 @@ impl MlMono {
             }
             State::ChkMotorLimitsExit => {
                 if !v.on(OP_ALERT) {
+                    ctl_debug!(v, "ml_monoCtl:chkMotorLimitsExit: OK");
                     v.put(OP_ALERT).await;
                     self.msg1("All motors within limits").await;
                     return Some(State::WaitForCmndEnter);
                 }
                 if d.delay(2.0) {
+                    ctl_debug!(v, "ml_monoCtl:chkMotorLimitsExit: opAlert");
                     v.put(OP_ALERT).await;
                     self.msg2("Modify Motor Positions/Limits").await;
                     return Some(State::ChkMotorLimits);
@@ -1049,23 +985,30 @@ impl MlMono {
                 None
             }
             State::StopMlMono => {
+                ctl_debug!(v, "ml_monoCtl:stop_ml_mono");
                 for i in [TH_STOP, TH2_STOP, Z_STOP] {
                     v.put(i).await;
                 }
                 Some(State::StoppedMlMonoWait)
             }
-            State::StoppedMlMonoWait => d.delay(1.0).then_some(State::UpdateRdbk),
+            State::StoppedMlMonoWait => {
+                if d.delay(1.0) {
+                    ctl_debug!(v, "ml_monoCtl:stopped_ml_monoWait");
+                    return Some(State::UpdateRdbk);
+                }
+                None
+            }
         }
     }
 
     /// `thetaRdbk = thetaMotRdbk; lambdaRdbk = ...; ERdbk = ...` and their puts.
     async fn put_rdbk(&mut self) {
-        let theta = self.v.val[TH_RBV];
+        let theta = self.v.get(TH_RBV);
         let lambda = self.lambda_of(theta);
         let v = &mut self.v;
-        v.val[THETA_RDBK] = theta;
-        v.val[LAMBDA_RDBK] = lambda;
-        v.val[E_RDBK] = HC / lambda;
+        v.assign(THETA_RDBK, theta);
+        v.assign(LAMBDA_RDBK, lambda);
+        v.assign(E_RDBK, HC / lambda);
         for i in [THETA_RDBK, LAMBDA_RDBK, E_RDBK] {
             v.put(i).await;
         }
@@ -1073,8 +1016,8 @@ impl MlMono {
 
     /// lambdaHi/Lo from thetaHi/Lo, then EHi/Lo, each put.
     async fn put_e_lambda_limits(&mut self) {
-        let hi = self.lambda_of(self.v.val[THETA_HI]);
-        let lo = self.lambda_of(self.v.val[THETA_LO]);
+        let (hi, lo) = (self.v.get(THETA_HI), self.v.get(THETA_LO));
+        let (hi, lo) = (self.lambda_of(hi), self.lambda_of(lo));
         let v = &mut self.v;
         v.set(LAMBDA_HI, hi).await;
         v.set(LAMBDA_LO, lo).await;

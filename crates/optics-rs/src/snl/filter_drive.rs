@@ -349,7 +349,8 @@ pub(super) const MBBO_STATE_FIELDS: [&str; 16] = [
 /// One channel per blade field the program assigns.
 struct BladeChannels {
     thick: SeqPv,
-    mater: String,
+    /// MATER's variable name and the `mbbo` it reads.
+    mater: (String, String),
     transm: SeqPv,
     lock: SeqPv,
     set: SeqPv,
@@ -361,7 +362,7 @@ impl BladeChannels {
     async fn read(&self, queue: &PutQueue) -> Blade {
         Blade {
             thick: self.thick.get_f64().await,
-            mater: mbbo_string(queue, &self.mater).await,
+            mater: mbbo_string(queue, &self.mater.0, &self.mater.1).await,
             lock: self.lock.get_i32().await,
             set: self.set.get_i32().await,
             enbl: self.enbl.get_i32().await,
@@ -370,13 +371,18 @@ impl BladeChannels {
     }
 }
 
-async fn mbbo_string(queue: &PutQueue, record: &str) -> String {
-    let idx = queue.pv(record).get_i32().await;
+async fn mbbo_string(queue: &PutQueue, var: &str, record: &str) -> String {
+    let idx = queue.pv(var, record).get_i32().await;
     match usize::try_from(idx)
         .ok()
         .and_then(|i| MBBO_STATE_FIELDS.get(i))
     {
-        Some(field) => queue.pv(&format!("{record}.{field}")).get_string().await,
+        Some(field) => {
+            queue
+                .pv(var, &format!("{record}.{field}"))
+                .get_string()
+                .await
+        }
         None => "Illegal Value".into(),
     }
 }
@@ -438,22 +444,22 @@ pub async fn run(
     let pr = format!("{}{}", config.prefix, config.record);
     let n = config.num_filters;
     let queue = PutQueue::new(&db, "filterDrive");
-    let ch = |leaf: &str| queue.pv(&format!("{pr}{leaf}"));
+    let ch = |var: &str, leaf: &str| queue.pv(var, &format!("{pr}{leaf}"));
 
-    let ch_status = ch("Status");
-    let ch_nfilters = ch("NumFilters");
-    let ch_debug = ch("Debug");
-    let ch_trans = ch("Transmission");
-    let ch_trans_up = ch("TransmissionUp");
-    let ch_trans_down = ch("TransmissionDown");
-    let ch_mask = ch("FilterMask");
-    let ch_setpt = ch("TransmissionSetpoint");
-    let ch_mask_setpt = ch("FilterMaskSetpoint");
-    let ch_step_up = ch("TransmissionStepUp");
-    let ch_step_down = ch("TransmissionStepDown");
-    let ch_energy = ch("Energy");
-    let ch_msg = ch("Message");
-    let ch_wait_time = ch("WaitTime");
+    let ch_status = ch("STATUS_BUSY", "Status");
+    let ch_nfilters = ch("NFILTERS", "NumFilters");
+    let ch_debug = ch("DEBUG", "Debug");
+    let ch_trans = ch("TRANSMISSION", "Transmission");
+    let ch_trans_up = ch("TRANSMISSION_UP", "TransmissionUp");
+    let ch_trans_down = ch("TRANSMISSION_DOWN", "TransmissionDown");
+    let ch_mask = ch("FILTER_MASK", "FilterMask");
+    let ch_setpt = ch("TRANSM_SETPT", "TransmissionSetpoint");
+    let ch_mask_setpt = ch("FILTERMASK_SETPT", "FilterMaskSetpoint");
+    let ch_step_up = ch("TRANSM_UP", "TransmissionStepUp");
+    let ch_step_down = ch("TRANSM_DN", "TransmissionStepDown");
+    let ch_energy = ch("ENERGY", "Energy");
+    let ch_msg = ch("MSGE", "Message");
+    let ch_wait_time = ch("FILTER_WAIT_TIME", "WaitTime");
 
     // `start` (`filterDrive.st:327-372`).
     let mut prog = FilterDrive {
@@ -462,14 +468,20 @@ pub async fn run(
     };
     sleep_secs(1.0).await;
     let blades_ch: Vec<BladeChannels> = (1..=n)
-        .map(|i| BladeChannels {
-            thick: queue.pv(&config.blade_pv(i, "Thickness")),
-            mater: config.blade_pv(i, "Material"),
-            transm: queue.pv(&config.blade_pv(i, "Transmission")),
-            lock: queue.pv(&config.blade_pv(i, "Lock")),
-            set: queue.pv(&config.blade_pv(i, "Set")),
-            enbl: queue.pv(&config.blade_pv(i, "Enable")),
-            outget: queue.pv(&config.blade_pv(i, "OutGet")),
+        .map(|i| {
+            // snc names an element of an array assigned to a list `VAR[i]`.
+            let blade = |var: &str, leaf: &str| {
+                queue.pv(&format!("{var}[{}]", i - 1), &config.blade_pv(i, leaf))
+            };
+            BladeChannels {
+                thick: blade("THICK", "Thickness"),
+                mater: (format!("MATER[{}]", i - 1), config.blade_pv(i, "Material")),
+                transm: blade("TRANSM", "Transmission"),
+                lock: blade("LOCK", "Lock"),
+                set: blade("SET", "Set"),
+                enbl: blade("ENBL", "Enable"),
+                outget: blade("OUTGET", "OutGet"),
+            }
         })
         .collect();
     let names = Names {

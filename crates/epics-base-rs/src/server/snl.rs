@@ -133,14 +133,14 @@ impl PutQueue {
         }
     }
 
-    /// The channel to `name`.
-    pub fn pv(&self, name: &str) -> SeqPv {
-        self.set.pv(name)
+    /// See [`StateSet::pv`].
+    pub fn pv(&self, var: &str, name: &str) -> SeqPv {
+        self.set.pv(var, name)
     }
 
     /// See [`StateSet::pv_with_origin`].
-    pub fn pv_with_origin(&self, name: &str, origin: u64) -> SeqPv {
-        self.set.pv_with_origin(name, origin)
+    pub fn pv_with_origin(&self, var: &str, name: &str, origin: u64) -> SeqPv {
+        self.set.pv_with_origin(var, name, origin)
     }
 
     /// See [`StateSet::flush`].
@@ -174,17 +174,20 @@ pub struct StateSet {
 }
 
 impl StateSet {
-    /// The channel to `name`.
-    pub fn pv(&self, name: &str) -> SeqPv {
-        self.pv_with_origin(name, 0)
+    /// The program variable `var` assigned to `name` — snc's `varName`,
+    /// with `[i]` for an element of an array assigned to a list
+    /// (`gen_tables.c`), which `check_pending`'s messages print.
+    pub fn pv(&self, var: &str, name: &str) -> SeqPv {
+        self.pv_with_origin(var, name, 0)
     }
 
-    /// The channel to `name`, its puts tagged with `origin` as
+    /// [`Self::pv`], its puts tagged with `origin` as
     /// [`crate::server::database::db_access::DbChannel::with_origin`] tags them.
-    pub fn pv_with_origin(&self, name: &str, origin: u64) -> SeqPv {
+    pub fn pv_with_origin(&self, var: &str, name: &str, origin: u64) -> SeqPv {
         SeqPv {
             db: self.db.clone(),
             ss: self.ss.clone(),
+            var: var.into(),
             name: name.into(),
             origin,
             tx: self.tx.clone(),
@@ -279,6 +282,7 @@ async fn serve(
 pub struct SeqPv {
     db: PvDatabase,
     ss: Arc<str>,
+    var: Arc<str>,
     name: Arc<str>,
     origin: u64,
     tx: mpsc::UnboundedSender<Request>,
@@ -329,7 +333,7 @@ impl SeqPv {
         if tmo.is_zero() {
             self.report(format_args!(
                 "pvPut({},SYNC,{:.6}): user error (timeout must be positive)",
-                self.name,
+                self.var,
                 tmo.as_secs_f64()
             ));
             return Err(PvStat::Error);
@@ -342,7 +346,7 @@ impl SeqPv {
         {
             self.report(format_args!(
                 "pvPut(ss {}, var {}, pv {}): failed (timeout waiting for other pvPut requests to finish)",
-                self.ss, self.name, self.name
+                self.ss, self.var, self.name
             ));
             return Err(PvStat::Timeout);
         }
@@ -372,7 +376,7 @@ impl SeqPv {
         if self.slot.borrow().is_some() {
             self.report(format_args!(
                 "pvPut(ss {}, var {}, pv {}): user error (there is already a pvPut pending for this channel/state set combination)",
-                self.ss, self.name, self.name
+                self.ss, self.var, self.name
             ));
             return Err(PvStat::Error);
         }
@@ -577,7 +581,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_default_put_returns_while_the_record_is_locked() {
         let (db, q) = circuit().await;
-        let a = q.pv("A");
+        let a = q.pv("a", "A");
         let held = db.lock_for_put("A", "VAL", &EpicsValue::Double(0.0));
         assert_eq!(a.put(EpicsValue::Double(4.0)), Ok(()));
         std::thread::sleep(Duration::from_millis(100));
@@ -589,7 +593,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_get_after_default_puts_reads_the_last_of_them() {
         let (_db, q) = circuit().await;
-        let a = q.pv("A");
+        let a = q.pv("a", "A");
         for v in 1..=50 {
             a.put(EpicsValue::Double(f64::from(v))).unwrap();
         }
@@ -600,7 +604,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_flush_returns_with_the_puts_before_it_taken() {
         let (db, q) = circuit().await;
-        let a = q.pv("A");
+        let a = q.pv("a", "A");
         for v in 1..=50 {
             a.put(EpicsValue::Double(f64::from(v))).unwrap();
         }
@@ -612,8 +616,8 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn another_state_set_reads_behind_the_puts_of_the_first() {
         let (_db, q) = circuit().await;
-        let a = q.pv("A");
-        let other = q.state_set("other").pv("A");
+        let a = q.pv("a", "A");
+        let other = q.state_set("other").pv("a", "A");
         for v in 1..=50 {
             a.put(EpicsValue::Double(f64::from(v))).unwrap();
         }
@@ -625,8 +629,8 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_pending_put_refuses_only_its_own_state_set() {
         let (db, q) = circuit().await;
-        let b = q.pv("B");
-        let other = q.state_set("other").pv("B");
+        let b = q.pv("b", "B");
+        let other = q.state_set("other").pv("b", "B");
         b.put_async(EpicsValue::Short(1)).unwrap();
         assert_eq!(b.put_async(EpicsValue::Short(1)), Err(PvStat::Error));
         assert_eq!(other.put_async(EpicsValue::Short(1)), Ok(()));
@@ -636,7 +640,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_put_to_no_record_is_disconnected() {
         let (_db, q) = circuit().await;
-        let x = q.pv("X");
+        let x = q.pv("x", "X");
         assert_eq!(x.put(EpicsValue::Double(1.0)), Err(PvStat::Disconn));
         assert_eq!(x.put_async(EpicsValue::Double(1.0)), Err(PvStat::Disconn));
         assert_eq!(
@@ -649,7 +653,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_sync_put_to_a_synchronous_record_completes_at_once() {
         let (db, mut q) = circuit().await;
-        let a = q.pv("A");
+        let a = q.pv("a", "A");
         assert_eq!(a.put_sync(EpicsValue::Double(3.0)).await, Ok(()));
         assert_eq!(f64_of(&db, "A"), 3.0);
         assert!(a.put_complete());
@@ -659,7 +663,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_sync_put_waits_for_the_record_to_finish() {
         let (db, mut q) = circuit().await;
-        let b = q.pv("B");
+        let b = q.pv("b", "B");
         let resetter = db.clone();
         let reset = crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
@@ -678,7 +682,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn a_sync_put_times_out_and_its_late_completion_is_ignored() {
         let (db, mut q) = circuit().await;
-        let b = q.pv("B");
+        let b = q.pv("b", "B");
         assert_eq!(
             b.put_sync_tmo(EpicsValue::Short(1), Duration::from_millis(200))
                 .await,
@@ -693,7 +697,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn an_async_put_is_refused_while_one_is_pending() {
         let (db, mut q) = circuit().await;
-        let b = q.pv("B");
+        let b = q.pv("b", "B");
         assert_eq!(b.put_async(EpicsValue::Short(1)), Ok(()));
         assert!(!b.put_complete());
         assert_eq!(b.put_async(EpicsValue::Short(1)), Err(PvStat::Error));
@@ -703,10 +707,39 @@ mod tests {
         assert_eq!(b.put_async(EpicsValue::Short(1)), Ok(()));
     }
 
+    /// `check_pending` names the program variable and the PV apart
+    /// (`seq_if.c:89-136`).
+    #[epics_macros_rs::epics_test]
+    async fn the_refusals_print_the_variable_and_the_pv() {
+        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+        let (db, q) = circuit().await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+        let b = q.pv("motTTH", "B");
+        b.put_async(EpicsValue::Short(1)).unwrap();
+        let _ = b.put_async(EpicsValue::Short(1));
+        let _ = b
+            .put_sync_tmo(EpicsValue::Short(1), Duration::from_millis(50))
+            .await;
+        let _ = b.put_sync_tmo(EpicsValue::Short(1), Duration::ZERO).await;
+        errlog_flush();
+        errlog_remove_listener(id);
+        release(&db).await;
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "sevr=major pvPut(ss ss, var motTTH, pv B): user error (there is already a pvPut pending for this channel/state set combination)",
+                "sevr=major pvPut(ss ss, var motTTH, pv B): failed (timeout waiting for other pvPut requests to finish)",
+                "sevr=major pvPut(motTTH,SYNC,0.000000): user error (timeout must be positive)",
+            ]
+        );
+    }
+
     #[epics_macros_rs::epics_test]
     async fn a_sync_put_waits_out_a_pending_async_put() {
         let (db, q) = circuit().await;
-        let b = q.pv("B");
+        let b = q.pv("b", "B");
         b.put_async(EpicsValue::Short(1)).unwrap();
         assert_eq!(
             b.put_sync_tmo(EpicsValue::Short(0), Duration::from_millis(200))

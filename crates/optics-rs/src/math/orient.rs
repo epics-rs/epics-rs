@@ -216,24 +216,26 @@ pub fn calc_omtx(
 /// Check orientation matrix consistency.
 ///
 /// Returns error in degrees between expected and calculated directions
-/// for the second reflection.
+/// for the second reflection: NaN where C's zero vectors divide by a zero
+/// norm (orient.c:289-312).
 pub fn check_omtx(
     v2_hkl: &Vec3,
     v2_angles: &[f64; 4],
     a0: &Mat3,
     a0_inv: &Mat3,
     o_inv: &Mat3,
-) -> Option<f64> {
+) -> f64 {
     let v2p = mult_mat_vec(a0, v2_hkl);
     let norm = dot(&v2p, &v2p).sqrt();
     let v2p: Vec3 = [v2p[0] / norm, v2p[1] / norm, v2p[2] / norm];
 
-    let v2pp_hkl = angles_to_hkl(v2_angles, o_inv, a0_inv)?;
+    // angles_to_HKL leaves zeros when it fails.
+    let v2pp_hkl = angles_to_hkl(v2_angles, o_inv, a0_inv).unwrap_or([0.0; 3]);
     let v2pp = mult_mat_vec(a0, &v2pp_hkl);
     let norm = dot(&v2pp, &v2pp).sqrt();
     let v2pp: Vec3 = [v2pp[0] / norm, v2pp[1] / norm, v2pp[2] / norm];
 
-    Some(dot(&v2p, &v2pp).acos() / D2R)
+    dot(&v2p, &v2pp).acos() / D2R
 }
 
 #[cfg(test)]
@@ -514,7 +516,7 @@ mod tests {
             calc_omtx(&v1_hkl, &v1_angles, &v2_hkl, &v2_angles, &a0, &a0_inv).unwrap();
 
         // Check OMTX consistency
-        let err = check_omtx(&v2_hkl, &v2_angles, &a0, &a0_inv, &omtx_inv).unwrap();
+        let err = check_omtx(&v2_hkl, &v2_angles, &a0, &a0_inv, &omtx_inv);
         assert!(err < 0.1, "OMTX check error: {err} degrees");
 
         // Use OMTX to convert (1,2,3) and verify round-trip
@@ -530,5 +532,12 @@ mod tests {
                 hkl_back[i]
             );
         }
+    }
+
+    /// a=0 makes A0 NaN, which invertArray's `fabs(det) > SMALL` refuses
+    /// (C calc_A0 returns -1).
+    #[test]
+    fn a_zero_a_fails_calc_a0() {
+        assert!(calc_a0(0.0, 5.431, 5.431, 90.0, 90.0, 90.0, 0.5725).is_none());
     }
 }

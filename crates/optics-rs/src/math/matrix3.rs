@@ -59,10 +59,11 @@ pub fn determinant(a: &Mat3) -> f64 {
 }
 
 /// Invert a 3×3 matrix using Cramer's rule.
-/// Returns `None` if the matrix is singular (|det| ≤ SMALL).
+/// Returns `None` unless |det| > SMALL, which a NaN determinant fails as
+/// it does C's test (matrix3.c:91).
 pub fn invert(a: &Mat3) -> Option<Mat3> {
     let det = determinant(a);
-    if det.abs() <= SMALL {
+    if det.abs().partial_cmp(&SMALL) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
     let inv_det = 1.0 / det;

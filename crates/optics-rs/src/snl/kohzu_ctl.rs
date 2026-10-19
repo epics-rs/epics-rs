@@ -8,15 +8,16 @@
 //! Supports Normal, Channel-Cut, Freeze-Z, and Freeze-Y operating modes.
 //! Supports Auto and Manual modes, plus Set/Use calibration mode.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
+use epics_base_rs::calc::engine::cvt::fmt_f;
 use epics_base_rs::server::database::PvDatabase;
-use tracing::info;
 
-use crate::db_access::{DbMultiMonitor, alloc_origin};
+use crate::db_access::alloc_origin;
+use crate::snl::vars::{
+    DOUBLE, DOUBLE_MON, DOUBLE_SYNC, Decl, Delays, EventFlag, SHORT, SHORT_MON, SHORT_SYNC, Vars,
+    ctl_debug,
+};
 use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 
 // ---------------------------------------------------------------------------
@@ -26,46 +27,8 @@ use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 /// Planck constant * speed of light in keV*Angstrom.
 pub const HC: f64 = 12.3984244;
 
-/// Degrees per radian.
-pub const RAD_CONV: f64 = 57.29577951308232;
-
-// ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
-
-/// Crystal mode (ccMode / Mode2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrystalMode {
-    /// Normal -- all motors move.
-    Normal = 0,
-    /// Channel-cut -- Y and Z frozen.
-    ChannelCut = 1,
-    /// Freeze Z only.
-    FreezeZ = 2,
-    /// Freeze Y only.
-    FreezeY = 3,
-}
-
-impl CrystalMode {
-    pub fn from_i16(v: i16) -> Self {
-        match v {
-            1 => Self::ChannelCut,
-            2 => Self::FreezeZ,
-            3 => Self::FreezeY,
-            _ => Self::Normal,
-        }
-    }
-
-    /// Whether the Y motor is frozen in this mode.
-    pub fn y_frozen(self) -> bool {
-        matches!(self, Self::ChannelCut | Self::FreezeY)
-    }
-
-    /// Whether the Z motor is frozen in this mode.
-    pub fn z_frozen(self) -> bool {
-        matches!(self, Self::ChannelCut | Self::FreezeZ)
-    }
-}
+/// Degrees per radian, rounded as C's radConv (kohzuCtl.st:525).
+pub const RAD_CONV: f64 = 57.2958;
 
 // ---------------------------------------------------------------------------
 // Monochromator geometry
@@ -91,42 +54,14 @@ impl Geometry {
 }
 
 // ---------------------------------------------------------------------------
-// State enum
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KohzuState {
-    Init,
-    InitSequence,
-    WaitForCommand,
-    DInputChanged,
-    ThetaLimits,
-    EChanged,
-    LambdaChanged,
-    ThetaChanged,
-    CalcMovements,
-    MoveKohzu,
-    UpdateReadback,
-    CheckDone,
-    ThetaMotorStopped,
-    CheckMotorLimits,
-    StopKohzu,
-}
-
-// ---------------------------------------------------------------------------
 // Pure physics functions
 // ---------------------------------------------------------------------------
 
-/// Calculate the 2d-spacing from lattice constant `a` and Miller indices (h,k,l).
-/// Returns (two_d, is_forbidden, message).
+/// kohzuCtl_calc2dSpacing (kohzuCtl.st:1439-1460): the 2d-spacing from
+/// lattice constant `a` and Miller indices (h,k,l), with opAlert and seqMsg1.
+/// All-zero HKL divides by zero as C does.
 pub fn calc_2d_spacing(a: f64, h: f64, k: f64, l: f64) -> (f64, bool, &'static str) {
-    let hkl_sq = h * h + k * k + l * l;
-    if hkl_sq <= 0.0 {
-        return (0.0, true, "Invalid (H,K,L): all zero");
-    }
-    let two_d = (2.0 * a) / hkl_sq.sqrt();
-
-    // Check for forbidden reflections (diamond cubic selection rules).
+    let two_d = (2.0 * a) / (h * h + k * k + l * l).sqrt();
     let forbidden = is_forbidden_reflection(h, k, l);
     let msg = if forbidden {
         "(H,K,L) is 'forbidden' reflection"
@@ -136,51 +71,19 @@ pub fn calc_2d_spacing(a: f64, h: f64, k: f64, l: f64) -> (f64, bool, &'static s
     (two_d, forbidden, msg)
 }
 
-/// Check diamond cubic selection rules for forbidden reflections.
+/// C's opAlert test: exact `fmod` parity, then `float avg` and `int nint`.
 pub fn is_forbidden_reflection(h: f64, k: f64, l: f64) -> bool {
-    // All must have same parity
-    let h_mod = h.rem_euclid(2.0);
-    let k_mod = k.rem_euclid(2.0);
-    let l_mod = l.rem_euclid(2.0);
-    if (h_mod - k_mod).abs() > 0.01 || (h_mod - l_mod).abs() > 0.01 {
-        return true;
+    let mut alert = h % 2.0 != k % 2.0 || h % 2.0 != l % 2.0;
+    let avg = ((h + k + l) / 2.0) as f32;
+    let nint = if avg > 0.0 {
+        (f64::from(avg) + 0.5) as i32
+    } else {
+        (f64::from(avg) - 0.5) as i32
+    };
+    if (avg - nint as f32).abs() <= 0.25 && nint % 2 != 0 {
+        alert = true;
     }
-    // Additional rule: if (h+k+l)/2 is odd and near integer, forbidden
-    let avg = (h + k + l) / 2.0;
-    let nint = avg.round();
-    if (avg - nint).abs() <= 0.25 && (nint as i64).rem_euclid(2) != 0 {
-        return true;
-    }
-    false
-}
-
-/// Convert energy (keV) to wavelength (Angstrom).
-pub fn energy_to_lambda(e: f64) -> f64 {
-    if e <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / e
-}
-
-/// Convert wavelength (Angstrom) to energy (keV).
-pub fn lambda_to_energy(lambda: f64) -> f64 {
-    if lambda <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / lambda
-}
-
-/// Convert wavelength to Bragg angle (degrees), given 2d spacing.
-/// Returns `None` if lambda > two_d (impossible reflection).
-pub fn lambda_to_theta(lambda: f64, two_d: f64) -> Option<f64> {
-    if two_d <= 0.0 || lambda <= 0.0 {
-        return None;
-    }
-    let sin_theta = lambda / two_d;
-    if !(-1.0..=1.0).contains(&sin_theta) {
-        return None;
-    }
-    Some(sin_theta.asin() * RAD_CONV)
+    alert
 }
 
 /// Convert Bragg angle (degrees) to wavelength, given 2d spacing.
@@ -203,156 +106,6 @@ pub fn calc_z_position(geom: Geometry, theta_deg: f64, y_offset: f64) -> f64 {
     match geom {
         Geometry::Standard => y_offset / theta_rad.sin(),
         Geometry::Alternate => y_offset / (2.0 * theta_rad.sin()),
-    }
-}
-
-/// Clamp theta to [lo, hi], returning (clamped_value, was_clamped).
-///
-/// The limit test is inclusive (`<=`/`>=`): theta landing exactly on a soft
-/// limit counts as constrained, matching C `(theta <= thetaLo) ||
-/// (theta >= thetaHi)` (kohzuCtl_soft.st:771, ml_monoCtl.st:852). A strict test
-/// let a move to the exact limit through without raising the constraint/alert.
-pub fn clamp_theta(theta: f64, lo: f64, hi: f64) -> (f64, bool) {
-    if theta <= lo {
-        (lo, true)
-    } else if theta >= hi {
-        (hi, true)
-    } else {
-        (theta, false)
-    }
-}
-
-/// Compute theta limits from motor limits, clamped to [1, 89] degrees.
-pub fn compute_theta_limits(motor_hi: f64, motor_lo: f64) -> (f64, f64) {
-    let hi = motor_hi.min(89.0);
-    let lo = motor_lo.max(1.0);
-    (hi, lo)
-}
-
-/// Compute energy/lambda limits from 2d spacing and theta limits.
-pub fn compute_energy_lambda_limits(
-    two_d: f64,
-    theta_hi: f64,
-    theta_lo: f64,
-) -> (f64, f64, f64, f64) {
-    let lambda_hi = two_d * (theta_hi / RAD_CONV).sin();
-    let lambda_lo = two_d * (theta_lo / RAD_CONV).sin();
-    // C's `EHi = hc/lambdaLo; ELo = hc/lambdaHi`: both infinite while the
-    // theta limits are still C's unset zeros.
-    (HC / lambda_lo, HC / lambda_hi, lambda_hi, lambda_lo)
-}
-
-/// Coordinate motor speeds so all motors arrive at the same time.
-/// Returns (new_th_speed, new_y_speed, new_z_speed).
-pub fn coordinate_speeds(
-    theta_delta: f64,
-    y_delta: f64,
-    z_delta: f64,
-    th_speed: f64,
-    y_speed: f64,
-    z_speed: f64,
-    cc_mode: CrystalMode,
-) -> (f64, f64, f64) {
-    let th_time = if th_speed > 0.0 {
-        theta_delta.abs() / th_speed
-    } else {
-        0.0
-    };
-    let y_time = if cc_mode.y_frozen() {
-        0.0
-    } else if y_speed > 0.0 {
-        y_delta.abs() / y_speed
-    } else {
-        0.0
-    };
-    let z_time = if cc_mode.z_frozen() {
-        0.0
-    } else if z_speed > 0.0 {
-        z_delta.abs() / z_speed
-    } else {
-        0.0
-    };
-
-    let max_time = th_time.max(y_time).max(z_time);
-    if max_time <= 0.0 {
-        return (th_speed, y_speed, z_speed);
-    }
-
-    let new_th = if max_time > 0.0 && theta_delta.abs() > 0.0 {
-        theta_delta.abs() / max_time
-    } else {
-        th_speed
-    };
-    let new_y = if max_time > 0.0 && y_delta.abs() > 0.0 {
-        y_delta.abs() / max_time
-    } else {
-        y_speed
-    };
-    let new_z = if max_time > 0.0 && z_delta.abs() > 0.0 {
-        z_delta.abs() / max_time
-    } else {
-        z_speed
-    };
-    (new_th, new_y, new_z)
-}
-
-/// Work the run loop takes before it waits on a monitor: C's init states,
-/// then the connect-time monitor events.
-enum Step {
-    ThChanged,
-    UpdateRdbk,
-    ChkMotorLimits,
-    Ready,
-    Event(String, f64),
-}
-
-/// The C state a dispatched event continues into.
-#[derive(PartialEq)]
-enum Next {
-    Wait,
-    UpdateRdbk,
-    EChanged,
-    LChanged,
-    ThChanged,
-    ThetaMotStopped,
-    CalcMovements,
-}
-
-/// Theta, Y and Z limit-switch channels (HLS, LLS).
-pub(crate) struct LimitSwitches {
-    hls: [SeqPv; 3],
-    lls: [SeqPv; 3],
-}
-
-impl LimitSwitches {
-    /// `motor_pv(axis, field)` names axis 0 (theta), 1 (Y) or 2 (Z).
-    pub(crate) fn new(
-        ss: &StateSet,
-        origin: u64,
-        motor_pv: impl Fn(usize, &str) -> String,
-    ) -> Self {
-        let ch = |m, f| ss.pv_with_origin(&motor_pv(m, f), origin);
-        Self {
-            hls: [ch(0, ".HLS"), ch(1, ".HLS"), ch(2, ".HLS")],
-            lls: [ch(0, ".LLS"), ch(1, ".LLS"), ch(2, ".LLS")],
-        }
-    }
-
-    /// The message of the first switch C updateRdbk's arms find hit, in
-    /// their order; a frozen axis's switches are ignored
-    /// (kohzuCtl.st:1131-1168).
-    pub(crate) async fn hit(&self, cc_mode: CrystalMode) -> Option<&'static str> {
-        let axes = [
-            (true, "Theta Motor hit a limit switch!"),
-            (!cc_mode.y_frozen(), "Y Motor hit a limit switch!"),
-            (!cc_mode.z_frozen(), "Z Motor hit a limit switch!"),
-        ];
-        for (i, (watched, msg)) in axes.into_iter().enumerate() {
-            if watched && (self.hls[i].get_i16().await != 0 || self.lls[i].get_i16().await != 0) {
-                return Some(msg);
-            }
-        }
-        None
     }
 }
 
@@ -403,12 +156,15 @@ impl KohzuConfig {
         Self::new(&p, &m_theta, &m_y, &m_z, geom)
     }
 
-    fn pv(&self, suffix: &str) -> String {
-        format!("{}{}", self.prefix, suffix)
-    }
-
-    fn motor_pv(&self, motor: &str, field: &str) -> String {
-        format!("{}{}{}", self.prefix, motor, field)
+    fn program(self) -> Program {
+        Program {
+            name: "kohzuCtl",
+            soft: false,
+            p: self.prefix.clone(),
+            prefix: self.prefix,
+            motors: [self.m_theta, self.m_y, self.m_z],
+            geom: self.geom,
+        }
     }
 }
 
@@ -416,1091 +172,1126 @@ impl KohzuConfig {
 // Async runner
 // ---------------------------------------------------------------------------
 
-/// C's updatePsuedo state set (kohzuCtl.st:1312-1380): every motor field
-/// monitor, its connect-time one included, is echoed to its display PV.
-/// The theta readback echo stays with the main state set, which raises C's
-/// thetaMotRdbkPseudo_mon.
-pub(crate) async fn echo_motor_fields(db: PvDatabase, ss: StateSet, pairs: Vec<(String, String)>) {
-    let origin = alloc_origin();
-    let echoes: HashMap<String, SeqPv> = pairs
-        .iter()
-        .map(|(src, echo)| (src.clone(), ss.pv_with_origin(echo, origin)))
-        .collect();
-    let sources: Vec<String> = pairs.into_iter().map(|(src, _)| src).collect();
-    let mut monitor = DbMultiMonitor::new(&db, &sources).await;
-    for src in &sources {
-        let val = ss.pv(src).get_f64().await;
-        let _ = echoes[src].put_f64_process(val).await;
+/// kohzuCtl.st, or kohzuCtl_soft.st: the same program but for the
+/// `{P}{MONO}` names, no `kMbusy`/busyChanged, no tweak, and the limit
+/// rollback nested inside moveKohzu's move arm (kohzuCtl_soft.st:891-938).
+pub(crate) struct Program {
+    pub(crate) name: &'static str,
+    pub(crate) soft: bool,
+    /// `{P}`, or `{P}{MONO}` for the soft names.
+    pub(crate) p: String,
+    /// `{P}`, which the motor records and their names take.
+    pub(crate) prefix: String,
+    pub(crate) motors: [String; 3],
+    pub(crate) geom: Geometry,
+}
+
+impl Program {
+    fn pv(&self, hard: &str, soft: &str) -> String {
+        format!("{}{}", self.p, if self.soft { soft } else { hard })
     }
-    loop {
-        let (src, val) = monitor.wait_change().await;
-        if let Some(echo) = echoes.get(&src) {
-            let _ = echo.put_f64_process(val).await;
-        }
+
+    fn motor(&self, axis: usize, field: &str) -> String {
+        format!("{}{}{}", self.prefix, self.motors[axis], field)
     }
 }
 
-/// C's updateSet state set (kohzuCtl.st:1387-1430): the UseSet PV and the
-/// three motor .SET fields follow each other, starting with the
-/// connect-time monitor of each. `use_set_mode` is the SNL variable the main
-/// state set reads; only this loop writes it.
-pub(crate) async fn update_set(
-    db: PvDatabase,
-    ss: StateSet,
-    use_set_pv: String,
-    motor_set_pvs: [String; 3],
-    use_set_mode: Arc<AtomicBool>,
-) {
-    let origin = alloc_origin();
-    let ch_use_set = ss.pv_with_origin(&use_set_pv, origin);
-    let ch_mot_set = motor_set_pvs
-        .each_ref()
-        .map(|pv| ss.pv_with_origin(pv, origin));
-    let mut monitored = vec![use_set_pv.clone()];
-    monitored.extend(motor_set_pvs.iter().cloned());
-    let mut monitor = DbMultiMonitor::new(&db, &monitored).await;
-    let mut use_set = ch_use_set.get_i16().await;
-    let mut mot_set = [0; 3];
-    for (set, ch) in mot_set.iter_mut().zip(&ch_mot_set) {
-        *set = ch.get_i16().await;
-    }
-    let mut use_set_mon = true;
-    let mut mot_set_mon = [true; 3];
-    loop {
-        use_set_mode.store(use_set != 0, Ordering::Relaxed);
-        if use_set_mon {
-            use_set_mon = false;
-            for (set, ch) in mot_set.iter_mut().zip(&ch_mot_set) {
-                if *set != use_set {
-                    *set = use_set;
-                    let _ = ch.put_i16_process(use_set).await;
-                }
-            }
-        } else if let Some(i) = mot_set_mon.iter().position(|&raised| raised) {
-            mot_set_mon[i] = false;
-            if use_set != mot_set[i] {
-                use_set = mot_set[i];
-                let _ = ch_use_set.put_i16_process(use_set).await;
-            }
-        } else {
-            let (pv, val) = monitor.wait_change().await;
-            if pv == use_set_pv {
-                use_set = val as i16;
-                use_set_mon = true;
-            } else if let Some(i) = motor_set_pvs.iter().position(|m| *m == pv) {
-                mot_set[i] = val as i16;
-                mot_set_mon[i] = true;
-            }
+// Indices into `Vars`, one per assigned SNL variable that is not a string.
+const OP_ALERT: usize = 0;
+const OP_ACK: usize = 1;
+const PUT_VALS: usize = 2;
+const AUTO_MODE: usize = 3;
+const CC_MODE: usize = 4;
+const MOVING: usize = 5;
+const H: usize = 6;
+const K: usize = 7;
+const L: usize = 8;
+const A: usize = 9;
+const D: usize = 10;
+const E: usize = 11;
+const E_HI: usize = 12;
+const E_LO: usize = 13;
+const E_RDBK: usize = 14;
+const LAMBDA: usize = 15;
+const LAMBDA_HI: usize = 16;
+const LAMBDA_LO: usize = 17;
+const LAMBDA_RDBK: usize = 18;
+const THETA: usize = 19;
+const THETA_HI: usize = 20;
+const THETA_LO: usize = 21;
+const THETA_RDBK: usize = 22;
+const CMD_ECHO: [usize; 3] = [23, 24, 25];
+const RDBK_ECHO: [usize; 3] = [26, 27, 28];
+const VEL_ECHO: [usize; 3] = [29, 30, 31];
+const DMOV_ECHO: [usize; 3] = [32, 33, 34];
+const STOP: [usize; 3] = [35, 36, 37];
+const DMOV: [usize; 3] = [38, 39, 40];
+const HLS: [usize; 3] = [41, 42, 43];
+const LLS: [usize; 3] = [44, 45, 46];
+const DESIRED: [usize; 3] = [47, 48, 49];
+const Y_DESIRED_HI: usize = 50;
+const Y_DESIRED_LO: usize = 51;
+const HLM: [usize; 3] = [52, 53, 54];
+const LLM: [usize; 3] = [55, 56, 57];
+const CMD: [usize; 3] = [58, 59, 60];
+const CMD_MON: [usize; 3] = [61, 62, 63];
+const SPEED: [usize; 3] = [64, 65, 66];
+const SPEED_CTRL: usize = 67;
+const RBV: [usize; 3] = [68, 69, 70];
+const USE_SET: usize = 71;
+const Y_OFFSET: usize = 72;
+const Y_OFFSET_HI: usize = 73;
+const Y_OFFSET_LO: usize = 74;
+const DEBUG: usize = 75;
+/// The variables both programs declare; kohzuCtl.st adds the tweak ones.
+const N_SOFT: usize = 76;
+const E_TWEAK: usize = 76;
+const E_INC: usize = 77;
+const E_DEC: usize = 78;
+const L_TWEAK: usize = 79;
+const L_INC: usize = 80;
+const L_DEC: usize = 81;
+const TH_TWEAK: usize = 82;
+const TH_INC: usize = 83;
+const TH_DEC: usize = 84;
+const N_VARS: usize = 85;
+
+const TH: usize = 0;
+const Y: usize = 1;
+const Z: usize = 2;
+
+/// Each variable's name, PV and declaration, by index (kohzuCtl.st:47-485).
+fn table(prog: &Program) -> Vec<(&'static str, String, Decl)> {
+    let pv = |hard: &str, soft: &str| prog.pv(hard, soft);
+    let axes = |vars: [&'static str; 3], field: &str, decl: Decl| {
+        [TH, Y, Z].map(|i| (vars[i], prog.motor(i, field), decl))
+    };
+    let echoes = |vars: [&'static str; 3], hard: &str, soft: &str, decl: Decl| {
+        [(TH, "Theta"), (Y, "Y"), (Z, "Z")].map(|(i, axis)| {
+            (
+                vars[i],
+                pv(&format!("Kohzu{axis}{hard}"), &format!("{axis}{soft}")),
+                decl,
+            )
+        })
+    };
+    let mut t = vec![
+        ("opAlert", pv("KohzuAlertBO", "Alert"), SHORT),
+        ("opAck", pv("KohzuOperAckBO", "OperAck"), SHORT_MON),
+        ("putVals", pv("KohzuPutBO", "Put"), SHORT_MON),
+        ("autoMode", pv("KohzuModeBO", "Mode"), SHORT_MON),
+        ("ccMode", pv("KohzuMode2MO", "Mode2"), SHORT_MON),
+        // `sync kohzuMoving kMbusy` is kohzuCtl.st's alone (:90-91).
+        (
+            "kohzuMoving",
+            pv("KohzuMoving", "Moving"),
+            if prog.soft { SHORT_MON } else { SHORT_SYNC },
+        ),
+        ("H", pv("BraggHAO", "H"), DOUBLE_SYNC),
+        ("K", pv("BraggKAO", "K"), DOUBLE_SYNC),
+        ("L", pv("BraggLAO", "L"), DOUBLE_SYNC),
+        ("A", pv("BraggAAO", "A"), DOUBLE_SYNC),
+        ("D", pv("Bragg2dSpacingAO", "2dSpacing"), DOUBLE),
+        ("E", pv("BraggEAO", "E"), DOUBLE_SYNC),
+        ("EHi", pv("BraggEAO.DRVH", "E.HLM"), DOUBLE),
+        ("ELo", pv("BraggEAO.DRVL", "E.LLM"), DOUBLE),
+        ("ERdbk", pv("BraggERdbkAO", "ERdbk"), DOUBLE),
+        ("lambda", pv("BraggLambdaAO", "Lambda"), DOUBLE_SYNC),
+        ("lambdaHi", pv("BraggLambdaAO.DRVH", "Lambda.HLM"), DOUBLE),
+        ("lambdaLo", pv("BraggLambdaAO.DRVL", "Lambda.LLM"), DOUBLE),
+        ("lambdaRdbk", pv("BraggLambdaRdbkAO", "LambdaRdbk"), DOUBLE),
+        ("theta", pv("BraggThetaAO", "Theta"), DOUBLE_SYNC),
+        ("thetaHi", pv("BraggThetaAO.DRVH", "Theta.HLM"), DOUBLE),
+        ("thetaLo", pv("BraggThetaAO.DRVL", "Theta.LLM"), DOUBLE),
+        ("thetaRdbk", pv("BraggThetaRdbkAO", "ThetaRdbk"), DOUBLE),
+    ];
+    t.extend(echoes(
+        ["thetaMotCmdEcho", "yMotCmdEcho", "zMotCmdEcho"],
+        "CmdAO",
+        "Cmd",
+        DOUBLE,
+    ));
+    t.push((
+        "thetaMotRdbkEcho",
+        pv("KohzuThetaRdbkAI", "ThetaMotRdbk"),
+        DOUBLE,
+    ));
+    t.push(("yMotRdbkEcho", pv("KohzuYRdbkAI", "YRdbk"), DOUBLE));
+    t.push(("zMotRdbkEcho", pv("KohzuZRdbkAI", "ZRdbk"), DOUBLE));
+    t.extend(echoes(
+        ["thetaMotVelEcho", "yMotVelEcho", "zMotVelEcho"],
+        "VelAI",
+        "Vel",
+        DOUBLE,
+    ));
+    t.extend(echoes(
+        ["thetaDmovEcho", "yDmovEcho", "zDmovEcho"],
+        "DmovBI",
+        "Dmov",
+        SHORT,
+    ));
+    t.extend(axes(["thetaMotStop", "yStop", "zStop"], ".STOP", SHORT));
+    t.extend(axes(["thetaDmov", "yDmov", "zDmov"], ".DMOV", SHORT_SYNC));
+    t.extend(axes(["thetaHls", "yHls", "zHls"], ".HLS", SHORT_MON));
+    t.extend(axes(["thetaLls", "yLls", "zLls"], ".LLS", SHORT_MON));
+    t.extend([
+        (
+            "thetaMotDesired",
+            pv("KohzuThetaSetAO", "ThetaSet"),
+            DOUBLE_MON,
+        ),
+        ("yMotDesired", pv("KohzuYSetAO", "YSet"), DOUBLE_MON),
+        ("zMotDesired", pv("KohzuZSetAO", "ZSet"), DOUBLE_MON),
+        ("yMotDesiredHi", pv("KohzuYSetAO.DRVH", "YSet.DRVH"), DOUBLE),
+        ("yMotDesiredLo", pv("KohzuYSetAO.DRVL", "YSet.DRVL"), DOUBLE),
+    ]);
+    t.push(("thetaMotHiLim", prog.motor(TH, ".HLM"), DOUBLE_SYNC));
+    t.extend(
+        [(Y, "yMotHiLim"), (Z, "zMotHiLim")]
+            .map(|(i, var)| (var, prog.motor(i, ".HLM"), DOUBLE_MON)),
+    );
+    t.push(("thetaMotLoLim", prog.motor(TH, ".LLM"), DOUBLE_SYNC));
+    t.extend(
+        [(Y, "yMotLoLim"), (Z, "zMotLoLim")]
+            .map(|(i, var)| (var, prog.motor(i, ".LLM"), DOUBLE_MON)),
+    );
+    t.extend(axes(["thetaMotCmd", "yMotCmd", "zMotCmd"], "", DOUBLE));
+    t.extend(axes(
+        ["thetaMotCmdMon", "yMotCmdMon", "zMotCmdMon"],
+        "",
+        DOUBLE_SYNC,
+    ));
+    t.extend(axes(["thSpeed", "ySpeed", "zSpeed"], ".VELO", DOUBLE_SYNC));
+    t.push(("speedControl", pv("KohzuSpeedCtrl", "SpeedCtrl"), SHORT_MON));
+    t.extend(axes(
+        ["thetaMotRdbk", "yMotRdbk", "zMotRdbk"],
+        ".RBV",
+        DOUBLE_SYNC,
+    ));
+    t.extend([
+        ("useSetMode", pv("KohzuUseSetBO", "UseSet"), SHORT_MON),
+        ("yOffset", pv("Kohzu_yOffsetAO", "yOffset"), DOUBLE_SYNC),
+        (
+            "yOffsetHi",
+            pv("Kohzu_yOffsetAO.DRVH", "yOffset.DRVH"),
+            DOUBLE,
+        ),
+        (
+            "yOffsetLo",
+            pv("Kohzu_yOffsetAO.DRVL", "yOffset.DRVL"),
+            DOUBLE,
+        ),
+        ("kohzuCtlDebug", pv("KohzuCtlDebug", "CtlDebug"), SHORT_MON),
+    ]);
+    debug_assert_eq!(t.len(), N_SOFT);
+    if !prog.soft {
+        for (vars, (step, inc, dec)) in [
+            (
+                ["ETweakVal", "ETweakInc", "ETweakDec"],
+                ("BraggETweakAI", "BraggEIncBO", "BraggEDecBO"),
+            ),
+            (
+                ["LTweakVal", "LTweakInc", "LTweakDec"],
+                ("BraggLambdaTweakAI", "BraggLambdaIncBO", "BraggLambdaDecBO"),
+            ),
+            (
+                ["thTweakVal", "thTweakInc", "thTweakDec"],
+                ("BraggThetaTweakAI", "BraggThetaIncBO", "BraggThetaDecBO"),
+            ),
+        ] {
+            t.extend([
+                (vars[0], pv(step, ""), DOUBLE_MON),
+                (vars[1], pv(inc, ""), SHORT_MON),
+                (vars[2], pv(dec, ""), SHORT_MON),
+            ]);
         }
+        debug_assert_eq!(t.len(), N_VARS);
     }
+    t
 }
 
-/// Run the Kohzu monochromator control state machine.
-///
-/// This is the main async entry point. It accesses PVs directly through
-/// the in-process database — no CA network, no search, no port conflicts.
+/// Run the kohzuCtl, updatePsuedo and updateSet state sets.
 pub async fn run(
     config: KohzuConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut echoes = Vec::new();
-    for (m, axis) in [
-        (&config.m_theta, "Theta"),
-        (&config.m_y, "Y"),
-        (&config.m_z, "Z"),
-    ] {
-        if axis != "Theta" {
-            echoes.push((
-                config.motor_pv(m, ".RBV"),
-                config.pv(&format!("Kohzu{axis}RdbkAI")),
-            ));
-        }
-        echoes.push((
-            config.motor_pv(m, ".VELO"),
-            config.pv(&format!("Kohzu{axis}VelAI")),
-        ));
-        echoes.push((
-            config.motor_pv(m, ""),
-            config.pv(&format!("Kohzu{axis}CmdAO")),
-        ));
-        echoes.push((
-            config.motor_pv(m, ".DMOV"),
-            config.pv(&format!("Kohzu{axis}DmovBI")),
-        ));
-    }
-    let queue = PutQueue::new(&db, "kohzuCtl");
-    let echoes = echo_motor_fields(db.clone(), queue.state_set("updatePsuedo"), echoes);
-    let use_set_pv = config.pv("KohzuUseSetBO");
-    let update_set_ss = queue.state_set("updateSet");
-    let use_set_mode = Arc::new(AtomicBool::new(
-        update_set_ss.pv(&use_set_pv).get_i16().await != 0,
-    ));
+    run_program(config.program(), db).await;
+    Ok(())
+}
+
+pub(crate) async fn run_program(prog: Program, db: PvDatabase) {
+    let queue = PutQueue::new(&db, prog.name);
+    let pseudo = Arc::new(EventFlag::default());
+    let main = Kohzu::new(&prog, &db, &queue.state_set(prog.name), pseudo.clone()).await;
+    let pseudo_ss = queue.state_set(if prog.soft {
+        "updatePsuedo_soft"
+    } else {
+        "updatePsuedo"
+    });
     let update_set = update_set(
         db.clone(),
-        update_set_ss,
-        use_set_pv,
-        [&config.m_theta, &config.m_y, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
-        use_set_mode.clone(),
+        queue.state_set("updateSet"),
+        prog.pv("KohzuUseSetBO", "UseSet"),
+        ["thetaMotSet", "yMotSet", "zMotSet"],
+        [0, 1, 2].map(|i| prog.motor(i, ".SET")),
     );
     tokio::select! {
-        r = kohzu_ctl(config, db, queue.state_set("kohzuCtl"), use_set_mode) => r,
-        () = echoes => Ok(()),
-        () = update_set => Ok(()),
+        () = main.run() => {}
+        () = update_pseudo(&prog, &db, &pseudo_ss, &pseudo) => {}
+        () = update_set => {}
     }
 }
 
-/// The kohzuCtl state set.
-async fn kohzu_ctl(
-    config: KohzuConfig,
+/// ss updatePsuedo (kohzuCtl.st:1312-1380). `pseudo` is
+/// `thetaMotRdbkPseudo_mon`, which ss kohzuCtl sets.
+async fn update_pseudo(prog: &Program, db: &PvDatabase, ss: &StateSet, pseudo: &EventFlag) {
+    let watch = RBV.into_iter().chain(SPEED).chain(CMD_MON).chain(DMOV);
+    let mut v = Vars::new(db, ss, &table(prog), alloc_origin(), watch).await;
+    let echoes = [
+        (RBV[Y], RDBK_ECHO[Y]),
+        (RBV[Z], RDBK_ECHO[Z]),
+        (SPEED[TH], VEL_ECHO[TH]),
+        (SPEED[Y], VEL_ECHO[Y]),
+        (SPEED[Z], VEL_ECHO[Z]),
+        (CMD_MON[TH], CMD_ECHO[TH]),
+        (CMD_MON[Y], CMD_ECHO[Y]),
+        (CMD_MON[Z], CMD_ECHO[Z]),
+        (DMOV[TH], DMOV_ECHO[TH]),
+        (DMOV[Y], DMOV_ECHO[Y]),
+        (DMOV[Z], DMOV_ECHO[Z]),
+    ];
+    v.flush().await;
+    loop {
+        let fired = if pseudo.test_and_clear() {
+            Some((RBV[TH], RDBK_ECHO[TH]))
+        } else {
+            echoes.into_iter().find(|&(from, _)| v.test_and_clear(from))
+        };
+        match fired {
+            Some((from, to)) => {
+                let x = v.get(from);
+                v.set(to, x).await;
+                v.flush().await;
+            }
+            None => tokio::select! {
+                () = v.wait(None) => {}
+                () = pseudo.raised() => {}
+            },
+        }
+    }
+}
+
+/// ss updateSet (kohzuCtl.st:1387-1430): the UseSet PV (variable
+/// useSetMode) and the three motor .SET fields follow each other, starting
+/// with the connect-time monitor of each.
+pub(crate) async fn update_set(
     db: PvDatabase,
     ss: StateSet,
-    use_set_mode: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("kohzuCtl: starting for prefix={}", config.prefix);
-
-    let my_origin = alloc_origin();
-
-    // -- Create channels for all PVs (direct database access, available immediately) --
-    let ch_debug = ss.pv_with_origin(&config.pv("KohzuCtlDebug"), my_origin);
-    let ch_seq_msg1 = ss.pv_with_origin(&config.pv("KohzuSeqMsg1SI"), my_origin);
-    let ch_seq_msg2 = ss.pv_with_origin(&config.pv("KohzuSeqMsg2SI"), my_origin);
-    let ch_alert = ss.pv_with_origin(&config.pv("KohzuAlertBO"), my_origin);
-    let ch_oper_ack = ss.pv_with_origin(&config.pv("KohzuOperAckBO"), my_origin);
-    let ch_put_vals = ss.pv_with_origin(&config.pv("KohzuPutBO"), my_origin);
-    let ch_auto_mode = ss.pv_with_origin(&config.pv("KohzuModeBO"), my_origin);
-    let ch_moving = ss.pv_with_origin(&config.pv("KohzuMoving"), my_origin);
-
-    // Crystal parameters
-    let ch_h = ss.pv_with_origin(&config.pv("BraggHAO"), my_origin);
-    let ch_k = ss.pv_with_origin(&config.pv("BraggKAO"), my_origin);
-    let ch_l = ss.pv_with_origin(&config.pv("BraggLAO"), my_origin);
-    let ch_a = ss.pv_with_origin(&config.pv("BraggAAO"), my_origin);
-    let ch_d = ss.pv_with_origin(&config.pv("Bragg2dSpacingAO"), my_origin);
-
-    // Energy / lambda / theta set points
-    let ch_e = ss.pv_with_origin(&config.pv("BraggEAO"), my_origin);
-    let ch_e_hi = ss.pv_with_origin(&config.pv("BraggEAO.DRVH"), my_origin);
-    let ch_e_lo = ss.pv_with_origin(&config.pv("BraggEAO.DRVL"), my_origin);
-    let ch_e_rdbk = ss.pv_with_origin(&config.pv("BraggERdbkAO"), my_origin);
-
-    let ch_lambda = ss.pv_with_origin(&config.pv("BraggLambdaAO"), my_origin);
-    let ch_lambda_hi = ss.pv_with_origin(&config.pv("BraggLambdaAO.DRVH"), my_origin);
-    let ch_lambda_lo = ss.pv_with_origin(&config.pv("BraggLambdaAO.DRVL"), my_origin);
-    let ch_lambda_rdbk = ss.pv_with_origin(&config.pv("BraggLambdaRdbkAO"), my_origin);
-
-    let ch_theta = ss.pv_with_origin(&config.pv("BraggThetaAO"), my_origin);
-    let ch_theta_hi = ss.pv_with_origin(&config.pv("BraggThetaAO.DRVH"), my_origin);
-    let ch_theta_lo = ss.pv_with_origin(&config.pv("BraggThetaAO.DRVL"), my_origin);
-    let ch_theta_rdbk = ss.pv_with_origin(&config.pv("BraggThetaRdbkAO"), my_origin);
-
-    // Soft echo PVs
-    let ch_theta_mot_name = ss.pv_with_origin(&config.pv("KohzuThetaPvSI"), my_origin);
-    let ch_y_mot_name = ss.pv_with_origin(&config.pv("KohzuYPvSI"), my_origin);
-    let ch_z_mot_name = ss.pv_with_origin(&config.pv("KohzuZPvSI"), my_origin);
-
-    let ch_theta_cmd_echo = ss.pv_with_origin(&config.pv("KohzuThetaCmdAO"), my_origin);
-    let ch_y_cmd_echo = ss.pv_with_origin(&config.pv("KohzuYCmdAO"), my_origin);
-    let ch_z_cmd_echo = ss.pv_with_origin(&config.pv("KohzuZCmdAO"), my_origin);
-    let ch_theta_rdbk_echo = ss.pv_with_origin(&config.pv("KohzuThetaRdbkAI"), my_origin);
-    let ch_y_rdbk_echo = ss.pv_with_origin(&config.pv("KohzuYRdbkAI"), my_origin);
-    let ch_z_rdbk_echo = ss.pv_with_origin(&config.pv("KohzuZRdbkAI"), my_origin);
-    let ch_theta_vel_echo = ss.pv_with_origin(&config.pv("KohzuThetaVelAI"), my_origin);
-    let ch_y_vel_echo = ss.pv_with_origin(&config.pv("KohzuYVelAI"), my_origin);
-    let ch_z_vel_echo = ss.pv_with_origin(&config.pv("KohzuZVelAI"), my_origin);
-    let ch_theta_dmov_echo = ss.pv_with_origin(&config.pv("KohzuThetaDmovBI"), my_origin);
-    let ch_y_dmov_echo = ss.pv_with_origin(&config.pv("KohzuYDmovBI"), my_origin);
-    let ch_z_dmov_echo = ss.pv_with_origin(&config.pv("KohzuZDmovBI"), my_origin);
-
-    // Motor records
-    let ch_theta_mot_stop =
-        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".STOP"), my_origin);
-    let ch_y_stop = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".STOP"), my_origin);
-    let ch_z_stop = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".STOP"), my_origin);
-
-    let ch_theta_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
-    let ch_y_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".DMOV"), my_origin);
-    let ch_z_dmov = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".DMOV"), my_origin);
-
-    let limit_switches = LimitSwitches::new(&ss, my_origin, |m, f| {
-        config.motor_pv(
-            match m {
-                0 => &config.m_theta,
-                1 => &config.m_y,
-                _ => &config.m_z,
-            },
-            f,
-        )
-    });
-
-    let ch_theta_set_ao = ss.pv_with_origin(&config.pv("KohzuThetaSetAO"), my_origin);
-    let ch_y_set_ao = ss.pv_with_origin(&config.pv("KohzuYSetAO"), my_origin);
-    let ch_z_set_ao = ss.pv_with_origin(&config.pv("KohzuZSetAO"), my_origin);
-    let ch_y_set_hi = ss.pv_with_origin(&config.pv("KohzuYSetAO.DRVH"), my_origin);
-    let ch_y_set_lo = ss.pv_with_origin(&config.pv("KohzuYSetAO.DRVL"), my_origin);
-
-    let ch_theta_mot_hilim =
-        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".HLM"), my_origin);
-    let ch_theta_mot_lolim =
-        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".LLM"), my_origin);
-    let ch_y_mot_hilim = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".HLM"), my_origin);
-    let ch_y_mot_lolim = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".LLM"), my_origin);
-    let ch_z_mot_hilim = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".HLM"), my_origin);
-    let ch_z_mot_lolim = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".LLM"), my_origin);
-
-    let ch_theta_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ""), my_origin);
-    let ch_y_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_y, ""), my_origin);
-    let ch_z_mot_cmd = ss.pv_with_origin(&config.motor_pv(&config.m_z, ""), my_origin);
-
-    let ch_theta_mot_velo =
-        ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".VELO"), my_origin);
-    let ch_y_mot_velo = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".VELO"), my_origin);
-    let ch_z_mot_velo = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".VELO"), my_origin);
-
-    let ch_theta_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_theta, ".RBV"), my_origin);
-    let ch_y_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_y, ".RBV"), my_origin);
-    let ch_z_mot_rbv = ss.pv_with_origin(&config.motor_pv(&config.m_z, ".RBV"), my_origin);
-
-    let ch_speed_ctrl = ss.pv_with_origin(&config.pv("KohzuSpeedCtrl"), my_origin);
-
-    let ch_y_offset = ss.pv_with_origin(&config.pv("Kohzu_yOffsetAO"), my_origin);
-    let ch_y_offset_hi = ss.pv_with_origin(&config.pv("Kohzu_yOffsetAO.DRVH"), my_origin);
-    let ch_y_offset_lo = ss.pv_with_origin(&config.pv("Kohzu_yOffsetAO.DRVL"), my_origin);
-
-    // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
-    // C kohzuCtl.st:734-797 (state tweak): each button adds ± the matching
-    // step value, limit-checks, and resets the pressed BO to 0.
-    let ch_e_tweak_val = ss.pv_with_origin(&config.pv("BraggETweakAI"), my_origin);
-    let ch_e_inc = ss.pv_with_origin(&config.pv("BraggEIncBO"), my_origin);
-    let ch_e_dec = ss.pv_with_origin(&config.pv("BraggEDecBO"), my_origin);
-    let ch_lambda_tweak_val = ss.pv_with_origin(&config.pv("BraggLambdaTweakAI"), my_origin);
-    let ch_lambda_inc = ss.pv_with_origin(&config.pv("BraggLambdaIncBO"), my_origin);
-    let ch_lambda_dec = ss.pv_with_origin(&config.pv("BraggLambdaDecBO"), my_origin);
-    let ch_theta_tweak_val = ss.pv_with_origin(&config.pv("BraggThetaTweakAI"), my_origin);
-    let ch_theta_inc = ss.pv_with_origin(&config.pv("BraggThetaIncBO"), my_origin);
-    let ch_theta_dec = ss.pv_with_origin(&config.pv("BraggThetaDecBO"), my_origin);
-
-    // Build a poll-based monitor for all PVs that drive state changes.
-    // DbMonitor replaces CA subscribe+select — it polls the in-process database.
-    let monitored_pvs: Vec<String> = vec![
-        config.pv("BraggEAO"),
-        config.pv("BraggLambdaAO"),
-        config.pv("BraggThetaAO"),
-        config.pv("BraggHAO"),
-        config.pv("BraggKAO"),
-        config.pv("BraggLAO"),
-        config.pv("BraggAAO"),
-        config.pv("KohzuPutBO"),
-        config.pv("KohzuOperAckBO"),
-        // C `monitor kohzuMoving; sync kohzuMoving kMbusy;` (kohzuCtl.st:87-91).
-        // The database asserts busy on every setpoint put, including one that
-        // writes the value already there; without this the sequencer never
-        // learns of such a put and the busy record never returns to done.
-        config.pv("KohzuMoving"),
-        config.motor_pv(&config.m_theta, ".RBV"),
-        config.motor_pv(&config.m_theta, ".HLM"),
-        config.motor_pv(&config.m_theta, ".LLM"),
-        config.pv("Kohzu_yOffsetAO"),
-        config.pv("BraggEIncBO"),
-        config.pv("BraggEDecBO"),
-        config.pv("BraggLambdaIncBO"),
-        config.pv("BraggLambdaDecBO"),
-        config.pv("BraggThetaIncBO"),
-        config.pv("BraggThetaDecBO"),
-    ];
-    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
-    // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
-    // waitForCmnd `when` tests them (kohzuCtl.st:78-85, :673-810): they are
-    // written on arrival and only read. kohzuMoving's variable takes every
-    // monitor, the sequencer's own included, unlike its kMbusy wake above.
-    monitor
-        .add_vars(
-            &db,
-            &[
-                config.pv("KohzuModeBO"),
-                config.pv("KohzuMode2MO"),
-                config.pv("KohzuMoving"),
-            ],
-        )
-        .await;
-    println!(
-        "kohzuCtl: subscribed to {} PVs, {} active",
-        monitored_pvs.len(),
-        monitor.sub_count()
+    use_set_pv: String,
+    motor_set_vars: [&str; 3],
+    motor_set_pvs: [String; 3],
+) {
+    const USE: usize = 0;
+    let mut table = vec![("useSetMode", use_set_pv, SHORT_SYNC)];
+    table.extend(
+        motor_set_vars
+            .into_iter()
+            .zip(motor_set_pvs)
+            .map(|(var, pv)| (var, pv, SHORT_SYNC)),
     );
-
-    // -- Initialize state --
-    let geom = config.geom;
-
-    // Set motor names
-    let theta_name = format!("{}{}", config.prefix, config.m_theta);
-    let y_name = format!("{}{}", config.prefix, config.m_y);
-    let z_name = format!("{}{}", config.prefix, config.m_z);
-    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
-    let _ = ch_y_mot_name.put_string_process(&y_name).await;
-    let _ = ch_z_mot_name.put_string_process(&z_name).await;
-
-    // Initialize geometry-specific y offset limits
-    match geom {
-        Geometry::Standard => {
-            let _ = ch_y_offset_hi.put_f64_process(17.5 + 0.000001).await;
-            let _ = ch_y_offset_lo.put_f64_process(17.5 - 0.000001).await;
-            let _ = ch_y_offset.put_f64_process(17.5).await;
-            let _ = ch_y_set_hi.put_f64_process(0.0).await;
-            let _ = ch_y_set_lo.put_f64_process(-35.0).await;
+    let mut v = Vars::new(&db, &ss, &table, alloc_origin(), 0..4).await;
+    v.flush().await;
+    loop {
+        if v.test_and_clear(USE) {
+            for i in 1..4 {
+                let use_set = v.get(USE);
+                if v.get(i) != use_set {
+                    v.set(i, use_set).await;
+                }
+            }
+            v.flush().await;
+        } else if let Some(i) = (1..4).find(|&i| v.test_and_clear(i)) {
+            let mot_set = v.get(i);
+            if v.get(USE) != mot_set {
+                v.set(USE, mot_set).await;
+            }
+            v.flush().await;
+        } else {
+            v.wait(None).await;
         }
-        Geometry::Alternate => {
-            let _ = ch_y_set_hi.put_f64_process(60.0).await;
-            let _ = ch_y_set_lo.put_f64_process(0.0).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Init,
+    InitSequence,
+    WaitForCmndEnter,
+    WaitForCmnd,
+    Tweak,
+    DInputChanged,
+    ThetaLimits,
+    BusyChanged,
+    EChanged,
+    LChanged,
+    ThChanged,
+    CalcMovements,
+    MoveKohzu,
+    CheckDone,
+    UpdateRdbk,
+    ThetaMotStopped,
+    ChkMotorLimits,
+    ChkMotorLimitsExit,
+    StopKohzu,
+    StoppedKohzuWait,
+}
+
+/// ss kohzuCtl and its program variables. `riskAverse` is C's constant 0.
+struct Kohzu {
+    soft: bool,
+    geom: Geometry,
+    v: Vars,
+    seq_msg1: SeqPv,
+    seq_msg2: SeqPv,
+    mot_names: [(SeqPv, String); 3],
+    pseudo: Arc<EventFlag>,
+    kohzu_done: bool,
+    caused_move: bool,
+    init_seq: u8,
+    init_seq_done: bool,
+    will_violate_limit: bool,
+    prev_e: f64,
+    prev_theta: f64,
+    prev_lambda: f64,
+    prev_desired: [f64; 3],
+    old_speed: [f64; 3],
+    new_speed: [f64; 3],
+}
+
+impl Kohzu {
+    async fn new(prog: &Program, db: &PvDatabase, ss: &StateSet, pseudo: Arc<EventFlag>) -> Self {
+        let origin = alloc_origin();
+        let ch = |var: &str, hard: &str, soft: &str| {
+            ss.pv_with_origin(var, &prog.pv(hard, soft), origin)
+        };
+        let name = |var: &str, hard: &str, soft: &str, axis: usize| {
+            (ch(var, hard, soft), prog.motor(axis, ""))
+        };
+        let table = table(prog);
+        let n = table.len();
+        Self {
+            soft: prog.soft,
+            geom: prog.geom,
+            v: Vars::new(db, ss, &table, origin, 0..n).await,
+            seq_msg1: ch("seqMsg1", "KohzuSeqMsg1SI", "SeqMsg1"),
+            seq_msg2: ch("seqMsg2", "KohzuSeqMsg2SI", "SeqMsg2"),
+            mot_names: [
+                name("thetaMotName", "KohzuThetaPvSI", "ThetaPv", TH),
+                name("yMotName", "KohzuYPvSI", "YPv", Y),
+                name("zMotName", "KohzuZPvSI", "ZPv", Z),
+            ],
+            pseudo,
+            kohzu_done: false,
+            caused_move: false,
+            init_seq: 0,
+            init_seq_done: false,
+            will_violate_limit: false,
+            prev_e: 0.0,
+            prev_theta: 0.0,
+            prev_lambda: 0.0,
+            prev_desired: [0.0; 3],
+            old_speed: [0.0; 3],
+            new_speed: [0.0; 3],
         }
     }
 
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
+    async fn msg1(&self, s: &str) {
+        let _ = self.seq_msg1.put_string_process(s).await;
+    }
 
-    // C dInputChanged (kohzuCtl.st:811-831); returns the new 2d spacing.
-    let d_input_changed = async |theta_hi: f64, theta_lo: f64| {
-        let _ = ch_auto_mode.put_i16_process(0).await;
-        let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-        let (two_d, forbidden, msg) = calc_2d_spacing(
-            ch_a.get_f64().await,
-            ch_h.get_f64().await,
-            ch_k.get_f64().await,
-            ch_l.get_f64().await,
-        );
-        let _ = ch_d.put_f64_process(two_d).await;
-        let _ = ch_seq_msg1.put_string_process(msg).await;
-        let (e_hi, e_lo, lambda_hi, lambda_lo) =
-            compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-        let _ = ch_lambda_hi.put_f64_process(lambda_hi).await;
-        let _ = ch_lambda_lo.put_f64_process(lambda_lo).await;
-        let _ = ch_e_hi.put_f64_process(e_hi).await;
-        let _ = ch_e_lo.put_f64_process(e_lo).await;
-        let _ = ch_alert.put_i16_process(forbidden as i16).await;
-        two_d
-    };
-    // C's thetaHi/thetaLo are assigned, not monitored (kohzuCtl.st:160-164):
-    // zero until thetaLimits, which first runs on the connect-time
-    // thetaMotHiLim monitor.
-    let mut theta_hi = 0.0;
-    let mut theta_lo = 0.0;
-    // initSeq=0 enters dInputChanged (kohzuCtl.st:583).
-    let mut two_d = d_input_changed(theta_hi, theta_lo).await;
+    async fn msg2(&self, s: &str) {
+        let _ = self.seq_msg2.put_string_process(s).await;
+    }
 
-    let mut theta_rdbk_val;
-    let mut lambda_rdbk_val;
-    let mut e_rdbk_val;
+    /// `D*sin(theta/radConv)`.
+    fn lambda_of(&mut self, theta: f64) -> f64 {
+        theta_to_lambda(theta, self.v.get(D))
+    }
 
-    // C's E/lambda/theta are monitored globals; prev_* are snapshotted only
-    // by waitForCmndEnter once initSeqDone, so the init passes roll back to
-    // zero.
-    let mut theta_val = ch_theta.get_f64().await;
-    let mut lambda_val = ch_lambda.get_f64().await;
-    let mut e_val = ch_e.get_f64().await;
-    let (mut prev_e, mut prev_theta, mut prev_lambda) = (0.0, 0.0, 0.0);
-
-    #[allow(unused_assignments)]
-    let mut speed_control: bool = false;
-    let mut y_offset_val: f64 = ch_y_offset.get_f64().await;
-    // C's causedMove, and the speeds moveKohzu replaced, which
-    // thetaMotStopped restores (kohzuCtl.st:997, :1181-1195).
-    let mut caused_move = false;
-    let mut old_speeds = [0.0; 3];
-    let risk_averse = false;
-
-    // Last *accepted* motor setpoints. C kohzuCtl snapshots prev_thetaMotDesired/
-    // prev_yMotDesired/prev_zMotDesired at waitForCmnd entry (kohzuCtl.st:655-657)
-    // and restores them when a command would violate a limit (kohzuCtl.st:1004-1009).
-    let mut last_theta_set = 0.0;
-    let mut last_y_set = 0.0;
-    let mut last_z_set = 0.0;
-
-    // C's kohzuDone and initSeqDone: waitForCmndEnter clears KohzuMoving
-    // only when both are set (kohzuCtl.st:607-671, :654-658).
-    let mut kohzu_done = false;
-    let mut init_seq_done = false;
-    let mut enter_wait = false;
-    // initSeq=0's dInputChanged ends in thChanged; initSeq=2's updateRdbk is
-    // a no-op, since that thChanged always leaves willViolateLimit set.
-    let mut steps: VecDeque<Step> = [Step::ThChanged, Step::ChkMotorLimits, Step::Ready].into();
-
-    info!("Kohzu controller initialized for {}", config.prefix);
-
-    // -- Main loop --
-    // PV name constants for dispatch
-    let pv_e = config.pv("BraggEAO");
-    let pv_lambda = config.pv("BraggLambdaAO");
-    let pv_theta = config.pv("BraggThetaAO");
-    let pv_h = config.pv("BraggHAO");
-    let pv_k = config.pv("BraggKAO");
-    let pv_l = config.pv("BraggLAO");
-    let pv_a = config.pv("BraggAAO");
-    let pv_put_vals = config.pv("KohzuPutBO");
-    let pv_auto_mode = config.pv("KohzuModeBO");
-    let pv_cc_mode = config.pv("KohzuMode2MO");
-    let cc_mode_of = |m: &mut DbMultiMonitor| CrystalMode::from_i16(m.var(&pv_cc_mode) as i16);
-    let pv_oper_ack = config.pv("KohzuOperAckBO");
-    let pv_moving = config.pv("KohzuMoving");
-    let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
-    let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
-    let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
-    let pv_y_offset = config.pv("Kohzu_yOffsetAO");
-    let pv_e_inc = config.pv("BraggEIncBO");
-    let pv_e_dec = config.pv("BraggEDecBO");
-    let pv_lambda_inc = config.pv("BraggLambdaIncBO");
-    let pv_lambda_dec = config.pv("BraggLambdaDecBO");
-    let pv_theta_inc = config.pv("BraggThetaIncBO");
-    let pv_theta_dec = config.pv("BraggThetaDecBO");
-
-    println!(
-        "kohzuCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
-        two_d, theta_lo, theta_hi
-    );
-
-    loop {
-        // C waitForCmndEnter (kohzuCtl.st:607-671), which only acts once
-        // initSeqDone.
-        if std::mem::take(&mut enter_wait) && init_seq_done {
-            // The events C's efClears drop 0.1 s in, own posts included
-            // (kohzuCtl.st:608-617).
-            epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-            for pv in [
-                &pv_h, &pv_k, &pv_l, &pv_a, &pv_e, &pv_moving, &pv_lambda, &pv_theta,
-            ] {
-                monitor.clear(pv);
-            }
-            let _ = ch_theta_rdbk_echo
-                .put_f64_process(ch_theta_mot_rbv.get_f64().await)
-                .await;
-            let _ = ch_y_rdbk_echo
-                .put_f64_process(ch_y_mot_rbv.get_f64().await)
-                .await;
-            let _ = ch_z_rdbk_echo
-                .put_f64_process(ch_z_mot_rbv.get_f64().await)
-                .await;
-            let _ = ch_theta_vel_echo
-                .put_f64_process(ch_theta_mot_velo.get_f64().await)
-                .await;
-            let _ = ch_y_vel_echo
-                .put_f64_process(ch_y_mot_velo.get_f64().await)
-                .await;
-            let _ = ch_z_vel_echo
-                .put_f64_process(ch_z_mot_velo.get_f64().await)
-                .await;
-            let _ = ch_theta_cmd_echo
-                .put_f64_process(ch_theta_mot_cmd.get_f64().await)
-                .await;
-            let _ = ch_y_cmd_echo
-                .put_f64_process(ch_y_mot_cmd.get_f64().await)
-                .await;
-            let _ = ch_z_cmd_echo
-                .put_f64_process(ch_z_mot_cmd.get_f64().await)
-                .await;
-            let _ = ch_theta_dmov_echo
-                .put_i16_process(ch_theta_dmov.get_i16().await)
-                .await;
-            let _ = ch_y_dmov_echo
-                .put_i16_process(ch_y_dmov.get_i16().await)
-                .await;
-            let _ = ch_z_dmov_echo
-                .put_i16_process(ch_z_dmov.get_i16().await)
-                .await;
-            if monitor.var(&pv_auto_mode) != 0.0 || use_set_mode.load(Ordering::Relaxed) {
-                theta_rdbk_val = ch_theta_mot_rbv.get_f64().await;
-                lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            }
-            let _ = ch_oper_ack.put_i16_process(0).await;
-            if kohzu_done && monitor.var(&pv_moving) != 0.0 {
-                kohzu_done = false;
-                let _ = ch_moving.put_i16_process(0).await;
-            }
-            // The last-accepted bragg state a limit-violating command rolls
-            // back to.
-            prev_e = e_val;
-            prev_theta = theta_val;
-            prev_lambda = lambda_val;
+    async fn run(mut self) {
+        let mut state = State::Init;
+        loop {
+            self.v.flush().await;
+            let mut delays = Delays::new();
+            state = loop {
+                if let Some(next) = self.step(state, &mut delays).await {
+                    break next;
+                }
+                let deadline = delays.next.take();
+                self.v.wait(deadline).await;
+            };
         }
+    }
 
-        let mut next = Next::Wait;
-        let (changed_pv, new_val) = match steps.pop_front() {
-            Some(Step::Event(pv, val)) => {
-                // One C flag with the live monitors queued behind it.
-                monitor.clear(&pv);
-                (pv, val)
+    /// Evaluate `state`'s `when` clauses in order; run the first true one's
+    /// action and return its next state, or `None` when no clause is true.
+    async fn step(&mut self, state: State, d: &mut Delays) -> Option<State> {
+        let v = &mut self.v;
+        match state {
+            State::Init => {
+                self.init_seq = 0;
+                Some(State::InitSequence)
             }
-            Some(Step::ThChanged) => {
-                next = Next::ThChanged;
-                (String::new(), 0.0)
+            State::InitSequence => {
+                if self.init_seq == 0 {
+                    ctl_debug!(v, "kohzuCtl:initSequence:initSeq=0");
+                    for i in STOP {
+                        v.assign(i, 1.0);
+                    }
+                    v.set(PUT_VALS, 0.0).await;
+                    v.set(AUTO_MODE, 0.0).await;
+                    v.set(OP_ACK, 0.0).await;
+                    if self.geom == Geometry::Standard {
+                        v.set(Y_OFFSET_HI, 17.5 + 0.000001).await;
+                        v.set(Y_OFFSET_LO, 17.5 - 0.000001).await;
+                        v.set(Y_OFFSET, 17.5).await;
+                        v.set(Y_DESIRED_HI, 0.0).await;
+                        v.set(Y_DESIRED_LO, -35.0).await;
+                    } else {
+                        v.set(Y_DESIRED_HI, 60.0).await;
+                        v.set(Y_DESIRED_LO, 0.0).await;
+                    }
+                    for (ch, name) in &self.mot_names {
+                        let _ = ch.put_string_process(name).await;
+                    }
+                    self.init_seq = 1;
+                    return Some(State::DInputChanged);
+                }
+                if self.init_seq == 1 {
+                    ctl_debug!(v, "kohzuCtl:initSequence:initSeq=1");
+                    self.init_seq = 2;
+                    return Some(State::ChkMotorLimits);
+                }
+                if self.init_seq == 2 {
+                    ctl_debug!(v, "kohzuCtl:initSequence:initSeq=2");
+                    self.init_seq = 3;
+                    return Some(State::UpdateRdbk);
+                }
+                if self.init_seq == 3 && d.delay(1.0) {
+                    ctl_debug!(v, "kohzuCtl:initSequence:initSeq=3");
+                    self.msg1("Kohzu Control Ready").await;
+                    self.msg2(" ").await;
+                    self.init_seq_done = true;
+                    let v = &mut self.v;
+                    let x = v.get(RBV[TH]);
+                    v.set(THETA, x).await;
+                    return Some(State::ThChanged);
+                }
+                None
             }
-            Some(Step::UpdateRdbk) => {
-                next = Next::UpdateRdbk;
-                (String::new(), 0.0)
-            }
-            Some(Step::ChkMotorLimits) => {
-                // C chkMotorLimits / chkMotorLimitsExit (kohzuCtl.st:1218-1287):
-                // init holds here, re-checking every 2 s, until every readback
-                // is nonzero and inside its motor limits.
-                loop {
-                    let mut alert = false;
-                    let rbv = ch_theta_mot_rbv.get_f64().await;
-                    theta_rdbk_val = rbv;
-                    lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                    e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                    let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                    let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                    let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-                    let cc_mode = cc_mode_of(&mut monitor);
-                    let axes = [
-                        (
-                            !cc_mode.y_frozen(),
-                            ch_y_mot_rbv.get_f64().await,
-                            ch_y_mot_lolim.get_f64().await,
-                            ch_y_mot_hilim.get_f64().await,
-                            "Y",
-                        ),
-                        (
-                            !cc_mode.z_frozen(),
-                            ch_z_mot_rbv.get_f64().await,
-                            ch_z_mot_lolim.get_f64().await,
-                            ch_z_mot_hilim.get_f64().await,
-                            "Z",
-                        ),
-                        (
-                            true,
-                            rbv,
-                            ch_theta_mot_lolim.get_f64().await,
-                            ch_theta_mot_hilim.get_f64().await,
-                            "Theta",
-                        ),
-                    ];
-                    for (checked, rdbk, lo, hi, axis) in axes {
-                        if !checked {
-                            continue;
-                        }
-                        if rdbk == 0.0 {
-                            let _ = ch_seq_msg1
-                                .put_string_process(&format!("{axis} Readback of 0 not reasonable"))
-                                .await;
-                            alert = true;
-                        }
-                        if rdbk < lo || rdbk > hi {
-                            let _ = ch_seq_msg1
-                                .put_string_process(&format!(
-                                    "{axis} Readback outside Motor Limits"
-                                ))
-                                .await;
-                            alert = true;
+            State::WaitForCmndEnter => {
+                if self.init_seq_done && d.delay(0.1) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmndEnter:initSeqDone");
+                    for i in [H, K, L, A, E] {
+                        v.clear(i);
+                    }
+                    if !self.soft {
+                        v.clear(MOVING);
+                    }
+                    v.clear(LAMBDA);
+                    v.clear(THETA);
+                    for (to, from) in [
+                        (RDBK_ECHO, RBV),
+                        (VEL_ECHO, SPEED),
+                        (CMD_ECHO, CMD_MON),
+                        (DMOV_ECHO, DMOV),
+                    ] {
+                        for axis in [TH, Y, Z] {
+                            let x = v.get(from[axis]);
+                            v.set(to[axis], x).await;
                         }
                     }
-                    if !alert {
-                        let _ = ch_alert.put_i16_process(0).await;
-                        let _ = ch_seq_msg1
-                            .put_string_process("All motors within limits")
-                            .await;
-                        break;
+                    if v.on(AUTO_MODE) || v.on(USE_SET) {
+                        self.put_rdbk().await;
                     }
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-                    epics_base_rs::runtime::task::sleep(Duration::from_secs(2)).await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_seq_msg2
-                        .put_string_process("Modify Motor Positions/Limits")
-                        .await;
+                    let v = &mut self.v;
+                    v.set(OP_ACK, 0.0).await;
+                    ctl_debug!(
+                        v,
+                        "kohzuCtl:waitForCmndEnter: kohzuMoving={}; kohzuDone={}",
+                        v.get(MOVING) as i32,
+                        u8::from(self.kohzu_done)
+                    );
+                    if v.on(MOVING) && self.kohzu_done {
+                        ctl_debug!(v, "kohzuCtl:waitForCmndEnter: asserting 'done'.");
+                        self.kohzu_done = false;
+                        v.set(MOVING, 0.0).await;
+                    }
+                    self.prev_theta = v.get(THETA);
+                    self.prev_e = v.get(E);
+                    self.prev_lambda = v.get(LAMBDA);
+                    self.prev_desired = DESIRED.map(|i| v.get(i));
+                    self.will_violate_limit = false;
+                    return Some(State::WaitForCmnd);
                 }
-                continue;
-            }
-            Some(Step::Ready) => {
-                // C initSeq=3 (kohzuCtl.st:595-604).
-                epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
-                let _ = ch_seq_msg1.put_string_process("Kohzu Control Ready").await;
-                let _ = ch_seq_msg2.put_string_process(" ").await;
-                init_seq_done = true;
-                theta_val = ch_theta_mot_rbv.get_f64().await;
-                let _ = ch_theta.put_f64_process(theta_val).await;
-                // The connect-time monitors C's waitForCmndEnter leaves set,
-                // in waitForCmnd's order (kohzuCtl.st:686-733).
-                for ch in [&ch_theta_mot_hilim, &ch_theta_mot_rbv, &ch_y_offset] {
-                    steps.push_back(Step::Event(ch.name().to_string(), ch.get_f64().await));
+                if !self.init_seq_done {
+                    return Some(State::InitSequence);
                 }
-                next = Next::ThChanged;
-                (String::new(), 0.0)
+                None
             }
-            None => monitor.wait_change().await,
-        };
-        tracing::trace!("kohzuCtl: PV changed: {} = {}", changed_pv, new_val);
-
-        if changed_pv == pv_e {
-            e_val = new_val;
-            next = Next::EChanged;
-        } else if changed_pv == pv_lambda {
-            lambda_val = new_val;
-            next = Next::LChanged;
-        } else if changed_pv == pv_theta {
-            theta_val = new_val;
-            next = Next::ThChanged;
-        } else if changed_pv == pv_e_inc || changed_pv == pv_e_dec {
-            // C state tweak (kohzuCtl.st:747-766): E steps by ± ETweakVal
-            // when inside its limits, and eChanged runs either way.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_e_inc;
-                let step = ch_e_tweak_val.get_f64().await;
-                let temp = e_val + step * if inc { 1.0 } else { -1.0 };
-                let e_hi = ch_e_hi.get_f64().await;
-                let e_lo = ch_e_lo.get_f64().await;
-                if temp >= e_lo && temp <= e_hi {
-                    e_val = temp;
-                    let _ = ch_e.put_f64_process(e_val).await;
-                } else {
-                    let _ = ch_seq_msg1
-                        .put_string_process("E tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
+            State::WaitForCmnd => {
+                if v.test(H) || v.test(K) || v.test(L) || v.test(A) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:HKLA_mon");
+                    self.msg1("Lattice Spacing Changed").await;
+                    self.msg2(" ").await;
+                    for i in [H, K, L, A] {
+                        self.v.clear(i);
+                    }
+                    return Some(State::DInputChanged);
                 }
-                let reset = if inc { &ch_e_inc } else { &ch_e_dec };
-                let _ = reset.put_i16_process(0).await;
-                next = Next::EChanged;
-            }
-        } else if changed_pv == pv_lambda_inc || changed_pv == pv_lambda_dec {
-            // C state tweak (kohzuCtl.st:768-787): lambda steps by
-            // ± LTweakVal when inside its limits, and lChanged runs either way.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_lambda_inc;
-                let step = ch_lambda_tweak_val.get_f64().await;
-                let temp = lambda_val + step * if inc { 1.0 } else { -1.0 };
-                let l_hi = ch_lambda_hi.get_f64().await;
-                let l_lo = ch_lambda_lo.get_f64().await;
-                if temp >= l_lo && temp <= l_hi {
-                    lambda_val = temp;
-                    let _ = ch_lambda.put_f64_process(lambda_val).await;
-                } else {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Lambda tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
+                if v.test(HLM[TH]) || v.test(LLM[TH]) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:thetaMotXxLim_mon");
+                    self.msg1("Theta Motor Soft Limits Changed").await;
+                    self.msg2(" ").await;
+                    self.v.clear(HLM[TH]);
+                    self.v.clear(LLM[TH]);
+                    return Some(State::ThetaLimits);
                 }
-                let reset = if inc { &ch_lambda_inc } else { &ch_lambda_dec };
-                let _ = reset.put_i16_process(0).await;
-                next = Next::LChanged;
-            }
-        } else if changed_pv == pv_theta_inc || changed_pv == pv_theta_dec {
-            // C state tweak (kohzuCtl.st:789-808): theta steps by
-            // ± thTweakVal when inside its limits, and thChanged runs either way.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_theta_inc;
-                let step = ch_theta_tweak_val.get_f64().await;
-                let temp = theta_val + step * if inc { 1.0 } else { -1.0 };
-                if temp >= theta_lo && temp <= theta_hi {
-                    theta_val = temp;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                } else {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Theta tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
+                if v.test_and_clear(RBV[TH]) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:thetaMotRdbk_mon");
+                    self.pseudo.set();
+                    return Some(State::UpdateRdbk);
                 }
-                let reset = if inc { &ch_theta_inc } else { &ch_theta_dec };
-                let _ = reset.put_i16_process(0).await;
-                next = Next::ThChanged;
-            }
-        } else if changed_pv == pv_h
-            || changed_pv == pv_k
-            || changed_pv == pv_l
-            || changed_pv == pv_a
-        {
-            // C waitForCmnd HKLA_mon -> dInputChanged -> thChanged
-            // (kohzuCtl.st:674-684, :811-831).
-            let _ = ch_seq_msg1
-                .put_string_process("Lattice Spacing Changed")
-                .await;
-            for pv in [&pv_h, &pv_k, &pv_l, &pv_a] {
-                monitor.clear(pv);
-            }
-            let _ = ch_seq_msg2.put_string_process(" ").await;
-            two_d = d_input_changed(theta_hi, theta_lo).await;
-            next = Next::ThChanged;
-        } else if changed_pv == pv_put_vals {
-            let pv = new_val as i16;
-            if pv != 0 {
-                next = Next::ThChanged;
-            }
-        } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_seq_msg1.put_string_process(" ").await;
-                let _ = ch_seq_msg2.put_string_process(" ").await;
-                enter_wait = true;
-            }
-        } else if changed_pv == pv_theta_mot_rbv {
-            // updatePsuedo's thetaMotRdbkPseudo_mon echo.
-            let _ = ch_theta_rdbk_echo.put_f64_process(new_val).await;
-            next = Next::UpdateRdbk;
-        } else if changed_pv == pv_theta_hilim || changed_pv == pv_theta_lolim {
-            // C waitForCmnd thetaMotXxLim_mon -> thetaLimits -> checkDone
-            // (kohzuCtl.st:686-694, :833-859, :1090-1100).
-            let _ = ch_seq_msg1
-                .put_string_process("Theta Motor Soft Limits Changed")
-                .await;
-            let _ = ch_seq_msg2.put_string_process(" ").await;
-            monitor.clear(&pv_theta_hilim);
-            monitor.clear(&pv_theta_lolim);
-            let theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
-            let theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
-            (theta_hi, theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            if theta_mot_hi > theta_hi {
-                let _ = ch_seq_msg2
-                    .put_string_process("ThetaHiLim > 89 deg. (Using 89 deg.)")
-                    .await;
-            }
-            if theta_mot_lo < theta_lo {
-                let _ = ch_seq_msg2
-                    .put_string_process("ThetaLoLim < 1 deg. (Using 1 deg.)")
-                    .await;
-            }
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            if ch_theta_dmov.get_i16().await != 0
-                && ch_y_dmov.get_i16().await != 0
-                && ch_z_dmov.get_i16().await != 0
-            {
-                kohzu_done = true;
-                enter_wait = true;
-            } else {
-                next = Next::UpdateRdbk;
-            }
-        } else if changed_pv == pv_y_offset {
-            y_offset_val = new_val;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_seq_msg1
-                .put_string_process(&format!("y offset changed to {y_offset_val:.6}"))
-                .await;
-            let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-            next = Next::CalcMovements;
-        } else if changed_pv == pv_moving {
-            // C `state busyChanged` (kohzuCtl.st:865-887), reached from
-            // waitForCmnd on `efTestAndClear(kMbusy)` (:714). A put that
-            // writes a setpoint's existing value posts no monitor — C's own
-            // comment at :862-864 — yet BraggEAO/BraggLambdaAO/BraggThetaAO
-            // all FLNK to KohzuPutMoving, which asserts the busy record. C
-            // treats that assertion as the command: with no setpoint event
-            // left to consume it falls to `when (kohzuMoving > 0)` and enters
-            // eChanged, recomputing lambda and theta from the current E and
-            // running the move. A clearing edge is C's `when (kohzuMoving ==
-            // 0)`, which only returns to waitForCmndEnter.
-            if new_val as i16 != 0 {
-                next = Next::EChanged;
-            } else {
-                enter_wait = true;
-            }
-        }
-
-        if next == Next::UpdateRdbk {
-            // C updateRdbk (kohzuCtl.st:1102-1179): no command is taken
-            // while the motors move; the setpoint monitors raised meanwhile
-            // are dropped by the next waitForCmndEnter.
-            loop {
-                if ch_theta_mot_rbv.get_f64().await == 0.0 {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Theta Motor Readback is 0 !")
-                        .await;
-                    let _ = ch_seq_msg2
-                        .put_string_process("Monochromator stopped")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    break;
+                if v.test_and_clear(E) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:E_mon");
+                    return Some(State::EChanged);
                 }
-                if ch_theta_dmov.get_i16().await != 0
-                    && ch_y_dmov.get_i16().await != 0
-                    && ch_z_dmov.get_i16().await != 0
-                {
-                    epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
-                    next = Next::ThetaMotStopped;
-                    break;
+                if v.test_and_clear(LAMBDA) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:lambda_mon");
+                    return Some(State::LChanged);
                 }
-                if let Some(msg) = limit_switches.hit(cc_mode_of(&mut monitor)).await {
-                    // stopKohzu, stoppedKohzuWait (kohzuCtl.st:1289-1305).
-                    let _ = ch_seq_msg1.put_string_process(msg).await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_seq_msg2
-                        .put_string_process("Setting to Manual Mode")
-                        .await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_y_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
-                    continue;
+                if v.test_and_clear(THETA) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:theta_mon");
+                    return Some(State::ThChanged);
                 }
-                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-                theta_rdbk_val = ch_theta_mot_rbv.get_f64().await;
-                lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            }
-            if next != Next::ThetaMotStopped {
-                enter_wait = true;
-                continue;
-            }
-            theta_rdbk_val = ch_theta_mot_rbv.get_f64().await;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            kohzu_done = true;
-            let _ = ch_theta_rdbk_echo.put_f64_process(theta_rdbk_val).await;
-            monitor.clear(&pv_theta_mot_rbv);
-            // C thetaMotStopped (kohzuCtl.st:1181-1216).
-            if std::mem::take(&mut caused_move) {
-                if speed_control {
-                    for (ch, speed) in [&ch_theta_mot_velo, &ch_y_mot_velo, &ch_z_mot_velo]
+                if !self.soft && v.test_and_clear(MOVING) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:kMbusy");
+                    return Some(State::BusyChanged);
+                }
+                if v.on(PUT_VALS) && d.delay(0.1) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:putVals");
+                    return Some(State::MoveKohzu);
+                }
+                if !self.soft
+                    && [E_INC, E_DEC, L_INC, L_DEC, TH_INC, TH_DEC]
                         .into_iter()
-                        .zip(old_speeds)
-                    {
-                        let _ = ch.put_f64_process(speed).await;
+                        .any(|i| v.on(i))
+                {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:Tweak");
+                    return Some(State::Tweak);
+                }
+                if v.test_and_clear(Y_OFFSET) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:yOffset_mon");
+                    v.set(AUTO_MODE, 0.0).await;
+                    let msg = format!("y offset changed to {}", fmt_f(v.get(Y_OFFSET), 6));
+                    self.msg1(&msg).await;
+                    self.msg2("Set to Manual Mode").await;
+                    return Some(State::CalcMovements);
+                }
+                if v.on(OP_ACK) {
+                    ctl_debug!(v, "kohzuCtl:waitForCmnd:opAck");
+                    v.set(OP_ALERT, 0.0).await;
+                    self.msg1(" ").await;
+                    self.msg2(" ").await;
+                    return Some(State::WaitForCmndEnter);
+                }
+                None
+            }
+            State::Tweak => {
+                for (line, inc, dec, val, step, lo, hi, msg, next) in [
+                    (
+                        "kohzuCtl:tweak:E+",
+                        E_INC,
+                        E_DEC,
+                        E,
+                        E_TWEAK,
+                        E_LO,
+                        E_HI,
+                        "E tweak exceeds limit",
+                        State::EChanged,
+                    ),
+                    (
+                        "kohzuCtl:tweak:L",
+                        L_INC,
+                        L_DEC,
+                        LAMBDA,
+                        L_TWEAK,
+                        LAMBDA_LO,
+                        LAMBDA_HI,
+                        "Lambda tweak exceeds limit",
+                        State::LChanged,
+                    ),
+                    (
+                        "kohzuCtl:tweak:th",
+                        TH_INC,
+                        TH_DEC,
+                        THETA,
+                        TH_TWEAK,
+                        THETA_LO,
+                        THETA_HI,
+                        "Theta tweak exceeds limit",
+                        State::ThChanged,
+                    ),
+                ] {
+                    let v = &mut self.v;
+                    if !(v.on(inc) || v.on(dec)) {
+                        continue;
+                    }
+                    ctl_debug!(v, "{line}");
+                    let sign = if v.on(inc) { 1.0 } else { -1.0 };
+                    let temp = v.get(val) + v.get(step) * sign;
+                    if (temp >= v.get(lo)) && (temp <= v.get(hi)) {
+                        v.set(val, temp).await;
+                    } else {
+                        self.msg1(msg).await;
+                        self.v.set(OP_ALERT, 1.0).await;
+                    }
+                    let v = &mut self.v;
+                    let pressed = if v.on(inc) { inc } else { dec };
+                    v.set(pressed, 0.0).await;
+                    return Some(next);
+                }
+                None
+            }
+            State::DInputChanged => {
+                ctl_debug!(v, "kohzuCtl:dInputChanged");
+                v.set(AUTO_MODE, 0.0).await;
+                self.msg2("Set to Manual Mode").await;
+                let v = &mut self.v;
+                let (two_d, forbidden, msg) =
+                    calc_2d_spacing(v.get(A), v.get(H), v.get(K), v.get(L));
+                v.assign(OP_ALERT, f64::from(u8::from(forbidden)));
+                v.set(D, two_d).await;
+                self.msg1(msg).await;
+                self.put_e_lambda_limits().await;
+                self.v.put(OP_ALERT).await;
+                Some(State::ThChanged)
+            }
+            State::ThetaLimits => {
+                ctl_debug!(v, "kohzuCtl:thetaLimits");
+                let x = v.get(HLM[TH]);
+                v.assign(THETA_HI, x);
+                let x = v.get(LLM[TH]);
+                v.assign(THETA_LO, x);
+                if v.get(THETA_HI) > 89.0 {
+                    v.assign(THETA_HI, 89.0);
+                    self.msg2("ThetaHiLim > 89 deg. (Using 89 deg.)").await;
+                }
+                if self.v.get(THETA_LO) < 1.0 {
+                    self.v.assign(THETA_LO, 1.0);
+                    self.msg2("ThetaLoLim < 1 deg. (Using 1 deg.)").await;
+                }
+                self.v.put(THETA_HI).await;
+                self.v.put(THETA_LO).await;
+                self.put_e_lambda_limits().await;
+                Some(State::CheckDone)
+            }
+            // A setpoint put that writes the value already there posts no
+            // monitor, but its FLNK still asserts the busy record
+            // (kohzuCtl.st:861-864).
+            State::BusyChanged => {
+                let moving = v.get(MOVING) > 0.0;
+                for (flag, line, next) in [
+                    (E, "E changed", State::EChanged),
+                    (LAMBDA, "lambda changed", State::LChanged),
+                    (THETA, "theta changed", State::ThChanged),
+                ] {
+                    if moving && v.test(flag) {
+                        // C's lines put the newline mid-string (kohzuCtl.st:867-882).
+                        if v.on(DEBUG) {
+                            print!("kohzuCtl:busyChanged\n to Moving and {line}");
+                        }
+                        v.clear(flag);
+                        return Some(next);
                     }
                 }
-                enter_wait = true;
-                continue;
+                if moving {
+                    if v.on(DEBUG) {
+                        print!("kohzuCtl:busyChanged\n to Moving but unclear why");
+                    }
+                    return Some(State::EChanged);
+                }
+                if v.get(MOVING) == 0.0 {
+                    if v.on(DEBUG) {
+                        print!("kohzuCtl:busyChanged\n to Done");
+                    }
+                    return Some(State::WaitForCmndEnter);
+                }
+                None
             }
-            if init_seq_done {
-                let _ = ch_alert.put_i16_process(1).await;
-                let _ = ch_seq_msg1
-                    .put_string_process("Only Theta Motor Moved")
-                    .await;
-                let _ = ch_seq_msg2
-                    .put_string_process("Hit MOVE to Adjust Y & Z")
-                    .await;
-                let _ = ch_auto_mode.put_i16_process(0).await;
+            State::EChanged => {
+                ctl_debug!(v, "kohzuCtl:eChanged");
+                let x = HC / v.get(E);
+                v.set(LAMBDA, x).await;
+                Some(State::LChanged)
             }
-            theta_val = theta_rdbk_val;
-            let _ = ch_theta.put_f64_process(theta_val).await;
-            lambda_val = theta_to_lambda(theta_val, two_d);
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            e_val = lambda_to_energy(lambda_val);
-            let _ = ch_e.put_f64_process(e_val).await;
-            next = Next::ThChanged;
-        }
-        if next == Next::Wait {
-            continue;
-        }
-        if next == Next::EChanged {
-            // C state eChanged (kohzuCtl.st:886-892).
-            lambda_val = energy_to_lambda(e_val);
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            next = Next::LChanged;
-        }
-        if next == Next::LChanged {
-            // C state lChanged (kohzuCtl.st:894-909).
-            if lambda_val > two_d {
-                let _ = ch_seq_msg1
-                    .put_string_process("Wavelength > 2d spacing.")
-                    .await;
-                let _ = ch_alert.put_i16_process(1).await;
-            } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                theta_val = th;
-                let _ = ch_theta.put_f64_process(theta_val).await;
-            }
-            next = Next::ThChanged;
-        }
-
-        let mut will_violate = false;
-        if next == Next::ThChanged {
-            let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
-            if was_clamped {
-                theta_val = clamped_theta;
-                let _ = ch_seq_msg1
-                    .put_string_process("Theta constrained to LIMIT")
-                    .await;
-                let _ = ch_alert.put_i16_process(1).await;
-                if risk_averse {
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
+            State::LChanged => {
+                if v.get(LAMBDA) > v.get(D) {
+                    ctl_debug!(v, "kohzuCtl:lChanged: lambda>D");
+                    self.msg1("Wavelength > 2d spacing.").await;
+                    self.v.set(OP_ALERT, 1.0).await;
                 } else {
-                    // C kohzuCtl.st:889-891 — outside risk-averse mode a theta-limit
-                    // hit sets willViolateLimit, so the whole command is rolled back.
-                    will_violate = true;
+                    ctl_debug!(v, "kohzuCtl:lChanged");
+                    let theta = RAD_CONV * (v.get(LAMBDA) / v.get(D)).asin();
+                    v.set(THETA, theta).await;
                 }
+                Some(State::ThChanged)
             }
-
-            lambda_val = theta_to_lambda(theta_val, two_d);
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            e_val = lambda_to_energy(lambda_val);
-            let _ = ch_e.put_f64_process(e_val).await;
-
-            theta_rdbk_val = ch_theta_mot_rbv.get_f64().await;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-        }
-
-        let current_rbv = ch_theta_mot_rbv.get_f64().await;
-
-        // -- Calculate motor movements --
-        let theta_mot_desired = theta_val;
-        let y_mot_desired = calc_y_position(geom, theta_val, y_offset_val);
-        let z_mot_desired = calc_z_position(geom, theta_val, y_offset_val);
-
-        let _ = ch_theta_set_ao.put_f64_process(theta_mot_desired).await;
-        let _ = ch_y_set_ao.put_f64_process(y_mot_desired).await;
-        let _ = ch_z_set_ao.put_f64_process(z_mot_desired).await;
-
-        // Check Y and Z limits
-        let y_hi = ch_y_mot_hilim.get_f64().await;
-        let y_lo = ch_y_mot_lolim.get_f64().await;
-        let z_hi = ch_z_mot_hilim.get_f64().await;
-        let z_lo = ch_z_mot_lolim.get_f64().await;
-
-        if !cc_mode_of(&mut monitor).y_frozen() && (y_mot_desired < y_lo || y_mot_desired > y_hi) {
-            let _ = ch_seq_msg1
-                .put_string_process("Y will exceed soft limits")
-                .await;
-            if ch_debug.get_i16().await > 0 {
-                eprintln!(
-                    "kohzuCtl: move blocked by Y soft limit (want={:.6}, lo={:.6}, hi={:.6}, theta={:.6}, E={:.6})",
-                    y_mot_desired, y_lo, y_hi, theta_val, e_val
+            State::ThChanged => {
+                ctl_debug!(v, "kohzuCtl:thChanged");
+                if (v.get(THETA) <= v.get(THETA_LO)) || (v.get(THETA) >= v.get(THETA_HI)) {
+                    self.msg1("Theta constrained to LIMIT").await;
+                    let v = &mut self.v;
+                    v.set(OP_ALERT, 1.0).await;
+                    if v.get(THETA) < v.get(THETA_LO) {
+                        let x = v.get(THETA_LO);
+                        v.assign(THETA, x);
+                    }
+                    if v.get(THETA) > v.get(THETA_HI) {
+                        let x = v.get(THETA_HI);
+                        v.assign(THETA, x);
+                    }
+                    self.will_violate_limit = true;
+                }
+                let theta = self.v.get(THETA);
+                let lambda = self.lambda_of(theta);
+                let v = &mut self.v;
+                v.set(LAMBDA, lambda).await;
+                v.set(E, HC / lambda).await;
+                self.put_rdbk().await;
+                Some(State::CalcMovements)
+            }
+            State::CalcMovements => {
+                ctl_debug!(v, "kohzuCtl:calcMovements");
+                let theta = v.get(THETA);
+                let y_off = v.get(Y_OFFSET);
+                v.assign(DESIRED[TH], theta);
+                v.assign(DESIRED[Y], calc_y_position(self.geom, theta, y_off));
+                v.assign(DESIRED[Z], calc_z_position(self.geom, theta, y_off));
+                for (axis, other_frozen, msg) in [
+                    (Y, 3.0, "Y will exceed soft limits"),
+                    (Z, 2.0, "Z will exceed soft limits"),
+                ] {
+                    let v = &mut self.v;
+                    let cc = v.get(CC_MODE);
+                    let x = v.get(DESIRED[axis]);
+                    if cc != 1.0
+                        && cc != other_frozen
+                        && (x < v.get(LLM[axis]) || x > v.get(HLM[axis]))
+                    {
+                        self.msg1(msg).await;
+                        self.v.set(OP_ALERT, 1.0).await;
+                        self.will_violate_limit = true;
+                    }
+                }
+                let v = &mut self.v;
+                for i in DESIRED {
+                    v.put(i).await;
+                }
+                self.old_speed = SPEED.map(|i| v.get(i));
+                let dist = [TH, Y, Z].map(|axis| (v.get(DESIRED[axis]) - v.get(RBV[axis])).abs());
+                let mut time = [TH, Y, Z].map(|axis| dist[axis] / v.get(SPEED[axis]));
+                match v.get(CC_MODE) {
+                    1.0 => {
+                        time[Y] = 0.0;
+                        time[Z] = 0.0;
+                    }
+                    2.0 => time[Z] = 0.0,
+                    3.0 => time[Y] = 0.0,
+                    _ => {}
+                }
+                // The longest move keeps its speed; the others take its time.
+                let longest = if time[TH] >= time[Y] && time[TH] >= time[Z] {
+                    TH
+                } else if time[Y] >= time[TH] && time[Y] >= time[Z] {
+                    Y
+                } else {
+                    Z
+                };
+                for axis in [TH, Y, Z] {
+                    self.new_speed[axis] = if axis == longest {
+                        v.get(SPEED[axis])
+                    } else {
+                        dist[axis] / time[longest]
+                    };
+                }
+                Some(State::MoveKohzu)
+            }
+            State::MoveKohzu => {
+                if !self.soft && self.will_violate_limit {
+                    self.roll_back().await;
+                    self.kohzu_done = true;
+                    return Some(State::WaitForCmndEnter);
+                }
+                let v = &mut self.v;
+                if v.on(AUTO_MODE) || v.on(PUT_VALS) || v.on(USE_SET) {
+                    ctl_debug!(v, "kohzuCtl:moveKohzu:auto|put");
+                    if self.will_violate_limit {
+                        self.roll_back().await;
+                    } else {
+                        self.move_motors().await;
+                    }
+                    return Some(State::UpdateRdbk);
+                }
+                ctl_debug!(v, "kohzuCtl:moveKohzu");
+                Some(State::WaitForCmndEnter)
+            }
+            State::CheckDone => {
+                if DMOV.into_iter().all(|i| v.on(i)) {
+                    ctl_debug!(v, "kohzuCtl:checkDone: done");
+                    self.kohzu_done = true;
+                    return Some(State::WaitForCmndEnter);
+                }
+                ctl_debug!(v, "kohzuCtl:checkDone: not done");
+                Some(State::UpdateRdbk)
+            }
+            State::UpdateRdbk => {
+                if self.will_violate_limit {
+                    return Some(State::WaitForCmndEnter);
+                }
+                if v.get(RBV[TH]) == 0.0 {
+                    ctl_debug!(v, "kohzuCtl:updateRdbk:thetaMotRdbk==0");
+                    self.msg1("Theta Motor Readback is 0 !").await;
+                    self.msg2("Monochromator stopped").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    return Some(State::WaitForCmndEnter);
+                }
+                // A delay, as some readback monitors arrive after DMOV
+                // (kohzuCtl.st:1114).
+                let all_done = DMOV.into_iter().all(|i| v.on(i));
+                if all_done && d.delay(0.01) {
+                    ctl_debug!(
+                        v,
+                        "kohzuCtl:updateRdbk:*Dmov (done={},moving={})",
+                        u8::from(self.kohzu_done),
+                        v.get(MOVING) as i32
+                    );
+                    self.put_rdbk().await;
+                    self.kohzu_done = true;
+                    self.pseudo.set();
+                    self.v.clear(RBV[TH]);
+                    ctl_debug!(self.v, "kohzuCtl:updateRdbk: done");
+                    return Some(State::ThetaMotStopped);
+                }
+                let v = &mut self.v;
+                let cc = v.get(CC_MODE);
+                for (axis, watched, name, msg) in [
+                    (TH, true, "Th", "Theta Motor hit a limit switch!"),
+                    (
+                        Y,
+                        cc != 1.0 && cc != 3.0,
+                        "Y",
+                        "Y Motor hit a limit switch!",
+                    ),
+                    (
+                        Z,
+                        cc != 1.0 && cc != 2.0,
+                        "Z",
+                        "Z Motor hit a limit switch!",
+                    ),
+                ] {
+                    let v = &mut self.v;
+                    if watched && (v.on(HLS[axis]) || v.on(LLS[axis])) {
+                        ctl_debug!(v, "kohzuCtl:updateRdbk: {name} limit switch");
+                        self.msg1(msg).await;
+                        self.v.set(OP_ALERT, 1.0).await;
+                        self.v.set(AUTO_MODE, 0.0).await;
+                        self.msg2("Setting to Manual Mode").await;
+                        return Some(State::StopKohzu);
+                    }
+                }
+                if !all_done && d.delay(0.1) {
+                    if self.v.get(DEBUG) > 1.0 {
+                        println!("kohzuCtl:updateRdbk:moving");
+                    }
+                    self.put_rdbk().await;
+                    return Some(State::UpdateRdbk);
+                }
+                None
+            }
+            State::ThetaMotStopped => {
+                if self.caused_move {
+                    ctl_debug!(
+                        v,
+                        "kohzuCtl:thetaMotStopped:causedMove (done={},moving={})",
+                        u8::from(self.kohzu_done),
+                        v.get(MOVING) as i32
+                    );
+                    if v.on(SPEED_CTRL) {
+                        for axis in [TH, Y, Z] {
+                            v.set(SPEED[axis], self.old_speed[axis]).await;
+                        }
+                    }
+                    ctl_debug!(
+                        v,
+                        "kohzuCtl:thetaMotStopped: ySpeed = {:.6}",
+                        v.get(SPEED[Y])
+                    );
+                    self.caused_move = false;
+                    return Some(State::WaitForCmndEnter);
+                }
+                // Someone moved the theta motor directly.
+                ctl_debug!(
+                    v,
+                    "kohzuCtl:thetaMotStopped:!causedMove (done={},moving={})",
+                    u8::from(self.kohzu_done),
+                    v.get(MOVING) as i32
                 );
+                if self.init_seq_done {
+                    v.set(OP_ALERT, 1.0).await;
+                    self.msg1("Only Theta Motor Moved").await;
+                    self.msg2("Hit MOVE to Adjust Y & Z").await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                }
+                let theta = self.v.get(RBV[TH]);
+                self.v.set(THETA, theta).await;
+                let lambda = self.lambda_of(theta);
+                self.v.set(LAMBDA, lambda).await;
+                self.v.set(E, HC / lambda).await;
+                Some(State::ThChanged)
             }
-            let _ = ch_alert.put_i16_process(1).await;
-            if risk_averse {
-                let _ = ch_auto_mode.put_i16_process(0).await;
-                let _ = ch_seq_msg2
-                    .put_string_process("Setting to Manual Mode")
-                    .await;
-            } else {
-                will_violate = true;
+            State::ChkMotorLimits => {
+                ctl_debug!(v, "kohzuCtl:chkMotorLimits");
+                v.assign(OP_ALERT, 0.0);
+                self.put_rdbk().await;
+                let cc = self.v.get(CC_MODE);
+                for (axis, checked, name) in [
+                    (Y, cc != 1.0 && cc != 3.0, "Y"),
+                    (Z, cc != 1.0 && cc != 2.0, "Z"),
+                    (TH, true, "Theta"),
+                ] {
+                    if !checked {
+                        continue;
+                    }
+                    let v = &mut self.v;
+                    let rbv = v.get(RBV[axis]);
+                    if rbv == 0.0 {
+                        self.msg1(&format!("{name} Readback of 0 not reasonable"))
+                            .await;
+                        self.v.assign(OP_ALERT, 1.0);
+                    }
+                    let v = &mut self.v;
+                    if (rbv < v.get(LLM[axis])) || (rbv > v.get(HLM[axis])) {
+                        self.msg1(&format!("{name} Readback outside Motor Limits"))
+                            .await;
+                        self.v.assign(OP_ALERT, 1.0);
+                    }
+                }
+                if self.v.on(OP_ALERT) {
+                    self.v.put(OP_ALERT).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Set to Manual Mode").await;
+                }
+                Some(State::ChkMotorLimitsExit)
+            }
+            State::ChkMotorLimitsExit => {
+                if !v.on(OP_ALERT) {
+                    ctl_debug!(v, "kohzuCtl:chkMotorLimitsExit: OK");
+                    v.put(OP_ALERT).await;
+                    self.msg1("All motors within limits").await;
+                    return Some(State::WaitForCmndEnter);
+                }
+                if d.delay(2.0) {
+                    ctl_debug!(v, "kohzuCtl:chkMotorLimitsExit: opAlert");
+                    v.put(OP_ALERT).await;
+                    self.msg2("Modify Motor Positions/Limits").await;
+                    return Some(State::ChkMotorLimits);
+                }
+                None
+            }
+            State::StopKohzu => {
+                ctl_debug!(v, "kohzuCtl:stopKohzu");
+                for i in STOP {
+                    v.put(i).await;
+                }
+                Some(State::StoppedKohzuWait)
+            }
+            State::StoppedKohzuWait => {
+                if d.delay(1.0) {
+                    ctl_debug!(v, "kohzuCtl:stoppedKohzuWait");
+                    return Some(State::UpdateRdbk);
+                }
+                None
             }
         }
-        if !cc_mode_of(&mut monitor).z_frozen() && (z_mot_desired < z_lo || z_mot_desired > z_hi) {
-            let _ = ch_seq_msg1
-                .put_string_process("Z will exceed soft limits")
-                .await;
-            if ch_debug.get_i16().await > 0 {
-                eprintln!(
-                    "kohzuCtl: move blocked by Z soft limit (want={:.6}, lo={:.6}, hi={:.6}, theta={:.6}, E={:.6})",
-                    z_mot_desired, z_lo, z_hi, theta_val, e_val
-                );
+    }
+
+    /// moveKohzu's `willViolateLimit` arm: the command's E, lambda, theta
+    /// and motor setpoints back to what waitForCmndEnter saved.
+    async fn roll_back(&mut self) {
+        let v = &mut self.v;
+        v.set(E, self.prev_e).await;
+        v.set(THETA, self.prev_theta).await;
+        v.set(LAMBDA, self.prev_lambda).await;
+        for axis in [TH, Y, Z] {
+            v.set(DESIRED[axis], self.prev_desired[axis]).await;
+        }
+        self.msg2("Command ignored").await;
+    }
+
+    /// moveKohzu's move arm: a frozen motor gets neither speed nor move.
+    async fn move_motors(&mut self) {
+        let v = &mut self.v;
+        let cc = v.get(CC_MODE);
+        if v.on(SPEED_CTRL) {
+            for axis in [TH, Y, Z] {
+                v.assign(SPEED[axis], self.new_speed[axis]);
             }
-            let _ = ch_alert.put_i16_process(1).await;
-            if risk_averse {
-                let _ = ch_auto_mode.put_i16_process(0).await;
-                let _ = ch_seq_msg2
-                    .put_string_process("Setting to Manual Mode")
-                    .await;
-            } else {
-                will_violate = true;
+            v.put(SPEED[TH]).await;
+            if cc == 0.0 || cc == 2.0 {
+                v.put(SPEED[Y]).await;
+            }
+            if cc == 0.0 || cc == 3.0 {
+                v.put(SPEED[Z]).await;
             }
         }
-
-        if will_violate {
-            // C kohzuCtl.st:998-1012 (moveKohzu, `when (willViolateLimit)`):
-            // restore E/theta/lambda and the three motor setpoints to their
-            // pre-command values, pvPut each, and report "Command ignored".
-            // Without this the rejected out-of-range setpoints stay on the PVs.
-            e_val = prev_e;
-            theta_val = prev_theta;
-            lambda_val = prev_lambda;
-            let _ = ch_e.put_f64_process(e_val).await;
-            let _ = ch_theta.put_f64_process(theta_val).await;
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            let _ = ch_theta_set_ao.put_f64_process(last_theta_set).await;
-            let _ = ch_y_set_ao.put_f64_process(last_y_set).await;
-            let _ = ch_z_set_ao.put_f64_process(last_z_set).await;
-            let _ = ch_seq_msg2.put_string_process("Command ignored").await;
-            if ch_debug.get_i16().await > 0 {
-                eprintln!(
-                    "kohzuCtl: command ignored (limit violation); reverted to E={:.3} theta={:.3}",
-                    e_val, theta_val
-                );
-            }
-            kohzu_done = true;
-            enter_wait = true;
-            continue;
+        for axis in [TH, Y, Z] {
+            let x = v.get(DESIRED[axis]);
+            v.assign(CMD[axis], x);
         }
-
-        // Command accepted — these motor setpoints become the values to revert
-        // to if the next command violates a limit (C snapshots them as
-        // prev_*MotDesired at the following waitForCmnd entry).
-        last_theta_set = theta_mot_desired;
-        last_y_set = y_mot_desired;
-        last_z_set = z_mot_desired;
-
-        // -- Move motors if in auto or put mode --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if monitor.var(&pv_auto_mode) != 0.0
-            || put_requested
-            || use_set_mode.load(Ordering::Relaxed)
-        {
-            // Coordinate speeds
-            speed_control = ch_speed_ctrl.get_i16().await != 0;
-            if speed_control {
-                let th_speed = ch_theta_mot_velo.get_f64().await;
-                let y_speed = ch_y_mot_velo.get_f64().await;
-                let z_speed = ch_z_mot_velo.get_f64().await;
-                old_speeds = [th_speed, y_speed, z_speed];
-                let th_delta = theta_val - current_rbv;
-                let y_delta = y_mot_desired - ch_y_mot_rbv.get_f64().await;
-                let z_delta = z_mot_desired - ch_z_mot_rbv.get_f64().await;
-
-                let (new_th, new_y, new_z) = coordinate_speeds(
-                    th_delta,
-                    y_delta,
-                    z_delta,
-                    th_speed,
-                    y_speed,
-                    z_speed,
-                    cc_mode_of(&mut monitor),
-                );
-                let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
-                if !cc_mode_of(&mut monitor).y_frozen() {
-                    let _ = ch_y_mot_velo.put_f64_process(new_y).await;
-                }
-                if !cc_mode_of(&mut monitor).z_frozen() {
-                    let _ = ch_z_mot_velo.put_f64_process(new_z).await;
-                }
-            }
-
-            // Command motors — use put_f64_process to trigger motor record processing
-            if ch_debug.get_i16().await > 0 {
-                eprintln!(
-                    "kohzuCtl: MOVING theta={} y={} z={}",
-                    theta_mot_desired, y_mot_desired, z_mot_desired
-                );
-            }
-            let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
-            match cc_mode_of(&mut monitor) {
-                CrystalMode::Normal => {
-                    let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await;
-                    let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
-                }
-                CrystalMode::ChannelCut => {}
-                CrystalMode::FreezeZ => {
-                    let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await;
-                }
-                CrystalMode::FreezeY => {
-                    let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
-                }
-            }
-
-            let _ = ch_put_vals.put_i16_process(0).await;
-            caused_move = true;
-            steps.push_back(Step::UpdateRdbk);
-            continue;
+        v.put(CMD[TH]).await;
+        if cc == 0.0 || cc == 2.0 {
+            v.put(CMD[Y]).await;
         }
-        enter_wait = true;
+        if cc == 0.0 || cc == 3.0 {
+            v.put(CMD[Z]).await;
+        }
+        v.set(PUT_VALS, 0.0).await;
+        self.caused_move = true;
+    }
+
+    /// `thetaRdbk = thetaMotRdbk; lambdaRdbk = ...; ERdbk = ...` and their puts.
+    async fn put_rdbk(&mut self) {
+        let theta = self.v.get(RBV[TH]);
+        let lambda = self.lambda_of(theta);
+        let v = &mut self.v;
+        v.assign(THETA_RDBK, theta);
+        v.assign(LAMBDA_RDBK, lambda);
+        v.assign(E_RDBK, HC / lambda);
+        for i in [THETA_RDBK, LAMBDA_RDBK, E_RDBK] {
+            v.put(i).await;
+        }
+    }
+
+    /// lambdaHi/Lo from thetaHi/Lo, then EHi/Lo, each put.
+    async fn put_e_lambda_limits(&mut self) {
+        let (hi, lo) = (self.v.get(THETA_HI), self.v.get(THETA_LO));
+        let (hi, lo) = (self.lambda_of(hi), self.lambda_of(lo));
+        let v = &mut self.v;
+        v.set(LAMBDA_HI, hi).await;
+        v.set(LAMBDA_LO, lo).await;
+        v.set(E_HI, HC / lo).await;
+        v.set(E_LO, HC / hi).await;
     }
 }
 
@@ -1511,27 +1302,6 @@ async fn kohzu_ctl(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_energy_to_lambda() {
-        let lambda = energy_to_lambda(10.0);
-        assert!((lambda - 1.23984244).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_lambda_to_energy() {
-        let e = lambda_to_energy(1.23984244);
-        assert!((e - 10.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_energy_lambda_roundtrip() {
-        for e in [5.0, 8.0, 12.0, 20.0, 50.0] {
-            let l = energy_to_lambda(e);
-            let e2 = lambda_to_energy(l);
-            assert!((e - e2).abs() < 1e-10, "roundtrip failed for E={e}");
-        }
-    }
 
     #[test]
     fn test_calc_2d_spacing_si111() {
@@ -1557,29 +1327,29 @@ mod tests {
         assert!(!is_forbidden_reflection(2.0, 2.0, 0.0));
     }
 
+    /// kohzuCtl_calc2dSpacing (kohzuCtl.st:1439-1460): exact fmod parity,
+    /// so -1 and 1 differ and 1.005 is not odd, and all-zero HKL is 2A/0
+    /// with no alert.
     #[test]
-    fn test_lambda_to_theta() {
-        // Si(111) at 8 keV: lambda = 12.3984/8 = 1.54980 A
-        let (two_d, _, _) = calc_2d_spacing(5.4309, 1.0, 1.0, 1.0);
-        let lambda = energy_to_lambda(8.0);
-        let theta = lambda_to_theta(lambda, two_d).unwrap();
-        // Expected: asin(1.5498/6.2712) * 57.2958 ~ 14.3 deg
-        assert!((theta - 14.3).abs() < 0.5, "theta={theta}");
+    fn calc_2d_spacing_follows_c_arithmetic() {
+        assert!(is_forbidden_reflection(-1.0, 1.0, 1.0));
+        assert!(is_forbidden_reflection(1.005, 1.0, 1.0));
+        assert!(is_forbidden_reflection(0.5, 0.5, 0.5));
+        assert!(!is_forbidden_reflection(-2.0, -2.0, 0.0));
+        assert_eq!(
+            calc_2d_spacing(5.4309, 0.0, 0.0, 0.0),
+            (f64::INFINITY, false, "New d spacing")
+        );
+        let (two_d, alert, _) = calc_2d_spacing(0.0, 0.0, 0.0, 0.0);
+        assert!(two_d.is_nan() && !alert);
     }
 
+    /// C's radConv is 57.2958 (kohzuCtl.st:525), not 180/pi.
     #[test]
-    fn test_lambda_to_theta_impossible() {
-        // lambda > 2d should return None
-        assert!(lambda_to_theta(10.0, 6.0).is_none());
-    }
-
-    #[test]
-    fn test_theta_to_lambda_roundtrip() {
-        let two_d = 6.2712;
-        let theta = 14.3;
-        let lambda = theta_to_lambda(theta, two_d);
-        let theta2 = lambda_to_theta(lambda, two_d).unwrap();
-        assert!((theta - theta2).abs() < 1e-6);
+    fn theta_converts_with_c_rad_conv() {
+        assert_eq!(theta_to_lambda(30.0, 6.0), 6.0 * (30.0f64 / 57.2958).sin());
+        let y = calc_y_position(Geometry::Standard, 30.0, 17.5);
+        assert_eq!(y, -17.5 / (30.0f64 / 57.2958).cos());
     }
 
     #[test]
@@ -1600,61 +1370,5 @@ mod tests {
         assert!((y - 10.1036).abs() < 0.01, "y={y}");
         // z = 17.5/(2*sin(30)) = 17.5/1.0 = 17.5
         assert!((z - 17.5).abs() < 0.01, "z={z}");
-    }
-
-    #[test]
-    fn test_clamp_theta() {
-        assert_eq!(clamp_theta(45.0, 1.0, 89.0), (45.0, false));
-        assert_eq!(clamp_theta(0.5, 1.0, 89.0), (1.0, true));
-        assert_eq!(clamp_theta(90.0, 1.0, 89.0), (89.0, true));
-        // Exactly on a limit is constrained (inclusive, matching C).
-        assert_eq!(clamp_theta(1.0, 1.0, 89.0), (1.0, true));
-        assert_eq!(clamp_theta(89.0, 1.0, 89.0), (89.0, true));
-    }
-
-    #[test]
-    fn test_compute_theta_limits() {
-        assert_eq!(compute_theta_limits(100.0, -5.0), (89.0, 1.0));
-        assert_eq!(compute_theta_limits(45.0, 5.0), (45.0, 5.0));
-    }
-
-    #[test]
-    fn test_compute_energy_lambda_limits() {
-        let two_d = 6.2712;
-        let (e_hi, e_lo, l_hi, l_lo) = compute_energy_lambda_limits(two_d, 89.0, 1.0);
-        assert!(e_hi > e_lo);
-        assert!(l_hi > l_lo);
-        assert!(l_hi <= two_d);
-    }
-
-    #[test]
-    fn test_coordinate_speeds() {
-        let (th, y, z) = coordinate_speeds(10.0, 5.0, 20.0, 1.0, 1.0, 1.0, CrystalMode::Normal);
-        // Z takes longest (20s at speed 1), so th and y should be slower
-        assert!((z - 1.0).abs() < 1e-6);
-        assert!((th - 0.5).abs() < 1e-6);
-        assert!((y - 0.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_coordinate_speeds_frozen() {
-        let (th, _y, z) =
-            coordinate_speeds(10.0, 5.0, 20.0, 1.0, 1.0, 1.0, CrystalMode::ChannelCut);
-        // Y and Z frozen, so only theta time matters
-        assert!((th - 1.0).abs() < 1e-6);
-        // Z frozen means z_time = 0, so z_speed adjusted to theta time
-        assert!((z - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_crystal_mode_frozen() {
-        assert!(!CrystalMode::Normal.y_frozen());
-        assert!(!CrystalMode::Normal.z_frozen());
-        assert!(CrystalMode::ChannelCut.y_frozen());
-        assert!(CrystalMode::ChannelCut.z_frozen());
-        assert!(!CrystalMode::FreezeZ.y_frozen());
-        assert!(CrystalMode::FreezeZ.z_frozen());
-        assert!(CrystalMode::FreezeY.y_frozen());
-        assert!(!CrystalMode::FreezeY.z_frozen());
     }
 }

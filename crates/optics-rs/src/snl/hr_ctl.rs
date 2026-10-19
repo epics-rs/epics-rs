@@ -8,14 +8,14 @@
 //! Crystal angles are in *micro-radian* motor units internally; user-facing
 //! angles (theta, phi) are in degrees.
 
-use std::collections::HashMap;
-use std::time::Duration;
-
 use epics_base_rs::server::database::PvDatabase;
-use tracing::info;
+use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::db_access::alloc_origin;
 use crate::snl::kohzu_ctl::HC;
+use crate::snl::vars::{
+    DOUBLE, DOUBLE_MON, DOUBLE_SYNC, Decl, Delays, SHORT, SHORT_MON, SHORT_SYNC, Vars, ctl_debug,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -32,388 +32,33 @@ const UR2D: f64 = R2D / 1_000_000.0;
 const D2UR: f64 = 1_000_000.0 * PI / 180.0;
 
 // ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
-
-/// HR operating mode (opMode / Mode2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HrOpMode {
-    /// Single crystal -- only phi1 moves.
-    Single = 0,
-    /// Two crystals locked -- phi1 and phi2 move together.
-    TwoLocked = 1,
-    /// Two crystals independent -- user adjusts theta2 for fine energy.
-    TwoIndependent = 2,
-}
-
-impl HrOpMode {
-    pub fn from_i16(v: i16) -> Self {
-        match v {
-            1 => Self::TwoLocked,
-            2 => Self::TwoIndependent,
-            _ => Self::Single,
-        }
-    }
-}
-
-/// HR geometry (nested vs symmetric).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HrGeometry {
-    /// Nested: surfaces 1,4 use (H1,K1,L1); surfaces 2,3 use (H2,K2,L2).
-    Nested = 0,
-    /// Symmetric: surfaces 1,2 use (H1,K1,L1); surfaces 3,4 use (H2,K2,L2).
-    Symmetric = 1,
-}
-
-impl HrGeometry {
-    pub fn from_i16(v: i16) -> Self {
-        if v == 0 {
-            Self::Nested
-        } else {
-            Self::Symmetric
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // State enum
 // ---------------------------------------------------------------------------
 
+/// The states of ss hr_Ctl (hrCtl.st:552-1477).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HrState {
     Init,
     InitSequence,
-    WaitForCommand,
-    DInputChanged,
+    WaitForCmndEnter,
+    WaitForCmnd,
+    CheckAutoMode,
     PhiLimits,
+    CheckDone,
+    DInputChanged,
+    Tweak,
     EChanged,
-    LambdaChanged,
-    ThetaChanged,
+    LChanged,
+    ThChanged,
     CalcMovements,
     MoveHr,
-    UpdateReadback,
-    CheckDone,
+    UpdateRdbk,
+    UpdateRdbkAfterDelay,
     MotorsStopped,
-    CheckMotorLimits,
+    ChkMotorLimits,
+    ChkMotorLimitsExit,
     StopHr,
-    Tweak,
-}
-
-// ---------------------------------------------------------------------------
-// Pure physics functions
-// ---------------------------------------------------------------------------
-
-/// Calculate 2d-spacing for a crystal from lattice constant and Miller indices.
-/// Returns (two_d, is_forbidden, message).
-pub fn calc_2d_spacing(a: f64, h: f64, k: f64, l: f64) -> (f64, bool, String) {
-    let hkl_sq = h * h + k * k + l * l;
-    if hkl_sq <= 0.0 {
-        return (0.0, true, "Invalid HKL: all zero".to_string());
-    }
-    let two_d = (2.0 * a) / hkl_sq.sqrt();
-    let forbidden = crate::snl::kohzu_ctl::is_forbidden_reflection(h, k, l);
-    let msg = if forbidden {
-        "Invalid HKL combination".to_string()
-    } else {
-        "New d spacing".to_string()
-    };
-    (two_d, forbidden, msg)
-}
-
-/// Compute phi1 from theta1 (they are equal in all modes).
-pub fn theta1_to_phi1(theta1: f64) -> f64 {
-    theta1
-}
-
-/// Compute phi2 from phi1, theta1, theta2 for nested geometry.
-pub fn calc_phi2_nested(phi1: f64, theta1: f64, theta2: f64) -> f64 {
-    phi1 + theta1 + theta2
-}
-
-/// Compute phi2 for symmetric geometry.
-pub fn calc_phi2_symmetric(theta2: f64) -> f64 {
-    theta2
-}
-
-/// Compute phi2 for two-independent mode with nested geometry.
-/// Uses the perturbation formula from hrCtl.st.
-pub fn calc_phi2_independent_nested(
-    phi1: f64,
-    theta1: f64,
-    theta2_nom: f64,
-    lambda: f64,
-    lambda_nom: f64,
-    d1: f64,
-    d2: f64,
-) -> f64 {
-    let correction = R2D
-        * (lambda - lambda_nom)
-        * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
-    (phi1 + theta1 + theta2_nom) + correction
-}
-
-/// Compute phi2 for two-independent mode with symmetric geometry.
-pub fn calc_phi2_independent_symmetric(
-    theta2_nom: f64,
-    lambda: f64,
-    lambda_nom: f64,
-    d1: f64,
-    d2: f64,
-    theta1: f64,
-) -> f64 {
-    let correction = R2D
-        * (lambda - lambda_nom)
-        * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (theta2_nom * D2R).cos()));
-    theta2_nom + correction
-}
-
-/// Compute phi motor command from phi angle, offset, and world offset.
-/// `geom_sign` is -1 for symmetric geometry phi2, +1 otherwise.
-pub fn phi_to_motor(phi: f64, phi_off: f64, world_off_deg: f64) -> f64 {
-    (phi - phi_off - world_off_deg) * D2UR
-}
-
-/// Compute phi motor command for phi2 in symmetric geometry (world sign is reversed).
-pub fn phi2_to_motor_symmetric(phi2: f64, phi2_off: f64, world_off_deg: f64) -> f64 {
-    (phi2 - phi2_off + world_off_deg) * D2UR
-}
-
-/// Convert motor readback (micro-radians) to phi angle (degrees) with offset.
-pub fn motor_to_phi(motor_ur: f64, phi_off: f64, world_off_deg: f64) -> f64 {
-    motor_ur * UR2D + phi_off + world_off_deg
-}
-
-/// For phi2 in symmetric geometry, world offset sign is reversed.
-pub fn motor_to_phi2_symmetric(motor_ur: f64, phi2_off: f64, world_off_deg: f64) -> f64 {
-    motor_ur * UR2D + phi2_off - world_off_deg
-}
-
-/// Calculate readback values from motor positions.
-pub struct HrReadback {
-    pub phi1_rdbk: f64,
-    pub theta1_rdbk: f64,
-    pub phi2_rdbk: f64,
-    pub theta2_rdbk: f64,
-    pub lambda_rdbk: f64,
-    pub e_rdbk: f64,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn calc_readback(
-    phi1_mot_rdbk: f64,
-    phi2_mot_rdbk: f64,
-    phi1_off: f64,
-    phi2_off: f64,
-    world_off: f64, // in degrees already (worldOff * uR2D applied by caller)
-    d1: f64,
-    d2: f64,
-    op_mode: HrOpMode,
-    geom: HrGeometry,
-) -> HrReadback {
-    let world_off_deg = world_off * UR2D;
-
-    let phi1_rdbk = motor_to_phi(phi1_mot_rdbk, phi1_off, world_off_deg);
-    let theta1_rdbk_initial = phi1_rdbk;
-
-    let (phi2_rdbk, lambda_rdbk) = match op_mode {
-        HrOpMode::Single => {
-            let lambda = d1 * (theta1_rdbk_initial * D2R).sin();
-            (0.0, lambda)
-        }
-        HrOpMode::TwoLocked => {
-            let phi2 = match geom {
-                HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => {
-                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
-                }
-            };
-            let lambda = d1 * (theta1_rdbk_initial * D2R).sin();
-            (phi2, lambda)
-        }
-        HrOpMode::TwoIndependent => {
-            let phi2 = match geom {
-                HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => {
-                    motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg)
-                }
-            };
-            let theta2_nom = (d1 * (theta1_rdbk_initial * D2R).sin() / d2).asin() * R2D;
-            let lambda = match geom {
-                HrGeometry::Nested => {
-                    d1 * (theta1_rdbk_initial * D2R).sin()
-                        + D2R * (phi2 - phi1_rdbk - theta1_rdbk_initial - theta2_nom)
-                            / (1.0 / (d1 * (theta1_rdbk_initial * D2R).cos())
-                                + 1.0 / (d2 * (theta2_nom * D2R).cos()))
-                }
-                HrGeometry::Symmetric => {
-                    d1 * (theta1_rdbk_initial * D2R).sin()
-                        + D2R * (phi2 - theta2_nom)
-                            / (1.0 / (d1 * (theta1_rdbk_initial * D2R).cos())
-                                + 1.0 / (d2 * (theta2_nom * D2R).cos()))
-                }
-            };
-            (phi2, lambda)
-        }
-    };
-
-    // Recompute theta from lambda
-    let theta1_rdbk = if d1 > 0.0 && lambda_rdbk.abs() <= d1 {
-        (lambda_rdbk / d1).asin() * R2D
-    } else {
-        theta1_rdbk_initial
-    };
-    let theta2_rdbk = if d2 > 0.0 && lambda_rdbk.abs() <= d2 && op_mode != HrOpMode::Single {
-        (lambda_rdbk / d2).asin() * R2D
-    } else {
-        0.0
-    };
-    let e_rdbk = if lambda_rdbk > 0.0 {
-        HC / lambda_rdbk
-    } else {
-        0.0
-    };
-
-    HrReadback {
-        phi1_rdbk,
-        theta1_rdbk,
-        phi2_rdbk,
-        theta2_rdbk,
-        lambda_rdbk,
-        e_rdbk,
-    }
-}
-
-/// Drive limits C's `phiLimits` state derives from the motor soft limits.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PhiLimits {
-    pub theta1_hi: f64,
-    pub theta1_lo: f64,
-    pub theta2_hi: f64,
-    pub theta2_lo: f64,
-    pub lambda_hi: f64,
-    pub lambda_lo: f64,
-    pub e_hi: f64,
-    pub e_lo: f64,
-    /// The seqMsg2 clip messages, in C's put order.
-    pub msgs: Vec<String>,
-}
-
-/// C `phiLimits` with `!useSetMode` (hrCtl.st:843-904). `mot_lims` is the
-/// phi1 HLM, phi1 LLM, phi2 HLM, phi2 LLM in micro-radians.
-#[allow(clippy::too_many_arguments)]
-pub fn calc_phi_limits(
-    mot_lims: [f64; 4],
-    phi1_off: f64,
-    phi2_off: f64,
-    world_off: f64,
-    theta_min: f64,
-    theta_max: f64,
-    d1: f64,
-    d2: f64,
-    geom: HrGeometry,
-) -> PhiLimits {
-    let [phi1_mot_hi, phi1_mot_lo, phi2_mot_hi, phi2_mot_lo] = mot_lims;
-    let world_off_deg = world_off * UR2D;
-    let mut msgs = Vec::new();
-
-    let phi1_hi = motor_to_phi(phi1_mot_hi, phi1_off, world_off_deg);
-    let phi1_lo = motor_to_phi(phi1_mot_lo, phi1_off, world_off_deg);
-    let (mut theta1_hi, mut theta1_lo) = (phi1_hi, phi1_lo);
-    if theta1_hi > theta_max {
-        theta1_hi = theta_max;
-        msgs.push(format!("Theta1HiLim clipped at {theta_max:.3}"));
-    }
-    if theta1_lo < theta_min {
-        theta1_lo = theta_min;
-        msgs.push(format!("Theta1LoLim clipped at {theta_min:.3}"));
-    }
-
-    let (mut theta2_hi, mut theta2_lo) = match geom {
-        HrGeometry::Nested => {
-            let phi2_hi = motor_to_phi(phi2_mot_hi, phi2_off, world_off_deg);
-            let phi2_lo = motor_to_phi(phi2_mot_lo, phi2_off, world_off_deg);
-            (phi2_hi - phi1_lo - theta1_lo, phi2_lo - phi1_hi - theta1_hi)
-        }
-        HrGeometry::Symmetric => (
-            motor_to_phi2_symmetric(phi2_mot_hi, phi2_off, world_off_deg),
-            motor_to_phi2_symmetric(phi2_mot_lo, phi2_off, world_off_deg),
-        ),
-    };
-    if theta2_hi > theta_max {
-        theta2_hi = theta_max;
-        msgs.push(format!("Theta2HiLim clipped at {theta_max:.3}"));
-    }
-    if theta2_lo < theta_min {
-        theta2_lo = theta_min;
-        msgs.push(format!("Theta2LoLim clipped at {theta_min:.3}"));
-    }
-
-    let lambda_hi = (d1 * (theta1_hi * D2R).sin()).min(d2 * (theta2_hi * D2R).sin());
-    let lambda_lo = (d1 * (theta1_lo * D2R).sin()).max(d2 * (theta2_lo * D2R).sin());
-    PhiLimits {
-        theta1_hi,
-        theta1_lo,
-        theta2_hi,
-        theta2_lo,
-        lambda_hi,
-        lambda_lo,
-        e_hi: HC / lambda_lo,
-        e_lo: HC / lambda_hi,
-        msgs,
-    }
-}
-
-/// The twelve drive-limit fields `phiLimits` and the UseSet arm write.
-struct LimitChannels {
-    e_hi: DbChannel,
-    e_lo: DbChannel,
-    lambda_hi: DbChannel,
-    lambda_lo: DbChannel,
-    theta1_hi: DbChannel,
-    theta1_lo: DbChannel,
-    phi1_hi: DbChannel,
-    phi1_lo: DbChannel,
-    theta2_hi: DbChannel,
-    theta2_lo: DbChannel,
-    phi2_hi: DbChannel,
-    phi2_lo: DbChannel,
-}
-
-impl LimitChannels {
-    /// C puts no phi1/phi2 limit here (hrCtl.st:843-904).
-    async fn put(&self, lim: &PhiLimits, msg2: &DbChannel) {
-        for m in &lim.msgs {
-            let _ = msg2.put_string_process(m).await;
-        }
-        let _ = self.theta1_hi.put_f64_process(lim.theta1_hi).await;
-        let _ = self.theta1_lo.put_f64_process(lim.theta1_lo).await;
-        let _ = self.theta2_hi.put_f64_process(lim.theta2_hi).await;
-        let _ = self.theta2_lo.put_f64_process(lim.theta2_lo).await;
-        let _ = self.lambda_hi.put_f64_process(lim.lambda_hi).await;
-        let _ = self.lambda_lo.put_f64_process(lim.lambda_lo).await;
-        let _ = self.e_hi.put_f64_process(lim.e_hi).await;
-        let _ = self.e_lo.put_f64_process(lim.e_lo).await;
-    }
-
-    /// Limits ignored entirely during Use/Set setup (hrCtl.st:765-779, :906-918).
-    async fn zero(&self) {
-        for ch in [
-            &self.e_hi,
-            &self.e_lo,
-            &self.lambda_hi,
-            &self.lambda_lo,
-            &self.theta1_hi,
-            &self.theta1_lo,
-            &self.phi1_hi,
-            &self.phi1_lo,
-            &self.theta2_hi,
-            &self.theta2_lo,
-            &self.phi2_hi,
-            &self.phi2_lo,
-        ] {
-            let _ = ch.put_f64_process(0.0).await;
-        }
-    }
+    StoppedHrWait,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,810 +96,1183 @@ impl HrConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Program variables
+// ---------------------------------------------------------------------------
+
+// Indices into `Vars`, one per assigned variable that is not a string.
+const DEBUG: usize = 0;
+const OP_ALERT: usize = 1;
+const OP_ACK: usize = 2;
+const PUT_VALS: usize = 3;
+const AUTO_MODE: usize = 4;
+const OP_MODE: usize = 5;
+const GEOM: usize = 6;
+const MOVING: usize = 7;
+const H1: usize = 8;
+const K1: usize = 9;
+const L1: usize = 10;
+const A1: usize = 11;
+const D1: usize = 12;
+const H2: usize = 13;
+const K2: usize = 14;
+const L2: usize = 15;
+const A2: usize = 16;
+const D2: usize = 17;
+const E: usize = 18;
+const E_HI: usize = 19;
+const E_LO: usize = 20;
+const E_RDBK: usize = 21;
+const LAMBDA: usize = 22;
+const LAMBDA_HI: usize = 23;
+const LAMBDA_LO: usize = 24;
+const LAMBDA_RDBK: usize = 25;
+const THETA1: usize = 26;
+const THETA1_HI: usize = 27;
+const THETA1_LO: usize = 28;
+const THETA1_RDBK: usize = 29;
+const PHI1: usize = 30;
+const PHI1_OFF: usize = 31;
+const PHI1_HI: usize = 32;
+const PHI1_LO: usize = 33;
+const PHI1_RDBK: usize = 34;
+const THETA2: usize = 35;
+const THETA2_HI: usize = 36;
+const THETA2_LO: usize = 37;
+const THETA2_RDBK: usize = 38;
+const PHI2: usize = 39;
+const PHI2_OFF: usize = 40;
+const PHI2_HI: usize = 41;
+const PHI2_LO: usize = 42;
+const PHI2_RDBK: usize = 43;
+const CMD_ECHO: [usize; 2] = [44, 45];
+const RDBK_ECHO: [usize; 2] = [46, 47];
+const DMOV_ECHO: [usize; 2] = [48, 49];
+const STOP: [usize; 2] = [50, 51];
+const DMOV: [usize; 2] = [52, 53];
+const HLS: [usize; 2] = [54, 55];
+const LLS: [usize; 2] = [56, 57];
+const DESIRED: [usize; 2] = [58, 59];
+const HLM: [usize; 2] = [60, 61];
+const LLM: [usize; 2] = [62, 63];
+const CMD: [usize; 2] = [64, 65];
+const CMD_MON: [usize; 2] = [66, 67];
+const RBV: [usize; 2] = [68, 69];
+const WORLD_OFF: usize = 70;
+const WORLD_TWEAK: usize = 71;
+const WORLD_INC: usize = 72;
+const WORLD_DEC: usize = 73;
+const USE_SET: usize = 74;
+const E_TWEAK: usize = 75;
+const E_INC: usize = 76;
+const E_DEC: usize = 77;
+const L_TWEAK: usize = 78;
+const L_INC: usize = 79;
+const L_DEC: usize = 80;
+const TH1_TWEAK: usize = 81;
+const TH1_INC: usize = 82;
+const TH1_DEC: usize = 83;
+const TH2_TWEAK: usize = 84;
+const TH2_INC: usize = 85;
+const TH2_DEC: usize = 86;
+const THETA_MIN: usize = 87;
+const THETA_MAX: usize = 88;
+const N_VARS: usize = 89;
+
+/// The limits phiLimits zeroes in set mode, in C's put order.
+const LIMITS: [usize; 12] = [
+    E_HI, E_LO, LAMBDA_HI, LAMBDA_LO, THETA1_HI, THETA1_LO, PHI1_HI, PHI1_LO, THETA2_HI, THETA2_LO,
+    PHI2_HI, PHI2_LO,
+];
+
+/// Each variable's name, PV and declaration, by index (hrCtl.st:43-489).
+fn table(c: &HrConfig) -> Vec<(&'static str, String, Decl)> {
+    let pv = |s: &str| c.pv(s);
+    let motors = |vars: [&'static str; 2], field: &str, decl: Decl| {
+        [(vars[0], &c.m_phi1), (vars[1], &c.m_phi2)]
+            .map(|(var, m)| (var, c.motor_pv(m, field), decl))
+    };
+    let echoes = |vars: [&'static str; 2], suffix: &str, decl: Decl| {
+        [(vars[0], "phi1"), (vars[1], "phi2")]
+            .map(|(var, phi)| (var, pv(&format!("{phi}{suffix}")), decl))
+    };
+    let mut t = vec![
+        ("hrCtlDebug", c.pv_no_underscore("CtlDebug"), SHORT_MON),
+        ("opAlert", pv("AlertBO"), SHORT),
+        ("opAck", pv("OperAckBO"), SHORT_MON),
+        ("putVals", pv("PutBO"), SHORT_MON),
+        ("autoMode", pv("ModeBO"), SHORT_MON),
+        ("opMode", pv("Mode2MO"), SHORT_SYNC),
+        ("Geom", pv("GeomMO"), SHORT_SYNC),
+        ("hr_Moving", pv("Moving"), SHORT_SYNC),
+        ("H1", pv("H1AO"), DOUBLE_SYNC),
+        ("K1", pv("K1AO"), DOUBLE_SYNC),
+        ("L1", pv("L1AO"), DOUBLE_SYNC),
+        ("A1", pv("A1AO"), DOUBLE_SYNC),
+        ("D1", pv("2d1AO"), DOUBLE),
+        ("H2", pv("H2AO"), DOUBLE_SYNC),
+        ("K2", pv("K2AO"), DOUBLE_SYNC),
+        ("L2", pv("L2AO"), DOUBLE_SYNC),
+        ("A2", pv("A2AO"), DOUBLE_SYNC),
+        ("D2", pv("2d2AO"), DOUBLE),
+        ("E", pv("EAO"), DOUBLE_SYNC),
+        ("EHi", pv("EAO.DRVH"), DOUBLE),
+        ("ELo", pv("EAO.DRVL"), DOUBLE),
+        ("ERdbk", pv("ERdbkAO"), DOUBLE),
+        ("lambda", pv("LambdaAO"), DOUBLE_SYNC),
+        ("lambdaHi", pv("LambdaAO.DRVH"), DOUBLE),
+        ("lambdaLo", pv("LambdaAO.DRVL"), DOUBLE),
+        ("lambdaRdbk", pv("LambdaRdbkAO"), DOUBLE),
+    ];
+    for (n, vars) in [
+        (
+            "1",
+            [
+                "theta1",
+                "theta1Hi",
+                "theta1Lo",
+                "theta1Rdbk",
+                "phi1",
+                "phi1Off",
+                "phi1Hi",
+                "phi1Lo",
+                "phi1Rdbk",
+            ],
+        ),
+        (
+            "2",
+            [
+                "theta2",
+                "theta2Hi",
+                "theta2Lo",
+                "theta2Rdbk",
+                "phi2",
+                "phi2Off",
+                "phi2Hi",
+                "phi2Lo",
+                "phi2Rdbk",
+            ],
+        ),
+    ] {
+        t.extend([
+            (vars[0], pv(&format!("Theta{n}AO")), DOUBLE_SYNC),
+            (vars[1], pv(&format!("Theta{n}AO.DRVH")), DOUBLE),
+            (vars[2], pv(&format!("Theta{n}AO.DRVL")), DOUBLE),
+            (vars[3], pv(&format!("Theta{n}RdbkAO")), DOUBLE),
+            (vars[4], pv(&format!("phi{n}AO")), DOUBLE_SYNC),
+            (vars[5], pv(&format!("phi{n}OffAO")), DOUBLE_SYNC),
+            (vars[6], pv(&format!("phi{n}AO.DRVH")), DOUBLE),
+            (vars[7], pv(&format!("phi{n}AO.DRVL")), DOUBLE),
+            (vars[8], pv(&format!("phi{n}RdbkAO")), DOUBLE),
+        ]);
+    }
+    t.extend(echoes(
+        ["phi1MotCmdEcho", "phi2MotCmdEcho"],
+        "CmdAO",
+        DOUBLE,
+    ));
+    t.extend(echoes(
+        ["phi1MotRdbkEcho", "phi2MotRdbkEcho"],
+        "RdbkAI",
+        DOUBLE,
+    ));
+    t.extend(echoes(["phi1DmovEcho", "phi2DmovEcho"], "DmovBI", SHORT));
+    t.extend(motors(["phi1MotStop", "phi2MotStop"], ".STOP", SHORT));
+    t.extend(motors(["phi1Dmov", "phi2Dmov"], ".DMOV", SHORT_SYNC));
+    t.extend(motors(["phi1Hls", "phi2Hls"], ".HLS", SHORT_MON));
+    t.extend(motors(["phi1Lls", "phi2Lls"], ".LLS", SHORT_MON));
+    t.extend(echoes(
+        ["phi1MotDesired", "phi2MotDesired"],
+        "SetAO",
+        DOUBLE_MON,
+    ));
+    t.extend(motors(
+        ["phi1MotHiLim", "phi2MotHiLim"],
+        ".HLM",
+        DOUBLE_SYNC,
+    ));
+    t.extend(motors(
+        ["phi1MotLoLim", "phi2MotLoLim"],
+        ".LLM",
+        DOUBLE_SYNC,
+    ));
+    t.extend(motors(["phi1MotCmd", "phi2MotCmd"], "", DOUBLE));
+    t.extend(motors(["phi1MotCmdMon", "phi2MotCmdMon"], "", DOUBLE_SYNC));
+    t.extend(motors(["phi1MotRdbk", "phi2MotRdbk"], ".RBV", DOUBLE_SYNC));
+    t.extend([
+        ("worldOff", pv("worldOffAO"), DOUBLE_SYNC),
+        ("worldTweakVal", pv("worldTweakAI"), DOUBLE_MON),
+        ("worldTweakInc", pv("worldIncBO"), SHORT_MON),
+        ("worldTweakDec", pv("worldDecBO"), SHORT_MON),
+        ("useSetMode", pv("UseSetBO"), SHORT_SYNC),
+    ]);
+    for (vars, (step, inc, dec)) in [
+        (
+            ["ETweakVal", "ETweakInc", "ETweakDec"],
+            ("ETweakAI", "EIncBO", "EDecBO"),
+        ),
+        (
+            ["LTweakVal", "LTweakInc", "LTweakDec"],
+            ("LambdaTweakAI", "LambdaIncBO", "LambdaDecBO"),
+        ),
+        (
+            ["th1TweakVal", "th1TweakInc", "th1TweakDec"],
+            ("Theta1TweakAI", "Theta1IncBO", "Theta1DecBO"),
+        ),
+        (
+            ["th2TweakVal", "th2TweakInc", "th2TweakDec"],
+            ("Theta2TweakAI", "Theta2IncBO", "Theta2DecBO"),
+        ),
+    ] {
+        t.extend([
+            (vars[0], pv(step), DOUBLE_MON),
+            (vars[1], pv(inc), SHORT_MON),
+            (vars[2], pv(dec), SHORT_MON),
+        ]);
+    }
+    t.push(("thetaMin", pv("thetaMin"), DOUBLE_MON));
+    t.push(("thetaMax", pv("thetaMax"), DOUBLE_MON));
+    debug_assert_eq!(t.len(), N_VARS);
+    t
+}
+
+// ---------------------------------------------------------------------------
 // Async runner
 // ---------------------------------------------------------------------------
 
-/// Run the HR analyzer crystal control state machine.
+/// Run the hr_Ctl and updatePsuedo state sets.
 pub async fn run(
     config: HrConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let queue = PutQueue::new(&db, "hr_Ctl");
+    let main = Hr::new(&config, &db, &queue.state_set("hr_Ctl")).await;
+    let pseudo = queue.state_set("updatePsuedo");
     tokio::select! {
-        r = hr_ctl(&config, db.clone()) => r,
-        () = update_pseudo(&config, &db) => Ok(()),
+        () = main.run() => {}
+        () = update_pseudo(&config, &db, &pseudo) => {}
     }
+    Ok(())
 }
 
 /// ss updatePsuedo (hrCtl.st:1487-1536). Its phi readback clauses never
 /// fire: nothing sets phi1MotRdbkPseudo_mon or phi2MotRdbkPseudo_mon.
-async fn update_pseudo(config: &HrConfig, db: &PvDatabase) {
-    let origin = alloc_origin();
+async fn update_pseudo(config: &HrConfig, db: &PvDatabase, ss: &StateSet) {
+    let watch = CMD_MON.into_iter().chain(DMOV).chain([DEBUG]);
+    let mut v = Vars::new(db, ss, &table(config), alloc_origin(), watch).await;
+    ctl_debug!(v, "hrCtl:updatePsuedo:init: entry");
+    ctl_debug!(v, "hrCtl:updatePsuedo:update: entry");
     let echoes = [
-        ("", "phi1CmdAO", &config.m_phi1),
-        ("", "phi2CmdAO", &config.m_phi2),
-        (".DMOV", "phi1DmovBI", &config.m_phi1),
-        (".DMOV", "phi2DmovBI", &config.m_phi2),
-    ]
-    .map(|(field, echo, m)| {
-        (
-            config.motor_pv(m, field),
-            DbChannel::with_origin(db, &config.pv(echo), origin),
-        )
-    });
-    let watched: Vec<String> = echoes.iter().map(|(pv, _)| pv.clone()).collect();
-    let mut monitor = DbMultiMonitor::new(db, &watched).await;
+        (CMD_MON[0], CMD_ECHO[0]),
+        (CMD_MON[1], CMD_ECHO[1]),
+        (DMOV[0], DMOV_ECHO[0]),
+        (DMOV[1], DMOV_ECHO[1]),
+    ];
+    v.flush().await;
     loop {
-        let (pv, v) = monitor.wait_change().await;
-        let (from, echo) = echoes.iter().find(|(from, _)| *from == pv).unwrap();
-        let _ = if from.ends_with(".DMOV") {
-            echo.put_i16_process(v as i16).await
-        } else {
-            echo.put_f64_process(v).await
-        };
+        match echoes.into_iter().find(|&(from, _)| v.test(from)) {
+            Some((from, to)) => {
+                let x = v.get(from);
+                v.set(to, x).await;
+                v.clear(from);
+                v.flush().await;
+            }
+            None => v.wait(None).await,
+        }
     }
 }
 
-async fn hr_ctl(
-    config: &HrConfig,
-    db: PvDatabase,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("hrCtl: starting for prefix={}HR{}", config.prefix, config.n);
+/// ss hr_Ctl and its program variables.
+struct Hr {
+    v: Vars,
+    seq_msg1: SeqPv,
+    seq_msg2: SeqPv,
+    mot_names: [(SeqPv, String); 2],
+    /// seqMsg1 as last written: dInputChanged puts it after calc2dSpacing,
+    /// which writes it only for an invalid HKL.
+    msg1: String,
+    put_complete: [bool; 2],
+    hr_done: bool,
+    caused_move: bool,
+    init_seq: u8,
+    init_seq_done: bool,
+}
 
-    let my_origin = alloc_origin();
-
-    // -- Create channels --
-    let _ch_debug = DbChannel::with_origin(&db, &config.pv_no_underscore("CtlDebug"), my_origin);
-    let ch_msg1 = DbChannel::with_origin(&db, &config.pv("SeqMsg1SI"), my_origin);
-    let ch_msg2 = DbChannel::with_origin(&db, &config.pv("SeqMsg2SI"), my_origin);
-    let ch_alert = DbChannel::with_origin(&db, &config.pv("AlertBO"), my_origin);
-    let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAckBO"), my_origin);
-    let ch_put_vals = DbChannel::with_origin(&db, &config.pv("PutBO"), my_origin);
-    let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("ModeBO"), my_origin);
-    let ch_op_mode = DbChannel::with_origin(&db, &config.pv("Mode2MO"), my_origin);
-    let ch_geom = DbChannel::with_origin(&db, &config.pv_no_underscore("_GeomMO"), my_origin);
-    let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
-
-    // Crystal 1
-    let ch_h1 = DbChannel::with_origin(&db, &config.pv("H1AO"), my_origin);
-    let ch_k1 = DbChannel::with_origin(&db, &config.pv("K1AO"), my_origin);
-    let ch_l1 = DbChannel::with_origin(&db, &config.pv("L1AO"), my_origin);
-    let ch_a1 = DbChannel::with_origin(&db, &config.pv("A1AO"), my_origin);
-    let ch_d1 = DbChannel::with_origin(&db, &config.pv("2d1AO"), my_origin);
-
-    // Crystal 2
-    let ch_h2 = DbChannel::with_origin(&db, &config.pv("H2AO"), my_origin);
-    let ch_k2 = DbChannel::with_origin(&db, &config.pv("K2AO"), my_origin);
-    let ch_l2 = DbChannel::with_origin(&db, &config.pv("L2AO"), my_origin);
-    let ch_a2 = DbChannel::with_origin(&db, &config.pv("A2AO"), my_origin);
-    let ch_d2 = DbChannel::with_origin(&db, &config.pv("2d2AO"), my_origin);
-
-    // Energy / lambda
-    let ch_e = DbChannel::with_origin(&db, &config.pv("EAO"), my_origin);
-    let ch_e_hi = DbChannel::with_origin(&db, &config.pv("EAO.DRVH"), my_origin);
-    let ch_e_lo = DbChannel::with_origin(&db, &config.pv("EAO.DRVL"), my_origin);
-    let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbkAO"), my_origin);
-
-    let ch_lambda = DbChannel::with_origin(&db, &config.pv("LambdaAO"), my_origin);
-    let ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVH"), my_origin);
-    let ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVL"), my_origin);
-    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbkAO"), my_origin);
-
-    // Theta 1/2
-    let ch_theta1 = DbChannel::with_origin(&db, &config.pv("Theta1AO"), my_origin);
-    let ch_theta1_hi = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVH"), my_origin);
-    let ch_theta1_lo = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVL"), my_origin);
-    let ch_theta1_rdbk = DbChannel::with_origin(&db, &config.pv("Theta1RdbkAO"), my_origin);
-
-    let ch_theta2 = DbChannel::with_origin(&db, &config.pv("Theta2AO"), my_origin);
-    let ch_theta2_hi = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVH"), my_origin);
-    let ch_theta2_lo = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVL"), my_origin);
-    let ch_theta2_rdbk = DbChannel::with_origin(&db, &config.pv("Theta2RdbkAO"), my_origin);
-
-    // Phi 1/2
-    let ch_phi1 = DbChannel::with_origin(&db, &config.pv("phi1AO"), my_origin);
-    let ch_phi1_off = DbChannel::with_origin(&db, &config.pv("phi1OffAO"), my_origin);
-    let ch_phi1_hi = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVH"), my_origin);
-    let ch_phi1_lo = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVL"), my_origin);
-    let ch_phi1_rdbk = DbChannel::with_origin(&db, &config.pv("phi1RdbkAO"), my_origin);
-
-    let ch_phi2 = DbChannel::with_origin(&db, &config.pv("phi2AO"), my_origin);
-    let ch_phi2_off = DbChannel::with_origin(&db, &config.pv("phi2OffAO"), my_origin);
-    let ch_phi2_hi = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVH"), my_origin);
-    let ch_phi2_lo = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVL"), my_origin);
-    let ch_phi2_rdbk = DbChannel::with_origin(&db, &config.pv("phi2RdbkAO"), my_origin);
-
-    // Echo PVs
-    let ch_phi1_mot_name = DbChannel::with_origin(&db, &config.pv("phi1PvSI"), my_origin);
-    let ch_phi2_mot_name = DbChannel::with_origin(&db, &config.pv("phi2PvSI"), my_origin);
-    let ch_phi1_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi1CmdAO"), my_origin);
-    let ch_phi2_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi2CmdAO"), my_origin);
-    let ch_phi1_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi1RdbkAI"), my_origin);
-    let ch_phi2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi2RdbkAI"), my_origin);
-    let ch_phi1_dmov_echo = DbChannel::with_origin(&db, &config.pv("phi1DmovBI"), my_origin);
-    let ch_phi2_dmov_echo = DbChannel::with_origin(&db, &config.pv("phi2DmovBI"), my_origin);
-
-    // Motor records
-    let ch_phi1_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".STOP"), my_origin);
-    let ch_phi2_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".STOP"), my_origin);
-    let ch_phi1_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".DMOV"), my_origin);
-    let ch_phi2_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".DMOV"), my_origin);
-    let ch_phi1_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".HLS"), my_origin);
-    let ch_phi1_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".LLS"), my_origin);
-    let ch_phi2_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".HLS"), my_origin);
-    let ch_phi2_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".LLS"), my_origin);
-
-    let ch_phi1_set_ao = DbChannel::with_origin(&db, &config.pv("phi1SetAO"), my_origin);
-    let ch_phi2_set_ao = DbChannel::with_origin(&db, &config.pv("phi2SetAO"), my_origin);
-
-    let ch_phi1_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".HLM"), my_origin);
-    let ch_phi1_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".LLM"), my_origin);
-    let ch_phi2_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".HLM"), my_origin);
-    let ch_phi2_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".LLM"), my_origin);
-
-    let ch_phi1_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ""), my_origin);
-    let ch_phi2_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ""), my_origin);
-    let ch_phi1_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".RBV"), my_origin);
-    let ch_phi2_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".RBV"), my_origin);
-
-    let ch_world_off = DbChannel::with_origin(&db, &config.pv("worldOffAO"), my_origin);
-    let ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSetBO"), my_origin);
-
-    let limits = LimitChannels {
-        e_hi: ch_e_hi,
-        e_lo: ch_e_lo,
-        lambda_hi: ch_lambda_hi,
-        lambda_lo: ch_lambda_lo,
-        theta1_hi: ch_theta1_hi,
-        theta1_lo: ch_theta1_lo,
-        phi1_hi: ch_phi1_hi,
-        phi1_lo: ch_phi1_lo,
-        theta2_hi: ch_theta2_hi,
-        theta2_lo: ch_theta2_lo,
-        phi2_hi: ch_phi2_hi,
-        phi2_lo: ch_phi2_lo,
-    };
-    let pv_theta_min = config.pv_no_underscore("_thetaMin");
-    let pv_theta_max = config.pv_no_underscore("_thetaMax");
-
-    let pv_mot_lims = [
-        config.motor_pv(&config.m_phi1, ".HLM"),
-        config.motor_pv(&config.m_phi1, ".LLM"),
-        config.motor_pv(&config.m_phi2, ".HLM"),
-        config.motor_pv(&config.m_phi2, ".LLM"),
-    ];
-    // Build multi-monitor for all event-driving PVs
-    let monitored_pvs: Vec<String> = vec![
-        config.pv("EAO"),
-        config.pv("LambdaAO"),
-        config.pv("Theta1AO"),
-        config.pv("Theta2AO"),
-        config.pv("H1AO"),
-        config.pv("K1AO"),
-        config.pv("L1AO"),
-        config.pv("A1AO"),
-        config.pv("H2AO"),
-        config.pv("K2AO"),
-        config.pv("L2AO"),
-        config.pv("A2AO"),
-        config.pv("PutBO"),
-        config.pv("OperAckBO"),
-        config.motor_pv(&config.m_phi1, ".RBV"),
-        config.motor_pv(&config.m_phi2, ".RBV"),
-        config.pv("worldOffAO"),
-        config.pv("phi1OffAO"),
-        config.pv("phi2OffAO"),
-        config.pv("UseSetBO"),
-        config.pv("Mode2MO"),
-        config.pv_no_underscore("_GeomMO"),
-        config.pv("Moving"),
-    ]
-    .into_iter()
-    .chain(pv_mot_lims.iter().cloned())
-    .collect();
-    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
-    // C `monitor autoMode;` syncs no event flag and no waitForCmnd `when`
-    // tests it (hrCtl.st:64-66, :693-826): it is written on arrival and only
-    // read.
-    monitor
-        .add_vars(
-            &db,
-            &[
-                config.pv("ModeBO"),
-                pv_theta_min.clone(),
-                pv_theta_max.clone(),
-                // C's E, lambda, theta1 and theta2 take every monitor, the
-                // sequencer's own posts and a record's clamp of them
-                // included, whether or not waitForCmndEnter cleared the flag.
-                config.pv("EAO"),
-                config.pv("LambdaAO"),
-                config.pv("Theta1AO"),
-                config.pv("Theta2AO"),
+impl Hr {
+    async fn new(c: &HrConfig, db: &PvDatabase, ss: &StateSet) -> Self {
+        let origin = alloc_origin();
+        let ch = |var: &str, s: &str| ss.pv_with_origin(var, &c.pv(s), origin);
+        Self {
+            v: Vars::new(db, ss, &table(c), origin, 0..N_VARS).await,
+            seq_msg1: ch("seqMsg1", "SeqMsg1SI"),
+            seq_msg2: ch("seqMsg2", "SeqMsg2SI"),
+            mot_names: [
+                (
+                    ch("phi1MotName", "phi1PvSI"),
+                    format!("{}{}", c.prefix, c.m_phi1),
+                ),
+                (
+                    ch("phi2MotName", "phi2PvSI"),
+                    format!("{}{}", c.prefix, c.m_phi2),
+                ),
             ],
-        )
-        .await;
-    println!(
-        "hrCtl: subscribed to {} PVs, {} active",
-        monitored_pvs.len(),
-        monitor.sub_count()
-    );
-
-    // -- Initialize --
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
-
-    let phi1_name = format!("{}{}", config.prefix, config.m_phi1);
-    let phi2_name = format!("{}{}", config.prefix, config.m_phi2);
-    let _ = ch_phi1_mot_name.put_string_process(&phi1_name).await;
-    let _ = ch_phi2_mot_name.put_string_process(&phi2_name).await;
-
-    // Read crystal parameters
-    let mut h1 = ch_h1.get_f64().await;
-    let mut k1 = ch_k1.get_f64().await;
-    let mut l1 = ch_l1.get_f64().await;
-    let mut a1 = ch_a1.get_f64().await;
-    let (mut d1, _, _) = calc_2d_spacing(a1, h1, k1, l1);
-    let _ = ch_d1.put_f64_process(d1).await;
-
-    let mut h2 = ch_h2.get_f64().await;
-    let mut k2 = ch_k2.get_f64().await;
-    let mut l2 = ch_l2.get_f64().await;
-    let mut a2 = ch_a2.get_f64().await;
-    let (mut d2, _, _) = calc_2d_spacing(a2, h2, k2, l2);
-    let _ = ch_d2.put_f64_process(d2).await;
-
-    let mut op_mode = HrOpMode::from_i16(ch_op_mode.get_i16().await);
-    let mut geom = HrGeometry::from_i16(ch_geom.get_i16().await);
-    let mut phi1_off = ch_phi1_off.get_f64().await;
-    let mut phi2_off = ch_phi2_off.get_f64().await;
-    let mut world_off = ch_world_off.get_f64().await;
-    let mut use_set_mode = ch_use_set.get_i16().await != 0;
-    let mut _caused_move = false;
-
-    // Read motor readbacks and compute initial angles
-    let phi1_mot_rdbk = ch_phi1_mot_rbv.get_f64().await;
-    let phi2_mot_rdbk = ch_phi2_mot_rbv.get_f64().await;
-    let world_off_deg = world_off * UR2D;
-
-    let mut phi1_val = motor_to_phi(phi1_mot_rdbk, phi1_off, world_off_deg);
-    let mut theta1_val = phi1_val;
-    let _ = ch_phi1.put_f64_process(phi1_val).await;
-    let _ = ch_theta1.put_f64_process(theta1_val).await;
-
-    let mut phi2_val = match geom {
-        HrGeometry::Nested => motor_to_phi(phi2_mot_rdbk, phi2_off, world_off_deg),
-        HrGeometry::Symmetric => motor_to_phi2_symmetric(phi2_mot_rdbk, phi2_off, world_off_deg),
-    };
-    let mut theta2_val = match geom {
-        HrGeometry::Nested => phi2_val - phi1_val - theta1_val,
-        HrGeometry::Symmetric => phi2_val,
-    };
-    let _ = ch_phi2.put_f64_process(phi2_val).await;
-    let _ = ch_theta2.put_f64_process(theta2_val).await;
-
-    // Compute initial lambda/E from theta1
-    let mut lambda_val = d1 * (theta1_val * D2R).sin();
-    let _ = ch_lambda.put_f64_process(lambda_val).await;
-    let mut e_val = if lambda_val > 0.0 {
-        HC / lambda_val
-    } else {
-        0.0
-    };
-    let _ = ch_e.put_f64_process(e_val).await;
-
-    // Initial readback
-    let rdbk = calc_readback(
-        phi1_mot_rdbk,
-        phi2_mot_rdbk,
-        phi1_off,
-        phi2_off,
-        world_off,
-        d1,
-        d2,
-        op_mode,
-        geom,
-    );
-    let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-    let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-    let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-    let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-
-    let _ = ch_msg1.put_string_process("HR Control Ready").await;
-    let _ = ch_msg2.put_string_process(" ").await;
-
-    info!(
-        "HR controller initialized for {}HR{}",
-        config.prefix, config.n
-    );
-
-    // PV name constants for dispatch
-    let pv_e = config.pv("EAO");
-    let pv_lambda = config.pv("LambdaAO");
-    let pv_theta1 = config.pv("Theta1AO");
-    let pv_theta2 = config.pv("Theta2AO");
-    let pv_h1 = config.pv("H1AO");
-    let pv_k1 = config.pv("K1AO");
-    let pv_l1 = config.pv("L1AO");
-    let pv_a1 = config.pv("A1AO");
-    let pv_h2 = config.pv("H2AO");
-    let pv_k2 = config.pv("K2AO");
-    let pv_l2 = config.pv("L2AO");
-    let pv_a2 = config.pv("A2AO");
-    let pv_put_vals = config.pv("PutBO");
-    let pv_auto_mode = config.pv("ModeBO");
-    let pv_oper_ack = config.pv("OperAckBO");
-    let pv_phi1_mot_rbv = config.motor_pv(&config.m_phi1, ".RBV");
-    let pv_phi2_mot_rbv = config.motor_pv(&config.m_phi2, ".RBV");
-    let pv_world_off = config.pv("worldOffAO");
-    let pv_phi1_off = config.pv("phi1OffAO");
-    let pv_phi2_off = config.pv("phi2OffAO");
-    let pv_use_set = config.pv("UseSetBO");
-    let pv_op_mode = config.pv("Mode2MO");
-    let pv_geom = config.pv_no_underscore("_GeomMO");
-    let pv_moving = config.pv("Moving");
-
-    println!("hrCtl: ready");
-
-    // -- Main loop --
-    // C's first HLM/LLM monitors raise their flags, which waitForCmndEnter
-    // leaves set (hrCtl.st:605-621), so phiLimits runs at boot.
-    let mut deferred_events: HashMap<String, f64> =
-        pv_mot_lims.iter().map(|pv| (pv.clone(), 0.0)).collect();
-    // waitForCmndEnter drops the command flags raised during a pass and the
-    // 0.1 s after it (hrCtl.st:603-621); every pass ends there except
-    // checkAutoMode's manual-mode return to waitForCmnd (:834).
-    let enter_clears = [
-        &pv_h1,
-        &pv_k1,
-        &pv_l1,
-        &pv_a1,
-        &pv_h2,
-        &pv_k2,
-        &pv_l2,
-        &pv_a2,
-        &pv_e,
-        &pv_lambda,
-        &pv_theta1,
-        &pv_theta2,
-        &pv_phi1_off,
-        &pv_phi2_off,
-        &pv_world_off,
-        &pv_use_set,
-        &pv_op_mode,
-        &pv_geom,
-    ];
-    let mut wait_for_cmnd_enter = false;
-    loop {
-        if wait_for_cmnd_enter {
-            epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-            for pv in enter_clears {
-                monitor.clear(pv);
-            }
-            // The echoes and opAck follow the efClears (hrCtl.st:624-680).
-            for (echo, from) in [
-                (&ch_phi1_rdbk_echo, &ch_phi1_mot_rbv),
-                (&ch_phi2_rdbk_echo, &ch_phi2_mot_rbv),
-                (&ch_phi1_cmd_echo, &ch_phi1_mot_cmd),
-                (&ch_phi2_cmd_echo, &ch_phi2_mot_cmd),
-            ] {
-                let _ = echo.put_f64_process(from.get_f64().await).await;
-            }
-            for (echo, from) in [
-                (&ch_phi1_dmov_echo, &ch_phi1_dmov),
-                (&ch_phi2_dmov_echo, &ch_phi2_dmov),
-            ] {
-                let _ = echo.put_i16_process(from.get_i16().await).await;
-            }
-            let _ = ch_oper_ack.put_i16_process(0).await;
+            msg1: String::new(),
+            put_complete: [false; 2],
+            hr_done: false,
+            caused_move: false,
+            init_seq: 0,
+            init_seq_done: false,
         }
-        wait_for_cmnd_enter = true;
-        let mut proceed_to_theta_changed = false;
-        let mut phi_limits = false;
+    }
 
-        let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
-            let val = deferred_events.remove(&key).unwrap();
-            // One C flag with the live monitors queued behind it.
-            monitor.clear(&key);
-            (key, val)
-        } else {
-            monitor.wait_change().await
-        };
-        // putVals and opAck sync no flag: their waitForCmnd clauses test the
-        // value (hrCtl.st:761, :810), and when no clause is true the state set
-        // stays in waitForCmnd and runs no waitForCmndEnter pass.
-        let fires = if changed_pv == pv_put_vals || changed_pv == pv_oper_ack {
-            new_val != 0.0
-        } else {
-            true
-        };
-        if !fires {
-            wait_for_cmnd_enter = false;
-            continue;
-        }
-        e_val = monitor.var(&pv_e);
-        lambda_val = monitor.var(&pv_lambda);
-        theta1_val = monitor.var(&pv_theta1);
-        theta2_val = monitor.var(&pv_theta2);
+    async fn msg1(&mut self, s: &str) {
+        self.msg1 = s.to_string();
+        let _ = self.seq_msg1.put_string_process(s).await;
+    }
 
-        if changed_pv == pv_e {
-            lambda_val = HC / e_val;
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_lambda {
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_theta1 || changed_pv == pv_theta2 {
-            monitor.clear(&pv_theta1);
-            monitor.clear(&pv_theta2);
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_moving {
-            // checkAutoMode (:827-835).
-            wait_for_cmnd_enter = monitor.var(&pv_auto_mode) != 0.0;
-        } else if changed_pv == pv_h1
-            || changed_pv == pv_k1
-            || changed_pv == pv_l1
-            || changed_pv == pv_a1
-        {
-            h1 = ch_h1.get_f64().await;
-            k1 = ch_k1.get_f64().await;
-            l1 = ch_l1.get_f64().await;
-            a1 = ch_a1.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a1, h1, k1, l1);
-            d1 = d;
-            let _ = ch_d1.put_f64_process(d1).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-        } else if changed_pv == pv_h2
-            || changed_pv == pv_k2
-            || changed_pv == pv_l2
-            || changed_pv == pv_a2
-        {
-            h2 = ch_h2.get_f64().await;
-            k2 = ch_k2.get_f64().await;
-            l2 = ch_l2.get_f64().await;
-            a2 = ch_a2.get_f64().await;
-            let (d, _, _) = calc_2d_spacing(a2, h2, k2, l2);
-            d2 = d;
-            let _ = ch_d2.put_f64_process(d2).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-        } else if changed_pv == pv_put_vals {
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_oper_ack {
-            let _ = ch_alert.put_i16_process(0).await;
-            let _ = ch_msg1.put_string_process(" ").await;
-            let _ = ch_msg2.put_string_process(" ").await;
-        } else if changed_pv == pv_phi1_mot_rbv || changed_pv == pv_phi2_mot_rbv {
-            let rdbk = calc_readback(
-                ch_phi1_mot_rbv.get_f64().await,
-                ch_phi2_mot_rbv.get_f64().await,
-                phi1_off,
-                phi2_off,
-                world_off,
-                d1,
-                d2,
-                op_mode,
-                geom,
-            );
-            let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-            let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-            let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-            let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-            if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-                let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-            }
-        } else if changed_pv == pv_world_off {
-            world_off = ch_world_off.get_f64().await;
-            proceed_to_theta_changed = true;
-        } else if pv_mot_lims.contains(&changed_pv) {
-            let _ = ch_msg1.put_string_process("Motor Soft Limit Changed").await;
-            let _ = ch_msg2.put_string_process(" ").await;
-            phi_limits = true;
-        } else if changed_pv == pv_phi1_off || changed_pv == pv_phi2_off {
-            monitor.clear(&pv_phi1_off);
-            monitor.clear(&pv_phi2_off);
-            phi1_off = ch_phi1_off.get_f64().await;
-            phi2_off = ch_phi2_off.get_f64().await;
-            let rdbk = calc_readback(
-                ch_phi1_mot_rbv.get_f64().await,
-                ch_phi2_mot_rbv.get_f64().await,
-                phi1_off,
-                phi2_off,
-                world_off,
-                d1,
-                d2,
-                op_mode,
-                geom,
-            );
-            let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-            let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-            if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-                let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-            }
-            let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-            let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-            phi_limits = true;
-        } else if changed_pv == pv_use_set {
-            use_set_mode = new_val as i16 != 0;
-            if use_set_mode {
-                // C goes on to eChanged (hrCtl.st:765-779).
-                limits.zero().await;
-                // Zeroing EHi before ELo clamps E to 0 (aoRecord.c:461),
-                // and eChanged reads that.
-                lambda_val = HC / monitor.var(&pv_e);
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                proceed_to_theta_changed = true;
-            } else {
-                phi_limits = true;
-            }
-        } else if changed_pv == pv_op_mode {
-            op_mode = HrOpMode::from_i16(new_val as i16);
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-        } else if changed_pv == pv_geom {
-            geom = HrGeometry::from_i16(new_val as i16);
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process("New geometry. Switch Phi 2 motor dir.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        }
+    async fn msg2(&self, s: &str) {
+        let _ = self.seq_msg2.put_string_process(s).await;
+    }
 
-        if phi_limits {
-            if use_set_mode {
-                limits.zero().await;
-            } else {
-                let mut mot_lims = [0.0; 4];
-                for (lim, ch) in mot_lims.iter_mut().zip([
-                    &ch_phi1_mot_hilim,
-                    &ch_phi1_mot_lolim,
-                    &ch_phi2_mot_hilim,
-                    &ch_phi2_mot_lolim,
-                ]) {
-                    *lim = ch.get_f64().await;
+    async fn run(mut self) {
+        let mut state = HrState::Init;
+        let mut prev = None;
+        loop {
+            if prev != Some(state) {
+                self.entry(state);
+            }
+            self.v.flush().await;
+            let mut delays = Delays::new();
+            let next = loop {
+                if let Some(next) = self.step(state, &mut delays).await {
+                    break next;
                 }
-                let lim = calc_phi_limits(
-                    mot_lims,
-                    phi1_off,
-                    phi2_off,
-                    world_off,
-                    monitor.var(&pv_theta_min),
-                    monitor.var(&pv_theta_max),
-                    d1,
-                    d2,
-                    geom,
-                );
-                limits.put(&lim, &ch_msg2).await;
-            }
-            continue;
-        }
-        if !proceed_to_theta_changed {
-            continue;
-        }
-
-        // -- Lambda changed processing --
-        if d1 > 0.0 && lambda_val > d1 {
-            let _ = ch_msg1
-                .put_string_process("Wavelength > 2d spacing of crystal 1.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        } else if d2 > 0.0 && lambda_val > d2 && op_mode != HrOpMode::Single {
-            let _ = ch_msg1
-                .put_string_process("Wavelength > 2d spacing of crystal 2.")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-        } else {
-            // Compute theta from lambda
-            match op_mode {
-                HrOpMode::Single => {
-                    if d1 > 0.0 {
-                        theta1_val = (lambda_val / d1).asin() * R2D;
-                    }
-                    let _ = ch_theta1.put_f64_process(theta1_val).await;
-                }
-                HrOpMode::TwoLocked => {
-                    if d1 > 0.0 {
-                        theta1_val = (lambda_val / d1).asin() * R2D;
-                    }
-                    if d2 > 0.0 {
-                        theta2_val = (lambda_val / d2).asin() * R2D;
-                    }
-                    let _ = ch_theta1.put_f64_process(theta1_val).await;
-                    let _ = ch_theta2.put_f64_process(theta2_val).await;
-                }
-                HrOpMode::TwoIndependent => {
-                    if d2 > 0.0 {
-                        theta2_val = (lambda_val / d2).asin() * R2D;
-                    }
-                    let _ = ch_theta2.put_f64_process(theta2_val).await;
-                }
-            }
-        }
-
-        // -- Theta changed -> calc phi, lambda --
-        let world_off_deg = world_off * UR2D;
-        match op_mode {
-            HrOpMode::Single | HrOpMode::TwoLocked => {
-                lambda_val = d1 * (theta1_val * D2R).sin();
-                phi1_val = theta1_to_phi1(theta1_val);
-                if op_mode == HrOpMode::TwoLocked {
-                    phi2_val = match geom {
-                        HrGeometry::Nested => calc_phi2_nested(phi1_val, theta1_val, theta2_val),
-                        HrGeometry::Symmetric => calc_phi2_symmetric(theta2_val),
-                    };
-                }
-            }
-            HrOpMode::TwoIndependent => {
-                let lambda_nom = d1 * (theta1_val * D2R).sin();
-                let theta2_nom = if d2 > 0.0 {
-                    (lambda_nom / d2).asin() * R2D
-                } else {
-                    0.0
-                };
-                lambda_val = d2 * (theta2_val * D2R).sin();
-                phi1_val = theta1_to_phi1(theta1_val);
-                phi2_val = match geom {
-                    HrGeometry::Nested => calc_phi2_independent_nested(
-                        phi1_val, theta1_val, theta2_nom, lambda_val, lambda_nom, d1, d2,
-                    ),
-                    HrGeometry::Symmetric => calc_phi2_independent_symmetric(
-                        theta2_nom, lambda_val, lambda_nom, d1, d2, theta1_val,
-                    ),
-                };
-            }
-        }
-        let _ = ch_phi1.put_f64_process(phi1_val).await;
-        if op_mode != HrOpMode::Single {
-            let _ = ch_phi2.put_f64_process(phi2_val).await;
-        }
-        let _ = ch_lambda.put_f64_process(lambda_val).await;
-        e_val = if lambda_val > 0.0 {
-            HC / lambda_val
-        } else {
-            0.0
-        };
-        let _ = ch_e.put_f64_process(e_val).await;
-
-        // Update readbacks
-        let rdbk = calc_readback(
-            ch_phi1_mot_rbv.get_f64().await,
-            ch_phi2_mot_rbv.get_f64().await,
-            phi1_off,
-            phi2_off,
-            world_off,
-            d1,
-            d2,
-            op_mode,
-            geom,
-        );
-        let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-        let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-        let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-        let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-        if op_mode != HrOpMode::Single {
-            let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-            let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
-        }
-
-        // -- Calc motor movements --
-        if use_set_mode {
-            let phi1_mot_cur = ch_phi1_mot_rbv.get_f64().await;
-            phi1_off = phi1_val - phi1_mot_cur / D2UR;
-            let _ = ch_phi1_off.put_f64_process(phi1_off).await;
-            if op_mode != HrOpMode::Single {
-                let phi2_mot_cur = ch_phi2_mot_rbv.get_f64().await;
-                phi2_off = phi2_val - phi2_mot_cur / D2UR;
-                let _ = ch_phi2_off.put_f64_process(phi2_off).await;
-            }
-            let _ = ch_put_vals.put_i16_process(0).await;
-        }
-
-        let phi1_mot_desired = phi_to_motor(phi1_val, phi1_off, world_off_deg);
-        let _ = ch_phi1_set_ao.put_f64_process(phi1_mot_desired).await;
-
-        let phi2_mot_desired = if op_mode != HrOpMode::Single {
-            let v = match geom {
-                HrGeometry::Nested => phi_to_motor(phi2_val, phi2_off, world_off_deg),
-                HrGeometry::Symmetric => phi2_to_motor_symmetric(phi2_val, phi2_off, world_off_deg),
+                let deadline = delays.next.take();
+                self.v.wait(deadline).await;
             };
-            let _ = ch_phi2_set_ao.put_f64_process(v).await;
-            v
-        } else {
-            0.0
+            prev = Some(state);
+            state = next;
+        }
+    }
+
+    /// The entry blocks.
+    fn entry(&mut self, state: HrState) {
+        let name = match state {
+            HrState::Init => "init:",
+            HrState::InitSequence => "initSequence:",
+            HrState::WaitForCmndEnter => "waitForCmndEnter:",
+            HrState::WaitForCmnd => "waitForCmnd:",
+            HrState::CheckAutoMode => "checkAutoMode:",
+            HrState::PhiLimits => "phiLimits:",
+            HrState::CheckDone => "checkDone:",
+            HrState::DInputChanged => "dInputChanged:",
+            HrState::Tweak => "tweak:",
+            HrState::EChanged => "eChanged:",
+            HrState::LChanged => "lChanged:",
+            HrState::ThChanged => "thChanged:",
+            HrState::CalcMovements => "calcMovements:",
+            HrState::MoveHr => "moveHR",
+            HrState::UpdateRdbk => "updateRdbk:",
+            HrState::MotorsStopped => "motorsStopped:",
+            HrState::ChkMotorLimits => "chkMotorLimits:",
+            HrState::ChkMotorLimitsExit => "chkMotorLimitsExit:",
+            HrState::StopHr => "stopHR:",
+            HrState::StoppedHrWait => "stoppedHRWait:",
+            HrState::UpdateRdbkAfterDelay => "",
         };
-
-        // -- Move motors --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if (monitor.var(&pv_auto_mode) != 0.0 || put_requested) && !use_set_mode {
-            let _ = ch_phi1_mot_cmd.put_f64_process(phi1_mot_desired).await;
-            if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_mot_cmd.put_f64_process(phi2_mot_desired).await;
+        if !name.is_empty() {
+            ctl_debug!(self.v, "hrCtl:{name} entry");
+        }
+        if matches!(state, HrState::CheckDone | HrState::UpdateRdbk) {
+            for (done, cmd) in self.put_complete.iter_mut().zip(CMD) {
+                if !*done {
+                    *done = self.v.put_complete(cmd);
+                }
             }
-            let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
+        }
+    }
 
-            // Wait for motors
-            loop {
-                epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    fn op_mode(&mut self) -> f64 {
+        self.v.get(OP_MODE)
+    }
 
-                // Check limit switches
-                if ch_phi1_hls.get_i16().await != 0 || ch_phi1_lls.get_i16().await != 0 {
-                    let _ = ch_msg1
-                        .put_string_process("Theta 1 motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_phi1_mot_stop.put_i16_process(1).await;
-                    if op_mode != HrOpMode::Single {
-                        let _ = ch_phi2_mot_stop.put_i16_process(1).await;
+    fn nested(&mut self) -> bool {
+        self.v.get(GEOM) == 0.0
+    }
+
+    /// Evaluate `state`'s `when` clauses in order; run the first true one's
+    /// action and return its next state, or `None` when no clause is true.
+    async fn step(&mut self, state: HrState, d: &mut Delays) -> Option<HrState> {
+        let v = &mut self.v;
+        match state {
+            HrState::Init => {
+                self.init_seq = 0;
+                Some(HrState::InitSequence)
+            }
+            HrState::InitSequence => match self.init_seq {
+                0 => {
+                    for i in STOP {
+                        v.assign(i, 1.0);
                     }
-                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
-                    break;
+                    self.put_complete = [true; 2];
+                    v.set(PUT_VALS, 0.0).await;
+                    v.set(AUTO_MODE, 0.0).await;
+                    v.set(OP_ACK, 0.0).await;
+                    for (ch, name) in &self.mot_names {
+                        let _ = ch.put_string_process(name).await;
+                    }
+                    self.init_seq = 1;
+                    Some(HrState::DInputChanged)
                 }
-                if op_mode != HrOpMode::Single
-                    && (ch_phi2_hls.get_i16().await != 0 || ch_phi2_lls.get_i16().await != 0)
-                {
-                    let _ = ch_msg1
-                        .put_string_process("Theta 2 motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_phi1_mot_stop.put_i16_process(1).await;
-                    let _ = ch_phi2_mot_stop.put_i16_process(1).await;
-                    epics_base_rs::runtime::task::sleep(Duration::from_secs(1)).await;
-                    break;
+                1 => {
+                    self.init_seq = 2;
+                    Some(HrState::ChkMotorLimits)
                 }
-
-                // Update readbacks
-                let rdbk = calc_readback(
-                    ch_phi1_mot_rbv.get_f64().await,
-                    ch_phi2_mot_rbv.get_f64().await,
-                    phi1_off,
-                    phi2_off,
-                    world_off,
-                    d1,
-                    d2,
-                    op_mode,
-                    geom,
-                );
-                let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
-                let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
-                let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
-                let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
-                if op_mode != HrOpMode::Single {
-                    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
-                    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
+                2 => {
+                    self.init_seq = 3;
+                    Some(HrState::UpdateRdbk)
                 }
-
-                let d1_done = ch_phi1_dmov.get_i16().await != 0;
-                let d2_done = if op_mode != HrOpMode::Single {
-                    ch_phi2_dmov.get_i16().await != 0
-                } else {
-                    true
-                };
-                if d1_done && d2_done {
-                    break;
+                3 => {
+                    self.msg1("HR Control Ready").await;
+                    self.msg2(" ").await;
+                    self.init_seq_done = true;
+                    let nested = self.nested();
+                    let v = &mut self.v;
+                    let world = v.get(WORLD_OFF) * UR2D;
+                    let phi1 = v.get(RBV[0]) * UR2D + (v.get(PHI1_OFF) + world);
+                    v.set(PHI1, phi1).await;
+                    v.set(THETA1, phi1).await;
+                    let (phi2, theta2) = if nested {
+                        let phi2 = v.get(RBV[1]) * UR2D + v.get(PHI2_OFF) + world;
+                        (phi2, phi2 - phi1 - phi1)
+                    } else {
+                        let phi2 = v.get(RBV[1]) * UR2D + v.get(PHI2_OFF) - world;
+                        (phi2, phi2)
+                    };
+                    ctl_debug!(
+                        v,
+                        "hrCtl:initSequence: opMode={}, Geom={}, phi2={phi2:.6}",
+                        v.get(OP_MODE) as i32,
+                        v.get(GEOM) as i32
+                    );
+                    v.set(PHI2, phi2).await;
+                    v.set(THETA2, theta2).await;
+                    Some(HrState::ThChanged)
                 }
+                _ => None,
+            },
+            HrState::WaitForCmndEnter => {
+                if self.init_seq_done && d.delay(0.1) {
+                    ctl_debug!(v, "hrCtl:waitForCmdEnter: initSeqDone");
+                    for i in [
+                        H1, K1, L1, A1, H2, K2, L2, A2, E, LAMBDA, THETA1, THETA2, PHI1_OFF,
+                        PHI2_OFF, WORLD_OFF, USE_SET, OP_MODE, GEOM,
+                    ] {
+                        v.clear(i);
+                    }
+                    for (to, from) in [
+                        (RDBK_ECHO[0], RBV[0]),
+                        (RDBK_ECHO[1], RBV[1]),
+                        (CMD_ECHO[0], CMD_MON[0]),
+                        (DMOV_ECHO[0], DMOV[0]),
+                        (CMD_ECHO[1], CMD_MON[1]),
+                        (DMOV_ECHO[1], DMOV[1]),
+                    ] {
+                        let x = v.get(from);
+                        v.set(to, x).await;
+                    }
+                    v.set(OP_ACK, 0.0).await;
+                    ctl_debug!(
+                        v,
+                        "hrCtl:waitForCmndEnter: Moving={}; Done={}",
+                        v.get(MOVING) as i32,
+                        u8::from(self.hr_done)
+                    );
+                    if v.on(MOVING) && self.hr_done {
+                        ctl_debug!(v, "hrCtl:waitForCmndEnter: asserting 'done'.");
+                        self.hr_done = false;
+                        v.set(MOVING, 0.0).await;
+                    }
+                    return Some(HrState::WaitForCmnd);
+                }
+                if !self.init_seq_done {
+                    return Some(HrState::InitSequence);
+                }
+                None
             }
-            _caused_move = false;
-            let _ = ch_moving.put_i16_process(0).await;
+            HrState::WaitForCmnd => {
+                if v.test_and_clear(HLM[0])
+                    || v.test_and_clear(LLM[0])
+                    || v.test_and_clear(HLM[1])
+                    || v.test_and_clear(LLM[1])
+                {
+                    self.msg1("Motor Soft Limit Changed").await;
+                    self.msg2(" ").await;
+                    return Some(HrState::PhiLimits);
+                }
+                if [H1, K1, L1, A1, H2, K2, L2, A2]
+                    .into_iter()
+                    .any(|i| v.test_and_clear(i))
+                {
+                    self.msg1("Lattice Spacing Changed").await;
+                    self.msg2(" ").await;
+                    return Some(HrState::DInputChanged);
+                }
+                if v.test(E) {
+                    ctl_debug!(v, "hrCtl:waitForCmd: E_mon");
+                    v.clear(E);
+                    return Some(HrState::EChanged);
+                }
+                if v.test(LAMBDA) {
+                    ctl_debug!(v, "hrCtl:waitForCmd: lambda_mon");
+                    v.clear(LAMBDA);
+                    return Some(HrState::LChanged);
+                }
+                if v.test(THETA1) || v.test(THETA2) {
+                    ctl_debug!(v, "hrCtl:waitForCmd: theta*_mon");
+                    v.clear(THETA1);
+                    v.clear(THETA2);
+                    return Some(HrState::ThChanged);
+                }
+                if v.test(WORLD_OFF) {
+                    ctl_debug!(v, "hrCtl:waitForCmd: worldOff_mon");
+                    v.clear(WORLD_OFF);
+                    return Some(HrState::CalcMovements);
+                }
+                if v.test(PHI1_OFF) || v.test(PHI2_OFF) {
+                    ctl_debug!(v, "hrCtl:waitForCmd: phi*Off_mon");
+                    v.clear(PHI1_OFF);
+                    v.clear(PHI2_OFF);
+                    self.calc_readback();
+                    self.put_rdbk(false).await;
+                    return Some(HrState::PhiLimits);
+                }
+                if v.on(PUT_VALS) && d.delay(0.1) {
+                    ctl_debug!(v, "hrCtl:waitForCmnd:putVals");
+                    return Some(HrState::CalcMovements);
+                }
+                if v.test(USE_SET) && v.on(USE_SET) {
+                    v.clear(USE_SET);
+                    for i in LIMITS {
+                        v.set(i, 0.0).await;
+                    }
+                    return Some(HrState::EChanged);
+                }
+                if v.test(USE_SET) && !v.on(USE_SET) {
+                    v.clear(USE_SET);
+                    return Some(HrState::PhiLimits);
+                }
+                if v.test_and_clear(OP_MODE) {
+                    ctl_debug!(v, "hrCtl:waitForCmnd: opMode event.");
+                    v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Set to Manual Mode").await;
+                    return Some(HrState::CalcMovements);
+                }
+                if v.test_and_clear(GEOM) {
+                    ctl_debug!(v, "hrCtl:waitForCmnd: Geom event.");
+                    v.set(AUTO_MODE, 0.0).await;
+                    self.msg1("New geometry.  Switch Phi 2 motor dir.").await;
+                    self.msg2("and recalibrate monochromator.").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    return Some(HrState::CalcMovements);
+                }
+                if [
+                    E_INC, E_DEC, L_INC, L_DEC, TH1_INC, TH1_DEC, TH2_INC, TH2_DEC, WORLD_INC,
+                    WORLD_DEC,
+                ]
+                .into_iter()
+                .any(|i| v.on(i))
+                {
+                    return Some(HrState::Tweak);
+                }
+                if v.on(OP_ACK) {
+                    v.set(OP_ALERT, 0.0).await;
+                    self.msg1(" ").await;
+                    self.msg2(" ").await;
+                    return Some(HrState::WaitForCmndEnter);
+                }
+                if v.test(MOVING) {
+                    v.clear(MOVING);
+                    return Some(HrState::CheckAutoMode);
+                }
+                if (!v.on(DMOV[0]) || !v.on(DMOV[1])) && d.delay(0.1) {
+                    return Some(HrState::UpdateRdbk);
+                }
+                None
+            }
+            HrState::CheckAutoMode => Some(if v.on(AUTO_MODE) {
+                HrState::CheckDone
+            } else {
+                HrState::WaitForCmnd
+            }),
+            HrState::PhiLimits => {
+                ctl_debug!(v, "hrCtl:phiLimits");
+                if !v.on(USE_SET) {
+                    self.phi_limits().await;
+                } else {
+                    for i in LIMITS {
+                        v.set(i, 0.0).await;
+                    }
+                }
+                Some(HrState::CheckDone)
+            }
+            HrState::CheckDone => {
+                if self.put_complete == [true; 2] {
+                    ctl_debug!(v, "hrCtl:checkDone: done");
+                    self.hr_done = true;
+                    return Some(HrState::WaitForCmndEnter);
+                }
+                ctl_debug!(v, "hrCtl:checkDone: not done");
+                Some(HrState::UpdateRdbk)
+            }
+            HrState::DInputChanged => {
+                v.set(AUTO_MODE, 0.0).await;
+                self.msg2("Set to Manual Mode").await;
+                for (xtal, [a, h, k, l, d]) in
+                    [(1, [A1, H1, K1, L1, D1]), (2, [A2, H2, K2, L2, D2])]
+                {
+                    let x = self.calc_2d_spacing(xtal, a, h, k, l);
+                    self.v.set(d, x).await;
+                    let _ = self.seq_msg1.put_string_process(&self.msg1).await;
+                }
+                let v = &mut self.v;
+                let (lambda_hi, lambda_lo) = if v.on(USE_SET) {
+                    let d1 = v.get(D1);
+                    (
+                        d1 * (v.get(THETA1_HI) * D2R).sin(),
+                        d1 * (v.get(THETA1_LO) * D2R).sin(),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                let (e_hi, e_lo) = if v.on(USE_SET) {
+                    (HC / lambda_lo, HC / lambda_hi)
+                } else {
+                    (0.0, 0.0)
+                };
+                v.set(LAMBDA_LO, lambda_lo).await;
+                v.set(LAMBDA_HI, lambda_hi).await;
+                v.set(E_HI, e_hi).await;
+                v.set(E_LO, e_lo).await;
+                v.put(OP_ALERT).await;
+                Some(HrState::ThChanged)
+            }
+            HrState::Tweak => {
+                let use_set = v.on(USE_SET);
+                for (inc, dec, step, scale, var, lo, hi, msg, next) in [
+                    (
+                        E_INC,
+                        E_DEC,
+                        E_TWEAK,
+                        1_000_000.0,
+                        E,
+                        E_LO,
+                        E_HI,
+                        "Tweaked E",
+                        HrState::EChanged,
+                    ),
+                    (
+                        L_INC,
+                        L_DEC,
+                        L_TWEAK,
+                        100_000.0,
+                        LAMBDA,
+                        LAMBDA_LO,
+                        LAMBDA_HI,
+                        "Tweaked Lambda",
+                        HrState::LChanged,
+                    ),
+                    (
+                        TH1_INC,
+                        TH1_DEC,
+                        TH1_TWEAK,
+                        1.0,
+                        THETA1,
+                        THETA1_LO,
+                        THETA1_HI,
+                        "Tweaked Theta 1",
+                        HrState::ThChanged,
+                    ),
+                    (
+                        TH2_INC,
+                        TH2_DEC,
+                        TH2_TWEAK,
+                        1.0,
+                        THETA2,
+                        THETA2_LO,
+                        THETA2_HI,
+                        "Tweaked Theta 2",
+                        HrState::ThChanged,
+                    ),
+                ] {
+                    let v = &mut self.v;
+                    if !(v.on(inc) || v.on(dec)) {
+                        continue;
+                    }
+                    let up = v.on(inc);
+                    let temp = if up {
+                        v.get(var) + v.get(step) / scale
+                    } else {
+                        v.get(var) - v.get(step) / scale
+                    };
+                    if use_set || (temp >= v.get(lo) && temp <= v.get(hi)) {
+                        v.set(var, temp).await;
+                        self.msg1(msg).await;
+                    } else {
+                        self.msg1("Exceeds Limit").await;
+                        self.v.set(OP_ALERT, 1.0).await;
+                    }
+                    self.v.set(if up { inc } else { dec }, 0.0).await;
+                    return Some(next);
+                }
+                let v = &mut self.v;
+                if v.on(WORLD_INC) || v.on(WORLD_DEC) {
+                    let up = v.on(WORLD_INC);
+                    let world = if up {
+                        v.get(WORLD_OFF) + v.get(WORLD_TWEAK)
+                    } else {
+                        v.get(WORLD_OFF) - v.get(WORLD_TWEAK)
+                    };
+                    v.set(WORLD_OFF, world).await;
+                    self.msg1("Tweaked world").await;
+                    let i = if up { WORLD_INC } else { WORLD_DEC };
+                    self.v.set(i, 0.0).await;
+                    return Some(HrState::CalcMovements);
+                }
+                None
+            }
+            HrState::EChanged => {
+                ctl_debug!(v, "hrCtl:eChanged");
+                let lambda = HC / v.get(E);
+                v.set(LAMBDA, lambda).await;
+                Some(HrState::LChanged)
+            }
+            HrState::LChanged => {
+                let op_mode = self.op_mode();
+                let v = &mut self.v;
+                let (lambda, d1, d2) = (v.get(LAMBDA), v.get(D1), v.get(D2));
+                if lambda > d1 {
+                    self.msg1("Wavelength > 2d spacing of crystal 1.").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    return Some(HrState::ThChanged);
+                }
+                if lambda > d2 && op_mode != 0.0 {
+                    self.msg1("Wavelength > 2d spacing of crystal 2.").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    return Some(HrState::ThChanged);
+                }
+                // C prints "opMode 1" for opMode 2 too (hrCtl.st:1136).
+                if op_mode == 0.0 {
+                    ctl_debug!(v, "hrCtl:lChanged, opMode 0");
+                } else if op_mode == 1.0 || op_mode == 2.0 {
+                    ctl_debug!(v, "hrCtl:lChanged, opMode 1");
+                }
+                if op_mode == 0.0 || op_mode == 1.0 {
+                    v.set(THETA1, (lambda / d1).asin() * R2D).await;
+                }
+                if op_mode == 1.0 || op_mode == 2.0 {
+                    v.set(THETA2, (lambda / d2).asin() * R2D).await;
+                }
+                (op_mode == 0.0 || op_mode == 1.0 || op_mode == 2.0).then_some(HrState::ThChanged)
+            }
+            HrState::ThChanged => {
+                self.th_changed().await;
+                Some(HrState::CalcMovements)
+            }
+            HrState::CalcMovements => {
+                let use_set = v.get(USE_SET);
+                if use_set == 0.0 {
+                    ctl_debug!(v, "hrCtl:calcMovements, USE");
+                    self.put_desired().await;
+                    return Some(HrState::MoveHr);
+                }
+                if use_set == 1.0 {
+                    ctl_debug!(v, "hrCtl:calcMovements, SET");
+                    let op_mode = self.op_mode();
+                    let v = &mut self.v;
+                    let off = v.get(PHI1) - v.get(RBV[0]) / D2UR;
+                    v.set(PHI1_OFF, off).await;
+                    if op_mode != 0.0 {
+                        let off = v.get(PHI2) - v.get(RBV[1]) / D2UR;
+                        v.set(PHI2_OFF, off).await;
+                    }
+                    self.put_desired().await;
+                    self.v.set(PUT_VALS, 0.0).await;
+                    self.calc_readback();
+                    self.put_rdbk(false).await;
+                    return Some(HrState::WaitForCmndEnter);
+                }
+                None
+            }
+            HrState::MoveHr => {
+                if v.on(AUTO_MODE) || v.on(PUT_VALS) {
+                    ctl_debug!(v, "hrCtl:moveHR: putting to motors");
+                    let op_mode = self.op_mode();
+                    let v = &mut self.v;
+                    let x = v.get(DESIRED[0]);
+                    v.assign(CMD[0], x);
+                    if op_mode == 0.0 {
+                        self.put_complete[0] = false;
+                        v.put_async(CMD[0]);
+                    } else if op_mode == 1.0 || op_mode == 2.0 {
+                        let x = v.get(DESIRED[1]);
+                        v.assign(CMD[1], x);
+                        self.put_complete = [false; 2];
+                        v.put_async(CMD[1]);
+                        v.put_async(CMD[0]);
+                    }
+                    v.set(PUT_VALS, 0.0).await;
+                    self.caused_move = true;
+                    return Some(HrState::UpdateRdbk);
+                }
+                ctl_debug!(v, "hrCtl:moveHR: NOT putting to motors");
+                Some(HrState::WaitForCmndEnter)
+            }
+            HrState::UpdateRdbk => {
+                let (hls1, hls2) = (v.on(HLS[0]) || v.on(LLS[0]), v.on(HLS[1]) || v.on(LLS[1]));
+                if hls1 || hls2 {
+                    if hls1 {
+                        self.msg1("Theta 1 motor hit a limit switch !").await;
+                    }
+                    if self.op_mode() != 0.0 && hls2 {
+                        self.msg1("Theta 2 motor hit a limit switch !").await;
+                    }
+                    self.v.set(OP_ALERT, 1.0).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Setting to Manual Mode").await;
+                    return Some(HrState::StopHr);
+                }
+                if !v.on(DMOV[0]) || !v.on(DMOV[1]) {
+                    ctl_debug!(v, "hrCtl:updateRdbk: a motor is moving");
+                    v.set(MOVING, 1.0).await;
+                    self.calc_readback();
+                    self.put_rdbk(false).await;
+                    return Some(HrState::UpdateRdbkAfterDelay);
+                }
+                if self.put_complete == [true; 2] {
+                    ctl_debug!(self.v, "hrCtl:updateRdbk: motors stopped");
+                    self.calc_readback();
+                    self.put_rdbk(false).await;
+                    self.hr_done = true;
+                    return Some(HrState::MotorsStopped);
+                }
+                None
+            }
+            HrState::UpdateRdbkAfterDelay => d.delay(0.1).then_some(HrState::UpdateRdbk),
+            HrState::MotorsStopped => {
+                if self.caused_move {
+                    ctl_debug!(v, "hrCtl:motorsStopped (we started them)");
+                    self.caused_move = false;
+                    return Some(HrState::WaitForCmndEnter);
+                }
+                ctl_debug!(v, "hrCtl:motorsStopped (we didn't start them)");
+                if self.init_seq_done {
+                    v.set(OP_ALERT, 1.0).await;
+                    self.msg1("Somebody moved one of my motors.").await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                }
+                self.calc_readback();
+                self.put_rdbk(false).await;
+                Some(HrState::WaitForCmndEnter)
+            }
+            HrState::ChkMotorLimits => {
+                v.assign(OP_ALERT, 0.0);
+                self.calc_readback();
+                self.put_rdbk(true).await;
+                let v = &mut self.v;
+                let rbv = v.get(RBV[0]);
+                if rbv < v.get(LLM[0]) || rbv > v.get(HLM[0]) {
+                    self.msg1("Theta 1 motor is outside its limits").await;
+                    self.v.assign(OP_ALERT, 1.0);
+                }
+                let op_mode = self.op_mode();
+                let v = &mut self.v;
+                let rbv = v.get(RBV[1]);
+                if op_mode != 0.0 && (rbv < v.get(LLM[1]) || rbv > v.get(HLM[1])) {
+                    self.msg1("Theta 2 motor is outside its limits").await;
+                    self.v.assign(OP_ALERT, 1.0);
+                }
+                if self.v.on(OP_ALERT) {
+                    self.v.put(OP_ALERT).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Set to manual mode").await;
+                }
+                Some(HrState::ChkMotorLimitsExit)
+            }
+            HrState::ChkMotorLimitsExit => {
+                if !v.on(OP_ALERT) {
+                    v.put(OP_ALERT).await;
+                    self.msg1("All motors within limits").await;
+                    return Some(HrState::WaitForCmndEnter);
+                }
+                if d.delay(2.0) {
+                    v.put(OP_ALERT).await;
+                    self.msg2("Modify motor positions and/or limits").await;
+                    return Some(HrState::ChkMotorLimits);
+                }
+                None
+            }
+            HrState::StopHr => {
+                v.put(STOP[0]).await;
+                if self.op_mode() != 0.0 {
+                    self.v.put(STOP[1]).await;
+                }
+                Some(HrState::StoppedHrWait)
+            }
+            HrState::StoppedHrWait => d.delay(1.0).then_some(HrState::UpdateRdbk),
+        }
+    }
+
+    /// hrCtl_calc2dSpacing (hrCtl.st:1546-1566), which leaves opAlert set
+    /// for an invalid HKL and writes seqMsg1 without putting it.
+    fn calc_2d_spacing(&mut self, xtal: u8, a: usize, h: usize, k: usize, l: usize) -> f64 {
+        let v = &mut self.v;
+        let (a, h, k, l) = (v.get(a), v.get(h), v.get(k), v.get(l));
+        let result = (2.0 * a) / (h * h + k * k + l * l).sqrt();
+        let mut alert = h % 2.0 != k % 2.0 || h % 2.0 != l % 2.0;
+        let avg = ((h + k + l) / 2.0) as f32;
+        let nint = if avg > 0.0 {
+            (f64::from(avg) + 0.5) as i32
+        } else {
+            (f64::from(avg) - 0.5) as i32
+        };
+        if (avg - nint as f32).abs() <= 0.25 && nint % 2 != 0 {
+            alert = true;
+        }
+        v.assign(OP_ALERT, f64::from(u8::from(alert)));
+        if alert {
+            self.msg1 = format!("Invalid HKL combination for crystal {xtal}");
+        }
+        result
+    }
+
+    /// hrCtl_calcReadback (hrCtl.st:1568-1616).
+    fn calc_readback(&mut self) {
+        let op_mode = self.op_mode();
+        let nested = self.nested();
+        let v = &mut self.v;
+        let world = v.get(WORLD_OFF) * UR2D;
+        let phi1 = v.get(RBV[0]) * UR2D + (v.get(PHI1_OFF) + world);
+        v.assign(PHI1_RDBK, phi1);
+        let theta1 = phi1;
+        let (d1, d2) = (v.get(D1), v.get(D2));
+        let phi2 = if nested {
+            v.get(RBV[1]) * UR2D + (v.get(PHI2_OFF) + world)
+        } else {
+            v.get(RBV[1]) * UR2D + (v.get(PHI2_OFF) - world)
+        };
+        let lambda = if op_mode == 0.0 {
+            Some(d1 * (theta1 * D2R).sin())
+        } else if op_mode == 1.0 {
+            v.assign(PHI2_RDBK, phi2);
+            Some(d1 * (theta1 * D2R).sin())
+        } else if op_mode == 2.0 {
+            v.assign(PHI2_RDBK, phi2);
+            let nom = (d1 * (theta1 * D2R).sin() / d2).asin() * R2D;
+            let dev = if nested {
+                phi2 - phi1 - theta1 - nom
+            } else {
+                phi2 - nom
+            };
+            Some(
+                d1 * (theta1 * D2R).sin()
+                    + D2R * dev
+                        / (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (nom * D2R).cos())),
+            )
+        } else {
+            None
+        };
+        if let Some(lambda) = lambda {
+            v.assign(LAMBDA_RDBK, lambda);
+        }
+        let lambda = v.get(LAMBDA_RDBK);
+        v.assign(THETA1_RDBK, (lambda / d1).asin() * R2D);
+        if op_mode != 0.0 {
+            v.assign(THETA2_RDBK, (lambda / d2).asin() * R2D);
+        }
+        v.assign(E_RDBK, HC / lambda);
+    }
+
+    /// The readback puts; chkMotorLimits puts phi2's and theta2's in every
+    /// mode, the other states only when `opMode != 0`.
+    async fn put_rdbk(&mut self, both: bool) {
+        let two = both || self.op_mode() != 0.0;
+        let v = &mut self.v;
+        v.put(PHI1_RDBK).await;
+        v.put(THETA1_RDBK).await;
+        if two {
+            v.put(PHI2_RDBK).await;
+            v.put(THETA2_RDBK).await;
+        }
+        v.put(LAMBDA_RDBK).await;
+        v.put(E_RDBK).await;
+    }
+
+    /// phiLimits with `!useSetMode` (hrCtl.st:843-904).
+    async fn phi_limits(&mut self) {
+        let nested = self.nested();
+        let v = &mut self.v;
+        let world = v.get(WORLD_OFF) * UR2D;
+        let (theta_min, theta_max) = (v.get(THETA_MIN), v.get(THETA_MAX));
+        let phi1_off = v.get(PHI1_OFF);
+        let phi1_hi = v.get(HLM[0]) * UR2D + (phi1_off + world);
+        let phi1_lo = v.get(LLM[0]) * UR2D + (phi1_off + world);
+        v.assign(PHI1_HI, phi1_hi);
+        v.assign(PHI1_LO, phi1_lo);
+        let (mut theta1_hi, mut theta1_lo) = (phi1_hi, phi1_lo);
+        if theta1_hi > theta_max {
+            theta1_hi = theta_max;
+            self.msg2(&format!("Theta1HiLim clipped at {theta_max:.3}"))
+                .await;
+        }
+        if theta1_lo < theta_min {
+            theta1_lo = theta_min;
+            self.msg2(&format!("Theta1LoLim clipped at {theta_min:.3}"))
+                .await;
+        }
+        let v = &mut self.v;
+        v.set(THETA1_HI, theta1_hi).await;
+        v.set(THETA1_LO, theta1_lo).await;
+
+        let phi2_off = v.get(PHI2_OFF);
+        let (phi2_hi, phi2_lo) = if nested {
+            (
+                v.get(HLM[1]) * UR2D + phi2_off + world,
+                v.get(LLM[1]) * UR2D + phi2_off + world,
+            )
+        } else {
+            (
+                v.get(HLM[1]) * UR2D + phi2_off - world,
+                v.get(LLM[1]) * UR2D + phi2_off - world,
+            )
+        };
+        v.assign(PHI2_HI, phi2_hi);
+        v.assign(PHI2_LO, phi2_lo);
+        let (mut theta2_hi, mut theta2_lo) = if nested {
+            (phi2_hi - phi1_lo - theta1_lo, phi2_lo - phi1_hi - theta1_hi)
+        } else {
+            (phi2_hi, phi2_lo)
+        };
+        if theta2_hi > theta_max {
+            theta2_hi = theta_max;
+            self.msg2(&format!("Theta2HiLim clipped at {theta_max:.3}"))
+                .await;
+        }
+        if theta2_lo < theta_min {
+            theta2_lo = theta_min;
+            self.msg2(&format!("Theta2LoLim clipped at {theta_min:.3}"))
+                .await;
+        }
+        let v = &mut self.v;
+        v.set(THETA2_HI, theta2_hi).await;
+        v.set(THETA2_LO, theta2_lo).await;
+
+        let (d1, d2) = (v.get(D1), v.get(D2));
+        let lambda_hi = (d1 * (theta1_hi * D2R).sin()).min(d2 * (theta2_hi * D2R).sin());
+        v.set(LAMBDA_HI, lambda_hi).await;
+        let lambda_lo = (d1 * (theta1_lo * D2R).sin()).max(d2 * (theta2_lo * D2R).sin());
+        v.set(LAMBDA_LO, lambda_lo).await;
+        v.set(E_HI, HC / lambda_lo).await;
+        v.set(E_LO, HC / lambda_hi).await;
+    }
+
+    /// thChanged's action (hrCtl.st:1147-1216).
+    async fn th_changed(&mut self) {
+        let op_mode = self.op_mode();
+        let nested = self.nested();
+        let v = &mut self.v;
+        ctl_debug!(v, "hrCtl:thChanged");
+        let use_set = v.on(USE_SET);
+        let theta1 = v.get(THETA1);
+        if !use_set && (theta1 <= v.get(THETA1_LO) || theta1 >= v.get(THETA1_HI)) {
+            self.constrained("Theta 1 constrained to LIMIT").await;
+        }
+        let v = &mut self.v;
+        let theta2 = v.get(THETA2);
+        if !use_set && op_mode != 0.0 && (theta2 <= v.get(THETA2_LO) || theta2 >= v.get(THETA2_HI))
+        {
+            self.constrained("Theta 2 constrained to LIMIT").await;
+        }
+        let v = &mut self.v;
+        let (theta1, theta2) = (v.get(THETA1), v.get(THETA2));
+        let (d1, d2) = (v.get(D1), v.get(D2));
+        if op_mode == 0.0 || op_mode == 1.0 {
+            v.assign(LAMBDA, d1 * (theta1 * D2R).sin());
+            v.assign(PHI1, theta1);
+            if op_mode == 1.0 {
+                v.assign(
+                    PHI2,
+                    if nested {
+                        theta1 + theta1 + theta2
+                    } else {
+                        theta2
+                    },
+                );
+                ctl_debug!(
+                    v,
+                    "hrCtl:thChanged: opMode={}, Geom={}, theta2={theta2:.6}",
+                    op_mode as i32,
+                    v.get(GEOM) as i32
+                );
+            }
+        } else {
+            let lambda_nom = d1 * (theta1 * D2R).sin();
+            let nom = (lambda_nom / d2).asin() * R2D;
+            let lambda = d2 * (theta2 * D2R).sin();
+            v.assign(LAMBDA, lambda);
+            v.assign(PHI1, theta1);
+            let dev = R2D
+                * (lambda - lambda_nom)
+                * (1.0 / (d1 * (theta1 * D2R).cos()) + 1.0 / (d2 * (nom * D2R).cos()));
+            v.assign(
+                PHI2,
+                if nested {
+                    (theta1 + theta1 + nom) + dev
+                } else {
+                    nom + dev
+                },
+            );
+        }
+        v.put(PHI1).await;
+        if op_mode != 0.0 {
+            ctl_debug!(
+                v,
+                "hrCtl:thChanged: opMode={}, Geom={}, phi2={:.6}",
+                op_mode as i32,
+                v.get(GEOM) as i32,
+                v.get(PHI2)
+            );
+            v.put(PHI2).await;
+        }
+        v.put(LAMBDA).await;
+        let e = HC / v.get(LAMBDA);
+        v.set(E, e).await;
+        self.calc_readback();
+        self.put_rdbk(false).await;
+    }
+
+    /// thChanged's limit arm.
+    async fn constrained(&mut self, msg: &str) {
+        self.msg1(msg).await;
+        self.v.set(OP_ALERT, 1.0).await;
+        self.v.set(AUTO_MODE, 0.0).await;
+        self.msg2("Set to Manual Mode").await;
+    }
+
+    /// Both calcMovements arms' phi*MotDesired puts.
+    async fn put_desired(&mut self) {
+        let op_mode = self.op_mode();
+        let nested = self.nested();
+        let v = &mut self.v;
+        let world = v.get(WORLD_OFF) * UR2D;
+        let x = (v.get(PHI1) - v.get(PHI1_OFF) - world) * D2UR;
+        v.set(DESIRED[0], x).await;
+        if op_mode != 0.0 {
+            let x = if nested {
+                (v.get(PHI2) - v.get(PHI2_OFF) - world) * D2UR
+            } else {
+                (v.get(PHI2) - v.get(PHI2_OFF) + world) * D2UR
+            };
+            v.set(DESIRED[1], x).await;
         }
     }
 }
@@ -1266,163 +1284,6 @@ async fn hr_ctl(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_calc_2d_spacing() {
-        let (two_d, forb, _) = calc_2d_spacing(5.4309, 1.0, 1.0, 1.0);
-        assert!((two_d - 6.2712).abs() < 0.01);
-        assert!(!forb);
-    }
-
-    #[test]
-    fn test_theta1_to_phi1() {
-        assert_eq!(theta1_to_phi1(14.0), 14.0);
-    }
-
-    #[test]
-    fn test_phi2_nested() {
-        // phi2 = phi1 + theta1 + theta2
-        let phi2 = calc_phi2_nested(14.0, 14.0, 15.0);
-        assert!((phi2 - 43.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_phi2_symmetric() {
-        assert_eq!(calc_phi2_symmetric(15.0), 15.0);
-    }
-
-    #[test]
-    fn test_motor_phi_roundtrip() {
-        let phi = 14.5;
-        let phi_off = 0.1;
-        let world = 0.05;
-        let motor = phi_to_motor(phi, phi_off, world);
-        let phi2 = motor_to_phi(motor, phi_off, world);
-        assert!(
-            (phi - phi2).abs() < 1e-8,
-            "phi roundtrip: {} vs {}",
-            phi,
-            phi2
-        );
-    }
-
-    #[test]
-    fn test_motor_phi2_symmetric_roundtrip() {
-        let phi = 14.5;
-        let phi_off = 0.1;
-        let world = 0.05;
-        let motor = phi2_to_motor_symmetric(phi, phi_off, world);
-        let phi2 = motor_to_phi2_symmetric(motor, phi_off, world);
-        assert!((phi - phi2).abs() < 1e-8);
-    }
-
-    #[test]
-    fn test_calc_readback_single() {
-        let d1 = 6.2712;
-        let d2 = 6.0;
-        let phi1_off = 0.0;
-        let phi2_off = 0.0;
-        let world_off = 0.0;
-        // Motor value in micro-radians for theta1=14 deg
-        let theta1_deg = 14.0;
-        let phi1_mot = theta1_deg * D2UR;
-        let rdbk = calc_readback(
-            phi1_mot,
-            0.0,
-            phi1_off,
-            phi2_off,
-            world_off,
-            d1,
-            d2,
-            HrOpMode::Single,
-            HrGeometry::Nested,
-        );
-        // lambda = d1 * sin(theta1)
-        let expected_lambda = d1 * (theta1_deg * D2R).sin();
-        assert!(
-            (rdbk.lambda_rdbk - expected_lambda).abs() < 1e-6,
-            "lambda: {} vs {}",
-            rdbk.lambda_rdbk,
-            expected_lambda
-        );
-        assert!(
-            (rdbk.theta1_rdbk - theta1_deg).abs() < 0.01,
-            "theta1: {} vs {}",
-            rdbk.theta1_rdbk,
-            theta1_deg
-        );
-        assert!(rdbk.e_rdbk > 0.0);
-    }
-
-    #[test]
-    fn test_calc_readback_two_locked_nested() {
-        let d1 = 6.2712;
-        let d2 = 6.0;
-        let theta1 = 14.0;
-        let theta2 = (d1 * (theta1 * D2R).sin() / d2).asin() * R2D;
-        let phi1 = theta1;
-        let phi2 = phi1 + theta1 + theta2;
-        let phi1_mot = phi1 * D2UR;
-        let phi2_mot = phi2 * D2UR;
-        let rdbk = calc_readback(
-            phi1_mot,
-            phi2_mot,
-            0.0,
-            0.0,
-            0.0,
-            d1,
-            d2,
-            HrOpMode::TwoLocked,
-            HrGeometry::Nested,
-        );
-        let expected_lambda = d1 * (theta1 * D2R).sin();
-        assert!((rdbk.lambda_rdbk - expected_lambda).abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_phi_limits_nested_clip_to_theta_range() {
-        let lim = calc_phi_limits(
-            [1e6, 0.0, 2e6, 0.0],
-            0.0,
-            0.0,
-            0.0,
-            0.5,
-            89.5,
-            2.0,
-            2.0,
-            HrGeometry::Nested,
-        );
-        assert!((lim.theta1_hi - 57.29578).abs() < 1e-4);
-        assert_eq!(lim.theta1_lo, 0.5);
-        // phi2Hi - phi1Lo - theta1Lo = 114.59 - 0 - 0.5, clipped.
-        assert_eq!(lim.theta2_hi, 89.5);
-        assert_eq!(lim.theta2_lo, 0.5);
-        assert!((lim.lambda_hi - 2.0 * (57.29578 * D2R).sin()).abs() < 1e-5);
-        assert!((lim.lambda_lo - 2.0 * (0.5 * D2R).sin()).abs() < 1e-9);
-        assert!((lim.e_hi - HC / lim.lambda_lo).abs() < 1e-9);
-        assert_eq!(
-            lim.msgs,
-            [
-                "Theta1LoLim clipped at 0.500",
-                "Theta2HiLim clipped at 89.500",
-                "Theta2LoLim clipped at 0.500",
-            ]
-        );
-    }
-
-    #[test]
-    fn test_op_mode_from_i16() {
-        assert_eq!(HrOpMode::from_i16(0), HrOpMode::Single);
-        assert_eq!(HrOpMode::from_i16(1), HrOpMode::TwoLocked);
-        assert_eq!(HrOpMode::from_i16(2), HrOpMode::TwoIndependent);
-        assert_eq!(HrOpMode::from_i16(99), HrOpMode::Single);
-    }
-
-    #[test]
-    fn test_hr_geometry() {
-        assert_eq!(HrGeometry::from_i16(0), HrGeometry::Nested);
-        assert_eq!(HrGeometry::from_i16(1), HrGeometry::Symmetric);
-    }
 
     #[test]
     fn test_config_pv() {

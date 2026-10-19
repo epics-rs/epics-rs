@@ -101,36 +101,17 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     panic!("{ack} never taken");
 }
 
-/// Run `posts` while the sequencer is held past waitForCmndEnter's
-/// efClears (ml_monoCtl.st:564-575): OperAck sends it there, the theta
-/// readback echo is its first put after them, and the theta2 echo, locked
-/// here, its next. A post that lands before the efClears is dropped, as in C.
-async fn post_while_held(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
-    let rbv = f64_of(db, "M:th.RBV").await;
+/// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
+/// (ml_monoCtl.st:564-607): OperAck sends it there, and the enter's `opAck = 0` follows them.
+/// Its puts are queued, so no record lock can hold it inside the enter.
+async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
-    db.get_record("M:ml_monoThetaRdbkEcho")
-        .unwrap()
-        .write()
-        .record
-        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
-        .unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let echo2 = db.get_record("M:ml_monoTheta2RdbkEcho").unwrap();
-    let holder = std::thread::spawn(move || {
-        let _held = echo2.write();
-        locked_tx.send(()).unwrap();
-        let _ = release_rx.recv();
-    });
-    locked_rx.recv().unwrap();
     optics_rs::db_access::DbChannel::new(db, "M:ml_monoOperAck")
         .put_f64_process(1.0)
         .await
         .unwrap();
-    wait_near(db, "M:ml_monoThetaRdbkEcho", rbv).await;
+    wait_near(db, "M:ml_monoOperAck", 0.0).await;
     posts(db);
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
 }
 
 async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
@@ -160,7 +141,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
     let ioc = boot([10.0, 10.0, 35.0, 100.0]).await;
     settled(&ioc, "y offset changed to 35.000000").await;
     let e = f64_of(&ioc, "M:ml_monoE").await;
-    post_while_held(&ioc, |db| {
+    post_after_enter(&ioc, |db| {
         post(db, "M:ml_monoMode", EpicsValue::Enum(1));
         post(db, "M:ml_monoE", EpicsValue::Double(e * 1.01));
     })
@@ -201,7 +182,7 @@ async fn an_oper_ack_0_leaves_the_e_put_after_it() {
     let ioc = boot([10.0, 10.0, 35.0, 100.0]).await;
     settled(&ioc, "y offset changed to 35.000000").await;
     let e = f64_of(&ioc, "M:ml_monoE").await;
-    post_while_held(&ioc, |db| {
+    post_after_enter(&ioc, |db| {
         post(db, "M:ml_monoMode", EpicsValue::Enum(1));
         post(db, "M:ml_monoOperAck", EpicsValue::Enum(0));
     })
@@ -292,4 +273,58 @@ async fn use_set_and_the_motor_set_fields_follow_each_other() {
         "UseSet {} .SET {flags:?} after th2.SET 0",
         f64_of(&ioc, "M:ml_monoUseSet").await
     );
+}
+
+const CHILD: &str = "ML_MONO_CTL_DEBUG_CHILD";
+
+/// `test` run again in a child whose stdout is not captured, and the
+/// ml_monoCtl lines it printed.
+fn trace_of(test: &str) -> Vec<String> {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        // libtest's `test <name> ... ` heads the first line, unterminated.
+        .filter_map(|l| l.find("ml_monoCtl:").map(|i| l[i..].to_string()))
+        .collect()
+}
+
+/// With ml_monoCtlDebug set, an E put in manual mode prints C's lines
+/// (ml_monoCtl.st:669-672, :824-956, :564-618).
+#[epics_base_rs::epics_test]
+async fn debug_prints_c_lines() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("debug_prints_c_lines");
+        assert_eq!(
+            trace,
+            [
+                "ml_monoCtl:waitForCmnd:E_mon",
+                "ml_monoCtl:eChanged",
+                "ml_monoCtl:lChanged",
+                "ml_monoCtl:thChanged",
+                "ml_monoCtl:calcMovements",
+                "ml_monoCtl:move_ml_mono",
+                "ml_monoCtl:waitForCmndEnter:initSeqDone",
+                "ml_monoCtl:waitForCmndEnter: ml_monoMoving=1; ml_monoDone=0",
+            ]
+        );
+        return;
+    }
+    let ioc = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    post(&ioc, "M:ml_monoCtlDebug", EpicsValue::Long(1));
+    task::sleep(Duration::from_millis(200)).await;
+    let e = f64_of(&ioc, "M:ml_monoE").await;
+    post(&ioc, "M:ml_monoE", EpicsValue::Double(e * 1.01));
+    task::sleep(Duration::from_millis(500)).await;
 }

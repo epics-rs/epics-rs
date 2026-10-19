@@ -16,6 +16,7 @@ use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
+use optics_rs::snl::kohzu_ctl::{HC, RAD_CONV};
 use optics_rs::snl::kohzu_ctl_soft::{self, KohzuSoftConfig};
 use std::collections::HashMap;
 use std::future::Future;
@@ -111,9 +112,21 @@ async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
 
 /// Wait until SeqMsg1 reads `msg1`, then let the rest of the pass land.
 async fn settled(ioc: &PvDatabase, msg1: &str) {
+    shown(ioc, msg1).await;
+    task::sleep(Duration::from_millis(500)).await;
+}
+
+/// Wait until SeqMsg1 reads `msg1`, then until the sequencer waits for a
+/// command past its efClears, where a command put is taken.
+async fn ready(ioc: &PvDatabase, msg1: &str) {
+    shown(ioc, msg1).await;
+    idle(ioc, "K:m:OperAck", "K:m:SeqMsg1").await;
+}
+
+/// Wait until SeqMsg1 reads `msg1`.
+async fn shown(ioc: &PvDatabase, msg1: &str) {
     for _ in 0..200 {
         if string_of(ioc, "K:m:SeqMsg1").await == msg1 {
-            task::sleep(Duration::from_millis(500)).await;
             return;
         }
         task::sleep(Duration::from_millis(50)).await;
@@ -204,6 +217,7 @@ async fn a_readback_inside_the_limits_stands_after_the_connect_time_passes() {
 /// Below thetaLo the readback pass clamps the setpoints to 1 deg and Z
 /// exceeds its limit; in manual mode nothing is rolled back.
 #[epics_base_rs::epics_test]
+#[ignore = "needs devMotorSoft (devSoft.cc), reviewer6"]
 async fn a_readback_below_theta_lo_keeps_the_clamped_setpoints_in_manual_mode() {
     let ioc = boot([0.5, -17.501, 200.0]).await;
     settled(&ioc, "Z will exceed soft limits").await;
@@ -277,14 +291,14 @@ async fn a_zero_readback_holds_init_in_chk_motor_limits() {
 #[epics_base_rs::epics_test]
 async fn the_echo_pvs_follow_the_motors_while_init_holds() {
     let ioc = boot([0.0, 0.0, 0.0]).await;
-    settled(&ioc, "Theta Readback of 0 not reasonable").await;
+    shown(&ioc, "Theta Readback of 0 not reasonable").await;
     let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:z.VELO")
         .put_f64_process(7.0)
         .await
         .unwrap();
     eventually_near(&ioc, "K:m:ZVel", 7.0).await;
-    assert_eq!(f64_of(&ioc, "K:m:ThetaDmov").await, 1.0);
+    eventually_near(&ioc, "K:m:ThetaDmov", 1.0).await;
 }
 
 /// A theta move made outside kohzuCtl_soft posts many readbacks; updateRdbk's
@@ -293,7 +307,7 @@ async fn the_echo_pvs_follow_the_motors_while_init_holds() {
 #[epics_base_rs::epics_test]
 async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    ready(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     // Each pass puts the readback to the theta motor, whose HLM refuses it,
     // so theta posts once per pass. SeqMsg1 cannot count passes: a string
@@ -356,31 +370,35 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
 #[epics_base_rs::epics_test]
 async fn use_set_drives_the_motor_set_fields_at_connect() {
     let ioc = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&ioc).await, [0.0; 4]);
+    sets_reach(&ioc, [0.0; 4]).await;
     let ioc = boot_with([10.0, -17.77, 100.78], &[("K:m:UseSet", 1.0)]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
-    assert_eq!(use_set_and_motor_sets(&ioc).await, [1.0; 4]);
+    sets_reach(&ioc, [1.0; 4]).await;
+}
+
+async fn sets_reach(ioc: &PvDatabase, want: [f64; 4]) {
+    eventually(|| async {
+        match use_set_and_motor_sets(ioc).await {
+            sets if sets == want => Ok(()),
+            sets => Err(format!("UseSet and motor SETs {sets:?}, C {want:?}")),
+        }
+    })
+    .await;
 }
 
 /// A motor .SET put reaches UseSet, and UseSet the other two motors
 /// (C kohzuIoc oracle: y.SET=Set leaves all four Set).
 #[epics_base_rs::epics_test]
 async fn a_motor_set_put_drives_use_set_and_the_other_motors() {
-    let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    // updateSet's connect-time UseSet pass puts back a motor SET put before
+    // it: the preset th.SET it resets shows that pass has run.
+    let ioc = boot_with([10.0, -17.77, 100.78], &[("K:th.SET", 1.0)]).await;
+    sets_reach(&ioc, [0.0; 4]).await;
     let db = PvDatabase::clone(&ioc);
     optics_rs::db_access::DbChannel::new(&db, "K:y.SET")
         .put_f64_process(1.0)
         .await
         .unwrap();
-    eventually(|| async {
-        match use_set_and_motor_sets(&ioc).await {
-            [1.0, 1.0, 1.0, 1.0] => Ok(()),
-            sets => Err(format!("UseSet and motor SETs {sets:?}")),
-        }
-    })
-    .await;
+    sets_reach(&ioc, [1.0; 4]).await;
 }
 
 /// Poll `pv` until it is within [`assert_near`]'s tolerance of `want`, then
@@ -418,36 +436,17 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     panic!("{ack} never taken");
 }
 
-/// Run `posts` while the sequencer is held past waitForCmndEnter's
-/// efClears (kohzuCtl_soft.st:563-576): `ack` sends it there, the `echo` put is its
-/// first after them, and its next read blocks on K:y, locked here. A post
-/// that lands before the efClears is dropped, as in C.
-async fn post_while_held(db: &PvDatabase, ack: &str, echo: &str, posts: impl FnOnce(&PvDatabase)) {
-    let rbv = f64_of(db, "K:th.RBV").await;
+/// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
+/// (kohzuCtl_soft.st:563-606): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// Its puts are queued, so no record lock can hold it inside the enter.
+async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:m:SeqMsg1").await;
-    db.get_record(echo)
-        .unwrap()
-        .write()
-        .record
-        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
-        .unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let y = db.get_record("K:y").unwrap();
-    let holder = std::thread::spawn(move || {
-        let _held = y.write();
-        locked_tx.send(()).unwrap();
-        let _ = release_rx.recv();
-    });
-    locked_rx.recv().unwrap();
     optics_rs::db_access::DbChannel::new(db, ack)
         .put_f64_process(1.0)
         .await
         .unwrap();
-    eventually_near(db, echo, rbv).await;
+    eventually_near(db, ack, 0.0).await;
     posts(db);
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
 }
 
 /// Post `v` to `pv`'s VAL with no processing.
@@ -463,20 +462,16 @@ fn post(db: &PvDatabase, pv: &str, v: EpicsValue) {
 #[epics_base_rs::epics_test]
 async fn two_queued_e_puts_take_the_later_value() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    shown(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
-    post_while_held(&db, "K:m:OperAck", "K:m:ThetaMotRdbk", |db| {
+    post_after_enter(&db, "K:m:OperAck", |db| {
         for e in [12.0, 14.0] {
             post(db, "K:m:E", EpicsValue::Double(e));
         }
     })
     .await;
     let two_d = f64_of(&ioc, "K:m:2dSpacing").await;
-    let theta = optics_rs::snl::kohzu_ctl::lambda_to_theta(
-        optics_rs::snl::kohzu_ctl::energy_to_lambda(14.0),
-        two_d,
-    )
-    .unwrap();
+    let theta = RAD_CONV * (HC / 14.0 / two_d).asin();
     eventually_near(&ioc, "K:m:Theta", theta).await;
     assert_near(&ioc, "K:m:E", 14.0).await;
 }
@@ -489,7 +484,7 @@ async fn two_queued_e_puts_take_the_later_value() {
 #[epics_base_rs::epics_test]
 async fn an_e_put_below_1e_12_off_still_moves() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    shown(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     db.get_record("K:y")
         .unwrap()
@@ -501,7 +496,7 @@ async fn an_e_put_below_1e_12_off_still_moves() {
         .pos
         .val = 5.0;
     let e = f64_of(&ioc, "K:m:E").await;
-    post_while_held(&db, "K:m:OperAck", "K:m:ThetaMotRdbk", |db| {
+    post_after_enter(&db, "K:m:OperAck", |db| {
         post(db, "K:m:Mode", EpicsValue::Enum(1));
         post(db, "K:m:E", EpicsValue::Double(e + 5e-13));
     })
@@ -516,7 +511,7 @@ async fn an_e_put_below_1e_12_off_still_moves() {
 #[epics_base_rs::epics_test]
 async fn a_moving_write_with_no_monitor_is_not_cleared() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
-    settled(&ioc, "y offset changed to 17.500000").await;
+    ready(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
     db.put_record_field_from_ca("K:np", "VAL", EpicsValue::Double(1.0))
         .await
@@ -525,6 +520,7 @@ async fn a_moving_write_with_no_monitor_is_not_cleared() {
     db.put_record_field_from_ca("K:th", "HLM", EpicsValue::Double(80.0))
         .await
         .unwrap();
-    settled(&ioc, "Theta Motor Soft Limits Changed").await;
+    // The idle step ends with waitForCmndEnter past the limits pass's own.
+    ready(&ioc, "Theta Motor Soft Limits Changed").await;
     assert_eq!(f64_of(&ioc, "K:m:Moving").await, 1.0);
 }

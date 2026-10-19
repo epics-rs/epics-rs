@@ -1176,27 +1176,32 @@ impl DbMultiMonitor {
         }
     }
 
+    /// [`Self::wait_change`]'s answer if a change is already queued.
+    pub fn try_change(&mut self) -> Option<(String, f64)> {
+        for (name, sub) in &mut self.subs {
+            if let Ok(mut event) = sub.try_next_event() {
+                while let Ok(newer) = sub.try_next_event() {
+                    event = newer;
+                }
+                let val = event
+                    .value()
+                    .as_value()
+                    .and_then(EpicsValue::to_f64)
+                    .unwrap_or(0.0);
+                return Some((name.clone(), val));
+            }
+        }
+        None
+    }
+
     /// Wait for any subscribed PV to change. Returns (pv_name, new_value)
     /// with the newest value queued for that PV: one SNL sync'd event flag
     /// stands for every monitor since it was last cleared, and its variable
     /// holds the last of them.
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
-            for (name, sub) in &mut self.subs {
-                match sub.try_next_event() {
-                    Ok(mut event) => {
-                        while let Ok(newer) = sub.try_next_event() {
-                            event = newer;
-                        }
-                        let val = event
-                            .value()
-                            .as_value()
-                            .and_then(EpicsValue::to_f64)
-                            .unwrap_or(0.0);
-                        return (name.clone(), val);
-                    }
-                    Err(_) => continue,
-                }
+            if let Some(change) = self.try_change() {
+                return change;
             }
             // No events ready — yield briefly then retry. The background
             // timer, not the ambient one: a caller can await this from a

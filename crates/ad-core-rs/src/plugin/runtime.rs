@@ -755,6 +755,44 @@ impl<T> WriteOutcome<T> {
     }
 }
 
+/// The callbacks a C write override ends in. NDPluginDriver's own write
+/// ends in `callParamCallbacks(addr)` (NDPluginDriver.cpp:767, :809, :845),
+/// and an override hands it the base class's reasons first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteEpilogue {
+    /// No override, or one ending as NDPluginDriver does.
+    Addr,
+    /// `callParamCallbacks(addr)` then `callParamCallbacks()`.
+    AddrAndZero,
+    /// `setIntegerParam(function, value)` and `callParamCallbacks()`: list 0
+    /// alone, whatever address was written.
+    Zero,
+}
+
+impl WriteEpilogue {
+    /// The address posted first, if any, and whether address 0 follows, for
+    /// a write at `addr`; `own` is a reason the override keeps rather than
+    /// handing to NDPluginDriver.
+    fn posts(self, addr: i32, own: bool) -> (Option<i32>, bool) {
+        match self {
+            Self::Addr => (Some(addr), false),
+            Self::AddrAndZero => (Some(addr), true),
+            Self::Zero => ((!own).then_some(addr), true),
+        }
+    }
+
+    /// Where the written value is stored, in the same shape: a `Zero`
+    /// override stores at list 0 (NDPluginAttribute.cpp:121,
+    /// NDPosPlugin.cpp:228) and NDPluginDriver stores a reason handed to it
+    /// at `addr`.
+    fn stores(self, addr: i32, own: bool) -> (Option<i32>, bool) {
+        match self {
+            Self::Zero => ((!own).then_some(addr), true),
+            Self::Addr | Self::AddrAndZero => (Some(addr), false),
+        }
+    }
+}
+
 /// Store one param a write override set; an array posts at once, as
 /// `doCallbacksFloat64Array` does.
 fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
@@ -1132,6 +1170,12 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     const INTERFACE_MASK: InterfaceMask;
     const INTERRUPT_MASK: InterfaceMask;
 
+    /// The callbacks C's writeInt32 override ends in; a plugin without one
+    /// ends as NDPluginDriver does.
+    const WRITE_INT32_EPILOGUE: WriteEpilogue = WriteEpilogue::Addr;
+    /// As `WRITE_INT32_EPILOGUE`, for writeFloat64.
+    const WRITE_FLOAT64_EPILOGUE: WriteEpilogue = WriteEpilogue::Addr;
+
     /// Process one array. Return output arrays and param updates.
     ///
     /// May run concurrently with itself on `NumThreads` worker threads.
@@ -1477,9 +1521,6 @@ struct SharedProcessorInner {
     /// Last *input* array, cached for ProcessPlugin re-injection
     /// (C++ `pPrevInputArray_`, G5). Released on `EnableCallbacks=0` (B6).
     prev_input_array: Option<PublishedArray>,
-    /// Shadow of `POOL_NUM_PRE_ALLOC_BUFFERS`, the count C reads back inside
-    /// `preAllocateBuffers` (asynNDArrayDriver.cpp:723).
-    num_pre_alloc_buffers: usize,
     /// Previous array dimensions, for firing an NDDimensions int32-array
     /// callback when dimensions change (C++ `dimsPrev_`, G8).
     dims_prev: Vec<i32>,
@@ -1764,54 +1805,6 @@ impl SharedProcessorInner {
         output.batch.time_stamp = Some(array.timestamp.to_system_time());
         output.addressed = self.delivery.publishable_addressed(result.addressed);
         output
-    }
-
-    /// The pool branch of C `asynNDArrayDriver::writeInt32`
-    /// (asynNDArrayDriver.cpp:684-694). A plugin port answers it exactly as a
-    /// driver port does, because `NDPluginDriver::writeInt32` hands every
-    /// parameter below `FIRST_NDPLUGIN_PARAM` straight to the base class
-    /// (NDPluginDriver.cpp:690-692) — so `PoolPollStats`, `PoolEmptyFreeList`
-    /// and `PoolPreAllocBuffers` are live PVs on a plugin, not decoration.
-    ///
-    /// Returns the readback batch when `reason` was one of the three, `None`
-    /// otherwise so the caller can go on matching.
-    fn pool_control_write(&mut self, reason: usize, value: i32) -> Option<ProcessOutput> {
-        let p = &self.ndarray_params;
-        let (empty, poll, pre_alloc, num_pre_alloc) = (
-            p.pool_empty_free_list,
-            p.pool_poll_stats,
-            p.pool_pre_alloc,
-            p.pool_num_pre_alloc_buffers,
-        );
-        let mut batch = ParamBatch::empty();
-        if reason == num_pre_alloc {
-            // Shadow the count so `PoolPreAllocBuffers` can read it without a
-            // round trip to the param table; not itself a control write.
-            self.num_pre_alloc_buffers = value.max(0) as usize;
-            return None;
-        } else if reason == empty {
-            self.delivery.empty_free_list();
-        } else if reason == pre_alloc {
-            self.delivery
-                .pre_allocate_buffers(self.num_pre_alloc_buffers);
-            // C clears the command PV once it has run (`:688`).
-            batch.addr0.push(asyn_rs::request::ParamSetValue::new(
-                pre_alloc,
-                0,
-                ParamValue::Int32(0),
-            ));
-        } else if reason != poll {
-            return None;
-        }
-        batch
-            .addr0
-            .extend(self.delivery.pool_stats(&self.ndarray_params));
-        Some(ProcessOutput {
-            arrays: vec![],
-            scatter: false,
-            batch,
-            addressed: vec![],
-        })
     }
 
     /// A param batch carrying only the current DroppedArrays / queue counters,
@@ -2350,6 +2343,12 @@ pub struct PluginPortDriver {
     plugin_params: PluginBaseParams,
     /// C `FIRST_NDPLUGIN_PARAM`: the reasons below it are the base class's.
     first_plugin_param: usize,
+    /// The plugin's own first reason; its override hands those below to
+    /// NDPluginDriver.
+    first_processor_param: usize,
+    /// `NDPluginProcess::WRITE_INT32_EPILOGUE` / `WRITE_FLOAT64_EPILOGUE`.
+    int32_epilogue: WriteEpilogue,
+    float64_epilogue: WriteEpilogue,
     param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
     /// Optional handle to the latest NDArray for array read methods (used by StdArrays).
     array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
@@ -2364,6 +2363,8 @@ pub struct PluginPortDriver {
     hand_on: Arc<std::sync::OnceLock<HandOn>>,
     /// What the plugin's own pool and queued count lead back to.
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
+    /// C `pNDArrayPool`, for the base class's pool branch.
+    pool: PluginPool,
     /// C `pThreads_.size() != 0`: whether `createCallbackThreads` has run.
     /// A plugin built with blocking callbacks has not, so its configure-line
     /// queueSize stands unfloored until it first goes non-blocking.
@@ -2456,6 +2457,7 @@ impl PluginPortDriver {
         };
 
         // Let the processor register its plugin-specific params
+        let first_processor_param = base.params.len();
         processor.register_params(&mut base)?;
         processor.bind_attributes(PluginAttributes(Arc::clone(&owner)));
         let pool = PluginPool::new(pool);
@@ -2467,6 +2469,9 @@ impl PluginPortDriver {
             ndarray_params,
             plugin_params,
             first_plugin_param,
+            first_processor_param,
+            int32_epilogue: P::WRITE_INT32_EPILOGUE,
+            float64_epilogue: P::WRITE_FLOAT64_EPILOGUE,
             param_change_tx,
             array_data,
             std_array_data_param,
@@ -2474,9 +2479,14 @@ impl PluginPortDriver {
             validator: processor.clone(),
             hand_on: Arc::default(),
             owner,
+            pool: pool.clone(),
             callback_threads,
         };
         Ok((driver, processor, pool))
+    }
+
+    fn is_own(&self, reason: usize) -> bool {
+        reason >= self.first_processor_param
     }
 
     /// What C `NDPluginDriver::writeInt32` leaves for an int32 write, which
@@ -2565,14 +2575,13 @@ impl PluginPortDriver {
     }
 
     /// Store what a write override set beside the written param, print its
-    /// lines, and post the written address. C overrides end in
-    /// `callParamCallbacks(addr)` or `callParamCallbacks()` on an address-0
-    /// write, so a side param at another address waits for that address's
-    /// next post, as NDPluginAttribute's Reset leaves channels 1.. (:122-136);
-    /// an array posts at once, as `doCallbacksFloat64Array` does.
+    /// lines, and post `posts`. A side param at any other address waits for
+    /// that address's next post, as NDPluginAttribute's Reset leaves
+    /// channels 1.. (:122-136); an array posts at once, as
+    /// `doCallbacksFloat64Array` does.
     fn store_side(
         &mut self,
-        addr: i32,
+        (first, zero): (Option<i32>, bool),
         side: Vec<SideParam>,
         trace: Vec<(TraceMask, String)>,
     ) -> AsynResult<()> {
@@ -2582,7 +2591,13 @@ impl PluginPortDriver {
         for (mask, line) in trace {
             self.base.trace_print(mask, format_args!("{line}"));
         }
-        self.base.call_param_callbacks(addr)
+        if let Some(addr) = first {
+            self.base.call_param_callbacks(addr)?;
+        }
+        if zero && first != Some(0) {
+            self.base.call_param_callbacks(0)?;
+        }
+        Ok(())
     }
 
     fn send_published(&self, publish: Published, addressed: Addressed) {
@@ -2887,7 +2902,26 @@ impl PortDriver for PluginPortDriver {
             self.hand_on.get(),
         );
         let value = verdict.kept();
-        self.base.set_int32_param(reason, addr, value)?;
+        let own = self.is_own(reason);
+        let (at, zero) = self.int32_epilogue.stores(addr, own);
+        for a in at.into_iter().chain(zero.then_some(0)) {
+            self.base.set_int32_param(reason, a, value)?;
+        }
+        let base_class = reason < self.first_plugin_param;
+        if base_class {
+            // NDPluginDriver.cpp:690-692 hands these to asynNDArrayDriver.
+            let template = self
+                .hand_on
+                .get()
+                .and_then(|h| h.delivery.last_output_array());
+            crate::driver::ndarray_driver::handle_pool_write_int32(
+                &mut self.base,
+                &self.ndarray_params,
+                &self.pool.current(),
+                reason,
+                template.as_deref(),
+            )?;
+        }
         let p = self.plugin_params;
         // C runs `createCallbackThreads` on every QueueSize or NumThreads write
         // (NDPluginDriver.cpp:746-748) and on a BlockingCallbacks 0 before any
@@ -2930,7 +2964,14 @@ impl PortDriver for PluginPortDriver {
                 .set_int32_param(p.queue_use, 0, settled.queue_size)?;
             self.callback_threads = true;
         }
-        self.store_side(addr, side, trace)?;
+        // asynNDArrayDriver.cpp:697 posts list 0 alone, leaving the written
+        // address's readback unposted; that C defect is not copied.
+        let posts = if base_class {
+            (Some(addr), true)
+        } else {
+            self.int32_epilogue.posts(addr, own)
+        };
+        self.store_side(posts, side, trace)?;
         self.send_published(publish, addressed);
         if !settled {
             // B14: reliable send on an unbounded channel — never drop param changes.
@@ -2958,8 +2999,13 @@ impl PortDriver for PluginPortDriver {
             .validator
             .float64(reason, addr, value, WriteVerdict::Accept(value), &self.base);
         let value = verdict.kept();
-        self.base.set_float64_param(reason, addr, value)?;
-        self.store_side(addr, side, trace)?;
+        let own = self.is_own(reason);
+        let (at, zero) = self.float64_epilogue.stores(addr, own);
+        for a in at.into_iter().chain(zero.then_some(0)) {
+            self.base.set_float64_param(reason, a, value)?;
+        }
+        let posts = self.float64_epilogue.posts(addr, own);
+        self.store_side(posts, side, trace)?;
         self.send_published(publish, addressed);
         if !settled {
             let _ = self.param_change_tx.send(PluginParamMsg::Change(
@@ -3021,7 +3067,7 @@ impl PortDriver for PluginPortDriver {
             );
         }
         side.splice(0..0, base.side);
-        self.store_side(addr, side, trace)?;
+        self.store_side(WriteEpilogue::Addr.posts(addr, true), side, trace)?;
         self.send_published(publish, addressed);
         if !settled {
             let _ = self.param_change_tx.send(PluginParamMsg::Change(
@@ -3423,7 +3469,6 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
@@ -3968,17 +4013,6 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             po.batch.flush(&port).await;
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
-                            // The base-class pool branch, which a plugin port
-                            // inherits (NDPluginDriver.cpp:690-692). Answered
-                            // first because none of these is a plugin
-                            // parameter and none of the arms below can match.
-                            if let Some(out) = {
-                                let mut guard = shared.lock();
-                                guard.pool_control_write(reason, value.as_i32())
-                            } {
-                                let port = shared.lock().port_handle.clone();
-                                out.batch.flush(&port).await;
-                            }
                             if reason == enable_callbacks_reason {
                                 let on = value.as_i32() != 0;
                                 enabled.store(on, Ordering::Release);
@@ -4460,7 +4494,6 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
@@ -6280,6 +6313,233 @@ mod tests {
         assert_eq!(drv.base.get_string_param(name, 0).unwrap(), b"img");
     }
 
+    /// A multi-address plugin whose writes set STATUS at address 0, as
+    /// ROIStat's TSControl sets TSAcquiring, ending each int32/float64 write
+    /// in `EPILOGUE`.
+    #[derive(Default)]
+    struct AddrZeroStatus<const EPILOGUE: u8> {
+        ids: Arc<parking_lot::Mutex<(usize, usize, usize, usize)>>,
+    }
+
+    const fn epilogue(e: u8) -> WriteEpilogue {
+        match e {
+            0 => WriteEpilogue::Addr,
+            1 => WriteEpilogue::AddrAndZero,
+            _ => WriteEpilogue::Zero,
+        }
+    }
+
+    impl<const EPILOGUE: u8> NDPluginProcess for AddrZeroStatus<EPILOGUE> {
+        const ASYN_FLAGS: PortFlags = ASYN_MULTIDEVICE;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+        const WRITE_INT32_EPILOGUE: WriteEpilogue = epilogue(EPILOGUE);
+        const WRITE_FLOAT64_EPILOGUE: WriteEpilogue = epilogue(EPILOGUE);
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "AddrZeroStatus"
+        }
+        fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+            use asyn_rs::param::ParamType;
+            *self.ids.lock() = (
+                base.create_param("CONTROL", ParamType::Int32)?,
+                base.create_param("RATE", ParamType::Float64)?,
+                base.create_param("LABEL", ParamType::Octet)?,
+                base.create_param("STATUS", ParamType::Int32)?,
+            );
+            Ok(())
+        }
+        fn validate_int32(
+            &self,
+            _reason: usize,
+            _addr: i32,
+            value: i32,
+            verdict: WriteVerdict<i32>,
+            _params: &mut WritePort<'_>,
+        ) -> WriteOutcome<i32> {
+            WriteOutcome::from(verdict).set_int32(self.ids.lock().3, 0, value)
+        }
+        fn validate_float64(
+            &self,
+            _reason: usize,
+            _addr: i32,
+            value: f64,
+            verdict: WriteVerdict<f64>,
+            _params: &PortDriverBase,
+        ) -> WriteOutcome<f64> {
+            WriteOutcome::from(verdict).set_int32(self.ids.lock().3, 0, value as i32)
+        }
+        fn validate_octet(
+            &self,
+            _reason: usize,
+            _addr: i32,
+            _value: &str,
+            verdict: WriteVerdict<String>,
+            _params: &PortDriverBase,
+        ) -> WriteOutcome<String> {
+            WriteOutcome::from(verdict).set_int32(self.ids.lock().3, 0, 99)
+        }
+    }
+
+    /// Writes CONTROL 1, RATE 2.0 and LABEL at address 1 of an
+    /// `AddrZeroStatus<EPILOGUE>`, with STATUS 7 set but not posted at
+    /// address 1 first; returns the STATUS posts seen at address 0, and at 1
+    /// before the octet write, which posts address 1 itself.
+    fn status_posts<const EPILOGUE: u8>(port: &str) -> (Vec<i32>, Vec<i32>) {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = AddrZeroStatus::<EPILOGUE>::default();
+        let ids = processor.ids.clone();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            port,
+            "AddrZeroStatus",
+            10,
+            0,
+            &"UP".into(),
+            2,
+            tx,
+            processor,
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let (control, rate, label, status) = *ids.lock();
+        let seen = [0, 1].map(|addr| {
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            let sync = drv
+                .base
+                .interrupts
+                .register_sync_callback(
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(status),
+                        addr: Some(addr),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int32(v) = iv.value {
+                            log.lock().push(v)
+                        }
+                    },
+                )
+                .unwrap();
+            (seen, sync)
+        });
+        drv.base.set_int32_param(status, 1, 7).unwrap();
+        drv.io_write_int32(&mut AsynUser::new(control).with_addr(1), 1)
+            .unwrap();
+        drv.io_write_float64(&mut AsynUser::new(rate).with_addr(1), 2.0)
+            .unwrap();
+        let [(zero, _), (one, _)] = seen;
+        let one = one.lock().clone();
+        drv.io_write_octet(&mut AsynUser::new(label).with_addr(1), b"x")
+            .unwrap();
+        let zero = zero.lock().clone();
+        (zero, one)
+    }
+
+    /// NDPluginROIStat.cpp:389-390: `callParamCallbacks(roi)` then
+    /// `callParamCallbacks()`; a writeOctet posts its address only
+    /// (NDPluginDriver.cpp:845).
+    #[test]
+    fn an_addr_and_zero_write_at_another_address_posts_address_zero_too() {
+        assert_eq!(status_posts::<1>("EPIADDRZERO"), (vec![1, 2], vec![7]));
+    }
+
+    /// NDPluginDriver.cpp:767, :809: `callParamCallbacks(addr)` leaves an
+    /// address-0 param set by the write unposted.
+    #[test]
+    fn an_addr_only_write_leaves_address_zero_unposted() {
+        assert_eq!(status_posts::<0>("EPIADDR"), (vec![], vec![7]));
+    }
+
+    /// NDPluginAttribute.cpp:136: `callParamCallbacks()` alone leaves the
+    /// written address unposted.
+    #[test]
+    fn a_zero_only_write_leaves_the_written_address_unposted() {
+        assert_eq!(status_posts::<2>("EPIZERO"), (vec![1, 2], vec![]));
+    }
+
+    /// Writes 1 to the base-class reason `write` at address 1 of an
+    /// `AddrZeroStatus<EPILOGUE>`; returns how often `watch` posted at
+    /// addresses 0 and 1 by the time the write returned.
+    fn base_write_posts<const EPILOGUE: u8>(
+        port: &str,
+        pick: impl Fn(&NDArrayDriverParams) -> (usize, usize),
+    ) -> [usize; 2] {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            port,
+            "AddrZeroStatus",
+            10,
+            0,
+            &"UP".into(),
+            2,
+            tx,
+            AddrZeroStatus::<EPILOGUE>::default(),
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let (write, watch) = pick(&drv.ndarray_params);
+        let seen = [0, 1].map(|addr| {
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let log = seen.clone();
+            let sync = drv
+                .base
+                .interrupts
+                .register_sync_callback(
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(watch),
+                        addr: Some(addr),
+                        ..Default::default()
+                    },
+                    move |_| {
+                        log.fetch_add(1, Ordering::Relaxed);
+                    },
+                )
+                .unwrap();
+            (seen, sync)
+        });
+        drv.io_write_int32(&mut AsynUser::new(write).with_addr(1), 1)
+            .unwrap();
+        seen.map(|(n, _)| n.load(Ordering::Relaxed))
+    }
+
+    /// asynNDArrayDriver.cpp:690-697: PoolPollStats sets the stats at list 0
+    /// and posts it before the write returns, on an addr-only plugin too.
+    #[test]
+    fn a_pool_poll_at_another_address_posts_the_stats_at_address_zero() {
+        let posts = base_write_posts::<0>("BASEPOOL", |p| (p.pool_poll_stats, p.pool_max_memory));
+        assert_eq!(posts, [1, 0]);
+    }
+
+    /// C posts only list 0 (asynNDArrayDriver.cpp:697), leaving the written
+    /// address's readback unposted; rs posts it as well.
+    #[test]
+    fn a_base_write_at_another_address_posts_its_readback() {
+        let [_, readback] =
+            base_write_posts::<0>("BASEREADBACK", |p| (p.file_number, p.file_number));
+        assert_eq!(readback, 1);
+    }
+
     /// NDPluginDriver.cpp:702, :792, :829: parseAsynUser makes a
     /// single-device plugin's address list 0.
     #[test]
@@ -7741,10 +8001,12 @@ mod tests {
         params_applied(&handle);
         assert_eq!((alloc(), free()), (3, 3), "returned buffers are free");
 
-        // PoolEmptyFreeList: drops them and republishes without a poll.
+        // PoolEmptyFreeList: drops them; the readbacks wait for a poll
+        // (asynNDArrayDriver.cpp:684-685).
         port.write_int32_blocking(p.pool_empty_free_list, 0, 1)
             .unwrap();
-        params_applied(&handle);
+        assert_eq!((alloc(), free()), (3, 3), "not republished");
+        port.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
         assert_eq!((alloc(), free()), (0, 0), "the free list is gone");
 
         // PoolPreAllocBuffers: needs an array to take dimensions from, so run

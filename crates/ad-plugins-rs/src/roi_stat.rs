@@ -370,6 +370,9 @@ impl NDPluginProcess for ROIStatProcessor {
         .or(InterfaceMask::FLOAT64_ARRAY)
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPluginROIStat.cpp:389-390; no writeFloat64 override.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
 
     /// C `NDPluginROIStat::writeInt32` keeps the base class clamp but replaces its
     /// errorMessage with its own, carrying `getAddress`'s status

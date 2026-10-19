@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use asyn_rs::port_handle::PortHandle;
-use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
@@ -20,7 +19,6 @@ use epics_libcom_rs::runtime::task::ThreadDrive;
 use crate::attributes::NDAttributeList;
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
-use crate::params::ndarray_driver::NDArrayDriverParams;
 
 use super::super::channel::NDArrayOutput;
 use super::super::throttler::Throttler;
@@ -200,21 +198,10 @@ impl Delivery {
         Arc::clone(pool.pool())
     }
 
-    pub(super) fn empty_free_list(&self) {
-        self.pool.current().empty_free_list();
-    }
-
-    /// C refuses with asynError when no array has been produced yet — there
-    /// are no dimensions to allocate against (asynNDArrayDriver.cpp:715-721).
-    pub(super) fn pre_allocate_buffers(&self, count: usize) {
-        let state = self.state.lock();
-        if let Some(template) = &state.last_output_array {
-            let _ = self.pool.current().pre_allocate_buffers(template, count);
-        }
-    }
-
-    pub(super) fn pool_stats(&self, params: &NDArrayDriverParams) -> Vec<ParamSetValue> {
-        crate::driver::ndarray_driver::pool_stats_values(params, &self.pool.current())
+    /// C `pArrays[0]`, the array `preAllocateBuffers` copies
+    /// (asynNDArrayDriver.cpp:715-725).
+    pub(super) fn last_output_array(&self) -> Option<Arc<NDArray>> {
+        self.state.lock().last_output_array.clone()
     }
 
     /// The downstream senders, cloned so they are used with no lock held;

@@ -486,6 +486,9 @@ impl NDPluginProcess for PosPluginProcessor {
         .or(InterfaceMask::FLOAT64_ARRAY)
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPosPlugin.cpp:260; no writeFloat64 override.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::Zero;
     /// NDPosPlugin.cpp:203.
     const READ_ATTRIBUTES: bool = false;
 

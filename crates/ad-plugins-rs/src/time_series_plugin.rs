@@ -563,6 +563,11 @@ impl NDPluginProcess for TimeSeriesProcessor {
         .or(InterfaceMask::FLOAT64_ARRAY)
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPluginTimeSeries.cpp:477-478, :520-521.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
+    const WRITE_FLOAT64_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
 
     /// C `NDPluginTimeSeries::writeInt32` (NDPluginTimeSeries.cpp:441-490):
     /// its branch runs inside the write, before `callParamCallbacks`. It keeps

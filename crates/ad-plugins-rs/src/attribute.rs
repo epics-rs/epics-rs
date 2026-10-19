@@ -127,6 +127,9 @@ impl NDPluginProcess for AttributeProcessor {
         .or(InterfaceMask::FLOAT64_ARRAY)
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    // NDPluginAttribute.cpp:136; no writeFloat64 override.
+    const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
+        ad_core_rs::plugin::runtime::WriteEpilogue::Zero;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
@@ -314,6 +317,31 @@ mod tests {
             NDAttrValue::Float64(value),
         ));
         arr
+    }
+
+    #[test]
+    fn a_write_at_another_address_stores_at_address_zero() {
+        // NDPluginAttribute.cpp:121: setIntegerParam(function, value) is
+        // list 0 whatever address was written.
+        use asyn_rs::port::DrvUserRequest;
+        let (handle, _jh) = create_attribute_runtime(
+            &asyn_rs::asyn_record::claim_port("ATTR_RST1").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            3,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let reset = port
+            .drv_user_create_blocking(&DrvUserRequest::new("ATTR_RESET", 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reset, 1, 1).unwrap();
+        assert_eq!(port.read_int32_blocking(reset, 0).unwrap(), 1);
+        assert!(port.read_int32_blocking(reset, 1).is_err());
     }
 
     #[test]

@@ -174,6 +174,18 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-ca-rs",
         "tests/a_loopback_interface_binds_two_responder_sockets.rs",
     ),
+    (
+        "epics-ca-rs",
+        "tests/a_put_the_task_cannot_send_is_dropped.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_put_to_an_unopened_remote_link_is_refused.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_remote_link_put_that_does_not_convert_alarms.rs",
+    ),
     ("epics-ca-rs", "tests/access_rights_spc_nomod.rs"),
     ("epics-ca-rs", "tests/acf_host_identity.rs"),
     ("epics-ca-rs", "tests/acf_hot_reload.rs"),

@@ -316,6 +316,10 @@ pub struct NotifyWaitSet {
     /// already, and a WRITE_NOTIFY then pays no second copy of its name.
     joined: StdMutex<Vec<crate::types::RecordName>>,
     tx: StdMutex<Option<crate::runtime::sync::oneshot::Sender<()>>>,
+    /// C `ppn->status = notifyError` (`dbNotify.c:528-530`): the put failed
+    /// but the record still processes, so the completion ends in the error a
+    /// dropped sender gives its waiter instead of firing.
+    failed: AtomicBool,
     /// C `dbChannelRecord(ppn->chan)` — the record the notify was ISSUED
     /// against, as opposed to the records that joined its chain.
     ///
@@ -353,6 +357,7 @@ impl NotifyWaitSet {
             pending: AtomicUsize::new(1),
             joined: StdMutex::new(Vec::new()),
             tx: StdMutex::new(Some(tx)),
+            failed: AtomicBool::new(false),
             entry: None,
         })
     }
@@ -368,6 +373,7 @@ impl NotifyWaitSet {
             pending: AtomicUsize::new(1),
             joined: StdMutex::new(Vec::new()),
             tx: StdMutex::new(Some(tx)),
+            failed: AtomicBool::new(false),
             entry: Some(record.clone()),
         })
     }
@@ -390,10 +396,19 @@ impl NotifyWaitSet {
         let prev = self.pending.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev >= 1, "NotifyWaitSet::leave underflow");
         if prev == 1 {
-            if let Some(tx) = self.tx.lock().unwrap().take() {
+            if let Some(tx) = self.tx.lock().unwrap().take()
+                && !self.failed.load(Ordering::Acquire)
+            {
                 let _ = tx.send(());
             }
         }
+    }
+
+    /// The put this set completes was refused yet drives its process cycle
+    /// (C `notifyError` with `didPut = 1`): the cycle runs, and its
+    /// completion reports the failure.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
     }
 
     /// A member was destroyed and will never leave: end the set with the

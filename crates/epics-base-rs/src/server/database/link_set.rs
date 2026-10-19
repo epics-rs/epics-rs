@@ -144,6 +144,42 @@ pub enum LinkPutDone {
     NotIssued,
 }
 
+/// C `dbCaPutLinkCallback`'s conversion into `pputNative` (`dbCa.c:572-590`):
+/// the scalar put row when one element goes to a one-element channel, the
+/// array row otherwise, clamped to the channel's `nelements`. A string that
+/// is not a number of a numeric `native` type is `Err`, the status
+/// `dbPutLink` turns into the link alarm, where C still sends the stale
+/// buffer; that write is not copied. `name` labels the error.
+pub fn link_put_convert(
+    name: &[u8],
+    value: EpicsValue,
+    native: crate::types::DbFieldType,
+    nelements: u32,
+) -> Result<EpicsValue, String> {
+    use crate::types::c_parse::{self, Converted, NumericField};
+    let nelements = nelements as usize;
+    if let Some(row) = NumericField::of(native) {
+        let field = String::from_utf8_lossy(name);
+        let texts = match &value {
+            EpicsValue::String(s) => std::slice::from_ref(s),
+            EpicsValue::StringArray(a) => &a[..a.len().min(nelements)],
+            _ => &[],
+        };
+        let converted = match texts {
+            [] => None,
+            [one] if nelements == 1 => Some(c_parse::put_string(&field, row, &one.as_str_lossy())),
+            many => Some(c_parse::put_string_elements(&field, row, many)),
+        };
+        // `Unchanged` keeps C's old buffer, which this port does not hold.
+        if let Some(Converted::Stored(v)) = converted.transpose().map_err(|e| e.to_string())? {
+            return Ok(v);
+        }
+    }
+    let mut value = value.into_type(native);
+    value.truncate(nelements);
+    Ok(value)
+}
+
 /// Whether an external OUT link will accept a staged write right now —
 /// the answer to C `dbCaPutLinkCallback`'s first gate:
 ///
@@ -615,6 +651,16 @@ pub trait LinkSet: Send + Sync {
         }
     }
 
+    /// The native type and element count a put to `name` is converted to
+    /// on the record thread, C `pca->dbrType` / `pca->nelements`
+    /// (`dbCa.c:572-590`), from cached state like [`Self::put_admission`].
+    /// `None`: the link is down, or the lset converts in
+    /// [`Self::put_value`] itself (the default).
+    fn put_native(&self, name: &[u8]) -> Option<(crate::types::DbFieldType, u32)> {
+        let _ = name;
+        None
+    }
+
     /// Write `value` to `name` with the delivery semantics named by
     /// `op` ([`LinkPutOp::Plain`] for a fire-and-forget put,
     /// [`LinkPutOp::Async`] for a put that is part of a put-notify /
@@ -859,6 +905,33 @@ impl LinkSetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boundaries of `dbCaPutLinkCallback`'s two conversion rows: the scalar
+    /// row (one element to a one-element channel) takes the empty string as
+    /// 0, the array row refuses it, and a refused element refuses the put.
+    #[test]
+    fn link_put_convert_picks_cs_row_by_count() {
+        use crate::types::{DbFieldType as T, PvString};
+        let conv = |v, t, n| link_put_convert(b"RMT", v, t, n);
+        let s = |t: &str| EpicsValue::String(t.into());
+        let strings =
+            |ts: &[&str]| EpicsValue::StringArray(ts.iter().map(|&t| PvString::from(t)).collect());
+        assert!(conv(s("abc"), T::Double, 1).is_err());
+        assert_eq!(conv(s("0x10"), T::Long, 1), Ok(EpicsValue::Long(16)));
+        assert_eq!(conv(s(""), T::Double, 1), Ok(EpicsValue::Double(0.0)));
+        assert!(conv(s(""), T::Double, 3).is_err());
+        assert!(conv(strings(&["1", "x"]), T::Long, 2).is_err());
+        // Clamped before converting: the element past `nelements` is not read.
+        assert_eq!(
+            conv(strings(&["1", "2", "x"]), T::Long, 2),
+            Ok(EpicsValue::LongArray(vec![1, 2].into()))
+        );
+        assert_eq!(conv(s("abc"), T::String, 1), Ok(s("abc")));
+        assert_eq!(
+            conv(EpicsValue::Double(2.5), T::Long, 1),
+            Ok(EpicsValue::Long(2))
+        );
+    }
 
     struct StubLset;
     #[async_trait::async_trait]

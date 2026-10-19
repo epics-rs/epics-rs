@@ -3583,6 +3583,15 @@ impl PvDatabase {
         use super::link_put_queue::{Channel, LinkKey, PutWaiter};
 
         let (scheme, body) = self.external_put_gate(name)?;
+        // `dbCaPutLinkCallback` converts into `pputNative` on the record
+        // thread and returns that status (`dbCa.c:572-590`).
+        let value = match super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+            lset.put_native(body)
+        }) {
+            Some((native, nelements)) => super::link_put_convert(body, value, native, nelements)
+                .map_err(ExternalPutRefusal::Unconvertible)?,
+            None => value,
+        };
 
         let key = LinkKey {
             link,
@@ -7271,6 +7280,9 @@ pub(crate) enum ExternalPutRefusal {
     NotConnected,
     /// No link set or reactor can carry the write, a state C cannot reach.
     Unserviceable(String),
+    /// The value does not convert to the channel's native type: the
+    /// conversion status `dbCaPutLinkCallback` returns, with nothing logged.
+    Unconvertible(String),
 }
 
 impl ExternalPutRefusal {
@@ -7292,7 +7304,7 @@ impl std::fmt::Display for ExternalPutRefusal {
                 "not connected, or connected without write access \
                  (db/dbCa.c:558-560 (dbCaPutLinkCallback))",
             ),
-            Self::Unserviceable(why) => f.write_str(why),
+            Self::Unserviceable(why) | Self::Unconvertible(why) => f.write_str(why),
         }
     }
 }

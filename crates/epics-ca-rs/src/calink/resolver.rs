@@ -17,8 +17,8 @@ use crate::client::{CaChannel, CaClient, ConnFold};
 use arc_swap::ArcSwap;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    CaLinkInit, CpTarget, ExternalCpProcess, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet,
-    PutAdmission, PvDatabase,
+    CaLinkInit, CpTarget, ExternalCpProcess, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp,
+    LinkSet, PutAdmission, PvDatabase, link_put_convert,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
@@ -1178,23 +1178,38 @@ impl LinkSet for CaLinkResolver {
     /// Both flavours are closed by refusing here; neither needs a second,
     /// later check.
     ///
-    /// A link this resolver has never opened reports `Unopened` rather than
-    /// `Refused`: C opens at `dbCaAddLink` (record init) so the `caLink`
-    /// always exists by the first put, while this resolver opens lazily
-    /// inside `put_value` / `get_value`. Reporting `Refused` would refuse
-    /// the very write whose staging performs the open, and the link would
-    /// never connect.
+    /// A link this resolver has not opened is refused too: C opens every CA
+    /// link at `dbCaAddLink` (iocInit's open pass, or a relink here) and
+    /// refuses its puts until it connects.
     fn put_admission(&self, name: &[u8]) -> PutAdmission {
         let name = strip_ca_scheme(name);
         let links = self.links.read();
         match links.get(name) {
-            None => PutAdmission::Unopened,
+            None => PutAdmission::Refused,
             Some(link) if link.is_connected() && link.has_write_access() => PutAdmission::Connected,
             Some(_) => PutAdmission::Refused,
         }
     }
 
     async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+        self.put_value_done(name, value, op).await.1
+    }
+
+    fn put_native(&self, name: &[u8]) -> Option<(DbFieldType, u32)> {
+        channel_native(&self.cached_link(strip_ca_scheme(name))?.channel)
+    }
+
+    /// Issuing the put and completing it are separate steps, as in C
+    /// `dbCaTask`: a put that cannot be issued (channel down, or the
+    /// request refused) is [`LinkPutDone::NotIssued`], which the database
+    /// drops (`dbCa.c:1225-1247`); an issued put callback completes
+    /// when the server answers or the circuit drops, with no put timeout.
+    async fn put_value_done(
+        &self,
+        name: &[u8],
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> (LinkPutDone, Result<(), String>) {
         // Honour the C dbCore split between a plain link put and a
         // put-notify-aware put. `dbCaPutLink` (no callback) sets
         // `putType = CA_PUT`, and the CA task later issues a
@@ -1209,14 +1224,13 @@ impl LinkSet for CaLinkResolver {
         // write to `LinkPutOp::Async`, so the resolver must preserve
         // the split: routing `Plain` through the fire-and-forget
         // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
-        // CA server from stalling normal record processing for the
-        // `EPICS_CA_PUT_TIMEOUT` window, while `Async` keeps the
-        // WRITE_NOTIFY completion wait the put-notify chain needs.
+        // CA server from stalling normal record processing, while `Async`
+        // keeps the WRITE_NOTIFY completion the put-notify chain needs.
         let name = strip_ca_scheme(name);
-        let link = self
-            .link_for(name)
-            .await
-            .ok_or_else(|| format!("CA link {} not open", String::from_utf8_lossy(name)))?;
+        let Some(link) = self.link_for(name).await else {
+            let reason = format!("CA link {} not open", String::from_utf8_lossy(name));
+            return (LinkPutDone::NotIssued, Err(reason));
+        };
         // The clamp C applies before the CA request is ever built:
         // `dbCaPutLinkCallback` converts the caller's buffer to the
         // channel's native type and bounds the request to the channel's
@@ -1237,22 +1251,26 @@ impl LinkSet for CaLinkResolver {
         // already clamped. Clamping the converted value keeps
         // `validate_put_count` unreachable from this path by
         // construction rather than by a second bound inside the client.
-        let value = match channel_native(&link.channel) {
-            Some((native, nelements)) => {
-                let mut converted = value.into_type(native);
-                converted.truncate(nelements as usize);
-                converted
-            }
-            // No native description yet: the channel is not operational,
-            // so there is nothing to clamp against and the write below
-            // reports the disconnect itself.
-            None => value,
+        //
+        // No native description: the channel is down, which `dbCaTask`
+        // skips without sending (`dbCa.c:1221`).
+        let Some((native, nelements)) = channel_native(&link.channel) else {
+            let reason = format!("CA link {} not connected", String::from_utf8_lossy(name));
+            return (LinkPutDone::NotIssued, Err(reason));
         };
-        match op {
-            LinkPutOp::Plain => link.channel.put_nowait(&value).await,
-            LinkPutOp::Async => link.channel.put(&value).await,
+        let value = match link_put_convert(name, value, native, nelements) {
+            Ok(value) => value,
+            Err(e) => return (LinkPutDone::Callback, Err(e)),
+        };
+        let issued = match op {
+            LinkPutOp::Plain => link.channel.put_nowait(&value).await.map(|()| None),
+            LinkPutOp::Async => link.channel.put_callback(&value).map(Some),
+        };
+        match issued {
+            Err(e) => (LinkPutDone::NotIssued, Err(e.to_string())),
+            Ok(None) => (LinkPutDone::Callback, Ok(())),
+            Ok(Some(done)) => (LinkPutDone::Callback, done.await.map_err(|e| e.to_string())),
         }
-        .map_err(|e| e.to_string())
     }
 
     fn alarm_severity(&self, name: &[u8]) -> Option<i32> {

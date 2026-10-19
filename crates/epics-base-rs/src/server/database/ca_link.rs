@@ -299,9 +299,20 @@ impl LinkSet for CaLinks {
         }
         match self.network.read().as_deref() {
             Some(net) => net.put_admission(name),
-            None if self.serves(name) => PutAdmission::Unopened,
             None => PutAdmission::Refused,
         }
+    }
+
+    fn put_native(&self, name: &[u8]) -> Option<(DbFieldType, u32)> {
+        let name = strip_ca_scheme(name);
+        match self.routes.read().get(name) {
+            Some(Route::Local(link)) if link.is_connected() => {
+                return Some((link.channel.native_type(), link.channel.element_count()));
+            }
+            Some(Route::Local(_)) => return None,
+            _ => {}
+        }
+        self.network.read().as_deref()?.put_native(name)
     }
 
     async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
@@ -331,7 +342,7 @@ impl LinkSet for CaLinks {
             return (done, unconnected());
         }
         match self.open(name).await {
-            Some(link) => link.write(value, op).await,
+            Some(link) => link.write(name, value, op).await,
             None => match self.network() {
                 Some(net) => net.put_value_done(name, value, op).await,
                 None => (LinkPutDone::Callback, unconnected()),
@@ -553,11 +564,19 @@ impl LocalLink {
     }
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and
-    /// clamps to its element count (`dbCa.c:575-577`).
-    async fn write(&self, value: EpicsValue, op: LinkPutOp) -> (LinkPutDone, Result<(), String>) {
-        let mut value = value.into_type(self.channel.native_type());
-        value.truncate(self.channel.element_count() as usize);
-        self.channel.write(value, op).await
+    /// clamps to its element count (`dbCa.c:575-577`); a value staged
+    /// through [`LinkSet::put_native`] is already converted.
+    async fn write(
+        &self,
+        name: &[u8],
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> (LinkPutDone, Result<(), String>) {
+        let native = (self.channel.native_type(), self.channel.element_count());
+        match super::link_put_convert(name, value, native.0, native.1) {
+            Ok(value) => self.channel.write(value, op).await,
+            Err(e) => (LinkPutDone::Inline, Err(e)),
+        }
     }
 
     /// `dbcar`'s columns for this link (`dbCaTest.c:95-123`); the host is
@@ -677,7 +696,8 @@ pub(super) struct LocalChannel {
     db: Weak<PvDatabaseInner>,
     chan: DbAccessChannel,
     /// C `dbPutNotifyBlocker`: one put callback at a time per channel,
-    /// held until the put completes.
+    /// held until the put completes. Taken only by a channel a record opens
+    /// itself ([`Self::issue_put`]); see [`Self::write`] for links.
     blocker: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -767,10 +787,12 @@ impl LocalChannel {
         })
     }
 
-    /// `dbChannelIO::write`: a plain put is `dbChannel_put`
-    /// (`dbChannelIO.cpp:78-91`); a put callback goes through the
-    /// `dbPutNotifyBlocker` and completes when the record's processing does
-    /// (`dbPutNotifyBlocker.cpp:132-176`).
+    /// `dbChannelIO::write` for a link: a plain put is `dbChannel_put`
+    /// (`dbChannelIO.cpp:78-91`); a put callback completes when the record's
+    /// processing does (`dbPutNotifyBlocker.cpp:132-176`). This channel is
+    /// shared by every link naming the PV, where each C `caLink` has its own,
+    /// so the `dbPutNotifyBlocker` is not taken here: the link put queue keeps
+    /// one put in flight per link, which is what a per-link blocker does.
     async fn write(&self, value: EpicsValue, op: LinkPutOp) -> (LinkPutDone, Result<(), String>) {
         match op {
             LinkPutOp::Plain => (
@@ -780,17 +802,17 @@ impl LocalChannel {
                     .map(|_| ())
                     .map_err(|r| format!("db_put_field() completed unsuccessfully: {}", r.error)),
             ),
-            LinkPutOp::Async => match self.put_notify(value).await {
-                Err(e) => (LinkPutDone::NotIssued, Err(e)),
-                Ok((completion, status, _blocker)) => {
-                    let done = match completion {
-                        ProcessCompletion::Unprocessed => LinkPutDone::Inline,
-                        _ => LinkPutDone::Callback,
-                    };
-                    let settled = settle(completion).await;
-                    (done, status.and(settled))
-                }
-            },
+            LinkPutOp::Async => {
+                let (completion, status) =
+                    crate::server::record::PutRefused::outcome(self.put(value, true).await);
+                let status = status.map_err(|e| format!("put notify unsuccessful: {e}"));
+                let done = match completion {
+                    ProcessCompletion::Unprocessed => LinkPutDone::Inline,
+                    _ => LinkPutDone::Callback,
+                };
+                let settled = settle(completion).await;
+                (done, status.and(settled))
+            }
         }
     }
 

@@ -57,9 +57,9 @@
 //! **Invariant.** *Every staged completion is resolved exactly once* —
 //! by the owner (with the lset's result), by a superseding put, or by the
 //! queue's teardown. A put the lset could not issue
-//! ([`LinkPutDone::NotIssued`]) is not resolved by the owner: its completion
-//! stays on the link until a later put supersedes it or the queue is torn
-//! down. [`PutCompletion`] enforces it by construction: its
+//! ([`LinkPutDone::NotIssued`]) is dropped, never re-sent, and the owner
+//! resolves its completion then. [`PutCompletion`] enforces it by
+//! construction: its
 //! `Drop` resolves an unresolved completion, so no path — early return,
 //! `?`, panic, or the whole database dropping — can drop a pending put
 //! silently.
@@ -265,11 +265,14 @@ enum LinkState {
     /// A network op is running AND a newer value was staged behind it.
     /// Not in the deque; `finish` moves it back to `Queued` and enqueues.
     InFlightRestaged(StagedPut),
-    /// The lset could not issue the put callback; its completion waits for
-    /// the next put on the link — C leaves `newOutNative` set and the
-    /// callback in `pca->putCallback` (`dbCa.c:1233-1247`). Not in the deque,
-    /// and not pending for the `dbCaSync` barrier.
-    Unsent(PutCompletion),
+}
+
+/// A `caLink`'s counters outlive its staged values: one per link field and
+/// channel, holding the install it counts for.
+type Site = (Option<super::RecordIdx>, &'static str, Channel);
+
+fn site(key: &LinkKey) -> Site {
+    (key.link.rec, key.link.field, key.channel.clone())
 }
 
 /// Per-link OPEN state — C's `CA_CONNECT` action, staged once per link by
@@ -291,6 +294,15 @@ enum OpenState {
 struct QueueInner {
     links: HashMap<LinkKey, LinkState>,
     ready: VecDeque<LinkKey>,
+    /// Each `ca` link whose last put the owner dropped unsent, with the
+    /// install it was dropped on: C consumes the action bits before
+    /// `dbCaTask` skips a link that is down (`dbCa.c:1195`, `:1225`) or logs
+    /// a failed `ca_array_put` (`:1246`), and no connect re-arms them —
+    /// `dbCaPutLinkCallback` never sets `pvlOptOutNative` (`dbCa.c:556`), so
+    /// `connectionCallback` writes nothing (`:918-923`). `newOutNative`
+    /// stays set, so the link's next put counts in `nNoWrite`
+    /// (`dbCa.c:582-583`). Never pending for the `dbCaSync` barrier.
+    unsent: HashMap<Site, LinkInstall>,
     opens: HashMap<Channel, OpenState>,
     ready_opens: VecDeque<(Channel, Option<super::CaLinkInit>)>,
     /// Per-link count of staged values a later put on the same link
@@ -303,7 +315,7 @@ struct QueueInner {
     /// One entry per link field and channel, holding the install it counts
     /// for: C's counter lives as long as the `caLink`, so it outlives the
     /// link going idle and starts over at a relink (`dbCa.c:398`).
-    coalesced: HashMap<(Option<super::RecordIdx>, &'static str, Channel), (LinkInstall, u64)>,
+    coalesced: HashMap<Site, (LinkInstall, u64)>,
     /// Number of writes the owner has completed. Diagnostic.
     completed: u64,
     /// Number of link opens the owner has completed. Diagnostic.
@@ -312,9 +324,7 @@ struct QueueInner {
 
 impl QueueInner {
     fn is_idle(&self) -> bool {
-        self.links
-            .values()
-            .all(|s| matches!(s, LinkState::Unsent(_)))
+        self.links.is_empty()
             && !self
                 .opens
                 .values()
@@ -386,7 +396,9 @@ impl Drop for LinkPutQueue {
         // does the resolving, so clearing the map is enough — and stays
         // correct if a future state variant carries a completion somewhere
         // this function would forget to visit.
-        self.inner.get_mut().links.clear();
+        let inner = self.inner.get_mut();
+        inner.links.clear();
+        inner.unsent.clear();
         // Wake the owner so it observes the dead `Weak` and exits instead of
         // parking on a signal nobody will ever send again.
         self.work.notify_waiters();
@@ -445,6 +457,13 @@ impl LinkPutQueue {
         };
         let wake = {
             let mut inner = self.inner.lock();
+            if inner
+                .unsent
+                .remove(&site(&key))
+                .is_some_and(|install| install == key.link.install)
+            {
+                Self::supersede(&mut inner, &key, None);
+            }
             match inner.links.remove(&key) {
                 None => {
                     inner.links.insert(key.clone(), LinkState::Queued(staged));
@@ -467,12 +486,6 @@ impl LinkPutQueue {
                     inner.links.insert(key, LinkState::InFlightRestaged(staged));
                     false
                 }
-                Some(LinkState::Unsent(prev)) => {
-                    Self::supersede(&mut inner, &key, Some(prev));
-                    inner.links.insert(key.clone(), LinkState::Queued(staged));
-                    inner.ready.push_back(key);
-                    true
-                }
             }
         };
         if wake {
@@ -484,10 +497,9 @@ impl LinkPutQueue {
     /// Resolve a displaced value's completion — the only place a staged put
     /// is superseded, so the `nNoWrite` accounting has one owner.
     fn supersede(inner: &mut QueueInner, key: &LinkKey, prev: Option<PutCompletion>) {
-        let site = (key.link.rec, key.link.field, key.channel.clone());
         let count = inner
             .coalesced
-            .entry(site)
+            .entry(site(key))
             .or_insert_with(|| (key.link.install.clone(), 0));
         if count.0 != key.link.install {
             *count = (key.link.install.clone(), 0);
@@ -536,30 +548,27 @@ impl LinkPutQueue {
         }
     }
 
-    /// Owner-only: the write for `key` finished, `unsent` holding the
-    /// completion of a put callback the lset could not issue. `InFlight` →
-    /// idle, or `Unsent`; `InFlightRestaged` → `Queued` and back in the
-    /// deque, which is how a put that landed mid-flight is not lost (C clears
-    /// `link_action` before the wire write for the same reason,
-    /// `dbCa.c:1130`), superseding `unsent`.
-    fn finish(&self, key: LinkKey, unsent: Option<PutCompletion>) {
+    /// Owner-only: the write for `key` finished, `unsent` if it was dropped.
+    /// `InFlight` → idle, keeping `unsent`; `InFlightRestaged` → `Queued`
+    /// and back in the deque, which is how a put that landed mid-flight is
+    /// not lost (C clears `link_action` before the wire write for the same
+    /// reason, `dbCa.c:1130`), superseding `unsent`.
+    fn finish(&self, key: LinkKey, unsent: bool) {
         let (wake_work, wake_idle) = {
             let mut inner = self.inner.lock();
             inner.completed += 1;
             let wake_work = match inner.links.remove(&key) {
                 Some(LinkState::InFlight) => {
-                    match unsent {
-                        Some(c) if key.link.install.removed() => c.removed(),
-                        Some(c) => {
-                            inner.links.insert(key, LinkState::Unsent(c));
-                        }
-                        None => {}
+                    if unsent && !key.link.install.removed() {
+                        inner.unsent.insert(site(&key), key.link.install.clone());
                     }
                     false
                 }
                 None => false,
-                Some(LinkState::InFlightRestaged(staged)) if unsent.is_some() => {
-                    Self::supersede(&mut inner, &key, unsent);
+                Some(LinkState::InFlightRestaged(staged)) => {
+                    if unsent {
+                        Self::supersede(&mut inner, &key, None);
+                    }
                     if key.link.install.removed() {
                         staged.removed();
                         false
@@ -568,15 +577,6 @@ impl LinkPutQueue {
                         inner.ready.push_back(key);
                         true
                     }
-                }
-                Some(LinkState::InFlightRestaged(staged)) if key.link.install.removed() => {
-                    staged.removed();
-                    false
-                }
-                Some(LinkState::InFlightRestaged(staged)) => {
-                    inner.links.insert(key.clone(), LinkState::Queued(staged));
-                    inner.ready.push_back(key);
-                    true
                 }
                 // Cannot happen: only `finish` and `take_ready` move a key
                 // out of `InFlight*`, and both run on the owner path.
@@ -863,7 +863,7 @@ async fn owner_loop(
                     }
                     while let Some((key, staged)) = q.take_ready() {
                         refuse_for_want_of_a_reactor(&key, staged);
-                        q.finish(key, None);
+                        q.finish(key, false);
                     }
                 }
             }
@@ -917,13 +917,9 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
 }
 
 /// Perform one dequeued write. The network suspension lives here — on the
-/// owner's spawned task, never on a record-processing thread. Returns the
-/// completion of a put callback the lset could not issue, unresolved.
-async fn run_put(
-    lset: Option<&DynLinkSet>,
-    key: &LinkKey,
-    staged: StagedPut,
-) -> Option<PutCompletion> {
+/// owner's spawned task, never on a record-processing thread. Returns
+/// whether a `ca` put was left unsent (`newOutNative`).
+async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) -> bool {
     let StagedPut {
         value,
         op,
@@ -965,15 +961,19 @@ async fn run_put(
             key.channel.name
         ));
     }
-    match done {
-        LinkPutDone::NotIssued => completion,
-        _ => {
-            if let Some(c) = completion {
-                c.resolve(done == LinkPutDone::Inline, result);
-            }
-            None
-        }
+    let unsent = match op {
+        LinkPutOp::Async => done == LinkPutDone::NotIssued,
+        LinkPutOp::Plain => result.is_err(),
+    };
+    // A put callback dropped at `dbCa.c:1225` is left unanswered in C until
+    // `caLinkDec` completes it on a relink (`dbCa.c:184-197`), so a transient
+    // disconnect hangs the record PACT. That is a C defect, not copied: the
+    // callback completes now, as `caLinkDec` completes it.
+    if let Some(c) = completion {
+        c.resolve(done == LinkPutDone::Inline, result);
     }
+    // `newOutNative` is dbCa's: pvalink replays its own (`flush_puts`).
+    unsent && key.channel.scheme == "ca"
 }
 
 #[cfg(test)]
@@ -1113,7 +1113,7 @@ mod tests {
         q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, _staged) = q.take_ready().expect("ready");
-        q.finish(k, None);
+        q.finish(k, false);
         assert!(q.is_idle(), "nothing pending on any link");
         assert_eq!(coalesced(&q, &key("A")), 1);
     }
@@ -1149,7 +1149,7 @@ mod tests {
             "still in flight — at most one write per link keeps write order"
         );
 
-        q.finish(k, None);
+        q.finish(k, false);
         let (_, second) = q.take_ready().expect("re-queued after finish");
         assert_eq!(second.value, EpicsValue::Long(9));
     }
@@ -1172,47 +1172,64 @@ mod tests {
         );
     }
 
-    /// Boundary: a put callback the lset could not issue stays pending, holds
-    /// up no `dbCaSync`, and the next put on the link supersedes it — C's
-    /// `newOutNative` left set, then `nNoWrite++` (`dbCa.c:582-583`,
-    /// `:1233-1247`).
+    /// Boundary: the put that could not be sent already has a newer one
+    /// staged behind it, which counts it in `nNoWrite` at once.
     #[test]
-    fn an_unsent_completion_waits_for_the_next_put() {
+    fn an_unsent_put_is_counted_by_the_put_staged_behind_it() {
         let q = LinkPutQueue::default();
-        let mut rx = q
-            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
-            .expect("Async put yields a completion");
-        let (k, staged) = q.take_ready().expect("ready");
-        q.finish(k, staged.completion);
-
-        assert!(q.is_idle(), "an unsent put is not pending for dbCaSync");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
+        let (k, _) = q.take_ready().expect("ready");
         q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
-        assert!(resolved(rx).unwrap_err().contains("superseded"));
+        q.finish(k, true);
+
         assert_eq!(coalesced(&q, &key("A")), 1);
-        let (_, staged) = q.take_ready().expect("the newer put is queued");
+        let (k, staged) = q.take_ready().expect("the newer put is queued");
         assert_eq!(staged.value, EpicsValue::Long(2));
+        q.finish(k, false);
+        q.stage_put(key("A"), EpicsValue::Long(3), PutWaiter::None);
+        assert_eq!(coalesced(&q, &key("A")), 1, "counted once");
     }
 
-    /// Boundary: the put that cannot be issued already has a newer one staged
-    /// behind it, which supersedes it at once.
+    /// Boundary: a plain put the lset could not send is dropped — nothing is
+    /// queued again, and it holds up no `dbCaSync` — but it leaves
+    /// `newOutNative` set, so the link's next put counts in `nNoWrite`
+    /// (`dbCa.c:582-583`, `:1225`, `:1246`).
     #[test]
-    fn an_unsent_completion_is_superseded_by_the_put_staged_behind_it() {
+    fn an_unsent_plain_put_is_dropped_and_counted_by_the_next_put() {
         let q = LinkPutQueue::default();
-        let rx = q
-            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
-            .expect("Async put yields a completion");
-        let (k, staged) = q.take_ready().expect("ready");
-        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
-        q.finish(k, staged.completion);
+        q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
+        let (k, _) = q.take_ready().expect("ready");
+        q.finish(k, true);
+        assert!(q.is_idle(), "a dropped put is not pending for dbCaSync");
+        assert!(
+            q.take_ready().is_none(),
+            "a dropped put is not queued again"
+        );
 
-        assert!(resolved(rx).unwrap_err().contains("superseded"));
+        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1);
-        let (_, staged) = q.take_ready().expect("the newer put is queued");
+        let (k, staged) = q.take_ready().expect("the newer put is queued");
         assert_eq!(staged.value, EpicsValue::Long(2));
+
+        q.finish(k, false);
+        q.stage_put(key("A"), EpicsValue::Long(3), PutWaiter::None);
+        assert_eq!(coalesced(&q, &key("A")), 1, "a sent put is not counted");
+    }
+
+    /// Boundary: a relink makes a new `caLink` (`dbCa.c:398`), so a put
+    /// left unsent on the old one is not counted by the new link's first put.
+    #[test]
+    fn a_relink_starts_the_unsent_mark_over() {
+        let q = LinkPutQueue::default();
+        let old = Arc::new(crate::server::record::ParsedLink::None);
+        q.stage_put(key_on("A", &old), EpicsValue::Long(1), PutWaiter::None);
+        let (k, _) = q.take_ready().expect("ready");
+        q.finish(k, true);
+        drop(old);
+
+        let new = Arc::new(crate::server::record::ParsedLink::None);
+        q.stage_put(key_on("A", &new), EpicsValue::Long(2), PutWaiter::None);
+        assert_eq!(coalesced(&q, &key_on("A", &new)), 0);
     }
 
     /// Boundary: tearing the queue down resolves every pending completion.
@@ -1254,7 +1271,7 @@ mod tests {
         assert!(!q.is_idle(), "staged but not run");
         let (k, _) = q.take_ready().expect("ready");
         assert!(!q.is_idle(), "in flight");
-        q.finish(k, None);
+        q.finish(k, false);
         assert!(q.is_idle());
         assert_eq!(q.completed_count(), 1);
     }
@@ -1303,7 +1320,7 @@ mod tests {
             .expect("Async put yields a completion");
         drop(old);
 
-        q.finish(k, None);
+        q.finish(k, false);
         assert!(q.take_ready().is_none(), "the restaged value is dropped");
         assert!(q.is_idle());
         assert!(resolved(rx).unwrap_err().contains("removed"));

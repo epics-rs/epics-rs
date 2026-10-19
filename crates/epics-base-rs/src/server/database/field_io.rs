@@ -1593,6 +1593,29 @@ impl NotifyClaim<'_> {
             .take()
             .expect("a claim is committed exactly once, by value")
     }
+
+    /// The put was written and drives no process cycle: C `callDone` with
+    /// `notifyOK` (`dbNotify.c:263-268`). Releasing alone would drop the
+    /// sender, which a replayed put's waiter reads as a failure.
+    fn complete_unprocessed(mut self) {
+        let set = self
+            .set
+            .take()
+            .expect("a claim is completed exactly once, by value");
+        self.rec.write().abandon_put_notify(&set);
+        set.leave();
+    }
+
+    /// [`Self::commit`] for a refused put that still drives its cycle
+    /// ([`PvDatabase::process_refused_notify`]), marking the set failed — C
+    /// `ppn->status = notifyError` (`dbNotify.c:528-530`). A put replayed from
+    /// the restart list was answered "pending" on arrival and holds only the
+    /// completion, so this is how its waiter learns of the refusal.
+    fn commit_refused(self) -> std::sync::Arc<crate::server::record::NotifyWaitSet> {
+        let set = self.commit();
+        set.fail();
+        set
+    }
 }
 
 impl Drop for NotifyClaim<'_> {
@@ -3583,11 +3606,14 @@ impl PvDatabase {
             // (`singlesource.cpp:347-368`), which processes only for PROC or
             // a pp field of a Passive record (`dbNotify.c:243-247`):
             // `process=true` does not force it.
-            let completion = self
-                .put_record_field_from_ca(record_name, field, value)
-                .await?;
-            self.await_completion(record_name, completion).await;
-            return Ok(());
+            // A refusal that still processed is answered when that settles,
+            // as pvxs `doneCallback` answers `notifyError`.
+            let (completion, status) = crate::server::record::PutRefused::outcome(
+                self.put_record_field_notify(record_name, field, value)
+                    .await,
+            );
+            let settled = self.await_completion(record_name, completion).await;
+            return status.and(settled);
         }
         match process {
             ProcessMode::Inhibit => {
@@ -3637,11 +3663,13 @@ impl PvDatabase {
             guard.queue_notify_put(crate::server::record::DeferredNotify::Wait { completion: tx });
             rx
         };
-        self.await_completion(
-            record_name,
-            crate::server::record::ProcessCompletion::Async(rx),
-        )
-        .await;
+        // A wait writes nothing, so nothing can mark it failed.
+        let _ = self
+            .await_completion(
+                record_name,
+                crate::server::record::ProcessCompletion::Async(rx),
+            )
+            .await;
         Ok(())
     }
 
@@ -3675,13 +3703,16 @@ impl PvDatabase {
     /// Await a blocking external PUT's completion under
     /// [`ClientAwaitingNotify`], so a client that goes away mid-put hands the
     /// record back instead of wedging every put queued behind it.
+    ///
+    /// A completion that fires failed (`ppn->status = notifyError`) is the
+    /// put's error, as pvxs `doneCallback` answers it (`singlesource.cpp:262`).
     async fn await_completion(
         &self,
         record_name: &[u8],
         completion: crate::server::record::ProcessCompletion,
-    ) {
+    ) -> CaResult<()> {
         let crate::server::record::ProcessCompletion::Async(rx) = completion else {
-            return;
+            return Ok(());
         };
         let mut pending = ClientAwaitingNotify {
             db: self,
@@ -3690,10 +3721,12 @@ impl PvDatabase {
             answered: false,
         };
         // Either outcome ends the wait. `Err` means the sender was dropped
-        // without sending, and only the completion path does that — it takes
-        // the sender out of the set first, so the sweep would no-op anyway.
-        let _ = (&mut pending.rx).await;
+        // without sending, and only the completion path does that — for a
+        // failed set — taking the sender out of the set first, so the sweep
+        // would no-op anyway.
+        let done = (&mut pending.rx).await;
         pending.answered = true;
+        done.map_err(|_| CaError::ProcessStatus(crate::error::DbStatus::FAILED))
     }
 
     /// C `dbPut`'s alarm-acknowledge interception (`dbAccess.c:1331-1335`) —
@@ -3905,89 +3938,94 @@ impl PvDatabase {
     /// busy record — the deferral is closed under its own restart. Called only
     /// from `PvDatabase::apply_pact_exit`, the single drain owner.
     pub(crate) async fn restart_next_notify_put(&self, record_name: &[u8]) {
-        // The clients already hold their receivers; a failure here (record gone,
-        // field refused) must still release them, which dropping the senders
-        // does — the same completion a `dbNotifyCancel` gives the C client.
-        let held = loop {
-            let _record_gate = self.acquire_put_gate(record_name, "", None);
-            let Some(rec) = self.get_record(record_name) else {
-                return;
-            };
-            let Some(queued) = rec.write().take_next_notify_restart() else {
-                return;
-            };
-            break match queued {
-                crate::server::record::DeferredNotify::Put(
-                    crate::server::record::DeferredNotifyPut {
-                        field,
-                        value,
-                        completion,
-                    },
-                ) => {
-                    let link_text = is_link_text(&value);
-                    let mut tail = PutTail::default();
-                    // No parses: a put to a DBF link field is never deferred
-                    // (`is_dbf_link_field` in the body), so none replays.
-                    let put = self.put_record_field_from_ca_body(
-                        record_name,
-                        &field,
-                        value,
-                        NotifyRequest::Deferred(completion),
-                        &mut LinkPutParses::default(),
-                        &mut tail,
-                    );
-                    (field, link_text, put, tail)
-                }
-                // C `processRequest` on restart: no put, no process; the
-                // next entry is checked before the callback (`dbNotify.c:263-270`).
-                crate::server::record::DeferredNotify::Wait { completion } => {
-                    let _ = completion.send(());
-                    continue;
-                }
-                // C `processGetRequest` on restart: `processNotifyCommon`
-                // re-enters with no `putCallback`, so the replay is the process
-                // alone. The gate is already held, so this takes the
-                // already-locked entry.
-                crate::server::record::DeferredNotify::Process { completion } => {
-                    // Only a Passive record is processed (`dbNotify.c:248-250`);
-                    // any other completes and the next entry is checked.
-                    if rec.read().common.scan != crate::server::record::ScanType::Passive {
+        // A replayed put that drives no cycle leaves the record free, and C
+        // then hands it to the next entry (`restartCheck`, dbNotify.c:263-264);
+        // one that does is owned again and `take_next_notify_restart` stops.
+        loop {
+            // The clients already hold their receivers; a failure here (record gone,
+            // field refused) must still release them, which dropping the senders
+            // does — the same completion a `dbNotifyCancel` gives the C client.
+            let held = loop {
+                let _record_gate = self.acquire_put_gate(record_name, "", None);
+                let Some(rec) = self.get_record(record_name) else {
+                    return;
+                };
+                let Some(queued) = rec.write().take_next_notify_restart() else {
+                    return;
+                };
+                break match queued {
+                    crate::server::record::DeferredNotify::Put(
+                        crate::server::record::DeferredNotifyPut {
+                            field,
+                            value,
+                            completion,
+                        },
+                    ) => {
+                        let link_text = is_link_text(&value);
+                        let mut tail = PutTail::default();
+                        // No parses: a put to a DBF link field is never deferred
+                        // (`is_dbf_link_field` in the body), so none replays.
+                        let put = self.put_record_field_from_ca_body(
+                            record_name,
+                            &field,
+                            value,
+                            NotifyRequest::Deferred(completion),
+                            &mut LinkPutParses::default(),
+                            &mut tail,
+                        );
+                        (field, link_text, put, tail)
+                    }
+                    // C `processRequest` on restart: no put, no process; the
+                    // next entry is checked before the callback (`dbNotify.c:263-270`).
+                    crate::server::record::DeferredNotify::Wait { completion } => {
                         let _ = completion.send(());
                         continue;
                     }
-                    let _ = self.install_notify_and_process_already_locked(
-                        record_name,
-                        completion,
-                        NotifyArrival::Replay,
-                    );
-                    return;
-                }
-                // C `processNotifyCommon` with `first == 0`: a cancelled
-                // request was taken off the list (`dbNotify.c:400-410`), and
-                // one whose record is no longer Passive completes without a
-                // process (`:263-270`); either way the next entry is checked.
-                crate::server::record::DeferredNotify::ProcessGet {
-                    completion,
-                    requester,
-                } => {
-                    if !requester.is_current() {
-                        continue;
+                    // C `processGetRequest` on restart: `processNotifyCommon`
+                    // re-enters with no `putCallback`, so the replay is the process
+                    // alone. The gate is already held, so this takes the
+                    // already-locked entry.
+                    crate::server::record::DeferredNotify::Process { completion } => {
+                        // Only a Passive record is processed (`dbNotify.c:248-250`);
+                        // any other completes and the next entry is checked.
+                        if rec.read().common.scan != crate::server::record::ScanType::Passive {
+                            let _ = completion.send(());
+                            continue;
+                        }
+                        let _ = self.install_notify_and_process_already_locked(
+                            record_name,
+                            completion,
+                            NotifyArrival::Replay,
+                        );
+                        return;
                     }
-                    if rec.read().common.scan != crate::server::record::ScanType::Passive {
-                        let _ = completion.send(());
-                        continue;
-                    }
-                    let _ = self.install_notify_and_process_already_locked(
-                        record_name,
+                    // C `processNotifyCommon` with `first == 0`: a cancelled
+                    // request was taken off the list (`dbNotify.c:400-410`), and
+                    // one whose record is no longer Passive completes without a
+                    // process (`:263-270`); either way the next entry is checked.
+                    crate::server::record::DeferredNotify::ProcessGet {
                         completion,
-                        NotifyArrival::Replay,
-                    );
-                    return;
-                }
+                        requester,
+                    } => {
+                        if !requester.is_current() {
+                            continue;
+                        }
+                        if rec.read().common.scan != crate::server::record::ScanType::Passive {
+                            let _ = completion.send(());
+                            continue;
+                        }
+                        let _ = self.install_notify_and_process_already_locked(
+                            record_name,
+                            completion,
+                            NotifyArrival::Replay,
+                        );
+                        return;
+                    }
+                };
             };
-        };
-        let (field, link_text, put, tail) = held;
-        let _ = self.after_put_gate(record_name, &field, link_text, put, tail);
+            let (field, link_text, put, tail) = held;
+            let _ = self.after_put_gate(record_name, &field, link_text, put, tail);
+        }
     }
 
     /// Arm `record_name`'s wait-set around `completion` and drive one process
@@ -4149,7 +4187,7 @@ impl PvDatabase {
             Option<crate::runtime::sync::oneshot::Receiver<()>>,
         )>,
     ) -> crate::server::record::ProcessCompletion {
-        let parked = claim.map(|(c, rx)| (c.commit(), rx));
+        let parked = claim.map(|(c, rx)| (c.commit_refused(), rx));
         let _ = self.put_driven_process_already_locked(record_name);
         parked.map_or(
             crate::server::record::ProcessCompletion::Sync,
@@ -4509,7 +4547,11 @@ impl PvDatabase {
 
         if !should_process {
             // No processing cycle, so C never raises `putf` (and this put did
-            // not either), and a WRITE_NOTIFY caller's `callDone` runs inline.
+            // not either), and a WRITE_NOTIFY caller's `callDone` runs inline;
+            // a replayed one's waiter is answered here.
+            if let Some((c, _rx)) = claim.take() {
+                c.complete_unprocessed();
+            }
             return Ok(crate::server::record::ProcessCompletion::Unprocessed);
         }
 

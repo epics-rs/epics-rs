@@ -690,6 +690,12 @@ pub(crate) enum MenuBound {
 /// The shared front end of both C converters: exact label, else a base-0
 /// `epicsParseUInt16` index, then the caller's bound.
 fn menu_index_from_string(choices: &[&str], s: &str, bound: MenuBound) -> Option<i64> {
+    // `dbPutStringNum`: "empty string is the same as writing numeric zero"
+    // (`dbStaticRun.c:405-407`), before the choice test.
+    let s = match bound {
+        MenuBound::DbLoad if s.is_empty() => "0",
+        _ => s,
+    };
     if let Some(i) = choices.iter().position(|c| *c == s) {
         return Some(i as i64);
     }

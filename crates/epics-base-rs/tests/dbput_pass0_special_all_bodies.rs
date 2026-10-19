@@ -53,7 +53,12 @@ impl Record for Pass0TrackingRecord {
         static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
-    fn special(&mut self, _field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        _field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after {
             self.pass1_count.fetch_add(1, Ordering::SeqCst);
         } else {

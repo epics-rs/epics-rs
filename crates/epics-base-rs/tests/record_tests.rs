@@ -879,14 +879,16 @@ fn test_ai_smoothing() {
     rec.smoo = 0.5;
     // `init_record` is what arms the INIT phase (C `aiRecord.c:114`), and the
     // phase is what makes the first conversion SMOO's initial condition rather
-    // than a blend against the pre-init VAL. A `.db` load always runs it.
+    // than a blend against the pre-init VAL. A `.db` load always runs both
+    // passes, and C arms it in pass 1.
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
 
     rec.rval = 100;
     rec.process().unwrap();
     assert!((rec.val - 100.0).abs() < 1e-10);
     assert!(
-        !rec.init.is_initial(),
+        rec.init == 0,
         "C clears INIT at the end of every process (aiRecord.c:170)"
     );
 
@@ -1902,7 +1904,12 @@ impl Record for HookTrackingRecord {
     fn on_put(&mut self, _field: &str) {
         self.on_put_count.fetch_add(1, Ordering::SeqCst);
     }
-    fn special(&mut self, _field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        _field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after {
             self.special_after_count.fetch_add(1, Ordering::SeqCst);
         } else {

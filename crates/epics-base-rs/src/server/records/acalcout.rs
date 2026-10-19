@@ -436,6 +436,9 @@ const ACALCOUT_RPCL_SIZE: usize = 282;
 /// aCalcout record state. Field comments cite the `aCalcoutRecord.dbd`
 /// declaration; behaviour cites `aCalcoutRecord.c`.
 pub struct AcalcoutRecord {
+    /// VERS: C `vers = VERSION` in `init_record` pass 0; a `.db` VERS lands
+    /// until then.
+    vers: f64,
     // --- result ---
     pub val: f64,
     aval: Vec<f64>,
@@ -580,6 +583,7 @@ pub struct AcalcoutRecord {
 impl Default for AcalcoutRecord {
     fn default() -> Self {
         Self {
+            vers: VERSION,
             val: 0.0,
             aval: Vec::new(),
             pval: 0.0,
@@ -1209,6 +1213,20 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::acalcout;
+        fields:
+        VERS => vers;
+        custom: VAL, AVAL, NELM, NUSE, PVAL, CALC, CLCV, INPA, INPB, INPC, INPD, INPE, INPF,
+            INPG, INPH, INPI, INPJ, INPK, INPL, INAA, INBB, INCC, INDD, INEE, INFF, INGG, INHH,
+            INII, INJJ, INKK, INLL, OUT, INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV,
+            INJV, INKV, INLV, IAAV, IBBV, ICCV, IDDV, IEEV, IFFV, IGGV, IHHV, IIIV, IJJV, IKKV,
+            ILLV, OUTV, OOPT, ODLY, WAIT, DLYA, DOPT, OCAL, OCLV, OEVT, IVOA, IVOV, EGU, PREC,
+            HOPR, LOPR, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A, B, C,
+            D, E, F, G, H, I, J, K, L, AA, BB, CC, DD, EE, FF, GG, HH, II, JJ, KK, LL, NEWM,
+            OVAL, OAV, PA, PB, PC, PD, PE, PF, PG, PH, PI, PJ, PK, PL, POVL, LALM, ALST, MLST,
+            CACT, CSTAT, AMASK, SIZE, AMEM, PMEM;
+        spill: RPVT, PAVL, PAA, POAV);
+
     fn stamp_point(&self) -> crate::server::record::StampPoint {
         crate::server::record::StampPoint::AfterAlarms
     }
@@ -1257,10 +1275,13 @@ impl Record for AcalcoutRecord {
     /// does.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            self.vers = VERSION;
             // C `init_record` pass 0 (`aCalcoutRecord.c:188-190`) — a .db or an
             // autosave restore can name NUSE > NELM, and the record must not
             // enter its first cycle holding it.
             self.clamp_nuse(CyclePostMask::ValueLog);
+        } else {
+            // C `aCalcoutRecord.c:245-260`, after the pass-0 return at :192.
             let report = self.recompile_calc("acalcout: init_record: Illegal CALC field");
             self.init_report(report);
             let report = self.recompile_ocal("acalcout: init_record: Illegal OCAL field");
@@ -1289,7 +1310,12 @@ impl Record for AcalcoutRecord {
     /// C `aCalcoutRecord.c::special:469-491` — a put to CALC/OCAL recompiles
     /// into RPCL/ORPC, stores `aCalcPostfix()`'s return status in CLCV/OCLV,
     /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -1840,7 +1866,7 @@ impl Record for AcalcoutRecord {
             "AMASK" => Some(EpicsValue::ULong(self.amask)),
             "AMEM" => Some(EpicsValue::Long(self.mem.amem())),
             "PMEM" => Some(EpicsValue::Long(self.mem.pmem())),
-            "VERS" => Some(EpicsValue::Double(VERSION)),
+            "VERS" => Some(EpicsValue::Double(self.vers)),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -2269,8 +2295,6 @@ impl Record for AcalcoutRecord {
                 );
                 Ok(())
             }
-            // VERS is a fixed code-version constant; accept and ignore writes.
-            "VERS" => Ok(()),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     self.num_vals[idx] = value
@@ -2811,7 +2835,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
         // Scalar result broadcasts into AVAL (C aCalcPerform toArray).
@@ -2832,7 +2856,7 @@ mod tests {
         .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("AVAL"),
@@ -2850,10 +2874,10 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("AA*2".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(
@@ -2872,7 +2896,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "AVAL")]);
@@ -2883,7 +2907,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(6)).unwrap(); // Never
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[]);
@@ -2894,7 +2918,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("MDEL", EpicsValue::Double(0.5)).unwrap();
 
@@ -2912,10 +2936,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("2".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "OAV")]);
@@ -2930,10 +2954,10 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("5".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("VAL+10".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(10.0)));
@@ -2977,7 +3001,7 @@ mod tests {
         // A finite result clears UDF (C `else pcalc->udf = FALSE`).
         rec.put_field("CALC", EpicsValue::String("1+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         rec.check_alarms(&mut common);
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
@@ -2986,7 +3010,7 @@ mod tests {
         // CALC_ALARM (`if(cstat)`) and leaves `udf` at FALSE.
         rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert!(rec.calc_alarm, "non-finite result raises CALC_ALARM");
         rec.check_alarms(&mut common);
@@ -3039,7 +3063,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => {
@@ -3060,7 +3084,7 @@ mod tests {
         rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
         rec.put_field("CALC", EpicsValue::String("ACOS(2)".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         match rec.get_field("VAL") {
             Some(EpicsValue::Double(v)) => assert!(v.is_nan(), "VAL = {v}, expected NaN"),
@@ -3187,7 +3211,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
 
         rec.process().unwrap();
@@ -3221,7 +3245,7 @@ mod tests {
         stored
             .put_field("CALC", EpicsValue::String("AA:=3;SUM(AA)".into()))
             .unwrap();
-        stored.special("CALC", true).unwrap();
+        stored.special("CALC", true, &Default::default()).unwrap();
         stored.process().unwrap();
         assert_ne!(stored.amask & 1, 0, "STORE_AA set the mask bit");
         assert_eq!(
@@ -3233,7 +3257,7 @@ mod tests {
         let mut read = AcalcoutRecord::new();
         read.put_field("CALC", EpicsValue::String("AA+1".into()))
             .unwrap();
-        read.special("CALC", true).unwrap();
+        read.special("CALC", true, &Default::default()).unwrap();
         read.process().unwrap();
         assert_eq!(
             read.get_field("AMEM"),
@@ -3396,7 +3420,7 @@ mod tests {
             "the raw store keeps what the client sent; special() has not run yet"
         );
 
-        let status = rec.special("NUSE", true);
+        let status = rec.special("NUSE", true, &Default::default());
         assert!(status.is_err(), "C returns -1, so the put must fail");
         assert_eq!(
             rec.get_field("NUSE"),
@@ -3462,7 +3486,7 @@ mod tests {
         .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         // num_elements = NUSE (3) since 0 < NUSE < NELM.
         assert_eq!(

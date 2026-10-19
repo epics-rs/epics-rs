@@ -39,7 +39,12 @@ impl Record for OutProbe {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if field == "OUT" && after {
             self.specials.fetch_add(1, Ordering::SeqCst);
             let runs = Arc::clone(&self.runs);

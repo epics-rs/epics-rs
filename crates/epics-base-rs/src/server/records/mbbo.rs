@@ -93,8 +93,9 @@ pub struct MbboRecord {
     skip_convert: bool,
     /// `special()` re-labelled the state VAL sits on; the put drains it.
     label_post: bool,
-    /// SDEF, written by [`Self::init_common`] only.
-    sdef: bool,
+    /// C's DBF_SHORT `sdef`: a `.db` value until [`Self::init_common`]
+    /// writes it, and C tests it as nonzero.
+    pub sdef: i16,
 }
 
 impl Default for MbboRecord {
@@ -172,7 +173,7 @@ impl Default for MbboRecord {
             soft_alarm: false,
             skip_convert: false,
             label_post: false,
-            sdef: false,
+            sdef: 0,
         }
     }
 }
@@ -219,7 +220,7 @@ impl MbboRecord {
     fn init_common(&mut self) {
         let rvs = self.raw_values();
         let sts = self.state_strings();
-        self.sdef = (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty());
+        self.sdef = i16::from((0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty()));
     }
 
     /// ZRST..FFST, C's `(&prec->zrst)[i]`.
@@ -231,10 +232,9 @@ impl MbboRecord {
         ]
     }
 
-    /// C's `prec->sdef`: 0 until `init_common` has run. It selects VAL's wire
-    /// type (`cvt_dbaddr`).
+    /// C's `if (prec->sdef)`. It selects VAL's wire type (`cvt_dbaddr`).
     pub fn sdef(&self) -> bool {
-        self.sdef
+        self.sdef != 0
     }
 
     /// C convert(): VAL -> RVAL with SDEF check and SHFT.
@@ -307,11 +307,10 @@ macro_rules! mbb_get_field {
             "VAL" if !$self.sdef() => Some(EpicsValue::UShort($self.val)),
             "VAL" => Some(EpicsValue::Enum($self.val)),
             // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
-            // (mbboRecord.dbd.pod) — readable over CA, never writable. It is
-            // the very predicate the VAL arms above branch on, so serving it
-            // derived keeps the reported flag and the served wire type from
-            // ever disagreeing.
-            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
+            // (mbboRecord.dbd.pod) — readable over CA, never writable. The
+            // VAL arms above branch on the same stored `sdef`, so the
+            // reported flag and the served wire type cannot disagree.
+            "SDEF" => Some(EpicsValue::Short($self.sdef)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -399,6 +398,7 @@ macro_rules! mbb_put_field {
 impl Record for MbboRecord {
     // The menus are stored as `i16` and served as ENUM, so they stay General.
     crate::slot_map!(crate::server::record::dbd_generated::slots::mbbo;
+        fields:
         VAL => val,
         ZRVL => zrvl,
         ONVL => onvl,
@@ -435,15 +435,18 @@ impl Record for MbboRecord {
         RVAL => rval,
         SHFT => shft,
         SDLY => sdly,
-        IVOV => ivov;
-        read_only:
+        IVOV => ivov,
         NOBT => nobt,
         ORAW => oraw,
         RBV => rbv,
         ORBV => orbv,
         MASK => mask,
         MLST => mlst,
-        LALM => lalm);
+        LALM => lalm,
+        SDEF => sdef;
+        custom: DOL, OMSL, ZRSV, ONSV, TWSV, THSV, FRSV, FVSV, SXSV, SVSV, EISV, NISV, TESV,
+            ELSV, TVSV, TTSV, FTSV, FFSV, UNSV, COSV, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -496,7 +499,12 @@ impl Record for MbboRecord {
     /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
     /// fall outside the index range and post nothing; they reach only
     /// `init_common`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         // Every state string is `??ST`; a VAL put skips the name scan.
         if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
             self.label_post =
@@ -650,6 +658,8 @@ impl Record for MbboRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.init_common();
+        } else {
+            // C `mbboRecord.c:137-138`, after the pass-0 return.
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
@@ -688,6 +698,10 @@ impl Record for MbboRecord {
 
     /// `mbboRecord.c:141`, `:173`
     fn after_dset_init(&mut self) {
+        self.init_common();
+    }
+
+    fn state_table_written(&mut self) {
         self.init_common();
     }
 

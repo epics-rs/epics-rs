@@ -9,7 +9,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::time::Duration;
 
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{CommonFields, Record};
 use epics_base_rs::types::EpicsValue;
 use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
@@ -349,9 +349,10 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
         // CNCT asks for the state the port is in: no driver call, port stays up.
         rec.cnct = 1;
 
+        let common = CommonFields::default();
         let put = |rec: &mut AsynRecord, field: &str| -> u64 {
             let before = thread_allocs();
-            rec.special(field, true).unwrap();
+            rec.special(field, true, &common).unwrap();
             let allocs = thread_allocs() - before;
             assert_eq!(rec.errs, "", "{field} was queued");
             while !rec.specials_settled() {
@@ -427,9 +428,10 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
         rec.set_async_context("ALLOC_RF".into(), db.async_handle());
         rec.lbaud = 115200;
 
+        let common = CommonFields::default();
         let put = |rec: &mut AsynRecord| -> u64 {
             let before = thread_allocs();
-            rec.special("LBAUD", true).unwrap();
+            rec.special("LBAUD", true, &common).unwrap();
             let allocs = thread_allocs() - before;
             assert_eq!(rec.errs, "port ALLOCRF disabled");
             allocs
@@ -490,10 +492,11 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
 
         let mut rec = AsynRecord::default();
         rec.port = name.to_string();
+        let common = CommonFields::default();
         let put = |rec: &mut AsynRecord| -> u64 {
             rec.pcnct = 1;
             let before = thread_allocs();
-            rec.special("PCNCT", true).unwrap();
+            rec.special("PCNCT", true, &common).unwrap();
             let allocs = thread_allocs() - before;
             assert_eq!(
                 rec.errs,
@@ -517,10 +520,11 @@ fn a_put_that_cancels_io_intr_leaves_its_scan_put_without_allocating() {
         let mut rec = AsynRecord::default();
         let db = PvDatabase::new();
         rec.set_async_context("ALLOC_CANCEL".into(), db.async_handle());
+        let common = CommonFields::default();
         let put = |rec: &mut AsynRecord| -> u64 {
             rec.io_intr.set_active(true).unwrap();
             let before = thread_allocs();
-            rec.special("UI32MASK", true).unwrap();
+            rec.special("UI32MASK", true, &common).unwrap();
             let owed = rec.take_after_gate();
             let allocs = thread_allocs() - before;
             assert!(owed.is_some(), "the SCAN put is owed");

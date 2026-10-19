@@ -49,13 +49,16 @@ fn link_ls_chars(read: &[u8], sizv: u16, val: &mut LongStringVal) {
     }
 }
 
-/// lsi/lso/printf VAL (and lsi/lso OVAL) as the `LEN` elements their
-/// `get_array_info` reports (`lsiRecord.c:154`, `lsoRecord.c:196`,
-/// `printfRecord.c:432`): none until first written, the text and its NUL
-/// after (bar [`Self::set_text_strlen`]). LEN is this length by construction, and every reader lends the
-/// elements with their count instead of building them.
+/// lsi/lso/printf VAL (and lsi/lso OVAL) with its C `len` (`olen`): the
+/// elements every writer leaves, and the length C's `get_array_info` reports
+/// (`lsiRecord.c:154`, `lsoRecord.c:196`, `printfRecord.c:432`). Each writer
+/// stores `len` as its C site does; a `.db` LEN stores only `len`
+/// ([`Self::set_len`]), over a buffer `init_record` then empties.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct LongStringVal(SharedArray<u8>);
+pub struct LongStringVal {
+    bytes: SharedArray<u8>,
+    len: u32,
+}
 
 impl LongStringVal {
     /// `text` and its NUL.
@@ -65,25 +68,30 @@ impl LongStringVal {
         v
     }
 
-    /// The `LEN` elements.
+    /// The elements the last writer left.
     pub fn elements(&self) -> &SharedArray<u8> {
-        &self.0
+        &self.bytes
     }
 
-    /// `LEN`.
+    /// C's `len`.
     pub fn len(&self) -> u32 {
-        self.0.len() as u32
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
+    }
+
+    /// A `.db` LEN: C's `dbPutString` stores the ULONG and nothing else.
+    pub fn set_len(&mut self, n: u32) {
+        self.len = n;
     }
 
     /// The elements less the terminating NUL.
     pub fn text(&self) -> &[u8] {
-        match self.0.split_last() {
+        match self.bytes.split_last() {
             Some((0, text)) => text,
-            _ => &self.0,
+            _ => &self.bytes,
         }
     }
 
@@ -92,7 +100,7 @@ impl LongStringVal {
     pub fn set_text(&mut self, text: &[u8]) {
         // Unchanged text is already in place; rewriting it would only cost
         // the buffer's uniqueness check and the copy.
-        if self.0.split_last() == Some((&0, text)) {
+        if self.bytes.split_last() == Some((&0, text)) && self.len == self.bytes.len() as u32 {
             return;
         }
         self.write_text(text);
@@ -116,7 +124,7 @@ impl LongStringVal {
     /// `devEnviron.c::read_lsi`'s `strncpy` and `len = strlen`: the one
     /// writer whose LEN leaves the NUL out.
     pub fn set_text_strlen(&mut self, text: &[u8]) {
-        if self.0[..] != *text {
+        if self.bytes[..] != *text || self.len != text.len() as u32 {
             self.fill(text.len(), |b| b.copy_from_slice(text));
         }
     }
@@ -126,16 +134,17 @@ impl LongStringVal {
     /// `monitor()`, the unchanged cycles that never copy included.
     #[inline(never)]
     pub fn copy_from(&mut self, src: &Self) -> bool {
-        let moved = self.0.len() != src.0.len();
-        self.fill(src.0.len(), |b| b.copy_from_slice(&src.0));
+        let moved = self.len != src.len;
+        self.fill(src.bytes.len(), |b| b.copy_from_slice(&src.bytes));
+        self.len = src.len;
         moved
     }
 
     /// `*plen = strlen(pbuffer) + 1` over the buffer as it stands.
     pub fn terminate(&mut self) {
-        let buf = self.0.buffer();
+        let buf = self.bytes.buffer();
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        if self.0.len() != end + 1 {
+        if self.bytes.len() != end + 1 || self.len != end as u32 + 1 {
             let text = buf[..end].to_vec();
             self.set_text(&text);
         }
@@ -143,11 +152,12 @@ impl LongStringVal {
 
     /// `dbLoadLinkLS`'s number case: the buffer is untouched and LEN is 1.
     pub fn set_len_one(&mut self) {
-        if self.0.is_empty() {
-            self.0 = [0].into();
+        if self.bytes.is_empty() {
+            self.bytes = [0].into();
         } else {
-            self.0.truncate(1);
+            self.bytes.truncate(1);
         }
+        self.len = 1;
     }
 
     /// A VAL put of up to `capacity` (SIZV - 1) bytes: a DBR_STRING put is
@@ -176,28 +186,21 @@ impl LongStringVal {
         sizv: usize,
         scan: impl FnOnce(&mut [u8]) -> Option<usize>,
     ) -> Option<usize> {
-        let len = self.0.len();
-        let capacity = self.0.buffer().len().max(sizv);
-        let buf = self.0.make_mut_resized(capacity, 0);
+        let len = self.bytes.len();
+        let capacity = self.bytes.buffer().len().max(sizv);
+        let buf = self.bytes.make_mut_resized(capacity, 0);
         let read = scan(&mut buf[..sizv]);
         match read {
             Some(n) => {
                 if n < sizv {
                     buf[n] = 0;
                 }
-                self.0.truncate(n);
+                self.bytes.truncate(n);
+                self.len = n as u32;
             }
-            None => self.0.truncate(len),
+            None => self.bytes.truncate(len),
         }
         read
-    }
-
-    /// Cut the text to `max` bytes.
-    pub fn cut_text(&mut self, max: usize) {
-        if self.text().len() > max {
-            self.0.make_mut()[max] = 0;
-            self.0.truncate(max + 1);
-        }
     }
 
     /// `n` elements written by `write`, followed by a NUL where the buffer
@@ -207,13 +210,14 @@ impl LongStringVal {
     /// copy C's `db_field_log` makes for the reader.
     #[inline]
     fn fill(&mut self, n: usize, write: impl FnOnce(&mut [u8])) {
-        let capacity = self.0.buffer().len().max(n);
-        let (text, rest) = self.0.make_mut_resized(capacity, 0).split_at_mut(n);
+        let capacity = self.bytes.buffer().len().max(n);
+        let (text, rest) = self.bytes.make_mut_resized(capacity, 0).split_at_mut(n);
         write(text);
         if let Some(pad) = rest.first_mut() {
             *pad = 0;
         }
-        self.0.truncate(n);
+        self.bytes.truncate(n);
+        self.len = n as u32;
     }
 }
 
@@ -293,6 +297,11 @@ impl LsiRecord {
 }
 
 impl Record for LsiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::lsi;
+        fields:;
+        custom: VAL, OVAL, SIZV, LEN, OLEN, MPST, APST, SIML, SIMM, SIMS, SIOL, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -470,7 +479,12 @@ impl Record for LsiRecord {
 
     /// C `special()` sets `len` and posts it on every VAL put (lsiRecord.c:197),
     /// changed or not; `monitor()` posts it again only when `len != olen`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "VAL" {
             self.len_marked = true;
         }
@@ -589,6 +603,28 @@ impl Record for LsiRecord {
         }
     }
 
+    /// C `lsiRecord.c:46-55`: SIZV clamps to [16, 0x7fff] and sizes VAL.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.sizv = self.sizv.clamp(16, 0x7fff);
+            // C callocs VAL and OVAL here, with `len = olen = 0`.
+            self.val = LongStringVal::default();
+            self.oval = LongStringVal::default();
+        }
+        Ok(())
+    }
+
+    /// LEN and OLEN are the lengths of VAL and OVAL; `put_field` refuses the
+    /// `SPC_NOMOD` fields, and a `.db` value is stored as C stores it.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("LEN", EpicsValue::ULong(n)) => self.val.set_len(n),
+            ("OLEN", EpicsValue::ULong(n)) => self.oval.set_len(n),
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
@@ -598,17 +634,11 @@ impl Record for LsiRecord {
             "SIZV" => {
                 // SIZV is DBF_USHORT (lsiRecord.dbd.pod:75): a client put
                 // arrives as UShort, internal callers may still pass Short.
-                let raw = match value {
-                    EpicsValue::UShort(v) => v as i32,
-                    EpicsValue::Short(v) => v as i32,
+                self.sizv = match value {
+                    EpicsValue::UShort(v) => v,
+                    EpicsValue::Short(v) => v as u16,
                     _ => return Err(CaError::TypeMismatch("SIZV".into())),
                 };
-                // C `lsiRecord.c:46-55`: SIZV clamps to [16, 0x7fff].
-                self.sizv = raw.clamp(16, 0x7fff) as u16;
-                // C sizes the buffer once (SPC_NOMOD); the port takes SIZV
-                // after a .db VAL, so the cut lands here.
-                let capacity = self.capacity();
-                self.val.cut_text(capacity);
             }
             "SIMM" => {
                 if let EpicsValue::Short(v) = value {

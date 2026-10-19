@@ -353,7 +353,7 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
             .unwrap();
         match field {
             "RBV" => motor.pos.rbv = v,
-            _ => motor.stat.dmov = v != 0.0,
+            _ => motor.stat.dmov = i16::from(v != 0.0),
         }
         inst.notify_field(field, EventMask::VALUE | EventMask::LOG);
     };
@@ -610,7 +610,7 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
                 .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
                 .unwrap()
                 .stat
-                .dmov = done;
+                .dmov = i16::from(done);
             inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
         }
     };

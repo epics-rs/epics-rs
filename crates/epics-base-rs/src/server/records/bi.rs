@@ -85,7 +85,12 @@ impl BiRecord {
 
 impl Record for BiRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::bi;
-        RVAL => rval);
+        fields:
+        RVAL => rval,
+        ORAW => oraw;
+        custom: VAL, ZSV, OSV, COSV, ZNAM, ONAM, MASK, LALM, MLST, AFTC, AFVL, SIOL, SVAL, SIML,
+            SIMM, SIMS, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
 
     /// `biRecord.c:100` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {

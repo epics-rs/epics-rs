@@ -23,6 +23,11 @@ fn transform_with_prec(prec: i16) -> RecordInstance {
     inst.record
         .put_field("PREC", EpicsValue::Short(prec))
         .expect("transform stores PREC");
+    // The `.dbd` `initial("1")` holds VERS until `init_record` pass 0 stamps
+    // VERSION over it, as `iocInit` does.
+    inst.record
+        .init_record(0)
+        .expect("transform init_record pass 0");
     inst
 }
 

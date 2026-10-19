@@ -1321,7 +1321,12 @@ impl Record for SscanRecord {
         })
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         let Some(o) = own_index(field) else {
             return Ok(());
         };

@@ -54,7 +54,7 @@ async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
     // Stores into AA only — CC is untouched by the expression.
     a.put_field("CALC", EpicsValue::String("AA:=BB*2;SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field(
         "BB",
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),

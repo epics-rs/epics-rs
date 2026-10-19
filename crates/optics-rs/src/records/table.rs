@@ -2946,6 +2946,49 @@ impl Record for TableRecord {
         }
     }
 
+    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
+    /// `.db` file, as C's `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("VERS", EpicsValue::Float(v)) => self.vers = v,
+            ("AXL", EpicsValue::Double(v)) => self.axl = v,
+            ("AYL", EpicsValue::Double(v)) => self.ayl = v,
+            ("AZL", EpicsValue::Double(v)) => self.azl = v,
+            ("XL", EpicsValue::Double(v)) => self.xl = v,
+            ("YL", EpicsValue::Double(v)) => self.yl = v,
+            ("ZL", EpicsValue::Double(v)) => self.zl = v,
+            ("AXRB", EpicsValue::Double(v)) => self.axrb = v,
+            ("AYRB", EpicsValue::Double(v)) => self.ayrb = v,
+            ("AZRB", EpicsValue::Double(v)) => self.azrb = v,
+            ("XRB", EpicsValue::Double(v)) => self.xrb = v,
+            ("YRB", EpicsValue::Double(v)) => self.yrb = v,
+            ("ZRB", EpicsValue::Double(v)) => self.zrb = v,
+            ("EAX", EpicsValue::Double(v)) => self.eax = v,
+            ("EAY", EpicsValue::Double(v)) => self.eay = v,
+            ("EAZ", EpicsValue::Double(v)) => self.eaz = v,
+            ("EX", EpicsValue::Double(v)) => self.ex = v,
+            ("EY", EpicsValue::Double(v)) => self.ey = v,
+            ("EZ", EpicsValue::Double(v)) => self.ez = v,
+            ("HLAX", EpicsValue::Double(v)) => self.hlax = v,
+            ("HLAY", EpicsValue::Double(v)) => self.hlay = v,
+            ("HLAZ", EpicsValue::Double(v)) => self.hlaz = v,
+            ("HLX", EpicsValue::Double(v)) => self.hlx = v,
+            ("HLY", EpicsValue::Double(v)) => self.hly = v,
+            ("HLZ", EpicsValue::Double(v)) => self.hlz = v,
+            ("LLAX", EpicsValue::Double(v)) => self.llax = v,
+            ("LLAY", EpicsValue::Double(v)) => self.llay = v,
+            ("LLAZ", EpicsValue::Double(v)) => self.llaz = v,
+            ("LLX", EpicsValue::Double(v)) => self.llx = v,
+            ("LLY", EpicsValue::Double(v)) => self.lly = v,
+            ("LLZ", EpicsValue::Double(v)) => self.llz = v,
+            ("TORAD", EpicsValue::Double(v)) => self.torad = v,
+            ("LVIO", EpicsValue::Short(v)) => self.lvio = v,
+            ("MMAP", EpicsValue::ULong(v)) => self.mmap = v,
+            (name, value) => return self.put_field_internal(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         macro_rules! put_double {
             ($field:expr) => {

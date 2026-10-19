@@ -52,10 +52,12 @@ pub struct WaveformRecord {
     /// unrepresentable.
     ///
     /// Private, and written only by [`Self::set_ftvl`], which reallocates VAL in
-    /// the same breath (C allocates `bptr` from `dbValueSize(ftvl)` and never
-    /// re-types it independently). A `pub` field let a caller retype FTVL while
-    /// VAL kept its old element variant — the desync the `field_list`/`get_field`
-    /// pair then reports two different native types from.
+    /// the same breath, and by the `.db` store, which C makes before `bptr`
+    /// exists; `init_record` then allocates VAL of its type ([`Self::size_val`])
+    /// as C allocates `bptr` from `dbValueSize(ftvl)`. A `pub` field let a
+    /// caller retype FTVL while VAL kept its old element variant — the desync
+    /// the `field_list`/`get_field` pair then reports two different native
+    /// types from.
     ftvl: Ftype,
     pub mpst: i16, // Monitor Post Mode: 0=Always, 1=OnChange
     pub apst: i16, // Archive Post Mode: 0=Always, 1=OnChange
@@ -63,7 +65,7 @@ pub struct WaveformRecord {
     /// C `BUSY` (`DBF_SHORT`, `special(SPC_NOMOD)`): waveform acquisition-active
     /// flag, set by waveform device support (e.g. `devAsynXXXTimeSeries`) and
     /// read-only to CA clients. waveformRecord.dbd.pod:461. Waveform kind only.
-    pub busy: bool,
+    pub busy: i16,
     /// C `RARM` (`DBF_SHORT`, `pp(TRUE)`): re-arm acquisition control read by
     /// waveform device support: 1=start (clear, arm), 2=stop, 3=resume, 0=no-op.
     /// The device resets it to 0 each process. waveformRecord.dbd.pod:411.
@@ -150,6 +152,9 @@ pub struct WaveformRecord {
     /// decide the count for a record that arrived EMPTY — never discard this.
     /// Captured at pass 0, before the record's own seed runs.
     prebuilt_nord: i32,
+    /// VAL was put before init. A `.db` NORD alone is no data, so the init
+    /// rules overwrite it as C's do.
+    val_put: bool,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -213,7 +218,7 @@ impl Default for WaveformRecord {
             mpst: 0,
             apst: 0,
             hash: 0,
-            busy: false,
+            busy: 0,
             rarm: 0,
             egu: PvString::new(),
             hopr: 0.0,
@@ -243,6 +248,7 @@ impl Default for WaveformRecord {
             dol_read_failed: false,
             inp_read_failed: false,
             prebuilt_nord: 0,
+            val_put: false,
         }
     }
 }
@@ -383,6 +389,7 @@ impl WaveformRecord {
         // process only through an NPP link put; subArray's VAL is
         // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
         self.inp_read_failed = false;
+        self.val_put = true;
         self.land_val_in_buffer(value)
     }
 
@@ -532,6 +539,17 @@ impl WaveformRecord {
     pub fn reallocate_val(&mut self) {
         self.val = self.ftvl.zeroed(self.val_capacity());
         self.nord = 0;
+    }
+
+    /// C `init_record`'s `callocMustSucceed(capacity, dbValueSize(prec->ftvl))`,
+    /// keeping a builder's elements when they are already of FTVL's type.
+    fn size_val(&mut self) {
+        let typed = std::mem::discriminant(&self.ftvl.zeroed(0));
+        if std::mem::discriminant(&self.val) == typed {
+            self.resize_val_preserving();
+        } else {
+            self.reallocate_val();
+        }
     }
 
     /// Resize the VAL buffer to the current [`Self::val_capacity`] **while
@@ -851,6 +869,31 @@ impl Record for WaveformRecord {
         })
     }
 
+    fn declared_store(
+        &self,
+        slot: crate::server::record::FieldSlot,
+    ) -> Option<crate::server::record::DeclaredStore> {
+        use crate::server::record::dbd_generated::slots;
+        match self.kind {
+            ArrayKind::Waveform => crate::declared_store!(slot; slots::waveform;
+                member: RARM, PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, NELM, FTVL, BUSY, NORD, SIOL, SIML, SIMM, SIMS, MPST, APST;
+                spill: INP, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::Aai => crate::declared_store!(slot; slots::aai;
+                member: PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, NELM, FTVL, NORD, SIML, SIMM, SIMS, SIOL, MPST, APST;
+                spill: INP, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::Aao => crate::declared_store!(slot; slots::aao;
+                member: PREC, EGU, HOPR, LOPR, SDLY, HASH;
+                custom: VAL, DOL, OMSL, NELM, FTVL, NORD, SIML, SIMM, SIMS, SIOL, MPST, APST;
+                spill: OUT, BPTR, OLDSIMM, SSCN, SIMPVT),
+            ArrayKind::SubArray => crate::declared_store!(slot; slots::subArray;
+                member: PREC, EGU, HOPR, LOPR;
+                custom: VAL, FTVL, MALM, NELM, INDX, BUSY, NORD;
+                spill: INP, BPTR),
+        }
+    }
+
     fn slot_mut(
         &mut self,
         slot: crate::server::record::FieldSlot,
@@ -1105,7 +1148,7 @@ impl Record for WaveformRecord {
         if pass != 0 {
             return Ok(());
         }
-        self.prebuilt_nord = self.nord;
+        self.prebuilt_nord = if self.val_put { self.nord } else { 0 };
         if matches!(self.kind, ArrayKind::SubArray) {
             if self.malm < 1 {
                 self.malm = 1;
@@ -1124,8 +1167,17 @@ impl Record for WaveformRecord {
             // matter. Preserving resize, not a wipe: a `record()`-builder
             // subArray may already hold element data (a `.db` cannot — VAL is
             // `DBF_NOACCESS`).
-            self.resize_val_preserving();
+            self.size_val();
             return Ok(());
+        }
+        // C turns NELM <= 0 into 1 before `callocMustSucceed(prec->nelm, ...)`
+        // (waveformRecord.c:94, aaiRecord.c:109, aaoRecord.c:112).
+        if self.nelm <= 0 {
+            self.nelm = 1;
+        }
+        self.size_val();
+        if self.prebuilt_nord == 0 {
+            self.nord = 0;
         }
         if matches!(self.kind, ArrayKind::Aao) {
             return Ok(());
@@ -1371,7 +1423,7 @@ impl Record for WaveformRecord {
             "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
                 Some(EpicsValue::Short(self.rarm))
             }
-            "BUSY" if self.declares_busy() => Some(EpicsValue::Short(self.busy as i16)),
+            "BUSY" if self.declares_busy() => Some(EpicsValue::Short(self.busy)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -1388,6 +1440,32 @@ impl Record for WaveformRecord {
                 Some(EpicsValue::String(self.dol.clone().into()))
             }
             _ => None,
+        }
+    }
+
+    /// A `.db` NELM or FTVL is stored, not sized: `init_record` allocates VAL
+    /// from both ([`Self::size_val`]), so the `.db` order cannot matter.
+    /// areaDetector loads NELM=0 (NDStats YSIZE=0), which init turns into 1.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "NELM" if !matches!(self.kind, ArrayKind::SubArray) => match count_put(&value) {
+                Some(n) => {
+                    self.nelm = n;
+                    Ok(())
+                }
+                None => self.put_field(name, value),
+            },
+            "FTVL" => match value {
+                EpicsValue::Short(v) => match Ftype::from_index(v) {
+                    Some(ftvl) => {
+                        self.ftvl = ftvl;
+                        Ok(())
+                    }
+                    None => self.put_field(name, value),
+                },
+                _ => self.put_field(name, value),
+            },
+            _ => self.put_field(name, value),
         }
     }
 
@@ -1424,11 +1502,10 @@ impl Record for WaveformRecord {
                     Ok(())
                 } else {
                     // waveform/aai/aao: NELM is `special(SPC_NOMOD)`, so a CA put
-                    // never reaches here — this arm is the `.db`-load / builder
-                    // sizing path. C init_record turns NELM <= 0 into 1
-                    // (waveformRecord.c:94, aaiRecord.c:109, aaoRecord.c:112);
-                    // areaDetector loads NELM=0 (NDStats YSIZE=0), so refusing it
-                    // would drop the whole file. Preserve the existing element data.
+                    // never reaches here — this arm is the builder sizing path
+                    // (a `.db` stores through `load_field`). C init_record turns
+                    // NELM <= 0 into 1 (waveformRecord.c:94, aaiRecord.c:109,
+                    // aaoRecord.c:112). Preserve the existing element data.
                     self.nelm = n.max(1);
                     self.resize_val_preserving();
                     Ok(())
@@ -1487,7 +1564,15 @@ impl Record for WaveformRecord {
                 };
                 Ok(())
             }
-            "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
+            // SPC_NOMOD fields refuse a runtime put at the database's
+            // `check_no_mod_in_db_put`; reaching here is a `.db` store.
+            "NORD" => {
+                self.nord = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("NORD".into()))?
+                    as i32;
+                Ok(())
+            }
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => {
                 let Some(v) = count_put(&value) else {
                     return Err(CaError::TypeMismatch("INDX".into()));
@@ -1528,7 +1613,13 @@ impl Record for WaveformRecord {
                 self.rarm = v;
                 Ok(())
             }
-            "BUSY" if self.declares_busy() => Err(CaError::ReadOnlyField(name.to_string())),
+            "BUSY" if self.declares_busy() => {
+                self.busy = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("BUSY".into()))?
+                    as i16;
+                Ok(())
+            }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu.set_bytes(s.as_bytes());
@@ -2110,18 +2201,14 @@ mod array_kind_tests {
         assert!(!rarm.read_only, "RARM is pp(TRUE) — client-settable");
         assert!(busy.read_only, "BUSY is special(SPC_NOMOD) — read-only");
 
-        // RARM round-trips through put/get; BUSY is read-only (device-set) and
-        // reflects the struct flag.
+        // RARM round-trips through put/get. BUSY's runtime refusal is the
+        // database's `read_only` gate; `put_field` is the `.db` store.
         let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
         wf.put_field("RARM", EpicsValue::Short(1)).unwrap();
         assert_eq!(wf.get_field("RARM"), Some(EpicsValue::Short(1)));
         assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(0)));
-        assert!(
-            wf.put_field("BUSY", EpicsValue::Short(1)).is_err(),
-            "BUSY must reject CA puts (SPC_NOMOD)"
-        );
-        wf.busy = true;
-        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(1)));
+        wf.put_field("BUSY", EpicsValue::Short(3)).unwrap();
+        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(3)));
 
         // aai/aao declare neither field: not in field_list, get None, put errors.
         for kind in [ArrayKind::Aai, ArrayKind::Aao] {
@@ -2151,12 +2238,8 @@ mod array_kind_tests {
             .expect("subArray field_list must carry BUSY");
         assert!(busy.read_only, "subArray BUSY is special(SPC_NOMOD)");
         assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(0)));
-        assert!(
-            sub.put_field("BUSY", EpicsValue::Short(1)).is_err(),
-            "subArray BUSY must reject CA puts (SPC_NOMOD)"
-        );
-        sub.busy = true;
-        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(1)));
+        sub.put_field("BUSY", EpicsValue::Short(3)).unwrap();
+        assert_eq!(sub.get_field("BUSY"), Some(EpicsValue::Short(3)));
     }
 
     /// The static field sets and the runtime get/put arms must agree on which
@@ -2198,7 +2281,7 @@ mod array_kind_tests {
             .expect("waveform must expose itself via as_any_mut");
         // Device-only writes that the generic put path cannot do: BUSY is
         // read-only, RARM is reset by the device after applying it.
-        wf.busy = true;
+        wf.busy = 1;
         wf.rarm = 0;
         assert_eq!(r.get_field("BUSY"), Some(EpicsValue::Short(1)));
         assert_eq!(r.get_field("RARM"), Some(EpicsValue::Short(0)));
@@ -2502,6 +2585,32 @@ mod array_kind_tests {
             assert_eq!(wf.val, EpicsValue::LongArray(vec![1, 2].into()));
             assert_eq!(wf.nord, 2);
         }
+    }
+
+    /// A `.db` NORD is no data: pass 0 overwrites it as C's `init_record`s
+    /// do (waveformRecord.c:100, aaiRecord.c:113, devAaoSoft.c:43-51), while a
+    /// VAL put before init keeps its count.
+    #[test]
+    fn loaded_nord_is_overwritten_at_init_but_put_val_is_kept() {
+        for (kind, nelm, want) in [
+            (ArrayKind::Waveform, 1, 1),
+            (ArrayKind::Waveform, 4, 0),
+            (ArrayKind::Aai, 1, 1),
+            (ArrayKind::Aai, 4, 0),
+            (ArrayKind::Aao, 4, 0),
+        ] {
+            let mut r = WaveformRecord::with_kind(kind);
+            r.put_field("NELM", EpicsValue::Long(nelm)).unwrap();
+            r.put_field("NORD", EpicsValue::Long(3)).unwrap();
+            assert_eq!(r.nord, 3, "{kind:?}: the .db store lands");
+            r.init_record(0).unwrap();
+            assert_eq!(r.nord, want, "{kind:?} NELM={nelm}");
+        }
+        let mut wf = WaveformRecord::new(4, DbFieldType::Double);
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0].into()))
+            .unwrap();
+        wf.init_record(0).unwrap();
+        assert_eq!(wf.nord, 2);
     }
 
     #[test]

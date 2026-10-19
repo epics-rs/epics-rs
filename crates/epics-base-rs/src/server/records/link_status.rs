@@ -626,7 +626,10 @@ mod tests {
                 .record
                 .put_field(put2.0, EpicsValue::String(put2.1.into()))
                 .unwrap();
-            guard.record.special(put2.0, true).unwrap();
+            guard
+                .record
+                .special(put2.0, true, &Default::default())
+                .unwrap();
         }
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
@@ -706,7 +709,10 @@ mod tests {
                 .record
                 .put_field("INPA", EpicsValue::String("".into()))
                 .unwrap();
-            guard.record.special("INPA", true).unwrap();
+            guard
+                .record
+                .special("INPA", true, &Default::default())
+                .unwrap();
         }
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
 

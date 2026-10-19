@@ -114,7 +114,8 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
     // alarm events (`if (events) db_post_events(&prec->val, events)`,
     // seqRecord.c:227-229), never DBE_VALUE/DBE_LOG. So a run of `caput VAL`
     // posts no per-put value monitor (only the connect-time snapshot).
-    no_value_monitor
+    no_value_monitor,
+    spill(PREC)
 )]
 pub struct SeqRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (seqRecord.dbd:21-25) — the "Used

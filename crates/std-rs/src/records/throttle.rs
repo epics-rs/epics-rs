@@ -104,7 +104,7 @@ pub struct ThrottleRecord {
     /// Limit clipping: 0=Off, 1=On (DRVLC)
     pub drvlc: i16,
     /// Code version string (VER), read-only
-    pub ver: String,
+    pub ver: PvString,
     /// Record status: 0=Unknown, 1=Error, 2=Success (STS), read-only
     pub sts: i16,
     /// Display precision (PREC)
@@ -196,9 +196,7 @@ impl Default for ThrottleRecord {
             drvll: 0.0,
             drvls: 0, // Normal
             drvlc: 0, // Off
-            // C `throttleRecord.c:51` `#define VERSION "0-2-1"`,
-            // copied into VER by `init_record` pass 0 (line 149).
-            ver: "0-2-1".to_string(),
+            ver: PvString::default(),
             sts: 0, // Unknown
             prec: 0,
             dprec: 0,
@@ -553,7 +551,12 @@ impl Record for ThrottleRecord {
         true
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -647,7 +650,7 @@ impl Record for ThrottleRecord {
             "DRVLL" => Some(EpicsValue::Double(self.drvll)),
             "DRVLS" => Some(EpicsValue::Short(self.drvls)),
             "DRVLC" => Some(EpicsValue::Short(self.drvlc)),
-            "VER" => Some(EpicsValue::String(self.ver.clone().into())),
+            "VER" => Some(EpicsValue::String(self.ver.clone())),
             "STS" => Some(EpicsValue::Short(self.sts)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "DPREC" => Some(EpicsValue::Short(self.dprec)),
@@ -659,6 +662,24 @@ impl Record for ThrottleRecord {
             "SYNC" => Some(EpicsValue::Short(self.sync)),
             _ => None,
         }
+    }
+
+    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
+    /// `.db` file, as C's `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("OVAL", EpicsValue::Double(v)) => self.oval = v,
+            ("SENT", EpicsValue::Double(v)) => self.sent = v,
+            ("OSENT", EpicsValue::Double(v)) => self.osent = v,
+            ("WAIT", EpicsValue::Short(v)) => self.wait = v,
+            ("DRVLS", EpicsValue::Short(v)) => self.drvls = v,
+            ("VER", EpicsValue::String(v)) => self.ver = v,
+            ("STS", EpicsValue::Short(v)) => self.sts = v,
+            ("OV", EpicsValue::Short(v)) => self.link_status[0] = v,
+            ("SIV", EpicsValue::Short(v)) => self.link_status[1] = v,
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -942,13 +963,15 @@ impl Record for ThrottleRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         // C `init_record` (throttleRecord.c:133-228). Pass 0 copies the
-        // VERSION string into VER; the Rust port sets VER in `Default`
-        // instead (the framework constructs the record before init).
+        // VERSION string (`:51`) into VER over any `.db` value (line 149).
         //
         // Pass 1 (C lines 156-167): STS is reset to Unknown and VAL to
         // 0, and `limit_flag` is derived from `drvlh > drvll`. C also
         // resets the private delay/wait/sync flags to 0 — mirrored by
         // the runtime-state fields below.
+        if pass == 0 {
+            self.ver = "0-2-1".into();
+        }
         if pass == 1 {
             self.sts = 0; // throttleSTS_UNK
             self.val = 0.0;

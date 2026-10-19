@@ -814,7 +814,7 @@ fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option
     Some(match name {
         "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
-        | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
+        | "SEVR" | "STAT" | "NSEV" | "NSTA" | "OLDSIMM" => DbFieldType::Short,
         // The analog-alarm limits and the hysteresis margin are the one row
         // here whose stored type is the DECLARED type, and it varies by record:
         // `DBF_DOUBLE` on ai/ao/calc/calcout/sub/scalcout, `DBF_LONG` on
@@ -832,7 +832,7 @@ fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option
         // record whose hysteresis lives in `common.hyst`.
         "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => declared.unwrap_or(DbFieldType::Double),
         // The `DBF_UCHAR` flags. `bool` here, a NUMBER in C.
-        "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" | "PROC" => DbFieldType::Char,
+        "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" | "PROC" | "PUTF" | "PACT" => DbFieldType::Char,
         _ => return None,
     })
 }
@@ -7066,13 +7066,43 @@ impl RecordInstance {
         put
     }
 
+    /// [`Self::put_declared_field`] for a [`DeclaredStore::Member`] field: the
+    /// raw store through `slot_mut` in place of the record's `put_field`.
+    ///
+    /// [`DeclaredStore::Member`]: super::DeclaredStore::Member
+    pub(crate) fn store_declared_slot(
+        &mut self,
+        field: &str,
+        slot: super::FieldSlot,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        self.invalidate_plan_for(field);
+        let stored = match self.record.slot_mut(slot) {
+            Some(m) => m.store(value),
+            None => Err(CaError::FieldNotFound(field.to_string())),
+        };
+        self.refresh_dol_mode(field);
+        stored
+    }
+
     /// A `.db` field merged onto this installed record by a second
     /// `record(...)` block: the slot-aware funnel for a link, the declared
     /// funnel for anything else.
+    /// The record stores it through [`Record::load_field`].
     pub(crate) fn put_merged_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
+        self.invalidate_plan_for(field);
         match PreparedLink::for_put(self.record.field_list(), field, &value) {
-            Some(link) => self.put_link_field(link, value),
-            None => self.put_declared_field(field, value),
+            Some(link) => {
+                self.record.load_field(link.field(), value)?;
+                self.link_slots.install(link);
+                Ok(())
+            }
+            None => {
+                self.debug_assert_not_slotted(field, &value);
+                let put = self.record.load_field(field, value);
+                self.refresh_dol_mode(field);
+                put
+            }
         }
     }
 
@@ -10178,7 +10208,7 @@ impl RecordInstance {
     /// }
     /// ```
     ///
-    /// **The only writer of `CommonFields::oldsimm`.** Must run BEFORE the SIMM
+    /// **The only runtime writer of `CommonFields::oldsimm`.** Must run BEFORE the SIMM
     /// value moves — C calls it from `special(SPC_MOD)` pass 0 (before the put)
     /// and from `recGblGetSimm`/`recGblInitSimm` before the SIML read. The
     /// `sscn == 65535` guard is C's: with SSCN unset there is no scan to swap
@@ -10660,8 +10690,11 @@ impl RecordInstance {
         // The put entries hand the declared spelling already; only another
         // spelling allocates, under the caller's hold.
         let name = upper_field(name);
-        self.record.validate_put(&name, &value)?;
-        self.record.special(&name, false)?;
+        // C's `dbPutString` at load runs no `special()`; only `dbPut` does.
+        if matches!(bound, MenuBound::DbPut) {
+            self.record.validate_put(&name, &value)?;
+            self.record.special(&name, false, &self.common)?;
+        }
         // The db loader hands every common field to this path as a raw
         // `EpicsValue::String` (no per-field `FieldDesc` to parse against).
         // Coerce it to the field's canonical numeric/menu type up front so the
@@ -10695,10 +10728,17 @@ impl RecordInstance {
         // for them, so the stamp is bumped here and not per arm.
         self.invalidate_plan_for(&name);
         match &*name {
-            // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
-            // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
-            // simulation-mode owner (`rec_gbl_save_simm`).
-            "OLDSIMM" => return Err(CaError::ReadOnlyField(name.into_owned())),
+            // `special(SPC_NOMOD)`: C `dbPutSpecial` refuses the runtime put
+            // with `S_db_noMod` (dbAccess.c:123-127); `dbPutString` at load has
+            // no such gate, so a `.db` value is stored. PUTF and PACT likewise.
+            "OLDSIMM" | "PUTF" | "PACT" if matches!(bound, MenuBound::DbPut) => {
+                return Err(CaError::ReadOnlyField(name.into_owned()));
+            }
+            "OLDSIMM" => {
+                if let EpicsValue::Short(v) = value {
+                    self.common.oldsimm = v;
+                }
+            }
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.sevr = AlarmSeverity::from_u16(v as u16);
@@ -10774,7 +10814,7 @@ impl RecordInstance {
                 let result = self.set_scan(new_scan);
                 if !matches!(result, CommonFieldPutResult::NoChange) {
                     self.record.on_put(&name);
-                    self.record.special(&name, true)?;
+                    self.record.special(&name, true, &self.common)?;
                     return Ok(result);
                 }
             }
@@ -10991,7 +11031,7 @@ impl RecordInstance {
                     if old_phas != v && self.common.scan.scan_list().is_some() {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
-                        self.record.special(&name, true)?;
+                        self.record.special(&name, true, &self.common)?;
                         return Ok(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
@@ -11057,13 +11097,25 @@ impl RecordInstance {
                     self.common.disp = v;
                 }
             }
-            "PUTF" => return Err(CaError::ReadOnlyField("PUTF".into())),
+            "PUTF" => {
+                if let EpicsValue::Char(v) = value {
+                    self.common.putf = v != 0;
+                }
+            }
             "RPRO" => {
                 if let EpicsValue::Char(v) = value {
                     self.common.rpro = v;
                 }
             }
-            "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
+            // `run_init_pass0` releases it, as C `doInitRecord0` does.
+            "PACT" => match value {
+                EpicsValue::Char(0) => {
+                    // Nothing has run yet, so no put-notify waits on PACT.
+                    let _ = self.leave_pact();
+                }
+                EpicsValue::Char(_) => self.enter_pact(),
+                _ => {}
+            },
             // C `dbPut` stores the raw byte in `prec->proc` (retained across
             // processing — C never resets it); `coerce_common_field` has
             // already projected the put onto `DBF_UCHAR` (→ `Char`). The
@@ -11079,6 +11131,15 @@ impl RecordInstance {
             // one owner of "what type does this common field hold" — so every
             // writer (`.db` load, `caput`, a link) lands here with a numeric
             // value in the record's own alarm domain, `epicsInt64` included.
+            //
+            // The slot is "the framework runs the ladder", not the storage: a
+            // record type without it that declares the fields (motor's HSV/LSV)
+            // keeps them in the declared-override store, so a put reads back.
+            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HHSV" | "HSV" | "LSV" | "LLSV"
+                if self.common.analog_alarm.is_none() =>
+            {
+                return self.put_declared_override(&name, value, bound);
+            }
             "HIHI" => {
                 if let (Some(v), Some(a)) = (
                     AlarmLimit::from_stored(&value),
@@ -11169,7 +11230,7 @@ impl RecordInstance {
         // `dbPutSpecial(paddr, 1)` status to the caller — the stored value
         // stays, but the monitor post and the process are skipped and the
         // client sees the failure. Never drop it.
-        let special = self.record.special(&name, true);
+        let special = self.record.special(&name, true, &self.common);
         match link {
             Some(link) if matches!(&*name, "INP" | "OUT") => {
                 self.rebind_device_link(bound, link, special)?
@@ -16691,7 +16752,7 @@ mod forced_secondary_post_tests {
     fn ao_with_moved_rval(rval: i32) -> RecordInstance {
         let mut rec = AoRecord::default();
         rec.rval = rval;
-        rec.omod = true;
+        rec.omod = 1;
         RecordInstance::new("AO:FORCED", rec)
     }
 
@@ -17280,7 +17341,7 @@ mod mlis_tests {
     fn a_declared_field_post_compares_no_name_bytes() {
         let mut rec = AoRecord::default();
         rec.rval = 7;
-        rec.omod = true;
+        rec.omod = 1;
         let mut inst = RecordInstance::new("AO:PTR", rec);
         let mut readers: Vec<_> = ["VAL", "OVAL", "RVAL"]
             .into_iter()

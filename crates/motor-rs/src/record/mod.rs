@@ -221,11 +221,7 @@ impl MotorRecord {
     /// C 1335: the movn-block NTM stop — "We're going in the wrong
     /// direction. Readback problem?"
     pub(crate) fn report_ntm_stop(&self) {
-        println!(
-            "{}:tdir = {}",
-            self.trace.record(),
-            u8::from(self.stat.tdir)
-        );
+        println!("{}:tdir = {}", self.trace.record(), self.stat.tdir);
     }
 
     /// C syncTargetPosition (4414-4458). A failed RDBL read leaves the
@@ -374,7 +370,7 @@ impl MotorRecord {
         for command in commands {
             if built(&command) {
                 out.push(MotorCommand::MoveDirection {
-                    forward: self.stat.cdir,
+                    forward: self.stat.cdir != 0,
                 });
                 if strings && !matches!(command, MotorCommand::JogVelocity { .. }) {
                     out.push(MotorCommand::MoveStrings {
@@ -442,22 +438,24 @@ impl MotorRecord {
     /// C `MARK` / `MARK_AUX`: post these fields at the next `monitor()`.
     #[inline]
     pub(crate) fn mark(&mut self, bits: u64) {
-        self.internal.mmap |= bits;
+        debug_assert_eq!(bits & !(m::MMAP | m::NMAP), 0, "not a C mark");
+        self.internal.mmap |= bits as u32;
+        self.internal.nmap |= (bits >> 32) as u32;
     }
 
     /// DMOV as C writes it: marked where it changes (`if (pmr->dmov) { dmov
     /// = FALSE; MARK(M_DMOV); }`).
     pub(crate) fn set_dmov(&mut self, dmov: bool) {
-        if self.stat.dmov != dmov {
-            self.stat.dmov = dmov;
+        if (self.stat.dmov != 0) != dmov {
+            self.stat.dmov = i16::from(dmov);
             self.mark(m::DMOV);
         }
     }
 
     /// MOVN as `process_motor_info` posts it, on change (3746-3748).
     pub(crate) fn set_movn(&mut self, movn: bool) {
-        if self.stat.movn != movn {
-            self.stat.movn = movn;
+        if (self.stat.movn != 0) != movn {
+            self.stat.movn = i16::from(movn);
             self.mark(m::MOVN);
         }
     }
@@ -472,7 +470,8 @@ impl MotorRecord {
     /// C `UNMARK`.
     #[inline]
     pub(crate) fn unmark(&mut self, bits: u64) {
-        self.internal.mmap &= !bits;
+        self.internal.mmap &= !(bits as u32);
+        self.internal.nmap &= !((bits >> 32) as u32);
     }
 
     /// C init_record's tail (motorRecord.cc:720-746), after the device
@@ -483,8 +482,8 @@ impl MotorRecord {
         // no matter what the load wrote. In particular this
         // neutralizes any `special()` pass-0 blink a load-time /
         // restore write to a drive field may have left behind.
-        self.stat.dmov = true;
-        self.stat.movn = false;
+        self.stat.dmov = 1;
+        self.stat.movn = 0;
         self.mark(m::DMOV | m::MOVN | m::SPMG | m::DIFF | m::RDIF | m::MSTA);
         // C 734-743: LVIO starts clear; with soft limits enabled
         // (the dial pair not both 0), an initial dial readback
@@ -492,14 +491,14 @@ impl MotorRecord {
         // inverted pair, raises it. The slop is the SIGNED
         // resolution (C verbatim — a negative MRES narrows the
         // window).
-        self.limits.lvio = false;
+        self.limits.lvio = 0;
         let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
         if !limits_disabled
             && (self.pos.drbv > self.limits.dhlm + self.conv.mres
                 || self.pos.drbv < self.limits.dllm - self.conv.mres
                 || self.limits.dllm > self.limits.dhlm)
         {
-            self.limits.lvio = true;
+            self.limits.lvio = 1;
         }
         let _ = self.take_monitor_marks();
     }
@@ -508,7 +507,15 @@ impl MotorRecord {
     /// (motorRecord.cc:3645), with each switch mark carrying the raw switch
     /// `monitor()` posts beside it (3576-3589).
     fn take_monitor_marks(&mut self) -> u64 {
-        let mut bits = std::mem::take(&mut self.internal.mmap) & !m::RBV;
+        let mmap = std::mem::take(&mut self.internal.mmap);
+        let nmap = std::mem::take(&mut self.internal.nmap);
+        // The short circuit (3552) reads both whole words, past the upper
+        // block's UNMARKs (3509-3549).
+        self.internal.monitor_lower_marked = mmap & !((m::UPPER | m::RBV) as u32) != 0 || nmap != 0;
+        let mut bits = (u64::from(mmap) & m::MMAP | u64::from(nmap) << 32 & m::NMAP) & !m::RBV;
+        if std::mem::take(&mut self.internal.ueip_posted) {
+            bits |= m::UEIP_POSTED;
+        }
         let same = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
         if bits & m::HLS != 0 {
             bits |= if same { m::RHLS } else { m::RLLS };
@@ -524,9 +531,6 @@ impl MotorRecord {
                 bits |= m::CNEN;
             }
         }
-        // The short circuit (3550-3551) reads C's own bits only.
-        self.internal.monitor_lower_marked =
-            bits & m::MONITOR & !(m::UPPER | m::RHLS | m::RLLS | m::UEIP_POSTED) != 0;
         bits
     }
 
@@ -574,7 +578,7 @@ impl Record for MotorRecord {
     }
 
     fn is_put_complete(&self) -> bool {
-        self.stat.dmov
+        self.stat.dmov != 0
     }
 
     // C RSET per-field metadata (motorRecord.cc get_units 3156-3208,
@@ -636,7 +640,7 @@ impl Record for MotorRecord {
     /// standard.") Reading DMOV directly at FLNK time IS the C gate by
     /// construction — there is no per-path suppression state to track.
     fn should_fire_forward_link(&self) -> bool {
-        self.stat.dmov
+        self.stat.dmov != 0
     }
 
     /// Input links the framework must resolve via `dbGetLink` BEFORE each
@@ -667,7 +671,7 @@ impl Record for MotorRecord {
         // a CALLBACK_DATA poll mid-move (motorRecord.cc:1487-1492). Gating on
         // DMOV mirrors that dominant condition and stops a device poll from
         // re-reading DOL and clobbering the in-flight target every cycle.
-        if self.stat.dmov && self.closed_loop_dol_collection() {
+        if self.stat.dmov != 0 && self.closed_loop_dol_collection() {
             actions.push(ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",
@@ -707,7 +711,7 @@ impl Record for MotorRecord {
         // The outcome is latched here — gated exactly like the
         // pre_process_actions request — and applied to the framework's
         // CommonFields.udf in check_alarms (the C alarm_sub consumer).
-        if self.stat.dmov && self.closed_loop_dol_collection() {
+        if self.stat.dmov != 0 && self.closed_loop_dol_collection() {
             self.internal.dol_udf = Some(!resolved.contains("DOL"));
         }
         if self.conv.urip && !self.conv.ueip {
@@ -717,6 +721,10 @@ impl Record for MotorRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         field_access::motor_get_field(self, name)
+    }
+
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        field_access::motor_load_field(self, name, value)
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -758,17 +766,22 @@ impl Record for MotorRecord {
     /// fields); a drive put to a processing-disabled motor blinks DMOV
     /// low and it stays low until the record next processes, where C
     /// keeps DMOV=1. Known divergence.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after {
             return Ok(());
         }
         if ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"]
             .iter()
             .any(|f| field.eq_ignore_ascii_case(f))
-            && self.stat.dmov
+            && self.stat.dmov != 0
         {
             // C 2603-2606 posts the blink itself.
-            self.stat.dmov = false;
+            self.stat.dmov = 0;
             self.internal.put_posted |= m::PUT_DMOV;
         }
         Ok(())
@@ -782,6 +795,9 @@ impl Record for MotorRecord {
     /// `field_access::motor_sync_speed_at_init` and
     /// `field_access::motor_sync_limits_at_init`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.internal.vers = field_access::MOTOR_RECORD_VERSION;
+        }
         if pass == 1 {
             // C init_record runs check_speed_and_resolution (641) with the
             // resolution triple first (3905-3927), then the speed pairs,
@@ -859,7 +875,7 @@ impl Record for MotorRecord {
         _gate: MonitorValueGate,
         last_posted: &mut [f64; 2],
     ) -> MonitorValueClasses {
-        let marked = self.internal.mmap & m::RBV != 0;
+        let marked = self.internal.mmap & m::RBV as u32 != 0;
         self.unmark(m::RBV);
         let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
         let crossed = |del: f64, last: &mut f64| {
@@ -982,11 +998,11 @@ impl MotorRecord {
         // and a DVAL outside the dial soft limits alarms too.
         let hlsv = AlarmSeverity::from_u16(self.limits.hlsv as u16);
         if hlsv != AlarmSeverity::NoAlarm {
-            if self.limits.hls || self.pos.dval > self.limits.dhlm {
+            if self.limits.hls != 0 || self.pos.dval > self.limits.dhlm {
                 rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hlsv);
                 return;
             }
-            if self.limits.lls || self.pos.dval < self.limits.dllm {
+            if self.limits.lls != 0 || self.pos.dval < self.limits.dllm {
                 rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, hlsv);
                 return;
             }
@@ -1048,7 +1064,7 @@ mod tests {
         // collection — no controller command is dispatched (LOAD_POS
         // belongs to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
         assert!(effects.commands.is_empty());
-        assert!(rec.stat.dmov);
+        assert!(rec.stat.dmov != 0);
         assert!(rec.stat.mip.is_empty());
     }
 
@@ -1058,7 +1074,7 @@ mod tests {
         assert!(rec.should_fire_forward_link());
 
         // C motorRecord.cc:1509-1510: DMOV is the only FLNK gate.
-        rec.stat.dmov = false;
+        rec.stat.dmov = 0;
         assert!(!rec.should_fire_forward_link());
     }
 
@@ -1120,7 +1136,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let outcome = rec.process().unwrap();
-        assert!(!rec.stat.dmov, "the pass started the move");
+        assert!(rec.stat.dmov == 0, "the pass started the move");
         let rbv = rec.pos.rbv;
         assert!(
             outcome.actions.iter().any(|a| matches!(
@@ -1161,7 +1177,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         rec.process().unwrap();
-        assert!(!rec.stat.dmov, "the pass started the move");
+        assert!(rec.stat.dmov == 0, "the pass started the move");
         let fields: Vec<(&str, EpicsValue)> = rec
             .take_cycle_posted_fields()
             .map(|(ix, _)| {
@@ -1277,7 +1293,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // menuOmsl: closed_loop
         rec.links.dol = "setpoint_src.VAL".into(); // resolves to a DB link
-        assert!(rec.stat.dmov, "record starts done");
+        assert!(rec.stat.dmov != 0, "record starts done");
         assert!(
             has_dol_read(&rec.pre_process_actions()),
             "CLOSED_LOOP with a DB DOL must read DOL into VAL"
@@ -1304,7 +1320,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
         rec.links.dol = "setpoint_src.VAL".into();
-        assert!(rec.stat.dmov, "record starts done");
+        assert!(rec.stat.dmov != 0, "record starts done");
         let mut common = CommonFields::default();
 
         // Failed read: the resolved report omits DOL.
@@ -1334,7 +1350,7 @@ mod tests {
     #[test]
     fn request_poll_forces_poll_directive() {
         let mut rec = MotorRecord::new();
-        rec.stat.dmov = true;
+        rec.stat.dmov = 1;
         assert!(
             !rec.effects_to_actions(&ProcessEffects::default())
                 .force_poll
@@ -1456,7 +1472,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
         rec.links.dol = "setpoint_src.VAL".into();
-        rec.stat.dmov = false; // a move is in flight
+        rec.stat.dmov = 0; // a move is in flight
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "DOL must not be re-read while a move is in flight"
@@ -1468,7 +1484,7 @@ mod tests {
     #[test]
     fn test_flnk_fires_on_idle_pass_with_dmov_true() {
         let mut rec = MotorRecord::new();
-        assert!(rec.stat.dmov);
+        assert!(rec.stat.dmov != 0);
         let _ = rec.process();
         assert!(
             rec.should_fire_forward_link(),
@@ -1483,7 +1499,7 @@ mod tests {
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let _ = rec.process();
-        assert!(!rec.stat.dmov); // moving
+        assert!(rec.stat.dmov == 0); // moving
         assert!(!rec.should_fire_forward_link()); // suppressed while moving
 
         // Driver reports completion; next process finalizes DMOV false→true.
@@ -1497,7 +1513,7 @@ mod tests {
             },
         ));
         let _ = rec.process();
-        assert!(rec.stat.dmov); // completed
+        assert!(rec.stat.dmov != 0); // completed
         assert!(
             rec.should_fire_forward_link(),
             "FLNK must fire on the DMOV false→true completion transition"

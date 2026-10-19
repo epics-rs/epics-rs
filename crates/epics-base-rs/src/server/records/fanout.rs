@@ -33,7 +33,8 @@ static FANOUT_POSTED: [crate::server::record::FieldIx; 2] = crate::server::recor
     type = "fanout",
     constant_init = "SELL:SELN",
     no_value_monitor,
-    process_posted_fields = FANOUT_POSTED
+    process_posted_fields = FANOUT_POSTED,
+    spill()
 )]
 pub struct FanoutRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (fanoutRecord.dbd:21-25) — the

@@ -30,6 +30,9 @@ const SCALCOUT_RPCL_SIZE: usize = 282;
 /// OCAL provides optional output calculation.
 /// Output decision controlled by OOPT.
 pub struct ScalcoutRecord {
+    /// VERS: C `vers = VERSION` in `init_record` pass 0; a `.db` VERS lands
+    /// until then.
+    vers: f64,
     pub val: f64,
     pub sval: PvString,
     pub calc: String,
@@ -219,6 +222,7 @@ pub struct ScalcoutRecord {
 impl Default for ScalcoutRecord {
     fn default() -> Self {
         Self {
+            vers: VERSION,
             val: 0.0,
             sval: PvString::new(),
             calc: String::new(),
@@ -771,6 +775,33 @@ const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 
 impl Record for ScalcoutRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::scalcout;
+        fields:
+        PA => pa[0],
+        PB => pa[1],
+        PC => pa[2],
+        PD => pa[3],
+        PE => pa[4],
+        PF => pa[5],
+        PG => pa[6],
+        PH => pa[7],
+        PI => pa[8],
+        PJ => pa[9],
+        PK => pa[10],
+        PL => pa[11],
+        PSVL => psvl,
+        OSV => osv,
+        POSV => posv,
+        VERS => vers;
+        custom: VAL, SVAL, PVAL, CALC, CLCV, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH,
+            INPI, INPJ, INPK, INPL, INAA, INBB, INCC, INDD, INEE, INFF, INGG, INHH, INII, INJJ,
+            INKK, INLL, OUT, INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV, INJV, INKV,
+            INLV, IAAV, IBBV, ICCV, IDDV, IEEV, IFFV, IGGV, IHHV, IIIV, IJJV, IKKV, ILLV, OUTV,
+            OOPT, ODLY, WAIT, DLYA, DOPT, OCAL, OCLV, OEVT, IVOA, IVOV, PREC, ADEL, MDEL, A, B,
+            C, D, E, F, G, H, I, J, K, L, AA, BB, CC, DD, EE, FF, GG, HH, II, JJ, KK, LL, PAA,
+            PBB, PCC, PDD, PEE, PFF, PGG, PHH, PII, PJJ, PKK, PLL, OVAL, POVL, LALM, ALST, MLST;
+        spill: RPVT, EGU, HOPR, LOPR, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, STRS);
+
     fn stamp_point(&self) -> crate::server::record::StampPoint {
         crate::server::record::StampPoint::AfterAlarms
     }
@@ -830,6 +861,9 @@ impl Record for ScalcoutRecord {
     /// does. Unlike calcout, a bad OCAL is reported whatever DOPT says.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            self.vers = VERSION;
+        } else {
+            // C `sCalcoutRecord.c:290-304`, after the pass-0 return at :237.
             let report = self.recompile_calc("scalcout: init_record: Illegal CALC field");
             self.init_report(report);
             let report = self.recompile_ocal("scalcout: init_record: Illegal OCAL field");
@@ -842,7 +876,12 @@ impl Record for ScalcoutRecord {
     /// into RPCL/ORPC, stores `sCalcPostfix()`'s return status in CLCV/OCLV,
     /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED even for a
     /// garbage expression (unlike calcRecord, which refuses it — R8-1).
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -1284,9 +1323,7 @@ impl Record for ScalcoutRecord {
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::UShort(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
-            // Fixed code-version constant, C `pcalc->vers = VERSION` in
-            // init_record; never the `.dbd` initial.
-            "VERS" => Some(EpicsValue::Double(VERSION)),
+            "VERS" => Some(EpicsValue::Double(self.vers)),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -1470,7 +1507,14 @@ impl Record for ScalcoutRecord {
                     .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?;
                 Ok(())
             }
-            "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
+            // SPC_NOMOD: refused at runtime by `check_no_mod_in_db_put`.
+            "DLYA" => {
+                self.dlya = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("DLYA".into()))?
+                    as u16;
+                Ok(())
+            }
             "OEVT" => {
                 self.oevt = value
                     .to_f64()
@@ -1478,8 +1522,6 @@ impl Record for ScalcoutRecord {
                     as u16;
                 Ok(())
             }
-            // VERS is a fixed code-version constant; accept and ignore writes.
-            "VERS" => Ok(()),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     self.num_vals[idx] = value
@@ -1881,13 +1923,19 @@ mod tests {
 
     /// VERS is the code-version constant (C `sCalcoutRecord.c:55 #define
     /// VERSION 4.1`, written `pcalc->vers = VERSION` in init_record), NOT the
-    /// `.dbd` `initial("1")`. A write is accepted-and-ignored, matching
-    /// acalcout.
+    /// `.dbd` `initial("1")`. A `.db` VERS is stored like any field and
+    /// holds until `init_record` pass 0 writes the constant over it.
     #[test]
-    fn vers_is_the_version_constant_and_ignores_writes() {
+    fn vers_is_the_version_constant_after_init_record() {
+        use crate::server::record::dbd_generated::slots;
         let mut rec = ScalcoutRecord::new();
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
-        assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
+        rec.slot_mut(slots::scalcout::VERS)
+            .unwrap()
+            .store(EpicsValue::Double(99.0))
+            .unwrap();
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(99.0)));
+        rec.init_record(0).unwrap();
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(4.1)));
     }
 
@@ -1933,7 +1981,7 @@ mod tests {
         // A finite result clears UDF (C `else pcalc->udf = FALSE`).
         rec.put_field("CALC", EpicsValue::String("1+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         rec.check_alarms(&mut common);
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(2.0)));
@@ -1942,7 +1990,7 @@ mod tests {
         // C raises CALC_ALARM (`if(stat)`) and leaves `udf` at FALSE.
         rec.put_field("CALC", EpicsValue::String("".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         rec.check_alarms(&mut common);
         assert_eq!(
@@ -1986,7 +2034,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
         rec.put_field("MDEL", EpicsValue::Double(2.0)).unwrap();
 
@@ -2018,7 +2066,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
 
         rec.put_field("AA", EpicsValue::String("first".into()))
@@ -2045,7 +2093,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.take_cycle_posted_fields();
         rec.put_field("AA", EpicsValue::String("first".into()))
             .unwrap();
@@ -2079,7 +2127,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("VAL+1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 1.0);
         rec.process().unwrap();
@@ -2097,10 +2145,10 @@ mod tests {
         // would be 101 forever.
         rec.put_field("CALC", EpicsValue::String("100".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("VAL+1".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
 
@@ -2121,7 +2169,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
     }
@@ -2135,7 +2183,7 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+BB".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.sval, "hello world");
     }
@@ -2145,7 +2193,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, 42.0);
@@ -2156,7 +2204,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
 
         // First process — value changes from 0 to 5
@@ -2176,10 +2224,10 @@ mod tests {
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*2".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 10.0); // CALC result
@@ -2211,10 +2259,10 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.osv, "hi");
@@ -2313,14 +2361,14 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0, "good calc seeds VAL");
         // Now break the CALC: a bare binary operator underflows the stack.
         rec.put_field("CALC", EpicsValue::String("+".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, -1.0, "calc-fail forces VAL=-1 (C:361)");
         assert_eq!(rec.sval, "***ERROR***", "calc-fail forces SVAL (C:363)");
@@ -2335,19 +2383,19 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("OCAL", EpicsValue::String("5".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, 5.0, "good OCAL seeds OVAL");
         assert_eq!(rec.val, 3.0, "CALC side is unaffected");
         // Break OCAL: a bare binary operator underflows the stack.
         rec.put_field("OCAL", EpicsValue::String("+".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, -1.0, "OCAL-fail forces OVAL=-1 (C:771)");
         assert_eq!(rec.osv, "***ERROR***", "OCAL-fail forces OSV (C:772)");
@@ -2365,13 +2413,13 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("AA".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("AA", EpicsValue::String("calc-str".into()))
             .unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("OCAL", EpicsValue::String("BB".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("BB", EpicsValue::String("ocal-str".into()))
             .unwrap();
         rec.process().unwrap();

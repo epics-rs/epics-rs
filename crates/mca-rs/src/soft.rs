@@ -147,7 +147,7 @@ mod tests {
     fn the_soft_device_does_not_destroy_the_dwell_time() {
         let (mut dev, mut rec) = soft_mca(16);
         rec.put_field("DWEL", EpicsValue::Double(0.5)).unwrap();
-        rec.special("DWEL", true).unwrap();
+        rec.special("DWEL", true, &Default::default()).unwrap();
         cycle(&mut dev, &mut rec);
         assert_eq!(rec.dwel, 0.5);
     }

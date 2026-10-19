@@ -3,7 +3,6 @@ use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
 };
-use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
@@ -31,7 +30,7 @@ pub struct AoRecord {
     /// where VAL's own monitor mask is empty (`:535`), which is why it is a
     /// field and not a local: OROC can walk OVAL one step per cycle toward a
     /// VAL that has not moved since MLST.
-    pub omod: bool,
+    pub omod: u8,
     pub rbv: i32,  // readback value
     pub orbv: i32, // old readback value
     pub oval: f64,
@@ -70,9 +69,10 @@ pub struct AoRecord {
     pub alst: f64,
     pub mlst: f64,
     // Runtime
-    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
-    /// `SPC_LINCONV` put, cleared at the end of every `process`.
-    pub init: ConvertPhase,
+    /// C `prec->init`: nonzero while the next conversion is the initial one.
+    /// Set by `init_record` and by an `SPC_LINCONV` put, cleared at the end of
+    /// every `process`.
+    pub init: i16,
     /// Set by `convert()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the engineering value
     /// fell past an end of the table. C `aoRecord.c::convert` raises
@@ -124,7 +124,7 @@ impl Default for AoRecord {
             drvl: 0.0,
             rval: 0,
             oraw: 0,
-            omod: false,
+            omod: 0,
             rbv: 0,
             orbv: 0,
             oval: 0.0,
@@ -148,7 +148,7 @@ impl Default for AoRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: ConvertPhase::default(),
+            init: 0,
             bpt_error: false,
             readback_bpt_error: false,
             bpt_registry: None,
@@ -200,7 +200,7 @@ impl AoRecord {
 
         // C `aoRecord.c:482-483`, in this order: the flag is the comparison
         // against the PREVIOUS oval, then oval takes the new value.
-        self.omod = self.oval != value;
+        self.omod = u8::from(self.oval != value);
         self.oval = value; // oval = rate-limited output value
 
         // convert(): engineering units to raw value
@@ -350,6 +350,7 @@ impl Record for AoRecord {
     // LINR/EGUF/EGUL reset the convert in `put_field`; menus are stored as
     // `i16` and served as ENUM, so neither maps.
     crate::slot_map!(crate::server::record::dbd_generated::slots::ao;
+        fields:
         VAL => val,
         OVAL => oval,
         OROC => oroc,
@@ -368,15 +369,19 @@ impl Record for AoRecord {
         MDEL => mdel,
         RVAL => rval,
         SDLY => sdly,
-        IVOV => ivov;
-        read_only:
+        IVOV => ivov,
         ORAW => oraw,
         RBV => rbv,
         ORBV => orbv,
         PVAL => pval,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst,
+        INIT => init,
+        OMOD => omod;
+        custom: DOL, OMSL, OIF, LINR, EGUF, EGUL, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, PBRK, LBRK, OLDSIMM,
+            SSCN, SIMPVT);
 
     fn held_pointer(&self, field: &str) -> Option<usize> {
         match field {
@@ -541,9 +546,10 @@ impl Record for AoRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `aoRecord.c:120`: `prec->init = TRUE;`
-            self.init = ConvertPhase::Initial;
+        if pass == 1 {
+            // C `aoRecord.c:120`, after pass 0 returned at :103:
+            // `prec->init = TRUE;`
+            self.init = 1;
         }
         Ok(())
     }
@@ -588,7 +594,7 @@ impl Record for AoRecord {
         if value_mask.bits() | u16::from(self.omod) == 0 {
             return crate::server::record::SecondaryTake::NONE;
         }
-        let widened = std::mem::take(&mut self.omod);
+        let widened = std::mem::take(&mut self.omod) != 0;
         let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
         let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
         crate::server::record::SecondaryTake::new(
@@ -618,7 +624,7 @@ impl Record for AoRecord {
         self.skip_convert = false;
         // C `aoRecord.c:237`: `prec->init = FALSE;` on the way out of EVERY
         // process, not just the first one.
-        self.init = ConvertPhase::Converted;
+        self.init = 0;
         Ok(ProcessOutcome::complete())
     }
 
@@ -742,7 +748,7 @@ impl Record for AoRecord {
             "RBV" => Some(EpicsValue::Long(self.rbv)),
             "ORBV" => Some(EpicsValue::Long(self.orbv)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
-            "OMOD" => Some(EpicsValue::UChar(self.omod as u8)),
+            "OMOD" => Some(EpicsValue::UChar(self.omod)),
             "LINR" => Some(EpicsValue::Short(self.linr)),
             "EGUF" => Some(EpicsValue::Double(self.eguf)),
             "EGUL" => Some(EpicsValue::Double(self.egul)),
@@ -763,7 +769,7 @@ impl Record for AoRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(self.init.as_field()),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -869,7 +875,7 @@ impl Record for AoRecord {
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv`); drop the cached table + interval
                     // index so the next conversion resolves the new LINR.
@@ -882,7 +888,7 @@ impl Record for AoRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -890,7 +896,7 @@ impl Record for AoRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

@@ -33,7 +33,7 @@ fn make_builder(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorBuilder {
             rec.limits.dllm = -100.0;
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
-            rec.limits.lvio = false;
+            rec.limits.lvio = 0;
             rec.vel.velo = 100000.0; // very fast for tests
             rec.vel.accl = 0.5;
             rec.vel.bvel = 100000.0;
@@ -81,7 +81,7 @@ async fn test_full_move_via_mailbox() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(!setup.record.stat.dmov);
+    assert!(setup.record.stat.dmov == 0);
 
     // Wait for DMOV=true with polling
     let record_ref = &mut setup.record;
@@ -90,7 +90,7 @@ async fn test_full_move_via_mailbox() {
         // Process record to pick up device updates
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov
+        record_ref.stat.dmov != 0
     })
     .await;
 
@@ -123,7 +123,7 @@ async fn test_stop_during_move() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(!setup.record.stat.dmov);
+    assert!(setup.record.stat.dmov == 0);
 
     // Let it move a bit
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -144,7 +144,7 @@ async fn test_stop_during_move() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov
+        record_ref.stat.dmov != 0
     })
     .await;
 
@@ -168,7 +168,7 @@ async fn test_delay_via_poll_loop() {
             rec.limits.dllm = -100.0;
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
-            rec.limits.lvio = false;
+            rec.limits.lvio = 0;
             rec.vel.velo = 100000.0; // very fast
             rec.vel.accl = 0.5;
             rec.vel.bvel = 5.0;
@@ -200,7 +200,7 @@ async fn test_delay_via_poll_loop() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov
+        record_ref.stat.dmov != 0
     })
     .await;
 
@@ -230,7 +230,7 @@ async fn test_backlash_via_mailbox() {
             rec.limits.dllm = -100.0;
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
-            rec.limits.lvio = false;
+            rec.limits.lvio = 0;
             rec.vel.velo = 100000.0;
             rec.vel.accl = 0.5;
             rec.vel.bvel = 100000.0;
@@ -255,7 +255,7 @@ async fn test_backlash_via_mailbox() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(!setup.record.stat.dmov);
+    assert!(setup.record.stat.dmov == 0);
 
     // Wait for DMOV
     let record_ref = &mut setup.record;
@@ -263,7 +263,7 @@ async fn test_backlash_via_mailbox() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov
+        record_ref.stat.dmov != 0
     })
     .await;
 
@@ -520,7 +520,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
             Ok(Some(())) => {
                 setup.device_support.arm_readback_callback();
                 setup.record.process().unwrap();
-                if setup.record.stat.dmov && setup.record.stat.phase == MotionPhase::Idle {
+                if setup.record.stat.dmov != 0 && setup.record.stat.phase == MotionPhase::Idle {
                     completed = true;
                     // Drop any moving-phase io_intr still buffered, so a
                     // leftover cannot hand the resume a free pass. This must
@@ -553,7 +553,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
             Err(_) => continue,
         }
     }
-    assert!(setup.record.ctrl.jogf, "the button stays latched");
+    assert!(setup.record.ctrl.jogf != 0, "the button stays latched");
 
     // Phase 3: a fresh press on the idle record arms and starts the jog.
     setup
@@ -1214,7 +1214,7 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         "restored DVAL survives init and the Startup pass"
     );
     assert_eq!(setup.record.pos.dval, 1.5);
-    assert!(setup.record.stat.dmov, "restored axis comes up done");
+    assert!(setup.record.stat.dmov != 0, "restored axis comes up done");
     assert_eq!(
         moves.load(Ordering::SeqCst),
         0,

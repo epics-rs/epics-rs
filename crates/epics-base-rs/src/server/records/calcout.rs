@@ -703,6 +703,7 @@ const CALCOUT_PROCESS_POSTED: [&str; 23] = [
 impl Record for CalcoutRecord {
     // The menus are `i16` served as ENUM, so they map no slot.
     crate::slot_map!(crate::server::record::dbd_generated::slots::calcout;
+        fields:
         VAL => val,
         PVAL => pval,
         CLCV => clcv,
@@ -736,8 +737,7 @@ impl Record for CalcoutRecord {
         S => s,
         T => t,
         U => u,
-        OVAL => oval;
-        read_only:
+        OVAL => oval,
         LA => la,
         LB => lb,
         LC => lc,
@@ -762,7 +762,12 @@ impl Record for CalcoutRecord {
         LALM => lalm,
         ALST => alst,
         MLST => mlst,
-        DLYA => dlya);
+        DLYA => dlya;
+        custom: CALC, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ, INPK, INPL,
+            INPM, INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU, INAV, INBV, INCV, INDV, INEV,
+            INFV, INGV, INHV, INIV, INJV, INKV, INLV, INMV, INNV, INOV, INPV, INQV, INRV, INSV,
+            INTV, INUV, OUTV, OOPT, DOPT, OCAL, OEVT, IVOA, POVL;
+        spill: RPVT, OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST);
 
     fn stamp_point(&self) -> crate::server::record::StampPoint {
         crate::server::record::StampPoint::AfterAlarms
@@ -1015,8 +1020,9 @@ impl Record for CalcoutRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `calcoutRecord.c::init_record:191-205` — `clcv = postfix(...)`
+        if pass == 1 {
+            // C `calcoutRecord.c::init_record:191-205`, after the pass-0 return
+            // at :139-142 — `clcv = postfix(...)`
             // and `oclv = postfix(...)`, UNCONDITIONALLY, both logged but never
             // fatal. Base `postfix()` refuses an empty expression
             // (`postfix.c:235-240`: CALC_ERR_NULL_ARG, return -1), so C's own
@@ -1438,7 +1444,14 @@ impl Record for CalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("ODLY".into())),
             },
-            "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
+            // SPC_NOMOD: refused at runtime by `check_no_mod_in_db_put`.
+            "DLYA" => {
+                self.dlya = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("DLYA".into()))?
+                    as u16;
+                Ok(())
+            }
             "OEVT" => match value {
                 EpicsValue::String(s) => {
                     self.oevt = s;
@@ -1829,7 +1842,12 @@ impl Record for CalcoutRecord {
         self.refresh_link_status();
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -2054,6 +2072,7 @@ mod process_tests {
         assert!(rec.pval.is_nan());
         // Transient: a process cycle latches pval = val (0.0 here).
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.pval, rec.val);
     }
@@ -2067,6 +2086,7 @@ mod process_tests {
             ..Default::default()
         };
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 1.0);
         rec.process().unwrap();
@@ -2131,6 +2151,7 @@ mod process_tests {
             ..Default::default()
         };
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 0.0);
         assert_eq!(rec.oval, 1.0);
@@ -2151,6 +2172,7 @@ mod process_tests {
         // CALC fails (empty program), DOPT=Use VAL so no OCAL runs → "calcPerform".
         let mut rec = CalcoutRecord::default();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);
@@ -2166,6 +2188,7 @@ mod process_tests {
             ..Default::default()
         };
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);
@@ -2181,6 +2204,7 @@ mod process_tests {
             ..Default::default()
         };
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);

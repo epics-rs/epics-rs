@@ -295,6 +295,7 @@ enum Chan {
     Nov,
     Ne,
     Nev,
+    Onv,
 }
 
 /// Parse a per-channel field name into `(family, channel index)`.
@@ -316,6 +317,7 @@ fn parse_channel(name: &str) -> Option<(Chan, usize)> {
         b"NOV" => Chan::Nov,
         b"NE" => Chan::Ne,
         b"NEV" => Chan::Nev,
+        b"ONV" => Chan::Onv,
         _ => return None,
     };
     Some((chan, idx))
@@ -567,6 +569,32 @@ fn same_prefix(old: &EpicsValue, new: &EpicsValue, nev: i32) -> bool {
 }
 
 impl Record for ASubRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::aSub;
+        fields:
+        VAL => val,
+        OVAL => oval,
+        SNAM => snam,
+        INAM => inam,
+        ONAM => onam,
+        PREC => prec;
+        custom: LFLG, SUBL, BRSV, EFLG, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI,
+            INPJ, INPK, INPL, INPM, INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU, A, B, C, D,
+            E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, FTA, FTB, FTC, FTD, FTE, FTF,
+            FTG, FTH, FTI, FTJ, FTK, FTL, FTM, FTN, FTO, FTP, FTQ, FTR, FTS, FTT, FTU, NOA, NOB,
+            NOC, NOD, NOE, NOF, NOG, NOH, NOI, NOJ, NOK, NOL, NOM, NON, NOO, NOP, NOQ, NOR, NOS,
+            NOT, NOU, NEA, NEB, NEC, NED, NEE, NEF, NEG, NEH, NEI, NEJ, NEK, NEL, NEM, NEN, NEO,
+            NEP, NEQ, NER, NES, NET, NEU, ONVA, ONVB, ONVC, ONVD, ONVE, ONVF, ONVG, ONVH, ONVI,
+            ONVJ, ONVK, ONVL, ONVM, ONVN, ONVO, ONVP, ONVQ, ONVR, ONVS, ONVT, ONVU, OUTA, OUTB, OUTC, OUTD, OUTE, OUTF, OUTG, OUTH, OUTI,
+            OUTJ, OUTK, OUTL, OUTM, OUTN, OUTO, OUTP, OUTQ, OUTR, OUTS, OUTT, OUTU, VALA, VALB,
+            VALC, VALD, VALE, VALF, VALG, VALH, VALI, VALJ, VALK, VALL, VALM, VALN, VALO, VALP,
+            VALQ, VALR, VALS, VALT, VALU, FTVA, FTVB, FTVC, FTVD, FTVE, FTVF, FTVG, FTVH, FTVI,
+            FTVJ, FTVK, FTVL, FTVM, FTVN, FTVO, FTVP, FTVQ, FTVR, FTVS, FTVT, FTVU, NOVA, NOVB,
+            NOVC, NOVD, NOVE, NOVF, NOVG, NOVH, NOVI, NOVJ, NOVK, NOVL, NOVM, NOVN, NOVO, NOVP,
+            NOVQ, NOVR, NOVS, NOVT, NOVU, NEVA, NEVB, NEVC, NEVD, NEVE, NEVF, NEVG, NEVH, NEVI,
+            NEVJ, NEVK, NEVL, NEVM, NEVN, NEVO, NEVP, NEVQ, NEVR, NEVS, NEVT, NEVU;
+        spill: SADR, CADR, OVLA, OVLB, OVLC, OVLD, OVLE, OVLF, OVLG, OVLH, OVLI, OVLJ, OVLK,
+            OVLL, OVLM, OVLN, OVLO, OVLP, OVLQ, OVLR, OVLS, OVLT, OVLU);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -726,6 +754,7 @@ impl Record for ASubRecord {
                 Chan::Nov => EpicsValue::ULong(self.nova[idx] as u32),
                 Chan::Ne => EpicsValue::ULong(self.nea[idx] as u32),
                 Chan::Nev => EpicsValue::ULong(self.neva[idx] as u32),
+                Chan::Onv => EpicsValue::ULong(self.onva[idx] as u32),
             });
         }
         match name {
@@ -879,7 +908,7 @@ impl Record for ASubRecord {
                 }
                 ChannelDelivery::Empty => self.neva[idx] = 0,
             },
-            Chan::Ft | Chan::Ftv | Chan::No | Chan::Nov | Chan::Ne | Chan::Nev => {
+            Chan::Ft | Chan::Ftv | Chan::No | Chan::Nov | Chan::Ne | Chan::Nev | Chan::Onv => {
                 let v = match value {
                     EpicsValue::Short(v) => v as i32,
                     EpicsValue::Long(v) => v,
@@ -921,6 +950,8 @@ impl Record for ASubRecord {
                     }
                     Chan::Ne => self.nea[idx] = v,
                     Chan::Nev => self.neva[idx] = v,
+                    // SPC_NOMOD: the load path only.
+                    Chan::Onv => self.onva[idx] = v,
                     _ => unreachable!(),
                 }
             }

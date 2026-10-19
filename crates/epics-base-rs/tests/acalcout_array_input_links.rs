@@ -53,7 +53,7 @@ async fn r11_61_array_input_link_populates_aa() {
     a.put_field("NELM", EpicsValue::ULong(5)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("WF".into()))
         .unwrap();
     db.add_record("ACALC", Box::new(a)).await.unwrap();
@@ -79,7 +79,7 @@ async fn r11_61_short_array_source_zero_fills_the_tail() {
     a.put_field("NELM", EpicsValue::ULong(5)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("WF2".into()))
         .unwrap();
     db.add_record("ACALC2", Box::new(a)).await.unwrap();

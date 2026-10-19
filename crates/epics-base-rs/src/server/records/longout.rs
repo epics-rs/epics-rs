@@ -185,6 +185,7 @@ impl Record for LongoutRecord {
     // The alarm ladder lives in dbCommon's analog block; the menus are
     // stored as `i16` and served as ENUM. Neither maps.
     crate::slot_map!(crate::server::record::dbd_generated::slots::longout;
+        fields:
         VAL => val,
         EGU => egu,
         DRVH => drvh,
@@ -195,11 +196,12 @@ impl Record for LongoutRecord {
         MDEL => mdel,
         SDLY => sdly,
         IVOV => ivov,
-        PVAL => pval;
-        read_only:
+        PVAL => pval,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst;
+        custom: DOL, OMSL, SIOL, SIML, SIMM, SIMS, IVOA, OOCH, OOPT;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -566,7 +568,12 @@ impl Record for LongoutRecord {
     /// AFTER the `special(name, false)` validation hook — so by the
     /// time we run, `instance.common.text.out` already holds the new value
     /// (we don't need to read it; just react to the field name).
-    fn special(&mut self, field: &str, after: bool) -> crate::error::CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> crate::error::CaResult<()> {
         if after && field == "OUT" && self.ooch == 1 {
             self.first_output_done = false;
         }
@@ -769,7 +776,7 @@ mod tests {
         );
         // OOCH=YES then OUT change (fired via `special(OUT, true)`).
         r.ooch = 1;
-        r.special("OUT", true).unwrap();
+        r.special("OUT", true, &Default::default()).unwrap();
         assert!(
             r.compute_should_output(),
             "OOCH=YES + OUT change must force the next On_Change write"
@@ -786,7 +793,7 @@ mod tests {
         // OOCH=NO (explicitly set — the dbd default is now YES(1) per
         // initial("1")) — OUT change must NOT trigger a write.
         r.ooch = 0;
-        r.special("OUT", true).unwrap();
+        r.special("OUT", true, &Default::default()).unwrap();
         assert!(
             !r.compute_should_output(),
             "OOCH=NO: OUT change is silent, val==pval still suppresses output"

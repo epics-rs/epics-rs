@@ -334,7 +334,9 @@ fn a_stateless_mbbo_serves_its_val_as_dbf_long() {
         .put_field("ZRST", EpicsValue::String("zero".into()))
         .expect("ZRST is writable");
     // dbPut's special(), whose init_common sets SDEF (`mbboRecord.c:286`)
-    inst.record.special("ZRST", true).unwrap();
+    inst.record
+        .special("ZRST", true, &Default::default())
+        .unwrap();
     let with_states = inst.client_field_value("VAL").expect("mbbo.VAL resolves");
     assert_eq!(
         with_states.dbr_type(),

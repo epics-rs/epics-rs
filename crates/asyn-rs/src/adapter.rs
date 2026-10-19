@@ -3734,14 +3734,14 @@ impl DeviceSupport for AsynDeviceSupport {
             // C `process` registers the callback on BUSY 0->1 and cancels it
             // on 1->0 (devAsynXXXTimeSeries.h:155-176); the callback clearing
             // `st.busy` at buffer-full leaves it registered until then.
-            if wf.busy != busy {
+            if (wf.busy != 0) != busy {
                 self.time_series_sub = if busy {
                     self.time_series_subscribe(ts.clone())
                 } else {
                     None
                 };
             }
-            wf.busy = busy;
+            wf.busy = busy.into();
             wf.rarm = 0;
             // C `if (pPvt->status != asynSuccess) recGblSetSevr(prec, READ_ALARM,
             // INVALID_ALARM)`; success clears to NO_ALARM. Input default
@@ -6978,7 +6978,7 @@ mod tests {
             "VAL written directly → convert skipped"
         );
         assert_eq!(rec.rarm, 0, "process resets RARM to 0");
-        assert!(rec.busy, "RARM=1 sets BUSY (acquiring)");
+        assert_eq!(rec.busy, 1, "RARM=1 sets BUSY (acquiring)");
         assert_eq!(rec.nord, 0, "start zeroes NORD");
 
         // Stream NELM samples → buffer fills, BUSY auto-clears on the last.
@@ -7001,7 +7001,7 @@ mod tests {
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute());
         assert_eq!(rec.nord, 4, "NORD = samples accumulated");
-        assert!(!rec.busy, "BUSY cleared after completion");
+        assert_eq!(rec.busy, 0, "BUSY cleared after completion");
         match &rec.val {
             EpicsValue::LongArray(v) => {
                 assert_eq!(&v[..4], &[10, 20, 30, 40], "VAL holds the samples")
@@ -7042,7 +7042,7 @@ mod tests {
         // Stop: BUSY=0, partial commit (NORD=2, VAL[..2] = samples).
         rec.rarm = 2;
         ads.read(&mut rec).unwrap();
-        assert!(!rec.busy, "RARM=2 clears BUSY");
+        assert_eq!(rec.busy, 0, "RARM=2 clears BUSY");
         assert_eq!(rec.nord, 2, "stop commits the partial buffer (NORD=2)");
         match &rec.val {
             EpicsValue::LongArray(v) => assert_eq!(&v[..2], &[11, 22]),
@@ -7067,7 +7067,7 @@ mod tests {
         // Resume: BUSY=1, appends continue into the same buffer.
         rec.rarm = 3;
         ads.read(&mut rec).unwrap();
-        assert!(rec.busy, "RARM=3 re-arms BUSY");
+        assert_eq!(rec.busy, 1, "RARM=3 re-arms BUSY");
         for v in [33, 44] {
             interrupts.notify(InterruptValue {
                 reason,
@@ -7128,7 +7128,7 @@ mod tests {
         // empty buffer.
         rec.rarm = 1;
         ads.read(&mut rec).unwrap();
-        assert!(rec.busy, "re-arm sets BUSY");
+        assert_eq!(rec.busy, 1, "re-arm sets BUSY");
         assert_eq!(rec.nord, 0, "re-arm zeroes NORD in the arming process");
         match &rec.val {
             EpicsValue::LongArray(v) => assert_eq!(
@@ -7187,7 +7187,7 @@ mod tests {
         await_ts_len(&ts, 3).await;
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.nord, 3);
-        assert!(!rec.busy, "BUSY clears when the buffer fills");
+        assert_eq!(rec.busy, 0, "BUSY clears when the buffer fills");
         match &rec.val {
             EpicsValue::DoubleArray(v) => assert_eq!(&v[..3], &[1.5, 2.5, 3.5]),
             other => panic!("VAL should be DoubleArray, got {other:?}"),
@@ -7270,7 +7270,7 @@ mod tests {
             "no buffer → nothing accumulates"
         );
         assert_eq!(rec.nord, 0, "NORD untouched when the record cannot acquire");
-        assert!(!rec.busy, "BUSY stays 0");
+        assert_eq!(rec.busy, 0, "BUSY stays 0");
     }
 
     /// The valid-FTVL twin, so the kill is not a blanket refusal: a LONG-FTVL
@@ -10929,6 +10929,7 @@ mod tests {
         rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
         rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
         rec.init_record(0).unwrap(); // computes sdef=true
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap();
         rec.mask = 0x0C; // bits 2-3
         rec.shft = 2;
@@ -10967,6 +10968,7 @@ mod tests {
         rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
         rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap();
         rec.mask = 0x0C;
         rec.shft = 2;
@@ -11153,6 +11155,7 @@ mod tests {
         rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
         rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
         rec.init_record(0).unwrap(); // computes sdef=true
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap();
         // Set an already-positioned mask/shift directly to exercise the hook
         // (init-path positioning is tested separately).
@@ -11196,6 +11199,7 @@ mod tests {
         rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
         rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
         rec.init_record(0).unwrap(); // mbbiRecord: MASK = (1<<4)-1 = 0x0F unshifted
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap(); // positions MASK to 0x0F << 4 = 0xF0
         assert_eq!(
             rec.get_field("MASK"),
@@ -11233,6 +11237,7 @@ mod tests {
         rec.put_field("NOBT", EpicsValue::UShort(0)).unwrap();
         rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
         rec.init_record(0).unwrap(); // NOBT=0 -> mbbiRecord leaves MASK=0
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap();
         assert_eq!(
             rec.get_field("MASK"),
@@ -11253,6 +11258,7 @@ mod tests {
         rec.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
         rec.put_field("SHFT", EpicsValue::UShort(5)).unwrap();
         rec.init_record(0).unwrap(); // mbboRecord: MASK = (1<<3)-1 = 0x07 unshifted
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap(); // positions to 0x07 << 5 = 0xE0
         assert_eq!(
             rec.get_field("MASK"),
@@ -11276,6 +11282,7 @@ mod tests {
         rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
         rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
         rec.init_record(0).unwrap(); // MASK!=0 -> mbbiRecord leaves it 0x05
+        rec.init_record(1).unwrap();
         ads.init(&mut rec).unwrap(); // positions the CURRENT mask: 0x05 << 4 = 0x50
         assert_eq!(
             rec.get_field("MASK"),

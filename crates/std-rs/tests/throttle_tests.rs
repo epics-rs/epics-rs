@@ -365,7 +365,7 @@ fn test_pending_value_rejected_on_drain_when_clipping_off() {
 fn test_special_dly_clamp_negative() {
     let mut rec = ThrottleRecord::default();
     rec.dly = -5.0;
-    rec.special("DLY", true).unwrap();
+    rec.special("DLY", true, &Default::default()).unwrap();
     assert_eq!(rec.dly, 0.0);
 }
 
@@ -373,7 +373,7 @@ fn test_special_dly_clamp_negative() {
 fn test_special_dly_positive() {
     let mut rec = ThrottleRecord::default();
     rec.dly = 2.5;
-    rec.special("DLY", true).unwrap();
+    rec.special("DLY", true, &Default::default()).unwrap();
     assert_eq!(rec.dly, 2.5); // Unchanged
 }
 
@@ -382,7 +382,7 @@ fn test_special_drvlh_drvll_enables_limits() {
     let mut rec = ThrottleRecord::default();
     rec.drvlh = 100.0;
     rec.drvll = 0.0;
-    rec.special("DRVLH", true).unwrap();
+    rec.special("DRVLH", true, &Default::default()).unwrap();
     // limit_flag should be set internally
 
     rec.val = 150.0;
@@ -405,24 +405,24 @@ fn test_special_drvlh_drvll_recomputes_drvls() {
     rec.val = 500.0;
     rec.drvlh = 100.0;
     rec.drvll = 0.0;
-    rec.special("DRVLH", true).unwrap();
+    rec.special("DRVLH", true, &Default::default()).unwrap();
     assert_eq!(rec.drvls, 2, "VAL above DRVLH -> DRVLS High");
 
     // VAL below the new low limit -> DRVLS Low.
     rec.val = -5.0;
-    rec.special("DRVLL", true).unwrap();
+    rec.special("DRVLL", true, &Default::default()).unwrap();
     assert_eq!(rec.drvls, 1, "VAL below DRVLL -> DRVLS Low");
 
     // VAL inside the limits -> DRVLS Normal.
     rec.val = 50.0;
-    rec.special("DRVLH", true).unwrap();
+    rec.special("DRVLH", true, &Default::default()).unwrap();
     assert_eq!(rec.drvls, 0, "VAL within limits -> DRVLS Normal");
 
     // Disabling limits (drvlh <= drvll) -> DRVLS Normal.
     rec.val = 500.0;
     rec.drvlh = 0.0;
     rec.drvll = 0.0;
-    rec.special("DRVLH", true).unwrap();
+    rec.special("DRVLH", true, &Default::default()).unwrap();
     assert_eq!(rec.drvls, 0, "limits disabled -> DRVLS Normal");
 }
 
@@ -430,8 +430,8 @@ fn test_special_drvlh_drvll_recomputes_drvls() {
 /// `"0-2-1"`, copied into the VER field by `init_record` pass 0.
 #[test]
 fn test_ver_string() {
-    let rec = ThrottleRecord::default();
-    assert_eq!(rec.ver, "0-2-1");
+    let mut rec = ThrottleRecord::default();
+    rec.init_record(0).unwrap();
     assert_eq!(
         rec.get_field("VER"),
         Some(EpicsValue::String("0-2-1".into()))
@@ -743,7 +743,7 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
     let mut rec = ThrottleRecord::default();
     rec.out = "OUTPUT:PV".into();
     rec.dly = 1e300;
-    rec.special("DLY", true).unwrap();
+    rec.special("DLY", true, &Default::default()).unwrap();
     assert!(
         rec.dly.is_finite() && rec.dly <= 86_400.0,
         "special() must clamp a huge DLY to a Duration-safe ceiling, got {}",
@@ -792,7 +792,7 @@ fn armed(dly: f64) -> ThrottleRecord {
 /// actions `special()` asked for.
 fn put_dly(rec: &mut ThrottleRecord, dly: f64) -> Vec<ProcessAction> {
     rec.put_field("DLY", EpicsValue::Double(dly)).unwrap();
-    rec.special("DLY", true).unwrap();
+    rec.special("DLY", true, &Default::default()).unwrap();
     rec.take_special_actions()
 }
 

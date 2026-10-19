@@ -69,7 +69,12 @@ impl Record for Probe {
         };
         Ok(outcome)
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "SYNC" {
             self.queued
                 .push(ProcessAction::GetLink { link_field: "LNK" });

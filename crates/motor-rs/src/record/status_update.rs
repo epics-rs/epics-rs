@@ -40,7 +40,7 @@ impl MotorRecord {
             })
         });
         if let Some((Some(cdir), ..)) = mailbox {
-            self.stat.cdir = cdir;
+            self.stat.cdir = i16::from(cdir);
         }
         if put_pass {
             self.trace_update_values(false);
@@ -138,7 +138,7 @@ impl MotorRecord {
         // C posts the change without MARKing M_UEIP, so no re-anchor.
         if self.conv.ueip && !status.has_encoder {
             self.conv.ueip = false;
-            self.mark(m::UEIP_POSTED);
+            self.internal.ueip_posted = true;
         }
         let (old_rrbv, old_drbv, old_rbv) = (self.pos.rrbv, self.pos.drbv, self.pos.rbv);
         let (old_tdir, old_movn) = (self.stat.tdir, self.stat.movn);
@@ -208,8 +208,8 @@ impl MotorRecord {
         // MOVN: C uses RAW limit switches (rhls/rlls) with RAW cdir
         // Must compute ls_active BEFORE mapping limits to user coordinates
         let ls_active =
-            (status.high_limit && self.stat.cdir) || (status.low_limit && !self.stat.cdir);
-        self.stat.movn = !(ls_active || status.done || status.problem);
+            (status.high_limit && self.stat.cdir != 0) || (status.low_limit && self.stat.cdir == 0);
+        self.stat.movn = i16::from(!(ls_active || status.done || status.problem));
         if self.stat.movn != old_movn {
             self.mark(m::MOVN);
         }
@@ -227,12 +227,12 @@ impl MotorRecord {
         // process() into check_completion via the MIP_EXTERNAL bit.
         // C runs this in process() only, never at init_record.
         if !initcall
-            && self.stat.movn
-            && self.stat.dmov
+            && self.stat.movn != 0
+            && self.stat.dmov != 0
             && self.stat.phase == MotionPhase::Idle
             && !self.stat.mip.contains(MipFlags::EXTERNAL)
         {
-            self.stat.dmov = false;
+            self.stat.dmov = 0;
             self.stat.mip |= MipFlags::EXTERNAL;
             // C process 1315-1318.
             self.mark(m::DMOV | m::MIP);
@@ -241,8 +241,8 @@ impl MotorRecord {
         // Raw limit switch readbacks (C 3727-3728), then the user-mapped
         // pair derives from them by DIR/MRES polarity (C 3733-3734:
         // hls = ((dir == Pos) == (mres >= 0)) ? rhls : rlls).
-        self.limits.rhls = status.high_limit;
-        self.limits.rlls = status.low_limit;
+        self.limits.rhls = i16::from(status.high_limit);
+        self.limits.rlls = i16::from(status.low_limit);
         let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
         if same_polarity {
             self.limits.hls = self.limits.rhls;
@@ -268,7 +268,7 @@ impl MotorRecord {
         }
 
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
-        self.stat.tdir = status.direction;
+        self.stat.tdir = i16::from(status.direction);
         if self.stat.tdir != old_tdir {
             self.mark(m::TDIR);
         }
@@ -277,11 +277,11 @@ impl MotorRecord {
         // encoder's home signal when UEIP=Yes — on every poll. It is
         // pure switch readback, not a "has homed" latch (that is MSTA
         // bit 14, RA_HOMED).
-        self.stat.athm = if self.conv.ueip {
+        self.stat.athm = i16::from(if self.conv.ueip {
             msta.contains(MstaFlags::EA_HOME)
         } else {
             msta.contains(MstaFlags::HOME_LS)
-        };
+        });
         if self.stat.athm != old_athm {
             self.mark(m::ATHM);
         }
@@ -300,8 +300,8 @@ impl MotorRecord {
             // C init_record 721-724, right after its process_motor_info(true):
             // DMOV starts done and MOVN clear whatever the driver reports; a
             // moving axis is picked up as external on the next pass.
-            self.stat.dmov = true;
-            self.stat.movn = false;
+            self.stat.dmov = 1;
+            self.stat.movn = 0;
             self.mark(m::DMOV | m::MOVN);
         }
     }

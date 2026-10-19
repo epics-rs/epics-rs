@@ -50,7 +50,8 @@ const LONGIN_STATUS: crate::server::record::ProcessStatusRule =
     dset_owns_udf_on_computed,
     seeds_trackers,
     process_status = LONGIN_STATUS,
-    soft_input_read_as = Long
+    soft_input_read_as = Long,
+    spill(INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, OLDSIMM, SSCN, SIMPVT)
 )]
 pub struct LonginRecord {
     #[field(type = "Long")]

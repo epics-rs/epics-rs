@@ -17,6 +17,13 @@ fn declared_slots() -> Vec<(String, String, u16)> {
         let line = line.trim();
         if let Some(m) = line.strip_prefix("pub mod ") {
             module = Some(m.trim_end_matches(" {").to_string());
+        } else if let Some(count) = line.strip_prefix("pub const COUNT: usize = ") {
+            let count: u16 = count.trim_end_matches(';').parse().expect(line);
+            out.push((
+                module.clone().expect("const outside a module"),
+                "COUNT".into(),
+                count,
+            ));
         } else if let Some(rest) = line.strip_prefix("pub const ") {
             let (name, rest) = rest.split_once(": FieldSlot = FieldSlot(").expect(line);
             let index = rest.trim_end_matches(");").parse().expect(line);
@@ -41,7 +48,15 @@ fn slot_constants_index_the_field_table() {
             std::ptr::eq(fields, record_fields(rtype).unwrap()),
             "{rtype}"
         );
-        let consts: Vec<_> = declared.iter().filter(|(m, ..)| m == rtype).collect();
+        let (count, consts): (Vec<_>, Vec<_>) = declared
+            .iter()
+            .filter(|(m, ..)| m == rtype)
+            .partition(|(_, name, _)| name == "COUNT");
+        assert_eq!(
+            count.iter().map(|c| usize::from(c.2)).collect::<Vec<_>>(),
+            [fields.len()],
+            "{rtype}: COUNT"
+        );
         assert_eq!(
             consts.len(),
             fields.len(),
@@ -52,7 +67,10 @@ fn slot_constants_index_the_field_table() {
         }
     }
     assert_eq!(
-        declared.len(),
+        declared
+            .iter()
+            .filter(|(_, name, _)| name != "COUNT")
+            .count(),
         RECORD_TYPES
             .iter()
             .map(|t| record_fields(t).unwrap().len())
@@ -62,6 +80,7 @@ fn slot_constants_index_the_field_table() {
 
     // The constants the parse read are the ones that compile.
     assert_eq!(slots::ai::VAL, FieldSlot(0));
+    assert_eq!(slots::ai::COUNT, record_fields("ai").unwrap().len());
     assert_eq!(
         record_fields("ao").unwrap()[slots::ao::OVAL.0 as usize].name,
         "OVAL"

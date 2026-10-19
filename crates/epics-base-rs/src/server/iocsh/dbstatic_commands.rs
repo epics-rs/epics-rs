@@ -2926,6 +2926,7 @@ variable(seqDLYprecision,int)
             size: 0,
             extra: None,
             menu,
+            menu_name: None,
             initial,
             interest: 0,
             prop: false,

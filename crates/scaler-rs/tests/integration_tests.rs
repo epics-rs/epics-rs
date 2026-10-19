@@ -347,7 +347,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 
@@ -453,7 +453,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
     }
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -527,7 +527,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
         // Simulate the user writing TP: special() runs the truncating
         // tp_to_pr1, so pr[0] = trunc(tp*freq) = 10_000_000.
         scaler.tp = user_tp;
-        scaler.special("TP", true).unwrap();
+        scaler.special("TP", true, &Default::default()).unwrap();
         assert_eq!(
             scaler.pr[0], 10_000_000,
             "user TP write -> truncating tp_to_pr1"
@@ -551,7 +551,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
             .unwrap();
         scaler.cnt = 1;
-        scaler.special("CNT", true).unwrap();
+        scaler.special("CNT", true, &Default::default()).unwrap();
         assert_eq!(scaler.us, 2, "CNT=1 -> REQSTART");
     }
 

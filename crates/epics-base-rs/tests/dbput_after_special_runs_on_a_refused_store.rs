@@ -78,7 +78,12 @@ impl Record for RefusingRecord {
         static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
-    fn special(&mut self, _field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        _field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after {
             self.pass1.fetch_add(1, Ordering::SeqCst);
             if self.pass1_fails {

@@ -69,11 +69,13 @@ impl StringinRecord {
 
 impl Record for StringinRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::stringin;
+        fields:
         VAL => val,
         SVAL => sval,
-        SDLY => sdly;
-        read_only:
-        OVAL => oval);
+        SDLY => sdly,
+        OVAL => oval;
+        custom: MPST, APST, SIOL, SIML, SIMM, SIMS;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false

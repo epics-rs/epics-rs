@@ -179,7 +179,12 @@ impl Record for Throttle {
         }
         Ok(ProcessOutcome::complete_with(actions))
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "SYNC" {
             self.sync_flag = true;
             if self.pending.is_none() {

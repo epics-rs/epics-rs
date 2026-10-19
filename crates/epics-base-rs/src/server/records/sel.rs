@@ -231,6 +231,26 @@ impl SelRecord {
 }
 
 impl Record for SelRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::sel;
+        fields:
+        LA => prev[0],
+        LB => prev[1],
+        LC => prev[2],
+        LD => prev[3],
+        LE => prev[4],
+        LF => prev[5],
+        LG => prev[6],
+        LH => prev[7],
+        LI => prev[8],
+        LJ => prev[9],
+        LK => prev[10],
+        LL => prev[11],
+        NLST => nlst;
+        custom: VAL, SELM, SELN, NVL, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI,
+            INPJ, INPK, INPL, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A,
+            B, C, D, E, F, G, H, I, J, K, L, LALM, ALST, MLST;
+        spill: PREC, EGU, HOPR, LOPR);
+
     /// What `put_field` stores for `A`..`L`, without the by-name lookups
     /// that precede it on the default path.
     fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {

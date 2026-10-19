@@ -832,7 +832,11 @@ async fn lso_long_string_put_fills_sizv_past_41_only() {
 #[tokio::test]
 async fn lsi_long_string_get_put_round_trips_as_string() {
     let db = Arc::new(PvDatabase::new());
-    db.add_record("TEST:lsi", Box::new(LsiRecord::new("abcdef")))
+    db.add_record("TEST:lsi", Box::new(LsiRecord::new("")))
+        .await
+        .unwrap();
+    // After init_record, which empties VAL as C's calloc does.
+    db.put_pv("TEST:lsi", EpicsValue::String("abcdef".into()))
         .await
         .unwrap();
 
@@ -1610,7 +1614,10 @@ async fn a_scalar_put_reaches_an_array_only_destination() {
 #[tokio::test]
 async fn a_one_character_long_string_stays_a_long_string() {
     let db = Arc::new(PvDatabase::new());
-    db.add_record("TEST:ls1", Box::new(LsiRecord::new("x")))
+    db.add_record("TEST:ls1", Box::new(LsiRecord::new("")))
+        .await
+        .unwrap();
+    db.put_pv("TEST:ls1", EpicsValue::String("x".into()))
         .await
         .unwrap();
 

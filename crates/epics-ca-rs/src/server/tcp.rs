@@ -13600,9 +13600,13 @@ mod scalar_string_without_nul_tests {
         ] {
             let db = Arc::new(PvDatabase::new());
             for (rec, sizv) in [("L41", 41), ("L128", 128)] {
-                let mut lso = LsoRecord::new("x");
+                let mut lso = LsoRecord::new("");
                 lso.sizv = sizv;
                 db.add_record(rec, Box::new(lso)).await.unwrap();
+                // After init_record, which empties VAL as C's calloc does.
+                db.put_pv(rec, EpicsValue::String("x".into()))
+                    .await
+                    .unwrap();
             }
             db.add_record("SO", Box::new(StringoutRecord::new("x")))
                 .await

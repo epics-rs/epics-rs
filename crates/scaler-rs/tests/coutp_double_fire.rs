@@ -75,7 +75,7 @@ fn coutp_values(actions: &[ProcessAction]) -> Vec<i16> {
 /// process cycle. The returned list is every link write the put made.
 fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
     rec.cnt = cnt;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let mut actions = rec.take_special_actions();
     actions.extend(rec.process().unwrap().actions);
     actions

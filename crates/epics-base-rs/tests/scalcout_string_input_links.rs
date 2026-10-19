@@ -35,7 +35,7 @@ fn scalcout(calc: &str) -> ScalcoutRecord {
     let mut c = ScalcoutRecord::new();
     c.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
-    c.special("CALC", true).unwrap();
+    c.special("CALC", true, &Default::default()).unwrap();
     c
 }
 

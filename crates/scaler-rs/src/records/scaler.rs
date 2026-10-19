@@ -1045,7 +1045,12 @@ impl Record for ScalerRecord {
         self.continuation = continuation;
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             // The framework runs this pre-pass on every put (field_io.rs:937),
             // so it is the one point that retires the previous put's post list.
@@ -1260,6 +1265,24 @@ impl Record for ScalerRecord {
             return Some(EpicsValue::Short(self.d[i]));
         }
         None
+    }
+
+    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
+    /// `.db` file, as C's `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("PCNT", EpicsValue::Short(v)) => self.pcnt = v,
+            ("SS", EpicsValue::Short(v)) => self.ss = v,
+            ("US", EpicsValue::Short(v)) => self.us = v,
+            ("NCH", EpicsValue::Short(v)) => self.nch = v,
+            ("T", EpicsValue::Double(v)) => self.t = v,
+            ("VERS", EpicsValue::Float(v)) => self.vers = v,
+            (name, value) if parse_indexed_field(name, "S").is_some() => {
+                return self.put_field_internal(name, value);
+            }
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {

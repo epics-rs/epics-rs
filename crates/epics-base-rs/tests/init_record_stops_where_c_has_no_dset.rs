@@ -131,13 +131,13 @@ async fn an_ao_with_no_dset_is_not_marked_initialised() {
 #[epics_macros_rs::epics_test]
 async fn a_record_type_with_no_dset_test_still_runs_its_passes() {
     let db = ioc(
-        "record(calc, \"T:C\") { field(DTYP,\"asynInt32\") field(CALC,\"1\") field(VAL,\"1.5\") }\n",
+        "record(calc, \"T:C\") { field(DTYP,\"asynInt32\") field(CALC,\"1\") field(INPA,\"3\") }\n",
     )
     .await;
 
     assert_eq!(
-        f64_of(&db, "T:C.MLST"),
-        1.5,
-        "calcRecord.c has no `!pdset` branch, so nothing is skipped"
+        f64_of(&db, "T:C.A"),
+        3.0,
+        "calcRecord.c has no `!pdset` branch, so pass 1 loads INPA (:101)"
     );
 }

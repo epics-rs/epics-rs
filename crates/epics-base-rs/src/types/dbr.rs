@@ -849,6 +849,7 @@ mod dbf_link_class_tests {
             size: 0,
             extra: None,
             menu: None,
+            menu_name: None,
             initial: None,
             interest: 0,
             prop: false,

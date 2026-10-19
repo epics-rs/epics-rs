@@ -72,7 +72,12 @@ impl Record for Scan {
         }
         Ok(())
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "PV" {
             let h = self.handle.as_ref().expect("async context set");
             self.cnt = h.name_to_addr(&self.pv).map_or(-1, |n| n as i32);

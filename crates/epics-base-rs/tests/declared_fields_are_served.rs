@@ -375,7 +375,7 @@ fn every_declared_field_is_served() {
 /// whose `init_common` sets SDEF (`mbbiRecord.c:221`, `mbboRecord.c:286`).
 fn put_state(rec: &mut Box<dyn epics_base_rs::server::record::Record>, field: &str, v: EpicsValue) {
     rec.put_field(field, v).unwrap();
-    rec.special(field, true).unwrap();
+    rec.special(field, true, &Default::default()).unwrap();
 }
 
 /// SDEF is the field that exposed the gap, and it is not a constant: it is C's
@@ -426,6 +426,24 @@ fn a_state_written_at_runtime_is_visible_in_sdef() {
             rec.get_field("SDEF"),
             Some(EpicsValue::Short(1)),
             "{record_type}: SDEF must follow the state table, not a cache of it"
+        );
+    }
+}
+
+/// A device that writes the state table in place runs no `special()`, and
+/// devOpcua sets `sdef` itself (devOpcua.cpp:714-716):
+/// `state_table_written` is how it has the record re-derive SDEF.
+#[test]
+fn a_state_table_a_device_writes_is_visible_in_sdef() {
+    for record_type in ["mbbi", "mbbo"] {
+        let mut rec = create_record(record_type).unwrap();
+        rec.put_field("ZRVL", EpicsValue::ULong(3)).unwrap();
+        assert_eq!(rec.get_field("SDEF"), Some(EpicsValue::Short(0)));
+        rec.state_table_written();
+        assert_eq!(
+            rec.get_field("SDEF"),
+            Some(EpicsValue::Short(1)),
+            "{record_type}"
         );
     }
 }

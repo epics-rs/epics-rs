@@ -755,6 +755,16 @@ impl Record for McaRecord {
         })
     }
 
+    /// A `.db` NUSE is stored as loaded, as C's `dbPutString` stores it;
+    /// `init_record` pass 1 clamps it to NMAX (`mcaRecord.c:439`).
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "NUSE" => self.nuse = as_i32(name, &value)?,
+            _ => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if let Some((i, member)) = roi_field(name) {
             match member {
@@ -889,7 +899,12 @@ impl Record for McaRecord {
     /// undefined behaviour for a 32-bit `unsigned long`. The port addresses a
     /// region by NAME through `roi_field`, whose suffix set is closed, so a
     /// field that is not an ROI control field cannot be one.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -1429,7 +1444,7 @@ mod tests {
     #[test]
     fn a_pha_mode_put_run_inline_reads_the_spectrum_in_a_nested_pass() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.special("MODE", true).unwrap();
+        rec.special("MODE", true, &Default::default()).unwrap();
         let mut dset = Trips {
             status: Some(cycle::Sent::Ran),
             data: Some(cycle::Sent::Ran),
@@ -1454,7 +1469,7 @@ mod tests {
     #[test]
     fn a_pha_mode_put_queued_reads_the_spectrum_in_the_first_callback_pass() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.special("MODE", true).unwrap();
+        rec.special("MODE", true, &Default::default()).unwrap();
         let mut dset = Trips {
             status: Some(cycle::Sent::Queued),
             data: Some(cycle::Sent::Queued),
@@ -1482,7 +1497,7 @@ mod tests {
     #[test]
     fn a_refused_pha_mode_put_rereads_the_old_buffer_after_the_status_read() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.special("MODE", true).unwrap();
+        rec.special("MODE", true, &Default::default()).unwrap();
         let mut dset = Trips {
             status: Some(cycle::Sent::Done),
             data: None,
@@ -1502,7 +1517,7 @@ mod tests {
     #[test]
     fn a_refused_pha_mode_put_rereads_the_old_buffer_in_the_status_callback_pass() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.special("MODE", true).unwrap();
+        rec.special("MODE", true, &Default::default()).unwrap();
         let mut dset = Trips {
             status: Some(cycle::Sent::Queued),
             data: None,
@@ -1526,7 +1541,7 @@ mod tests {
         for (mode, cmd) in [(1, McaCommand::StartAcquire), (2, McaCommand::StopAcquire)] {
             let mut rec = loaded(8, &[0; 8]);
             rec.mode = mode;
-            rec.special("MODE", true).unwrap();
+            rec.special("MODE", true, &Default::default()).unwrap();
             assert_eq!(sent(&mut rec), [cmd]);
             assert_eq!(rec.rdng, 0);
         }
@@ -1616,7 +1631,7 @@ mod tests {
     fn the_setup_flags_are_consumed_by_the_cycle_that_sends_them() {
         let mut rec = loaded(8, &[0; 8]);
         rec.put_field("DWEL", EpicsValue::Double(0.25)).unwrap();
-        rec.special("DWEL", true).unwrap();
+        rec.special("DWEL", true, &Default::default()).unwrap();
         assert_eq!(sent(&mut rec), vec![McaCommand::DwellTime(0.25)]);
         assert_eq!(rec.newv, 0);
         assert!(sent(&mut rec).is_empty());
@@ -1629,7 +1644,7 @@ mod tests {
         for fail in [false, true] {
             for field in ["DWEL", "ERAS", "MODE"] {
                 let mut rec = loaded(8, &[0; 8]);
-                rec.special(field, true).unwrap();
+                rec.special(field, true, &Default::default()).unwrap();
                 rec.send_device_requests(&mut Probe {
                     fail,
                     ..Default::default()
@@ -1828,7 +1843,7 @@ mod tests {
         ] {
             let mut rec = loaded(8, &[0; 8]);
             rec.put_field("MODE", EpicsValue::Enum(mode)).unwrap();
-            rec.special("MODE", true).unwrap();
+            rec.special("MODE", true, &Default::default()).unwrap();
             assert_eq!(sent(&mut rec), vec![cmd], "MODE {mode}");
             assert_eq!(rec.acqg, 0, "MODE {mode} does not force ACQG");
         }
@@ -1842,9 +1857,9 @@ mod tests {
     fn start_is_sent_after_every_setup_field() {
         let mut rec = loaded(8, &[0; 8]);
         rec.put_field("PRTM", EpicsValue::Double(10.0)).unwrap();
-        rec.special("PRTM", true).unwrap();
+        rec.special("PRTM", true, &Default::default()).unwrap();
         rec.put_field("ERST", EpicsValue::Enum(1)).unwrap();
-        rec.special("ERST", true).unwrap();
+        rec.special("ERST", true, &Default::default()).unwrap();
 
         assert_eq!(
             sent(&mut rec),
@@ -1856,6 +1871,18 @@ mod tests {
         );
     }
 
+    /// A loaded NUSE above NMAX reads back as loaded until pass 1 clamps it.
+    #[test]
+    fn a_loaded_nuse_is_clamped_in_pass_1() {
+        let mut rec = McaRecord::default();
+        rec.put_field("NMAX", EpicsValue::Long(4)).unwrap();
+        rec.load_field("NUSE", EpicsValue::Long(9)).unwrap();
+        rec.init_record(0).unwrap();
+        assert_eq!(rec.nuse, 9);
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.nuse, 4);
+    }
+
     /// C `:614` erases `NUSE` channels, not `NMAX`: channels the client is not
     /// using keep whatever they held.
     #[test]
@@ -1863,7 +1890,7 @@ mod tests {
         let mut rec = loaded(8, &[1, 2, 3, 4, 5, 6, 7, 8]);
         rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
         rec.put_field("ERAS", EpicsValue::Enum(1)).unwrap();
-        rec.special("ERAS", true).unwrap();
+        rec.special("ERAS", true, &Default::default()).unwrap();
         sent(&mut rec);
 
         assert_eq!(rec.nord, 0, "NORD is reset — the data are gone");
@@ -1884,11 +1911,11 @@ mod tests {
     #[test]
     fn only_a_channel_count_change_forces_a_read() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.special("SEQ", true).unwrap();
+        rec.special("SEQ", true, &Default::default()).unwrap();
         assert_eq!(rec.read, 0);
-        rec.special("ERAS", true).unwrap();
+        rec.special("ERAS", true, &Default::default()).unwrap();
         assert_eq!(rec.read, 0);
-        rec.special("NUSE", true).unwrap();
+        rec.special("NUSE", true, &Default::default()).unwrap();
         assert_eq!(rec.read, 1);
     }
 

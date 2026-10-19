@@ -3,7 +3,9 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CaError, CaResult, JsonLexFault};
 use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
-use crate::server::record::{FieldDesc, Record, check_link_text};
+use crate::server::record::{
+    DeclaredStore, FieldDeclaration as _, FieldDesc, FieldSlot, Record, check_link_text,
+};
 use crate::types::{DbfCode, EpicsValue, PvString, RecordName};
 
 use reader::Feed;
@@ -402,17 +404,12 @@ fn suggest_field(record_type: &str, name: &str, value: &str) -> Option<&'static 
 /// not the generated `MENUS` statics and its `declared_dbf` is whatever
 /// [`FieldDesc::new`] derived from the served type (`Enum`, mostly); C could
 /// only have written such a field as `DBF_MENU` with a named `menu()`, so a
-/// carried table is treated as that declaration. The name half of C's pair
-/// is then unavailable — the `MENUS` lookup is by table identity and the
-/// external static is not in it — which is why the name is an `Option`:
+/// carried table is treated as that declaration. Such a row names no menu
+/// (`FieldDesc::menu_name`), which is why the name is an `Option`:
 /// validation does not need it, only the refusal wording does.
 ///
 /// `DBF_DEVICE` is not answered here: its menu is `merged_device_menu`, judged
 /// by `device_arm` with C's own wording.
-///
-/// `menuScan` is why the menu's NAME is looked up rather than carried on the
-/// declaration: its choices are the site's, resolved at run time, so the
-/// generated `FieldDesc` holds `None` and the table is in no generated row.
 fn load_menu_of(desc: &FieldDesc) -> Option<(Option<&'static str>, &'static [&'static str])> {
     use crate::server::record::shared_menu_choices;
 
@@ -429,7 +426,7 @@ fn load_menu_of(desc: &FieldDesc) -> Option<(Option<&'static str>, &'static [&'s
     if choices.is_empty() {
         return None;
     }
-    Some((menu_name_of(choices), choices))
+    Some((desc.menu_name, choices))
 }
 
 /// The choice table of `record_type`'s menu field `field`, as
@@ -440,24 +437,6 @@ pub(crate) fn menu_choices_of(record_type: &str, field: &str) -> Option<&'static
         return None;
     }
     load_menu_of(desc).map(|(_, choices)| choices)
-}
-
-/// The `.dbd` name of the menu whose choice table is `choices`.
-///
-/// C reads it off the menu itself (`pdbMenu->name`, `dbStaticRun.c:497`). The
-/// generated `MENUS` table is name -> choices and a menu field's `menu` member
-/// is that same static, so identity — not equality — is the relation: two menus
-/// may list the same strings, and only identity tells them apart.
-fn menu_name_of(choices: &'static [&'static str]) -> Option<&'static str> {
-    use crate::server::record::dbd_generated::MENUS;
-
-    if std::ptr::eq(choices, crate::server::record::menu_scan().choices()) {
-        return Some("menuScan");
-    }
-    MENUS
-        .iter()
-        .find(|(_, _, table)| std::ptr::eq(*table, choices))
-        .map(|(name, _, _)| *name)
 }
 
 /// C's `pdbentry->message` for one `record()` block: allocated with the entry
@@ -1283,6 +1262,17 @@ impl DbDiagnostic {
         }
     }
 
+    /// The notice, the `ERROR:` line and the suggestion, in C's order.
+    pub(crate) fn print(&self) {
+        if let Some(notice) = &self.notice {
+            notice.print();
+        }
+        eprintln!("{}", self.message);
+        if let Some(suggestion) = &self.suggestion {
+            eprintln!("{suggestion}");
+        }
+    }
+
     /// The same line with C's `dbPutStringSuggest` proposal under it.
     pub fn suggesting(message: String, suggestion: Option<String>) -> Self {
         Self {
@@ -1604,18 +1594,7 @@ impl DbFaults {
 
     /// Print `diagnostic` at the current [`Self::park`].
     fn render(&mut self, diagnostic: DbDiagnostic) {
-        let DbDiagnostic {
-            notice,
-            message,
-            suggestion,
-        } = diagnostic;
-        if let Some(notice) = notice {
-            notice.print();
-        }
-        eprintln!("{message}");
-        if let Some(suggestion) = suggestion {
-            eprintln!("{suggestion}");
-        }
+        diagnostic.print();
         self.yyerror(None);
     }
 
@@ -3484,10 +3463,8 @@ fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
             Some(t) => t,
             None => continue,
         };
-        let parsed = if let Some(choices) = spec
-            .and_then(|f| f.menu)
-            .or_else(|| record.menu_field_choices(name))
-            .or_else(|| crate::server::record::shared_menu_choices(name))
+        let parsed = if let Some(choices) =
+            crate::server::record::record_instance::menu_choices_with(record.as_ref(), name, spec)
         {
             crate::server::record::resolve_menu_field_string_db_load(
                 name, choices, dbf_type, initial,
@@ -3509,9 +3486,23 @@ fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
         if record.get_field(name).as_ref() == Some(&parsed) {
             continue;
         }
-        record.put_field_internal(name, parsed)?;
+        match declared_store_of(record.as_ref(), name) {
+            Some((slot, DeclaredStore::Member)) => record.store_loaded_slot(name, slot, parsed)?,
+            _ => record.put_field_internal(name, parsed)?,
+        }
     }
     Ok(())
+}
+
+/// The slot of `field` and the store its type declares for it; `None` for a
+/// type that does not classify its fields.
+fn declared_store_of(record: &dyn Record, field: &str) -> Option<(FieldSlot, DeclaredStore)> {
+    let slot = record
+        .field_list()
+        .iter()
+        .position(|f| f.name == field)
+        .and_then(|at| u16::try_from(at).ok().map(FieldSlot))?;
+    record.declared_store(slot).map(|store| (slot, store))
 }
 
 /// Create a record from a type name.
@@ -3755,6 +3746,13 @@ fn lax_numeric(declared: DbfCode, field: &str, value: &str) -> Option<EpicsValue
 pub trait LoadTarget {
     fn record(&self) -> &dyn Record;
     fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()>;
+    /// A [`DeclaredStore::Member`] field, stored raw at `slot`.
+    fn store_loaded_slot(
+        &mut self,
+        field: &str,
+        slot: FieldSlot,
+        value: EpicsValue,
+    ) -> CaResult<()>;
 }
 
 impl LoadTarget for Box<dyn Record> {
@@ -3763,7 +3761,19 @@ impl LoadTarget for Box<dyn Record> {
     }
 
     fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_field(field, value)
+        self.load_field(field, value)
+    }
+
+    fn store_loaded_slot(
+        &mut self,
+        field: &str,
+        slot: FieldSlot,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        match self.slot_mut(slot) {
+            Some(m) => m.store(value),
+            None => Err(CaError::FieldNotFound(field.to_string())),
+        }
     }
 }
 
@@ -3775,6 +3785,15 @@ impl LoadTarget for crate::server::record::RecordInstance {
     fn put_loaded_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.put_merged_field(field, value)
     }
+
+    fn store_loaded_slot(
+        &mut self,
+        field: &str,
+        slot: FieldSlot,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        self.store_declared_slot(field, slot, value)
+    }
 }
 
 /// The `dbRecordField` sentence for a field `apply_fields` refused
@@ -3785,28 +3804,27 @@ impl LoadTarget for crate::server::record::RecordInstance {
 /// with `Bad Field value` (`dbStaticLib.c:2646-2650`), a link `dbParseLink`
 /// refused is `S_dbLib_badField` and writes nothing, and the port's own text
 /// stands in for anything else the applier raises without entering the slot.
-fn field_refusal_line(
+pub(crate) fn field_refusal_line(
     entry: &mut EntryMessage,
-    target: &(impl LoadTarget + ?Sized),
+    record: &dyn Record,
     record_name: &str,
-    field: &DbFieldDef,
+    field: &str,
+    value: &str,
     err: &CaError,
 ) -> String {
-    let upper = field.name.to_uppercase();
-    let record = target.record();
+    let upper = field.to_uppercase();
     let spec = crate::server::record::record_instance::field_desc_of(record, upper.as_str());
-    let value = field.value.as_str_lossy();
     if is_declared_no_access(record.record_type(), &upper, spec) {
         let writes = Some("Can't set array field before iocInit()");
-        return entry.cant_set_line(record_name, &field.name, &value, writes, "Bad Field value");
+        return entry.cant_set_line(record_name, field, value, writes, "Bad Field value");
     }
     if matches!(err, CaError::BadLink(_)) {
-        return entry.cant_set_line(record_name, &field.name, &value, None, "Bad Field value");
+        return entry.cant_set_line(record_name, field, value, None, "Bad Field value");
     }
     cant_set_sentence(
         record_name,
-        &field.name,
-        &value,
+        field,
+        value,
         &err.to_string(),
         "Bad Field value",
     )
@@ -3836,10 +3854,10 @@ pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
     record_name: &str,
     fields: &[DbFieldDef],
     common_fields: &mut Vec<(String, EpicsValue)>,
+    entry: &mut EntryMessage,
     mut refused: impl FnMut(&DbFieldDef, Option<&CaError>, DbDiagnostic),
 ) -> bool {
     let record_type = target.record().record_type().to_string();
-    let mut entry = EntryMessage::default();
     let mut any = false;
     for f in fields {
         if let Some(refusal) =
@@ -3859,7 +3877,7 @@ pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
                 f,
                 None,
                 DbDiagnostic {
-                    message: refusal.line(&mut entry),
+                    message: refusal.line(entry),
                     notice: refusal.notice,
                     suggestion: refusal.suggestion,
                 },
@@ -3889,7 +3907,14 @@ pub(crate) fn apply_fields_one_at_a_time<T: LoadTarget + ?Sized>(
         else {
             continue;
         };
-        let line = field_refusal_line(&mut entry, target, record_name, f, &e);
+        let line = field_refusal_line(
+            entry,
+            target.record(),
+            record_name,
+            &f.name,
+            &f.value.as_str_lossy(),
+            &e,
+        );
         refused(f, Some(&e), DbDiagnostic::new(line));
         any = true;
     }
@@ -3917,7 +3942,13 @@ pub fn apply_fields<T: LoadTarget + ?Sized>(
         // carries every field the `.dbd` declares — including INP/OUT, which
         // most record types leave to the framework — so ownership is asked of
         // `implements_field()`, not of table membership.
-        let owned = record.implements_field(&upper_name);
+        // A type that classifies its declared fields says which store each
+        // one has; only an unclassified type is asked whether it serves it.
+        let declared = declared_store_of(record, &upper_name);
+        let owned = match declared {
+            Some((_, store)) => store != DeclaredStore::Spill,
+            None => record.implements_field(&upper_name),
+        };
         // The DECLARATION, from the same owner every other consumer asks: the
         // `.dbd`-generated table first, the record's hand table only where the
         // `.dbd` does not reach. Reading it off `field_list()` alone left an
@@ -3968,10 +3999,8 @@ pub fn apply_fields<T: LoadTarget + ?Sized>(
             // `dbPutStringNum`. Using the field's choices, not a cross-menu
             // global table, is what keeps a menu-specific label from being
             // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
-            let parsed = if let Some(choices) = spec
-                .and_then(|f| f.menu)
-                .or_else(|| record.menu_field_choices(&upper_name))
-                .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
+            let parsed = if let Some(choices) =
+                crate::server::record::record_instance::menu_choices_with(record, &upper_name, spec)
             {
                 crate::server::record::resolve_menu_field_string_db_load(
                     &upper_name,
@@ -3997,7 +4026,12 @@ pub fn apply_fields<T: LoadTarget + ?Sized>(
                     ))
                 })?
             };
-            target.put_loaded_field(&upper_name, parsed)?;
+            match declared {
+                Some((slot, DeclaredStore::Member)) => {
+                    target.store_loaded_slot(&upper_name, slot, parsed)?
+                }
+                _ => target.put_loaded_field(&upper_name, parsed)?,
+            }
             // A record type may declare INP/OUT in its own `field_list`,
             // mirroring its C `.dbd` (`scalerRecord`, `motorRecord`,
             // `acalcout`, …). The value is then stored by the record — but in
@@ -4585,7 +4619,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
             .unwrap();
         // C compiles CALC in special(SPC_CALC), never in the field write —
         // dbPut always runs both, so drive the same pair here.
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
@@ -4603,7 +4637,7 @@ record(calc, "C:THREE") { field(CALC, "3") }
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
 
@@ -4626,10 +4660,10 @@ record(calc, "C:THREE") { field(CALC, "3") }
             .unwrap();
         // C compiles CALC in special(SPC_CALC), never in the field write —
         // dbPut always runs both, so drive the same pair here.
-        rec.special("CALC", true).unwrap();
+        rec.special("CALC", true, &Default::default()).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*B".into()))
             .unwrap();
-        rec.special("OCAL", true).unwrap();
+        rec.special("OCAL", true, &Default::default()).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
@@ -6945,6 +6979,27 @@ mod menu_refusal_tests {
             super::load_menu_of(linr).and_then(|(n, _)| n),
             Some("menuConvert")
         );
+    }
+
+    /// Menus that list the same choices share one generated table, so only the
+    /// declaration can name the menu: C prints `calcoutDOPT`, not the
+    /// `acalcoutDOPT` whose table it shares.
+    #[test]
+    fn a_shared_choice_table_names_the_declared_menu() {
+        use crate::server::record::declared_field;
+
+        for (rt, field, menu, twin) in [
+            ("calcout", "DOPT", "calcoutDOPT", ("acalcout", "DOPT")),
+            ("longout", "OOPT", "longoutOOPT", ("calcout", "OOPT")),
+        ] {
+            let desc = declared_field(rt, field).expect("declared");
+            let other = declared_field(twin.0, twin.1).expect("declared");
+            assert!(std::ptr::eq(
+                desc.menu.expect("a menu"),
+                other.menu.expect("a menu")
+            ));
+            assert_eq!(super::load_menu_of(desc).and_then(|(n, _)| n), Some(menu));
+        }
     }
 
     /// An externally-registered record type's menu field carries its own

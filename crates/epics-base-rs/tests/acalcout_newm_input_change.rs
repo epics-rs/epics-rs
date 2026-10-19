@@ -56,7 +56,7 @@ async fn wf_into_aa(db: &PvDatabase, data: Vec<f64>) {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("WF".into()))
         .unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
@@ -180,7 +180,7 @@ async fn r11_c4_a_caput_alone_sets_no_newm_bit() {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
 
     db.put_record_field_from_ca(

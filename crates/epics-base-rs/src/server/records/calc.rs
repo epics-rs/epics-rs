@@ -410,8 +410,9 @@ impl Record for CalcRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a
+        if pass == 1 {
+            // C `calcRecord.c::init_record:105-110`, after the pass-0 return at
+            // :98 — postfix() into RPCL; a
             // failure is logged (errlog + recGblRecordError) but does NOT abort
             // the record's init (`return 0`). Only `special()` refuses.
             //
@@ -421,11 +422,6 @@ impl Record for CalcRecord {
             // CALC left the port with no program and no alarm.
             let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
             self.report_bad_calc(&compiled, "calc: init_record: Illegal CALC field");
-            if !self.calc.is_empty() {
-                self.mlst = self.val;
-                self.alst = self.val;
-                self.lalm = self.val;
-            }
         }
         Ok(())
     }
@@ -436,7 +432,12 @@ impl Record for CalcRecord {
     /// stays stored and RPCL is left empty. calcout/scalcout/acalcout make the
     /// opposite choice (store the status in CLCV, accept the put); both
     /// dispositions run off the one compile owner, `calc_compile`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after || !field.eq_ignore_ascii_case("CALC") {
             return Ok(());
         }
@@ -787,6 +788,7 @@ impl Record for CalcRecord {
     }
 
     crate::slot_map!(crate::server::record::dbd_generated::slots::calc;
+        fields:
         VAL => val,
         EGU => egu,
         PREC => prec,
@@ -815,8 +817,7 @@ impl Record for CalcRecord {
         R => vars[17],
         S => vars[18],
         T => vars[19],
-        U => vars[20];
-        read_only:
+        U => vars[20],
         LA => prev[0],
         LB => prev[1],
         LC => prev[2],
@@ -841,7 +842,10 @@ impl Record for CalcRecord {
         AFVL => afvl,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst;
+        custom: CALC, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ, INPK, INPL,
+            INPM, INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU;
+        spill: HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST);
 
     /// `slot_ref`'s value with no call per link read: the default's
     /// out-of-line `slot_ref` cost calc-link +29 instr/cycle.

@@ -77,7 +77,12 @@ impl Record for CoutpRecord {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         FIELDS
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "CNT" {
             self.queued.push(ProcessAction::WriteDbLink {
                 link_field: "COUTP",

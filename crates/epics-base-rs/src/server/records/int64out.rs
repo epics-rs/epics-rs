@@ -95,6 +95,7 @@ impl Int64outRecord {
 
 impl Record for Int64outRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::int64out;
+        fields:
         VAL => val,
         EGU => egu,
         DRVH => drvh,
@@ -105,11 +106,12 @@ impl Record for Int64outRecord {
         ADEL => adel,
         MDEL => mdel,
         SDLY => sdly,
-        IVOV => ivov;
-        read_only:
+        IVOV => ivov,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst;
+        custom: DOL, OMSL, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false

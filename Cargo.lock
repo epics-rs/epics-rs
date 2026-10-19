@@ -1234,7 +1234,9 @@ dependencies = [
  "motor-rs",
  "optics-rs",
  "scaler-rs",
+ "sscan-rs",
  "std-rs",
+ "tokio",
 ]
 
 [[package]]

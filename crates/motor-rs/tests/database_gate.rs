@@ -246,7 +246,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.limits.lvio = false;
+    rec.limits.lvio = 0;
     rec.vel.velo = 100000.0;
     rec.vel.accl = 0.5;
     rec.stat.msta = MstaFlags::DONE;
@@ -421,7 +421,7 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.limits.lvio = false;
+    rec.limits.lvio = 0;
     rec.vel.velo = 100000.0;
     rec.vel.accl = 0.5;
     rec.stat.msta = MstaFlags::DONE;

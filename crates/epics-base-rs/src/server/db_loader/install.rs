@@ -97,6 +97,7 @@ fn apply_fields_one_at_a_time<T: super::LoadTarget + ?Sized>(
     record_name: &str,
     fields: &[super::DbFieldDef],
     common_fields: &mut Vec<(String, EpicsValue)>,
+    entry: &mut super::EntryMessage,
     faults: &mut DbFaults,
 ) {
     super::apply_fields_one_at_a_time(
@@ -105,6 +106,7 @@ fn apply_fields_one_at_a_time<T: super::LoadTarget + ?Sized>(
         record_name,
         fields,
         common_fields,
+        entry,
         |f, e, diagnostic| {
             // C's lexer names the line; the parse is over by the time this
             // runs, so the element's own recorded line takes that seat.
@@ -117,6 +119,16 @@ fn apply_fields_one_at_a_time<T: super::LoadTarget + ?Sized>(
             faults.report(diagnostic);
         },
     );
+}
+
+/// The line of the last `field(<field>, …)` in `def`, where C's lexer stands
+/// when it reports that field; the record's own line for none.
+fn field_line(def: &DbRecordDef, field: &str) -> u32 {
+    def.fields
+        .iter()
+        .rev()
+        .find(|f| f.name.eq_ignore_ascii_case(field))
+        .map_or(def.line, |f| f.line)
 }
 
 /// How C classifies a per-record `.db` failure. `dbRecordHead` and
@@ -265,6 +277,9 @@ pub(crate) async fn install_records<H: InstallHost>(
             };
 
             let mut common_fields = Vec::new();
+            // C's `pdbentry->message`: one per `record()` block, shared by
+            // the record's own fields and the dbCommon ones applied later.
+            let mut entry = super::EntryMessage::default();
             let is_merge = existing.is_some();
             let rec_arc = if let Some(rec_arc) = existing {
                 // Merge: apply field overrides directly to the
@@ -277,6 +292,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                         &def.name.to_str_lossy(),
                         &def.fields,
                         &mut common_fields,
+                        &mut entry,
                         faults,
                     );
                 }
@@ -312,6 +328,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                     &def.name.to_str_lossy(),
                     &def.fields,
                     &mut common_fields,
+                    &mut entry,
                     faults,
                 );
                 // Record + its whole loaded field set in one call: the
@@ -323,9 +340,14 @@ pub(crate) async fn install_records<H: InstallHost>(
                     common_fields: std::mem::take(&mut common_fields),
                     info_tags: def.info_tags.clone(),
                 };
+                // A refused common field is `dbRecordField`'s `yyerror(NULL)`:
+                // reported at its own line, the record kept.
                 if host
                     .db()
-                    .add_loaded_record(&def.name, record, load)
+                    .add_loaded_record_reporting(&def.name, record, load, &mut entry, |field, diagnostic| {
+                        faults.seek(field_line(&def, field), ")");
+                        faults.report(diagnostic);
+                    })
                     .await
                     .is_err()
                 {
@@ -395,6 +417,7 @@ pub(crate) async fn install_records<H: InstallHost>(
                 }
                 for (name, value) in common_fields {
                     use crate::server::record::CommonFieldPutResult;
+                    let text = value.to_string();
                     // `.db` load: C's loader converter, whose menu
                     // bound differs from a runtime dbPut's
                     // (`dbStaticRun.c::dbPutStringNum`).
@@ -429,10 +452,16 @@ pub(crate) async fn install_records<H: InstallHost>(
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {
-                            faults.recoverable(format!(
-                                "put_common_field({name}) failed for {}: {e}",
-                                def.name
-                            ));
+                            let line = super::field_refusal_line(
+                                &mut entry,
+                                rec_arc.read().record.as_ref(),
+                                &def.name.to_str_lossy(),
+                                &name,
+                                &text,
+                                &e,
+                            );
+                            faults.seek(field_line(&def, &name), ")");
+                            faults.report(super::DbDiagnostic::new(line));
                         }
                     }
                 }

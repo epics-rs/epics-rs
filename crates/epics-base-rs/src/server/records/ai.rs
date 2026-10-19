@@ -3,7 +3,6 @@ use crate::server::record::{
     CycleCell, CycleRead, CycleValue, FieldMetadataOverride, MENU_SIMM, ProcessOutcome,
     RawSoftEntry, Record, SimmCells, ValuePostGate,
 };
-use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
 /// Analog input record with conversion support.
@@ -45,9 +44,10 @@ pub struct AiRecord {
     pub lalm: f64,
     pub alst: f64,
     pub mlst: f64,
-    /// C `prec->init` — see [`ConvertPhase`]. Set by `init_record` and by an
-    /// `SPC_LINCONV` put, cleared at the end of every `process`.
-    pub init: ConvertPhase,
+    /// C `prec->init`: nonzero while the next conversion is the initial one.
+    /// Set by `init_record` and by an `SPC_LINCONV` put, cleared at the end of
+    /// every `process`.
+    pub init: i16,
     skip_convert: bool,
     /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the raw value fell past
@@ -105,7 +105,7 @@ impl Default for AiRecord {
             lalm: 0.0,
             alst: 0.0,
             mlst: 0.0,
-            init: ConvertPhase::default(),
+            init: 0,
             skip_convert: false,
             bpt_error: false,
             bpt_registry: None,
@@ -144,7 +144,14 @@ fn raise_bpt_error(common: &mut crate::server::record::CommonFields) {
 
 impl Record for AiRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::ai;
-        RVAL => rval);
+        fields:
+        RVAL => rval,
+        ORAW => oraw,
+        INIT => init;
+        custom: VAL, PREC, LINR, EGUF, EGUL, EGU, HOPR, LOPR, AOFF, ASLO, SMOO, AFTC, ADEL,
+            MDEL, LALM, AFVL, ALST, MLST, ESLO, EOFF, ROFF, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        spill: INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, PBRK, LBRK, OLDSIMM,
+            SSCN, SIMPVT);
 
     fn held_pointer(&self, field: &str) -> Option<usize> {
         match field {
@@ -217,10 +224,11 @@ impl Record for AiRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `aiRecord.c:114`: `prec->init = TRUE;` — an initialised record
-            // has not converted yet, so the next conversion is the initial one.
-            self.init = ConvertPhase::Initial;
+        if pass == 1 {
+            // C `aiRecord.c:114`, after pass 0 returned at :101: `prec->init =
+            // TRUE;` — an initialised record has not converted yet, so the
+            // next conversion is the initial one.
+            self.init = 1;
         }
         Ok(())
     }
@@ -297,7 +305,7 @@ impl Record for AiRecord {
             // with the new value first — `if (prec->init) prec->val = val;` —
             // and only then runs the filter.
             if self.smoo != 0.0 && self.val.is_finite() {
-                if self.init.is_initial() {
+                if self.init != 0 {
                     self.val = v;
                 }
                 self.val = v * (1.0 - self.smoo) + self.val * self.smoo;
@@ -309,7 +317,7 @@ impl Record for AiRecord {
 
         // C `aiRecord.c:170`: `prec->init = FALSE;` on the way out of EVERY
         // process, not just the first one.
-        self.init = ConvertPhase::Converted;
+        self.init = 0;
         Ok(ProcessOutcome::complete())
     }
 
@@ -381,7 +389,7 @@ impl Record for AiRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "INIT" => Some(self.init.as_field()),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -477,7 +485,7 @@ impl Record for AiRecord {
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     // A LINR change re-selects the breakpoint table (C
                     // `special_linconv` sets `init=TRUE`, which makes the next
                     // `cvtRawToEngBpt` re-resolve via `findBrkTable`). Drop the
@@ -492,7 +500,7 @@ impl Record for AiRecord {
             "EGUF" => match value {
                 EpicsValue::Double(v) => {
                     self.eguf = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -500,7 +508,7 @@ impl Record for AiRecord {
             "EGUL" => match value {
                 EpicsValue::Double(v) => {
                     self.egul = v;
-                    self.init = ConvertPhase::Initial;
+                    self.init = 1;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -921,20 +929,18 @@ mod tests {
     /// SPC_LINCONV parity (aiRecord.c:187): writing LINR / EGUF / EGUL re-arms
     /// the INIT phase, so the next process takes the retuned conversion as its
     /// initial condition instead of blending it into the SMOO history. This
-    /// test previously asserted `!rec.init` — the port's inverted "primed" bit —
-    /// and so pinned the polarity C serves on the wire (`INIT = 1` while
-    /// initial). The behaviour it checks is unchanged; the flag it reads is the
-    /// C one. See tests/init_phase.rs for the whole phase.
+    /// C serves `INIT = 1` while initial. See tests/init_phase.rs for the
+    /// whole phase.
     #[test]
     fn linr_put_re_arms_the_init_phase_for_smoothing() {
         let mut rec = AiRecord::default();
-        rec.init = ConvertPhase::Converted; // post-first-process
+        rec.init = 0; // post-first-process
         rec.smoo = 0.5;
 
         rec.put_field("LINR", EpicsValue::Short(2)).unwrap();
 
         assert!(
-            rec.init.is_initial(),
+            rec.init != 0,
             "LINR put re-arms INIT so the next process reprimes SMOO"
         );
     }

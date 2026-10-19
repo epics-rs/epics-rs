@@ -1249,6 +1249,26 @@ async fn reenter_now(name: &[u8], handle: &AsyncDbHandle) {
 }
 
 impl Record for SseqRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::sseq;
+        fields:
+        VAL => val,
+        SELN => seln,
+        PREC => prec,
+        ABORT => abort,
+        BUSY => busy,
+        ABORTING => aborting;
+        custom: SELM, SELL, DLY1, DOL1, DO1, LNK1, STR1, DT1, LT1, WAIT1, WERR1, WTG1, IX1,
+            DOL1V, LNK1V, DLY2, DOL2, DO2, LNK2, STR2, DT2, LT2, WAIT2, WERR2, WTG2, IX2, DOL2V,
+            LNK2V, DLY3, DOL3, DO3, LNK3, STR3, DT3, LT3, WAIT3, WERR3, WTG3, IX3, DOL3V, LNK3V,
+            DLY4, DOL4, DO4, LNK4, STR4, DT4, LT4, WAIT4, WERR4, WTG4, IX4, DOL4V, LNK4V, DLY5,
+            DOL5, DO5, LNK5, STR5, DT5, LT5, WAIT5, WERR5, WTG5, IX5, DOL5V, LNK5V, DLY6, DOL6,
+            DO6, LNK6, STR6, DT6, LT6, WAIT6, WERR6, WTG6, IX6, DOL6V, LNK6V, DLY7, DOL7, DO7,
+            LNK7, STR7, DT7, LT7, WAIT7, WERR7, WTG7, IX7, DOL7V, LNK7V, DLY8, DOL8, DO8, LNK8,
+            STR8, DT8, LT8, WAIT8, WERR8, WTG8, IX8, DOL8V, LNK8V, DLY9, DOL9, DO9, LNK9, STR9,
+            DT9, LT9, WAIT9, WERR9, WTG9, IX9, DOL9V, LNK9V, DLYA, DOLA, DOA, LNKA, STRA, DTA,
+            LTA, WAITA, WERRA, WTGA, IXA, DOLAV, LNKAV;
+        spill:);
+
     fn has_array_monitor_post(&self) -> bool {
         false
     }
@@ -1290,7 +1310,8 @@ impl Record for SseqRecord {
     /// rendered from `DOn` at the record's PREC. Without it a
     /// `field(DO1,"3")` record starts with an empty `STR1`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+        // C `sseqRecord.c:198-248`, after the pass-0 return at :167.
+        if pass == 1 {
             let prec = self.prec;
             for step in &mut self.steps {
                 step.dly = crate::runtime::time::quantize_to_sleep_quantum(step.dly);
@@ -1474,7 +1495,12 @@ impl Record for SseqRecord {
         crate::server::record::StampPoint::AfterCompletion
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -2464,6 +2490,7 @@ mod tests {
         rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
         rec.steps[0].dov = 3.0;
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         assert_eq!(
             rec.get_field("STR1"),
             Some(EpicsValue::String("3.00".into()))
@@ -2473,6 +2500,7 @@ mod tests {
         let mut rec = SseqRecord::new();
         rec.steps[1].str_val = PvString::from("7.5");
         rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
         assert_eq!(rec.get_field("DO2"), Some(EpicsValue::Double(7.5)));
         assert_eq!(
             rec.get_field("STR2"),
@@ -2517,14 +2545,14 @@ mod tests {
         );
 
         // C's DLYn special posts DLY1 whichever DLY was written.
-        rec.special("DLY3", true).unwrap();
+        rec.special("DLY3", true, &Default::default()).unwrap();
         assert_eq!(
             rec.take_cycle_posted_fields()
                 .map(|(f, m)| (name(f), m))
                 .collect::<Vec<_>>(),
             vec![("DLY1", CyclePostMask::Value)],
         );
-        rec.special("LNK1", true).unwrap();
+        rec.special("LNK1", true, &Default::default()).unwrap();
         assert!(rec.take_cycle_posted_fields().is_empty());
     }
 
@@ -2676,7 +2704,9 @@ mod tests {
         // ABORTING put: rejected, but the stored value still reads back.
         let mut rec = SseqRecord::new();
         rec.put_field("ABORTING", EpicsValue::Short(5)).unwrap();
-        let err = rec.special("ABORTING", true).unwrap_err();
+        let err = rec
+            .special("ABORTING", true, &Default::default())
+            .unwrap_err();
         assert!(
             matches!(err, CaError::BadChoice(_)),
             "ABORTING is C's default:S_db_badChoice, got {err:?}"
@@ -2691,7 +2721,7 @@ mod tests {
         let mut rec = SseqRecord::new();
         assert_eq!(rec.get_field("BUSY"), Some(EpicsValue::Short(0)));
         rec.put_field("ABORT", EpicsValue::Short(1)).unwrap();
-        let err = rec.special("ABORT", true).unwrap_err();
+        let err = rec.special("ABORT", true, &Default::default()).unwrap_err();
         assert!(
             matches!(err, CaError::BadField(_)),
             "idle ABORT is C's -1 rejection, got {err:?}"
@@ -2712,8 +2742,8 @@ mod tests {
         // The accepted SPC_MOD siblings still return Ok (C has switch cases).
         let mut rec = SseqRecord::new();
         rec.put_field("DLY1", EpicsValue::Double(0.02)).unwrap();
-        rec.special("DLY1", true).unwrap();
-        rec.special("WAIT1", true).unwrap();
+        rec.special("DLY1", true, &Default::default()).unwrap();
+        rec.special("WAIT1", true, &Default::default()).unwrap();
     }
 
     /// A busy `ABORT` posts `aborting` (`sseqRecord.c:1192`), a second one all
@@ -2724,7 +2754,7 @@ mod tests {
         let mut rec = SseqRecord::new();
         rec.busy = 1;
         rec.steps[2].waiting = 1;
-        rec.special("ABORT", true).unwrap();
+        rec.special("ABORT", true, &Default::default()).unwrap();
         assert_eq!(rec.get_field("ABORTING"), Some(EpicsValue::Short(1)));
         assert_eq!(
             rec.take_cycle_posted_fields()
@@ -2732,7 +2762,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("ABORTING", CyclePostMask::Value)],
         );
-        rec.special("ABORT", true).unwrap();
+        rec.special("ABORT", true, &Default::default()).unwrap();
         assert_eq!(rec.get_field("WTG3"), Some(EpicsValue::Short(0)));
         assert_eq!(
             rec.take_cycle_posted_fields()

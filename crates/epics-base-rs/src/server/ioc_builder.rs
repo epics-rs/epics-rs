@@ -488,17 +488,9 @@ impl IocBuilder {
         })
     }
 
-    /// `build`'s body. `iocinit_begins` runs once the load has succeeded and
-    /// before any deferred `init_record`; `None` from it fails the build.
-    async fn build_through<T: BuildSteps>(
-        self,
-        iocinit_begins: impl FnOnce() -> Option<T>,
-        link_init: LinkInit,
-    ) -> CaResult<(
-        Arc<PvDatabase>,
-        Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
-        T,
-    )> {
+    /// The load half of a build: the records created and every `.db` installed,
+    /// in the LOAD phase `begin_load` opens.
+    async fn load_records(&mut self) -> CaResult<Arc<PvDatabase>> {
         let db = self
             .database
             .clone()
@@ -520,7 +512,9 @@ impl IocBuilder {
         // `BreakTableRegistry`, so `LINR = 3` selects the first table. When no
         // tables were loaded the snapshot is empty and never installed (zero
         // overhead for IOCs that use none).
-        let breaktable_registry = db.add_breaktables(self.breaktables).await;
+        let breaktable_registry = db
+            .add_breaktables(std::mem::take(&mut self.breaktables))
+            .await;
 
         // C's device support table and function registry, installed on the
         // database BEFORE the first record is created — `registerRecord\
@@ -531,19 +525,19 @@ impl IocBuilder {
         // run, so `init_record` could not see its own dset and ran the tail C
         // returns before.
         db.install_device_support_resolver(crate::server::ioc_app::device_support_resolver(
-            self.device_factories,
-            self.dynamic_device_factory,
+            std::mem::take(&mut self.device_factories),
+            self.dynamic_device_factory.take(),
         ));
-        db.install_subroutine_registry(self.subroutine_registry)
+        db.install_subroutine_registry(std::mem::take(&mut self.subroutine_registry))
             .await;
 
         // 1. Simple PVs
-        for (name, value) in self.pvs {
+        for (name, value) in std::mem::take(&mut self.pvs) {
             db.add_pv(&name, value).await?;
         }
 
         // 2. Inline records
-        for (name, record) in self.records {
+        for (name, record) in std::mem::take(&mut self.records) {
             // The sink owes the record its `iocInit` passes, as it owes a
             // `.db` record's: `begin_load` above opened the LOAD phase, so
             // `drain_deferred_record_inits` runs them after `iocinit_begins`.
@@ -564,7 +558,7 @@ impl IocBuilder {
             db: &db,
             record_factories: &self.record_factories,
         };
-        let mut loads = self.loads.into_iter();
+        let mut loads = std::mem::take(&mut self.loads).into_iter();
         while let Some(load) = loads.next() {
             let installed = match load.text {
                 Some(mut text) => db_loader::install_records(
@@ -594,6 +588,28 @@ impl IocBuilder {
                 }
             }
         }
+        Ok(db)
+    }
+
+    /// C's `dbLoadRecords` with no `iocInit` after it: the database as the
+    /// load left it, every record published with its `.db` fields and its
+    /// `init_record` passes still owed.
+    pub async fn load(mut self) -> CaResult<Arc<PvDatabase>> {
+        self.load_records().await
+    }
+
+    /// `build`'s body. `iocinit_begins` runs once the load has succeeded and
+    /// before any deferred `init_record`; `None` from it fails the build.
+    async fn build_through<T: BuildSteps>(
+        mut self,
+        iocinit_begins: impl FnOnce() -> Option<T>,
+        link_init: LinkInit,
+    ) -> CaResult<(
+        Arc<PvDatabase>,
+        Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
+        T,
+    )> {
+        let db = self.load_records().await?;
         let Some(mut begun) = iocinit_begins() else {
             return Err(CaError::InvalidValue(
                 "IOC can only be initialized from uninitialized or stopped state".into(),

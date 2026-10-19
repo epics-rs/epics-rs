@@ -38,7 +38,7 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field(
         "AA",
         EpicsValue::DoubleArray(vec![9.0, 9.0, 9.0, 9.0].into()),
@@ -139,7 +139,7 @@ async fn r11_9_amask_is_reset_each_process_not_accumulated() {
         g.record
             .put_field("CALC", EpicsValue::String("SUM(BB)".into()))
             .unwrap();
-        g.record.special("CALC", true).unwrap();
+        g.record.special("CALC", true, &Default::default()).unwrap();
     }
     process(&db, "S4").await;
 

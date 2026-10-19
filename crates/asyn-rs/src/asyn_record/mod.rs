@@ -4921,7 +4921,12 @@ impl Record for AsynRecord {
         Ok(())
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -6126,7 +6131,7 @@ mod tests {
         // tail's last query left in the buffer, not with the connect failure.
         let mut rec = AsynRecord::default();
         rec.port = "NO_SUCH_PORT_R9_51".to_string();
-        rec.special("PORT", true).unwrap();
+        rec.special("PORT", true, &Default::default()).unwrap();
         assert_eq!(
             rec.errs,
             "connectDevice failed: asynManager:isEnabled asynUser not connected to device"
@@ -6136,7 +6141,7 @@ mod tests {
         // same wrapper text, because the tail that overwrites the buffer is the
         // one both failures fall into.
         let mut rec = AsynRecord::default();
-        rec.special("PORT", true).unwrap();
+        rec.special("PORT", true, &Default::default()).unwrap();
         assert_eq!(
             rec.errs,
             "connectDevice failed: asynManager:isEnabled asynUser not connected to device"
@@ -6241,7 +6246,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = name.to_string();
         rec.pcnct = 1;
-        rec.special("PCNCT", true).unwrap();
+        rec.special("PCNCT", true, &Default::default()).unwrap();
         assert_eq!(
             rec.errs,
             "findInterface common: asynManager:findInterface: port shut down"
@@ -6249,7 +6254,7 @@ mod tests {
         assert_eq!(rec.pcnct, 0);
         assert!(rec.device_user.device().is_none(), "the bad: tail unbinds");
 
-        rec.special("PORT", true).unwrap();
+        rec.special("PORT", true, &Default::default()).unwrap();
         assert_eq!(
             rec.errs,
             "connectDevice failed: asynManager:isEnabled asynUser not connected to device"
@@ -6419,7 +6424,7 @@ mod tests {
         rec.errs = Errs::from("Write error, nout=0, timeout");
         rec.tmsk = 0;
 
-        rec.special("TMSK", true).unwrap();
+        rec.special("TMSK", true, &Default::default()).unwrap();
 
         assert_eq!(
             rec.errs, "",
@@ -6436,8 +6441,8 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.errs = Errs::from("Read error, timeout");
 
-        rec.special("VAL", true).unwrap();
-        rec.special("ERRS", true).unwrap();
+        rec.special("VAL", true, &Default::default()).unwrap();
+        rec.special("ERRS", true, &Default::default()).unwrap();
 
         assert_eq!(
             rec.errs, "Read error, timeout",
@@ -6646,7 +6651,7 @@ mod tests {
         // back off the same down port.
         log.lock().unwrap().option_sets.clear();
         rec.hostinfo = "newhost:5000".to_string();
-        rec.special("HOSTINFO", true).unwrap();
+        rec.special("HOSTINFO", true, &Default::default()).unwrap();
         assert_eq!(
             log.lock().unwrap().option_sets,
             vec![("hostinfo".to_string(), "newhost:5000".to_string())],
@@ -6659,7 +6664,7 @@ mod tests {
         // (asynRecord.c:561-565) and the gate refuses it.
         log.lock().unwrap().option_sets.clear();
         rec.baud = baud_choice_index("19200");
-        rec.special("BAUD", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
         assert!(
             log.lock().unwrap().option_sets.is_empty(),
             "a BAUD put on a disconnected port is asynDisconnected in C, not a driver call"
@@ -6682,7 +6687,7 @@ mod tests {
         // (asynRecord.c:1296 for the readback half), so IEOS/OEOS stay refused on
         // a down port. Preserving that asymmetry is part of the parity.
         rec.ieos = "\\r\\n".to_string();
-        rec.special("IEOS", true).unwrap();
+        rec.special("IEOS", true, &Default::default()).unwrap();
         assert!(
             log.lock().unwrap().eos_sets.is_empty(),
             "the EOS put must not inherit the HOSTINFO waiver"
@@ -6827,7 +6832,7 @@ mod tests {
         assert_eq!(rec.baud, baud_choice_index("9600"));
         assert_eq!(rec.prty, 2);
         rec.baud = 0;
-        rec.special("BAUD", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
 
         assert_eq!(
             *sets.lock().unwrap(),
@@ -6853,7 +6858,7 @@ mod tests {
         // a real setOption("hostInfo", "") (asynRecord.c:1824-1826).
         sets.lock().unwrap().clear();
         rec.hostinfo = String::new();
-        rec.special("HOSTINFO", true).unwrap();
+        rec.special("HOSTINFO", true, &Default::default()).unwrap();
         assert_eq!(
             *sets.lock().unwrap(),
             vec![("hostinfo".to_string(), String::new())],
@@ -6908,7 +6913,7 @@ mod tests {
         rec.port = port_name.to_string();
         let _ = rec.connect_device();
         rec.tfil = "/nonexistent-dir-r9-51/trace.log".to_string();
-        rec.special("TFIL", true).unwrap();
+        rec.special("TFIL", true, &Default::default()).unwrap();
         assert_eq!(
             rec.errs,
             "Error opening trace file: /nonexistent-dir-r9-51/trace.log"
@@ -7231,12 +7236,12 @@ mod tests {
         let mut rec = AsynRecord::default();
         let bits = [rec.tb0, rec.tb1, rec.tb2, rec.tb3, rec.tb4, rec.tb5];
         rec.tmsk = (TraceMask::ERROR | TraceMask::WARNING | TraceMask::FLOW).bits() as i32;
-        rec.special("TMSK", true).unwrap();
+        rec.special("TMSK", true, &Default::default()).unwrap();
         assert_eq!([rec.tb0, rec.tb1, rec.tb2, rec.tb3, rec.tb4, rec.tb5], bits);
 
         let tmsk = rec.tmsk;
         rec.tb3 = 1;
-        rec.special("TB3", true).unwrap();
+        rec.special("TB3", true, &Default::default()).unwrap();
         assert_eq!(rec.tmsk, tmsk);
     }
 
@@ -7363,7 +7368,7 @@ mod tests {
 
         // The record's own TFIL write must NOT read back as foreign.
         rec.tfil = "<stdout>".to_string();
-        rec.special("TFIL", true).unwrap();
+        rec.special("TFIL", true, &Default::default()).unwrap();
         rec.monitor_status();
         assert_eq!(rec.tfil, "<stdout>");
 
@@ -7660,26 +7665,26 @@ mod tests {
         // AUCT first: a device whose auto-connect is still on can be reconnected
         // under the CNCT put below, which would erase what that put proves.
         rec0.auct = 0;
-        rec0.special("AUCT", true).unwrap();
+        rec0.special("AUCT", true, &Default::default()).unwrap();
         assert!(!md.handle.is_auto_connect_blocking(0).unwrap());
         assert!(md.handle.is_auto_connect_blocking(1).unwrap());
         assert!(md.handle.is_auto_connect_blocking(-1).unwrap());
 
         rec0.cnct = 0;
-        rec0.special("CNCT", true).unwrap();
+        rec0.special("CNCT", true, &Default::default()).unwrap();
         assert!(!md.handle.is_connected_blocking(0).unwrap());
         assert!(md.handle.is_connected_blocking(1).unwrap());
         assert!(md.handle.is_connected_blocking(-1).unwrap());
 
         rec0.enbl = 0;
-        rec0.special("ENBL", true).unwrap();
+        rec0.special("ENBL", true, &Default::default()).unwrap();
         assert!(!md.handle.is_enabled_blocking(0).unwrap());
         assert!(md.handle.is_enabled_blocking(1).unwrap());
         assert!(md.handle.is_enabled_blocking(-1).unwrap());
 
         // TB4 is the FLOW bit of `traceMask` (asynRecord.c's TB0..TB5).
         rec0.tb4 = 1;
-        rec0.special("TB4", true).unwrap();
+        rec0.special("TB4", true, &Default::default()).unwrap();
         assert!(
             md.handle
                 .trace()
@@ -7717,7 +7722,7 @@ mod tests {
         );
 
         rec.enbl = 0;
-        rec.special("ENBL", true).unwrap();
+        rec.special("ENBL", true, &Default::default()).unwrap();
         assert!(!sd.handle.is_enabled_blocking(0).unwrap());
         assert!(
             !sd.handle.is_enabled_blocking(-1).unwrap(),
@@ -7725,7 +7730,7 @@ mod tests {
         );
 
         rec.tb4 = 1;
-        rec.special("TB4", true).unwrap();
+        rec.special("TB4", true, &Default::default()).unwrap();
         assert!(sd.handle.trace().is_enabled(sd_name, TraceMask::FLOW));
         assert!(
             sd.handle
@@ -7744,7 +7749,7 @@ mod tests {
         for field in ["IEOS", "OEOS", "CNCT"] {
             let mut rec = AsynRecord::default();
             rec.cnct = 1;
-            rec.special(field, true).unwrap();
+            rec.special(field, true, &Default::default()).unwrap();
             assert_eq!(
                 rec.errs, "asynManager::queueRequest asynUser not associated with a port",
                 "{field}"
@@ -7773,17 +7778,17 @@ mod tests {
         let trace = global.trace_manager();
         let mut rec = AsynRecord::default();
         rec.tfil = "/nonexistent/dir/f".into();
-        rec.special("TFIL", true).unwrap();
+        rec.special("TFIL", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "Error opening trace file: /nonexistent/dir/f");
 
         let before = trace.get_trace_mask(None);
         let flow = TraceMask::ERROR | TraceMask::FLOW;
         assert_ne!(before, flow);
         rec.tmsk = flow.bits() as i32;
-        rec.special("TMSK", true).unwrap();
+        rec.special("TMSK", true, &Default::default()).unwrap();
         let size_before = trace.snapshot(None, None).io_truncate_size;
         rec.tsiz = 77;
-        rec.special("TSIZ", true).unwrap();
+        rec.special("TSIZ", true, &Default::default()).unwrap();
 
         let mut fresh = AsynRecord::default();
         fresh.tfil = String::new();
@@ -8137,7 +8142,7 @@ mod tests {
         // The EOS readback runs through the same escape with the tighter
         // EOS_SIZE bound: six raw bytes escape to twelve characters, nine fit.
         rec.ieos = r"\r".to_string();
-        rec.special("IEOS", true).unwrap();
+        rec.special("IEOS", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "");
         assert_eq!(rec.ieos, r"\r\n\r\n\", "IEOS is cut at EOS_SIZE - 1");
         assert_eq!(rec.ieos.len(), EOS_SIZE - 1);
@@ -8441,15 +8446,15 @@ mod tests {
         opt.port = port_name.to_string();
         let _ = opt.connect_device();
         opt.lbaud = 9600;
-        opt.special("LBAUD", true).unwrap();
+        opt.special("LBAUD", true, &Default::default()).unwrap();
         assert_eq!(opt.errs, "Error setting option, opt boom");
 
         opt.ieos = "\\n".to_string();
-        opt.special("IEOS", true).unwrap();
+        opt.special("IEOS", true, &Default::default()).unwrap();
         assert_eq!(opt.errs, "Error setting input eos, ieos boom");
 
         opt.oeos = "\\r".to_string();
-        opt.special("OEOS", true).unwrap();
+        opt.special("OEOS", true, &Default::default()).unwrap();
         assert_eq!(opt.errs, "Error setting output eos, oeos boom");
         // The failed EOS sets fall through to the C `getEos` re-read (R9-47),
         // which finds no EOS in this driver and empties both fields.
@@ -8571,7 +8576,7 @@ mod tests {
         // 9600. C's getOptions fall-through snaps LBAUD (and the BAUD menu
         // index derived from it) back to what the port really runs at.
         rec.lbaud = 115_200;
-        rec.special("LBAUD", true).unwrap();
+        rec.special("LBAUD", true, &Default::default()).unwrap();
         assert_eq!(rec.lbaud, 9600, "LBAUD is a driver readback, not a latch");
         assert_eq!(rec.baud, baud_choice_index("9600"));
         assert_eq!(rec.errs, "", "the set succeeded — no ERRS");
@@ -8583,7 +8588,7 @@ mod tests {
         // shows the driver's actual terminators — escaped, as `getEos` does
         // with epicsStrSnPrintEscaped.
         rec.ieos = "\\n".to_string();
-        rec.special("IEOS", true).unwrap();
+        rec.special("IEOS", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "Error setting input eos, ieos boom");
         assert_eq!(rec.ieos, "\\r\\n", "IEOS snaps back to the driver's EOS");
         assert_eq!(
@@ -8999,7 +9004,7 @@ mod tests {
 
         // CNCT=0 → pasynCommon->disconnect. The record stays attached.
         rec.cnct = 0;
-        rec.special("CNCT", true).unwrap();
+        rec.special("CNCT", true, &Default::default()).unwrap();
         assert_eq!(
             disconnects.load(Ordering::SeqCst),
             1,
@@ -9020,7 +9025,7 @@ mod tests {
         // device at its ADDR (`locateDevice`, asynManager.c:576), so C's
         // `checkPortConnect` waiver holds (:1538-1540).
         rec.cnct = 1;
-        rec.special("CNCT", true).unwrap();
+        rec.special("CNCT", true, &Default::default()).unwrap();
         assert_eq!(
             connects.load(Ordering::SeqCst),
             base_connects + 1,
@@ -9032,7 +9037,7 @@ mod tests {
         // C's isConnected gate: re-putting the state the port is already in
         // issues no driver call at all (asynRecord.c:865-889).
         rec.cnct = 1;
-        rec.special("CNCT", true).unwrap();
+        rec.special("CNCT", true, &Default::default()).unwrap();
         assert_eq!(
             connects.load(Ordering::SeqCst),
             base_connects + 1,
@@ -9042,7 +9047,7 @@ mod tests {
         // PCNCT=0 detaches the record and leaves the transport alone.
         let disconnects_before = disconnects.load(Ordering::SeqCst);
         rec.pcnct = 0;
-        rec.special("PCNCT", true).unwrap();
+        rec.special("PCNCT", true, &Default::default()).unwrap();
         assert!(
             rec.device_user.device().is_none(),
             "PCNCT=0 detaches the record"
@@ -9202,7 +9207,7 @@ mod tests {
         // callback tail — the getOptions fall-through snaps BAUD back to 9600.
         log.lock().unwrap().option_sets.clear();
         rec.baud = 0; // menu index 0 = "Unknown"
-        rec.special("BAUD", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
         assert_eq!(
             log.lock().unwrap().option_sets,
             vec![("baud".to_string(), "Unknown".to_string())],
@@ -9220,7 +9225,7 @@ mod tests {
         entry_handle.set_enable(-1, false).unwrap();
         log.lock().unwrap().option_sets.clear();
         rec.baud = baud_choice_index("19200");
-        rec.special("BAUD", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
         assert!(
             log.lock().unwrap().option_sets.is_empty(),
             "a refused put must not reach the driver"
@@ -9262,7 +9267,7 @@ mod tests {
         entry_handle.disconnect_blocking().unwrap();
         log.lock().unwrap().eos_sets.clear();
         rec.ieos = "\\n".to_string();
-        rec.special("IEOS", true).unwrap();
+        rec.special("IEOS", true, &Default::default()).unwrap();
         assert!(
             log.lock().unwrap().eos_sets.is_empty(),
             "a refused EOS put must not reach the driver"
@@ -9280,7 +9285,7 @@ mod tests {
         entry_handle.set_enable(-1, false).unwrap();
         let connects_before = connects.load(Ordering::SeqCst);
         rec.cnct = 1;
-        rec.special("CNCT", true).unwrap();
+        rec.special("CNCT", true, &Default::default()).unwrap();
         assert_eq!(
             connects.load(Ordering::SeqCst),
             connects_before,
@@ -9368,7 +9373,7 @@ mod tests {
 
         entry_handle.set_enable(-1, false).unwrap();
         rec.baud = baud_choice_index("9600");
-        rec.special("BAUD", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
         rec.tmod = TransferMode::NoIo as i32;
         rec.process().unwrap();
         assert_eq!(rec.errs, "queueRequest failed");
@@ -11134,8 +11139,8 @@ mod tests {
         );
         entered.wait();
 
-        rec.special("BAUD", true).unwrap();
-        rec.special("PRTY", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
+        rec.special("PRTY", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "", "the second put queued behind the first");
         assert_eq!(rec.special_cells.len(), 2);
         assert!(rec.special_cells.iter().all(|s| s.cell.is_outstanding()));
@@ -11153,8 +11158,8 @@ mod tests {
         while !rec.specials_settled() {
             std::thread::yield_now();
         }
-        rec.special("BAUD", true).unwrap();
-        rec.special("PRTY", true).unwrap();
+        rec.special("BAUD", true, &Default::default()).unwrap();
+        rec.special("PRTY", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "");
         assert_eq!(rec.special_cells.len(), 2, "released requests are reused");
     }
@@ -11247,7 +11252,7 @@ mod tests {
         rec.async_ctx = Some(("ASYNAQR_REC".into(), db.async_handle()));
 
         // No request in flight yet: AQR is the C `wasQueued==false` no-op.
-        rec.special("AQR", true).unwrap();
+        rec.special("AQR", true, &Default::default()).unwrap();
         assert!(rec.errs.is_empty(), "AQR with no in-flight request is idle");
 
         // Submit off-thread, then wait until the read is parked in the driver.
@@ -11267,7 +11272,7 @@ mod tests {
         // AQR fires while the read is already running in the driver: the token
         // is `Running`, so the cancel loses (C `wasQueued==0`). Release the
         // parked read so the request completes.
-        rec.special("AQR", true).unwrap();
+        rec.special("AQR", true, &Default::default()).unwrap();
         release.wait();
 
         let job = Arc::clone(&rec.process_job);
@@ -12122,7 +12127,7 @@ A.OEOS
             rec.tmsk = TraceMask::ERROR.bits() as i32;
             rec.update_trace_bits_from_mask();
             rec.port = port_name.to_string();
-            rec.special("PORT", true).unwrap();
+            rec.special("PORT", true, &Default::default()).unwrap();
             assert_eq!(rec.cnct, 1, "record must connect to the registered port");
         }
 
@@ -12390,7 +12395,7 @@ A.OEOS
                 .downcast_mut::<AsynRecord>()
                 .unwrap();
             rec.port = port_name.to_string();
-            rec.special("PORT", true).unwrap();
+            rec.special("PORT", true, &Default::default()).unwrap();
         }
 
         let refused = format!("port {port_name} not connected");
@@ -12408,7 +12413,7 @@ A.OEOS
                 // `resetError` post at all — the cycle then posts twice.
                 rec.report_error(AsynStatus::Success, format_args!("seed"));
                 rec.baud = 9600;
-                rec.special("BAUD", true).unwrap();
+                rec.special("BAUD", true, &Default::default()).unwrap();
                 assert_eq!(
                     rec.errs.as_str(),
                     refused,
@@ -12682,7 +12687,7 @@ A.OEOS
                 .downcast_mut::<AsynRecord>()
                 .unwrap();
             rec.port = port_name.to_string();
-            rec.special("PORT", true).unwrap();
+            rec.special("PORT", true, &Default::default()).unwrap();
             rec.iface = InterfaceType::Octet as i32;
             rec.tmod = TransferMode::Read as i32;
             rec.ifmt = ASYN_FMT_ASCII;
@@ -13090,12 +13095,12 @@ A.OEOS
         rec.status_dirty.store(false, Ordering::Release);
 
         rec.tmsk = (TraceMask::ERROR | TraceMask::FLOW).bits() as i32;
-        rec.special("TMSK", true).unwrap();
+        rec.special("TMSK", true, &Default::default()).unwrap();
         assert_eq!(rec.tb4, 1, "the refresh in special() ran");
         assert!(!rec.status_dirty.load(Ordering::Acquire), "trace setter");
 
         rec.enbl = 0;
-        rec.special("ENBL", true).unwrap();
+        rec.special("ENBL", true, &Default::default()).unwrap();
         // One round trip: the actor drains what it owes before it serves this.
         let _ = rec
             .device_user
@@ -13105,7 +13110,7 @@ A.OEOS
             .call_param_callbacks_blocking(0);
         assert!(!rec.status_dirty.load(Ordering::Acquire), "actor setter");
         rec.enbl = 1;
-        rec.special("ENBL", true).unwrap();
+        rec.special("ENBL", true, &Default::default()).unwrap();
 
         std::thread::spawn({
             let trace = trace.clone();
@@ -13168,7 +13173,7 @@ A.OEOS
         assert_eq!(rec.cnct, 1);
 
         rec.tmsk = 0x41;
-        rec.special("TMSK", true).unwrap();
+        rec.special("TMSK", true, &Default::default()).unwrap();
         assert_eq!(trace.get_trace_mask(Some(port_name)).bits(), 0x41);
         rec.read_trace_state();
         assert_eq!(rec.tmsk, 0x41);
@@ -13176,9 +13181,9 @@ A.OEOS
 
         // TIOM and TINM are ints too (asynManager.c:2828, :2870).
         rec.tiom = 0x9;
-        rec.special("TIOM", true).unwrap();
+        rec.special("TIOM", true, &Default::default()).unwrap();
         rec.tinm = 0x11;
-        rec.special("TINM", true).unwrap();
+        rec.special("TINM", true, &Default::default()).unwrap();
         let snap = trace.snapshot(Some(port_name), None);
         assert_eq!(snap.io_mask.bits(), 0x9);
         assert_eq!(snap.info_mask.bits(), 0x11);
@@ -13469,7 +13474,7 @@ A.OEOS
 
         rec.tmot = 3.5;
         rec.lbaud = 19200;
-        rec.special("LBAUD", true).unwrap();
+        rec.special("LBAUD", true, &Default::default()).unwrap();
 
         assert_eq!(
             SEEN.lock().unwrap().take(),
@@ -13531,7 +13536,7 @@ A.OEOS
         assert_eq!(rec.octetiv, 1);
 
         rec.lbaud = 9600;
-        rec.special("LBAUD", true).unwrap();
+        rec.special("LBAUD", true, &Default::default()).unwrap();
         assert_eq!(rec.errs, "No asynOption interface");
         let mut c = CommonFields::default();
         rec.check_alarms(&mut c);
@@ -13541,7 +13546,7 @@ A.OEOS
         // asynOctet is implemented, so the EOS put reaches the driver.
         rec.errs = Errs::EMPTY;
         rec.ieos = "\\n".to_string();
-        rec.special("IEOS", true).unwrap();
+        rec.special("IEOS", true, &Default::default()).unwrap();
         assert_ne!(rec.errs, "No asynOctet interface");
     }
 
@@ -14049,7 +14054,7 @@ A.OEOS
 
             // Now the operator puts the field. Whatever the arm does with it, C's
             // callback ends in `monitorStatus`.
-            rec.special(field, true).unwrap();
+            rec.special(field, true, &Default::default()).unwrap();
 
             assert_eq!(
                 rec.auct, 0,
@@ -14111,7 +14116,7 @@ A.OEOS
         for field in ["IEOS", "OEOS"] {
             rec.put_field(field, EpicsValue::String("\r".into()))
                 .unwrap();
-            rec.special(field, true).unwrap();
+            rec.special(field, true, &Default::default()).unwrap();
             assert_eq!(rec.errs, "No asynOctet interface", "{field}");
             assert_eq!((rec.ieos.as_str(), rec.oeos.as_str()), ("", ""), "{field}");
         }
@@ -14179,7 +14184,7 @@ A.OEOS
         let cnct = |rec: &mut AsynRecord, value: &str| {
             rec.put_field("CNCT", EpicsValue::String(value.into()))
                 .unwrap();
-            rec.special("CNCT", true).unwrap();
+            rec.special("CNCT", true, &Default::default()).unwrap();
         };
 
         let (mut rec, _rt) = start("cnct_texts_connect", false);
@@ -14226,7 +14231,7 @@ A.OEOS
 
         // The operator overrides REASON by hand.
         rec.reason = 3;
-        rec.special("REASON", true).unwrap();
+        rec.special("REASON", true, &Default::default()).unwrap();
         assert_eq!(
             rec.resolved_reason, 3,
             "C assigns pasynUser->reason from the field (asynRecord.c:488)"
@@ -14970,7 +14975,7 @@ A.OEOS
                 "PCNCT" => rec.pcnct = 0,
                 _ => unreachable!(),
             }
-            rec.special(field, true).unwrap();
+            rec.special(field, true, &Default::default()).unwrap();
             assert!(
                 !scan.is_active(),
                 "{field}: C forces SCAN back to Passive, cancelling the registration"
@@ -14980,7 +14985,7 @@ A.OEOS
             // has a device. The reconnect must not re-arm the scan by itself.
             if field == "PCNCT" {
                 rec.pcnct = 1;
-                rec.special("PCNCT", true).unwrap();
+                rec.special("PCNCT", true, &Default::default()).unwrap();
                 assert!(!scan.is_active(), "a reconnect does not re-arm I/O Intr");
             }
 

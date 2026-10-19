@@ -709,9 +709,11 @@ fn format_float_conv(conv: u8, val: f64, prec: usize, alt_form: bool) -> String 
 impl Record for PrintfRecord {
     // FMT recompiles on put and LEN is VAL's length, so neither maps.
     crate::slot_map!(crate::server::record::dbd_generated::slots::printf;
-        IVLS => ivls;
-        read_only:
-        SIZV => sizv);
+        fields:
+        IVLS => ivls,
+        SIZV => sizv;
+        custom: VAL, LEN, FMT, INP0, INP1, INP2, INP3, INP4, INP5, INP6, INP7, INP8, INP9;
+        spill: OUT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -891,19 +893,35 @@ impl Record for PrintfRecord {
         }
     }
 
+    /// C `printfRecord.c:335-344`: SIZV clamps to [16, 0x7fff].
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.sizv = self.sizv.clamp(16, 0x7fff);
+            // C callocs VAL here, with `len = 0`.
+            self.val = LongStringVal::default();
+        }
+        Ok(())
+    }
+
+    /// LEN is the length of VAL; `put_field` refuses the `SPC_NOMOD` field,
+    /// and a `.db` value is stored as C stores it.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("LEN", EpicsValue::ULong(n)) => self.val.set_len(n),
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "SIZV" => {
                 // SIZV is DBF_USHORT (printfRecord.dbd.pod:202): a client put
                 // arrives as UShort, internal callers may still pass Short.
-                let raw = match value {
-                    EpicsValue::UShort(v) => Some(v as i32),
-                    EpicsValue::Short(v) => Some(v as i32),
-                    _ => None,
-                };
-                if let Some(raw) = raw {
-                    // C printfRecord.c:337-342 clamps SIZV to [16, 0x7fff].
-                    self.sizv = raw.clamp(16, 0x7fff) as u16;
+                match value {
+                    EpicsValue::UShort(v) => self.sizv = v,
+                    EpicsValue::Short(v) => self.sizv = v as u16,
+                    _ => {}
                 }
             }
             // C `cvt_dbaddr` (`printfRecord.c:410-421`) types VAL `DBF_STRING`

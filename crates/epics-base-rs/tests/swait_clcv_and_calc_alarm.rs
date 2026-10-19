@@ -63,6 +63,7 @@ async fn r10_67_clcv_carries_the_postfix_status() {
         w.put_field("CALC", EpicsValue::String(calc.into()))
             .unwrap();
         w.init_record(0).unwrap();
+        w.init_record(1).unwrap();
         assert_eq!(w.clcv, want, "CALC={calc:?}");
     }
 }

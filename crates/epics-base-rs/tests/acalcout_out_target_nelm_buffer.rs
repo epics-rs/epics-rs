@@ -146,10 +146,10 @@ fn invalid_ivov_record(dopt: i16, nelm: u32, out: &str) -> AcalcoutRecord {
     a.put_field("NELM", EpicsValue::ULong(nelm)).unwrap();
     a.put_field("CALC", EpicsValue::String("10".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("DOPT", EpicsValue::Short(dopt)).unwrap();
     a.put_field("OCAL", EpicsValue::String("7".into())).unwrap();
-    a.special("OCAL", true).unwrap();
+    a.special("OCAL", true, &Default::default()).unwrap();
     a.put_field("HIHI", EpicsValue::Double(5.0)).unwrap();
     a.put_field("HHSV", EpicsValue::Short(3)).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();

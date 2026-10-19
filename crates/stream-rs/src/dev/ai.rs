@@ -69,7 +69,7 @@ fn read_data(
     }
     val += ai.aoff;
     if !(ai.smoo == 0.0
-        || ai.init.is_initial()
+        || ai.init != 0
         || common.udf != 0
         || ai.val.is_infinite()
         || ai.val.is_nan())

@@ -142,6 +142,11 @@ fn put_double(slot: &mut f64, value: EpicsValue, field: &str) -> CaResult<()> {
 }
 
 impl Record for EventRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::event;
+        fields:;
+        custom: VAL, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
+
     fn acts_before_process(&self) -> bool {
         false
     }

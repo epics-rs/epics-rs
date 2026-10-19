@@ -60,7 +60,8 @@ const INT64IN_STATUS: crate::server::record::ProcessStatusRule =
     dset_owns_udf_on_computed,
     seeds_trackers,
     process_status = INT64IN_STATUS,
-    soft_input_read_as = Int64
+    soft_input_read_as = Int64,
+    spill(INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, OLDSIMM, SSCN, SIMPVT)
 )]
 pub struct Int64inRecord {
     #[field(type = "Int64")]

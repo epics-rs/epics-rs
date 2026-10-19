@@ -63,6 +63,15 @@ impl Default for PermissiveRecord {
 }
 
 impl Record for PermissiveRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::permissive;
+        fields:
+        VAL => val,
+        WFLG => wflg,
+        OVAL => oval,
+        OFLG => oflg;
+        custom: LABL;
+        spill:);
+
     fn acts_before_process(&self) -> bool {
         false
     }

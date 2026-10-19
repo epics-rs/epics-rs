@@ -33,14 +33,14 @@ impl MotorRecord {
             self.mark(m::MIP);
             // An error stop post-processes like a commanded stop (sync at
             // completion), not like a Pause (resume armed).
-            self.internal.pp = true;
+            self.internal.pp = 1;
             effects.commands.push(MotorCommand::stop_axis());
             return effects;
         }
 
         // C 1366-1380 precedes the pp test, the retry test and the delay
         // handling of every stopped callback.
-        if !self.stat.movn && self.ls_error_update(&mut effects) {
+        if self.stat.movn == 0 && self.ls_error_update(&mut effects) {
             return effects;
         }
 
@@ -78,7 +78,7 @@ impl MotorRecord {
         // computes movn = 0 for ls_active and RA_PROBLEM too, so an
         // axis stopped by its limit switch or a driver fault completes
         // instead of waiting forever for a DONE that never comes.
-        let driver_done = !self.stat.movn;
+        let driver_done = self.stat.movn == 0;
 
         if !driver_done {
             // C movn block (1327-1342): poll-time NTM. The axis moving
@@ -91,7 +91,7 @@ impl MotorRecord {
             // target and re-dispatches. Runs before the LVIO recompute,
             // like C's movn block preceding enter_do_work.
             if self.timing.ntm
-                && (self.pos.rdif >= 0) != self.stat.cdir
+                && (self.pos.rdif >= 0) != (self.stat.cdir != 0)
                 && self.pos.diff.abs()
                     > self.timing.ntmf as f64 * (self.retry.bdst.abs() + self.retry.rdbd)
                 && self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY)
@@ -100,7 +100,7 @@ impl MotorRecord {
                 self.report_ntm_stop();
                 self.stat.mip.insert(MipFlags::STOP);
                 self.mark(m::MIP);
-                self.internal.pp = false;
+                self.internal.pp = 0;
                 effects.commands.push(MotorCommand::stop_axis());
                 return effects;
             }
@@ -141,7 +141,7 @@ impl MotorRecord {
                 // motion starts with pp armed again (887), so a pause
                 // interrupting it syncs at its own stop completion.
                 self.postprocess_sync();
-                self.internal.pp = true;
+                self.internal.pp = 1;
                 match queued {
                     QueuedMotion::Home { forward } => {
                         self.set_phase(MotionPhase::Homing);
@@ -154,7 +154,7 @@ impl MotorRecord {
                         } else {
                             !forward
                         };
-                        self.stat.cdir = hw_forward;
+                        self.stat.cdir = i16::from(hw_forward);
                         let home = MotorCommand::Home {
                             forward: hw_forward,
                             min_velocity: self.raw_rate(self.effective_vbas()),
@@ -173,7 +173,7 @@ impl MotorRecord {
             // which armed pp) runs postProcess — VAL/DVAL/RVAL <- readback
             // and MIP_STOP cleared (827-849, 1027-1032) — so maybeRetry
             // never runs (mip == MIP_DONE at its 1432 gate).
-            let pp = std::mem::take(&mut self.internal.pp);
+            let pp = std::mem::take(&mut self.internal.pp) != 0;
             if pp && self.stat.mip.contains(MipFlags::JOG_STOP) {
                 // A queued jog released while its stop was in flight
                 // (mip = STOP|JOG_STOP, C 2153-2154).
@@ -202,7 +202,7 @@ impl MotorRecord {
             // Pause its do_work returns at 2237, so a retry or a write
             // parked during the stop waits for Go. With DMOV already set
             // there is no fresh M_DMOV edge to request DLY on (1441).
-            if self.stat.dmov {
+            if self.stat.dmov != 0 {
                 self.evaluate_position_error(&mut effects);
             } else {
                 self.settle_then_evaluate(&mut effects);
@@ -215,7 +215,7 @@ impl MotorRecord {
                 if self.internal.backlash_pending {
                     // C: the backlash move armed pp (2523), so a target
                     // parked during the first leg is replayed (1384-1397).
-                    if std::mem::take(&mut self.internal.pp)
+                    if std::mem::take(&mut self.internal.pp) != 0
                         && self.replay_overtaken_target(&mut effects)
                     {
                         return effects;
@@ -227,7 +227,7 @@ impl MotorRecord {
             }
             MotionPhase::BacklashFinal => {
                 // The final leg armed pp too (C 975).
-                if std::mem::take(&mut self.internal.pp)
+                if std::mem::take(&mut self.internal.pp) != 0
                     && self.replay_overtaken_target(&mut effects)
                 {
                     return effects;
@@ -280,7 +280,7 @@ impl MotorRecord {
                     // mip is not DONE, so maybeRetry runs against
                     // `dval - drbv` (1427-1430). BL1 never gets here: its
                     // postProcess branch dispatches BL2.
-                    self.internal.pp = false;
+                    self.internal.pp = 0;
                     self.internal.lval = self.pos.val;
                     self.internal.ldvl = self.pos.dval;
                     self.internal.lrvl = self.pos.rval;
@@ -296,10 +296,10 @@ impl MotorRecord {
                 // button latched (it reads back 1 for the whole home), so
                 // this is the lifecycle owner for the done path; stops
                 // and pauses clear via clear_buttons (1893/1899-1900).
-                if std::mem::take(&mut self.ctrl.homf) {
+                if std::mem::take(&mut self.ctrl.homf) != 0 {
                     self.mark(m::HOMF);
                 }
-                if std::mem::take(&mut self.ctrl.homr) {
+                if std::mem::take(&mut self.ctrl.homr) != 0 {
                     self.mark(m::HOMR);
                 }
                 // C 1387-1397: a VAL written while homing was parked by
@@ -352,8 +352,8 @@ impl MotorRecord {
                 // (do_work 1981-1987: pp = TRUE + GET_INFO) completes
                 // here, re-deriving VAL/DVAL/RVAL at the new
                 // resolution.
-                if self.internal.pp {
-                    self.internal.pp = false;
+                if self.internal.pp != 0 {
+                    self.internal.pp = 0;
                     // C 1384-1399: a target written before the pp pass is
                     // replayed, not synced away.
                     if self.replay_overtaken_target(&mut effects) {
@@ -426,7 +426,7 @@ impl MotorRecord {
         // ++rcnt of the exhausted maybeRetry pass) until the next move.
         // C postProcess clears pp on entry (825); every normal completion
         // runs it, so a leftover pp must not leak into the next motion.
-        self.internal.pp = false;
+        self.internal.pp = 0;
         self.internal.backlash_pending = false;
         self.internal.queued_motion = None;
         // No blanket button clear here: C clears the buttons only at
@@ -478,10 +478,10 @@ impl MotorRecord {
     pub(crate) fn request_poll_for_held_button(&self, effects: &mut ProcessEffects) {
         if self.can_accept_command()
             && (self.stat.mip.contains(MipFlags::JOG_REQ)
-                || self.ctrl.homf
-                || self.ctrl.homr
-                || self.ctrl.twf
-                || self.ctrl.twr)
+                || self.ctrl.homf != 0
+                || self.ctrl.homr != 0
+                || self.ctrl.twf != 0
+                || self.ctrl.twr != 0)
         {
             effects.request_poll = true;
         }
@@ -542,22 +542,24 @@ impl MotorRecord {
     pub(super) fn recompute_lvio_during_motion(&mut self) -> bool {
         let old_lvio = self.limits.lvio;
         if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
-            self.limits.lvio = false;
+            self.limits.lvio = 0;
         } else if self
             .stat
             .mip
             .intersects(MipFlags::JOGF | MipFlags::JOGR | MipFlags::JOG_BL1 | MipFlags::JOG_BL2)
         {
-            self.limits.lvio = (self.ctrl.jogf && self.pos.rbv > self.limits.hlm - self.vel.jvel)
-                || (self.ctrl.jogr && self.pos.rbv < self.limits.llm + self.vel.jvel)
-                || (self.limits.dllm > self.limits.dhlm);
+            self.limits.lvio = i16::from(
+                (self.ctrl.jogf != 0 && self.pos.rbv > self.limits.hlm - self.vel.jvel)
+                    || (self.ctrl.jogr != 0 && self.pos.rbv < self.limits.llm + self.vel.jvel)
+                    || (self.limits.dllm > self.limits.dhlm),
+            );
         } else if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
-            self.limits.lvio = false;
+            self.limits.lvio = 0;
         }
         if self.limits.lvio != old_lvio {
             self.mark(m::LVIO);
         }
-        self.limits.lvio && !old_lvio && !self.conv.set && !self.conv.igset
+        self.limits.lvio != 0 && old_lvio == 0 && !self.conv.set && self.conv.igset == 0
     }
 
     /// Set motion phase.
@@ -602,7 +604,7 @@ impl MotorRecord {
         self.stat.mip = MipFlags::empty();
         self.mark(m::MIP);
         self.set_phase(MotionPhase::Idle);
-        self.internal.pp = true;
+        self.internal.pp = 1;
         self.internal.backlash_pending = false;
         self.internal.queued_motion = None;
         effects.commands.push(MotorCommand::Poll);
@@ -613,12 +615,8 @@ impl MotorRecord {
     /// limit switch in its commanded direction.
     fn limit_stopped(&self) -> bool {
         let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
-        let user_cdir = if same_polarity {
-            self.stat.cdir
-        } else {
-            !self.stat.cdir
-        };
-        (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir)
+        let user_cdir = (self.stat.cdir != 0) == same_polarity;
+        (self.limits.hls != 0 && user_cdir) || (self.limits.lls != 0 && !user_cdir)
     }
 
     /// The C `maybeRetry` port (motorRecord.cc:1042-1104) — the single
@@ -643,7 +641,7 @@ impl MotorRecord {
                 // The retry branches below never touch miss.
                 self.retry.rcnt += 1;
                 self.mark(m::RCNT);
-                self.retry.miss = true;
+                self.retry.miss = 1;
                 self.mark(m::MISS);
                 self.finalize_motion(effects);
                 // C maybeRetry give-up (motorRecord.cc:1063-1065):
@@ -652,7 +650,9 @@ impl MotorRecord {
                 // (1055/1088 `mip &= MIP_JOG_REQ`), which only PRESERVE an
                 // already-set bit and during a positional move read 0 because
                 // special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053).
-                if (self.ctrl.jogf && !self.limits.hls) || (self.ctrl.jogr && !self.limits.lls) {
+                if (self.ctrl.jogf != 0 && self.limits.hls == 0)
+                    || (self.ctrl.jogr != 0 && self.limits.lls == 0)
+                {
                     self.stat.mip.insert(MipFlags::JOG_REQ);
                 }
                 // dmov stays TRUE through give-up, so do_work re-fires the
@@ -709,7 +709,7 @@ impl MotorRecord {
             // rtry==0 branch (1054-1056) leaves both untouched —
             // retry-disabled never latches a miss.
             if diff < self.retry.rdbd {
-                if std::mem::take(&mut self.retry.miss) {
+                if std::mem::take(&mut self.retry.miss) != 0 {
                     self.mark(m::MISS);
                 }
                 self.restore_spmg_move_to_pause();
@@ -746,7 +746,7 @@ impl MotorRecord {
     /// then the MIP_JOG_STOP branch (908-958) corrects when |BDST| >=
     /// |MRES|; otherwise MIP_STOP clears (1030) and the motion ends.
     fn postprocess_jog_stop(&mut self, effects: &mut ProcessEffects) {
-        self.internal.pp = false;
+        self.internal.pp = 0;
         self.postprocess_sync();
         if self.needs_jog_backlash() {
             self.start_jog_backlash(effects);
@@ -766,7 +766,7 @@ impl MotorRecord {
         self.internal.backlash_pending = false;
         // C 975: the final leg arms pp, so its completion replays a
         // target parked during it and a Pause syncs like a commanded stop.
-        self.internal.pp = true;
+        self.internal.pp = 1;
         self.set_phase(MotionPhase::BacklashFinal);
         self.stat.mip = MipFlags::MOVE_BL;
         self.mark(m::MIP);
@@ -775,7 +775,7 @@ impl MotorRecord {
             // C relative: relpos = (dval - drbv) * frac / mres
             let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
             // C 973: CDIR follows the (frac-scaled) raw-unit stroke.
-            self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
+            self.stat.cdir = i16::from(rel_distance / self.conv.mres >= 0.0);
             effects.commands.extend(
                 MotorCommand::MoveRelative {
                     distance: self.raw_position(rel_distance),
@@ -793,7 +793,7 @@ impl MotorRecord {
             // C 967: the FRAC-scaled commanded raw position is posted to
             // RVAL; 973 derives CDIR from the unscaled raw error.
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
-            self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
+            self.stat.cdir = i16::from((self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0);
             effects.commands.extend(
                 MotorCommand::MoveAbsolute {
                     position: self.raw_position(position),
@@ -832,7 +832,7 @@ impl MotorRecord {
         // sibling arms are self-consistent: MIP_MOVE is excluded from that sync
         // so its relpos is live, and the fractional-retry arm re-derives relpos
         // at C 960. Only JOG_STOP keys CDIR on the value it just zeroed.
-        self.stat.cdir = (pretarget - self.pos.drbv) / self.conv.mres >= 0.0;
+        self.stat.cdir = i16::from((pretarget - self.pos.drbv) / self.conv.mres >= 0.0);
         if self.use_relative_moves() {
             effects.commands.extend(
                 MotorCommand::MoveRelative {
@@ -872,7 +872,7 @@ impl MotorRecord {
             // the MOVE_BL formula (957), not the jog one.
             let rel_distance = self.retry.bdst * frac;
             // C 1020: CDIR follows the scaled raw-unit stroke.
-            self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
+            self.stat.cdir = i16::from(rel_distance / self.conv.mres >= 0.0);
             effects.commands.extend(
                 MotorCommand::MoveRelative {
                     distance: self.raw_position(rel_distance),
@@ -887,7 +887,7 @@ impl MotorRecord {
             // C 1016: the FRAC-scaled commanded raw position is posted to
             // RVAL; 1020 derives CDIR from the unscaled raw error.
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
-            self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
+            self.stat.cdir = i16::from((self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0);
             effects.commands.extend(
                 MotorCommand::MoveAbsolute {
                     position: self.raw_position(position),

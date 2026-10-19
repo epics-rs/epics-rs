@@ -515,7 +515,7 @@ async fn deleting_a_record_in_its_odly_window_ends_its_put_notify() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("42".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.oopt = 0;
     sc.put_field("ODLY", EpicsValue::Double(0.3)).unwrap();
     sc.put_field("OUT", EpicsValue::String("TGT1".into()))

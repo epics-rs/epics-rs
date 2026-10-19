@@ -85,8 +85,9 @@ pub struct MbbiRecord {
     skip_convert: bool,
     /// `special()` re-labelled the state VAL sits on; the put drains it.
     label_post: bool,
-    /// SDEF, written by [`Self::init_common`] only.
-    sdef: bool,
+    /// C's DBF_SHORT `sdef`: a `.db` value until [`Self::init_common`]
+    /// writes it, and C tests it as nonzero.
+    pub sdef: i16,
 }
 
 impl Default for MbbiRecord {
@@ -160,7 +161,7 @@ impl Default for MbbiRecord {
             sdly: -1.0,
             skip_convert: false,
             label_post: false,
-            sdef: false,
+            sdef: 0,
         }
     }
 }
@@ -189,12 +190,12 @@ impl MbbiRecord {
     fn init_common(&mut self) {
         let rvs = self.raw_values();
         let sts = self.state_strings();
-        self.sdef = (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty());
+        self.sdef = i16::from((0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty()));
     }
 
-    /// C's `prec->sdef`: 0 until `init_common` has run.
+    /// C's `if (prec->sdef)`.
     pub fn sdef(&self) -> bool {
-        self.sdef
+        self.sdef != 0
     }
 
     /// ZRST..FFST, C's `(&prec->zrst)[i]`.
@@ -254,7 +255,7 @@ macro_rules! mbb_get_field {
             "VAL" => Some(EpicsValue::Enum($self.val)),
             // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
             // (mbbiRecord.dbd.pod:628) — readable over CA, never writable.
-            "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
+            "SDEF" => Some(EpicsValue::Short($self.sdef)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
@@ -336,7 +337,15 @@ macro_rules! mbb_put_field {
 
 impl Record for MbbiRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::mbbi;
-        RVAL => rval);
+        fields:
+        RVAL => rval,
+        SDEF => sdef;
+        custom: VAL, NOBT, ZRVL, ONVL, TWVL, THVL, FRVL, FVVL, SXVL, SVVL, EIVL, NIVL, TEVL,
+            ELVL, TVVL, TTVL, FTVL, FFVL, ZRST, ONST, TWST, THST, FRST, FVST, SXST, SVST, EIST,
+            NIST, TEST, ELST, TVST, TTST, FTST, FFST, ZRSV, ONSV, TWSV, THSV, FRSV, FVSV, SXSV,
+            SVSV, EISV, NISV, TESV, ELSV, TVSV, TTSV, FTSV, FFSV, AFTC, AFVL, UNSV, COSV, ORAW,
+            MASK, MLST, LALM, SHFT, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
 
     /// `mbbiRecord.c:126` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
@@ -353,6 +362,10 @@ impl Record for MbbiRecord {
 
     /// `mbbiRecord.c:135`
     fn after_dset_init(&mut self) {
+        self.init_common();
+    }
+
+    fn state_table_written(&mut self) {
         self.init_common();
     }
 
@@ -486,7 +499,12 @@ impl Record for MbbiRecord {
         Ok(())
     }
 
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         // Every state string is `??ST`; a VAL put skips the name scan.
         if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
             self.label_post =
@@ -594,7 +612,8 @@ impl Record for MbbiRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+        if pass == 1 {
+            // C `mbbiRecord.c:129-130`, after the pass-0 return.
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }

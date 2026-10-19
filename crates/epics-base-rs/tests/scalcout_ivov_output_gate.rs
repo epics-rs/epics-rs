@@ -25,7 +25,7 @@ async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
     // A stack-underflow CALC fails at eval → CALC_ALARM → INVALID severity.
     sc.put_field("CALC", EpicsValue::String("+".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.dopt = 0; // Use_VAL
     sc.oopt = 0; // Every_Time: output is due.
     sc.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set_to_IVOV

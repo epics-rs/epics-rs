@@ -63,8 +63,11 @@ fn arm_bands(inst: &mut RecordInstance) {
         ("LLSV", EpicsValue::Short(AlarmSeverity::Major as i16)),
     ] {
         if inst.record.put_field(field, value.clone()).is_err() {
-            inst.put_common_field(field, value)
-                .unwrap_or_else(|e| panic!("put {field}: {e:?}"));
+            match inst.put_common_field(field, value) {
+                // `seq` and `swait` declare no alarm bands at all.
+                Ok(_) | Err(epics_base_rs::error::CaError::FieldNotFound(_)) => {}
+                Err(e) => panic!("put {field}: {e:?}"),
+            }
         }
     }
 }

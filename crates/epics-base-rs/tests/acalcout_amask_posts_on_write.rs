@@ -41,7 +41,7 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field(
         "BB",
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into()),
@@ -128,7 +128,7 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
         g.record
             .put_field("CALC", EpicsValue::String("SUM(BB)".into()))
             .unwrap();
-        g.record.special("CALC", true).unwrap();
+        g.record.special("CALC", true, &Default::default()).unwrap();
     }
     process(&db, "P2").await;
 
@@ -313,7 +313,7 @@ fn the_aftercalc_post_through_process_local_carries_the_previous_stamp() {
     rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     rec.put_field("CALC", EpicsValue::String("AA:=IX;VAL+1".into()))
         .unwrap();
-    rec.special("CALC", true).unwrap();
+    rec.special("CALC", true, &Default::default()).unwrap();
     let mut inst = RecordInstance::new("AC", rec);
     let mut aa = inst
         .add_subscriber(

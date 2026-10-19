@@ -121,6 +121,62 @@ impl Default for SubRecord {
 }
 
 impl Record for SubRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::sub;
+        fields:
+        VAL => val,
+        SNAM => snam,
+        INAM => inam,
+        MDEL => mdel,
+        ADEL => adel,
+        LALM => lalm,
+        MLST => mlst,
+        ALST => alst,
+        A => a[0],
+        LA => la[0],
+        B => a[1],
+        LB => la[1],
+        C => a[2],
+        LC => la[2],
+        D => a[3],
+        LD => la[3],
+        E => a[4],
+        LE => la[4],
+        F => a[5],
+        LF => la[5],
+        G => a[6],
+        LG => la[6],
+        H => a[7],
+        LH => la[7],
+        I => a[8],
+        LI => la[8],
+        J => a[9],
+        LJ => la[9],
+        K => a[10],
+        LK => la[10],
+        L => a[11],
+        LL => la[11],
+        M => a[12],
+        LM => la[12],
+        N => a[13],
+        LN => la[13],
+        O => a[14],
+        LO => la[14],
+        P => a[15],
+        LP => la[15],
+        Q => a[16],
+        LQ => la[16],
+        R => a[17],
+        LR => la[17],
+        S => a[18],
+        LS => la[18],
+        T => a[19],
+        LT => la[19],
+        U => a[20],
+        LU => la[20];
+        custom: INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ, INPK, INPL, INPM,
+            INPN, INPO, INPP, INPQ, INPR, INPS, INPT, INPU, BRSV;
+        spill: EGU, HOPR, LOPR, HIHI, LOLO, HIGH, LOW, PREC, HHSV, LLSV, HSV, LSV, HYST);
+
     fn acts_before_process(&self) -> bool {
         false
     }

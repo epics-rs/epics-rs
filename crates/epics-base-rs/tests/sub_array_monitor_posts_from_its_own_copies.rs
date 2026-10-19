@@ -239,7 +239,7 @@ async fn a_moved_busy_posts_nothing_on_the_cycle() {
         let wf = inst.record.as_any_mut();
         wf.and_then(|a| a.downcast_mut::<WaveformRecord>())
             .unwrap()
-            .busy = set;
+            .busy = set.into();
         drop(inst);
         db.put_record_field_from_ca("S", "PROC", EpicsValue::String("1".into()))
             .await

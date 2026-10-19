@@ -15,7 +15,7 @@ use crate::types::{EpicsValue, PvString};
 pub struct BusyRecord {
     // Primary value
     pub val: u16,
-    pub oval: u16,
+    pub oval: u32,
     // Enum labels
     pub znam: PvString,
     pub onam: PvString,
@@ -121,8 +121,17 @@ const BUSY_HIGH_PRECISION: i16 = 2;
 
 impl Record for BusyRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::busy;
-        RVAL => rval;
-        read_only: RBV => rbv);
+        fields:
+        RVAL => rval,
+        RBV => rbv,
+        ORAW => oraw,
+        ORBV => orbv,
+        MLST => mlst,
+        LALM => lalm,
+        OVAL => oval;
+        custom: VAL, OMSL, DOL, HIGH, ZNAM, ONAM, MASK, ZSV, OSV, COSV, SIOL, SIML, SIMM, SIMS,
+            IVOA, IVOV;
+        spill: OUT, RPVT, WDPT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -309,7 +318,7 @@ impl Record for BusyRecord {
         self.skip_convert = false;
 
         // Step 3: Save current VAL before write (for FLNK decision)
-        self.oval = self.val;
+        self.oval = u32::from(self.val);
 
         // Step 4: alarm raising is owned by the trait check_alarms() hook (STATE
         // vs COS, raw menu ordinals), and the INVALID-output IVOA policy is
@@ -454,7 +463,7 @@ impl Record for BusyRecord {
     fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
         match cell {
             CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
-            CycleCell::Oval => CycleRead::Value(CycleValue::ULong(u32::from(self.oval))),
+            CycleCell::Oval => CycleRead::Value(CycleValue::ULong(self.oval)),
             CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
             CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
             _ => CycleRead::Absent,
@@ -464,7 +473,7 @@ impl Record for BusyRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
-            "OVAL" => Some(EpicsValue::ULong(u32::from(self.oval))),
+            "OVAL" => Some(EpicsValue::ULong(self.oval)),
             "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),

@@ -185,6 +185,7 @@ impl DfanoutRecord {
 impl Record for DfanoutRecord {
     // The menus are stored as `i16` and served as ENUM, so they stay General.
     crate::slot_map!(crate::server::record::dbd_generated::slots::dfanout;
+        fields:
         VAL => val,
         SELN => seln,
         HIHI => hihi,
@@ -194,11 +195,13 @@ impl Record for DfanoutRecord {
         HYST => hyst,
         ADEL => adel,
         MDEL => mdel,
-        IVOV => ivov;
-        read_only:
+        IVOV => ivov,
         LALM => lalm,
         ALST => alst,
-        MLST => mlst);
+        MLST => mlst;
+        custom: SELM, SELL, OUTA, OUTB, OUTC, OUTD, OUTE, OUTF, OUTG, OUTH, OUTI, OUTJ, OUTK,
+            OUTL, OUTM, OUTN, OUTO, OUTP, DOL, OMSL, HHSV, LLSV, HSV, LSV, IVOA;
+        spill: EGU, PREC, HOPR, LOPR);
 
     fn acts_before_process(&self) -> bool {
         false

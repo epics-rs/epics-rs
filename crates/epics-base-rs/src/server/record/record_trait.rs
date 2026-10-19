@@ -240,6 +240,32 @@ typed_slots! {
     Str(PvString),
 }
 
+impl SlotMut<'_> {
+    /// Store `value` raw, as `dbPutString` writes record memory: it must
+    /// already be the variant the slot holds ([`SlotRef::to_value`]'s).
+    pub(crate) fn store(self, value: EpicsValue) -> CaResult<()> {
+        match (self, value) {
+            (SlotMut::F64(s), EpicsValue::Double(v)) => *s = v,
+            (SlotMut::F32(s), EpicsValue::Float(v)) => *s = v,
+            (SlotMut::I8(s), EpicsValue::Char(v)) => *s = v as i8,
+            (SlotMut::U8(s), EpicsValue::UChar(v)) => *s = v,
+            (SlotMut::I16(s), EpicsValue::Short(v)) => *s = v,
+            (SlotMut::U16(s), EpicsValue::UShort(v) | EpicsValue::Enum(v)) => *s = v,
+            (SlotMut::I32(s), EpicsValue::Long(v)) => *s = v,
+            (SlotMut::U32(s), EpicsValue::ULong(v)) => *s = v,
+            (SlotMut::I64(s), EpicsValue::Int64(v)) => *s = v,
+            (SlotMut::U64(s), EpicsValue::UInt64(v)) => *s = v,
+            (SlotMut::Str(s), EpicsValue::String(v)) => *s = v,
+            (slot, value) => {
+                return Err(crate::error::CaError::InvalidValue(format!(
+                    "{slot:?} cannot hold {value:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SlotRef<'_> {
     /// The field as [`Record::get_field`] answers it; `dbf` is its declared
     /// type, which tells a `DBF_ENUM` apart from a `DBF_USHORT`.
@@ -285,22 +311,95 @@ impl SlotRef<'_> {
     }
 }
 
-/// [`Record::slot_ref`] and [`Record::slot_mut`] over a record type's
-/// generated slot constants:
+/// Where a `.db` `field()` of a record type's own declared field is stored at
+/// load ([`Record::declared_store`]). C's `dbPutString` writes record memory
+/// at the field's offset and runs no record code, so a record type answers
+/// for every field it declares; none can be "not found".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeclaredStore {
+    /// A plain member: stored raw through [`Record::slot_mut`].
+    Member,
+    /// A field the record stores itself, through [`Record::load_field`].
+    Custom,
+    /// A field the record keeps no storage for: the framework holds it, in
+    /// the common fields it models (`INP`, `OUT`, the alarm limits, `SSCN`)
+    /// or else its declared-field store.
+    Spill,
+}
+
+/// [`Record::slot_ref`], [`Record::slot_mut`] and [`Record::declared_store`]
+/// over a record type's generated slot constants:
 ///
 /// ```ignore
 /// slot_map!(crate::server::record::dbd_generated::slots::calc;
-///     VAL => val, A => vars[0];
-///     read_only: LA => prev[0]);
+///     fields: VAL => val, A => vars[0], LA => prev[0];
+///     custom: CALC, INPA;
+///     spill: VERS);
 /// ```
 ///
 /// Each arm matches `slots::<rtype>::<FIELD>`, so a misspelt field does not
-/// compile, and the variant comes from the member's type. A `read_only:`
-/// field (`SPC_NOMOD`, refused by `put_field`) has a `slot_ref` and no
-/// `slot_mut`. Every `slot_mut` arm must store what `put_field(name, v)`
-/// stores (`every_slot_store_equals_the_name_store`).
+/// compile, and the variant comes from the member's type. The three sections
+/// must name every field the type declares exactly once, against the
+/// generated `COUNT` ([`declared_store!`](crate::declared_store)). Every
+/// `slot_mut` arm must store what `put_field(name, v)` stores
+/// (`every_slot_store_equals_the_name_store`); `SPC_NOMOD` is the runtime
+/// put gate's, not the record's.
+///
+/// The form without `fields:` maps slots only, for a type not yet migrated:
+/// it has no `declared_store`, and a `read_only:` field gets no `slot_mut`.
 #[macro_export]
 macro_rules! slot_map {
+    // No member: the trait's `slot_ref`/`slot_mut` stand.
+    ($($seg:ident)::+;
+     fields:
+     $(; custom: $($cfield:ident),* $(,)?)?
+     $(; spill: $($sfield:ident),* $(,)?)?) => {
+        fn declared_store(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::DeclaredStore> {
+            $crate::declared_store!(slot; $($seg)::+;
+                member: ;
+                custom: $($($cfield),*)?;
+                spill: $($($sfield),*)?)
+        }
+    };
+    ($($seg:ident)::+;
+     fields: $($field:ident => $member:ident $([$i:expr])?),* $(,)?
+     $(; custom: $($cfield:ident),* $(,)?)?
+     $(; spill: $($sfield:ident),* $(,)?)?) => {
+        fn slot_ref(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::SlotRef<'_>> {
+            use $($seg)::+ as __slots;
+            match slot {
+                $(__slots::$field => Some((&self.$member $([$i])?).into()),)*
+                _ => None,
+            }
+        }
+
+        fn slot_mut(
+            &mut self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::SlotMut<'_>> {
+            use $($seg)::+ as __slots;
+            match slot {
+                $(__slots::$field => Some((&mut self.$member $([$i])?).into()),)*
+                _ => None,
+            }
+        }
+
+        fn declared_store(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::DeclaredStore> {
+            $crate::declared_store!(slot; $($seg)::+;
+                member: $($field),*;
+                custom: $($($cfield),*)?;
+                spill: $($($sfield),*)?)
+        }
+    };
     ($($seg:ident)::+;
      $($field:ident => $member:ident $([$i:expr])?),* $(,)?
      $(; read_only: $($rfield:ident => $rmember:ident $([$ri:expr])?),* $(,)?)?) => {
@@ -327,6 +426,82 @@ macro_rules! slot_map {
             }
         }
     };
+}
+
+/// Whether `slots` names each of a type's `N` fields exactly once: the check
+/// [`declared_store!`](crate::declared_store) makes at compile time.
+#[doc(hidden)]
+pub const fn covers_every_slot<const N: usize>(slots: &[FieldSlot]) -> bool {
+    if slots.len() != N {
+        return false;
+    }
+    let mut seen = [false; N];
+    let mut i = 0;
+    while i < slots.len() {
+        let at = slots[i].0 as usize;
+        if at >= N || seen[at] {
+            return false;
+        }
+        seen[at] = true;
+        i += 1;
+    }
+    true
+}
+
+/// [`Record::declared_store`]'s answer for `slot` of one record type, as an
+/// expression: the classification [`slot_map!`](crate::slot_map) writes, for a
+/// type that serves several record types and answers per kind. The sections
+/// must name every field of `slots::<rtype>` exactly once, or it does not
+/// compile:
+///
+/// ```
+/// use epics_base_rs::server::record::{DeclaredStore, FieldSlot};
+/// fn store(slot: FieldSlot) -> Option<DeclaredStore> {
+///     epics_base_rs::declared_store!(slot;
+///         epics_base_rs::server::record::dbd_generated::slots::state;
+///         member: ; custom: VAL; spill: OVAL)
+/// }
+/// assert_eq!(store(FieldSlot(1)), Some(DeclaredStore::Spill));
+/// ```
+///
+/// ```compile_fail
+/// use epics_base_rs::server::record::{DeclaredStore, FieldSlot};
+/// fn store(slot: FieldSlot) -> Option<DeclaredStore> {
+///     epics_base_rs::declared_store!(slot;
+///         epics_base_rs::server::record::dbd_generated::slots::state;
+///         member: ; custom: VAL; spill: VAL)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use epics_base_rs::server::record::{DeclaredStore, FieldSlot};
+/// fn store(slot: FieldSlot) -> Option<DeclaredStore> {
+///     epics_base_rs::declared_store!(slot;
+///         epics_base_rs::server::record::dbd_generated::slots::state;
+///         member: ; custom: VAL; spill: )
+/// }
+/// ```
+#[macro_export]
+macro_rules! declared_store {
+    ($slot:expr; $($seg:ident)::+;
+     member: $($field:ident),* $(,)?;
+     custom: $($cfield:ident),* $(,)?;
+     spill: $($sfield:ident),* $(,)?) => {{
+        use $($seg)::+ as __slots;
+        use $crate::server::record::DeclaredStore as __S;
+        const _: () = assert!(
+            $crate::server::record::covers_every_slot::<{ __slots::COUNT }>(&[
+                $(__slots::$field,)* $(__slots::$cfield,)* $(__slots::$sfield,)*
+            ]),
+            "the sections do not name every declared field exactly once"
+        );
+        Some(match $slot {
+            $(__slots::$field => __S::Member,)*
+            $(__slots::$cfield => __S::Custom,)*
+            $(__slots::$sfield => __S::Spill,)*
+            _ => return None,
+        })
+    }};
 }
 
 /// The `.dbd` declaration of a single record field.
@@ -463,6 +638,10 @@ pub struct FieldDesc {
     /// index is the stored value and the strings are what `get_enum_strs` serves,
     /// so a client sees `"NO CONVERSION"` rather than `0`.
     pub menu: Option<&'static [&'static str]>,
+    /// The `menu(...)` name itself, C's `pdbMenu->name` — set for `menuScan`
+    /// too, whose [`Self::menu`] is `None`. Menus that list the same choices
+    /// share one table, so the table cannot name its menu.
+    pub menu_name: Option<&'static str>,
     /// `initial("...")` — the value C's dbd loader seeds the field with.
     pub initial: Option<&'static str>,
     /// `interest(N)` — the `dbpr` verbosity level at which C prints the field.
@@ -531,6 +710,7 @@ impl FieldDesc {
             size: 0,
             extra: None,
             menu: None,
+            menu_name: None,
             initial: None,
             interest: 0,
             prop: false,
@@ -3660,6 +3840,14 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Set a field value by name.
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()>;
 
+    /// A `.db` `field()` of a field the record stores itself: what C's
+    /// `dbPutString` writes and nothing more, so a buffer sized by the field
+    /// is sized in `init_record`, as C sizes it. The default is
+    /// [`Self::put_field`], for a type whose arms only store.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_field(name, value)
+    }
+
     /// The field declaration of a record type **base's** `.dbd` set does not
     /// cover — a record type that lives in another crate.
     ///
@@ -5265,6 +5453,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// (`mbboRecord.c:141`, `:173`). Before [`Self::dset_init_convert`].
     fn after_dset_init(&mut self) {}
 
+    /// A device rewrote the state table in place, outside any put, as
+    /// devOpcua's `updateEnumInfos` does (it sets `sdef` itself,
+    /// devOpcua.cpp:714-716): re-derive what `init_common` caches. No
+    /// `special()` runs.
+    fn state_table_written(&mut self) {}
+
     /// Post-init finalisation hook with mutable access to the
     /// framework's UDF flag. Called once after both `init_record`
     /// passes complete. Default implementation is a no-op.
@@ -5800,8 +5994,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Default: ignore (records with no subroutine).
     fn set_subroutine_status(&mut self, _status: i64) {}
 
-    /// Called before/after a field put for side-effect processing.
-    fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
+    /// Called before/after a field put for side-effect processing. C's
+    /// `special(paddr, after)` reaches the whole record through the dbAddr;
+    /// `common` is the record's common half (DISA, DISV, SCAN, ...).
+    fn special(
+        &mut self,
+        _field: &str,
+        _after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         Ok(())
     }
 
@@ -6448,6 +6649,13 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// [`Self::put_field`] stores for the same value; a field `put_field`
     /// refuses has no `slot_mut`.
     fn slot_mut(&mut self, _slot: FieldSlot) -> Option<SlotMut<'_>> {
+        None
+    }
+
+    /// Where a `.db` `field()` of the declared field at `slot` is stored at
+    /// load. `None` (the default) for a type [`slot_map!`](crate::slot_map)
+    /// does not yet classify; the load then asks [`Self::implements_field`].
+    fn declared_store(&self, _slot: FieldSlot) -> Option<DeclaredStore> {
         None
     }
 
@@ -8413,23 +8621,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn store(slot: SlotMut<'_>, value: &EpicsValue) {
-        match (slot, value) {
-            (SlotMut::F64(s), EpicsValue::Double(v)) => *s = *v,
-            (SlotMut::F32(s), EpicsValue::Float(v)) => *s = *v,
-            (SlotMut::I8(s), EpicsValue::Char(v)) => *s = *v as i8,
-            (SlotMut::U8(s), EpicsValue::UChar(v)) => *s = *v,
-            (SlotMut::I16(s), EpicsValue::Short(v)) => *s = *v,
-            (SlotMut::U16(s), EpicsValue::UShort(v) | EpicsValue::Enum(v)) => *s = *v,
-            (SlotMut::I32(s), EpicsValue::Long(v)) => *s = *v,
-            (SlotMut::U32(s), EpicsValue::ULong(v)) => *s = *v,
-            (SlotMut::I64(s), EpicsValue::Int64(v)) => *s = *v,
-            (SlotMut::U64(s), EpicsValue::UInt64(v)) => *s = *v,
-            (SlotMut::Str(s), EpicsValue::String(v)) => *s = v.clone(),
-            (slot, value) => panic!("{slot:?} cannot hold {value:?}"),
-        }
-    }
-
     /// `slot_mut(slot)` stores exactly what `put_field(name, v)` stores, its
     /// variant is the declared `DBF_*`, and `field_slot` hands out exactly the
     /// slots `slot_ref` answers. A slot pointing at the wrong member, or one
@@ -8482,11 +8673,19 @@ pub(crate) mod tests {
                 for value in boundary_puts(&m, desc.dbf_type) {
                     let value = as_put(value, desc);
                     let mut by_slot = any_record(record_type);
-                    store(by_slot.slot_mut(slot).unwrap(), &value);
+                    by_slot
+                        .slot_mut(slot)
+                        .unwrap()
+                        .store(value.clone())
+                        .unwrap();
                     let mut by_name = any_record(record_type);
-                    by_name
-                        .put_field(desc.name, value.clone())
-                        .unwrap_or_else(|e| panic!("{at}: put_field({value:?}): {e}"));
+                    match by_name.put_field(desc.name, value.clone()) {
+                        // A `SPC_NOMOD` member's writers are the load, through
+                        // the slot, and the record itself.
+                        Err(_) if desc.read_only => continue,
+                        Err(e) => panic!("{at}: put_field({value:?}): {e}"),
+                        Ok(()) => {}
+                    }
                     assert_eq!(image(&*by_slot), image(&*by_name), "{at} <- {value:?}");
                     if let EpicsValue::Double(v) = value {
                         let mut by_put = any_record(record_type);
@@ -8499,6 +8698,77 @@ pub(crate) mod tests {
             }
         }
         assert!(checked > 0, "no type maps a slot");
+    }
+
+    /// A type that classifies its declared fields classifies all of them, and
+    /// each as what the record does with it: a member is a slot, a custom
+    /// field is one the record serves, a spilt one the record does not.
+    #[test]
+    fn every_declared_store_matches_the_record() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let mut classified = 0usize;
+        for record_type in RECORD_TYPES {
+            let mut record = any_record(record_type);
+            let fields = record.field_list();
+            if (0..fields.len()).all(|i| record.declared_store(FieldSlot(i as u16)).is_none()) {
+                continue;
+            }
+            classified += 1;
+            for (i, desc) in fields.iter().enumerate() {
+                let slot = FieldSlot(i as u16);
+                let at = format!("{record_type}.{}", desc.name);
+                let served = record.get_field(desc.name).is_some();
+                match record.declared_store(slot) {
+                    None => panic!("{at}: unclassified"),
+                    Some(DeclaredStore::Member) => {
+                        assert!(record.slot_ref(slot).is_some(), "{at}: member without slot");
+                        assert!(record.slot_mut(slot).is_some(), "{at}: member not writable");
+                    }
+                    Some(DeclaredStore::Custom) => {
+                        assert!(record.slot_ref(slot).is_none(), "{at}: custom with a slot");
+                        assert!(served || desc.no_access(), "{at}: custom, not served");
+                    }
+                    Some(DeclaredStore::Spill) => assert!(!served, "{at}: spilt, but served"),
+                }
+            }
+        }
+        assert!(classified > 0, "no type classifies its fields");
+    }
+
+    /// A member slot is the member `get_field` serves under the same name: a
+    /// value stored through the slot reads back by name. A `slot_map!` entry
+    /// pointing at a sibling member passes every test that writes and reads
+    /// through the slot alone, the load census included.
+    #[test]
+    fn every_member_slot_store_reads_back_by_name() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        let mut checked = 0usize;
+        for record_type in RECORD_TYPES {
+            let probe = any_record(record_type);
+            for (i, desc) in probe.field_list().iter().enumerate() {
+                let slot = FieldSlot(i as u16);
+                if probe.declared_store(slot) != Some(DeclaredStore::Member) {
+                    continue;
+                }
+                let at = format!("{record_type}.{}", desc.name);
+                let mut shape = any_record(record_type);
+                let values = boundary_puts(&shape.slot_mut(slot).unwrap(), desc.dbf_type);
+                for value in values {
+                    let value = as_put(value, desc);
+                    let mut record = any_record(record_type);
+                    record.slot_mut(slot).unwrap().store(value.clone()).unwrap();
+                    // Debug text, so a stored NaN compares equal to itself.
+                    let by_slot = record.slot_ref(slot).unwrap().to_value(desc.dbf_type);
+                    assert_eq!(
+                        format!("{:?}", record.get_field(desc.name)),
+                        format!("{:?}", Some(by_slot)),
+                        "{at} <- {value:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no type maps a member");
     }
 
     /// C `dbPut` skips `dbPutSpecial` for a field whose `special` is 0, and a
@@ -8520,8 +8790,8 @@ pub(crate) mod tests {
                 let mut record = any_record(record_type);
                 let before = image(&*record);
                 let ran = record
-                    .special(desc.name, false)
-                    .and_then(|()| record.special(desc.name, true));
+                    .special(desc.name, false, &Default::default())
+                    .and_then(|()| record.special(desc.name, true, &Default::default()));
                 record.on_put(desc.name);
                 if ran.is_err() || image(&*record) != before {
                     hooked.push((*record_type, desc.name));

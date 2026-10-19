@@ -18,7 +18,7 @@
 #![cfg(feature = "client-core")]
 
 use epics_base_rs::server::records::bi::BiRecord;
-use epics_base_rs::server::records::lsi::{LongStringVal, LsiRecord};
+use epics_base_rs::server::records::lsi::LsiRecord;
 use epics_base_rs::server::records::printf::PrintfRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -415,14 +415,18 @@ async fn long_string_count_clamp_trims_char_array() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn printf_val_native_type_is_scalar_dbr_string() {
-    let mut rec = PrintfRecord::default();
-    rec.val = LongStringVal::from_text(b"log: 42");
     let server = CaServer::builder()
         .port(0)
-        .record("R3C2:PF:VAL", rec)
+        .record("R3C2:PF:VAL", PrintfRecord::default())
         .build()
         .await
         .expect("build CA server");
+    // VAL is the formatted FMT, written by a process after init_record.
+    let db = server.database().clone();
+    db.put_pv("R3C2:PF:VAL.FMT", EpicsValue::String("log: 42".into()))
+        .await
+        .unwrap();
+    db.process_record("R3C2:PF:VAL").await.unwrap();
     let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
 
@@ -469,10 +473,19 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
     let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI";
     let server = CaServer::builder()
         .port(0)
-        .record("R3C2:LSI:VAL", LsiRecord::new(long))
+        .record("R3C2:LSI:VAL", LsiRecord::new(""))
         .build()
         .await
         .expect("build CA server");
+    // After init_record, which empties VAL as C's calloc does.
+    server
+        .database()
+        .put_pv(
+            "R3C2:LSI:VAL",
+            EpicsValue::CharArray(long.as_bytes().into()),
+        )
+        .await
+        .unwrap();
     let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
 
@@ -503,7 +516,7 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
         ref other => panic!("expected scalar String, got {other:?}"),
     };
     assert!(
-        long.starts_with(&s) && s.len() <= 39,
+        !s.is_empty() && long.starts_with(&s) && s.len() <= 39,
         "lsi VAL plain read must clip to the <=39-char DBR_STRING slot; got {s:?}"
     );
 }

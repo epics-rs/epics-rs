@@ -30,7 +30,7 @@ async fn force_block_sync_record_returns_none_and_processes() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("42".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.oopt = 0;
     sc.put_field("ODLY", EpicsValue::Double(0.0)).unwrap();
     sc.put_field("OUT", EpicsValue::String("TGT0".into()))
@@ -76,7 +76,7 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("42".into()))
         .unwrap();
-    sc.special("CALC", true).unwrap();
+    sc.special("CALC", true, &Default::default()).unwrap();
     sc.oopt = 0;
     sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     sc.put_field("OUT", EpicsValue::String("TGT1".into()))

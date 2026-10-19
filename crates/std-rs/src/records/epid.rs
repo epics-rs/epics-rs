@@ -781,6 +781,30 @@ impl Record for EpidRecord {
         }
     }
 
+    /// The `SPC_NOMOD` fields `put_field` refuses are still stored from a
+    /// `.db` file, as C's `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("CVAL", EpicsValue::Double(v)) => self.cval = v,
+            ("CVLP", EpicsValue::Double(v)) => self.cvlp = v,
+            ("OVAL", EpicsValue::Double(v)) => self.oval = v,
+            ("OVLP", EpicsValue::Double(v)) => self.ovlp = v,
+            ("P", EpicsValue::Double(v)) => self.p = v,
+            ("PP", EpicsValue::Double(v)) => self.pp = v,
+            ("D", EpicsValue::Double(v)) => self.d = v,
+            ("DP", EpicsValue::Double(v)) => self.dp = v,
+            ("DTP", EpicsValue::Double(v)) => self.dtp = v,
+            ("ERR", EpicsValue::Double(v)) => self.err = v,
+            ("ERRP", EpicsValue::Double(v)) => self.errp = v,
+            ("LALM", EpicsValue::Double(v)) => self.lalm = v,
+            ("ALST", EpicsValue::Double(v)) => self.alst = v,
+            ("MLST", EpicsValue::Double(v)) => self.mlst = v,
+            ("FBOP", EpicsValue::Short(v)) => self.fbop = v,
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {

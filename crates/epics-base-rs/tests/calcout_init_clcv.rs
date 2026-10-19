@@ -43,6 +43,7 @@ fn oclv(rec: &CalcoutRecord) -> i64 {
 fn empty_calc_and_ocal_init_to_postfix_err() {
     let mut rec = CalcoutRecord::default();
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     assert_eq!(clcv(&rec), POSTFIX_ERR, "C: clcv = postfix(\"\") = -1");
     assert_eq!(oclv(&rec), POSTFIX_ERR, "C: oclv = postfix(\"\") = -1");
 }
@@ -55,6 +56,7 @@ fn db_file_calc_compiles_at_init_and_empty_ocal_stays_err() {
     rec.put_field("CALC", EpicsValue::String("A+B".into()))
         .unwrap();
     rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     assert_eq!(clcv(&rec), 0, "C: clcv = postfix(\"A+B\") = 0");
     assert_eq!(oclv(&rec), POSTFIX_ERR, "C: oclv = postfix(\"\") = -1");
 }
@@ -67,7 +69,7 @@ fn bad_db_file_calc_lands_in_clcv_and_init_still_succeeds() {
     rec.put_field("CALC", EpicsValue::String("A+".into()))
         .unwrap();
     assert!(
-        rec.init_record(0).is_ok(),
+        rec.init_record(0).and_then(|()| rec.init_record(1)).is_ok(),
         "C: init_record does not fail on a bad CALC"
     );
     assert_eq!(clcv(&rec), POSTFIX_ERR);
@@ -82,13 +84,15 @@ fn init_and_put_agree_on_the_same_expression() {
         .put_field("CALC", EpicsValue::String("".into()))
         .unwrap();
     from_db.init_record(0).unwrap();
+    from_db.init_record(1).unwrap();
 
     let mut from_put = CalcoutRecord::default();
     from_put.init_record(0).unwrap();
+    from_put.init_record(1).unwrap();
     from_put
         .put_field("CALC", EpicsValue::String("".into()))
         .unwrap();
-    from_put.special("CALC", true).unwrap();
+    from_put.special("CALC", true, &Default::default()).unwrap();
 
     assert_eq!(clcv(&from_db), clcv(&from_put));
     assert_eq!(clcv(&from_db), POSTFIX_ERR);

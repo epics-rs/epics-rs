@@ -28,8 +28,11 @@ use epics_base_rs::types::EpicsValue;
 const INITIAL: EpicsValue = EpicsValue::Short(1);
 const CONVERTED: EpicsValue = EpicsValue::Short(0);
 
+/// Both passes, as iocInit runs them: C sets `init` in pass 1, after
+/// pass 0 returned (`aiRecord.c:101`, `aoRecord.c:103`).
 fn init(rec: &mut dyn Record) -> CaResult<()> {
-    rec.init_record(0)
+    rec.init_record(0)?;
+    rec.init_record(1)
 }
 
 fn init_field(rec: &dyn Record) -> EpicsValue {
@@ -138,4 +141,23 @@ fn r21_the_initial_phase_is_smoos_initial_condition() {
         rec.val, 15.0,
         "once converted, SMOO blends: 20*(1-0.5) + 10*0.5"
     );
+}
+
+/// C returns from pass 0 before `init = TRUE` (`aiRecord.c:101`,
+/// `aoRecord.c:103`, `swaitRecord.c:280`), so a record between the passes —
+/// where `doResolveLinks` and the constant-link seeds run — still reads 0.
+#[test]
+fn init_is_set_in_pass_1_not_pass_0() {
+    use epics_base_rs::server::records::swait::SwaitRecord;
+    let recs: [(&str, Box<dyn Record>); 3] = [
+        ("ai", Box::new(AiRecord::default())),
+        ("ao", Box::new(AoRecord::default())),
+        ("swait", Box::new(SwaitRecord::default())),
+    ];
+    for (rtype, mut rec) in recs {
+        rec.init_record(0).unwrap();
+        assert_eq!(init_field(&*rec), CONVERTED, "{rtype} after pass 0");
+        rec.init_record(1).unwrap();
+        assert_eq!(init_field(&*rec), INITIAL, "{rtype} after pass 1");
+    }
 }

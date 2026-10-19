@@ -10792,7 +10792,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     let mut src = CalcoutRecord::default();
     src.put_field("CALC", EpicsValue::String("A".into()))
         .unwrap();
-    src.special("CALC", true).unwrap();
+    src.special("CALC", true, &Default::default()).unwrap();
     src.put_field("A", EpicsValue::Double(42.0)).unwrap();
     src.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("CO6_SRC", Box::new(src)).await.unwrap();
@@ -11060,8 +11060,8 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
 /// (field absent from `field_list`).
 ///
 /// Covered fields (C dbd):
-///   - `histogram.NELM` — `promptgroup special(SPC_NOMOD)`: load resizes bins.
-///   - `compress.NSAM`   — `promptgroup special(SPC_NOMOD)`: load resizes buffer.
+///   - `histogram.NELM` — `promptgroup special(SPC_NOMOD)`: init sizes bins.
+///   - `compress.NSAM`   — `promptgroup special(SPC_NOMOD)`: init sizes buffer.
 ///   - `subArray.MALM`   — `special(SPC_NOMOD)`: load sets, runtime rejects.
 ///   - `subArray.INDX`   — `pp(TRUE)`: load AND runtime set.
 #[epics_macros_rs::epics_test]
@@ -11069,15 +11069,16 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     use epics_base_rs::server::db_loader::{DbFieldDef, apply_fields, create_record};
 
     // --- LOAD half: apply_fields (the `.db` load coercion) must store these
-    //     fields, resizing the backing array where one exists. ---
+    //     fields; `init_record` sizes the backing array from them, as C. ---
     let mut hist = create_record("histogram").expect("create histogram");
     let mut common: Vec<(String, EpicsValue)> = Vec::new();
     apply_fields(&mut hist, &[DbFieldDef::new("NELM", "5")], &mut common)
         .expect("histogram NELM is .db-settable (promptgroup)");
     assert_eq!(hist.get_field("NELM"), Some(EpicsValue::UShort(5)));
+    hist.init_record(0).unwrap();
     match hist.get_field("VAL") {
         Some(EpicsValue::ULongArray(v)) => {
-            assert_eq!(v.len(), 5, "NELM load resizes the bin array")
+            assert_eq!(v.len(), 5, "init sizes the bin array from NELM")
         }
         other => panic!("histogram VAL should be a 5-element ULongArray, got {other:?}"),
     }

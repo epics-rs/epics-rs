@@ -204,7 +204,7 @@ async fn acalcout_unwatched_odly_then_subscribe_sees_dlya_rise() {
     let mut ac = AcalcoutRecord::default();
     ac.put_field("CALC", EpicsValue::String("A".into()))
         .unwrap();
-    ac.special("CALC", true).unwrap();
+    ac.special("CALC", true, &Default::default()).unwrap();
     ac.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     ac.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("AC", Box::new(ac)).await.unwrap();

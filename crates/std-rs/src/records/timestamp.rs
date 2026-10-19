@@ -216,6 +216,17 @@ impl Record for TimestampRecord {
         }
     }
 
+    /// OVAL is `SPC_NOMOD`, refused by `put_field`, yet C's `dbPutString`
+    /// stores a `.db` value; the loader has already refused one that does
+    /// not fit (`S_dbLib_strLen`).
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("OVAL", EpicsValue::String(v)) => self.oval = v,
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => match value {

@@ -60,7 +60,7 @@ async fn an_unwatched_cycle_clears_newm() {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String("SUM(AA)".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("W".into())).unwrap();
     db.add_record("A", Box::new(a)).await.unwrap();
 

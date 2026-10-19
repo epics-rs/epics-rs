@@ -47,7 +47,12 @@ impl Record for Probe {
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_base_rs::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "CMND" {
             self.store = Some(ScanType::Passive);
         }

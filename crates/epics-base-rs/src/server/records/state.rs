@@ -61,6 +61,11 @@ impl StateRecord {
 }
 
 impl Record for StateRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::state;
+        fields:;
+        custom: VAL, OVAL;
+        spill:);
+
     fn acts_before_process(&self) -> bool {
         false
     }

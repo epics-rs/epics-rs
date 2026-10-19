@@ -102,6 +102,9 @@ const TRANSFORM_VERS_PRECISION: i16 = 2;
 /// (each can reference all 16 variables A-P), stores results back into A-P,
 /// then writes outputs via OUTA-OUTP links.
 pub struct TransformRecord {
+    /// VERS: C `vers = VERSION` in `init_record` pass 0; a `.db` VERS lands
+    /// until then.
+    vers: f32,
     /// `VAL` — a dummy. C `transformRecord.c:422` sets `ptran->val = 0` once in
     /// `init_record` ("Gotta have a .val field.  Make its value reproducible.")
     /// and NOTHING else ever touches it: `process()` iterates the channels from
@@ -220,6 +223,7 @@ pub struct TransformRecord {
 impl Default for TransformRecord {
     fn default() -> Self {
         Self {
+            vers: VERSION,
             val: 0.0,
             vals: [0.0; NUM_CHANNELS],
             lvals: [0.0; NUM_CHANNELS],
@@ -645,6 +649,36 @@ const TRANSFORM_COPT_CHOICES: &[&str] = &["Conditional", "Always"];
 const TRANSFORM_IVLA_CHOICES: &[&str] = &["Ignore error", "Do Nothing"];
 
 impl Record for TransformRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::transform;
+        fields:
+        LA => lvals[0],
+        LB => lvals[1],
+        LC => lvals[2],
+        LD => lvals[3],
+        LE => lvals[4],
+        LF => lvals[5],
+        LG => lvals[6],
+        LH => lvals[7],
+        LI => lvals[8],
+        LJ => lvals[9],
+        LK => lvals[10],
+        LL => lvals[11],
+        LM => lvals[12],
+        LN => lvals[13],
+        LO => lvals[14],
+        LP => lvals[15],
+        VERS => vers;
+        custom: IVLA, COPT, VAL, CLCA, CLCB, CLCC, CLCD, CLCE, CLCF, CLCG, CLCH, CLCI, CLCJ,
+            CLCK, CLCL, CLCM, CLCN, CLCO, CLCP, CAV, CBV, CCV, CDV, CEV, CFV, CGV, CHV, CIV,
+            CJV, CKV, CLV, CMV, CNV, COV, CPV, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH,
+            INPI, INPJ, INPK, INPL, INPM, INPN, INPO, INPP, OUTA, OUTB, OUTC, OUTD, OUTE, OUTF,
+            OUTG, OUTH, OUTI, OUTJ, OUTK, OUTL, OUTM, OUTN, OUTO, OUTP, PREC, A, B, C, D, E, F,
+            G, H, I, J, K, L, M, N, O, P, CMTA, CMTB, CMTC, CMTD, CMTE, CMTF, CMTG, CMTH, CMTI,
+            CMTJ, CMTK, CMTL, CMTM, CMTN, CMTO, CMTP, IAV, IBV, ICV, IDV, IEV, IFV, IGV, IHV,
+            IIV, IJV, IKV, ILV, IMV, INV, IOV, IPV, OAV, OBV, OCV, ODV, OEV, OFV, OGV, OHV, OIV,
+            OJV, OKV, OLV, OMV, ONV, OOV, OPV;
+        spill: RPVT, EGU, MAP);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -699,6 +733,9 @@ impl Record for TransformRecord {
     /// sees the macro. `put_field` only stores; a runtime put compiles in
     /// `special()`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.vers = VERSION;
+        }
         if pass == 1 {
             for i in 0..NUM_CHANNELS {
                 self.recompile(i, "transform: init_record: Illegal CALC field");
@@ -953,9 +990,7 @@ impl Record for TransformRecord {
             return Some(EpicsValue::Short(self.prec));
         }
         if name == "VERS" {
-            // Fixed code-version constant, C `ptran->vers = VERSION` in
-            // init_record; never the `.dbd` initial.
-            return Some(EpicsValue::Float(VERSION));
+            return Some(EpicsValue::Float(self.vers));
         }
         if let Some(idx) = Self::channel_index(name) {
             return Some(EpicsValue::Double(self.vals[idx]));
@@ -1019,10 +1054,6 @@ impl Record for TransformRecord {
                 }
                 _ => return Err(CaError::TypeMismatch("PREC".into())),
             }
-        }
-        if name == "VERS" {
-            // VERS is a fixed code-version constant; accept and ignore writes.
-            return Ok(());
         }
         if let Some(idx) = Self::channel_index(name) {
             self.vals[idx] = value
@@ -1113,7 +1144,12 @@ impl Record for TransformRecord {
     /// `put_field` directly *without* `special()`, which is C's shape too — a
     /// link-fed channel has `no_inlink == false` and is never gated by
     /// `new_value` at all.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         // C refuses a put to a value field whose input link is not CONSTANT,
         // valid or not (`transformRecord.c:651-660`).
         if !after
@@ -1380,7 +1416,7 @@ mod tests {
     /// A CLCx `dbPut`: the store, then `special(field, 1)`, which compiles.
     fn put_calc(rec: &mut TransformRecord, field: &str, value: EpicsValue) {
         rec.put_field(field, value).unwrap();
-        rec.special(field, true).unwrap();
+        rec.special(field, true, &Default::default()).unwrap();
     }
 
     #[test]
@@ -1463,13 +1499,19 @@ mod tests {
 
     /// VERS is the code-version constant (C `transformRecord.c:92 #define
     /// VERSION 5.8`, written `ptran->vers = VERSION` in init_record), NOT the
-    /// `.dbd` `initial("1")`. A write is accepted-and-ignored, matching
-    /// acalcout.
+    /// `.dbd` `initial("1")`. A `.db` VERS is stored like any field and
+    /// holds until `init_record` pass 0 writes the constant over it.
     #[test]
-    fn vers_is_the_version_constant_and_ignores_writes() {
+    fn vers_is_the_version_constant_after_init_record() {
+        use crate::server::record::dbd_generated::slots;
         let mut rec = TransformRecord::new();
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
-        assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
+        rec.slot_mut(slots::transform::VERS)
+            .unwrap()
+            .store(EpicsValue::Float(99.0))
+            .unwrap();
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(99.0)));
+        rec.init_record(0).unwrap();
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
     }
 

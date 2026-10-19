@@ -76,11 +76,13 @@ impl StringoutRecord {
 
 impl Record for StringoutRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::stringout;
+        fields:
         VAL => val,
         SDLY => sdly,
-        IVOV => ivov;
-        read_only:
-        OVAL => oval);
+        IVOV => ivov,
+        OVAL => oval;
+        custom: DOL, OMSL, MPST, APST, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false

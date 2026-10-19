@@ -853,7 +853,7 @@ fn special_after_put(
         let name = instance.name.clone();
         db.link_check_held(name.as_bytes(), instance);
     }
-    let mut status = instance.record.special(field, true);
+    let mut status = instance.record.special(field, true, &instance.common);
     collect_after_gate(instance, tail);
     collect_put_report(instance, status.is_err(), tail);
     // The record's half above and the registry half here are ONE C function,
@@ -2960,7 +2960,10 @@ impl PvDatabase {
                 .and_then(|()| check_no_mod_in_db_put(&instance, field, at, tail)),
             PutVia::DbPutField { common, .. } => gate_link(&mut instance, field, common, at, tail),
         }
-        .and_then(|()| instance.record.special(field, false))
+        .and_then(|()| {
+            let inst = &mut *instance;
+            inst.record.special(field, false, &inst.common)
+        })
         .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);

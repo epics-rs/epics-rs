@@ -61,7 +61,7 @@ fn undefined() -> CommonFields {
 fn with_calc(rec: &mut dyn Record, field: &str, expr: &str) {
     rec.put_field(field, EpicsValue::String(expr.into()))
         .unwrap();
-    rec.special(field, true).unwrap();
+    rec.special(field, true, &Default::default()).unwrap();
 }
 
 /// One cycle of the record's own half of C `process()` — the compute, then the

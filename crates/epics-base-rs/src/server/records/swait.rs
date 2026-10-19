@@ -46,11 +46,10 @@ pub struct SwaitRecord {
     pub clcv: i32,
     /// INIT ("Initialized?", `swaitRecord.dbd:42`, `DBF_SHORT`, `SPC_NOMOD`).
     /// C `swaitRecord.c:330` and `:374` set `pwait->init = TRUE` in
-    /// `init_record` and NOTHING ever clears it — unlike `ai`/`ao`'s INIT
-    /// (`ConvertPhase`) this is not a conversion phase but a latch:
-    /// "this record has been through init_record". The port served 0 for the
-    /// life of the IOC.
-    initialized: bool,
+    /// `init_record` and NOTHING ever clears it — unlike `ai`/`ao`'s INIT this
+    /// is not a conversion phase but a latch: "this record has been through
+    /// init_record".
+    init: i16,
     /// This cycle's `calcPerform` outcome. C `swaitRecord.c:409-410`:
     /// `if (calcPerform(...)) recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)`.
     ///
@@ -209,7 +208,7 @@ impl Default for SwaitRecord {
             calc: String::new(),
             rpcl: Rpcl::empty(),
             clcv: 0,
-            initialized: false,
+            init: 0,
             calc_alarm: false,
             calc_succeeded: false,
             oopt: 0,
@@ -485,6 +484,18 @@ const SWAIT_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 27] = {
 };
 
 impl Record for SwaitRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::swait;
+        fields:
+        OVAL => oval,
+        INIT => init;
+        custom: INAN, INBN, INCN, INDN, INEN, INFN, INGN, INHN, ININ, INJN, INKN, INLN, DOLN,
+            INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV, INJV, INKV, INLV, DOLV, OUTV,
+            A, B, C, D, E, F, G, H, I, J, K, L, LA, LB, LC, LD, LE, LF, LG, LH, LI, LJ, LK, LL,
+            INAP, INBP, INCP, INDP, INEP, INFP, INGP, INHP, INIP, INJP, INKP, INLP, CALC, CLCV,
+            VAL, PREC, OOPT, ODLY, DOPT, DOLD, OEVT, ADEL, MDEL, ALST, MLST, SIOL, SVAL, SIML,
+            SIMM, SIMS;
+        spill: VERS, HOPR, LOPR, CBST, OUTN);
+
     /// What `put_field` stores for `A`..`L`, without the by-name lookups
     /// that precede it on the default path.
     fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
@@ -554,7 +565,8 @@ impl Record for SwaitRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
+        if pass == 1 {
+            // C `swaitRecord.c:302`, after pass 0 returned at :280.
             self.recompile();
             // Not under a put's hold, so it prints at once.
             if let Some(report) = self.bad_calc_report("swait:init_record: Illegal CALC field") {
@@ -565,7 +577,18 @@ impl Record for SwaitRecord {
                 report.emit(&name, "");
             }
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
-            self.initialized = true;
+            self.init = 1;
+        }
+        Ok(())
+    }
+
+    /// A `.db` CALC is stored as text, as `dbPutString` stores it; C compiles
+    /// it in `init_record` pass 1, and only a put's `special` compiles it
+    /// earlier.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("CALC", EpicsValue::String(s)) => self.calc = s.as_str_lossy().into_owned(),
+            (name, value) => return self.put_field(name, value),
         }
         Ok(())
     }
@@ -589,7 +612,12 @@ impl Record for SwaitRecord {
     /// (swaitRecord.c:507-559) sets the status to `PV_NC` and re-issues
     /// `recDynLinkAddInput`/`AddOutput`, or to `NO_PV` when the name was
     /// cleared. `refresh_link_status` re-reads the name the put just stored.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -1028,7 +1056,7 @@ impl Record for SwaitRecord {
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
-            "INIT" => Some(EpicsValue::Short(if self.initialized { 1 } else { 0 })),
+            "INIT" => Some(EpicsValue::Short(self.init)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLN" => Some(EpicsValue::String(self.doln.clone().into())),
@@ -1077,6 +1105,11 @@ impl Record for SwaitRecord {
                 } else {
                     return Err(CaError::TypeMismatch("CALC".into()));
                 }
+            }
+            "OVAL" => {
+                self.oval = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OVAL".into()))?;
             }
             "CLCV" => {
                 self.clcv = value

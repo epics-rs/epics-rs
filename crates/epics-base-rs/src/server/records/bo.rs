@@ -136,20 +136,22 @@ pub(crate) fn set_bo_high_limit(value: f64) {
 impl Record for BoRecord {
     // The menus are stored as `i16` and served as ENUM, so they stay General.
     crate::slot_map!(crate::server::record::dbd_generated::slots::bo;
+        fields:
         VAL => val,
         HIGH => high,
         ZNAM => znam,
         ONAM => onam,
         RVAL => rval,
         SDLY => sdly,
-        IVOV => ivov;
-        read_only:
+        IVOV => ivov,
         ORAW => oraw,
         MASK => mask,
         RBV => rbv,
         ORBV => orbv,
         MLST => mlst,
-        LALM => lalm);
+        LALM => lalm;
+        custom: OMSL, DOL, ZSV, OSV, COSV, SIOL, SIML, SIMM, SIMS, IVOA;
+        spill: OUT, RPVT, WDPT, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false

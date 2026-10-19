@@ -212,7 +212,7 @@ fn test_tp_to_pr1_conversion() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 2.0; // 2 seconds
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 20_000_000); // 2.0 * 1e7
     assert_eq!(rec.d[0], 1); // Direction set
     assert_eq!(rec.g[0], 1); // Gate set
@@ -223,7 +223,7 @@ fn test_pr1_to_tp_conversion() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.pr[0] = 10_000_000; // 1 second
-    rec.special("PR1", true).unwrap();
+    rec.special("PR1", true, &Default::default()).unwrap();
     assert!((rec.tp - 1.0).abs() < 1e-6);
     assert_eq!(rec.d[0], 1);
     assert_eq!(rec.g[0], 1);
@@ -254,11 +254,11 @@ fn test_init_record_default_freq() {
 fn test_special_rate_clamp() {
     let mut rec = ScalerRecord::default();
     rec.rate = 100.0;
-    rec.special("RATE", true).unwrap();
+    rec.special("RATE", true, &Default::default()).unwrap();
     assert_eq!(rec.rate, 60.0);
 
     rec.rate = -5.0;
-    rec.special("RATE", true).unwrap();
+    rec.special("RATE", true, &Default::default()).unwrap();
     assert_eq!(rec.rate, 0.0);
 }
 
@@ -266,7 +266,7 @@ fn test_special_rate_clamp() {
 fn test_special_pr_auto_enables_gate() {
     let mut rec = ScalerRecord::default();
     rec.pr[4] = 5000; // PR5
-    rec.special("PR5", true).unwrap();
+    rec.special("PR5", true, &Default::default()).unwrap();
     assert_eq!(rec.d[4], 1); // D5 set
     assert_eq!(rec.g[4], 1); // G5 set
 }
@@ -276,7 +276,7 @@ fn test_special_gate_sets_default_preset() {
     let mut rec = ScalerRecord::default();
     rec.g[2] = 1; // G3
     rec.pr[2] = 0; // No preset
-    rec.special("G3", true).unwrap();
+    rec.special("G3", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[2], 1000); // Default preset
 }
 
@@ -285,7 +285,7 @@ fn test_special_gate_no_change_if_preset_exists() {
     let mut rec = ScalerRecord::default();
     rec.g[2] = 1;
     rec.pr[2] = 5000; // Already has preset
-    rec.special("G3", true).unwrap();
+    rec.special("G3", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[2], 5000); // Unchanged
 }
 
@@ -355,7 +355,7 @@ fn test_count_start_cycle_returns_no_emit_with_its_cout_write() {
     rec.tp = 1.0;
     rec.init_record(1).unwrap();
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let outcome = rec.process().unwrap();
     assert_eq!(rec.ss, 2, "COUNTING");
     assert!(!emits(&outcome), "ss COUNTING at :470");
@@ -459,7 +459,7 @@ fn test_count_start_via_special() {
 
     // Start counting
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 2); // REQSTART
 
     // Process to actually start
@@ -740,7 +740,7 @@ fn test_count_start_does_not_panic_when_nch_exceeds_max() {
     rec.g[0] = 1;
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     // process() calls build_start_actions, which iterates 0..nch and indexes
     // g[i]/pr[i]. Must not panic with nch > MAX_SCALER_CHANNELS.
     rec.process().unwrap();
@@ -757,7 +757,7 @@ fn test_count_start_does_not_panic_when_nch_negative() {
 
     rec.nch = -1;
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.ss, 2); // COUNTING — no panic, loop bound clamped to 0
 }
@@ -844,7 +844,7 @@ fn test_tp_to_pr1_special_truncates_process_rounds() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = tp;
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 10_000_000, "special() TP must truncate (C:672)");
 
     // process() REQSTART — NINT: 10_000_000.5 -> 10_000_001.
@@ -853,7 +853,7 @@ fn test_tp_to_pr1_special_truncates_process_rounds() {
     rec2.tp = tp;
     rec2.init_record(1).unwrap();
     rec2.cnt = 1;
-    rec2.special("CNT", true).unwrap();
+    rec2.special("CNT", true, &Default::default()).unwrap();
     rec2.process().unwrap();
     assert_eq!(
         rec2.pr[0], 10_000_001,
@@ -867,7 +867,7 @@ fn test_tp_to_pr1_saturates_on_large_tp() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 1e30; // tp * freq overflows u32 by many orders of magnitude
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], u32::MAX);
 }
 
@@ -883,7 +883,7 @@ fn test_special_tp_truncates() {
     rec.freq = 1e7;
     // 1.9 ticks of fractional part: 0.999_999_99 s * 1e7 = 9_999_999.9.
     rec.tp = 0.999_999_99;
-    rec.special("TP", true).unwrap();
+    rec.special("TP", true, &Default::default()).unwrap();
     assert_eq!(rec.pr[0], 9_999_999, "special() TP must truncate");
     assert_eq!(rec.d[0], 1);
     assert_eq!(rec.g[0], 1);
@@ -895,7 +895,7 @@ fn test_special_tp_truncates() {
 fn test_special_rat1_not_clamped() {
     let mut rec = ScalerRecord::default();
     rec.rat1 = 100.0;
-    rec.special("RAT1", true).unwrap();
+    rec.special("RAT1", true, &Default::default()).unwrap();
     assert_eq!(rec.rat1, 100.0, "RAT1 has no special() handler in C");
 }
 
@@ -942,7 +942,7 @@ fn test_process_zeroes_counts_while_waiting() {
     rec.nch = 4; // C zeroes and posts `counts[0..nch]` (:574, :579)
     rec.dly = 100.0; // long delay so we stay WAITING
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 1); // WAITING
 
     // Device support left stale counts in S1..; process() must zero them.
@@ -964,7 +964,7 @@ fn test_waiting_cycle_marks_t_and_every_channel() {
     rec.nch = MAX_SCALER_CHANNELS as i16;
     rec.dly = 100.0;
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.s = [1; MAX_SCALER_CHANNELS];
     rec.t = 1.0;
     rec.process().unwrap();
@@ -1181,7 +1181,7 @@ fn test_reqstart_reconciles_pr1_tp_freq_with_adjusting_driver() {
     // 1.0 s * 1e7 Hz = 10_000_000 ticks, which is NOT a multiple of
     // QUANTUM (4096), so the driver will quantize it.
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 2, "CNT request -> REQSTART");
 
     // process() runs the count start through the bound dset (C:391-433).
@@ -1298,7 +1298,7 @@ fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
     rec.init_record(1).unwrap();
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.process().unwrap();
 
     // SoftScalerDriver returns the preset unchanged and reports no
@@ -1389,7 +1389,7 @@ fn test_special_cnt_fires_coutp() {
 
     // CNT write — special() must queue the COUTP put.
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let special = rec.take_special_actions();
     assert!(
         special.iter().any(|a| matches!(
@@ -1436,7 +1436,7 @@ fn test_special_cnt_stop_fires_coutp() {
     // CNT=0 while idle — not a redundant in-progress request, so special()
     // still fires COUTP.
     rec.cnt = 0;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert!(
         rec.take_special_actions().iter().any(|a| matches!(
             a,
@@ -1561,7 +1561,7 @@ fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
     rec.freq = 1e7;
     rec.dly = 100.0;
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     assert_eq!(rec.us, 1); // USER_STATE_WAITING
 
     rec.process().unwrap();
@@ -1603,7 +1603,7 @@ fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
     rec.d[MAX_SCALER_CHANNELS - 1] = 1;
 
     rec.cnt = 1;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.ss, 2, "counting");
 

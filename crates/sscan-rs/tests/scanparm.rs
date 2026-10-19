@@ -514,7 +514,7 @@ async fn go_clears_and_posts_before_the_load_put() {
     let base = scanparm("S:mpts NPP", "S:busy NPP");
     let text = base.trim_end().strip_suffix('}').unwrap();
     let db = ioc(&format!(
-        "{TARGETS}record(calc, \"S:seen\") {{ field(INPA, \"P.GO NPP\") field(CALC, \"A\") field(VAL, \"-1\") }}\n\
+        "{TARGETS}record(calc, \"S:seen\") {{ field(INPA, \"P.GO NPP\") field(CALC, \"A\") field(MDEL, \"-1\") }}\n\
          {text}  field(OLOAD, \"S:seen.PROC\")\n}}\n"
     ))
     .await;

@@ -974,6 +974,17 @@ fn emit_slots(out: &mut String, base: &str, types: &[(String, Vec<String>)]) -> 
             )
             .unwrap();
         }
+        if consts.contains("COUNT") {
+            return Err(format!("slots::{module}: a field named COUNT"));
+        }
+        writeln!(
+            out,
+            "        /// How many fields the type declares here: what\n\
+             \x20       /// `slot_map!`'s sections must cover.\n\
+             \x20       pub const COUNT: usize = {};",
+            fields.len()
+        )
+        .unwrap();
         out.push_str("    }\n");
     }
     out.push_str("}\n");
@@ -1308,6 +1319,7 @@ fn emit_field(
     // a renderer (`dbTest.c:1235-1247`).
     writeln!(s, "        extra: {},", opt_str(&f.extra)).unwrap();
     writeln!(s, "        menu: {menu},").unwrap();
+    writeln!(s, "        menu_name: {},", opt_str(&f.menu)).unwrap();
     writeln!(s, "        initial: {initial},").unwrap();
     writeln!(s, "        interest: {},", f.interest.unwrap_or(0)).unwrap();
     writeln!(s, "        prop: {},", f.prop).unwrap();

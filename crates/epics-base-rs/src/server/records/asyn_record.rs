@@ -83,7 +83,17 @@ use epics_macros_rs::EpicsRecord;
 /// `"Unknown"` when the trace file changes — is port-derived, step 2 in the
 /// asyn module; the base display stub only needs the constant default.)
 #[derive(EpicsRecord)]
-#[record(type = "asyn")]
+#[record(
+    type = "asyn",
+    spill(
+        VAL, ADDR, PCNCT, DRVINFO, REASON, TMOD, TMOT, IFACE, OCTETIV, OPTIONIV, GPIBIV, I32IV,
+        UI32IV, F64IV, AOUT, OEOS, BOUT, OPTR, OMAX, NOWT, NAWT, OFMT, AINP, TINP, IEOS, BINP,
+        IPTR, IMAX, NRRD, NORD, IFMT, EOMR, I32INP, I32OUT, UI32INP, UI32OUT, UI32MASK, F64INP,
+        F64OUT, BAUD, LBAUD, PRTY, DBIT, SBIT, MCTL, FCTL, IXON, IXOFF, IXANY, HOSTINFO, DRTO,
+        UCMD, ACMD, SPR, TMSK, TB0, TB1, TB2, TB3, TB4, TB5, TIOM, TIB0, TIB1, TIB2, TINM, TINB0,
+        TINB1, TINB2, TINB3, TSIZ, AUCT, CNCT, ENBL, ERRS, AQR
+    )
+)]
 pub struct AsynRecord {
     /// `field(PORT,DBF_STRING) size(40)` — the asyn port name this record
     /// attaches to. The connect path keys on it, and its `DBF_STRING` type

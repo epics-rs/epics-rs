@@ -51,7 +51,7 @@ fn has_reprocess(actions: &[ProcessAction]) -> bool {
 /// `pp(TRUE)` process cycle.
 fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
     rec.cnt = cnt;
-    rec.special("CNT", true).unwrap();
+    rec.special("CNT", true, &Default::default()).unwrap();
     let mut actions = rec.take_special_actions();
     actions.extend(rec.process().unwrap().actions);
     actions

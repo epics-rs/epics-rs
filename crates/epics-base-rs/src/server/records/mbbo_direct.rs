@@ -130,15 +130,19 @@ impl Record for MbboDirectRecord {
     // VAL/IVOV/MLST/OBIT are DBF_LONG held as `u32`, B0..B1F rewrite VAL,
     // and the menus are `i16` served as ENUM: none of them maps.
     crate::slot_map!(crate::server::record::dbd_generated::slots::mbboDirect;
+        fields:
         SHFT => shft,
-        SDLY => sdly;
-        read_only:
+        SDLY => sdly,
         NOBT => nobt,
         RVAL => rval,
         ORAW => oraw,
         RBV => rbv,
         ORBV => orbv,
-        MASK => mask);
+        MASK => mask;
+        custom: VAL, OMSL, DOL, MLST, OBIT, SIOL, SIML, SIMM, SIMS, IVOA, IVOV, B0, B1, B2, B3,
+            B4, B5, B6, B7, B8, B9, BA, BB, BC, BD, BE, BF, B10, B11, B12, B13, B14, B15, B16,
+            B17, B18, B19, B1A, B1B, B1C, B1D, B1E, B1F;
+        spill: OUT, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -209,7 +213,12 @@ impl Record for MbboDirectRecord {
     /// The pass-1 arm (`:271-291`) folds the one bit written into VAL and
     /// converts. It is here and not in `put_field` because a `.db` load
     /// stores B0-B1F with no special, so VAL keeps what the file set.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         let Some(idx) = BIT_NAMES.iter().position(|&n| n == field) else {
             return Ok(());
         };
@@ -393,14 +402,13 @@ impl Record for MbboDirectRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `mbboDirectRecord.c::init_record` — MASK from NOBT,
-            // NOBT may span 1..32 (NUM_BITS 32).
+        if pass == 1 {
+            // C `mbboDirectRecord.c:123-124`, after the pass-0 return — MASK
+            // from NOBT, NOBT may span 1..32 (NUM_BITS 32). MLST and ORAW are
+            // the init tail's (:160-161).
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
-            self.mlst = self.val;
-            self.oraw = self.rval;
             // Don't derive bits from VAL yet — `post_init_finalize_undef`
             // runs after both passes and chooses VAL→bits or bits→VAL
             // based on the framework's UDF flag.
@@ -585,6 +593,22 @@ impl Record for MbboDirectRecord {
                 .iter()
                 .position(|&n| n == name)
                 .map(|idx| EpicsValue::UChar(self.bits[idx])),
+        }
+    }
+
+    /// The `SPC_NOMOD` MLST and OBIT that `put_field` refuses, stored raw from a
+    /// `.db` as `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("MLST", EpicsValue::Long(v)) => {
+                self.mlst = v as u32;
+                Ok(())
+            }
+            ("OBIT", EpicsValue::Long(v)) => {
+                self.obit = v as u32;
+                Ok(())
+            }
+            (name, value) => self.put_field(name, value),
         }
     }
 

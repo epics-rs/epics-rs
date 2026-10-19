@@ -87,10 +87,12 @@ impl LsoRecord {
 impl Record for LsoRecord {
     // LEN/OLEN are VAL's and OVAL's lengths, not members.
     crate::slot_map!(crate::server::record::dbd_generated::slots::lso;
+        fields:
         IVOV => ivov,
-        SDLY => sdly;
-        read_only:
-        SIZV => sizv);
+        SDLY => sdly,
+        SIZV => sizv;
+        custom: VAL, OVAL, LEN, OLEN, DOL, IVOA, OMSL, MPST, APST, SIML, SIMM, SIMS, SIOL;
+        spill: OUT, OLDSIMM, SSCN, SIMPVT);
 
     fn acts_before_process(&self) -> bool {
         false
@@ -261,7 +263,12 @@ impl Record for LsoRecord {
 
     /// C `special()` sets `len` and posts it on every VAL put (lsoRecord.c:239),
     /// changed or not; `monitor()` posts it again only when `len != olen`.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && field == "VAL" {
             self.len_marked = true;
         }
@@ -421,6 +428,28 @@ impl Record for LsoRecord {
         }
     }
 
+    /// C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff] and sizes VAL.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.sizv = self.sizv.clamp(16, 0x7fff);
+            // C callocs VAL and OVAL here, with `len = olen = 0`.
+            self.val = LongStringVal::default();
+            self.oval = LongStringVal::default();
+        }
+        Ok(())
+    }
+
+    /// LEN and OLEN are the lengths of VAL and OVAL; `put_field` refuses the
+    /// `SPC_NOMOD` fields, and a `.db` value is stored as C stores it.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("LEN", EpicsValue::ULong(n)) => self.val.set_len(n),
+            ("OLEN", EpicsValue::ULong(n)) => self.oval.set_len(n),
+            (name, value) => return self.put_field(name, value),
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
@@ -430,17 +459,11 @@ impl Record for LsoRecord {
             "SIZV" => {
                 // SIZV is DBF_USHORT (lsoRecord.dbd.pod:128): a client put
                 // arrives as UShort, internal callers may still pass Short.
-                let raw = match value {
-                    EpicsValue::UShort(v) => v as i32,
-                    EpicsValue::Short(v) => v as i32,
+                self.sizv = match value {
+                    EpicsValue::UShort(v) => v,
+                    EpicsValue::Short(v) => v as u16,
                     _ => return Err(CaError::TypeMismatch("SIZV".into())),
                 };
-                // C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff].
-                self.sizv = raw.clamp(16, 0x7fff) as u16;
-                // C sizes the buffer once (SPC_NOMOD); the port takes SIZV
-                // after a .db VAL, so the cut lands here.
-                let capacity = self.capacity();
-                self.val.cut_text(capacity);
             }
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {

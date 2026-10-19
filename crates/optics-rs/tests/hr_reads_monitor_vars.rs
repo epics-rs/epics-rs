@@ -240,7 +240,7 @@ async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
                     .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
                     .unwrap()
                     .stat
-                    .dmov = dmov == 1;
+                    .dmov = i16::from(dmov == 1);
                 inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
             }
             wait_near(&ioc, echo, f64::from(dmov)).await;

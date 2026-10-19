@@ -46,11 +46,11 @@ pub struct HistogramRecord {
     /// nonexistent INP, so `field(SVL,"MYSIG")` was dropped at load and the
     /// record was inert.
     pub svl: PvString,
-    pub cmd: i16,   // 0=Read, 1=Clear, 2=Start, 3=Stop
-    pub csta: bool, // Counting state — TRUE while counting is enabled
-    pub sdel: f64,  // Signal deadband (monitor refresh period, seconds)
-    pub mdel: i32,  // Monitor count deadband
-    pub mcnt: i32,  // Counts accumulated since last monitor post
+    pub cmd: i16,  // 0=Read, 1=Clear, 2=Start, 3=Stop
+    pub csta: i16, // Counting state — TRUE while counting is enabled
+    pub sdel: f64, // Signal deadband (monitor refresh period, seconds)
+    pub mdel: i32, // Monitor count deadband
+    pub mcnt: i32, // Counts accumulated since last monitor post
     // Simulation block (histogramRecord.dbd.pod:245-282). SIMM is
     // DBF_MENU menu(menuYesNo) (NO/YES), SIMS is DBF_MENU menu(menuAlarmSevr);
     // both served as DBR_ENUM shorts. SIOL/SIML are the simulation
@@ -111,7 +111,7 @@ impl Default for HistogramRecord {
             // record counts by default (CSTA defaults TRUE) so a
             // freshly created record accumulates without an explicit
             // CMD=2 start.
-            csta: true,
+            csta: 1,
             sdel: 0.0,
             mdel: 0,
             mcnt: 0,
@@ -131,7 +131,7 @@ impl Default for HistogramRecord {
 impl HistogramRecord {
     /// [`Record::check_alarms`]' SOFT/INVALID condition.
     fn limits_inverted(&self) -> bool {
-        self.csta && self.llim > self.ulim
+        self.csta != 0 && self.llim > self.ulim
     }
 
     pub fn new(nelm: i32, llim: f64, ulim: f64) -> Self {
@@ -158,7 +158,7 @@ impl HistogramRecord {
     /// pick the bucket with the closed-upper-edge `temp <= i*wdth`
     /// loop; wrap the `epicsUInt32` counter at `UINT_MAX`.
     pub fn add_count(&mut self) {
-        if !self.csta {
+        if self.csta == 0 {
             return;
         }
         // Inverted limits: count nothing. C's `add_count` also writes
@@ -233,6 +233,12 @@ pub(crate) fn set_histogram_sdel_precision(value: i32) {
 }
 
 impl Record for HistogramRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::histogram;
+        fields:;
+        custom: VAL, NELM, CSTA, CMD, ULIM, LLIM, WDTH, SGNL, SVL, MDEL, MCNT, SDEL, SIOL, SVAL,
+            SIML, SIMM, SIMS, SDLY;
+        spill: PREC, BPTR, WDOG, OLDSIMM, SSCN, SIMPVT, HOPR, LOPR);
+
     fn acts_before_process(&self) -> bool {
         false
     }
@@ -467,7 +473,12 @@ impl Record for HistogramRecord {
     /// (:261-263) live here too, not in `put_field`: the `.db` loader stores
     /// those fields without calling `special()`. (SIMM's SPC_MOD pass is the
     /// framework's `recGblSaveSimm`/`CheckSimm` owner.)
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -479,10 +490,10 @@ impl Record for HistogramRecord {
                     self.clear_histogram();
                     self.cmd = 0;
                 } else if self.cmd == 2 {
-                    self.csta = true;
+                    self.csta = 1;
                     self.cmd = 0;
                 } else if self.cmd == 3 {
-                    self.csta = false;
+                    self.csta = 0;
                     self.cmd = 0;
                 }
             }
@@ -696,7 +707,7 @@ impl Record for HistogramRecord {
             "SGNL" => Some(EpicsValue::Double(self.sgnl)),
             "SVL" => Some(EpicsValue::String(self.svl.clone().into())),
             "CMD" => Some(EpicsValue::Short(self.cmd)),
-            "CSTA" => Some(EpicsValue::Short(if self.csta { 1 } else { 0 })),
+            "CSTA" => Some(EpicsValue::Short(self.csta)),
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
             "MDEL" => Some(EpicsValue::Short(self.mdel as i16)),
             "MCNT" => Some(EpicsValue::Short(self.mcnt as i16)),
@@ -707,6 +718,18 @@ impl Record for HistogramRecord {
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
+        }
+    }
+
+    /// A `.db` NELM is stored, not sized: `init_record` allocates the bin array
+    /// from it, as C does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, crate::server::records::count_put(&value)) {
+            ("NELM", Some(n)) => {
+                self.nelm = n as i32;
+                Ok(())
+            }
+            _ => self.put_field(name, value),
         }
     }
 
@@ -789,7 +812,7 @@ impl Record for HistogramRecord {
             // At runtime CSTA moves through CMD's `special()`, never here.
             "CSTA" => match value {
                 EpicsValue::Short(v) => {
-                    self.csta = v != 0;
+                    self.csta = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CSTA".into())),
@@ -854,8 +877,8 @@ impl Record for HistogramRecord {
             // settable at `.db` load (dbStaticLib bypasses SPC_NOMOD), runtime-
             // immutable. The runtime block is the field_io `read_only` gate (the
             // FieldDesc carries `read_only: true`), so a CA/PVA caput is still
-            // rejected; this arm serves only the load path (`apply_fields`),
-            // sizing the bin array exactly like `new()`.
+            // rejected; this arm serves the builder, sizing the bin array
+            // exactly like `new()` (a `.db` stores through `load_field`).
             "NELM" => match crate::server::records::count_put(&value) {
                 Some(n) => {
                     let n = n.max(1);
@@ -866,10 +889,21 @@ impl Record for HistogramRecord {
                 }
                 None => Err(CaError::TypeMismatch("NELM".into())),
             },
-            // WDTH/MCNT are computed runtime fields (no promptgroup) — never
-            // client-writable, even at load. (OLDSIMM is the SPC_NOMOD saved
-            // copy, refused by the common-field path that owns it.)
-            "WDTH" | "MCNT" => Err(CaError::ReadOnlyField(name.to_string())),
+            // SPC_NOMOD: a runtime put is refused by the database's
+            // `check_no_mod_in_db_put`; reaching here is a `.db` store.
+            "WDTH" => {
+                self.wdth = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("WDTH".into()))?;
+                Ok(())
+            }
+            "MCNT" => {
+                self.mcnt = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MCNT".into()))?
+                    as i32;
+                Ok(())
+            }
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -1038,13 +1072,13 @@ mod tests {
     fn cmd_start_stop_pauses_counting() {
         let mut rec = HistogramRecord::new(2, 0.0, 10.0);
         rec.put_field("CMD", EpicsValue::Short(3)).unwrap(); // stop
-        rec.special("CMD", true).unwrap();
-        assert!(!rec.csta);
+        rec.special("CMD", true, &Default::default()).unwrap();
+        assert_eq!(rec.csta, 0);
         rec.add_sample(1.0);
         assert_eq!(rec.val[0], 0, "stopped histogram must not count");
         rec.put_field("CMD", EpicsValue::Short(2)).unwrap(); // start
-        rec.special("CMD", true).unwrap();
-        assert!(rec.csta);
+        rec.special("CMD", true, &Default::default()).unwrap();
+        assert_eq!(rec.csta, 1);
         rec.add_sample(1.0);
         assert_eq!(rec.val[0], 1, "started histogram counts again");
     }
@@ -1069,7 +1103,7 @@ mod tests {
         rec.add_sample(1.0);
         rec.add_sample(6.0);
         rec.put_field("CMD", EpicsValue::Short(1)).unwrap();
-        rec.special("CMD", true).unwrap();
+        rec.special("CMD", true, &Default::default()).unwrap();
         assert_eq!(rec.val, vec![0, 0]);
     }
 

@@ -69,3 +69,42 @@ async fn a_runtime_put_to_a_spc_nomod_field_is_still_refused() {
     );
     assert_eq!(db.get_pv("SUBREC.LA").unwrap(), EpicsValue::Double(17.5));
 }
+
+/// The SPC_NOMOD fields whose record `put_field` used to refuse them, and
+/// dbCommon's PUTF/OLDSIMM: a `.db` naming one loads (the stored value is the
+/// census's to check, before `init_record` rewrites it), and a runtime put is
+/// still refused by the database's gate now that the record stores it.
+#[epics_macros_rs::epics_test]
+async fn record_nomod_fields_load_and_refuse_at_runtime() {
+    let cases = [
+        ("compress", "NUSE"),
+        ("compress", "OFF"),
+        ("compress", "INPN"),
+        ("histogram", "MCNT"),
+        ("histogram", "WDTH"),
+        ("calcout", "DLYA"),
+        ("waveform", "NORD"),
+        ("waveform", "BUSY"),
+        ("ai", "PUTF"),
+        ("ai", "OLDSIMM"),
+    ];
+    for (rtype, field) in cases {
+        let db = PvDatabase::new();
+        load(
+            &db,
+            &format!("record({rtype}, \"R\") {{\n    field({field}, \"1\")\n}}\n"),
+        )
+        .await;
+        let pv = format!("R.{field}");
+        let before = db.get_pv(&pv).unwrap();
+        let err = db
+            .put_pv(&pv, EpicsValue::Double(2.0))
+            .await
+            .expect_err("SPC_NOMOD must refuse a runtime put");
+        assert!(
+            matches!(err, epics_base_rs::error::CaError::ReadOnlyField(_)),
+            "{rtype}.{field}: expected S_db_noMod, got {err:?}"
+        );
+        assert_eq!(db.get_pv(&pv).unwrap(), before, "{rtype}.{field} moved");
+    }
+}

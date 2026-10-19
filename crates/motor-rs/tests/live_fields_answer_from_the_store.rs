@@ -63,8 +63,8 @@ fn lspg_on_the_initial_answers_the_initial() {
 #[test]
 fn pp_answers_the_store_once_it_leaves_the_initial() {
     let mut rec = MotorRecord::default();
-    assert!(!rec.internal.pp, "the store starts on the .dbd initial");
-    rec.internal.pp = true;
+    assert!(rec.internal.pp == 0, "the store starts on the .dbd initial");
+    rec.internal.pp = 1;
 
     let inst = instance_of(rec);
     assert_eq!(

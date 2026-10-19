@@ -90,10 +90,10 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("10".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("DOPT", EpicsValue::Short(1)).unwrap();
     a.put_field("OCAL", EpicsValue::String("7".into())).unwrap();
-    a.special("OCAL", true).unwrap();
+    a.special("OCAL", true, &Default::default()).unwrap();
     a.put_field("HIHI", EpicsValue::Double(5.0)).unwrap();
     a.put_field("HHSV", EpicsValue::Short(3)).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
@@ -146,7 +146,7 @@ async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("10".into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("HIHI", EpicsValue::Double(5.0)).unwrap();
     a.put_field("HHSV", EpicsValue::Short(3)).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();

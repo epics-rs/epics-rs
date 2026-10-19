@@ -72,7 +72,7 @@ async fn acalcout_with(db: &PvDatabase, calc: &str) {
     a.put_field("NELM", EpicsValue::ULong(4)).unwrap();
     a.put_field("CALC", EpicsValue::String(calc.into()))
         .unwrap();
-    a.special("CALC", true).unwrap();
+    a.special("CALC", true, &Default::default()).unwrap();
     a.put_field("INAA", EpicsValue::String("WF".into()))
         .unwrap();
     // VAL = SUM(AA) = 10 > HIGH, so the cycle raises MINOR: monitor_mask gains

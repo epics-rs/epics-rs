@@ -75,7 +75,7 @@ fn read_data(
         return DO_NOT_CONVERT;
     }
     // In @init handler, no processing, enforce monitor updates.
-    ao.omod = ao.oval != val;
+    ao.omod = u8::from(ao.oval != val);
     // C also sets `orbv = (epicsInt32)(oval = val)` (devaoStream.c:73), so
     // RBV posted when it differed from (int)VAL, not when it changed: ORBV
     // stays the old RBV here.
@@ -105,11 +105,11 @@ fn read_data(
     if !monitor_mask.is_empty() {
         io.post_events("VAL", EpicsValue::Double(ao.val), monitor_mask);
     }
-    if ao.omod {
+    if ao.omod != 0 {
         monitor_mask |= EventMask::VALUE | EventMask::LOG;
     }
     if !monitor_mask.is_empty() {
-        ao.omod = false;
+        ao.omod = 0;
         io.post_events("OVAL", EpicsValue::Double(ao.oval), monitor_mask);
         if ao.oraw != ao.rval {
             let mask = monitor_mask | EventMask::VALUE | EventMask::LOG;

@@ -44,6 +44,7 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::quote;
+use syn::parse::Parse;
 use syn::{Data, DeriveInput, Fields, ItemFn, Lit, parse_macro_input};
 
 /// Resolve the path to the `runtime` module `#[epics_test]` expands into.
@@ -331,6 +332,10 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `[FieldIx; N]`, e.g. a `declared_set`
 /// - `#[record(type = "longin", process_status = LONGIN_STATUS)]` —
 ///   `Record::process_status_rule` answers the named `ProcessStatusRule`
+/// - `#[record(type = "longin", spill(INP, HIHI))]` — the declared fields the
+///   record keeps no member for, which the framework stores; emits the
+///   sectioned `slot_map!`, so a declared field neither a `#[field]` nor named
+///   here does not compile. `spill()` when there are none.
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -452,6 +457,11 @@ struct RecordAttrs {
     soft_input_read_as: Option<syn::Ident>,
     /// `#[record(process_status = SOME_RULE)]`.
     process_status: Option<syn::Path>,
+    /// `#[record(spill(INP, HIHI, ...))]` — the declared fields the record
+    /// keeps no member for, which the framework stores. Given, the derive
+    /// emits `slot_map!`'s sectioned form, so every declared field must be a
+    /// `#[field]` or named here.
+    spill: Option<Vec<syn::Ident>>,
 }
 
 struct FieldInfo {
@@ -540,7 +550,9 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         .map(|fi| {
             let epics_name = &fi.epics_name;
             let ident = &fi.ident;
-            if fi.read_only {
+            // Under `spill(...)` a read-only field is a member like any other:
+            // `SPC_NOMOD` is the runtime put gate's.
+            if fi.read_only && attrs.spill.is_none() {
                 quote! {
                     #epics_name => {
                         return Err(#krate::error::CaError::ReadOnlyField(
@@ -585,7 +597,19 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         .filter(|fi| fi.read_only)
         .map(slot_arm)
         .collect();
-    let slot_methods = if rw_slots.is_empty() && ro_slots.is_empty() {
+    let slot_methods = if let Some(spill) = &attrs.spill {
+        let rtype = proc_macro2::Ident::new(record_type_str, proc_macro2::Span::call_site());
+        let custom = field_infos
+            .iter()
+            .filter(|fi| !slotted(fi))
+            .map(|fi| proc_macro2::Ident::new(&fi.epics_name, fi.ident.span()));
+        quote! {
+            #krate::slot_map!(#krate::server::record::dbd_generated::slots::#rtype;
+                fields: #(#rw_slots,)* #(#ro_slots),*;
+                custom: #(#custom),*;
+                spill: #(#spill),*);
+        }
+    } else if rw_slots.is_empty() && ro_slots.is_empty() {
         quote! {}
     } else {
         let rtype = proc_macro2::Ident::new(record_type_str, proc_macro2::Span::call_site());
@@ -1081,6 +1105,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut seeds_trackers = false;
     let mut soft_input_read_as: Option<syn::Ident> = None;
     let mut process_status: Option<syn::Path> = None;
+    let mut spill: Option<Vec<syn::Ident>> = None;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -1148,14 +1173,22 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("process_status") {
                     process_status = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("spill") {
+                    // `spill()` is the sectioned form for a type with nothing
+                    // to spill, which `parse_nested_meta` refuses.
+                    let names;
+                    syn::parenthesized!(names in meta.input);
+                    let names = names.parse_terminated(syn::Ident::parse, syn::Token![,])?;
+                    spill.get_or_insert_with(Vec::new).extend(names);
+                    Ok(())
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
                          `no_value_monitor`, `take_cycle_posted_fields`, \
                          `fields_posted_only_when_marked`, `process_posted_fields`, \
-                         `dset_owns_udf_on_computed`, `seeds_trackers`, `soft_input_read_as` or \
-                         `process_status`",
+                         `dset_owns_udf_on_computed`, `seeds_trackers`, `soft_input_read_as`, \
+                         `process_status` or `spill`",
                     ))
                 }
             })?;
@@ -1180,6 +1213,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         seeds_trackers,
         soft_input_read_as,
         process_status,
+        spill,
     })
 }
 

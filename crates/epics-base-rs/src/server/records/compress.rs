@@ -98,6 +98,9 @@ pub struct CompressRecord {
     /// source's capacity and its delivered length both change exactly when the
     /// source array is re-shaped).
     inpn: usize,
+    /// C's `prec->wptr != NULL`: an INP ingest latched INPN. A `.db` INPN does
+    /// not allocate the working buffer, so it is not this.
+    wptr_held: bool,
     /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
     /// `RESET_POSTS` entry, until the put drains them.
     reset_posts: u64,
@@ -137,6 +140,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
+            wptr_held: false,
             reset_posts: 0,
             nuse_moved: false,
         }
@@ -583,10 +587,16 @@ const RESET_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 3] = [
 ];
 
 impl Record for CompressRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::compress;
+        fields:;
+        custom: VAL, RES, ALG, PBUF, BALG, NSAM, N, IHIL, ILIL, HOPR, LOPR, PREC, EGU, OFF,
+            NUSE, OUSE, INPN, CVB, INX;
+        spill: INP, BPTR, SPTR, WPTR);
+
     /// C allocates `wptr` with the first `inpn` latch and never frees it
     /// (compressRecord.c:334-339).
     fn held_pointer(&self, field: &str) -> Option<usize> {
-        (field == "WPTR" && self.inpn > 0).then(|| std::ptr::from_ref(&self.inpn) as usize)
+        (field == "WPTR" && self.wptr_held).then(|| std::ptr::from_ref(&self.inpn) as usize)
     }
 
     fn acts_before_process(&self) -> bool {
@@ -637,7 +647,12 @@ impl Record for CompressRecord {
     ///
     /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
     /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &crate::server::record::CommonFields,
+    ) -> CaResult<()> {
         if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
             self.reset();
             self.reset_posts = if self.monitor() { 0b101 } else { 0b110 };
@@ -730,11 +745,13 @@ impl Record for CompressRecord {
     /// `field(RES,"1")` — the static loader bypasses `special()`, so without
     /// this pass the record would come up with RES stuck at 1.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        // C `compressRecord.c:307-314`: NSAM < 1 is 1, and the buffer is
+        // allocated here, from what the `.db` stored.
         if pass == 0 {
             if self.nsam < 1 {
                 self.nsam = 1;
-                self.val = vec![0.0; 1];
             }
+            self.val = vec![0.0; self.nsam as usize];
             self.reset();
         }
         Ok(())
@@ -800,6 +817,18 @@ impl Record for CompressRecord {
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => None,
+        }
+    }
+
+    /// A `.db` NSAM is stored, not sized: `init_record` allocates the sample buffer
+    /// from it, as C does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, count_put(&value)) {
+            ("NSAM", Some(n)) => {
+                self.nsam = n as i32;
+                Ok(())
+            }
+            _ => self.put_field(name, value),
         }
     }
 
@@ -891,8 +920,8 @@ impl Record for CompressRecord {
             // C `field(NSAM,DBF_ULONG){ promptgroup special(SPC_NOMOD) }`:
             // settable at `.db` load, runtime-immutable (the field_io
             // `read_only` gate; the FieldDesc carries `read_only: true`). This
-            // arm serves only the load path, sizing the sample buffer like
-            // `new()`.
+            // arm serves the builder, sizing the sample buffer like `new()` (a
+            // `.db` stores through `load_field`).
             "NSAM" => match count_put(&value) {
                 Some(n) => {
                     let n = n.max(1);
@@ -905,11 +934,22 @@ impl Record for CompressRecord {
                 }
                 None => Err(CaError::TypeMismatch("NSAM".into())),
             },
-            // OFF/NUSE/OUSE/INPN/INX/CVB are `special(SPC_NOMOD)` runtime buffer
-            // state — never client-writable, and (unlike NSAM) not settable at
-            // load either: C gives them no promptgroup and the record owns each.
+            // OFF/NUSE/OUSE/INPN/INX/CVB are `special(SPC_NOMOD)`: a runtime put
+            // is refused by `check_no_mod_in_db_put`, so reaching here is a
+            // `.db` store, which C's `dbPutString` makes.
             "OFF" | "NUSE" | "OUSE" | "INPN" | "INX" | "CVB" => {
-                Err(CaError::ReadOnlyField(name.to_string()))
+                let v = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch(name.to_string()))?;
+                match name {
+                    "OFF" => self.off = v as i32,
+                    "NUSE" => self.nuse = v as i32,
+                    "OUSE" => self.ouse = v as i32,
+                    "INPN" => self.inpn = v as usize,
+                    "INX" => self.inx = v as i32,
+                    _ => self.cvb = v,
+                }
+                Ok(())
             }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
@@ -1058,10 +1098,11 @@ impl Record for CompressRecord {
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
         let nelements = value.count() as usize;
         if nelements > 0 {
-            if self.inpn != 0 && nelements != self.inpn {
+            if self.wptr_held && nelements != self.inpn {
                 self.reset();
             }
             self.inpn = nelements;
+            self.wptr_held = true;
         }
         match value {
             EpicsValue::DoubleArray(arr) => self.push_array(&arr),

@@ -2915,7 +2915,7 @@ impl PvDatabase {
                 Some(link) => inst.put_link_field(link, value),
                 None => inst.put_declared_field(field, value),
             };
-            let _ = inst.record.special(field, true);
+            let _ = inst.record.special(field, true, &inst.common);
             put
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");
@@ -3160,11 +3160,41 @@ impl PvDatabase {
     /// record whose `.db` fields have not landed, because the record is not
     /// reachable until they have. `RecordInstance::run_init_pass0` is
     /// crate-private for the same reason.
+    ///
+    /// A field the load refuses costs the field, not the record (C
+    /// `dbRecordField`'s `yyerror(NULL)`): its line is printed, the record is
+    /// added with the field at its default, and the call returns `Err`.
     pub async fn add_loaded_record(
         &self,
         name: impl AsRef<[u8]>,
         record: Box<dyn Record>,
         load: RecordLoad,
+    ) -> CaResult<()> {
+        let mut refused = None;
+        let mut entry = crate::server::db_loader::EntryMessage::default();
+        self.add_loaded_record_reporting(name, record, load, &mut entry, |field, diagnostic| {
+            diagnostic.print();
+            refused.get_or_insert_with(|| field.to_string());
+        })
+        .await?;
+        match refused {
+            Some(field) => Err(CaError::InvalidValue(format!(
+                "field {field} refused at load"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::add_loaded_record`] with each refused field's C line handed to
+    /// `refused` with the field's name; `Err` only when the record itself could
+    /// not be created.
+    pub(crate) async fn add_loaded_record_reporting(
+        &self,
+        name: impl AsRef<[u8]>,
+        record: Box<dyn Record>,
+        load: RecordLoad,
+        entry: &mut crate::server::db_loader::EntryMessage,
+        mut refused: impl FnMut(&str, crate::server::db_loader::DbDiagnostic),
     ) -> CaResult<()> {
         let name = RecordName::from(name.as_ref());
         // A record created after `iocInit` needs a lock set, and its links —
@@ -3227,13 +3257,11 @@ impl PvDatabase {
         // that registry is complete only once the builder has run every
         // registration — after the `.db` text was parsed. C has no such
         // ordering, since every `.dbd` is loaded before any `.db`.
-        let mut refused: Option<String> = None;
         // C's `plink->text` for the empty assignment — see
         // `PvDatabaseInner::empty_link_assignments`. Taken from the load's own
         // field list because that is the only place the distinction between
         // `field(INP,"")` and no `INP` line survives.
         let mut empty_links: Vec<String> = Vec::new();
-        let mut entry = crate::server::db_loader::EntryMessage::default();
         for (field, value) in load.common_fields {
             if let crate::types::EpicsValue::String(text) = &value {
                 if text.is_empty() && instance.common_link_text(&field.to_uppercase()).is_some() {
@@ -3247,34 +3275,35 @@ impl PvDatabase {
                     &field,
                     &text.as_str_lossy(),
                 ) {
-                    if let Some(notice) = &refusal.notice {
-                        notice.print();
-                    }
-                    eprintln!("{}", refusal.line(&mut entry));
-                    // C follows the refusal with `dbPutStringSuggest`, which
-                    // proposes the closest choice or prints nothing
-                    // (`dbLexRoutines.c:1414`). It reaches the operator through
-                    // errlog rather than stderr, so C's own output shows the
-                    // proposals batched at the end; one stream puts each under
-                    // the line it explains.
-                    if let Some(suggestion) = refusal.suggestion {
-                        eprintln!("{suggestion}");
-                    }
-                    refused.get_or_insert(format!("{name}.{field}"));
-                    if !refusal.stored {
+                    let stored = refusal.stored;
+                    refused(
+                        &field,
+                        crate::server::db_loader::DbDiagnostic {
+                            message: refusal.line(entry),
+                            notice: refusal.notice,
+                            suggestion: refusal.suggestion,
+                        },
+                    );
+                    if !stored {
                         continue;
                     }
                 }
             }
+            let text = value.to_string();
             if let Err(e) = instance.put_common_field_db_load(&field, value) {
-                eprintln!("put_common_field({field}) failed for {name}: {e}");
+                let line = crate::server::db_loader::field_refusal_line(
+                    entry,
+                    instance.record.as_ref(),
+                    &name.to_str_lossy(),
+                    &field,
+                    &text,
+                    &e,
+                );
+                refused(&field, crate::server::db_loader::DbDiagnostic::new(line));
             }
             // An unpublished record has no async context yet; its init passes
             // classify what this load set.
             drop(instance.record.take_after_gate());
-        }
-        if let Some(what) = refused {
-            return Err(CaError::BadChoice(what.into()));
         }
         // `info(...)` tags land before `init_record`, so device support that
         // reads them at init sees the values.
@@ -4607,6 +4636,36 @@ mod tests {
         fn link_names(&self) -> Vec<crate::types::RecordName> {
             self.names.iter().map(|n| n.as_str().into()).collect()
         }
+    }
+
+    /// C's `pdbentry->message` is one per `record()` block: a dbCommon field
+    /// refused in the creation sink prints what the record's own fields of
+    /// the same block left there.
+    #[epics_macros_rs::epics_test]
+    async fn a_common_field_refusal_reads_the_block_s_message() {
+        let db = PvDatabase::new();
+        let mut entry = crate::server::db_loader::EntryMessage::default();
+        entry.cant_set_line("P", "SCAN", "Bogus", Some("using menu menuScan"), "x");
+        let mut lines = Vec::new();
+        db.add_loaded_record_reporting(
+            "P",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+            RecordLoad::from_common_fields(vec![(
+                "DISV".to_string(),
+                EpicsValue::String("x".into()),
+            )]),
+            &mut entry,
+            |_, d| lines.push(d.message),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]
+                .ends_with("Can't set 'P.DISV' to 'x' using menu menuScan : No digits to convert"),
+            "{}",
+            lines[0]
+        );
     }
 
     // epics-base PR #336 — alias parsing + lookup integration tests.

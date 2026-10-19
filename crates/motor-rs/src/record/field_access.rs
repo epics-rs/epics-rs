@@ -11,7 +11,7 @@ use super::dbd_generated::MOTOR_FIELDS;
 
 /// The motorRecord version this port tracks (C `#define VERSION 7.4`,
 /// stamped into VERS at init_record:608; SPC_NOMOD).
-const MOTOR_RECORD_VERSION: f32 = 7.4;
+pub(crate) const MOTOR_RECORD_VERSION: f32 = 7.4;
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
     match name {
@@ -36,7 +36,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "SET" => Some(EpicsValue::Short(if rec.conv.set { 1 } else { 0 })),
         "SSET" => Some(EpicsValue::Short(rec.conv.sset)),
         "SUSE" => Some(EpicsValue::Short(rec.conv.suse)),
-        "IGSET" => Some(EpicsValue::Short(if rec.conv.igset { 1 } else { 0 })),
+        "IGSET" => Some(EpicsValue::Short(rec.conv.igset)),
         "MRES" => Some(EpicsValue::Double(rec.conv.mres)),
         "ERES" => Some(EpicsValue::Double(rec.conv.eres)),
         "SREV" => Some(EpicsValue::Long(rec.conv.srev)),
@@ -75,7 +75,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "RTRY" => Some(EpicsValue::Short(rec.retry.rtry)),
         "RMOD" => Some(EpicsValue::Short(rec.retry.rmod as i16)),
         "RCNT" => Some(EpicsValue::Short(rec.retry.rcnt)),
-        "MISS" => Some(EpicsValue::Short(if rec.retry.miss { 1 } else { 0 })),
+        "MISS" => Some(EpicsValue::Short(rec.retry.miss)),
         // Limits
         "HLM" => Some(EpicsValue::Double(rec.limits.hlm)),
         "LLM" => Some(EpicsValue::Double(rec.limits.llm)),
@@ -83,13 +83,12 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "DLLM" => Some(EpicsValue::Double(rec.limits.dllm)),
         "RHLM" => Some(EpicsValue::Double(rec.limits.rhlm)),
         "RLLM" => Some(EpicsValue::Double(rec.limits.rllm)),
-        "LVIO" => Some(EpicsValue::Short(if rec.limits.lvio { 1 } else { 0 })),
-        "HLS" => Some(EpicsValue::Short(if rec.limits.hls { 1 } else { 0 })),
-        "LLS" => Some(EpicsValue::Short(if rec.limits.lls { 1 } else { 0 })),
-        "RHLS" => Some(EpicsValue::Short(if rec.limits.rhls { 1 } else { 0 })),
-        "RLLS" => Some(EpicsValue::Short(if rec.limits.rlls { 1 } else { 0 })),
-        // C 196/608: init_record stamps the ported motorRecord version.
-        "VERS" => Some(EpicsValue::Float(MOTOR_RECORD_VERSION)),
+        "LVIO" => Some(EpicsValue::Short(rec.limits.lvio)),
+        "HLS" => Some(EpicsValue::Short(rec.limits.hls)),
+        "LLS" => Some(EpicsValue::Short(rec.limits.lls)),
+        "RHLS" => Some(EpicsValue::Short(rec.limits.rhls)),
+        "RLLS" => Some(EpicsValue::Short(rec.limits.rlls)),
+        "VERS" => Some(EpicsValue::Float(rec.internal.vers)),
         "HLSV" => Some(EpicsValue::Short(rec.limits.hlsv)),
         // Control
         "SPMG" => Some(EpicsValue::Short(rec.ctrl.spmg as i16)),
@@ -97,23 +96,23 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // (motorRecord.cc:725 init, :1859 sync). Same menu as SPMG, so
         // same served form; the declared DBF_MENU makes it a DBR_ENUM.
         "LSPG" => Some(EpicsValue::Short(rec.internal.lspg as i16)),
-        "STOP" => Some(EpicsValue::Short(if rec.ctrl.stop { 1 } else { 0 })),
-        "HOMF" => Some(EpicsValue::Short(if rec.ctrl.homf { 1 } else { 0 })),
-        "HOMR" => Some(EpicsValue::Short(if rec.ctrl.homr { 1 } else { 0 })),
-        "JOGF" => Some(EpicsValue::Short(if rec.ctrl.jogf { 1 } else { 0 })),
-        "JOGR" => Some(EpicsValue::Short(if rec.ctrl.jogr { 1 } else { 0 })),
-        "TWF" => Some(EpicsValue::Short(if rec.ctrl.twf { 1 } else { 0 })),
-        "TWR" => Some(EpicsValue::Short(if rec.ctrl.twr { 1 } else { 0 })),
+        "STOP" => Some(EpicsValue::Short(rec.ctrl.stop)),
+        "HOMF" => Some(EpicsValue::Short(rec.ctrl.homf)),
+        "HOMR" => Some(EpicsValue::Short(rec.ctrl.homr)),
+        "JOGF" => Some(EpicsValue::Short(rec.ctrl.jogf)),
+        "JOGR" => Some(EpicsValue::Short(rec.ctrl.jogr)),
+        "TWF" => Some(EpicsValue::Short(rec.ctrl.twf)),
+        "TWR" => Some(EpicsValue::Short(rec.ctrl.twr)),
         "TWV" => Some(EpicsValue::Double(rec.ctrl.twv)),
         "CNEN" => Some(EpicsValue::Short(if rec.ctrl.cnen { 1 } else { 0 })),
         // Status
-        "DMOV" => Some(EpicsValue::Short(if rec.stat.dmov { 1 } else { 0 })),
-        "MOVN" => Some(EpicsValue::Short(if rec.stat.movn { 1 } else { 0 })),
+        "DMOV" => Some(EpicsValue::Short(rec.stat.dmov)),
+        "MOVN" => Some(EpicsValue::Short(rec.stat.movn)),
         "MSTA" => Some(EpicsValue::ULong(rec.stat.msta.bits())),
         "MIP" => Some(EpicsValue::UShort(rec.stat.mip.bits())),
-        "CDIR" => Some(EpicsValue::Short(if rec.stat.cdir { 1 } else { 0 })),
-        "TDIR" => Some(EpicsValue::Short(if rec.stat.tdir { 1 } else { 0 })),
-        "ATHM" => Some(EpicsValue::Short(if rec.stat.athm { 1 } else { 0 })),
+        "CDIR" => Some(EpicsValue::Short(rec.stat.cdir)),
+        "TDIR" => Some(EpicsValue::Short(rec.stat.tdir)),
+        "ATHM" => Some(EpicsValue::Short(rec.stat.athm)),
         "STUP" => Some(EpicsValue::Short(rec.stat.stup)),
         "RVEL" => Some(EpicsValue::Long(rec.stat.rvel)),
         // PID
@@ -126,7 +125,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "ADEL" => Some(EpicsValue::Double(rec.disp.adel)),
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
         // SYNC is a write-only trigger; readback always 0.
-        "SYNC" => Some(EpicsValue::Short(if rec.internal.sync { 1 } else { 0 })),
+        "SYNC" => Some(EpicsValue::Short(rec.internal.sync)),
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
@@ -165,15 +164,11 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "LRLV" => Some(EpicsValue::Double(rec.internal.lrlv)),
         "ALST" => Some(EpicsValue::Double(rec.disp.alst)),
         "MLST" => Some(EpicsValue::Double(rec.disp.mlst)),
-        "MMAP" => Some(EpicsValue::ULong(
-            (rec.internal.mmap & ((1 << 29) - 1)) as u32,
-        )),
-        "NMAP" => Some(EpicsValue::ULong(
-            ((rec.internal.mmap & m::MONITOR) >> 32) as u32,
-        )),
+        "MMAP" => Some(EpicsValue::ULong(rec.internal.mmap)),
+        "NMAP" => Some(EpicsValue::ULong(rec.internal.nmap)),
         // C `pmr->pp` — post-process armed for the motion in flight
         // (15 write sites, motorRecord.cc:825..2523).
-        "PP" => Some(EpicsValue::Short(if rec.internal.pp { 1 } else { 0 })),
+        "PP" => Some(EpicsValue::Short(rec.internal.pp)),
         _ => None,
     }
 }
@@ -198,7 +193,7 @@ pub(crate) fn motor_put_field(
                 EpicsValue::Double(v) => v,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            if rec.conv.set && !rec.conv.igset && rec.conv.foff == FreezeOffset::Frozen {
+            if rec.conv.set && rec.conv.igset == 0 && rec.conv.foff == FreezeOffset::Frozen {
                 // #231: LOAD_POS blocked — refuse the Frozen-leg
                 // redefinition, which needs the controller write
                 // (C load_pos sends LOAD_POS unconditionally, 3811),
@@ -219,7 +214,7 @@ pub(crate) fn motor_put_field(
                 EpicsValue::Double(v) => v,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            if rec.conv.set && !rec.conv.igset {
+            if rec.conv.set && rec.conv.igset == 0 {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {
                     return Ok(());
@@ -237,7 +232,7 @@ pub(crate) fn motor_put_field(
             // Under closed-loop OMSL with a DB-link DOL the collection
             // never reads RVAL (1994): the put stays inert, and is not a
             // SET-mode redefinition either.
-            if rec.conv.set && !rec.conv.igset && !rec.closed_loop_dol_collection() {
+            if rec.conv.set && rec.conv.igset == 0 && !rec.closed_loop_dol_collection() {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {
                     return Ok(());
@@ -701,7 +696,7 @@ pub(crate) fn motor_put_field(
                 // the JOGR field, not the MIP bit (3064), folded to the
                 // dial frame as emit_jog does.
                 if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
-                    let forward = !rec.ctrl.jogr;
+                    let forward = rec.ctrl.jogr == 0;
                     let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
                     let jog = MotorCommand::JogVelocity {
                         min_velocity: rec.raw_rate(rec.effective_vbas()),
@@ -887,8 +882,8 @@ pub(crate) fn motor_put_field(
         },
         "STOP" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.stop = v;
                 if v != 0 {
-                    rec.ctrl.stop = true;
                     rec.last_write = Some(CommandSource::Stop);
                 }
                 Ok(())
@@ -907,7 +902,7 @@ pub(crate) fn motor_put_field(
                 // C writes the field value: a 0-write un-latches a parked
                 // button (e.g. one blocked at its limit switch) without
                 // triggering a dispatch pass.
-                rec.ctrl.homf = v != 0;
+                rec.ctrl.homf = v;
                 if v != 0 {
                     rec.last_write = Some(CommandSource::Homf);
                 }
@@ -923,7 +918,7 @@ pub(crate) fn motor_put_field(
                     return Err(CaError::InvalidValue("HOMR: home in progress".into()));
                 }
                 // C writes the field value, like HOMF above.
-                rec.ctrl.homr = v != 0;
+                rec.ctrl.homr = v;
                 if v != 0 {
                     rec.last_write = Some(CommandSource::Homr);
                 }
@@ -933,7 +928,7 @@ pub(crate) fn motor_put_field(
         },
         "JOGF" => match value {
             EpicsValue::Short(v) => {
-                rec.ctrl.jogf = v != 0;
+                rec.ctrl.jogf = v;
                 // C special() motorRecordJOGF (3042-3047): a release
                 // clears a parked MIP_JOG_REQ; a press arms it only on an
                 // idle record (mip == MIP_DONE) away from the limit
@@ -942,7 +937,7 @@ pub(crate) fn motor_put_field(
                 // none of it.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                } else if rec.stat.mip.is_empty() && !rec.limits.hls {
+                } else if rec.stat.mip.is_empty() && rec.limits.hls == 0 {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
                 }
                 rec.last_write = Some(CommandSource::Jogf);
@@ -952,12 +947,12 @@ pub(crate) fn motor_put_field(
         },
         "JOGR" => match value {
             EpicsValue::Short(v) => {
-                rec.ctrl.jogr = v != 0;
+                rec.ctrl.jogr = v;
                 // C special() motorRecordJOGR (3049-3054), mirror of JOGF
                 // with the low limit switch.
                 if v == 0 {
                     rec.stat.mip.remove(MipFlags::JOG_REQ);
-                } else if rec.stat.mip.is_empty() && !rec.limits.lls {
+                } else if rec.stat.mip.is_empty() && rec.limits.lls == 0 {
                     rec.stat.mip.insert(MipFlags::JOG_REQ);
                 }
                 rec.last_write = Some(CommandSource::Jogr);
@@ -967,8 +962,8 @@ pub(crate) fn motor_put_field(
         },
         "TWF" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.twf = v;
                 if v != 0 {
-                    rec.ctrl.twf = true;
                     rec.last_write = Some(CommandSource::Twf);
                 }
                 Ok(())
@@ -977,8 +972,8 @@ pub(crate) fn motor_put_field(
         },
         "TWR" => match value {
             EpicsValue::Short(v) => {
+                rec.ctrl.twr = v;
                 if v != 0 {
-                    rec.ctrl.twr = true;
                     rec.last_write = Some(CommandSource::Twr);
                 }
                 Ok(())
@@ -1083,12 +1078,12 @@ pub(crate) fn motor_put_field(
         // command_planner::sync_positions().
         "SYNC" => match value {
             EpicsValue::Short(v) => {
+                // C `pmr->sync` is the field value itself — it holds the
+                // request across a busy/paused pass (the apply is
+                // idle-gated, motorRecord.cc:2540-2544) and a last_write
+                // overtaken by a later put.
+                rec.internal.sync = v;
                 if v != 0 {
-                    // C `pmr->sync` is the field value itself — latch it
-                    // so the request survives a busy/paused pass (the
-                    // apply is idle-gated, motorRecord.cc:2540-2544) and
-                    // a last_write overtaken by a later put.
-                    rec.internal.sync = true;
                     rec.last_write = Some(CommandSource::Sync);
                 }
                 Ok(())
@@ -1101,6 +1096,51 @@ pub(crate) fn motor_put_field(
 
 /// A raw field write: the whole put at load, and the put of every field
 /// with no special() case at runtime.
+/// A `.db` value for a field: the `SPC_NOMOD` fields `put_field` refuses
+/// are still stored, as C's `dbPutString` does.
+pub(crate) fn motor_load_field(
+    rec: &mut MotorRecord,
+    name: &str,
+    value: EpicsValue,
+) -> CaResult<()> {
+    match (name, value) {
+        ("VERS", EpicsValue::Float(v)) => rec.internal.vers = v,
+        ("CARD", EpicsValue::Short(v)) => rec.links.card = v,
+        ("HLS", EpicsValue::Short(v)) => rec.limits.hls = v,
+        ("LLS", EpicsValue::Short(v)) => rec.limits.lls = v,
+        ("RHLS", EpicsValue::Short(v)) => rec.limits.rhls = v,
+        ("RLLS", EpicsValue::Short(v)) => rec.limits.rlls = v,
+        ("LVIO", EpicsValue::Short(v)) => rec.limits.lvio = v,
+        ("RCNT", EpicsValue::Short(v)) => rec.retry.rcnt = v,
+        ("MISS", EpicsValue::Short(v)) => rec.retry.miss = v,
+        ("LSPG", EpicsValue::Short(v)) => rec.internal.lspg = SpmgMode::from_i16(v),
+        ("LVAL", EpicsValue::Double(v)) => rec.internal.lval = v,
+        ("LDVL", EpicsValue::Double(v)) => rec.internal.ldvl = v,
+        ("LRVL", EpicsValue::Long(v)) => rec.internal.lrvl = v,
+        ("LRLV", EpicsValue::Double(v)) => rec.internal.lrlv = v,
+        ("PP", EpicsValue::Short(v)) => rec.internal.pp = v,
+        ("RBV", EpicsValue::Double(v)) => rec.pos.rbv = v,
+        ("DRBV", EpicsValue::Double(v)) => rec.pos.drbv = v,
+        ("DIFF", EpicsValue::Double(v)) => rec.pos.diff = v,
+        ("RDIF", EpicsValue::Long(v)) => rec.pos.rdif = v,
+        ("RRBV", EpicsValue::Long(v)) => rec.pos.rrbv = v,
+        ("RMP", EpicsValue::Long(v)) => rec.pos.rmp = v,
+        ("REP", EpicsValue::Long(v)) => rec.pos.rep = v,
+        ("CDIR", EpicsValue::Short(v)) => rec.stat.cdir = v,
+        ("DMOV", EpicsValue::Short(v)) => rec.stat.dmov = v,
+        ("MOVN", EpicsValue::Short(v)) => rec.stat.movn = v,
+        ("TDIR", EpicsValue::Short(v)) => rec.stat.tdir = v,
+        ("ATHM", EpicsValue::Short(v)) => rec.stat.athm = v,
+        ("RVEL", EpicsValue::Long(v)) => rec.stat.rvel = v,
+        ("MSTA", EpicsValue::ULong(v)) => rec.stat.msta = MstaFlags::from_bits_retain(v),
+        ("MIP", EpicsValue::UShort(v)) => rec.stat.mip = MipFlags::from_bits_retain(v),
+        ("MMAP", EpicsValue::ULong(v)) => rec.internal.mmap = v,
+        ("NMAP", EpicsValue::ULong(v)) => rec.internal.nmap = v,
+        (name, value) => return motor_put_field(rec, name, value),
+    }
+    Ok(())
+}
+
 fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> CaResult<()> {
     match name {
         // A position write keeps its source: was_position_restored reads
@@ -1171,13 +1211,13 @@ fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> Ca
         "DHLM" => as_f64(value, name).map(|v| rec.limits.dhlm = v),
         "DLLM" => as_f64(value, name).map(|v| rec.limits.dllm = v),
         "SPMG" => as_i16(value, name).map(|v| rec.ctrl.spmg = SpmgMode::from_i16(v)),
-        "STOP" => as_i16(value, name).map(|v| rec.ctrl.stop = v != 0),
-        "HOMF" => as_i16(value, name).map(|v| rec.ctrl.homf = v != 0),
-        "HOMR" => as_i16(value, name).map(|v| rec.ctrl.homr = v != 0),
-        "JOGF" => as_i16(value, name).map(|v| rec.ctrl.jogf = v != 0),
-        "JOGR" => as_i16(value, name).map(|v| rec.ctrl.jogr = v != 0),
-        "TWF" => as_i16(value, name).map(|v| rec.ctrl.twf = v != 0),
-        "TWR" => as_i16(value, name).map(|v| rec.ctrl.twr = v != 0),
+        "STOP" => as_i16(value, name).map(|v| rec.ctrl.stop = v),
+        "HOMF" => as_i16(value, name).map(|v| rec.ctrl.homf = v),
+        "HOMR" => as_i16(value, name).map(|v| rec.ctrl.homr = v),
+        "JOGF" => as_i16(value, name).map(|v| rec.ctrl.jogf = v),
+        "JOGR" => as_i16(value, name).map(|v| rec.ctrl.jogr = v),
+        "TWF" => as_i16(value, name).map(|v| rec.ctrl.twf = v),
+        "TWR" => as_i16(value, name).map(|v| rec.ctrl.twr = v),
         "CNEN" => as_i16(value, name).map(|v| rec.ctrl.cnen = v != 0),
         "STUP" => as_i16(value, name).map(|v| rec.stat.stup = v),
         "PCOF" => as_f64(value, name).map(|v| rec.pid.pcof = v),
@@ -1190,7 +1230,7 @@ fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> Ca
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
-        "SYNC" => as_i16(value, name).map(|v| rec.internal.sync = v != 0),
+        "SYNC" => as_i16(value, name).map(|v| rec.internal.sync = v),
         "FOFF" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.foff = FreezeOffset::from_i16(v);
@@ -1207,7 +1247,7 @@ fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> Ca
         },
         "IGSET" => match value {
             EpicsValue::Short(v) => {
-                rec.conv.igset = v != 0;
+                rec.conv.igset = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1897,9 +1937,13 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
 /// that is not being polled.
 fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     if limits.dllm > limits.dhlm || limits.llm > limits.hlm {
-        limits.lvio = true;
+        limits.lvio = 1;
     } else {
-        limits.lvio = coordinate::check_soft_limits(dval, limits.dhlm, limits.dllm);
+        limits.lvio = i16::from(coordinate::check_soft_limits(
+            dval,
+            limits.dhlm,
+            limits.dllm,
+        ));
     }
 }
 

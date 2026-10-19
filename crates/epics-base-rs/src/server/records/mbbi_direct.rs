@@ -83,7 +83,13 @@ pub const BIT_NAMES: [&str; 32] = [
 
 impl Record for MbbiDirectRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::mbbiDirect;
-        RVAL => rval);
+        fields:
+        RVAL => rval,
+        ORAW => oraw;
+        custom: VAL, NOBT, MASK, MLST, SHFT, SIOL, SVAL, SIML, SIMM, SIMS, SDLY, B0, B1, B2, B3,
+            B4, B5, B6, B7, B8, B9, BA, BB, BC, BD, BE, BF, B10, B11, B12, B13, B14, B15, B16,
+            B17, B18, B19, B1A, B1B, B1C, B1D, B1E, B1F;
+        spill: INP, OLDSIMM, SSCN, SIMPVT);
 
     /// `mbbiDirectRecord.c:109` loads a constant SIOL as `DBF_ULONG` into the LONG SVAL.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
@@ -285,9 +291,9 @@ impl Record for MbbiDirectRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `mbbiDirectRecord.c::init_record` — MASK from NOBT,
-            // NOBT may span 1..32 (NUM_BITS 32).
+        if pass == 1 {
+            // C `mbbiDirectRecord.c:112-113`, after the pass-0 return — MASK
+            // from NOBT, NOBT may span 1..32 (NUM_BITS 32).
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
@@ -423,6 +429,18 @@ impl Record for MbbiDirectRecord {
                 .iter()
                 .position(|&n| n == name)
                 .map(|idx| EpicsValue::UChar(self.bits[idx])),
+        }
+    }
+
+    /// The `SPC_NOMOD` MLST that `put_field` refuses, stored raw from a
+    /// `.db` as `dbPutString` does.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (name, value) {
+            ("MLST", EpicsValue::Long(v)) => {
+                self.mlst = v as u32;
+                Ok(())
+            }
+            (name, value) => self.put_field(name, value),
         }
     }
 

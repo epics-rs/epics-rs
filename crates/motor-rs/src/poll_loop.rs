@@ -103,7 +103,7 @@ pub struct PollerInbox {
 /// posting each to every record bound to it.
 ///
 /// It is the only caller of the drivers after `init`: polls and the records'
-/// commands all run on its own `motorPoller` OS thread (see [`Self::run`]),
+/// commands all run on its own `motorPoller` OS thread (see [`Self::start`]),
 /// as C runs one `asynMotorPoller` per controller on an epicsThread
 /// (asynMotorController.cpp:615-695), so a driver blocked on a dead serial
 /// line or TCP peer never stalls the IOC's async executor, and a slow axis
@@ -1592,8 +1592,8 @@ impl MotorPollLoop {
         }
     }
 
-    /// [`Self::startup_pass`] on the calling thread: for a harness standing
-    /// in for the poller thread, whose first act it is.
+    /// The poller thread's startup pass, on the calling thread: for a
+    /// harness standing in for the poller thread, whose first act it is.
     pub fn run_startup_pass(&mut self) {
         if self.is_motor_task() {
             return;
@@ -1608,7 +1608,8 @@ impl MotorPollLoop {
     }
 
     /// Run the commands queued so far on the calling thread: for a harness
-    /// standing in for the poller thread. The IOC path is [`Self::run`].
+    /// standing in for the poller thread. The IOC path is [`Self::start`]'s
+    /// thread.
     pub fn run_queued_commands(&mut self) {
         for axis in &mut self.axes {
             axis.run_queued_commands(&self.controller_poll);

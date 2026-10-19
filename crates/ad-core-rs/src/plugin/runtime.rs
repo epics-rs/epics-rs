@@ -2236,6 +2236,45 @@ impl ParamBatch {
 const PLUGIN_MAX_THREADS: i32 = 1;
 const PLUGIN_NUM_THREADS: i32 = 1;
 
+/// What C `createCallbackThreads` (NDPluginDriver.cpp:955-1024) settles on
+/// from the params as they stand, and the lines it prints doing so. Any line
+/// means it returned `asynError`.
+struct CallbackThreads {
+    num_threads: i32,
+    queue_size: i32,
+    lines: Vec<String>,
+}
+
+fn create_callback_threads(num_threads: i32, max_threads: i32, queue_size: i32) -> CallbackThreads {
+    let error = "NDPluginDriver::createCallbackThreads error";
+    let mut settled = CallbackThreads {
+        num_threads,
+        queue_size,
+        lines: Vec::new(),
+    };
+    if settled.num_threads > max_threads {
+        settled.lines.push(format!(
+            "{error}, numThreads={} must be <= maxThreads={max_threads}, setting to {max_threads}\n",
+            settled.num_threads
+        ));
+        settled.num_threads = max_threads;
+    }
+    if settled.num_threads < 1 {
+        settled.lines.push(format!(
+            "{error}, numThreads={} must be >= 1, setting to 1\n",
+            settled.num_threads
+        ));
+        settled.num_threads = 1;
+    }
+    if queue_size < 1 {
+        settled.lines.push(format!(
+            "{error}, queueSize={queue_size} must be >= 1, setting to 1\n"
+        ));
+        settled.queue_size = 1;
+    }
+    settled
+}
+
 /// The `NDArrayPort` and `NDArrayAddr` constructor arguments: the source C
 /// seeds both params with (NDPluginDriver.cpp:152-153) and connects to.
 /// A bare port name is address 0.
@@ -2313,13 +2352,17 @@ pub struct PluginPortDriver {
     hand_on: Arc<std::sync::OnceLock<HandOn>>,
     /// What the plugin's own pool and queued count lead back to.
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
+    /// C `pThreads_.size() != 0`: whether `createCallbackThreads` has run.
+    /// A plugin built with blocking callbacks has not, so its configure-line
+    /// queueSize stands unfloored until it first goes non-blocking.
+    callback_threads: bool,
 }
 
 impl PluginPortDriver {
     fn new<P: NDPluginProcess>(
         port_name: &str,
         plugin_type_name: &str,
-        queue_size: usize,
+        queue_size: i32,
         source: &ArraySource,
         max_addr: usize,
         param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
@@ -2357,11 +2400,12 @@ impl PluginPortDriver {
         base.set_int32_param(plugin_params.nd_array_addr, 0, source.addr)?;
         base.set_int32_param(plugin_params.dropped_arrays, 0, 0)?;
         base.set_int32_param(plugin_params.dropped_output_arrays, 0, 0)?;
-        base.set_int32_param(plugin_params.queue_size, 0, queue_size as i32)?;
+        // Unfloored: the floor is `createCallbackThreads`' (`:989-995`).
+        base.set_int32_param(plugin_params.queue_size, 0, queue_size)?;
         // C `:157` — an empty queue has every slot free. The param is spelled
         // QUEUE_FREE (params.rs:40) whatever the struct field is called, so 0
         // here published a permanently full queue on an idle plugin.
-        base.set_int32_param(plugin_params.queue_use, 0, queue_size as i32)?;
+        base.set_int32_param(plugin_params.queue_use, 0, queue_size)?;
         base.set_int32_param(plugin_params.max_threads, 0, PLUGIN_MAX_THREADS)?;
         base.set_int32_param(plugin_params.num_threads, 0, PLUGIN_NUM_THREADS)?;
         // C `:160` sets its `blockingCallbacks` constructor argument here;
@@ -2408,6 +2452,7 @@ impl PluginPortDriver {
             validator: processor.clone(),
             hand_on: Arc::default(),
             owner,
+            callback_threads: false,
         };
         Ok((driver, processor, pool))
     }
@@ -2424,32 +2469,28 @@ impl PluginPortDriver {
         // connectToArrayPort reads list 0 (NDPluginDriver.cpp:590-591).
         let port =
             String::from_utf8_lossy(self.base.get_string_param(p.nd_array_port, 0)?).into_owned();
-        let threads = "NDPluginDriver::createCallbackThreads error";
-        let (keep, why) = if reason == p.num_threads {
-            let max = self.base.get_int32_param(p.max_threads, 0)?;
-            if value > max {
-                (
-                    max,
-                    format!(
-                        "{threads}, numThreads={value} must be <= maxThreads={max}, setting to {max}\n"
-                    ),
-                )
-            } else if value < 1 {
-                (
-                    1,
-                    format!("{threads}, numThreads={value} must be >= 1, setting to 1\n"),
-                )
+        let (keep, why) = if reason == p.num_threads || reason == p.queue_size {
+            // C stores the write, then runs createCallbackThreads on all three
+            // params (:746-748), so either write can clamp the other field.
+            let get = |r| self.base.get_int32_param(r, 0);
+            let (num, queue) = if reason == p.num_threads {
+                (value, get(p.queue_size)?)
             } else {
+                (get(p.num_threads)?, value)
+            };
+            let settled = create_callback_threads(num, get(p.max_threads)?, queue);
+            if settled.lines.is_empty() {
                 return Ok(WriteVerdict::Accept(value).into());
             }
-        } else if reason == p.queue_size && value < 1 {
-            (
-                1,
-                format!("{threads}, queueSize={value} must be >= 1, setting to 1\n"),
-            )
+            let keep = if reason == p.num_threads {
+                settled.num_threads
+            } else {
+                settled.queue_size
+            };
+            (keep, settled.lines)
         } else if reason == p.nd_array_addr {
             match self.unresolved(&port, value) {
-                Some(why) => (value, why),
+                Some(why) => (value, vec![why]),
                 None => return Ok(WriteVerdict::Accept(value).into()),
             }
         } else {
@@ -2461,12 +2502,14 @@ impl PluginPortDriver {
                 .unresolved(&port, self.base.get_int32_param(p.nd_array_addr, 0)?)
                 .is_none();
         let name = self.base.params.param_name(reason).unwrap_or("");
-        Ok(WriteOutcome::from(WriteVerdict::Refuse {
+        let refused = WriteOutcome::from(WriteVerdict::Refuse {
             keep,
             message: String::new(),
-        })
-        .print(TraceMask::ERROR, why)
-        .print(
+        });
+        let refused = why
+            .into_iter()
+            .fold(refused, |out, line| out.print(TraceMask::ERROR, line));
+        Ok(refused.print(
             TraceMask::ERROR,
             format!(
                 "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}\n",
@@ -2823,12 +2866,47 @@ impl PortDriver for PluginPortDriver {
         );
         let value = verdict.kept();
         self.base.set_int32_param(reason, addr, value)?;
-        let p = &self.plugin_params;
-        if reason == p.queue_size || reason == p.num_threads {
-            // C `createCallbackThreads` ends with QueueFree = QueueSize
-            // (NDPluginDriver.cpp:1024), success or not.
-            let depth = self.base.get_int32_param(p.queue_size, 0)?;
-            self.base.set_int32_param(p.queue_use, 0, depth)?;
+        let p = self.plugin_params;
+        // C runs `createCallbackThreads` on every QueueSize or NumThreads write
+        // (NDPluginDriver.cpp:746-748) and on a BlockingCallbacks 0 before any
+        // has run (:715-717). That call's status is dropped, so its lines are
+        // the only sign; the queue it settles on is the one the data plane was
+        // already built with (`ndarray_channel` floors the same value).
+        let starts = reason == p.blocking_callbacks && value == 0 && !self.callback_threads;
+        if reason == p.queue_size || reason == p.num_threads || starts {
+            let settled = create_callback_threads(
+                self.base.get_int32_param(p.num_threads, 0)?,
+                self.base.get_int32_param(p.max_threads, 0)?,
+                self.base.get_int32_param(p.queue_size, 0)?,
+            );
+            if starts {
+                for line in &settled.lines {
+                    self.base
+                        .trace_print(TraceMask::ERROR, format_args!("{line}"));
+                }
+            }
+            for (other, settled) in [
+                (p.num_threads, settled.num_threads),
+                (p.queue_size, settled.queue_size),
+            ] {
+                if other == reason || self.base.get_int32_param(other, 0)? == settled {
+                    continue;
+                }
+                self.base.set_int32_param(other, 0, settled)?;
+                if !starts {
+                    // A write that clamped the other field: the data plane
+                    // runs that one too.
+                    let _ = self.param_change_tx.send(PluginParamMsg::Change(
+                        other,
+                        0,
+                        ParamChangeValue::Int32(settled),
+                    ));
+                }
+            }
+            // QueueFree = QueueSize (:1024), success or not.
+            self.base
+                .set_int32_param(p.queue_use, 0, settled.queue_size)?;
+            self.callback_threads = true;
         }
         self.store_side(addr, side, trace)?;
         self.send_published(publish, addressed);
@@ -3195,7 +3273,7 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     claim: &asyn_rs::registry::PortClaim,
     processor: P,
     max_memory: usize,
-    queue_size: usize,
+    queue_size: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: PluginThreads,
@@ -3212,7 +3290,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     claim: &asyn_rs::registry::PortClaim,
     processor: P,
     max_memory: usize,
-    queue_size: usize,
+    queue_size: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     max_addr: usize,
@@ -3275,7 +3353,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let port_handle = port_runtime.port_handle().clone();
 
     // Array channel (data plane)
-    let (array_sender, array_rx) = ndarray_channel(port_name, queue_size);
+    let (array_sender, array_rx) = ndarray_channel(port_name, queue_size.max(1) as usize);
 
     // Shared mode flags
     let enabled = Arc::new(AtomicBool::new(false));
@@ -4269,7 +4347,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     claim: &asyn_rs::registry::PortClaim,
     processor: P,
     max_memory: usize,
-    queue_size: usize,
+    queue_size: i32,
     output: NDArrayOutput,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
@@ -4319,7 +4397,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let port_handle = port_runtime.port_handle().clone();
 
-    let (array_sender, array_rx) = ndarray_channel(port_name, queue_size);
+    let (array_sender, array_rx) = ndarray_channel(port_name, queue_size.max(1) as usize);
 
     let enabled = Arc::new(AtomicBool::new(false));
     let blocking_mode = Arc::new(AtomicBool::new(false));
@@ -6323,6 +6401,35 @@ mod tests {
         }
         assert_eq!(last, Some((nd.file_path, Some(format!("{path}/")))));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// C `createCallbackThreads` reads all three params whichever one was
+    /// written (NDPluginDriver.cpp:746-748, :969-978), so a QueueSize write
+    /// clamps a NumThreads left above a lowered MaxThreads, and fails for it.
+    #[test]
+    fn queue_size_write_clamps_num_threads_to_max_threads() {
+        let wiring = test_wiring();
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("XCLAMP").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            "",
+            wiring,
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.plugin_params;
+        port.write_int32_blocking(p.max_threads, 0, 4).unwrap();
+        port.write_int32_blocking(p.num_threads, 0, 3).unwrap();
+        port.write_int32_blocking(p.max_threads, 0, 1).unwrap();
+        assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 3);
+
+        assert!(port.write_int32_blocking(p.queue_size, 0, 7).is_err());
+        params_applied(&handle);
+        assert_eq!(port.read_int32_blocking(p.queue_size, 0).unwrap(), 7);
+        assert_eq!(port.read_int32_blocking(p.queue_use, 0).unwrap(), 7);
+        assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 1);
     }
 
     #[test]
@@ -9192,7 +9299,7 @@ mod tests {
             &asyn_rs::asyn_record::claim_port("QFREE_ENQ").unwrap(),
             processor,
             1_000_000,
-            DEPTH as usize,
+            DEPTH,
             "",
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
@@ -9248,7 +9355,7 @@ mod tests {
     #[test]
     fn min_callback_time_gate_takes_no_queue_slot() {
         const OFFERED: usize = 20;
-        const DEPTH: usize = 2;
+        const DEPTH: i32 = 2;
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("MINCB_PRESSURE").unwrap(),
@@ -9294,7 +9401,7 @@ mod tests {
         assert_eq!(
             port.read_int32_blocking(handle.plugin_params.queue_use, 0)
                 .unwrap(),
-            DEPTH as i32,
+            DEPTH,
             "and it consumed no queue slot on the way"
         );
     }

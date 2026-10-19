@@ -51,6 +51,30 @@ pub fn plugin_arg_defs() -> Vec<ArgDesc> {
     ]
 }
 
+/// The first `nargs` of [`plugin_arg_defs`], for the commands whose C
+/// `iocshFuncDef` stops early: 9 for `NDProcessConfigure`,
+/// `NDPosPluginConfigure` and `NDScatterConfigure` (no `maxThreads`), 7 for
+/// `NDCircularBuffConfigure` (NDPluginCircularBuff.cpp:484).
+pub fn plugin_arg_defs_to(nargs: usize) -> Vec<ArgDesc> {
+    let mut defs = plugin_arg_defs();
+    defs.truncate(nargs);
+    defs
+}
+
+/// Arg descriptors for the `NDFile*Configure` commands, whose C signature
+/// takes `priority, stackSize` straight after `NDArrayAddr`
+/// (NDFileTIFF.cpp:651-660).
+pub fn file_arg_defs() -> Vec<ArgDesc> {
+    let mut defs = plugin_arg_defs_to(5);
+    for name in ["priority", "stackSize"] {
+        defs.push(ArgDesc {
+            name,
+            arg_type: ArgType::Int,
+        });
+    }
+    defs
+}
+
 /// Arg descriptors for the two plugin `*Configure` commands whose C signature
 /// inserts a count at argument 5, pushing every later argument along by one so
 /// that `maxThreads` lands at 10: `maxOverlays` (NDPluginOverlay.cpp:523-526)
@@ -130,7 +154,8 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
 /// leads with.
 pub struct PluginArgs {
     pub port_name: String,
-    pub queue_size: usize,
+    /// As written: the runtime applies C's floor (NDPluginDriver.cpp:989-995).
+    pub queue_size: i32,
     /// Handed to [`PluginManager::add_plugin`](crate::ioc::PluginManager::add_plugin),
     /// which is where every configure command publishes its plugin.
     pub blocking_callbacks: i32,
@@ -145,11 +170,11 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<PluginArgs, String> {
         ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
-    let queue_size = match args.get(1) {
-        Some(ArgValue::Int(n)) => *n as usize,
-        _ => 20,
-    };
     // An absent iocsh int argument is 0.
+    let queue_size = match args.get(1) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
+    };
     let blocking_callbacks = match args.get(2) {
         Some(ArgValue::Int(n)) => *n as i32,
         _ => 0,

@@ -28,7 +28,7 @@ pub struct AttrPlotArgs {
     pub cache_size: usize,
     pub n_data_blocks: usize,
     pub source: ArraySource,
-    pub queue_size: usize,
+    pub queue_size: i32,
     pub blocking_callbacks: i32,
 }
 
@@ -63,7 +63,11 @@ pub fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
         cache_size: usize_arg(2, 1000),
         n_data_blocks: usize_arg(3, 4),
         source: ArraySource { port, addr },
-        queue_size: usize_arg(6, 20),
+        // As written, absent 0: the runtime floors it as C does.
+        queue_size: match args.get(6) {
+            Some(ArgValue::Int(n)) => *n as i32,
+            _ => 0,
+        },
         blocking_callbacks: match args.get(7) {
             Some(ArgValue::Int(n)) => *n as i32,
             _ => 0,
@@ -110,7 +114,7 @@ mod tests {
     #[test]
     fn parse_attr_plot_args_honours_explicit_zero_and_defaults_absent() {
         // Boundary: an explicit cache_size=0 is meaningful (unlimited) and must be
-        // honoured; absent n_attributes/n_data_blocks/queue_size fall back.
+        // honoured; absent n_attributes/n_data_blocks fall back.
         let args = vec![
             ArgValue::String("AP2".into()),
             ArgValue::Missing, // n_attributes absent
@@ -124,6 +128,7 @@ mod tests {
         );
         assert_eq!(p.n_data_blocks, 4, "absent n_data_blocks -> fallback");
         assert_eq!(p.source.port, "", "absent in_port -> empty");
-        assert_eq!(p.queue_size, 20, "absent queue_size -> fallback");
+        // iocsh hands C an absent int as 0, which the runtime floors to 1.
+        assert_eq!(p.queue_size, 0, "absent queue_size is iocsh's 0");
     }
 }

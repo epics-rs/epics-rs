@@ -59,7 +59,7 @@ const FRAMES: usize = 48;
 /// mode is not the alternative: its publish path awaits per-frame completion
 /// (`channel.rs:194-208`), which serialises the producer and hides the pool
 /// entirely. `drive` asserts the drop count is zero.
-const QUEUE: usize = FRAMES * 4;
+const QUEUE: i32 = FRAMES as i32 * 4;
 
 /// A few milliseconds of real, unshareable CPU per frame.
 fn burn(array: &NDArray) -> u64 {

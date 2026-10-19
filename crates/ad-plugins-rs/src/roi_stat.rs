@@ -750,7 +750,7 @@ impl NDPluginProcess for ROIStatProcessor {
 pub fn create_roi_stat_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
-    queue_size: usize,
+    queue_size: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     num_rois: usize,

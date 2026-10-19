@@ -10,7 +10,7 @@
 #   $(XSIZE)     - Max image width
 #   $(YSIZE)     - Max image height
 #   $(NCHANS)    - Max time series points
-#   $(CBUFFS)    - Circular buffer frame count (default 500)
+#   $(CBUFFS)    - Maximum frames buffered in NDPluginCircularBuff (default 500)
 #
 # As in C, no NDStdArrays here: each st.cmd creates its own image1 with
 # its detector's waveform type and size.
@@ -142,7 +142,7 @@ dbLoadRecords("NDColorConvert.template", "P=$(PREFIX),R=CC2:,PORT=CC2,NDARRAY_PO
 
 # ===== Circular buffer =====
 
-NDCircularBuffConfigure("CB1", $(QSIZE), 0, "$(PORT)", 0)
+NDCircularBuffConfigure("CB1", $(QSIZE), 0, "$(PORT)", 0, $(CBUFFS=500), 0)
 dbLoadRecords("NDCircularBuff.template", "P=$(PREFIX),R=CB1:,PORT=CB1,NDARRAY_PORT=$(PORT)")
 
 # ===== Attributes (with 8 attribute channels + TimeSeries) =====

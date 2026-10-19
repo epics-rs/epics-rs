@@ -2141,7 +2141,7 @@ impl NDPluginProcess for StatsProcessor {
 pub fn create_stats_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
-    queue_size: usize,
+    queue_size: i32,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,

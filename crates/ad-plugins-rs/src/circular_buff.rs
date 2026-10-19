@@ -510,10 +510,10 @@ struct CircularBuffState {
 pub struct CircularBuffProcessor {
     state: Mutex<CircularBuffState>,
     params: CBParamIndices,
-    /// C `maxBuffers_` — the plugin's input NDArray queue size, passed to
-    /// `NDCircularBuffConfigure` as `queueSize`. Bounds the accepted pre-count:
-    /// C rejects `preCount > maxBuffers_ - 1` (NDPluginCircularBuff.cpp:284).
-    max_buffers: usize,
+    /// C `maxBuffers_`, the `maxBuffers` argument of `NDCircularBuffConfigure`
+    /// (NDPluginCircularBuff.cpp:407). Bounds the accepted pre-count: C
+    /// rejects `preCount > maxBuffers_ - 1` (:284).
+    max_buffers: i32,
 }
 
 impl CircularBuffProcessor {
@@ -521,7 +521,7 @@ impl CircularBuffProcessor {
         pre_count: usize,
         post_count: usize,
         condition: TriggerCondition,
-        max_buffers: usize,
+        max_buffers: i32,
     ) -> Self {
         Self {
             state: Mutex::new(CircularBuffState {
@@ -629,7 +629,7 @@ impl NDPluginProcess for CircularBuffProcessor {
             // still succeeds through `status = callParamCallbacks()`.
             let refused = if int(p.control) != 0 {
                 Some("Stop acquisition to set pre-count")
-            } else if value > self.max_buffers as i32 - 1 {
+            } else if value > self.max_buffers - 1 {
                 Some("Pre-count too high")
             } else if value < 0 {
                 Some("Invalid pre-count value")

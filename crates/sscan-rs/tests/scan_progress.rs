@@ -164,8 +164,11 @@ async fn a_two_dimensional_scan_counts_points_across_both() {
     start(&db);
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
 
-    scan(&db, 1, "BUSY", 1.0).await;
+    // Outer first, as an sscan sets BUSY before its triggers start the
+    // inner one (sscanRecord.c:1143): `idle` fixes scanDim from the BUSYs
+    // set when it wakes (scanProg.st:172-176).
     scan(&db, 2, "BUSY", 1.0).await;
+    scan(&db, 1, "BUSY", 1.0).await;
     assert!(eventually(5, || f(&db, "running") == 1.0).await);
     assert!(eventually(5, || f(&db, "Ntotal") == 30.0).await);
     assert_eq!(s(&db, "pauseTimeStr"), "00:00:00");
@@ -227,8 +230,11 @@ async fn an_outer_pause_waits_for_the_inner_scan() {
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
     sleep(Duration::from_millis(1200)).await;
 
-    scan(&db, 1, "BUSY", 1.0).await;
+    // Outer first, as an sscan sets BUSY before its triggers start the
+    // inner one (sscanRecord.c:1143): `idle` fixes scanDim from the BUSYs
+    // set when it wakes (scanProg.st:172-176).
     scan(&db, 2, "BUSY", 1.0).await;
+    scan(&db, 1, "BUSY", 1.0).await;
     assert!(eventually(5, || f(&db, "Ntotal") == 30.0).await);
 
     scan(&db, 2, "PAUS", 1.0).await;

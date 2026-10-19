@@ -769,7 +769,7 @@ impl IocRunConfig {
         let (db, acf, shell_commands) = (self.db, self.acf, self.shell_commands);
         let (tx, rx) = crate::runtime::sync::oneshot::channel();
         let started = crate::runtime::task::MandatoryThread::new(
-            "iocsh",
+            crate::runtime::task::MAIN_THREAD_NAME,
             crate::runtime::task::ThreadPriority::Iocsh,
             crate::runtime::task::StackSizeClass::Big,
         )
@@ -1028,7 +1028,7 @@ async fn run_uninitialized_tail(
     // process on this arm, so a thread that will not start is a boot
     // failure and not something to carry on without.
     crate::runtime::task::MandatoryThread::new(
-        "iocsh",
+        crate::runtime::task::MAIN_THREAD_NAME,
         crate::runtime::task::ThreadPriority::Iocsh,
         crate::runtime::task::StackSizeClass::Big,
     )
@@ -1100,7 +1100,7 @@ type ProtocolRunner = Box<
 /// [`IocApplication::run_to_completion`] through the build untouched.
 struct ProtocolStart {
     /// The runtime the runner is spawned onto. `BuiltIoc::run` is reached from
-    /// the `iocsh-startup` thread through `BlockingBridge::block_on`, which is
+    /// the startup-script thread through `BlockingBridge::block_on`, which is
     /// not a runtime thread, so the reactor has to be carried rather than
     /// looked up.
     bridge: crate::runtime::task::BlockingBridge,
@@ -2884,8 +2884,9 @@ impl IocApplication {
             // `try_spawn` rather than `spawn` because this *is* a fallible boot
             // step — the error reaches `run`'s caller, which then never starts
             // serving, so there is no need to abort the process.
+            // C runs the script on `_main_` (`softMain.cpp:231`).
             crate::runtime::task::MandatoryThread::new(
-                "iocsh-startup",
+                crate::runtime::task::MAIN_THREAD_NAME,
                 // C bands the thread that runs iocsh, and for the reason
                 // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
                 crate::runtime::task::ThreadPriority::Iocsh,
@@ -2899,7 +2900,7 @@ impl IocApplication {
                 let _ = tx.send(run_startup_phase(&shell, &startup_lines, script.as_deref()));
             })
             .map_err(|e| {
-                CaError::InvalidValue(format!("could not start the iocsh-startup thread: {e}"))
+                CaError::InvalidValue(format!("could not start the startup-script thread: {e}"))
             })?;
 
             // A parked shell never answers; its error is in the lifecycle.
@@ -3042,15 +3043,17 @@ impl IocApplication {
             let b1 = bridge.clone();
             let acf1 = acf.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
-            // Mandatory for the same reason as "iocsh-startup": the queue holds
+            // Mandatory for the same reason as the startup-script thread: the queue holds
             // commands the startup script deferred to post-init, so skipping it
             // hands the operator an IOC that is missing part of its own boot.
             // Still inside `run`, so the failure propagates rather than aborts.
             crate::runtime::task::MandatoryThread::new(
-                "iocsh-after-ioc-running",
-                // Same reasoning as "iocsh-startup" above.
+                // C runs the queue from `iocInit`'s `initHookAfterIocRunning`,
+                // on `_main_` (`afterIocRunning.c:40-56`).
+                crate::runtime::task::MAIN_THREAD_NAME,
+                // Same reasoning as the startup-script thread above.
                 crate::runtime::task::ThreadPriority::Iocsh,
-                // Same reasoning as "iocsh-startup" above.
+                // Same reasoning as the startup-script thread above.
                 crate::runtime::task::StackSizeClass::Big,
             )
             .try_spawn(move || {
@@ -3081,9 +3084,7 @@ impl IocApplication {
                 let _ = tx.send(errs);
             })
             .map_err(|e| {
-                CaError::InvalidValue(format!(
-                    "could not start the iocsh-after-ioc-running thread: {e}"
-                ))
+                CaError::InvalidValue(format!("could not start the afterIocRunning thread: {e}"))
             })?;
             if let Ok(errs) = rx.await {
                 for e in errs {
@@ -3887,26 +3888,17 @@ mod tests {
             0,
             "banding without naming leaves an RTEMS-anonymous thread"
         );
-        for (name, sites) in [
-            ("iocsh-startup", 1),
-            ("iocsh-after-ioc-running", 1),
-            ("iocsh", 2),
-        ] {
-            let quoted = format!("\"{name}\",");
-            let at: Vec<usize> = prod.match_indices(&quoted).map(|(at, _)| at).collect();
-            assert_eq!(
-                at.len(),
-                sites,
-                "the {name} threads moved; update this guard"
+        // All four run what C runs on `_main_`, so all four take its name.
+        let named = "MAIN_THREAD_NAME,";
+        let at: Vec<usize> = prod.match_indices(named).map(|(at, _)| at).collect();
+        assert_eq!(at.len(), 4, "the `_main_` threads moved; update this guard");
+        for at in at {
+            let head = &prod[at..(at + 700).min(prod.len())];
+            assert!(
+                head.contains("ThreadPriority::Iocsh"),
+                "a `_main_` thread must be declared at `ThreadPriority::Iocsh` \
+                 (posix/rtems_init.c:1002)"
             );
-            for at in at {
-                let head = &prod[at..(at + 700).min(prod.len())];
-                assert!(
-                    head.contains("ThreadPriority::Iocsh"),
-                    "{name} must be declared at `ThreadPriority::Iocsh` \
-                     (posix/rtems_init.c:1002)"
-                );
-            }
         }
     }
 

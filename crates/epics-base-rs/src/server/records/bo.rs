@@ -395,25 +395,33 @@ impl Record for BoRecord {
         }
         self.skip_convert = false;
 
-        // HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
-        // on every process that leaves VAL at 1, and the timer — never a
-        // process cycle — is what drives the momentary output back to Done.
-        // Arming is therefore idempotent and carries no record state: a caput,
-        // a FLNK or a periodic scan landing inside the window re-arms and moves
-        // the deadline out, exactly as C does, instead of consuming the pulse.
-        let mut actions = Vec::new();
+        Ok(ProcessOutcome {
+            result: crate::server::record::RecordProcessResult::Complete,
+            actions: Vec::new(),
+            device_did_compute: false,
+            status: Ok(()),
+        })
+    }
+
+    /// HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
+    /// on every pass past `writeValue` that leaves VAL at 1, and the timer —
+    /// never a process cycle — is what drives the momentary output back to
+    /// Done. Arming is therefore idempotent and carries no record state: a
+    /// caput, a FLNK or a periodic scan landing inside the window re-arms and
+    /// moves the deadline out, exactly as C does, instead of consuming the
+    /// pulse.
+    fn after_write_actions(&self) -> crate::server::record::ProcessActions {
+        let mut actions = crate::server::record::ProcessActions::new();
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
                 crate::runtime::time::duration_from_secs(self.high),
             ));
         }
+        actions
+    }
 
-        Ok(ProcessOutcome {
-            result: crate::server::record::RecordProcessResult::Complete,
-            actions,
-            device_did_compute: false,
-            status: Ok(()),
-        })
+    fn acts_after_write(&self) -> bool {
+        true
     }
 
     /// C `boRecord.c::myCallbackFunc` (:105-118) — the HIGH timer's own body,

@@ -1109,14 +1109,8 @@ fn drv_init() {
                 .format("%Y/%m/%d %H:%M:%S%.6f")
                 .to_string()
         });
-        // epicsThreadGetNameSelf never returns NULL: a thread it did not
-        // create is "non-EPICS_<tid>" (osdThread.c createImplicit).
         crate::error::set_get_thread_name_function(Some(|| {
-            let thread = std::thread::current();
-            Some(match thread.name() {
-                Some(name) => name.to_string(),
-                None => format!("non-EPICS_{:?}", thread.id()),
-            })
+            Some(epics_base_rs::runtime::task::thread_name_self())
         }));
         init_hook_register(Arc::new(init_hook));
         epics_base_rs::runtime::exit::at_exit("streamExitHook", || {

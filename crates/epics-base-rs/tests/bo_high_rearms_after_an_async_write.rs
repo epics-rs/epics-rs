@@ -1,7 +1,9 @@
-//! A bo's HIGH one-shot on an asynchronous device (stream's): the first pass
-//! returns once the device sets PACT (`boRecord.c:257`), and the completing
-//! pass arms the HIGH callback (`:263-268`), whose `val = 0` reprocess
-//! writes a second time.
+//! A bo's or busy's HIGH one-shot on an asynchronous device (stream's): the
+//! first pass returns once the device sets PACT (`boRecord.c:257`,
+//! `busyRecord.c:258`), and the completing pass decides the HIGH arm
+//! (`:263-268`) from the VAL it then holds. Armed, its `val = 0` reprocess
+//! writes a second time; a VAL 0 put during PACT leaves it unarmed, and only
+//! the RPRO reprocess writes again.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,10 +13,15 @@ use epics_base_rs::server::database::{DeviceDoneSource, PvDatabase};
 use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::bo::BoRecord;
+use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
 
-/// Completes every write from a "port" thread, logging the value it wrote.
-struct Port(Arc<Mutex<Vec<String>>>);
+/// Completes every write `delay` later from a "port" thread, logging the
+/// value it wrote.
+struct Port {
+    writes: Arc<Mutex<Vec<String>>>,
+    delay: Duration,
+}
 
 impl DeviceSupport for Port {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -29,10 +36,10 @@ impl DeviceSupport for Port {
             .get_field("VAL")
             .map(|v| format!("{v:?}"))
             .unwrap_or_default();
-        self.0.lock().unwrap().push(val);
-        let (done, band) = (done.device_done(), done.priority());
+        self.writes.lock().unwrap().push(val);
+        let (done, band, delay) = (done.device_done(), done.priority(), self.delay);
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(delay);
             done.complete(band).unwrap();
         });
         Ok(WriteStart::Pending)
@@ -42,26 +49,36 @@ impl DeviceSupport for Port {
     }
 }
 
-#[epics_macros_rs::epics_test]
-async fn the_high_reset_writes_again() {
+/// `R`, HIGH 0.2, on a [`Port`] completing `delay` after each write.
+async fn on_port(
+    record: Box<dyn Record>,
+    delay: Duration,
+) -> (PvDatabase, Arc<Mutex<Vec<String>>>) {
     let db = PvDatabase::new();
     epics_base_rs::runtime::task::background_init();
-    db.add_record("BO", Box::new(BoRecord::default()))
-        .await
-        .unwrap();
+    db.add_record("R", record).await.unwrap();
     db.ioc_init().await;
     let writes = Arc::new(Mutex::new(Vec::new()));
     {
-        let rec = db.get_record("BO").unwrap();
+        let rec = db.get_record("R").unwrap();
         let mut inst = rec.write();
         inst.record
             .put_field("HIGH", EpicsValue::Double(0.2))
             .unwrap();
         inst.common.udf = 0;
         inst.common.dtyp = "Port".into();
-        inst.device = Some(Box::new(Port(Arc::clone(&writes))));
+        inst.device = Some(Box::new(Port {
+            writes: Arc::clone(&writes),
+            delay,
+        }));
     }
-    db.put_record_field_from_ca_no_notify("BO", "VAL", EpicsValue::Enum(1))
+    (db, writes)
+}
+
+#[epics_macros_rs::epics_test]
+async fn the_high_reset_writes_again() {
+    let (db, writes) = on_port(Box::new(BoRecord::default()), Duration::from_millis(20)).await;
+    db.put_record_field_from_ca_no_notify("R", "VAL", EpicsValue::Enum(1))
         .await
         .unwrap();
     epics_base_rs::runtime::task::sleep(Duration::from_millis(800)).await;
@@ -71,5 +88,32 @@ async fn the_high_reset_writes_again() {
         "{:?}",
         writes.lock().unwrap()
     );
-    assert_eq!(db.get_pv("BO.VAL").ok().and_then(|v| v.to_f64()), Some(0.0));
+    assert_eq!(db.get_pv("R.VAL").ok().and_then(|v| v.to_f64()), Some(0.0));
+}
+
+/// VAL 1 is written, VAL 0 lands while the write is in flight, and the
+/// completing pass sees 0: no HIGH arm, so the writes are the 1 and the RPRO
+/// reprocess's 0 — C's two, not a third from a timer the first pass's VAL armed.
+async fn a_val_put_during_pact_disarms_high(record: Box<dyn Record>) {
+    let (db, writes) = on_port(record, Duration::from_millis(100)).await;
+    db.put_record_field_from_ca_no_notify("R", "VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(30)).await;
+    db.put_record_field_from_ca_no_notify("R", "VAL", EpicsValue::Enum(0))
+        .await
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(*writes.lock().unwrap(), ["Enum(1)", "Enum(0)"]);
+    assert_eq!(db.get_pv("R.VAL").ok().and_then(|v| v.to_f64()), Some(0.0));
+}
+
+#[epics_macros_rs::epics_test]
+async fn bo_decides_high_on_the_completing_pass() {
+    a_val_put_during_pact_disarms_high(Box::new(BoRecord::default())).await;
+}
+
+#[epics_macros_rs::epics_test]
+async fn busy_decides_high_on_the_completing_pass() {
+    a_val_put_during_pact_disarms_high(Box::new(BusyRecord::new())).await;
 }

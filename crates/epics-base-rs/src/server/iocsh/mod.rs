@@ -340,7 +340,7 @@ impl Drop for MacroScopeGuard {
 /// running, and nothing has to arrange that.
 ///
 /// Here the two are on different threads. `IocApplication::run` runs the script
-/// on its own `iocsh-startup` thread, and since the script's own `iocInit` line
+/// on its own thread, and since the script's own `iocInit` line
 /// now starts the protocol runner (C `iocRun` -> `dbRunServers`), the runner's
 /// interactive shell exists while the script still has lines to run. This pair
 /// states the ordering C gets from statement order: while a startup script is

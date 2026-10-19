@@ -7473,7 +7473,6 @@ impl PvDatabase {
                                                 instance.record.after_output_decision();
                                             }
                                             instance.enter_pact();
-                                            instance.defer_async_tail_actions(process_actions);
                                             cycle_end.hand_off_to_async_completion();
                                             return Ok(());
                                         }
@@ -7547,7 +7546,6 @@ impl PvDatabase {
                                         // `complete_async_write` ends the cycle there.
                                         instance.enter_pact();
                                         instance.device = Some(dev);
-                                        instance.defer_async_tail_actions(process_actions);
                                         // Not an end: `complete_async_record_inner`
                                         // owns this cycle's tail now, and mints its own
                                         // token from the record when the write lands.
@@ -7721,6 +7719,15 @@ impl PvDatabase {
             let instance = guard.hold();
             if let Some((stat, sevr)) = push_alarm {
                 crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
+            }
+            // A pass past the write: C's code after `if (!pact && prec->pact)
+            // return`, from the record as it now is. A hand-off above ended
+            // the pass there, and its completing pass asks the same.
+            let mut process_actions = process_actions;
+            if plan.acts_after_write {
+                for action in instance.record.after_write_actions() {
+                    process_actions.push(action);
+                }
             }
 
             // C `monitor()` with its opening `recGblResetAlarms` — AFTER every
@@ -8823,7 +8830,7 @@ impl PvDatabase {
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
         let tsel = self.cycle_tsel(rec, visited);
 
-        let (flnk_name, pact_exit) = {
+        let (flnk_name, pact_exit, after_write) = {
             // Phase 1 — first write guard, confined to this scope so the
             // (!Send) parking_lot guard is released before the async OUT
             // writes below. Yields the output work plus the put-notify
@@ -9021,6 +9028,15 @@ impl PvDatabase {
             // Phase 3 — fresh write guard for the alarm commit + monitor tail.
             let mut instance = rec.write();
 
+            // This pass runs C's code past `writeValue` (`boRecord.c:257`), so
+            // the record answers from the VAL it holds now — a put during the
+            // PACT window included.
+            let after_write = if plan.acts_after_write {
+                instance.record.after_write_actions()
+            } else {
+                crate::server::record::ProcessActions::new()
+            };
+
             // C `monitor()` with its opening `recGblResetAlarms` — after every
             // output.
             let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
@@ -9052,7 +9068,7 @@ impl PvDatabase {
             // membership) must propagate through the (now-completing) FLNK
             // chain so an async target reached here also defers
             // WRITE_NOTIFY completion.
-            (flnk_name, pact_exit)
+            (flnk_name, pact_exit, after_write)
         };
 
         // The record's own OUT link and its generic multi-output pairs were
@@ -9078,10 +9094,9 @@ impl PvDatabase {
         // external one).
         self.scan_forward_target(rec, &flnk_name, visited);
 
-        // The handed-off cycle's actions, after the FLNK as on the sync tail.
-        let tail = rec.write().take_async_tail_actions();
-        if !tail.is_empty() {
-            self.execute_process_actions_in(name, rec, tail, visited);
+        // After the FLNK, as on the synchronous tail.
+        if !after_write.is_empty() {
+            self.execute_process_actions_in(name, rec, after_write, visited);
         }
 
         // RPRO: C `recGblFwdLink` consumes a pending reprocess via

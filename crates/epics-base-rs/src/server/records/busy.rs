@@ -325,21 +325,30 @@ impl Record for BusyRecord {
         // enforced by the framework which gates the OUT write on
         // common.sevr == Invalid.
 
-        // Step 6: HIGH one-shot — C `busyRecord.c:258-262` arms
-        // `callbackRequestDelayed` on every process that leaves VAL at 1, and
-        // the timer, never a process cycle, is what drives the flag back to
-        // Done. Arming carries no record state, so a scan step's own FLNK or a
-        // caput inside the window re-arms rather than releasing the busy flag
-        // early — which is the whole point of BUSY=1 gating a synApps step.
-        let mut actions = Vec::new();
+        // Step 6: the HIGH one-shot is `after_write_actions`'.
+
+        // Step 7: FLNK handled by should_fire_forward_link()
+        Ok(ProcessOutcome::complete())
+    }
+
+    /// HIGH one-shot — C `busyRecord.c:258-262` arms `callbackRequestDelayed`
+    /// on every pass past `writeValue` that leaves VAL at 1, and the timer,
+    /// never a process cycle, is what drives the flag back to Done. Arming
+    /// carries no record state, so a scan step's own FLNK or a caput inside
+    /// the window re-arms rather than releasing the busy flag early — which is
+    /// the whole point of BUSY=1 gating a synApps step.
+    fn after_write_actions(&self) -> crate::server::record::ProcessActions {
+        let mut actions = crate::server::record::ProcessActions::new();
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
                 crate::runtime::time::duration_from_secs(self.high),
             ));
         }
+        actions
+    }
 
-        // Step 7: FLNK handled by should_fire_forward_link()
-        Ok(ProcessOutcome::complete_with(actions))
+    fn acts_after_write(&self) -> bool {
+        true
     }
 
     /// C `busyRecord.c::myCallbackFunc` (:107-124), boRecord's verbatim — the

@@ -4733,6 +4733,24 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         false
     }
 
+    /// The actions C's `process()` takes past its `if (!pact && prec->pact)
+    /// return` — bo's and busy's HIGH arm (`boRecord.c:257-262`,
+    /// `busyRecord.c:258-263`). That code runs on the synchronous pass or on
+    /// the completing pass of an async write, from the record as it is then,
+    /// so the cycle asks here on exactly those passes; a `process()` that
+    /// returned these would act on a first pass C ends at the early return.
+    fn after_write_actions(&self) -> ProcessActions {
+        ProcessActions::new()
+    }
+
+    /// Whether [`Self::after_write_actions`] can return anything for this
+    /// type, settled once in the plan (`ProcessPlan::acts_after_write`).
+    /// Override it beside the hook; `a_type_that_acts_after_write_says_so`
+    /// holds the two together.
+    fn acts_after_write(&self) -> bool {
+        false
+    }
+
     /// Whether this record uses MDEL/ADEL deadband for monitor posting.
     /// Binary records (bi, bo, busy, mbbi, mbbo) return false because
     /// C EPICS always posts monitors for these record types regardless
@@ -9024,6 +9042,26 @@ pub(crate) mod tests {
                 "{record_type}: after_output_decision changed {diff:?}, but \
                  redecides_after_output said {}",
                 untouched.redecides_after_output()
+            );
+        }
+    }
+
+    /// The cycle asks [`Record::after_write_actions`] only where
+    /// [`Record::acts_after_write`] says so, so a type whose hook acts at
+    /// VAL 1 / HIGH 1 (bo's and busy's arm) must say so, and one that says so
+    /// must act there.
+    #[test]
+    fn a_type_that_acts_after_write_says_so() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+
+        for record_type in RECORD_TYPES {
+            let mut record = any_record(record_type);
+            let _ = record.put_field("VAL", EpicsValue::Enum(1));
+            let _ = record.put_field("HIGH", EpicsValue::Double(1.0));
+            assert_eq!(
+                !record.after_write_actions().is_empty(),
+                record.acts_after_write(),
+                "{record_type}"
             );
         }
     }

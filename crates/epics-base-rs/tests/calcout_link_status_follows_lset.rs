@@ -1,9 +1,10 @@
 //! Base calcout classifies a link by its `lset` (`calcoutRecord.c:166-189`):
 //! `dbLinkIsConstant` is `!plset || plset->isConstant` (`dbLink.c:220-225`),
-//! so a hardware link, which `dbInitLink` gives no `lset`, is `Constant`,
-//! and a link refused by `dbCanSetLink` stays a `CONSTANT` one
-//! (`dbStaticLib.c:2195`, `:2222`). A `{state:…}` link's lset is neither
-//! constant nor volatile (`lnkState.c:213-214`), so it is `Local PV`.
+//! so a hardware link, which `dbInitLink` gives no `lset`, is `Constant`.
+//! So is an OUT naming a PV on a hardware DTYP: `dbCanSetLink` refuses it and
+//! the link stays the empty one of the device's type (`dbStaticLib.c:2192`,
+//! `:2222`). A `{state:…}` link's lset is neither constant nor volatile
+//! (`lnkState.c:213-214`), so it is `Local PV`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -40,6 +41,9 @@ impl DeviceSupport for Hw {
 const DB: &str = r#"
 record(calcout, "K:HW") { field(DTYP, "Hw") field(OUT, "@teled_h.proto setDigital(6,A) TelH1_tty") field(CALC, "1") }
 record(calcout, "K:ST") { field(INPA, {state:"kst"}) field(CALC, "A") }
+record(calcout, "K:PV") { field(DTYP, "Hw") field(OUT, "K:TGT") field(CALC, "1") }
+record(calcout, "K:EXT") { field(DTYP, "Hw") field(OUT, "NOWHERE:PV") field(CALC, "1") }
+record(ao, "K:TGT") {}
 "#;
 
 async fn settled(db: &PvDatabase, pv: &str, want: i16) {
@@ -65,4 +69,6 @@ async fn a_calcout_reads_a_hardware_out_constant_and_a_state_link_local() {
     assert!(ioc.run().await);
     settled(&db, "K:HW.OUTV", CON).await;
     settled(&db, "K:ST.INAV", LOC).await;
+    settled(&db, "K:PV.OUTV", CON).await;
+    settled(&db, "K:EXT.OUTV", CON).await;
 }

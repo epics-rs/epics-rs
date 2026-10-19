@@ -33,7 +33,7 @@
 //! of indexing the polled buffer; `poll_cycle` is a no-op and the periodic
 //! poller is not spawned.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,7 +43,7 @@ use tokio::sync::Notify;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::{EomReason, OctetReadResult};
-use asyn_rs::interrupt::{InterruptClient, InterruptFilter, InterruptValue};
+use asyn_rs::interrupt::{ClientId, InterruptClient, InterruptFilter, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUser, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -672,6 +672,9 @@ pub struct ModbusPortDriver {
     /// until the gate opens (drvModbusAsyn.cpp:1663-1667). The next cycle
     /// delivers it with no I/O; the poller task waits for the gate first.
     fanout_pending: Arc<AtomicBool>,
+    /// The clients whose data type has already been reported as not fitting
+    /// its offset: the line prints at a record's first failing poll only.
+    fit_reported: BTreeSet<ClientId>,
 }
 
 impl ModbusPortDriver {
@@ -757,6 +760,7 @@ impl ModbusPortDriver {
             prev_io_status: AsynStatus::Success,
             poll_backoff: Arc::new(AtomicBool::new(false)),
             fanout_pending: Arc::new(AtomicBool::new(false)),
+            fit_reported: BTreeSet::new(),
         };
         driver.read_once();
         Ok(driver)
@@ -1045,17 +1049,17 @@ impl ModbusPortDriver {
             // 0 because the wire transaction had succeeded. C never aborts
             // either: `readPlcInt64` reads `data_[offset+1]` (and +2, +3)
             // with no bound (drvModbusAsyn.cpp:2487-2556, `readPlcFloat`
-            // :2808-2862), past the end of the `modbusLength_` buffer for an
-            // offset this narrow — a C defect, not copied — and fires the
-            // rest of the list. The decode runs on a failed read's transition
-            // cycle too, in C as here (:1644-1745 gate nothing on
-            // `ioStatus_`), so the refusal is printed with no device present.
+            // :2808-2862), past the end of `data_`, which is allocated at
+            // `modbusLength_` (:286), for an offset this narrow — a C defect,
+            // not copied — and fires the rest of the list. The decode runs on
+            // a failed read's transition cycle too, in C as here (:1644-1745
+            // gate nothing on `ioStatus_`).
             //
-            // Narrowing the blast radius is not licence to say nothing: the
-            // record then never processes, so the misconfiguration has no
-            // other signal — the port stays `asynSuccess` because the wire
-            // transaction succeeded, IO_ERRORS stays 0, and the operator sees
-            // only a PV that never changes.
+            // C prints nothing here. The refusal is printed once per record,
+            // at its first failing poll (a user decision), because the port
+            // stays `asynSuccess` and IO_ERRORS stays 0, so the line is the
+            // only sign of the misconfiguration; the record's alarm still
+            // fires on every poll.
             self.fire_client(&client, force, port_gate, io_status);
             let f = &client.filter;
             let key = (f.reason, f.user_addr, f.iface);
@@ -1172,7 +1176,7 @@ impl ModbusPortDriver {
     /// at its own offset with its own data type, as C `readPoller` does for
     /// each node (drvModbusAsyn.cpp:1669-1924).
     fn fire_client(
-        &self,
+        &mut self,
         client: &InterruptClient,
         force: bool,
         port_gate: bool,
@@ -1181,13 +1185,15 @@ impl ModbusPortDriver {
         match self.decode(&client.filter, force, port_gate) {
             Ok(Some(value)) => self.fire(client, value, io_status),
             Ok(None) => {}
-            Err(refusal) => {
-                self.trace_binding_error(&refusal.what());
-                // C's invalid-reason and invalid-offset arms fire nothing.
-                if matches!(refusal, Refusal::Fit { .. }) {
-                    self.fire_client_failure(client, io_status);
+            Err(refusal @ Refusal::Fit { .. }) => {
+                if self.fit_reported.insert(client.id) {
+                    self.trace_binding_error(&refusal.what());
                 }
+                self.fire_client_failure(client, io_status);
             }
+            // C's invalid-reason and invalid-offset arms trace every poll and
+            // fire nothing.
+            Err(refusal) => self.trace_binding_error(&refusal.what()),
         }
     }
 
@@ -1878,7 +1884,11 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        // Writing the MODBUS_READ parameter triggers a poll cycle.
+        // Writing MODBUS_READ runs the poll cycle before the write completes.
+        // C only signals the poller (drvModbusAsyn.cpp:790-793), so a read
+        // right after the write still sees registers cached mid-move; in the
+        // AMCI ang1 pair that made C retry a 1-step move. That is a C defect,
+        // not copied: do not turn this back into a signal.
         if user.reason == self.read_reason {
             // Nothing collects this status: the poller task holds a
             // `PortHandle` and has no caller of its own, exactly as C's
@@ -6673,6 +6683,69 @@ mod tests {
         assert_eq!(
             refused_ring_fires("MB_RING_NARROW_FAILED", Err(down)),
             [(3, AsynStatus::Disconnected)]
+        );
+    }
+
+    /// The fit refusal prints at a record's first failing poll only, while
+    /// its alarm fires on every poll; a second record gets its own line.
+    #[test]
+    fn a_fit_refusal_prints_once_per_record_and_alarms_every_poll() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        const POLLS: u16 = 5;
+        let port = "MB_FIT_ONCE";
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut config = test_config(0, 4);
+        config.data_type = ModbusDataType::Int32Le;
+        let replies = (1..=POLLS)
+            .map(|txid| Ok(tcp_response(txid, &pdu)))
+            .collect();
+        let mut driver = test_driver(
+            port,
+            config,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(replies)),
+        )
+        .expect("non-absolute config must build");
+        let log = FireLog::default();
+        let narrow = |addr| asyn_rs::interrupt::InterruptFilter {
+            reason: Some(driver.data_reason),
+            addr: Some(addr),
+            user_addr: Some(3),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        };
+        let _first = log.client(&driver.base.interrupts, narrow(0));
+        let _second = log.client(&driver.base.interrupts, narrow(1));
+
+        let path = std::env::temp_dir().join(format!("modbus_{port}_{}.trace", std::process::id()));
+        PortServices::global().trace().set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).expect("the trace sink must open"),
+            ))),
+        );
+        for _ in 0..POLLS {
+            driver
+                .poll_cycle()
+                .expect("a refused client must not fail the cycle");
+        }
+
+        let logged = std::fs::read_to_string(&path).expect("the trace sink must be readable");
+        let _ = std::fs::remove_file(&path);
+        let lines = logged
+            .lines()
+            .filter(|l| l.contains("offset 3 data type does not fit"))
+            .count();
+        assert_eq!(
+            lines, 2,
+            "one line per record over {POLLS} polls: {logged:?}"
+        );
+        assert_eq!(
+            log.0.lock().unwrap().len(),
+            2 * POLLS as usize,
+            "each record's alarm fires on every poll"
         );
     }
 

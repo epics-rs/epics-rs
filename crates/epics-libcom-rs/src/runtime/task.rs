@@ -1903,6 +1903,25 @@ fn band_and_register(priority: ThreadPriority) -> PriorityApplied {
     applied
 }
 
+/// C's name for the thread that runs `main` (`osdThread.c:406-412`): the
+/// startup script, the `afterIocRunning` queue and the `iocsh(NULL)` prompt.
+pub const MAIN_THREAD_NAME: &str = "_main_";
+
+/// C `epicsThreadGetNameSelf` (`osdThread.c:972-981`): the calling thread's
+/// row name, so a thread [`register_main_thread`] listed answers `_main_`
+/// however it was spawned. A thread with no row keeps its `std` name (a
+/// runtime worker); one with neither gets C's `createImplicit` row.
+pub fn thread_name_self() -> String {
+    if let Some(name) = thread_registry::current_name() {
+        return name;
+    }
+    if let Some(name) = std::thread::current().name() {
+        return name.to_string();
+    }
+    thread_registry::register_current_implicit();
+    thread_registry::current_name().expect("register_current_implicit installed a row")
+}
+
 /// Put the calling thread on the thread list as C's `_main_`.
 ///
 /// C's `epicsThreadInit` runs `once()` under a `pthread_once`
@@ -2274,7 +2293,7 @@ mod thread_registry {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             push(
-                "_main_".to_string(),
+                super::MAIN_THREAD_NAME.to_string(),
                 ThreadPriority::Custom(0),
                 PriorityApplied::Disabled,
             );
@@ -2308,6 +2327,15 @@ mod thread_registry {
     /// still being there.
     pub(super) fn current_id() -> Option<u64> {
         REGISTRATION.with(|r| r.borrow().as_ref().map(|reg| reg.0))
+    }
+
+    /// The calling thread's row name, if it has a row.
+    pub(super) fn current_name() -> Option<String> {
+        let id = current_id()?;
+        lock()
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.name.clone())
     }
 
     /// C `createImplicit` (`osdThread.c:697-735`): the row a thread that never
@@ -5436,16 +5464,20 @@ mod tests {
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
             register_main_thread();
-            registered_tx.send(()).unwrap();
+            registered_tx.send(thread_name_self()).unwrap();
             finish_rx.recv().unwrap();
             // C's guard is per process, not per thread: the second call adds
             // nothing.
             register_main_thread();
-            registered_tx.send(()).unwrap();
+            registered_tx.send(thread_name_self()).unwrap();
             finish_rx.recv().unwrap();
         });
 
-        registered_rx.recv().unwrap();
+        assert_eq!(
+            registered_rx.recv().unwrap(),
+            "_main_",
+            "an unnamed shell thread's every name query answers its row"
+        );
         let row = thread_by_name("_main_").expect("listed while the shell runs");
         assert_eq!(row.epics_priority(), 0, "C's `_main_` is EPICS priority 0");
         assert_eq!(
@@ -5467,6 +5499,29 @@ mod tests {
             "the row is reaped where C's thread-specific-data destructor \
              removes it — when the thread holding it ends"
         );
+    }
+
+    /// `epicsThreadGetNameSelf`'s three cases: a listed thread answers its
+    /// row, an unlisted named one its `std` name, and one with neither gets
+    /// C's `createImplicit` row and answers that.
+    #[test]
+    fn the_name_self_is_the_row_name() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        MandatoryThread::new("nameSelfRow", ThreadPriority::Low, StackSizeClass::Small)
+            .spawn(move || tx.send(thread_name_self()).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(rx.recv().unwrap(), "nameSelfRow");
+
+        let unlisted = std::thread::Builder::new()
+            .name("nameSelfStd".into())
+            .spawn(|| (thread_name_self(), thread_registry::current_id()))
+            .unwrap();
+        assert_eq!(unlisted.join().unwrap(), ("nameSelfStd".to_string(), None));
+
+        let bare = std::thread::spawn(|| (thread_name_self(), thread_registry::os_thread_id()));
+        let (name, os_id) = bare.join().unwrap();
+        assert_eq!(name, format!("non-EPICS_{os_id}"));
     }
 
     /// Re-banding a thread is one thread, so it is one row. The boundary the

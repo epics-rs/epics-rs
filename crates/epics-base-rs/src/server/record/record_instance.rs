@@ -1135,6 +1135,7 @@ impl ProcessPlan {
         substitutes_input_stage_when_simulating: false,
         redecides_after_output: false,
         acts_before_process: false,
+        acts_after_write: false,
         hooks: crate::server::record::CycleHooks::NONE,
         input_fetch_policy: crate::server::record::InputFetchPolicy::ReadAll,
         constants_deliver_at_process: false,
@@ -1177,6 +1178,7 @@ impl ProcessPlan {
             substitutes_input_stage_when_simulating,
             redecides_after_output,
             acts_before_process,
+            acts_after_write,
             hooks,
             input_fetch_policy,
             constants_deliver_at_process,
@@ -1213,6 +1215,7 @@ impl ProcessPlan {
             && substitutes_input_stage_when_simulating == p.substitutes_input_stage_when_simulating
             && redecides_after_output == p.redecides_after_output
             && acts_before_process == p.acts_before_process
+            && acts_after_write == p.acts_after_write
             && hooks == p.hooks
             && input_fetch_policy == p.input_fetch_policy
             && constants_deliver_at_process == p.constants_deliver_at_process
@@ -1273,6 +1276,7 @@ impl ProcessPlan {
             substitutes_input_stage_when_simulating: record.simulation_substitutes_input_stage(),
             redecides_after_output: record.redecides_after_output(),
             acts_before_process: record.acts_before_process(),
+            acts_after_write: record.acts_after_write(),
             hooks: record.cycle_hooks(),
             input_fetch_policy: record.input_fetch_policy(),
             constants_deliver_at_process: record.constant_inputs_deliver_at_process(),
@@ -2282,6 +2286,9 @@ pub(crate) struct ProcessPlan {
     /// [`Record::acts_before_process`]. `false` drops the vtable call to an
     /// empty `pre_process_actions` from every cycle.
     pub(crate) acts_before_process: bool,
+    /// [`Record::acts_after_write`]. `false` drops the vtable call to an
+    /// empty `after_write_actions` from every write pass.
+    pub(crate) acts_after_write: bool,
     /// [`Record::cycle_hooks`].
     pub(crate) hooks: crate::server::record::CycleHooks,
     /// What a failed multi-input read means to this type — see
@@ -5183,10 +5190,6 @@ pub struct RecordInstance {
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
 /// the lines a cycle does read sit closer together.
 struct RecordCold {
-    /// The process actions of a cycle that handed off to an async output
-    /// completion: C runs the code past `writeValue` (bo's HIGH arm,
-    /// `boRecord.c:263-268`) on the completing pass, so that pass runs them.
-    async_tail_actions: super::ProcessActions,
     /// The cell holding this instance — none for one not yet in a cell — for
     /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
     cell: std::sync::Weak<RecordCell>,
@@ -6659,16 +6662,6 @@ fn walk_skip_term(field: &str, deadband_field: &str, event_posted: &[&str]) -> b
 }
 
 impl RecordInstance {
-    /// Keep a handed-off cycle's process actions for its completing pass.
-    pub(crate) fn defer_async_tail_actions(&mut self, actions: super::ProcessActions) {
-        self.cold.async_tail_actions = actions;
-    }
-
-    /// The handed-off cycle's process actions, for the completing pass to run.
-    pub(crate) fn take_async_tail_actions(&mut self) -> super::ProcessActions {
-        std::mem::take(&mut self.cold.async_tail_actions)
-    }
-
     /// Name what the next cycle reads past the cell into `hints`: the OUT
     /// link's parse and `DbLink`, and the first two monitors' queue slots.
     #[inline(always)]
@@ -7641,7 +7634,6 @@ impl RecordInstance {
             #[cfg(test)]
             ran_arm: CyclePlan::General,
             cold: Box::new(RecordCold {
-                async_tail_actions: super::ProcessActions::default(),
                 cell: std::sync::Weak::new(),
                 init_subroutines: None,
                 db: Default::default(),

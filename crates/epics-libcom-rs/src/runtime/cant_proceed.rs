@@ -62,7 +62,7 @@ pub fn cant_proceed(msg: &str) -> ! {
     errlog_vprintf(format_args!("{msg}\n"));
     errlog_vprintf(format_args!(
         "CRITICAL ERROR Thread {} can't proceed, {}.\n",
-        std::thread::current().name().unwrap_or("noname"),
+        task::thread_name_self(),
         match action {
             FatalAction::Abort => "aborting",
             FatalAction::SuspendSelf => "suspending",

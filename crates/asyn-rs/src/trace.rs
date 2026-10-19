@@ -1329,8 +1329,8 @@ fn write_prefix(
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::THREAD) {
-        let current = std::thread::current();
-        let name = current.name().unwrap_or("");
+        // C `epicsThreadGetNameSelf()`.
+        let name = epics_libcom_rs::runtime::task::thread_name_self();
         write!(
             out,
             "[{name},{:#x},{}] ",

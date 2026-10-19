@@ -60,12 +60,11 @@ fn a_high_the_network_can_set_never_unwinds_process() {
             rec.put_field("VAL", EpicsValue::Long(1))
                 .expect("VAL 1 arms the HIGH one-shot");
 
-            let outcome = rec
-                .process()
+            rec.process()
                 .unwrap_or_else(|e| panic!("{kind} HIGH={high} must process, got {e}"));
 
-            let delay = outcome
-                .actions
+            let delay = rec
+                .after_write_actions()
                 .iter()
                 .find_map(|a| match a {
                     ProcessAction::DelayedCallbackAfter(d) => Some(*d),
@@ -87,12 +86,10 @@ fn a_high_the_network_can_set_never_unwinds_process() {
             let mut rec = make();
             rec.put_field("HIGH", EpicsValue::Double(high)).unwrap();
             rec.put_field("VAL", EpicsValue::Long(1)).unwrap();
-            let outcome = rec
-                .process()
+            rec.process()
                 .unwrap_or_else(|e| panic!("{kind} HIGH={high} must process, got {e}"));
             assert!(
-                !outcome
-                    .actions
+                !rec.after_write_actions()
                     .iter()
                     .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(_))),
                 "{kind} HIGH={high} fails C's `high > 0` test and arms nothing"

@@ -1444,7 +1444,7 @@ impl Record for WaveformRecord {
     }
 
     /// A `.db` NELM or FTVL is stored, not sized: `init_record` allocates VAL
-    /// from both ([`Self::size_val`]), so the `.db` order cannot matter.
+    /// from both (`size_val`), so the `.db` order cannot matter.
     /// areaDetector loads NELM=0 (NDStats YSIZE=0), which init turns into 1.
     fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {

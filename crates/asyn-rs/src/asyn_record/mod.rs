@@ -5424,7 +5424,7 @@ impl Record for AsynRecord {
     }
 
     /// `post_fields_with_mask` writes a posted ERRS back through this path;
-    /// it goes straight to [`Self::store_errs`], since the default's coercion
+    /// it goes straight to `store_errs`, since the default's coercion
     /// would allocate the `ERR_SIZE` buffer `get_field` serves.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if name == "ERRS" {

@@ -85,7 +85,7 @@ pub struct MbbiRecord {
     skip_convert: bool,
     /// `special()` re-labelled the state VAL sits on; the put drains it.
     label_post: bool,
-    /// C's DBF_SHORT `sdef`: a `.db` value until [`Self::init_common`]
+    /// C's DBF_SHORT `sdef`: a `.db` value until `init_common`
     /// writes it, and C tests it as nonzero.
     pub sdef: i16,
 }

@@ -92,7 +92,6 @@ pub struct IpPortConfig {
     pub port: u16,
     pub local_port: Option<u16>,
     pub protocol: IpProtocol,
-    pub no_delay: bool,
 }
 
 impl IpPortConfig {
@@ -137,7 +136,6 @@ impl IpPortConfig {
                     port: 0,
                     local_port: None,
                     protocol: IpProtocol::Unix,
-                    no_delay: false,
                 });
             }
         }
@@ -154,7 +152,6 @@ impl IpPortConfig {
             port,
             local_port,
             protocol: proto,
-            no_delay: true,
         })
     }
 }
@@ -1042,7 +1039,14 @@ impl OctetNext for IpIoState {
 /// TCP/UDP port driver.
 pub struct DrvAsynIPPort {
     base: PortDriverBase,
-    config: IpPortConfig,
+    /// The parsed hostInfo; `None` is C's `FLAG_SHUTDOWN` after a failed
+    /// `parseHostInfo` (drvAsynIPPort.c:286, :399-400), which `connectIt`
+    /// refuses.
+    config: Option<IpPortConfig>,
+    /// `TCP_NODELAY` for the next TCP connect: C sets it unconditionally
+    /// (connectIt :580-589); the rs-only `noDelay` option can turn it off, and
+    /// a hostInfo reparse leaves it alone.
+    no_delay: bool,
     io: IpIoState,
     /// Auto-disconnect when read times out (default: false).
     disconnect_on_read_timeout: bool,
@@ -1470,9 +1474,9 @@ pub(crate) fn socket_poll_timeout(timeout: Option<Duration>) -> Option<Duration>
 
 impl DrvAsynIPPort {
     /// Tear down the live socket. C parity: `drvAsynIPPort.c::closeConnection`
-    /// (205-217) destroys the fd and fires `exceptionDisconnect` — but
-    /// **only** when the link is *not* connect-per-transaction
-    /// (`!(flags & FLAG_CONNECT_PER_TRANSACTION)`, line 214-216).
+    /// (205-217) destroys the fd and fires `exceptionDisconnect` unless the
+    /// link is connect-per-transaction and not being shut down
+    /// (`FLAG_SHUTDOWN`, line 214-216).
     ///
     /// For a normal link this drops `connected` to `false` so the actor's
     /// auto-reconnect (`port_actor.rs`) re-establishes it on the next
@@ -1481,15 +1485,19 @@ impl DrvAsynIPPort {
     /// socket (`io.inner`) is released, `connected` is left `true`, and the
     /// `Connect` exception does not flap each transaction. The socket is
     /// reopened lazily on the next write/read (gated on `io.inner.is_none()`,
-    /// not `!connected`).
-    ///
-    /// C `closeConnection(pasynUser, tty, why)` (drvAsynIPPort.c:206-216).
-    fn drop_connection(&mut self, user: &AsynUser, why: &str) {
+    /// not `!connected`). `shutdown` is C's `FLAG_SHUTDOWN`, which only
+    /// `parseHostInfo` sets before it closes (line 280-281).
+    fn drop_connection(&mut self, user: &AsynUser, why: &str, shutdown: bool) {
         self.trace_close(user, why);
         self.io.inner = None;
-        if self.config.protocol != IpProtocol::Http {
+        if !self.per_transaction() || shutdown {
             self.set_link_connected(user, false);
         }
+    }
+
+    /// C `FLAG_CONNECT_PER_TRANSACTION`, which a shut-down port has lost.
+    fn per_transaction(&self) -> bool {
+        matches!(&self.config, Some(c) if c.protocol == IpProtocol::Http)
     }
 
     /// The driver's one connection-edge owner. C's COM interpose restores its
@@ -1530,9 +1538,9 @@ impl DrvAsynIPPort {
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
         // HTTP connect-per-transaction: open the socket if there isn't one
-        // (C readIt, drvAsynIPPort.c:779-782). The link stays logically
+        // (C readIt, drvAsynIPPort.c:776-780). The link stays logically
         // connected, so this keys off the socket, not `connected`.
-        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
+        if self.per_transaction() && self.io.inner.is_none() {
             self.connect_it(user)?;
         }
         let result = self.with_base_link(|link| link.read(user, buf));
@@ -1552,7 +1560,7 @@ impl DrvAsynIPPort {
                 // the next write.
                 let eof = r.eom_reason.contains(EomReason::END);
                 if eof && self.base.is_connected() {
-                    self.drop_connection(user, "Read from broken connection");
+                    self.drop_connection(user, "Read from broken connection", false);
                 }
                 Ok((r.nbytes_transferred, r.eom_reason))
             }
@@ -1576,7 +1584,7 @@ impl DrvAsynIPPort {
                     &self.io.host_info,
                 );
                 if failure.disconnect && self.base.is_connected() {
-                    self.drop_connection(user, "Read error");
+                    self.drop_connection(user, "Read error", false);
                 }
                 Err(failure.error)
             }
@@ -1620,7 +1628,8 @@ impl DrvAsynIPPort {
 
         Ok(Self {
             base,
-            config,
+            config: Some(config),
+            no_delay: true,
             io: IpIoState::new(config_str.to_string()),
             disconnect_on_read_timeout: false,
             // C parseHostInfo: tty->IPDeviceName = epicsStrDup(hostInfo).
@@ -1695,7 +1704,7 @@ impl DrvAsynIPPort {
         let out = f(&mut com.options, &mut link);
         if let Some(why) = link.teardown {
             if self.base.is_connected() {
-                self.drop_connection(user, why);
+                self.drop_connection(user, why, false);
             }
         }
         Some(out)
@@ -1785,10 +1794,10 @@ impl DrvAsynIPPort {
     /// Which one is the platform's business, and
     /// [`socket::SocketOptions::reuse_port`] carries C's own
     /// `#ifndef SO_REUSEPORT` degrade rule for it.
-    fn socket_options(&self) -> socket::SocketOptions {
+    fn socket_options(config: &IpPortConfig) -> socket::SocketOptions {
         socket::SocketOptions {
-            broadcast: self.config.protocol.broadcast(),
-            reuse_port: self.config.protocol.reuse_port(),
+            broadcast: config.protocol.broadcast(),
+            reuse_port: config.protocol.reuse_port(),
             reuse_address: false,
             datagram_fanout: false,
         }
@@ -1797,16 +1806,16 @@ impl DrvAsynIPPort {
     /// Resolve the remote at connect time, as C does in case the device has
     /// just appeared in DNS; a failed or empty lookup is C's one message for
     /// `hostToIPAddr` failing (drvAsynIPPort.c:484-494).
-    fn resolve_remote(&self) -> AsynResult<Vec<std::net::SocketAddr>> {
+    fn resolve_remote(config: &IpPortConfig) -> AsynResult<Vec<std::net::SocketAddr>> {
         use std::net::ToSocketAddrs;
-        let addrs: Vec<_> = (self.config.host.as_str(), self.config.port)
+        let addrs: Vec<_> = (config.host.as_str(), config.port)
             .to_socket_addrs()
             .map(Iterator::collect)
             .unwrap_or_default();
         if addrs.is_empty() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("Unknown host \"{}\"", self.config.host),
+                message: format!("Unknown host \"{}\"", config.host),
             });
         }
         Ok(addrs)
@@ -1819,23 +1828,22 @@ impl DrvAsynIPPort {
         })
     }
 
-    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
-        let addrs = self.resolve_remote()?;
+    fn connect_tcp(&self, config: &IpPortConfig) -> AsynResult<TcpStream> {
+        let addrs = Self::resolve_remote(config)?;
         let mut last_err: Option<AsynError> = None;
         for remote_addr in &addrs {
             // C binds the local address only when one was configured — "a very
             // unusual configuration" (:499-506).
-            let local_addr: Option<std::net::SocketAddr> =
-                self.config.local_port.map(|local_port| {
-                    if remote_addr.is_ipv6() {
-                        (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
-                    } else {
-                        (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
-                    }
-                });
+            let local_addr: Option<std::net::SocketAddr> = config.local_port.map(|local_port| {
+                if remote_addr.is_ipv6() {
+                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+                } else {
+                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
+                }
+            });
             // No SO_REUSEADDR before the local bind (:499-509): during the last
             // connection's TIME_WAIT, C's reconnect fails the bind.
-            let opts = self.socket_options();
+            let opts = Self::socket_options(config);
             // C bounds the connect by `pasynBase->autoConnectTimeout`, read here
             // and now (drvAsynIPPort.c:541-566).
             let timeout = crate::runtime::config::connect_poll_timeout();
@@ -1852,13 +1860,13 @@ impl DrvAsynIPPort {
         Err(last_err.expect("resolve_remote returns at least one address"))
     }
 
-    fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+    fn connect_udp(&self, config: &IpPortConfig) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
         // C drvAsynIPPort.c::connectIt (484-493) resolves the remote name to
         // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
         // Resolve the peer once, then leave the socket unconnected and bind
         // a local endpoint of the peer's address family.
-        let peer = self.resolve_remote()?[0];
-        let local_port = self.config.local_port.unwrap_or(0);
+        let peer = Self::resolve_remote(config)?[0];
+        let local_port = config.local_port.unwrap_or(0);
         let local_addr: std::net::SocketAddr = if peer.is_ipv6() {
             (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
         } else {
@@ -1868,7 +1876,7 @@ impl DrvAsynIPPort {
         // of `udp&` is two ports sharing one local port, and the kernel only
         // honours SO_REUSEPORT on an unbound socket (C :467-481, then :499-506).
         // That ordering is the seam's contract, not this call site's.
-        let socket = socket::udp_socket(local_addr, self.socket_options()).map_err(|e| {
+        let socket = socket::udp_socket(local_addr, Self::socket_options(config)).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
                 message: setup_failure_text(&self.io.host_info, &e),
@@ -1878,10 +1886,10 @@ impl DrvAsynIPPort {
     }
 
     #[cfg(asyn_af_unix)]
-    fn connect_unix(&mut self) -> AsynResult<std::os::unix::net::UnixStream> {
+    fn connect_unix(&self, config: &IpPortConfig) -> AsynResult<std::os::unix::net::UnixStream> {
         // C's one connect text for every family (drvAsynIPPort.c:568-571); an
         // AF_UNIX connect fails at once, so its own errno is the one C saves.
-        let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
+        let stream = std::os::unix::net::UnixStream::connect(&config.host).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!(
@@ -1950,16 +1958,23 @@ impl DrvAsynIPPort {
                 message: format!("{}: Link already open!", self.io.host_info),
             });
         }
+        // C :429-432, after the already-open check.
+        let Some(config) = &self.config else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{}: Link shutdown!", self.io.host_info),
+            });
+        };
         // Built into a local and installed by `publish_transport` below, never
         // stored here: a step after the install that can fail is exactly what
         // wedged the port.
-        let inner = match self.config.protocol {
+        let inner = match config.protocol {
             // C :364-367 — `com` leaves `socketType = SOCK_STREAM` and sets no
             // flags, so its transport is plain TCP; the whole of what `COM` adds
             // rides in the interpose, not the socket.
             IpProtocol::Tcp | IpProtocol::TcpReusePort | IpProtocol::Com => {
-                let stream = self.connect_tcp()?;
-                if self.config.no_delay {
+                let stream = self.connect_tcp(config)?;
+                if self.no_delay {
                     self.enable_nodelay(&stream)?;
                 }
                 // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :467-481). The option
@@ -1973,11 +1988,11 @@ impl DrvAsynIPPort {
             | IpProtocol::UdpBroadcastReusePort => {
                 // BROADCAST / SO_REUSEPORT are the socket's, applied by
                 // `new_socket` before the bind — they are not a post-bind fixup.
-                let (socket, peer) = self.connect_udp()?;
+                let (socket, peer) = self.connect_udp(config)?;
                 IpIoInner::Udp(socket, peer)
             }
             #[cfg(asyn_af_unix)]
-            IpProtocol::Unix => IpIoInner::Unix(self.connect_unix()?),
+            IpProtocol::Unix => IpIoInner::Unix(self.connect_unix(config)?),
             // Unreachable rather than defensive: `IpPortConfig::parse` refuses
             // a `unix://` spec outright on a platform without AF_UNIX, so no
             // config carrying this variant can exist here. The arm is present
@@ -1993,7 +2008,7 @@ impl DrvAsynIPPort {
             // HTTP opens its socket per transaction, from write_octet and
             // read_octet_core.
             IpProtocol::Http => {
-                let stream = self.connect_tcp()?;
+                let stream = self.connect_tcp(config)?;
                 self.enable_nodelay(&stream)?;
                 IpIoInner::Tcp(stream)
             }
@@ -2015,17 +2030,20 @@ impl PortDriver for DrvAsynIPPort {
     /// no socket here, so it is connected whether or not the host answers
     /// and a dead host fails each write instead.
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
-        if self.config.protocol != IpProtocol::Http {
+        if !self.per_transaction() {
             self.connect_it(user)?;
         }
         self.set_link_connected(user, true);
         Ok(())
     }
 
+    /// C `asynCommonDisconnect` (drvAsynIPPort.c:611-620).
     fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
-        self.trace_close(user, "Disconnect request");
-        self.io.inner = None;
-        self.set_link_connected(user, false);
+        let per_transaction = self.per_transaction();
+        self.drop_connection(user, "Disconnect request", false);
+        if per_transaction {
+            self.set_link_connected(user, false);
+        }
         Ok(())
     }
 
@@ -2068,7 +2086,7 @@ impl PortDriver for DrvAsynIPPort {
         // HTTP connect-per-transaction: open the socket if there isn't one
         // (C writeIt, drvAsynIPPort.c:645-653, which replaces connectIt's
         // message).
-        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
+        if self.per_transaction() && self.io.inner.is_none() {
             self.connect_it(user).map_err(|e| AsynError::Status {
                 status: e.status(),
                 message: format!("{} connect failed", self.io.host_info),
@@ -2084,7 +2102,7 @@ impl PortDriver for DrvAsynIPPort {
                 // wedged socket reports `connected` forever and never
                 // self-heals.
                 if e.is_fatal_transport() && self.base.is_connected() {
-                    self.drop_connection(user, "Write error");
+                    self.drop_connection(user, "Write error", false);
                 }
                 Err(e)
             }
@@ -2146,7 +2164,7 @@ impl PortDriver for DrvAsynIPPort {
             // silently coercing to "off" — and it reports in C's words
             // ("Invalid <key> value."), like every other option.
             let enabled = parse_yn_option("noDelay", value)?;
-            self.config.no_delay = enabled;
+            self.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
             }
@@ -2157,56 +2175,24 @@ impl PortDriver for DrvAsynIPPort {
             // than silently coercing the unknown text to "off".
             self.disconnect_on_read_timeout = parse_yn_option("disconnectOnReadTimeout", value)?;
         } else if key.eq_ignore_ascii_case("hostInfo") {
-            // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
-            //
-            //   if (fd != INVALID_SOCKET) {
-            //       flags |= FLAG_SHUTDOWN;
-            //       closeConnection(...);
-            //       epicsThreadSleep(CLOSE_SOCKET_DELAY);   // 0.02s
-            //   }
-            //   ... full reparse: protocol, FLAG_BROADCAST,
-            //       FLAG_SO_REUSEPORT, hostname, port, localPort
-            //   flags &= ~FLAG_SHUTDOWN;
-            //
-            // Earlier this branch updated only host/port/local_port,
-            // so a runtime switch like "udp tcp" or "udp& udp*"
-            // left the previous protocol/flags active and the next
-            // connect() bound the wrong socket type.
-            //
-            // We parse first (no observable state change on
-            // parse error) and only then drop the live socket and
-            // overwrite config.
-            let new_config = IpPortConfig::parse(value)?;
+            // C drvAsynIPPort.c::parseHostInfo (273-401): close a live socket
+            // with FLAG_SHUTDOWN, reset the counters and IPDeviceName, shut the
+            // port down, then parse; only a good parse reopens it.
             if self.io.inner.is_some() {
-                // Drop in-flight socket; matches C closeConnection.
-                self.trace_close(
+                self.drop_connection(
                     user,
                     "drvAsynIPPort::parseHostInfo, closing socket to open new connection",
+                    true,
                 );
-                self.io.inner = None;
-                // The edge owner: a redundant call is a no-op for listeners,
-                // just like C's exceptionDisconnect.
-                self.set_link_connected(user, false);
-                // C's "if this delay is not present then the sockets
-                // are not always really closed cleanly" — same 20ms
-                // settle to ensure the kernel actually tears down
-                // the prior socket before we rebind on a fresh one
-                // (especially relevant for UDP+SO_REUSEPORT swaps).
+                // C's "if this delay is not present then the sockets are not
+                // always really closed cleanly".
                 std::thread::sleep(Duration::from_millis(20));
             }
-            self.config.host = new_config.host;
-            self.config.port = new_config.port;
-            self.config.local_port = new_config.local_port;
-            self.config.protocol = new_config.protocol;
             self.io.n_read = 0;
             self.io.n_written = 0;
-            // no_delay is not re-applied on a hostInfo reparse: C
-            // parseHostInfo leaves it alone (connectIt sets it unconditionally).
-            //
-            // C parseHostInfo replaces tty->IPDeviceName with
-            // epicsStrDup(hostInfo); store the verbatim spec so a later
-            // getOption("hostInfo") echoes the new endpoint, not the old.
             self.io.host_info = value.to_string();
+            self.config = None;
+            self.config = Some(IpPortConfig::parse(value)?);
         } else if !key.is_empty() {
             // C drvAsynIPPort.c::setOption (lines 941-945): any non-empty
             // unsupported key returns asynError "Unsupported key"; the empty
@@ -2244,6 +2230,13 @@ impl PortDriver for DrvAsynIPPort {
         } else {
             Err(AsynError::OptionNotFound(key.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+impl DrvAsynIPPort {
+    fn config(&self) -> &IpPortConfig {
+        self.config.as_ref().expect("the port is shut down")
     }
 }
 
@@ -2502,6 +2495,70 @@ mod tests {
         assert_eq!(e.status(), AsynStatus::Error);
         assert_eq!(e.message(), "127.0.0.1:1 HTTP connect failed");
         assert!(handle.is_connected_blocking(0).unwrap());
+    }
+
+    /// C `readIt` opens a per-transaction socket itself
+    /// (drvAsynIPPort.c:776-780): a read with no socket connects instead of
+    /// failing "disconnected".
+    #[test]
+    fn an_http_read_without_a_socket_opens_one() {
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(b"HELLO").unwrap();
+        });
+        let mut drv = DrvAsynIPPort::new("httpread", &format!("127.0.0.1:{port} HTTP")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.io.inner.is_none());
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 5];
+        let (n, _) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"HELLO");
+        server.join().unwrap();
+    }
+
+    /// C `parseHostInfo` sets `flags = FLAG_SHUTDOWN` before it parses and
+    /// clears it only on success (drvAsynIPPort.c:286, :399-400): a bad
+    /// hostInfo leaves even an HTTP port shut down, and `connectIt` refuses.
+    #[test]
+    fn a_bad_host_info_leaves_the_port_shut_down() {
+        let mut drv = DrvAsynIPPort::new("badreparse", "127.0.0.1:1 HTTP").unwrap();
+        let mut user = AsynUser::default();
+        assert!(drv.set_option(&mut user, "hostInfo", "no-colon").is_err());
+        let e = drv.connect(&user).unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "no-colon: Link shutdown!");
+        assert!(!drv.base().is_connected());
+    }
+
+    /// C `asynCommonDisconnect` disconnects a per-transaction link itself,
+    /// since `closeConnection` does not (drvAsynIPPort.c:616-618).
+    #[test]
+    fn a_disconnect_request_disconnects_an_http_port() {
+        let mut drv = DrvAsynIPPort::new("httpdisc", "127.0.0.1:1 HTTP").unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        drv.disconnect(&AsynUser::default()).unwrap();
+        assert!(!drv.base().is_connected());
+    }
+
+    /// C `parseHostInfo` closes a live socket with FLAG_SHUTDOWN set, so
+    /// `closeConnection` disconnects even a per-transaction link
+    /// (drvAsynIPPort.c:214-216, :280-281).
+    #[test]
+    fn a_host_info_change_disconnects_a_live_http_port() {
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+        let host = format!("127.0.0.1:{port} HTTP");
+        let mut drv = DrvAsynIPPort::new("httpreparse", &host).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"GET /\r\n").unwrap();
+        server.join().unwrap();
+        drv.set_option(&mut user, "hostInfo", &host).unwrap();
+        assert!(drv.io.inner.is_none());
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -3242,10 +3299,10 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
         drv.set_option(&mut AsynUser::default(), "noDelay", "Y")
             .unwrap();
-        assert!(drv.config.no_delay);
+        assert!(drv.no_delay);
         drv.set_option(&mut AsynUser::default(), "noDelay", "n")
             .unwrap();
-        assert!(!drv.config.no_delay);
+        assert!(!drv.no_delay);
         // Value is validated strictly Y/N (case-insensitive); the old loose
         // coercion silently treated any other token (incl. "0"/"1") as off.
         assert!(
@@ -3902,8 +3959,8 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
         drv.set_option(&mut AsynUser::default(), "hostInfo", "192.168.1.1:8080")
             .unwrap();
-        assert_eq!(drv.config.host, "192.168.1.1");
-        assert_eq!(drv.config.port, 8080);
+        assert_eq!(drv.config().host, "192.168.1.1");
+        assert_eq!(drv.config().port, 8080);
     }
 
     #[test]
@@ -3922,7 +3979,7 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:9999")
             .unwrap();
         assert!(!drv.base().is_connected());
-        assert_eq!(drv.config.port, 9999);
+        assert_eq!(drv.config().port, 9999);
     }
 
     /// C `connectIt` bounds a TCP connect by `pasynBase->autoConnectTimeout`
@@ -4108,8 +4165,8 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
-        let stream = drv.connect_tcp().unwrap();
+        let drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
+        let stream = drv.connect_tcp(drv.config()).unwrap();
         assert_eq!(stream.local_addr().unwrap().port(), local);
         let mut on: libc::c_int = -1;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -4147,28 +4204,28 @@ mod tests {
     #[test]
     fn host_info_reparse_updates_protocol_and_flags() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::Tcp);
+        assert_eq!(drv.config().protocol, IpProtocol::Tcp);
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 udp")
             .unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::Udp);
-        assert_eq!(drv.config.port, 5026);
+        assert_eq!(drv.config().protocol, IpProtocol::Udp);
+        assert_eq!(drv.config().port, 5026);
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5027 udp*")
             .unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
+        assert_eq!(drv.config().protocol, IpProtocol::UdpBroadcast);
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5028 udp&")
             .unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::UdpReusePort);
+        assert_eq!(drv.config().protocol, IpProtocol::UdpReusePort);
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5029 udp*&")
             .unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcastReusePort);
+        assert_eq!(drv.config().protocol, IpProtocol::UdpBroadcastReusePort);
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5030 tcp&")
             .unwrap();
-        assert_eq!(drv.config.protocol, IpProtocol::TcpReusePort);
+        assert_eq!(drv.config().protocol, IpProtocol::TcpReusePort);
     }
 
     /// hostInfo reparse must clear `local_port` when the new spec
@@ -4179,11 +4236,12 @@ mod tests {
     #[test]
     fn host_info_reparse_clears_omitted_local_port() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025:12345 tcp").unwrap();
-        assert_eq!(drv.config.local_port, Some(12345));
+        assert_eq!(drv.config().local_port, Some(12345));
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 tcp")
             .unwrap();
         assert_eq!(
-            drv.config.local_port, None,
+            drv.config().local_port,
+            None,
             "local_port must reset on hostInfo reparse"
         );
     }
@@ -4206,9 +4264,9 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "hostinfo", "10.0.0.5:1234 udp")
             .unwrap();
         // The live driver config must reflect the reparse, not the map.
-        assert_eq!(drv.config.host, "10.0.0.5");
-        assert_eq!(drv.config.port, 1234);
-        assert_eq!(drv.config.protocol, IpProtocol::Udp);
+        assert_eq!(drv.config().host, "10.0.0.5");
+        assert_eq!(drv.config().port, 1234);
+        assert_eq!(drv.config().protocol, IpProtocol::Udp);
 
         // get must echo the live endpoint for either key case
         // (C getOption returns tty->IPDeviceName verbatim).
@@ -4795,7 +4853,7 @@ mod tests {
         let cfg = IpPortConfig::parse("255.255.255.255:9000 UDP*").unwrap();
         let drv = DrvAsynIPPort::new("bcast_test", "255.255.255.255:9000 UDP*").unwrap();
         assert_eq!(cfg.protocol, IpProtocol::UdpBroadcast);
-        assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
+        assert_eq!(drv.config().protocol, IpProtocol::UdpBroadcast);
     }
 
     /// Regression: `connect` publishes the socket only after its last

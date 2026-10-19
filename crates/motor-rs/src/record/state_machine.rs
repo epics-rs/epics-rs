@@ -52,8 +52,9 @@ impl MotorRecord {
         // through without maybeRetry; only a move/backlash/retry
         // completion still carries motion bits. Rust keeps the
         // completion-type bits in MIP through DelayWait, so the same
-        // key reads as "MIP still carries MOVE/MOVE_BL/RETRY, or the
-        // STOP of a Pause, which skipped postProcess" — the
+        // key reads as "MIP still carries MOVE/MOVE_BL/RETRY, the
+        // STOP of a Pause, which skipped postProcess, or the EXTERNAL
+        // that postProcess keeps" — the
         // finalize family must not reach the close-enough branch,
         // which clears MISS and restores SPMG Move->Pause. The stup
         // half of the key is structural here: a STUP acknowledgment
@@ -61,11 +62,13 @@ impl MotorRecord {
         if self.stat.mip.contains(MipFlags::DELAY_ACK) {
             self.stat.mip.remove(MipFlags::DELAY_ACK);
             self.mark(m::MIP);
-            if self
-                .stat
-                .mip
-                .intersects(MipFlags::MOVE | MipFlags::MOVE_BL | MipFlags::RETRY | MipFlags::STOP)
-            {
+            if self.stat.mip.intersects(
+                MipFlags::MOVE
+                    | MipFlags::MOVE_BL
+                    | MipFlags::RETRY
+                    | MipFlags::STOP
+                    | MipFlags::EXTERNAL,
+            ) {
                 self.evaluate_position_error(&mut effects);
             } else {
                 self.finalize_motion(&mut effects);
@@ -245,6 +248,9 @@ impl MotorRecord {
                 // limit, fault, host stop): clear_buttons() so the latched
                 // button does not re-fire the jog on the next pass.
                 if self.stat.phase == MotionPhase::Jog {
+                    // The jog dispatch armed pp (C 2125); 1362 re-arms it
+                    // for this pp pass (1382).
+                    self.internal.pp = 0;
                     self.clear_buttons();
                     // C 1357-1364 collapses the sudden stop to MIP_DONE,
                     // so the replay gate (1385) passes — a VAL written
@@ -288,6 +294,9 @@ impl MotorRecord {
                 }
             }
             MotionPhase::Homing => {
+                // The home dispatch armed pp (C 2025); this is its pp
+                // pass (1382).
+                self.internal.pp = 0;
                 // No ATHM write here: C never sets it outside the poll —
                 // process_motor_info owns it as pure home-switch readback
                 // (3755-3762).
@@ -337,9 +346,8 @@ impl MotorRecord {
                 // collection below runs the move-block set test, which
                 // replays a second redefinition written during the load
                 // (its dval != ldvl divergence was parked by the
-                // MIP_LOAD_P skip in load_pos's set test). The pp and
-                // EXTERNAL blocks below self-gate: load_pos arms
-                // neither, and MIP is empty after the collapse.
+                // MIP_LOAD_P skip in load_pos's set test). The pp block
+                // below self-gates: load_pos does not arm pp.
                 if self.stat.mip.contains(MipFlags::LOAD_P) {
                     self.stat.mip = MipFlags::empty();
                     self.mark(m::MIP);
@@ -348,39 +356,42 @@ impl MotorRecord {
                 // C process (1382-1402): a done status callback with pp
                 // armed and no motion runs postProcess, whose first
                 // block re-syncs the drive values from the readback
-                // (827-849). The SET-mode resolution re-anchor
-                // (do_work 1981-1987: pp = TRUE + GET_INFO) completes
-                // here, re-deriving VAL/DVAL/RVAL at the new
-                // resolution.
+                // (827-849). It completes the SET-mode resolution
+                // re-anchor (do_work 1981-1987: pp = TRUE + GET_INFO),
+                // the LS-error update (1366-1380) and an external move
+                // (1314-1320).
                 if self.internal.pp != 0 {
+                    // C 1384-1397 jumps to do_work with pp still TRUE, so
+                    // the replayed move's completion runs postProcess: an
+                    // extra backlash leg, or no maybeRetry. That C defect
+                    // is not copied.
                     self.internal.pp = 0;
                     // C 1384-1399: a target written before the pp pass is
                     // replayed, not synced away.
                     if self.replay_overtaken_target(&mut effects) {
                         return effects;
                     }
-                    // C 1351: a stopped callback returns DMOV to TRUE first.
-                    self.set_dmov(true);
                     self.postprocess_sync();
-                    // This early-return quiesces the axis without finalize_motion
-                    // and dispatches nothing, deferring a held button to a later
-                    // pass. pp is now cleared, so the next forced poll falls
-                    // through to dispatch_latent_collection (427) and resumes it.
-                    self.request_poll_for_held_button(&mut effects);
-                    return effects;
-                }
-                // C: ea063f5f — if the record marked an externally initiated
-                // move (MIP_EXTERNAL set during process_motor_info), close
-                // the loop once the driver reports done. Reseed VAL/DVAL/RVAL
-                // from the readback and clear MIP.
-                if self.stat.mip.contains(MipFlags::EXTERNAL) {
-                    // C arms pp with MIP_EXTERNAL (1319), so a VAL the
-                    // move block parked during the motion is replayed.
-                    if self.replay_overtaken_target(&mut effects) {
+                    // C retry test (1410-1455): a MIP that postProcess
+                    // leaves (EXTERNAL, a parked JOG_REQ) runs maybeRetry,
+                    // after DLY only on a fresh DMOV edge.
+                    if !self.stat.mip.is_empty() && (self.timing.dly <= 0.0 || self.stat.dmov == 0)
+                    {
+                        self.settle_then_evaluate(&mut effects);
+                        if self.stat.phase != MotionPhase::Idle {
+                            return effects;
+                        }
+                    } else {
+                        // C 1351: a stopped callback returns DMOV to TRUE.
+                        self.set_dmov(true);
+                        // This early-return quiesces the axis without
+                        // finalize_motion and dispatches nothing, deferring a
+                        // held button to a later pass. pp is now cleared, so
+                        // the next forced poll falls through to
+                        // dispatch_latent_collection and resumes it.
+                        self.request_poll_for_held_button(&mut effects);
                         return effects;
                     }
-                    self.postprocess_sync();
-                    self.finalize_motion(&mut effects);
                 }
                 // C do_work gate (motorRecord.cc:1487-1492): a
                 // done-record callback falls into do_work through the
@@ -416,7 +427,9 @@ impl MotorRecord {
     /// Finalize motion: set Idle, DMOV=true.
     pub(crate) fn finalize_motion(&mut self, effects: &mut ProcessEffects) {
         self.set_phase(MotionPhase::Idle);
-        self.stat.mip = MipFlags::empty();
+        // C maybeRetry `mip &= MIP_JOG_REQ` (1055, 1088): a jog request
+        // parked under Pause outlives the completion.
+        self.stat.mip &= MipFlags::JOG_REQ;
         self.mark(m::MIP);
         self.set_dmov(true);
         self.set_movn(false);
@@ -424,9 +437,7 @@ impl MotorRecord {
         // sites — a non-retry move (2352-2356), home (2069, 869), and a
         // Move-resume (1931). After a give-up it stays at rtry+1 (the
         // ++rcnt of the exhausted maybeRetry pass) until the next move.
-        // C postProcess clears pp on entry (825); every normal completion
-        // runs it, so a leftover pp must not leak into the next motion.
-        self.internal.pp = 0;
+        // pp is not touched: only a completion's pp pass consumes it.
         self.internal.backlash_pending = false;
         self.internal.queued_motion = None;
         // No blanket button clear here: C clears the buttons only at
@@ -650,11 +661,11 @@ impl MotorRecord {
                 // (1055/1088 `mip &= MIP_JOG_REQ`), which only PRESERVE an
                 // already-set bit and during a positional move read 0 because
                 // special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053).
-                if (self.ctrl.jogf != 0 && self.limits.hls == 0)
-                    || (self.ctrl.jogr != 0 && self.limits.lls == 0)
-                {
-                    self.stat.mip.insert(MipFlags::JOG_REQ);
-                }
+                self.stat.mip.set(
+                    MipFlags::JOG_REQ,
+                    (self.ctrl.jogf != 0 && self.limits.hls == 0)
+                        || (self.ctrl.jogr != 0 && self.limits.lls == 0),
+                );
                 // dmov stays TRUE through give-up, so do_work re-fires the
                 // armed jog/home in the SAME process pass (1489 `pmr->dmov`).
                 // dispatch_latent_collection is the Rust same-pass do_work

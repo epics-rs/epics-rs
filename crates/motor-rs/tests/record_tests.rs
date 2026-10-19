@@ -5487,69 +5487,230 @@ fn test_external_move_idempotent_on_repeat_poll() {
 }
 
 #[test]
-fn test_external_move_completion_syncs_and_clears_mip() {
-    use asyn_rs::interfaces::motor::MotorStatus;
+fn test_external_move_arms_pp() {
+    // C process 1314-1320: the callback that finds a done record moving
+    // marks MIP_EXTERNAL and arms pp in the same block.
     let mut rec = MotorRecord::new();
-    // Start: external move in progress
-    let moving = MotorStatus {
-        position: 0.0,
-        encoder_position: 0.0,
-        velocity: 0.0,
-        moving: true,
-        msta_moving: true,
-        done: false,
-        direction: true,
-        high_limit: false,
-        low_limit: false,
-        home: false,
-        encoder_home: false,
-        homed: false,
-        powered: true,
-        problem: false,
-        slip: false,
-        slip_stall: false,
-        comms_error: false,
-        gain_support: true,
-        has_encoder: false,
-        vbas_supported: true,
-    };
-    rec.process_motor_info(&moving);
-    assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(3.0, true)));
+    rec.do_process();
+    assert_eq!(rec.stat.mip, MipFlags::EXTERNAL);
+    assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(1)));
+}
 
-    // Driver finishes the move at position 7.0 (integer to avoid MRES=1 rounding)
-    let done = MotorStatus {
-        position: 7.0,
-        encoder_position: 7.0,
-        velocity: 0.0,
-        moving: false,
-        msta_moving: false,
-        done: true,
-        direction: true,
-        high_limit: false,
-        low_limit: false,
-        home: false,
-        encoder_home: false,
-        homed: false,
-        powered: true,
-        problem: false,
-        slip: false,
-        slip_stall: false,
-        comms_error: false,
-        gain_support: true,
-        has_encoder: false,
-        vbas_supported: true,
-    };
-    // Drive the completion through the live dispatch path: process_motor_info
-    // runs during the Idle-phase readback (determine_event reports no event),
-    // and do_process() must still route MIP_EXTERNAL into check_completion.
-    rec.process_motor_info(&done);
-    let effects = rec.do_process();
+/// A mailbox-wired, anchored record: its passes read statuses and delay
+/// expiries from the returned state, and its puts are database puts, as in
+/// the IOC.
+fn live_axis(rec: &mut MotorRecord) -> motor_rs::device_state::SharedDeviceState {
+    rec.internal.init_invariants_synced = true;
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(rec, &state);
+    state
+}
 
-    assert!(!rec.stat.mip.contains(MipFlags::EXTERNAL));
-    assert!(rec.stat.dmov != 0);
-    assert_eq!(rec.pos.val, 7.0);
-    assert_eq!(rec.pos.dval, 7.0);
-    let _ = effects;
+/// Post `status` (if any) to the mailbox, run the pass, and take what it sent.
+fn live_pass(
+    rec: &mut MotorRecord,
+    state: &motor_rs::device_state::SharedDeviceState,
+    status: Option<asyn_rs::interfaces::motor::MotorStatus>,
+) -> motor_rs::device_state::DeviceActions {
+    if let Some(status) = status {
+        let mut ds = state.lock().unwrap();
+        let seq = ds.latest_status.as_ref().map_or(1, |s| s.seq + 1);
+        ds.latest_status = Some(motor_rs::device_state::StampedStatus { seq, status });
+    }
+    rec.process().unwrap();
+    state
+        .lock()
+        .unwrap()
+        .pending_actions
+        .take()
+        .unwrap_or_default()
+}
+
+#[test]
+fn test_external_move_that_ends_normally_completes_through_pp() {
+    // C 1382-1440: the stopped callback's pp pass runs postProcess
+    // (VAL/DVAL/RVAL <- readback, pp FALSE). MIP_EXTERNAL survives it, so
+    // the retry test waits out DLY and maybeRetry's close-enough branch
+    // ends the move. A pass with no callback runs do_work only.
+    for dly in [0.0, 0.5] {
+        let mut rec = MotorRecord::new();
+        rec.timing.dly = dly;
+        let state = live_axis(&mut rec);
+        live_pass(&mut rec, &state, Some(status_at(3.0, true)));
+        live_pass(&mut rec, &state, None);
+        assert_eq!(rec.stat.mip, MipFlags::EXTERNAL, "dly {dly}");
+        assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(1)), "dly {dly}");
+
+        let done = live_pass(&mut rec, &state, Some(status_at(7.0, false)));
+        assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(0)), "dly {dly}");
+        assert_eq!(
+            (rec.pos.val, rec.pos.dval, rec.pos.rval),
+            (7.0, 7.0, 7),
+            "dly {dly}"
+        );
+        if dly > 0.0 {
+            let delay = done.schedule_delay.expect("C 1441-1455: DLY armed");
+            assert!(rec.stat.dmov == 0, "DMOV waits out DLY");
+            state.lock().unwrap().expired_delay_id = Some(delay.id);
+            let ack = live_pass(&mut rec, &state, None);
+            assert!(ack.commands.contains(&MotorCommand::Poll), "C 1416-1426");
+            live_pass(&mut rec, &state, Some(status_at(7.0, false)));
+        }
+        assert!(rec.stat.dmov != 0, "dly {dly}");
+        assert!(rec.stat.mip.is_empty(), "dly {dly}: {:?}", rec.stat.mip);
+        assert_eq!(rec.stat.phase, MotionPhase::Idle, "dly {dly}");
+    }
+}
+
+#[test]
+fn test_external_move_that_ends_on_a_limit_completes_through_pp() {
+    // C 1366-1380: an external move stopped by the limit switch in CDIR
+    // takes the LS-error update (pp TRUE, MIP_DONE, GET_INFO, DMOV held
+    // FALSE); the GET_INFO callback's pp pass syncs to the limit without
+    // waiting out DLY (1405-1409).
+    for dly in [0.0, 0.5] {
+        let mut rec = MotorRecord::new();
+        rec.timing.dly = dly;
+        let state = live_axis(&mut rec);
+        assert_eq!(rec.stat.cdir, 0);
+        live_pass(&mut rec, &state, Some(status_at(-3.0, true)));
+        assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(1)), "dly {dly}");
+        let on_limit = asyn_rs::interfaces::motor::MotorStatus {
+            low_limit: true,
+            ..status_at(-9.0, true)
+        };
+        let ls = live_pass(&mut rec, &state, Some(on_limit.clone()));
+        assert!(ls.commands.contains(&MotorCommand::Poll), "dly {dly}");
+        assert!(rec.stat.dmov == 0, "dly {dly}");
+        assert!(rec.stat.mip.is_empty(), "dly {dly}");
+        assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(1)), "dly {dly}");
+
+        let update = live_pass(&mut rec, &state, Some(on_limit));
+        assert!(update.schedule_delay.is_none(), "dly {dly}");
+        assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(0)), "dly {dly}");
+        assert!(rec.stat.dmov != 0, "dly {dly}");
+        assert_eq!((rec.pos.val, rec.pos.dval), (-9.0, -9.0), "dly {dly}");
+    }
+}
+
+#[test]
+fn test_move_replayed_from_the_external_pp_pass_completes_as_a_move() {
+    // A VAL parked during the external move replays from its pp pass
+    // (C 1384-1397) with pp consumed, so the replayed move completes like
+    // any move: a short stop retries.
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 1.0;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = live_axis(&mut rec);
+    live_pass(&mut rec, &state, Some(status_at(3.0, true)));
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    assert_eq!(live_pass(&mut rec, &state, None).commands, []);
+
+    let replay = live_pass(&mut rec, &state, Some(status_at(10.0, false)));
+    assert!(
+        replay
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == 50.0)),
+        "{:?}",
+        replay.commands
+    );
+    assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(0)));
+
+    live_pass(&mut rec, &state, Some(status_at(20.0, true)));
+    let retry = live_pass(&mut rec, &state, Some(status_at(40.0, false)));
+    assert!(
+        retry
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        retry.commands
+    );
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+}
+
+#[test]
+fn test_home_during_an_external_move_stops_and_queues() {
+    // C do_work 2023-2033 keys on MOVN: a home requested while an external
+    // move runs stops the axis, and the stop's postProcess syncs and
+    // re-fires the home (827-891).
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 1.0;
+    rec.vel.hvel = 1.0;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = live_axis(&mut rec);
+    live_pass(&mut rec, &state, Some(status_at(3.0, true)));
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let stop = live_pass(&mut rec, &state, None);
+    assert!(
+        matches!(stop.commands[..], [MotorCommand::Stop { .. }]),
+        "{:?}",
+        stop.commands
+    );
+    assert_eq!(rec.stat.mip, MipFlags::HOMF | MipFlags::STOP);
+
+    let home = live_pass(&mut rec, &state, Some(status_at(5.0, false)));
+    assert!(
+        home.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "{:?}",
+        home.commands
+    );
+    assert_eq!(rec.pos.val, 5.0);
+}
+
+#[test]
+fn test_parked_jog_request_survives_the_pp_pass_maybe_retry() {
+    // C 1405-1440 after a SET-mode re-anchor's postProcess: with a jog
+    // parked under Pause, mip = MIP_JOG_REQ is not MIP_DONE, so DLY <= 0
+    // runs maybeRetry, whose close-enough branch clears MISS and keeps the
+    // request (`mip &= MIP_JOG_REQ`, 1088). DMOV was already TRUE, so with
+    // DLY > 0 there is no M_DMOV edge and nothing runs.
+    for dly in [0.0, 0.5] {
+        let mut rec = MotorRecord::new();
+        rec.vel.velo = 1.0;
+        rec.vel.jvel = 1.0;
+        rec.put_field("RTRY", EpicsValue::Short(1)).unwrap();
+        rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+        let state = live_axis(&mut rec);
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        live_pass(&mut rec, &state, None);
+        for _ in 0..2 {
+            live_pass(&mut rec, &state, Some(status_at(5.0, true)));
+            live_pass(&mut rec, &state, Some(status_at(5.0, false)));
+        }
+        assert_eq!(rec.retry.miss, 1, "dly {dly}: gave up short");
+
+        // The idle Pause stop's maybeRetry gives up again (MISS stays).
+        rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Pause as i16))
+            .unwrap();
+        live_pass(&mut rec, &state, None);
+        live_pass(&mut rec, &state, Some(status_at(5.0, false)));
+        assert_eq!(rec.retry.miss, 1, "dly {dly}");
+        rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+        assert_eq!(live_pass(&mut rec, &state, None).commands, []);
+        assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "dly {dly}");
+        rec.timing.dly = dly;
+
+        rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+        live_pass(&mut rec, &state, None);
+        rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+        let reanchor = live_pass(&mut rec, &state, None);
+        assert!(reanchor.commands.contains(&MotorCommand::Poll), "dly {dly}");
+        let pp = live_pass(&mut rec, &state, Some(status_at(5.0, false)));
+        assert!(pp.schedule_delay.is_none(), "dly {dly}");
+        assert_eq!(rec.pos.dval, 2.5, "dly {dly}");
+        assert_eq!(rec.retry.miss, i16::from(dly > 0.0), "dly {dly}");
+        assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "dly {dly}");
+        assert!(rec.stat.dmov != 0, "dly {dly}");
+    }
 }
 
 #[test]

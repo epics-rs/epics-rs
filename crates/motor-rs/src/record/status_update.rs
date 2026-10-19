@@ -223,8 +223,6 @@ impl MotorRecord {
         // C: ea063f5f (2008) — when the driver is moving but the record had no
         // pending motion, this is an externally initiated move (someone called
         // the controller directly, or another record drove the same axis).
-        // Mark MIP_EXTERNAL and clear DMOV; do_process() routes the next
-        // process() into check_completion via the MIP_EXTERNAL bit.
         // C runs this in process() only, never at init_record.
         if !initcall
             && self.stat.movn != 0
@@ -234,7 +232,9 @@ impl MotorRecord {
         {
             self.stat.dmov = 0;
             self.stat.mip |= MipFlags::EXTERNAL;
-            // C process 1315-1318.
+            // C process 1315-1320: pp makes the stopped callback
+            // post-process the move like any other.
+            self.internal.pp = 1;
             self.mark(m::DMOV | m::MIP);
         }
 

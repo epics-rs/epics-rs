@@ -797,8 +797,9 @@ impl MotorRecord {
         // C 2106-2115: the dispatch consumes MIP_JOG_REQ wholesale (mip =
         // MIP_JOGF/JOGR) and, while the axis still moves, ORs in MIP_STOP
         // and only stops it. Nothing re-fires the jog at the stop
-        // completion (postProcess re-fires only a home).
-        if self.stat.phase != MotionPhase::Idle && self.stat.movn != 0 {
+        // completion (postProcess re-fires only a home). The gate is
+        // MOVN alone, as in start_home.
+        if self.stat.movn != 0 {
             self.stat.mip = if forward {
                 MipFlags::JOGF
             } else {
@@ -1106,8 +1107,9 @@ impl MotorRecord {
         // C 2023-2033: mip = MIP_HOMF/HOMR wholesale, then the movn branch
         // ORs in MIP_STOP — a queued home reads back as HOMF|STOP. The
         // replay discriminator stays internal.queued_motion (see
-        // start_jog).
-        if self.stat.phase != MotionPhase::Idle && self.stat.movn != 0 {
+        // start_jog). The gate is MOVN alone: an external move runs
+        // with the phase Idle.
+        if self.stat.movn != 0 {
             self.stat.mip = if forward {
                 MipFlags::HOMF
             } else {
@@ -1971,13 +1973,13 @@ impl MotorRecord {
                 }
                 // C process (1301-1409): a CALLBACK_DATA pass on an idle
                 // record runs the stopped branch — LOAD_P collapse
-                // (1405-1409), the pp re-sync (1382-1402), the EXTERNAL
-                // close — before falling into do_work. determine_event
-                // consumed the status in place and left the one-pass
-                // mark; route it through check_completion so the live
-                // idle poll reaches that pipeline (its Idle arm), not
-                // only the EXTERNAL case.
-                if idle_status_pass || self.stat.mip.contains(MipFlags::EXTERNAL) {
+                // (1405-1409), the pp pass (1382-1402) — before falling
+                // into do_work. determine_event consumed the status in
+                // place and left the one-pass mark; route it through
+                // check_completion so the live idle poll reaches that
+                // pipeline (its Idle arm). Any other pass runs do_work
+                // only, as in C.
+                if idle_status_pass {
                     self.check_completion()
                 } else {
                     // C do_work gate (1487-1492): the put pass continues

@@ -1904,19 +1904,19 @@ fn close_enough_strands_a_jog_pressed_during_the_move() {
     assert!(rec.ctrl.jogf != 0, "the button stays latched");
 }
 
-/// The SET-mode pp-resync early-return (state_machine.rs:401) quiesces the axis
-/// WITHOUT finalize_motion and dispatches nothing — a formerly-bypassing member
-/// of the held-button deferral family. With the idle-poll change-gate it would
-/// strand a held jog. The shared `request_poll_for_held_button` owner now closes
-/// it too: the pp-resync must request the forced poll.
+/// The SET-mode pp-resync early-return quiesces the axis WITHOUT
+/// finalize_motion and dispatches nothing — a formerly-bypassing member of the
+/// held-button deferral family. With the idle-poll change-gate it would strand
+/// a held home. The shared `request_poll_for_held_button` owner now closes it
+/// too: the pp-resync must request the forced poll.
 #[test]
-fn pp_resync_requests_forced_poll_for_held_jog() {
+fn pp_resync_requests_forced_poll_for_held_home() {
     let mut rec = make_record();
     // dispatch_res_reanchor (SET && !IGSET) armed pp + a forced poll; the
-    // forced poll lands on this Idle-arm pp-resync with a jog still held.
+    // forced poll lands on this Idle-arm pp-resync with a home still held.
     rec.ctrl.spmg = SpmgMode::Go;
     rec.internal.pp = 1;
-    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
     // Reached only with the axis already done and idle (make_record sets
     // msta=DONE; a fresh record is Idle with movn=false).
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
@@ -1927,8 +1927,32 @@ fn pp_resync_requests_forced_poll_for_held_jog() {
     assert!(rec.internal.pp == 0, "the pp-resync consumes pp");
     assert!(
         effects.request_poll,
-        "the pp-resync early-return must request a forced poll so the held jog is not stranded by the change-gate"
+        "the pp-resync early-return must request a forced poll so the held home is not stranded by the change-gate"
     );
+}
+
+/// An armed MIP_JOG_REQ is not MIP_DONE, so the pp pass runs maybeRetry
+/// (C 1427-1431), which keeps the request (1088), and the same pass's do_work
+/// starts the jog (2079).
+#[test]
+fn pp_resync_dispatches_an_armed_jog_request() {
+    let mut rec = make_record();
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.internal.pp = 1;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ);
+
+    let effects = rec.check_completion();
+
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF);
 }
 
 #[test]

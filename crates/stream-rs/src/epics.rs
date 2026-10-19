@@ -730,8 +730,8 @@ impl CallbackBody for RecordProcess {
                     record_type.read_write(&stream, record, common);
                 });
             }
-            let prio = CallbackPriority::from_record_prio(shared.prio.load(Ordering::Relaxed));
-            let _ = done.complete(prio);
+            // C's rset->process completes the write before the "done" line.
+            done.complete_now();
         } else if let Some(reprocess) = shared.reprocess.get() {
             reprocess.process_now();
         }

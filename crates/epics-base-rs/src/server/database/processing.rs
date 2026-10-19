@@ -432,15 +432,10 @@ impl DeviceDone {
         priority: crate::runtime::task::CallbackPriority,
         completion: Completion,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        let body = self.0.body();
-        let first = {
-            let mut owed = body.owed.lock().unwrap();
-            owed.push(completion);
-            body.pending.fetch_add(1, Ordering::AcqRel) == 0
-        };
-        if !first {
+        if !self.push(completion) {
             return Ok(());
         }
+        let body = self.0.body();
         crate::runtime::task::request_cell(priority, &self.0).inspect_err(|_| {
             // No run will drain them: lost, as C loses a refused
             // `callbackRequest`, so the next pass owed requests afresh.
@@ -448,6 +443,26 @@ impl DeviceDone {
             *owed = Owed::default();
             body.pending.store(0, Ordering::Release);
         })
+    }
+
+    /// [`Self::complete`] on the calling thread, for a callback that runs
+    /// the record's `process()` itself before it goes on (StreamEpics.cc
+    /// `recordProcessCallback`). The caller holds no lock set. A run already
+    /// draining the cell on another thread takes this pass after its own.
+    pub fn complete_now(&self) {
+        use crate::runtime::background::CallbackBody;
+        if self.push(Completion::Write) {
+            self.0.body().run();
+        }
+    }
+
+    /// Owe `completion`; true when the cell was idle, so the caller owns
+    /// the run that drains it.
+    fn push(&self, completion: Completion) -> bool {
+        let body = self.0.body();
+        let mut owed = body.owed.lock().unwrap();
+        owed.push(completion);
+        body.pending.fetch_add(1, Ordering::AcqRel) == 0
     }
 
     /// [`Self::reprocess`] at the record's band for the re-entry `epoch`

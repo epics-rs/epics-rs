@@ -1064,7 +1064,13 @@ fn scripted_write(
     writes: &[Result<usize, (asyn_rs::error::AsynStatus, &'static str)>],
     drops: bool,
 ) -> (Vec<String>, Ended, Arc<Mutex<Book>>) {
-    let (_handle, book) = script(name);
+    let (handle, book) = script(name);
+    if drops {
+        // The port stays down after a drop: asynManager's connect timer
+        // would bring it back 10 ms on and print past the line the run
+        // ends with. connectToAsynPort connects without it (:530-537).
+        handle.set_auto_connect(0, false).unwrap();
+    }
     {
         let mut book = book.lock().unwrap();
         book.writes = writes.iter().cloned().collect();
@@ -1446,7 +1452,13 @@ fn scripted_read(
     read_more: &[isize],
     drops: bool,
 ) -> (Vec<String>, Reads, Arc<Mutex<Book>>) {
-    let (_handle, book) = script(name);
+    let (handle, book) = script(name);
+    if drops {
+        // The port stays down after a drop: asynManager's connect timer
+        // would bring it back 10 ms on and print past the line the run
+        // ends with. connectToAsynPort connects without it (:530-537).
+        handle.set_auto_connect(0, false).unwrap();
+    }
     {
         let mut book = book.lock().unwrap();
         book.reads = reads.iter().cloned().collect();

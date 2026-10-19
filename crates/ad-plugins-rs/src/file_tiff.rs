@@ -884,7 +884,9 @@ mod tests {
     /// A 3-frame capture into a TIFF plugin whose output feeds a
     /// BlockingCallbacks downstream, flushed by AutoSave or by WriteFile:
     /// what a NumCaptured monitor and the downstream saw, in one sequence.
-    fn capture_flush_log(port: &str, write_file: bool) -> Vec<Seen> {
+    /// `hold` keeps the port's actor in the NumCaptured=3 callback until the
+    /// downstream has frame 1, as a loaded box can.
+    fn capture_flush_log(port: &str, write_file: bool, hold: bool) -> Vec<Seen> {
         use crate::test_util::{auto_save_to, publish, registered, running, wait_saved};
         use std::time::Duration;
         let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -927,6 +929,14 @@ mod tests {
                 },
                 move |iv| {
                     if let asyn_rs::param::ParamValue::Int32(v) = iv.value {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while hold
+                            && v == 3
+                            && !posts.lock().contains(&Seen::Frame(1))
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
                         posts.lock().push(Seen::NumCaptured(v));
                     }
                 },
@@ -954,15 +964,23 @@ mod tests {
     /// in order, each before the NumCaptured posted for it. The count's order
     /// against the next frame is not asserted: in C a record only gets a
     /// scanIoRequest from the callback (devAsynInt32.c:575), so a PV has none.
+    /// That includes the 3 the last buffered frame posts, so it only marks
+    /// where the flush's counts start, not where its frames do.
     fn hands_on_before_each_post(log: &[Seen]) -> bool {
-        let Some(start) = log.iter().rposition(|s| *s == Seen::NumCaptured(3)) else {
+        let Some(start) = log.iter().position(|s| *s == Seen::NumCaptured(3)) else {
             return false;
         };
         let flush = &log[start + 1..];
-        let at = |seen: Seen| flush.iter().position(|s| *s == seen);
-        let frames: Vec<_> = flush
+        let at = |seen: Seen| log.iter().position(|s| *s == seen);
+        let posted = |n: i32| {
+            flush
+                .iter()
+                .position(|s| *s == Seen::NumCaptured(n))
+                .map(|i| start + 1 + i)
+        };
+        let frames: Vec<_> = log
             .iter()
-            .filter(|s| matches!(s, Seen::Frame(_)))
+            .filter(|s| matches!(s, Seen::Frame(k) if *k > 0))
             .collect();
         let counts: Vec<_> = flush
             .iter()
@@ -975,7 +993,7 @@ mod tests {
                     &Seen::NumCaptured(1),
                     &Seen::NumCaptured(0),
                 ]
-            && (1..=3).all(|k| at(Seen::Frame(k)) < at(Seen::NumCaptured(3 - k)))
+            && (1..=3).all(|k| at(Seen::Frame(k)) < posted(3 - k))
     }
 
     /// C's capture loop writes frame N, hands it to endProcessCallbacks,
@@ -983,7 +1001,19 @@ mod tests {
     /// downstream has frame N before a monitor sees N's count.
     #[test]
     fn an_autosave_flush_hands_each_frame_on_before_its_post() {
-        let log = capture_flush_log("TIFF_FLUSH_ORDER", false);
+        let log = capture_flush_log("TIFF_FLUSH_ORDER", false, false);
+        assert!(hands_on_before_each_post(&log), "{log:?}");
+    }
+
+    /// The flush's frame 1 can reach the downstream before the monitor sees
+    /// the 3 posted ahead of it: the frame callback's posts queue on the
+    /// port's actor while the frames are handed on from the callback's thread.
+    #[test]
+    fn a_late_count_before_the_flush_keeps_the_order() {
+        let log = capture_flush_log("TIFF_FLUSH_LATE", false, true);
+        let three = log.iter().position(|s| *s == Seen::NumCaptured(3));
+        let one = log.iter().position(|s| *s == Seen::Frame(1));
+        assert!(one < three, "not held: {log:?}");
         assert!(hands_on_before_each_post(&log), "{log:?}");
     }
 
@@ -992,7 +1022,7 @@ mod tests {
     /// the write still returns (NDPluginFile.cpp:296-321, :801-820).
     #[test]
     fn a_write_file_flush_waits_on_a_blocking_downstream_in_order() {
-        let log = capture_flush_log("TIFF_WRITE_ORDER", true);
+        let log = capture_flush_log("TIFF_WRITE_ORDER", true, false);
         assert!(hands_on_before_each_post(&log), "{log:?}");
     }
 

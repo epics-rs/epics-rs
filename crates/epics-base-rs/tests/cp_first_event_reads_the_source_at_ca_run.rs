@@ -15,6 +15,7 @@ use std::time::Duration;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::interrupt_accept::EdgeDone;
 use epics_base_rs::runtime::sync::mpsc;
+use epics_base_rs::runtime::task::{CallbackPriority, spawn_blocking_background};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -95,19 +96,39 @@ record(ai, "SRC") { field(DTYP, "Pulse") field(INP, "@x") field(SCAN, "I/O Intr"
 record(calc, "HOLD") { field(INPA, "SRC CP MS") field(CALC, "A") }
 "#;
 
+const HIGH_PULSED: &str = r#"
+record(ai, "SRC") {
+    field(DTYP, "Pulse") field(INP, "@x") field(SCAN, "I/O Intr") field(PRIO, "HIGH")
+}
+record(calc, "HOLD") { field(INPA, "SRC CP MS") field(CALC, "A") }
+"#;
+
 /// Boundary — an I/O Intr source with an interrupt pending on its pump when
 /// `dbCaRun` releases the link: the first event reads it processed.
 #[epics_macros_rs::epics_test]
 async fn a_pending_interrupt_processes_before_the_first_event() {
-    let (db, pulse) = build(PULSED).await;
+    let (db, pulse) = build(HIGH_PULSED).await;
     db.initialize_link_locality().await;
     setup_cp_links(&db, 1).await;
     db.scan_control().run();
-    // Queued before `dbCaRun`: once the link is released its turn may reach
-    // the pump at once, on a band thread, and would then rightly read UDF.
+    // The pump runs on SRC's band: holding it keeps both interrupts queued,
+    // with SRC unlocked, until after the link is released.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (busy, is_busy) = std::sync::mpsc::channel();
+    let hold = spawn_blocking_background(CallbackPriority::High, move |_| {
+        busy.send(()).unwrap();
+        let _ = held.recv_timeout(Duration::from_secs(30));
+    });
+    is_busy.recv_timeout(Duration::from_secs(10)).unwrap();
     pulse.try_send(()).unwrap();
     pulse.try_send(()).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = release.send(());
+    });
     db.process_cp_links_on_connect().await;
+    releaser.join().unwrap();
+    let _ = hold.await;
     db.ca_sync().await;
 
     assert_eq!(num(&db, "SRC.SEVR"), 0.0, "the source processed");

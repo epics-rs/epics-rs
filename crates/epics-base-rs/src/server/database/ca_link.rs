@@ -22,12 +22,14 @@ use parking_lot::RwLock;
 use super::channel_io::{self, ChannelTarget, DbAccessChannel};
 use super::dbr_delivery::{DeliveryStage, prepare_read, with_live_options};
 use super::link_set::{
-    DynLinkSet, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet, PutAdmission,
+    DynLinkSet, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp, LinkSet,
+    PutAdmission,
 };
 use super::{CaLinkInit, CpTarget, ExternalCpProcess, PvDatabase, PvDatabaseInner};
 use crate::runtime::task::TaskHandle;
 use crate::server::event_queue::{AttachId, EvQue, EventReader, EventUser, no_context};
 use crate::server::pv::{MonitorEvent, SubscribeRefused, WriteContext};
+use crate::server::record::ProcessCompletion;
 use crate::server::snapshot::Snapshot;
 use crate::types::{
     DBR_CTRL_DOUBLE, DbFieldType, EpicsValue, RecordName, decode_dbr, encode_dbr_into,
@@ -102,6 +104,12 @@ impl CaLinks {
     /// this database serves, or any name once a network half is registered.
     pub(crate) fn addresses(&self, name: &[u8]) -> bool {
         self.network.read().is_some() || self.serves(strip_ca_scheme(name))
+    }
+
+    /// Whether a `ca` link to `name` is a local link — C's `dbCaPutAsync`
+    /// to one completes through dbNotify rather than libca.
+    pub(crate) fn is_local(&self, name: &[u8]) -> bool {
+        self.serves(strip_ca_scheme(name))
     }
 
     /// `name` is, or on open would be, a local link: `dbChannelTest`
@@ -297,21 +305,36 @@ impl LinkSet for CaLinks {
     }
 
     async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+        self.put_value_done(name, value, op).await.1
+    }
+
+    async fn put_value_done(
+        &self,
+        name: &[u8],
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> (LinkPutDone, Result<(), String>) {
         let name = strip_ca_scheme(name);
-        if !self.ca_run.has_run() {
-            return Err(format!(
+        let unconnected = || {
+            Err(format!(
                 "CA link {} not connected",
                 String::from_utf8_lossy(name)
-            ));
+            ))
+        };
+        if !self.ca_run.has_run() {
+            // No target processed; a local one's put would have answered here.
+            let done = if self.serves(name) {
+                LinkPutDone::Inline
+            } else {
+                LinkPutDone::Callback
+            };
+            return (done, unconnected());
         }
         match self.open(name).await {
             Some(link) => link.write(value, op).await,
             None => match self.network() {
-                Some(net) => net.put_value(name, value, op).await,
-                None => Err(format!(
-                    "CA link {} not connected",
-                    String::from_utf8_lossy(name)
-                )),
+                Some(net) => net.put_value_done(name, value, op).await,
+                None => (LinkPutDone::Callback, unconnected()),
             },
         }
     }
@@ -500,6 +523,7 @@ impl LocalLink {
         });
         let monitor = bridge.spawn(subscribe(
             db.inner.ca_run.clone(),
+            db.inner.ca_run.claim_subscription(),
             channel.clone(),
             state.clone(),
         ));
@@ -530,7 +554,7 @@ impl LocalLink {
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and
     /// clamps to its element count (`dbCa.c:575-577`).
-    async fn write(&self, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn write(&self, value: EpicsValue, op: LinkPutOp) -> (LinkPutDone, Result<(), String>) {
         let mut value = value.into_type(self.channel.native_type());
         value.truncate(self.channel.element_count() as usize);
         self.channel.write(value, op).await
@@ -560,8 +584,11 @@ impl LocalLink {
 /// `DBR_TIME` monitor (`dbCa.c:1225-1229`), whose first event is the
 /// channel's value now (`dbSubscriptionIO`). An I/O Intr source is read as
 /// a turn on its own pump, behind every interrupt queued to it before.
+/// `claim`, for a link opened before `dbCaRun`, holds every CP process until
+/// the first event is taken.
 async fn subscribe(
     ca_run: Arc<super::processing::CaRunGate>,
+    claim: Option<super::processing::SubscribeClaim>,
     channel: Arc<LocalChannel>,
     state: Arc<LocalState>,
 ) {
@@ -589,7 +616,7 @@ async fn subscribe(
             let _ = state
                 .queue
                 .set((monitor.reader.queue(), monitor.reader.id()));
-            run_monitor(monitor, state).await;
+            run_monitor(monitor, state, claim).await;
         }
         // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
         // the link stays without a value. Its init wait is released, where
@@ -606,7 +633,11 @@ async fn subscribe(
 /// C `dbContext`'s event task handing each `dbSubscriptionIO` event to
 /// dbCa's `eventCallback`: refresh the cache, then add `CA_DBPROCESS`
 /// (`dbCa.c:891`, `:958-962`); after the first, `CA_INIT_READY`.
-async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
+async fn run_monitor(
+    mut monitor: LocalMonitor,
+    state: Arc<LocalState>,
+    mut claim: Option<super::processing::SubscribeClaim>,
+) {
     let mut first = true;
     // Each event is taken and handed on under `delivery`, never across a
     // suspension.
@@ -627,6 +658,7 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
         }
         if std::mem::take(&mut first) {
             state.process.request_init_ready();
+            drop(claim.take());
         }
         state.taken.fetch_add(1, Ordering::SeqCst);
         state.process.notify_settled();
@@ -739,16 +771,25 @@ impl LocalChannel {
     /// (`dbChannelIO.cpp:78-91`); a put callback goes through the
     /// `dbPutNotifyBlocker` and completes when the record's processing does
     /// (`dbPutNotifyBlocker.cpp:132-176`).
-    async fn write(&self, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn write(&self, value: EpicsValue, op: LinkPutOp) -> (LinkPutDone, Result<(), String>) {
         match op {
-            LinkPutOp::Plain => self
-                .put(value, false)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("db_put_field() completed unsuccessfully: {e}")),
-            LinkPutOp::Async => match self.issue_put(value, true).await? {
-                Some(done) => done.await,
-                None => Ok(()),
+            LinkPutOp::Plain => (
+                LinkPutDone::Callback,
+                self.put(value, false)
+                    .await
+                    .map(|_| ())
+                    .map_err(|r| format!("db_put_field() completed unsuccessfully: {}", r.error)),
+            ),
+            LinkPutOp::Async => match self.put_notify(value).await {
+                Err(e) => (LinkPutDone::NotIssued, Err(e)),
+                Ok((completion, status, _blocker)) => {
+                    let done = match completion {
+                        ProcessCompletion::Unprocessed => LinkPutDone::Inline,
+                        _ => LinkPutDone::Callback,
+                    };
+                    let settled = settle(completion).await;
+                    (done, status.and(settled))
+                }
             },
         }
     }
@@ -767,33 +808,48 @@ impl LocalChannel {
                 .put(value, false)
                 .await
                 .map(|_| None)
-                .map_err(|e| format!("db_put_field() completed unsuccessfully: {e}"));
+                .map_err(|r| format!("db_put_field() completed unsuccessfully: {}", r.error));
         }
+        let (completion, status, blocker) = self.put_notify(value).await?;
+        Ok(Some(Box::pin(async move {
+            let _blocker = blocker;
+            let settled = settle(completion).await;
+            status.and(settled)
+        })))
+    }
+
+    /// A put callback issued under the channel's `dbPutNotifyBlocker`, which
+    /// the caller holds until the completion settles: the completion and the
+    /// status it reports, a refusal's included (`putNotifyCompletion` reads
+    /// `notifyError` once the process ends). `Err` is a put never issued.
+    async fn put_notify(
+        &self,
+        value: EpicsValue,
+    ) -> Result<
+        (
+            ProcessCompletion,
+            Result<(), String>,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        String,
+    > {
         let blocker = crate::runtime::task::timeout(
             PUT_NOTIFY_BLOCK_TIMEOUT,
             self.blocker.clone().lock_owned(),
         )
         .await
         .map_err(|_| "put callback request timed out".to_string())?;
-        let completion = self
-            .put(value, true)
-            .await
-            .map_err(|e| format!("put notify unsuccessful: {e}"))?;
-        Ok(Some(Box::pin(async move {
-            let _blocker = blocker;
-            if let Some(done) = completion.into_handle() {
-                done.await
-                    .map_err(|_| "put notify unsuccessful: canceled".to_string())?;
-            }
-            Ok(())
-        })))
+        let (completion, status) =
+            crate::server::record::PutRefused::outcome(self.put(value, true).await);
+        let status = status.map_err(|e| format!("put notify unsuccessful: {e}"));
+        Ok((completion, status, blocker))
     }
 
     async fn put(
         &self,
         value: EpicsValue,
         notify: bool,
-    ) -> crate::error::CaResult<crate::server::record::ProcessCompletion> {
+    ) -> Result<ProcessCompletion, crate::server::record::PutRefused> {
         let db = self
             .db()
             .ok_or_else(|| crate::error::CaError::ChannelNotFound("database gone".into()))?;
@@ -806,6 +862,16 @@ impl LocalChannel {
             WriteContext::default,
         )
         .await
+    }
+}
+
+/// Wait out a put callback's completion.
+async fn settle(completion: ProcessCompletion) -> Result<(), String> {
+    match completion.into_handle() {
+        Some(done) => done
+            .await
+            .map_err(|_| "put notify unsuccessful: canceled".to_string()),
+        None => Ok(()),
     }
 }
 

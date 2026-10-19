@@ -4709,32 +4709,38 @@ pub(crate) async fn serve_write_head(
     // its error, so the reason C had for failing a refused buffer type — no
     // `dbChannel_put` arm, as opposed to a value the field rejected — survives
     // into both the audit line and the trap-write AfterWrite status.
-    use epics_base_rs::server::record::ProcessCompletion;
-    let (write_result, audit_result): (CaResult<ProcessCompletion>, &str) = match plan {
-        PutPlan::Refuse { .. } => (
-            Err(epics_base_rs::error::CaError::UnsupportedType(
-                hdr.data_type,
-            )),
-            "dbr-type-not-puttable",
-        ),
-        PutPlan::Write { value: new_value } => {
-            let result = epics_base_rs::server::database::channel_io::put(
-                db,
-                &entry.target,
-                entry.long_string_mode,
-                new_value,
-                is_notify,
-                || epics_base_rs::server::pv::WriteContext {
-                    user: state.username.clone(),
-                    host: state.hostname.as_bytes().to_vec(),
-                    peer: state.peer.clone(),
-                },
-            )
-            .await;
-            let tag = if result.is_ok() { "ok" } else { "fail" };
-            (result, tag)
-        }
-    };
+    //
+    // A refused put callback can still be pending: its record processed
+    // (`db_put_process` returns 1), so the PUTFAIL waits for that process.
+    use epics_base_rs::server::record::{ProcessCompletion, PutRefused};
+    let (completion, write_result, audit_result): (ProcessCompletion, CaResult<()>, &str) =
+        match plan {
+            PutPlan::Refuse { .. } => (
+                ProcessCompletion::Unprocessed,
+                Err(epics_base_rs::error::CaError::UnsupportedType(
+                    hdr.data_type,
+                )),
+                "dbr-type-not-puttable",
+            ),
+            PutPlan::Write { value: new_value } => {
+                let result = epics_base_rs::server::database::channel_io::put(
+                    db,
+                    &entry.target,
+                    entry.long_string_mode,
+                    new_value,
+                    is_notify,
+                    || epics_base_rs::server::pv::WriteContext {
+                        user: state.username.clone(),
+                        host: state.hostname.as_bytes().to_vec(),
+                        peer: state.peer.clone(),
+                    },
+                )
+                .await;
+                let (completion, result) = PutRefused::outcome(result);
+                let tag = if result.is_ok() { "ok" } else { "fail" };
+                (completion, result, tag)
+            }
+        };
 
     state.audit_channel("caput", sid, &display_value, audit_result);
 
@@ -4743,7 +4749,7 @@ pub(crate) async fn serve_write_head(
     // the guard. The async path instead hands the guard to the
     // completion task so AfterWrite reflects real device-side
     // completion timing (C `write_notify_reply:1400`).
-    let needs_async_after = is_notify && matches!(&write_result, Ok(pc) if pc.is_async());
+    let needs_async_after = is_notify && completion.is_async();
     if !needs_async_after {
         if let Some(guard) = &mut trap_guard {
             guard.complete(audit_result);
@@ -4788,11 +4794,9 @@ pub(crate) async fn serve_write_head(
             Err(e) => PutStatus::of_failure(e),
         }
         .eca();
-        // `Async(rx)` ⟹ the record's chain is still running: return the
-        // handle. `Sync` and any `Err` ⟹ reply inline now (an error
-        // carries no completion to await).
-        let completion_rx = write_result.ok().and_then(ProcessCompletion::into_handle);
-        if let Some(rx) = completion_rx {
+        // `Async(rx)` ⟹ the record's chain is still running, a refused
+        // put's included: return the handle. Otherwise reply inline now.
+        if let Some(rx) = completion.into_handle() {
             let reply = WriteNotifyReply {
                 // C `write_notify_reply` (`camessage.c:1386-1403`) frames the
                 // completion from the saved request header, so the echoed type

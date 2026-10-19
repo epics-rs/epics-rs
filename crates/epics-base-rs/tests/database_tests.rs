@@ -4208,9 +4208,9 @@ async fn test_put_notify_defers_for_async_flnk_target() {
         .expect("put must succeed");
     let mut rx = match result {
         ProcessCompletion::Async(rx) => rx,
-        ProcessCompletion::Sync => panic!(
+        ProcessCompletion::Sync | ProcessCompletion::Unprocessed => panic!(
             "an async FLNK target must defer completion — \
-             the put returned immediate (Sync) instead of a receiver"
+             the put returned immediately instead of a receiver"
         ),
     };
     // The async FLNK target is in flight; completion MUST NOT have fired.
@@ -4251,9 +4251,9 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
         .expect("put must succeed");
     let mut rx = match result {
         ProcessCompletion::Async(rx) => rx,
-        ProcessCompletion::Sync => panic!(
+        ProcessCompletion::Sync | ProcessCompletion::Unprocessed => panic!(
             "an async OUT PP target must defer completion — \
-             the put returned immediate (Sync) instead of a receiver"
+             the put returned immediately instead of a receiver"
         ),
     };
     assert!(

@@ -129,6 +129,21 @@ pub enum LinkPutOp {
     Async,
 }
 
+/// How an [`LinkPutOp::Async`] put's completion reached the link owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPutDone {
+    /// Through the target's completion callback.
+    Callback,
+    /// On the put's own call: the target processed nothing, so C's
+    /// `processNotifyCommon` ran `callDone` inline on `dbCaTask`
+    /// (`dbNotify.c:243-270`).
+    Inline,
+    /// Never: the put callback could not be issued, and C's `dbCaTask` only
+    /// logs a failed `ca_array_put_callback`, leaving `newOutNative` set
+    /// and never calling `putComplete` (`dbCa.c:1233-1247`).
+    NotIssued,
+}
+
 /// Whether an external OUT link will accept a staged write right now —
 /// the answer to C `dbCaPutLinkCallback`'s first gate:
 ///
@@ -621,6 +636,18 @@ pub trait LinkSet: Send + Sync {
     async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let _ = (name, value, op);
         Err("link set is read-only".into())
+    }
+
+    /// [`Self::put_value`], saying how its completion arrived, refused or
+    /// not. Default: [`LinkPutDone::Callback`], which only a local CA target
+    /// can refute.
+    async fn put_value_done(
+        &self,
+        name: &[u8],
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> (LinkPutDone, Result<(), String>) {
+        (LinkPutDone::Callback, self.put_value(name, value, op).await)
     }
 
     /// Open `name` as a forward link: the handle its `scanForward` runs

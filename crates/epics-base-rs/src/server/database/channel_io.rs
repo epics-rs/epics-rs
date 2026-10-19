@@ -10,13 +10,12 @@
 
 use std::sync::Arc;
 
-use crate::error::CaResult;
 use crate::server::database::filters::{ChannelCreateError, FilterChain};
 use crate::server::database::{PvDatabase, PvEntry};
 use crate::server::event_queue::{DeliveryContext, EventReader, EventUser};
 use crate::server::pv::{ProcessVariable, SubscribeRefused};
-use crate::server::record::ProcessCompletion;
 use crate::server::record::{FieldDeclaration, RecordCell};
+use crate::server::record::{ProcessCompletion, PutRefused};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// What a database channel addresses: a simple PV, or one field of a record.
@@ -477,7 +476,8 @@ pub fn read_ack_state(target: &ChannelTarget, alarm: &mut crate::server::snapsho
 /// The put C reaches through `dbChannel_put` (a plain write, `dbPutField`,
 /// `notify == false`) or through `dbProcessNotify` → `db_put_process` (a put
 /// callback, `notify == true`). `ctx` names the writer for a simple PV's
-/// write hook, the gateway's forwarded put.
+/// write hook, the gateway's forwarded put. A refusal says whether the put
+/// callback still processed the record.
 pub async fn put(
     db: &PvDatabase,
     target: &ChannelTarget,
@@ -485,14 +485,16 @@ pub async fn put(
     value: EpicsValue,
     notify: bool,
     ctx: impl FnOnce() -> crate::server::pv::WriteContext,
-) -> CaResult<ProcessCompletion> {
+) -> Result<ProcessCompletion, PutRefused> {
     match target {
         ChannelTarget::SimplePv(pv) => {
             if let Some(hook) = pv.write_hook() {
-                hook(value, ctx()).await.map(|()| ProcessCompletion::Sync)
+                Ok(hook(value, ctx())
+                    .await
+                    .map(|()| ProcessCompletion::Unprocessed)?)
             } else {
                 pv.set(value);
-                Ok(ProcessCompletion::Sync)
+                Ok(ProcessCompletion::Unprocessed)
             }
         }
         ChannelTarget::RecordField { record, field } => {
@@ -508,7 +510,7 @@ pub async fn put(
                 _ => field,
             };
             if notify {
-                db.put_record_field_from_ca(name, field, value).await
+                db.put_record_field_notify(name, field, value).await
             } else {
                 // C `write_action` (`rsrv/camessage.c:781-789`)
                 // routes CA_PROTO_WRITE through `dbPutField` —
@@ -519,9 +521,10 @@ pub async fn put(
                 // motor's whole motion), failing every
                 // legitimate WRITE_NOTIFY on the record with
                 // ECA_PUTCBINPROG in the meantime.
-                db.put_record_field_from_ca_no_notify(name, field, value)
+                Ok(db
+                    .put_record_field_from_ca_no_notify(name, field, value)
                     .await
-                    .map(|()| ProcessCompletion::Sync)
+                    .map(|()| ProcessCompletion::Sync)?)
             }
         }
     }

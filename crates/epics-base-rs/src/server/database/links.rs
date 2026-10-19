@@ -3594,7 +3594,18 @@ impl PvDatabase {
         let waiter = match done {
             ExternalDone::None => PutWaiter::None,
             ExternalDone::Notify(_) => PutWaiter::Notify,
-            ExternalDone::Record(done) => PutWaiter::Record(done),
+            // A local target's completion reaches `dbCaCallbackProcess`
+            // through dbNotify's callDone, pinned to priorityLow
+            // (`dbNotify.c:129-131`, `:466`, `:182`); a remote one through
+            // libca's callback thread.
+            ExternalDone::Record(done) => {
+                let band = if scheme == "ca" && self.inner.ca_links.is_local(body) {
+                    crate::runtime::task::CallbackPriority::Low
+                } else {
+                    done.priority()
+                };
+                PutWaiter::Record(done, band)
+            }
         };
         match self.inner.link_puts.stage_put(key, value, waiter) {
             // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:593-595`);
@@ -5443,9 +5454,10 @@ impl PvDatabase {
         self.inner.io_intr_turns.turn(record).await;
     }
 
-    /// The CP/CPP worker's wait for [`Self::process_cp_links_on_connect`].
-    pub(crate) async fn ca_run_reached(&self) {
-        self.inner.ca_run.reached().await;
+    /// The CP/CPP worker's wait for [`Self::process_cp_links_on_connect`]
+    /// and every local link's first event queued by then.
+    pub(crate) async fn ca_monitors_serviced(&self) {
+        self.inner.ca_run.monitors_serviced().await;
     }
 
     /// A put to `holder`'s link `field` after `dbCaRun`: C `dbPutFieldLink`

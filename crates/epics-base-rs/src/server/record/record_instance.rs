@@ -491,9 +491,57 @@ impl NotifyWaitSet {
 pub enum ProcessCompletion {
     /// The cycle settled within the calling thread — the caller replies inline.
     Sync,
+    /// The put processed nothing: C `processNotifyCommon` finds no
+    /// `doProcess` and runs `callDone` on the caller's thread
+    /// (`dbNotify.c:243-270`) instead of `dbNotifyCompletion`'s callback.
+    Unprocessed,
     /// The cycle went async; `handle` fires exactly once when the tracked
     /// FLNK/OUT chain settles (C `dbNotifyCompletion`).
     Async(crate::runtime::sync::oneshot::Receiver<()>),
+}
+
+/// A refused put, and the completion of the process it still drove. C's
+/// `putCallback` returns `didPut` on a refused put to a pp field
+/// (`dbNotify.c:528-530`), so `processNotifyCommon` runs `dbProcess` and the
+/// callback, carrying the error, comes from `dbNotifyCompletion`; a refusal
+/// that processes nothing reaches `callDone` inline (`:270`), which is
+/// [`ProcessCompletion::Unprocessed`].
+#[derive(Debug)]
+pub struct PutRefused {
+    pub error: crate::error::CaError,
+    pub completion: ProcessCompletion,
+}
+
+impl PutRefused {
+    pub fn into_error(self) -> crate::error::CaError {
+        self.error
+    }
+
+    /// A put callback's two answers: when it completes, and its status.
+    pub fn outcome(
+        put: Result<ProcessCompletion, Self>,
+    ) -> (ProcessCompletion, crate::error::CaResult<()>) {
+        match put {
+            Ok(completion) => (completion, Ok(())),
+            Err(refused) => (refused.completion, Err(refused.error)),
+        }
+    }
+}
+
+impl AsRef<crate::error::CaError> for PutRefused {
+    fn as_ref(&self) -> &crate::error::CaError {
+        &self.error
+    }
+}
+
+impl From<crate::error::CaError> for PutRefused {
+    /// A refusal ahead of any process cycle.
+    fn from(error: crate::error::CaError) -> Self {
+        Self {
+            error,
+            completion: ProcessCompletion::Unprocessed,
+        }
+    }
 }
 
 impl ProcessCompletion {
@@ -513,7 +561,7 @@ impl ProcessCompletion {
     /// spawned completion task (`Some(rx)`).
     pub fn into_handle(self) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
         match self {
-            Self::Sync => None,
+            Self::Sync | Self::Unprocessed => None,
             Self::Async(rx) => Some(rx),
         }
     }
@@ -525,7 +573,7 @@ impl ProcessCompletion {
 
     /// True if the cycle completed synchronously (no handle to await).
     pub fn is_sync(&self) -> bool {
-        matches!(self, Self::Sync)
+        matches!(self, Self::Sync | Self::Unprocessed)
     }
 }
 

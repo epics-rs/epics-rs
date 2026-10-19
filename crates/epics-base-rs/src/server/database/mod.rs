@@ -34,8 +34,8 @@ pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
-    LinkHolder, LinkMetadata, LinkOpen, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
-    RemoteAlarm,
+    LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkSet, LinkSetRegistry,
+    PutAdmission, RemoteAlarm,
 };
 #[cfg(test)]
 pub(crate) use links::ExternalDone;

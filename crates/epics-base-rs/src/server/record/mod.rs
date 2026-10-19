@@ -69,7 +69,7 @@ pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;
 pub use record_instance::{
     AlarmAck, AmbientWriteOriginScope, DeferredNotify, DeferredNotifyPut, FieldIx, NotifyWaitSet,
-    PactExit, ProcessCompletion, RecordCell, RecordInstance, RecordMut, RecordRef,
+    PactExit, ProcessCompletion, PutRefused, RecordCell, RecordInstance, RecordMut, RecordRef,
     ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{

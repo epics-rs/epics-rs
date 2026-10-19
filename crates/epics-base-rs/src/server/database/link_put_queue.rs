@@ -56,7 +56,10 @@
 //!
 //! **Invariant.** *Every staged completion is resolved exactly once* —
 //! by the owner (with the lset's result), by a superseding put, or by the
-//! queue's teardown. [`PutCompletion`] enforces it by construction: its
+//! queue's teardown. A put the lset could not issue
+//! ([`LinkPutDone::NotIssued`]) is not resolved by the owner: its completion
+//! stays on the link until a later put supersedes it or the queue is torn
+//! down. [`PutCompletion`] enforces it by construction: its
 //! `Drop` resolves an unresolved completion, so no path — early return,
 //! `?`, panic, or the whole database dropping — can drop a pending put
 //! silently.
@@ -65,7 +68,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Weak;
 
-use super::link_set::{DynLinkSet, LinkPutOp};
+use super::link_set::{DynLinkSet, LinkPutDone, LinkPutOp};
 use crate::types::EpicsValue;
 
 /// The channel an external link addresses: the scheme of the one lset it
@@ -164,17 +167,18 @@ enum PutCompletion {
     Notify(Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     /// C `dbCaCallbackProcess` → `dbLinkAsyncComplete` (`dbCa.c:317-322`,
     /// `dbLink.c`): the `devXxxSoftCallback` record's completing pass, which
-    /// takes no status.
-    Record(Option<super::DeviceDone>),
+    /// takes no status, run on the band its put's waiter named.
+    Record(Option<(super::DeviceDone, crate::runtime::task::CallbackPriority)>),
 }
 
 impl PutCompletion {
     /// Resolve with the outcome the owner (or a superseding put) determined.
-    fn resolve(mut self, result: Result<(), String>) {
-        self.finish(result);
+    /// `inline` is [`LinkPutDone::Inline`].
+    fn resolve(mut self, inline: bool, result: Result<(), String>) {
+        self.finish(inline, result);
     }
 
-    fn finish(&mut self, result: Result<(), String>) {
+    fn finish(&mut self, inline: bool, result: Result<(), String>) {
         match self {
             Self::Notify(tx) => {
                 if let Some(tx) = tx.take() {
@@ -182,8 +186,15 @@ impl PutCompletion {
                 }
             }
             Self::Record(done) => {
-                if let Some(done) = done.take() {
-                    let _ = done.complete(done.priority());
+                if let Some((done, band)) = done.take() {
+                    // An inline `callDone` runs the completing pass on
+                    // `dbCaTask` itself, at priorityMedium (`dbCa.c:340`).
+                    let band = if inline {
+                        crate::runtime::task::CallbackPriority::Medium
+                    } else {
+                        band
+                    };
+                    let _ = done.complete(band);
                 }
             }
         }
@@ -192,9 +203,10 @@ impl PutCompletion {
 
 impl Drop for PutCompletion {
     fn drop(&mut self) {
-        self.finish(Err(
-            "external link put dropped before completion (link queue torn down)".to_string(),
-        ));
+        self.finish(
+            false,
+            Err("external link put dropped before completion (link queue torn down)".to_string()),
+        );
     }
 }
 
@@ -207,8 +219,11 @@ pub(crate) enum PutWaiter<'a> {
     /// [`LinkPutQueue::stage_put`] returns.
     Notify,
     /// C `dbPutLinkAsync` from a `devXxxSoftCallback` (`dbCaPutAsync`,
-    /// `dbCa.c:537-542`): the record's own completion.
-    Record(&'a super::DeviceDone),
+    /// `dbCa.c:537-542`): the record's own completion, on the given band.
+    Record(
+        &'a super::DeviceDone,
+        crate::runtime::task::CallbackPriority,
+    ),
 }
 
 /// One link's pending value — `pca->pputNative` plus the `putType` /
@@ -224,10 +239,17 @@ impl StagedPut {
     /// Drop a value whose link was removed before it was sent.
     fn removed(self) {
         if let Some(c) = self.completion {
-            c.resolve(Err(
-                "external link put dropped: the link was removed before it was sent".to_string(),
-            ));
+            c.removed();
         }
+    }
+}
+
+impl PutCompletion {
+    fn removed(self) {
+        self.resolve(
+            false,
+            Err("external link put dropped: the link was removed before it was sent".to_string()),
+        );
     }
 }
 
@@ -243,6 +265,11 @@ enum LinkState {
     /// A network op is running AND a newer value was staged behind it.
     /// Not in the deque; `finish` moves it back to `Queued` and enqueues.
     InFlightRestaged(StagedPut),
+    /// The lset could not issue the put callback; its completion waits for
+    /// the next put on the link — C leaves `newOutNative` set and the
+    /// callback in `pca->putCallback` (`dbCa.c:1233-1247`). Not in the deque,
+    /// and not pending for the `dbCaSync` barrier.
+    Unsent(PutCompletion),
 }
 
 /// Per-link OPEN state — C's `CA_CONNECT` action, staged once per link by
@@ -285,7 +312,9 @@ struct QueueInner {
 
 impl QueueInner {
     fn is_idle(&self) -> bool {
-        self.links.is_empty()
+        self.links
+            .values()
+            .all(|s| matches!(s, LinkState::Unsent(_)))
             && !self
                 .opens
                 .values()
@@ -403,9 +432,9 @@ impl LinkPutQueue {
                     Some(rx),
                 )
             }
-            PutWaiter::Record(done) => (
+            PutWaiter::Record(done, band) => (
                 LinkPutOp::Async,
-                Some(PutCompletion::Record(Some(done.clone()))),
+                Some(PutCompletion::Record(Some((done.clone(), band)))),
                 None,
             ),
         };
@@ -423,7 +452,7 @@ impl LinkPutQueue {
                     true
                 }
                 Some(LinkState::Queued(prev)) => {
-                    Self::supersede(&mut inner, &key, prev);
+                    Self::supersede(&mut inner, &key, prev.completion);
                     // Already in the ready deque — C's `callAdd` is false
                     // here too (`dbCa.c:135`), so no second enqueue.
                     inner.links.insert(key, LinkState::Queued(staged));
@@ -434,9 +463,15 @@ impl LinkPutQueue {
                     false
                 }
                 Some(LinkState::InFlightRestaged(prev)) => {
-                    Self::supersede(&mut inner, &key, prev);
+                    Self::supersede(&mut inner, &key, prev.completion);
                     inner.links.insert(key, LinkState::InFlightRestaged(staged));
                     false
+                }
+                Some(LinkState::Unsent(prev)) => {
+                    Self::supersede(&mut inner, &key, Some(prev));
+                    inner.links.insert(key.clone(), LinkState::Queued(staged));
+                    inner.ready.push_back(key);
+                    true
                 }
             }
         };
@@ -448,7 +483,7 @@ impl LinkPutQueue {
 
     /// Resolve a displaced value's completion — the only place a staged put
     /// is superseded, so the `nNoWrite` accounting has one owner.
-    fn supersede(inner: &mut QueueInner, key: &LinkKey, prev: StagedPut) {
+    fn supersede(inner: &mut QueueInner, key: &LinkKey, prev: Option<PutCompletion>) {
         let site = (key.link.rec, key.link.field, key.channel.clone());
         let count = inner
             .coalesced
@@ -458,10 +493,11 @@ impl LinkPutQueue {
             *count = (key.link.install.clone(), 0);
         }
         count.1 += 1;
-        if let Some(c) = prev.completion {
-            c.resolve(Err(
-                "external link put superseded by a newer put on the same link".to_string(),
-            ));
+        if let Some(c) = prev {
+            c.resolve(
+                false,
+                Err("external link put superseded by a newer put on the same link".to_string()),
+            );
         }
     }
 
@@ -500,16 +536,39 @@ impl LinkPutQueue {
         }
     }
 
-    /// Owner-only: the write for `key` finished. `InFlight` → idle;
-    /// `InFlightRestaged` → `Queued` and back in the deque, which is how a
-    /// put that landed mid-flight is not lost (C clears `link_action` before
-    /// the wire write for the same reason, `dbCa.c:1130`).
-    fn finish(&self, key: LinkKey) {
+    /// Owner-only: the write for `key` finished, `unsent` holding the
+    /// completion of a put callback the lset could not issue. `InFlight` →
+    /// idle, or `Unsent`; `InFlightRestaged` → `Queued` and back in the
+    /// deque, which is how a put that landed mid-flight is not lost (C clears
+    /// `link_action` before the wire write for the same reason,
+    /// `dbCa.c:1130`), superseding `unsent`.
+    fn finish(&self, key: LinkKey, unsent: Option<PutCompletion>) {
         let (wake_work, wake_idle) = {
             let mut inner = self.inner.lock();
             inner.completed += 1;
             let wake_work = match inner.links.remove(&key) {
-                Some(LinkState::InFlight) | None => false,
+                Some(LinkState::InFlight) => {
+                    match unsent {
+                        Some(c) if key.link.install.removed() => c.removed(),
+                        Some(c) => {
+                            inner.links.insert(key, LinkState::Unsent(c));
+                        }
+                        None => {}
+                    }
+                    false
+                }
+                None => false,
+                Some(LinkState::InFlightRestaged(staged)) if unsent.is_some() => {
+                    Self::supersede(&mut inner, &key, unsent);
+                    if key.link.install.removed() {
+                        staged.removed();
+                        false
+                    } else {
+                        inner.links.insert(key.clone(), LinkState::Queued(staged));
+                        inner.ready.push_back(key);
+                        true
+                    }
+                }
                 Some(LinkState::InFlightRestaged(staged)) if key.link.install.removed() => {
                     staged.removed();
                     false
@@ -786,8 +845,8 @@ async fn owner_loop(
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
-                            run_put(lset.as_ref(), &key, staged).await;
-                            q2.finish(key);
+                            let unsent = run_put(lset.as_ref(), &key, staged).await;
+                            q2.finish(key, unsent);
                         });
                     }
                 }
@@ -804,7 +863,7 @@ async fn owner_loop(
                     }
                     while let Some((key, staged)) = q.take_ready() {
                         refuse_for_want_of_a_reactor(&key, staged);
-                        q.finish(key);
+                        q.finish(key, None);
                     }
                 }
             }
@@ -853,21 +912,26 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
     );
     crate::runtime::log::errlog_vprintf(format_args!("dbCa: {msg}\n"));
     if let Some(c) = staged.completion {
-        c.resolve(Err(msg));
+        c.resolve(false, Err(msg));
     }
 }
 
 /// Perform one dequeued write. The network suspension lives here — on the
-/// owner's spawned task, never on a record-processing thread.
-async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) {
+/// owner's spawned task, never on a record-processing thread. Returns the
+/// completion of a put callback the lset could not issue, unresolved.
+async fn run_put(
+    lset: Option<&DynLinkSet>,
+    key: &LinkKey,
+    staged: StagedPut,
+) -> Option<PutCompletion> {
     let StagedPut {
         value,
         op,
         completion,
     } = staged;
-    let result = match lset {
+    let (done, result) = match lset {
         Some(lset) => {
-            let result = lset.put_value(&key.channel.name, value, op).await;
+            let (done, result) = lset.put_value_done(&key.channel.name, value, op).await;
             if result.is_ok() {
                 // Production drain of any retry-queued OUT writes
                 // on this lset now that a write has reached it (the
@@ -876,12 +940,15 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) {
                 // test code (`ioc/pvalink_channel.cpp:220-280`).
                 lset.flush_puts().await;
             }
-            result
+            (done, result)
         }
-        None => Err(format!(
-            "no link set accepted the write to external link '{}'",
-            key.channel.name
-        )),
+        None => (
+            LinkPutDone::Callback,
+            Err(format!(
+                "no link set accepted the write to external link '{}'",
+                key.channel.name
+            )),
+        ),
     };
     // C reports a failed wire write on the task, via `errlogPrintf`
     // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
@@ -898,8 +965,14 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) {
             key.channel.name
         ));
     }
-    if let Some(c) = completion {
-        c.resolve(result);
+    match done {
+        LinkPutDone::NotIssued => completion,
+        _ => {
+            if let Some(c) = completion {
+                c.resolve(done == LinkPutDone::Inline, result);
+            }
+            None
+        }
     }
 }
 
@@ -1040,7 +1113,7 @@ mod tests {
         q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, _staged) = q.take_ready().expect("ready");
-        q.finish(k);
+        q.finish(k, None);
         assert!(q.is_idle(), "nothing pending on any link");
         assert_eq!(coalesced(&q, &key("A")), 1);
     }
@@ -1076,7 +1149,7 @@ mod tests {
             "still in flight — at most one write per link keeps write order"
         );
 
-        q.finish(k);
+        q.finish(k, None);
         let (_, second) = q.take_ready().expect("re-queued after finish");
         assert_eq!(second.value, EpicsValue::Long(9));
     }
@@ -1097,6 +1170,49 @@ mod tests {
             resolved(rx).unwrap_err().contains("superseded"),
             "a superseded completion must say so"
         );
+    }
+
+    /// Boundary: a put callback the lset could not issue stays pending, holds
+    /// up no `dbCaSync`, and the next put on the link supersedes it — C's
+    /// `newOutNative` left set, then `nNoWrite++` (`dbCa.c:582-583`,
+    /// `:1233-1247`).
+    #[test]
+    fn an_unsent_completion_waits_for_the_next_put() {
+        let q = LinkPutQueue::default();
+        let mut rx = q
+            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
+            .expect("Async put yields a completion");
+        let (k, staged) = q.take_ready().expect("ready");
+        q.finish(k, staged.completion);
+
+        assert!(q.is_idle(), "an unsent put is not pending for dbCaSync");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
+        assert!(resolved(rx).unwrap_err().contains("superseded"));
+        assert_eq!(coalesced(&q, &key("A")), 1);
+        let (_, staged) = q.take_ready().expect("the newer put is queued");
+        assert_eq!(staged.value, EpicsValue::Long(2));
+    }
+
+    /// Boundary: the put that cannot be issued already has a newer one staged
+    /// behind it, which supersedes it at once.
+    #[test]
+    fn an_unsent_completion_is_superseded_by_the_put_staged_behind_it() {
+        let q = LinkPutQueue::default();
+        let rx = q
+            .stage_put(key("A"), EpicsValue::Long(1), PutWaiter::Notify)
+            .expect("Async put yields a completion");
+        let (k, staged) = q.take_ready().expect("ready");
+        q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
+        q.finish(k, staged.completion);
+
+        assert!(resolved(rx).unwrap_err().contains("superseded"));
+        assert_eq!(coalesced(&q, &key("A")), 1);
+        let (_, staged) = q.take_ready().expect("the newer put is queued");
+        assert_eq!(staged.value, EpicsValue::Long(2));
     }
 
     /// Boundary: tearing the queue down resolves every pending completion.
@@ -1138,7 +1254,7 @@ mod tests {
         assert!(!q.is_idle(), "staged but not run");
         let (k, _) = q.take_ready().expect("ready");
         assert!(!q.is_idle(), "in flight");
-        q.finish(k);
+        q.finish(k, None);
         assert!(q.is_idle());
         assert_eq!(q.completed_count(), 1);
     }
@@ -1187,7 +1303,7 @@ mod tests {
             .expect("Async put yields a completion");
         drop(old);
 
-        q.finish(k);
+        q.finish(k, None);
         assert!(q.take_ready().is_none(), "the restaged value is dropped");
         assert!(q.is_idle());
         assert!(resolved(rx).unwrap_err().contains("removed"));

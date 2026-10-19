@@ -233,6 +233,14 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/qtime_tag_monitor_serves_the_raw_stamp.rs",
     ),
     ("epics-ca-rs", "tests/rate_limit_parity.rs"),
+    (
+        "epics-ca-rs",
+        "tests/refused_put_callback_answers_after_its_process.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/remote_async_put_completes_on_the_records_band.rs",
+    ),
     ("epics-ca-rs", "tests/rsrv_error_ctx_is_the_record_name.rs"),
     ("epics-ca-rs", "tests/rsrv_error_frame_matches_softioc.rs"),
     ("epics-ca-rs", "tests/scalar_string_write_needs_a_nul.rs"),

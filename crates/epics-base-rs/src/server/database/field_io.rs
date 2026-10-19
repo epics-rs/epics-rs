@@ -1,7 +1,9 @@
 use crate::error::{CaError, CaResult};
 use crate::server::event_queue::PostBurst;
 use crate::server::recgbl::PutReport;
-use crate::server::record::{AfterGate, PreparedCommonLink, PreparedLink, RecordInstance};
+use crate::server::record::{
+    AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordInstance,
+};
 use crate::server::snapshot::Snapshot;
 use crate::types::{EpicsValue, PvString, RecordName};
 
@@ -1282,7 +1284,8 @@ impl<'a, 'h> HeldPuts<'a, 'h> {
                 &mut parses,
                 &mut tail,
             )
-            .map(|_| ());
+            .map(|_| ())
+            .map_err(PutRefused::into_error);
         self.owe(record, field, link_text, put, tail, parses)
     }
 
@@ -1589,20 +1592,6 @@ impl NotifyClaim<'_> {
         self.set
             .take()
             .expect("a claim is committed exactly once, by value")
-    }
-
-    /// Same commit, for the two paths that drive a process cycle and then hand
-    /// the client an `Err` instead of the completion: a rejected PROC
-    /// conversion and "Cause B", a rejected write on the notify route.
-    ///
-    /// Committing is not a courtesy here, it is C: `putCallback` returns
-    /// `didPut = 1` even when the write failed (`dbNotify.c:528-530`), so
-    /// `processNotifyCommon` reaches `doProcess`, assigns `precord->ppn = ppn`
-    /// and processes (`:243-256`). The record therefore owns the set and its
-    /// own completion releases it; releasing here as well would clear a slot
-    /// the cycle is using.
-    fn commit_without_waiting(self) {
-        let _ = self.commit();
     }
 }
 
@@ -2543,13 +2532,13 @@ impl PvDatabase {
     }
 
     /// Drop `held`'s gate, then settle the put made under it.
-    fn settle_held<T>(
+    fn settle_held<T, E: AsRef<CaError>>(
         &self,
         held: HeldRecord<'_>,
         link_text: bool,
-        put: CaResult<T>,
+        put: Result<T, E>,
         tail: PutTail,
-    ) -> CaResult<T> {
+    ) -> Result<T, E> {
         let HeldRecord {
             record,
             field,
@@ -3370,15 +3359,33 @@ impl PvDatabase {
     ///
     /// Acquires the record's advisory write gate
     /// (`dbScanLock` analogue) for the duration of the write.
+    ///
+    /// A refusal drops the completion of any process it still drove; a
+    /// caller that answers a put callback uses
+    /// [`Self::put_record_field_notify`].
     pub async fn put_record_field_from_ca(
         &self,
         record_name: impl AsRef<[u8]>,
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
+        self.put_record_field_notify(record_name, field, value)
+            .await
+            .map_err(PutRefused::into_error)
+    }
+
+    /// [`Self::put_record_field_from_ca`], keeping on a refusal the
+    /// completion of the process the put still drove: a caller that answers
+    /// a put callback answers the error when that settles, as C does.
+    pub async fn put_record_field_notify(
+        &self,
+        record_name: impl AsRef<[u8]>,
+        field: &str,
+        value: EpicsValue,
+    ) -> Result<crate::server::record::ProcessCompletion, PutRefused> {
         let record_name = record_name.as_ref();
         let held = self.lock_for_put(record_name, field, &value);
-        self.put_record_field_from_ca_already_locked(held, value)
+        self.put_record_field_notify_already_locked(held, value)
     }
 
     /// Variant for a caller that already owns the target
@@ -3389,9 +3396,20 @@ impl PvDatabase {
     /// dead-locking on its own `ManyRecordWriteGuard`.
     pub fn put_record_field_from_ca_already_locked(
         &self,
-        mut held: HeldRecord<'_>,
+        held: HeldRecord<'_>,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
+        self.put_record_field_notify_already_locked(held, value)
+            .map_err(PutRefused::into_error)
+    }
+
+    /// [`Self::put_record_field_from_ca_already_locked`], keeping a refused
+    /// put's completion as [`Self::put_record_field_notify`] does.
+    pub fn put_record_field_notify_already_locked(
+        &self,
+        mut held: HeldRecord<'_>,
+        value: EpicsValue,
+    ) -> Result<crate::server::record::ProcessCompletion, PutRefused> {
         let link_text = is_link_text(&value);
         let mut tail = PutTail::default();
         let put = self.put_record_field_from_ca_body(
@@ -3450,16 +3468,16 @@ impl PvDatabase {
     /// ([`Self::relink_cp_link`]), and the work its
     /// `special()` left ([`AfterGate`]). `link_text` is whether the value
     /// could be a link's text, so any other put asks no relink.
-    fn after_put_gate<T>(
+    fn after_put_gate<T, E: AsRef<CaError>>(
         &self,
         record_name: &[u8],
         field: &str,
         link_text: bool,
-        put: CaResult<T>,
+        put: Result<T, E>,
         tail: PutTail,
-    ) -> CaResult<T> {
+    ) -> Result<T, E> {
         if let Err(e) = &put {
-            e.emit_put_report();
+            e.as_ref().emit_put_report();
         }
         self.settle_put(record_name, field, link_text, put.is_ok(), tail);
         put
@@ -3754,7 +3772,8 @@ impl PvDatabase {
                 &mut held.parses,
                 &mut tail,
             )
-            .map(|_| ());
+            .map(|_| ())
+            .map_err(PutRefused::into_error);
         drop(scope);
         self.settle_held(held, link_text, put, tail)
     }
@@ -4115,6 +4134,29 @@ impl PvDatabase {
         }
     }
 
+    /// The process a refused put-callback still drives: a rejected PROC
+    /// conversion, or "Cause B", a rejected write to a pp field. C's
+    /// `putCallback` returns `didPut = 1` even when the write failed
+    /// (`dbNotify.c:528-530`), so `processNotifyCommon` assigns
+    /// `precord->ppn = ppn` and processes (`:243-256`): the claim is committed
+    /// to that cycle, and the client's error waits for `dbNotifyCompletion`
+    /// like any other answer.
+    fn process_refused_notify(
+        &self,
+        record_name: &[u8],
+        claim: Option<(
+            NotifyClaim<'_>,
+            Option<crate::runtime::sync::oneshot::Receiver<()>>,
+        )>,
+    ) -> crate::server::record::ProcessCompletion {
+        let parked = claim.map(|(c, rx)| (c.commit(), rx));
+        let _ = self.put_driven_process_already_locked(record_name);
+        parked.map_or(
+            crate::server::record::ProcessCompletion::Sync,
+            parked_completion,
+        )
+    }
+
     /// The gate-held body of the whole CA field-put family — a `fn`, so
     /// nothing in it can suspend while the L1 gate is held. The gate is the
     /// caller's; see `acquire_put_gate`.
@@ -4126,7 +4168,7 @@ impl PvDatabase {
         notify_request: NotifyRequest,
         parses: &mut LinkPutParses,
         tail: &mut PutTail,
-    ) -> CaResult<crate::server::record::ProcessCompletion> {
+    ) -> Result<crate::server::record::ProcessCompletion, PutRefused> {
         let want_notify = notify_request.wants_notify();
 
         // Get record Arc — alias-aware (epics-base PR #336) so a CA
@@ -4375,15 +4417,15 @@ impl PvDatabase {
                 // ⇒ C plain `dbPutField`, which returns before `dbProcess` on a
                 // non-zero `dbPut` status (`dbAccess.c:1263-1264`), so it must NOT
                 // process. Either way the client is answered `ECA_PUTFAIL`.
-                if want_notify {
-                    // The cycle runs under this put's wait-set, so the claim is
-                    // committed before it starts — see `commit_without_waiting`.
-                    if let Some((c, _rx)) = claim.take() {
-                        c.commit_without_waiting();
-                    }
-                    let _ = self.put_driven_process_already_locked(record_name);
-                }
-                return Err(e);
+                let completion = if want_notify {
+                    self.process_refused_notify(record_name, claim.take())
+                } else {
+                    crate::server::record::ProcessCompletion::Unprocessed
+                };
+                return Err(PutRefused {
+                    error: e,
+                    completion,
+                });
             }
             // A fire-and-forget caller parks nothing — C `dbPutField` on PROC
             // processes the record with no putNotify. A notify caller commits
@@ -4436,15 +4478,15 @@ impl PvDatabase {
             });
         report_add_record_refusal(common_link, record_name);
         if let Err(e) = put {
-            if want_notify && refused_processes {
-                // Same rule as the PROC refusal above: the cycle runs under
-                // the wait-set, so commit before driving it.
-                if let Some((c, _rx)) = claim.take() {
-                    c.commit_without_waiting();
-                }
-                let _ = self.put_driven_process_already_locked(record_name);
-            }
-            return Err(e);
+            let completion = if want_notify && refused_processes {
+                self.process_refused_notify(record_name, claim.take())
+            } else {
+                crate::server::record::ProcessCompletion::Unprocessed
+            };
+            return Err(PutRefused {
+                error: e,
+                completion,
+            });
         }
 
         // C `dbAccess.c::dbPutField:1263-1268` re-processes the
@@ -4467,9 +4509,8 @@ impl PvDatabase {
 
         if !should_process {
             // No processing cycle, so C never raises `putf` (and this put did
-            // not either). Report immediate (synchronous) completion to a
-            // WRITE_NOTIFY caller.
-            return Ok(crate::server::record::ProcessCompletion::Sync);
+            // not either), and a WRITE_NOTIFY caller's `callDone` runs inline.
+            return Ok(crate::server::record::ProcessCompletion::Unprocessed);
         }
 
         // Set up the put-notify wait-set BEFORE processing. The wait-set
@@ -4909,14 +4950,27 @@ fn put_answer(
         Option<crate::runtime::sync::oneshot::Receiver<()>>,
     )>,
     processed: CaResult<()>,
-) -> CaResult<crate::server::record::ProcessCompletion> {
-    use crate::server::record::ProcessCompletion;
+) -> Result<crate::server::record::ProcessCompletion, PutRefused> {
     match parked {
-        Some((notify, _)) if notify.completed() => Ok(ProcessCompletion::Sync),
-        Some((_, completion_rx)) => Ok(ProcessCompletion::from_signal(completion_rx)),
+        Some(parked) => Ok(parked_completion(parked)),
         None => processed
-            .map(|()| ProcessCompletion::Sync)
-            .map_err(|e| CaError::ProcessStatus(crate::error::DbStatus::of_error(&e))),
+            .map(|()| crate::server::record::ProcessCompletion::Sync)
+            .map_err(|e| CaError::ProcessStatus(crate::error::DbStatus::of_error(&e)).into()),
+    }
+}
+
+/// The completion of a put-callback whose process ran under `parked`.
+fn parked_completion(
+    (notify, completion_rx): (
+        std::sync::Arc<crate::server::record::NotifyWaitSet>,
+        Option<crate::runtime::sync::oneshot::Receiver<()>>,
+    ),
+) -> crate::server::record::ProcessCompletion {
+    use crate::server::record::ProcessCompletion;
+    if notify.completed() {
+        ProcessCompletion::Sync
+    } else {
+        ProcessCompletion::from_signal(completion_rx)
     }
 }
 

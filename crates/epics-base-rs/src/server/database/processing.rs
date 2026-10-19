@@ -11295,9 +11295,10 @@ impl ExternalCpProcess {
     pub async fn run_worker(&self, db: impl Fn() -> Option<PvDatabase>) {
         loop {
             self.wake.notified().await;
-            // C queues `CA_DBPROCESS` on a `dbCaTask` paused until `dbCaRun`.
+            // C queues `CA_DBPROCESS` on a `dbCaTask` paused until `dbCaRun`,
+            // behind every link's monitor queued by then.
             if let Some(db) = db() {
-                db.ca_run_reached().await;
+                db.ca_monitors_serviced().await;
             }
             self.run_pending(db().as_ref());
         }
@@ -11371,6 +11372,12 @@ impl ExternalCpProcess {
 /// `dbCaTask` services nothing queued before `dbCaRun`, and `dbCaRun`
 /// returns once every local link added before it has run its first event's
 /// process.
+///
+/// At `dbCaRun` each link's `CA_CONNECT` re-queues it at the work list's
+/// tail for its monitor, and a first event's `CA_DBPROCESS` is queued
+/// behind those (`dbCa.c:1209-1236`, `:1312-1319`), so no CP process runs
+/// before every link opened by then has its first event: the
+/// [`SubscribeClaim`]s.
 #[derive(Default)]
 pub(crate) struct CaRunGate {
     state: parking_lot::Mutex<GateState>,
@@ -11379,12 +11386,16 @@ pub(crate) struct CaRunGate {
     started: std::sync::atomic::AtomicBool,
     notify: crate::runtime::sync::Notify,
     settled: crate::runtime::sync::Notify,
+    /// Signalled by `dbCaRun` and when the last [`SubscribeClaim`] drops.
+    subscribed: crate::runtime::sync::Notify,
 }
 
 #[derive(Default)]
 struct GateState {
     running: bool,
     outstanding: usize,
+    /// Local links opened before `dbCaRun` still without a first event.
+    unsubscribed: usize,
 }
 
 impl CaRunGate {
@@ -11394,6 +11405,7 @@ impl CaRunGate {
         self.started
             .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
+        self.subscribed.notify_waiters();
         loop {
             let settled = self.settled.notified();
             let mut settled = std::pin::pin!(settled);
@@ -11437,6 +11449,48 @@ impl CaRunGate {
         state.outstanding -= 1;
         if state.outstanding == 0 {
             self.settled.notify_waiters();
+        }
+    }
+
+    /// A local link opened before `dbCaRun`, whose first event every CP
+    /// process waits for; none after it.
+    pub(crate) fn claim_subscription(self: &std::sync::Arc<Self>) -> Option<SubscribeClaim> {
+        let mut state = self.state.lock();
+        if state.running {
+            return None;
+        }
+        state.unsubscribed += 1;
+        Some(SubscribeClaim(self.clone()))
+    }
+
+    /// `dbCaRun` has been called and every link opened before it has its
+    /// first event. Never returns to false.
+    pub(crate) async fn monitors_serviced(&self) {
+        loop {
+            let subscribed = self.subscribed.notified();
+            let mut subscribed = std::pin::pin!(subscribed);
+            subscribed.as_mut().enable();
+            {
+                let state = self.state.lock();
+                if state.running && state.unsubscribed == 0 {
+                    return;
+                }
+            }
+            subscribed.await;
+        }
+    }
+}
+
+/// One local link's monitor not yet serviced: dropped once its first event
+/// is taken, or when the link ends without one.
+pub(crate) struct SubscribeClaim(std::sync::Arc<CaRunGate>);
+
+impl Drop for SubscribeClaim {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.unsubscribed -= 1;
+        if state.unsubscribed == 0 {
+            self.0.subscribed.notify_waiters();
         }
     }
 }

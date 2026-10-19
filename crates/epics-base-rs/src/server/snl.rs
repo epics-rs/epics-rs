@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::CaResult;
 use crate::runtime::task::BlockingBridge;
 use crate::server::database::{PvDatabase, parse_pv_name};
-use crate::server::record::{ProcessCompletion, ambient_write_origin_scope};
+use crate::server::record::{ProcessCompletion, PutRefused, ambient_write_origin_scope};
 use crate::types::EpicsValue;
 
 /// Start `run` as a task once the database has finished its PINI pass.
@@ -238,7 +238,7 @@ async fn serve(
                 let put = {
                     let held = db.lock_for_put(record, field, &value);
                     let _origin = ambient_write_origin_scope(origin);
-                    db.put_record_field_from_ca_already_locked(held, value)
+                    db.put_record_field_notify_already_locked(held, value)
                 };
                 let done = done.clone();
                 let finish = move || {
@@ -253,8 +253,9 @@ async fn serve(
                         let _ = done.send(name);
                     }
                 };
-                match put {
-                    Ok(ProcessCompletion::Async(rx)) => {
+                // A refused put still answers when the process it drove ends.
+                match PutRefused::outcome(put).0 {
+                    ProcessCompletion::Async(rx) => {
                         crate::runtime::task::spawn_background(
                             crate::runtime::task::CallbackPriority::Medium,
                             async move {
@@ -677,6 +678,32 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
         let _ = reset.await;
         assert_eq!(&*q.completion().await, "B");
+    }
+
+    /// A refused put whose record still processes (calcout's `A` is pp,
+    /// `ODLY` holds the process) completes when that process does: C's
+    /// callback comes from `dbNotifyCompletion` (`dbNotify.c:528-530`).
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_sync_put_waits_for_the_process_it_started() {
+        let (db, _q) = circuit().await;
+        db.add_record(
+            "C",
+            Box::new(crate::server::records::calcout::CalcoutRecord::default()),
+        )
+        .await
+        .unwrap();
+        db.put_record_field_from_ca("C", "ODLY", EpicsValue::Double(0.3))
+            .await
+            .unwrap();
+        let q = PutQueue::new(&db, "ss");
+        let a = q.pv("a", "C.A");
+        let started = std::time::Instant::now();
+        let _ = a.put_sync(EpicsValue::String("nope".into())).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "answered {:?} into C's delay",
+            started.elapsed()
+        );
     }
 
     #[epics_macros_rs::epics_test]

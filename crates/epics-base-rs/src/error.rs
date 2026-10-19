@@ -173,6 +173,14 @@ pub enum CaError {
     ProcessStatus(DbStatus),
 }
 
+/// Lets a put's settle path take a bare [`CaError`] or one carried by a
+/// refusal (`PutRefused`).
+impl AsRef<CaError> for CaError {
+    fn as_ref(&self) -> &CaError {
+        self
+    }
+}
+
 impl CaError {
     /// A process frame's error as a put-callback sees it: `dbNotify` never
     /// reads `dbProcess`'s status (`dbNotify.c:261`), so it is no error.

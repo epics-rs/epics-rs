@@ -234,6 +234,14 @@ impl Delivery {
         }
     }
 
+    /// C `throttled(pArray)` for an output that is not an NDArray
+    /// (NDPluginPva.cpp:99-108): takes the array's bytes from the same
+    /// bucket `endProcessCallbacks` uses, and counts a refusal in
+    /// DroppedOutputArrays.
+    pub(super) fn throttled(&self, array: &NDArray) -> bool {
+        !self.state.lock().throttle_ok(array)
+    }
+
     /// G7: a MaxByteRate change resets the output throttler (C++
     /// writeFloat64 NDPluginDriver.cpp:788-790).
     pub(super) fn set_max_byte_rate(&self, rate: f64) {

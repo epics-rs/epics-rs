@@ -823,6 +823,10 @@ pub struct HandOn {
 }
 
 impl HandOn {
+    fn throttled(&self, array: &NDArray) -> bool {
+        self.delivery.throttled(array)
+    }
+
     /// Deliver `array` with what `attributes` reads when NDArrayCallbacks
     /// is on (NDPluginDriver.cpp:289); returns the counters C sets there.
     fn frame(
@@ -886,6 +890,14 @@ impl PortPost {
             set: Vec::new(),
             view: attributes.and_then(PluginAttributes::view),
         }
+    }
+
+    /// C `NDPluginDriver::throttled`, for a plugin whose output is not an
+    /// NDArray and so is not throttled by `endProcessCallbacks`
+    /// (NDPluginPva.cpp:97-99). A refusal is counted in
+    /// DroppedOutputArrays.
+    pub fn throttled(&self, array: &NDArray) -> bool {
+        self.hand_on.as_ref().is_some_and(|h| h.throttled(array))
     }
 }
 

@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PortPost, ProcessResult};
+use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
 use epics_bridge_rs::qsrv::PvaPvHandle;
@@ -81,6 +82,21 @@ impl NDPluginProcess for PvaProcessor {
     const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        // NDPluginPvxs.cpp:79-89 counts the drop but still posts, for want of
+        // Pva's `else`; both skip the post here.
+        if PortPost::of(None).throttled(array) {
+            return ProcessResult {
+                trace: vec![(
+                    TraceMask::WARNING,
+                    format!(
+                        "{}::processCallbacks maximum byte rate exceeded, dropped array uniqueId={}\n",
+                        self.plugin_type, array.unique_id
+                    ),
+                )],
+                counted: false,
+                ..ProcessResult::forward(array, vec![])
+            };
+        }
         let payload = ndarray_to_pv_field(array);
 
         // Regression.
@@ -804,6 +820,79 @@ mod tests {
             codec.get_field("name"),
             Some(&PvField::Scalar(ScalarValue::String("lz4".into()))),
             "the served snapshot must be the compressed frame"
+        );
+    }
+
+    /// C skips `m_record->update` for a frame `throttled()` refuses, counts
+    /// it in DroppedOutputArrays and takes it back off ArrayCounter
+    /// (NDPluginPva.cpp:99-115).
+    #[test]
+    fn a_throttled_frame_is_not_posted() {
+        use ad_core_rs::plugin::runtime::create_plugin_runtime;
+        use ad_core_rs::plugin::wiring::WiringRegistry;
+
+        let processor = PvaProcessor::new("TEST:PvaThrottle:Image".into());
+        let pv = processor.handle();
+        let pool = NDArrayPool::new(1_000_000);
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("PVA_THROTTLE").unwrap(),
+            processor,
+            pool.max_memory(),
+            10,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle().clone();
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        // One 16-byte frame fills the bucket; the refill over the run is
+        // a fraction of a byte.
+        port.write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 16.0)
+            .unwrap();
+        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+
+        // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — passes on the exec
+        // backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+        // ad-plugins-rs --all-features a_throttled_frame_is_not_posted`); the
+        // runtime is the test's own, built to await `publish`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let driver = ad_core_rs::ndarray_pool::DriverPool::standalone(0);
+        for id in 1..=3 {
+            let mut frame = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+            frame.unique_id = id;
+            rt.block_on(
+                handle
+                    .array_sender()
+                    .publish(driver.alloc_copy(&frame).unwrap()),
+            );
+        }
+
+        let dropped = handle.plugin_params.dropped_output_arrays;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while port.read_int32_blocking(dropped, 0).ok() != Some(2)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(port.read_int32_blocking(dropped, 0).unwrap(), 2);
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .unwrap(),
+            1
+        );
+        let Some(PvField::Structure(served)) = pv.current_value() else {
+            panic!("nothing posted");
+        };
+        assert_eq!(
+            served.get_field("uniqueId"),
+            Some(&PvField::Scalar(ScalarValue::Int(1)))
         );
     }
 

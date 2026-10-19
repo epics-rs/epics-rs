@@ -158,6 +158,24 @@ pub fn link_put_convert(
 ) -> Result<EpicsValue, String> {
     use crate::types::c_parse::{self, Converted, NumericField};
     let nelements = nelements as usize;
+    // A string put to a DBR_ENUM channel goes as one DBR_STRING, cut by
+    // `cvt_st_st`, for the server to resolve (`dbCa.c:561-575`,
+    // `dbFastLinkConv.c:74-88`).
+    if native == crate::types::DbFieldType::Enum {
+        let first = match &value {
+            EpicsValue::String(s) => Some(s.as_bytes()),
+            EpicsValue::StringArray(a) => a.first().map(|s| s.as_bytes()),
+            _ => None,
+        };
+        if let Some(bytes) = first {
+            // `strncpy` into MAX_STRING_SIZE (40) less the NUL.
+            let bytes = &bytes[..bytes.len().min(39)];
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            return Ok(EpicsValue::String(crate::types::PvString::from_bytes(
+                &bytes[..end],
+            )));
+        }
+    }
     if let Some(row) = NumericField::of(native) {
         let field = String::from_utf8_lossy(name);
         let texts = match &value {
@@ -931,6 +949,24 @@ mod tests {
             conv(EpicsValue::Double(2.5), T::Long, 1),
             Ok(EpicsValue::Long(2))
         );
+    }
+
+    /// Boundary: a string to an enum channel stays one string, the first
+    /// element of an array, cut to 39 bytes as `cvt_st_st` cuts it.
+    #[test]
+    fn link_put_convert_sends_a_string_to_an_enum_channel_as_one_string() {
+        use crate::types::{DbFieldType as T, PvString};
+        let conv = |v| link_put_convert(b"RMT", v, T::Enum, 1);
+        let s = |t: &str| EpicsValue::String(t.into());
+        assert_eq!(conv(s("two")), Ok(s("two")));
+        assert_eq!(
+            conv(EpicsValue::StringArray(
+                ["one", "two"].iter().map(|&t| PvString::from(t)).collect()
+            )),
+            Ok(s("one"))
+        );
+        assert_eq!(conv(s(&"x".repeat(45))), Ok(s(&"x".repeat(39))));
+        assert_eq!(conv(EpicsValue::Long(2)), Ok(EpicsValue::Enum(2)));
     }
 
     struct StubLset;

@@ -1262,9 +1262,16 @@ impl LinkSet for CaLinkResolver {
             Ok(value) => value,
             Err(e) => return (LinkPutDone::Callback, Err(e)),
         };
+        // Sent under the converted value's own type: the native one, or
+        // DBR_STRING for a string put to an enum channel.
+        let dbr_type = value.dbr_type() as u16;
         let issued = match op {
-            LinkPutOp::Plain => link.channel.put_nowait(&value).await.map(|()| None),
-            LinkPutOp::Async => link.channel.put_callback(&value).map(Some),
+            LinkPutOp::Plain => link
+                .channel
+                .put_as_dbr_nowait(dbr_type, &value)
+                .await
+                .map(|()| None),
+            LinkPutOp::Async => link.channel.put_as_dbr_callback(dbr_type, &value).map(Some),
         };
         match issued {
             Err(e) => (LinkPutDone::NotIssued, Err(e.to_string())),

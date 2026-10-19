@@ -2855,12 +2855,32 @@ impl CaChannel {
         value: &EpicsValue,
     ) -> CaResult<impl std::future::Future<Output = CaResult<()>> + Send + 'static> {
         let (ioid, reply_rx) = self.issue_write_notify(value)?;
+        Ok(self.write_completion(ioid, reply_rx))
+    }
+
+    /// [`Self::put_callback`] under an explicit DBR wire type, as
+    /// [`Self::put_as_dbr_with_timeout`] sends it.
+    pub fn put_as_dbr_callback(
+        &self,
+        dbr_type: u16,
+        value: &EpicsValue,
+    ) -> CaResult<impl std::future::Future<Output = CaResult<()>> + Send + 'static> {
+        let (ioid, reply_rx) = self.issue_write_notify_as(dbr_type, value)?;
+        Ok(self.write_completion(ioid, reply_rx))
+    }
+
+    /// The server's answer to write `ioid`, with no deadline.
+    fn write_completion(
+        &self,
+        ioid: u32,
+        reply_rx: oneshot::Receiver<CaResult<()>>,
+    ) -> impl std::future::Future<Output = CaResult<()>> + Send + 'static {
         let writes = self.in_flight.writes.clone();
-        Ok(async move {
+        async move {
             let result = reply_rx.await;
             writes.remove(&ioid);
             result.map_err(|_| CaError::Shutdown)?
-        })
+        }
     }
 
     /// Register a write waiter and send `value` as a native-typed
@@ -2946,6 +2966,21 @@ impl CaChannel {
         value: &EpicsValue,
         timeout: Duration,
     ) -> CaResult<()> {
+        let (ioid, reply_rx) = self.issue_write_notify_as(dbr_type, value)?;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// Register a write waiter and send `value` under `dbr_type` as a
+    /// `CA_PROTO_WRITE_NOTIFY`; the caller owns the waiter's removal.
+    fn issue_write_notify_as(
+        &self,
+        dbr_type: u16,
+        value: &EpicsValue,
+    ) -> CaResult<(u32, oneshot::Receiver<CaResult<()>>)> {
         let snap = self.snapshot()?;
         let count = value.count() as u32;
         validate_put_count(&snap, count)?;
@@ -2960,12 +2995,7 @@ impl CaChannel {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
-
-        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
-        self.in_flight.writes.remove(&ioid);
-        result
-            .map_err(|_| CaError::Timeout)?
-            .map_err(|_| CaError::Shutdown)?
+        Ok((ioid, reply_rx))
     }
 
     /// Fire-and-forget variant of [`Self::put_as_dbr_with_timeout`] —

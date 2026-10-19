@@ -313,6 +313,25 @@ fn all_threads_at<T>(level: i32, f: impl FnOnce() -> T) -> (T, Vec<String>) {
     (out, bus_lines(&capture.take()))
 }
 
+/// [`all_threads`] through the first line that starts with `last`: a
+/// handler's closing debug line comes after the callback `f` waits for.
+fn all_threads_through<T>(last: &str, f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    set_stream_msg_time_stamped(0);
+    let capture = capture_process_stderr();
+    set_stream_debug(1);
+    let out = f();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut bytes = capture.take();
+    while !bus_lines(&bytes).iter().any(|l| l.starts_with(last))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+        bytes.extend(capture.take());
+    }
+    set_stream_debug(0);
+    (out, bus_lines(&bytes))
+}
+
 /// Attach "rec" to `portname` with the debug lines captured.
 fn attach(client: &Arc<dyn Client>, portname: &str) -> (Option<bus::BusInterface>, Vec<String>) {
     set_stream_msg_time_stamped(0);
@@ -2096,11 +2115,14 @@ fn async_input_prints_what_c_prints() {
     let (client, calls) = rec_terminated("rec", Some(b"\r"), None);
     let (bus, _) = attach(&client, "IR");
     let bus = bus.unwrap();
-    let ((), lines) = all_threads(|| {
-        assert!(bus.bus().supports_async_read());
-        assert!(bus.bus().read_request(1000, 100, 0, true));
-        assert_eq!(reads_until_end(&calls), [read(Success, b"1.5\r")]);
-    });
+    let ((), lines) = all_threads_through(
+        "AsynDriverInterface::asynReadHandler(rec) readMore=",
+        || {
+            assert!(bus.bus().supports_async_read());
+            assert!(bus.bus().read_request(1000, 100, 0, true));
+            assert_eq!(reads_until_end(&calls), [read(Success, b"1.5\r")]);
+        },
+    );
     assert_eq!(of(&lines, &["asynReadHandler"]), oracle("intr"));
     assert_eq!(errors(&lines), Vec::<&str>::new());
 }

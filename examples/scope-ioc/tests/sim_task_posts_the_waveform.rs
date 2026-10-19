@@ -41,9 +41,11 @@ async fn a_running_simulation_posts_the_waveform() {
         .write_float64(idx.p_noise_amplitude, 0, 0.5)
         .await
         .unwrap();
+    // Before the run write: its notify can wake the task to stamp and post
+    // before that write's await returns.
+    let started = std::time::SystemTime::now();
     handle.write_int32(idx.p_run, 0, 1).await.unwrap();
 
-    let started = std::time::SystemTime::now();
     let (posted, stamp) = epics_base_rs::runtime::task::timeout(Duration::from_secs(5), async {
         loop {
             let iv = rx.recv().await.expect("the port is alive");

@@ -301,6 +301,9 @@ struct Frame {
     save_offset3: i32,
 }
 
+/// The frames that fit C's default 8 MiB thread stack.
+const FRAME_STACK_MAX: usize = (8 << 20) / std::mem::size_of::<Frame>();
+
 /// match(): MATCH_MATCH, MATCH_NOMATCH, a negative MATCH_xxx for the
 /// backtracking verbs, or a PCRE_ERROR_xxx.
 fn run_match(md: &mut Md, stack: &mut Vec<Frame>, eptr: usize, mstart: usize) -> i32 {
@@ -330,6 +333,10 @@ fn run_match(md: &mut Md, stack: &mut Vec<Frame>, eptr: usize, mstart: usize) ->
                     ..Frame::default()
                 };
                 f.ret = $ret;
+                if stack.len() == stack.capacity() {
+                    let more = stack.capacity().max(4).min(FRAME_STACK_MAX - stack.len());
+                    stack.reserve_exact(more);
+                }
                 stack.push(std::mem::replace(&mut f, child));
                 pc = Pc::TailRecurse;
                 continue 'run;
@@ -339,7 +346,11 @@ fn run_match(md: &mut Md, stack: &mut Vec<Frame>, eptr: usize, mstart: usize) ->
             ($v:expr) => {{
                 let v = $v;
                 match stack.pop() {
-                    None => return v,
+                    None => {
+                        #[cfg(test)]
+                        tests::HIGH_WATER.set(stack.capacity());
+                        return v;
+                    }
                     Some(parent) => {
                         f = parent;
                         rrc = v;
@@ -419,10 +430,10 @@ fn run_match(md: &mut Md, stack: &mut Vec<Frame>, eptr: usize, mstart: usize) ->
                 if count >= md.match_limit {
                     rreturn!(PCRE_ERROR_MATCHLIMIT);
                 }
-                // C recurses natively here and can overflow its own stack
-                // before rdepth reaches the limit; the heap frames get to
-                // the limit and return it instead.
-                if u64::from(f.rdepth) >= md.match_limit_recursion {
+                // C recurses on its 8 MiB stack and dies there long before
+                // MATCH_LIMIT_RECURSION; the frames stop at as many bytes.
+                if u64::from(f.rdepth) >= md.match_limit_recursion || stack.len() >= FRAME_STACK_MAX
+                {
                     rreturn!(PCRE_ERROR_RECURSIONLIMIT);
                 }
                 if md.match_function_type == MATCH_CBEGROUP {
@@ -2575,5 +2586,40 @@ pub fn pcre_exec(
         PCRE_ERROR_PARTIAL
     } else {
         PCRE_ERROR_NOMATCH
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::pcre::compile::pcre_compile2;
+
+    thread_local! {
+        /// The frame stack's capacity when the last match() returned.
+        pub(super) static HIGH_WATER: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// ^(a)*b nests a frame per 'a': past 8 MiB of frames the match stops
+    /// with RECURSIONLIMIT and never holds more, where MATCH_LIMIT_RECURSION
+    /// alone let it run to gigabytes.
+    #[test]
+    fn deep_match_stops_at_eight_mib_of_frames() {
+        let re = pcre_compile2(b"^(a)*b", 0, None).unwrap();
+        let subject = vec![b'a'; 1 << 20];
+        let rc = pcre_exec(
+            Some(&re),
+            Some(&subject),
+            subject.len() as i32,
+            0,
+            0,
+            None,
+            0,
+        );
+        assert_eq!(rc, PCRE_ERROR_RECURSIONLIMIT);
+        let bytes = HIGH_WATER.get() * std::mem::size_of::<Frame>();
+        assert!(bytes <= 8 << 20, "{bytes}");
+        assert!(bytes > 4 << 20, "{bytes}");
     }
 }

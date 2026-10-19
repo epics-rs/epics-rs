@@ -92,10 +92,59 @@ fn console_is_ours() -> bool {
 /// Framing only: which stream the bytes land on, and whether that stream has
 /// to be flushed afterwards, belong to [`Console`] — this is the step both of
 /// its arms share.
+///
+/// The bytes go out in one `write`, as glibc's `fprintf` to an unbuffered
+/// stream stages the whole conversion first. `write_fmt` on stderr writes each
+/// piece of the format separately, and a stdout line from another thread then
+/// lands inside the console line.
 fn write_console(out: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
     // C ignores `fprintf`'s return here too: a console that cannot be written
     // is not something an errlog line can report.
-    let _ = out.write_fmt(line);
+    let _ = out.write_all(StagedLine::of(line).bytes());
+}
+
+/// One console line formatted whole before it is written: on the stack, so a
+/// poster's immediate echo allocates nothing, and on the heap only past the
+/// stack buffer.
+struct StagedLine {
+    buf: [u8; 1024],
+    len: usize,
+    spill: Vec<u8>,
+}
+
+impl StagedLine {
+    fn of(line: std::fmt::Arguments<'_>) -> Self {
+        let mut staged = StagedLine {
+            buf: [0; 1024],
+            len: 0,
+            spill: Vec::new(),
+        };
+        let _ = std::fmt::Write::write_fmt(&mut staged, line);
+        staged
+    }
+
+    fn bytes(&self) -> &[u8] {
+        if self.spill.is_empty() {
+            &self.buf[..self.len]
+        } else {
+            &self.spill
+        }
+    }
+}
+
+impl std::fmt::Write for StagedLine {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.spill.is_empty() && self.len + s.len() <= self.buf.len() {
+            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+        } else {
+            if self.spill.is_empty() {
+                self.spill.extend_from_slice(&self.buf[..self.len]);
+            }
+            self.spill.extend_from_slice(s.as_bytes());
+        }
+        Ok(())
+    }
 }
 
 /// C's `pvt.console` and `pvt.ttyConsole` (`errlog.c:100-101`): the stream
@@ -2461,6 +2510,36 @@ mod tests {
         let mut bare = Vec::new();
         write_console(&mut bare, format_args!("dbConvertJSON: "));
         assert_eq!(bare, b"dbConvertJSON: ");
+    }
+
+    /// Every `write` call a stream receives.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl std::io::Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line is one `write`, past the stack buffer too, so no other writer
+    /// on the console's file can land between its pieces.
+    #[test]
+    fn a_console_line_is_one_write() {
+        for n in [7, 5000] {
+            let text = "x".repeat(n);
+            let mut out = Writes::default();
+            write_console(&mut out, format_args!("INFO  t: {text} n={n}\n"));
+            assert_eq!(
+                out.0,
+                [format!("INFO  t: {text} n={n}\n").into_bytes()],
+                "n={n}"
+            );
+        }
     }
 
     /// A file console for one test, taken back however the test leaves.

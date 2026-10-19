@@ -392,11 +392,9 @@ impl SwaitRecord {
 
     /// True for the link-NAME fields whose put re-classifies the PV status —
     /// C `special()` (swaitRecord.c:507-559) re-runs the search for any name in
-    /// `INAN`..`INLN`, `DOLN`, `OUTN`. `OUTN` is a common field, so its put is
-    /// not visible in `special()`; it is caught by `check_alarms` instead, the
-    /// same split calcout uses.
+    /// `INAN`..`INLN`, `DOLN`, `OUTN`.
     fn is_pv_name_field(name: &str) -> bool {
-        Self::inp_name_index(name).is_some() || name == "DOLN"
+        Self::inp_name_index(name).is_some() || matches!(name, "DOLN" | "OUTN")
     }
 
     /// Re-classify every PV name into its `menu(swaitINAV)` status and post the
@@ -616,12 +614,14 @@ impl Record for SwaitRecord {
         &mut self,
         field: &str,
         after: bool,
-        _common: &crate::server::record::CommonFields,
+        common: &crate::server::record::CommonFields,
     ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
         if Self::is_pv_name_field(field) {
+            // OUTN is stored in the common OUT slot.
+            self.out = common.text.out.as_bytes().into();
             self.refresh_link_status();
         }
         self.calc_post = field == "CALC";
@@ -694,13 +694,6 @@ impl Record for SwaitRecord {
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
-
-        // OUTN lives in the common fields, so a runtime re-point is invisible to
-        // `special()`. Catch it here — the same split calcout uses for its OUT.
-        if *self.out != *common.text.out.as_bytes() {
-            self.out = common.text.out.as_bytes().into();
-            self.refresh_link_status();
-        }
 
         // C `swaitRecord.c:409-410` — a failed `calcPerform` is
         // `recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)`. Consuming the flag

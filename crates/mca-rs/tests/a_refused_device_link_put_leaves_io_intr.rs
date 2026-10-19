@@ -191,11 +191,8 @@ fn a_refused_device_link_put_leaves_the_record_passive() {
     run(&shell, "dbpf AR.INP WF");
     assert_eq!((scan("AR"), pact("AR")), (PASSIVE.into(), CLEAR.into()));
 
-    // The instance's own `dbPut` entry takes the same `dsxt` refusal.
-    let an = db.get_record("AN").unwrap();
-    let put = an
-        .write()
-        .put_common_field("INP", EpicsValue::String("@z".into()));
+    // `dbPutField` without its process takes the same `dsxt` refusal.
+    let put = rt.block_on(db.put_pv_no_process("AN.INP", EpicsValue::String("@z".into())));
     assert!(put.is_err(), "{put:?}");
     assert_eq!(gf("AN.INP"), r#"DBF_STRING:         "@x""#);
     drop(shell);

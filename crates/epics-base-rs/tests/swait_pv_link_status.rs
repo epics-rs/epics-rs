@@ -15,7 +15,7 @@
 //! on DOLV; see `r9_76_dol_fetch_does_not_wait_for_the_classification_task` for
 //! why gating on it would be wrong.
 
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -179,13 +179,14 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
     w.put_field("DOLN", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
     w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
-    db.add_record("W", Box::new(w)).await.unwrap();
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    db.get_record("W")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
-        .unwrap();
+    // OUTN as the loader stores it (populates parsed_out).
+    db.add_loaded_record(
+        "W",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("SINK".into()))]),
+    )
+    .await
+    .unwrap();
     settle_until(&db, "W", "DOLV", PV_NC).await;
 
     assert_eq!(
@@ -226,13 +227,14 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
     w.put_field("DOLN", EpicsValue::String("DOLSRC".into()))
         .unwrap();
     w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
-    db.add_record("W", Box::new(w)).await.unwrap();
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    db.get_record("W")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
-        .unwrap();
+    // OUTN as the loader stores it (populates parsed_out).
+    db.add_loaded_record(
+        "W",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("SINK".into()))]),
+    )
+    .await
+    .unwrap();
     settle_until(&db, "W", "DOLV", PV_OK).await;
 
     assert_eq!(

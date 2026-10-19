@@ -2,7 +2,8 @@ use crate::error::{CaError, CaResult};
 use crate::server::event_queue::PostBurst;
 use crate::server::recgbl::PutReport;
 use crate::server::record::{
-    AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordInstance,
+    AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordCell, RecordInstance,
+    declared_field,
 };
 use crate::server::snapshot::Snapshot;
 use crate::types::{EpicsValue, PvString, RecordName};
@@ -160,17 +161,49 @@ fn refuse_no_mod(field: &str, tail: &mut PutTail) -> CaError {
 /// [`check_no_mod_in_db_put`] for a `dbPutField` body, which hands a link
 /// field to `dbPutFieldLink`: there C refuses a device without `dsxt` first,
 /// and a NOMOD link is removed before it is refused, both under the hold
-/// ([`gate_link`]).
+/// ([`gate_link`]). Any other field enters `dbPut`, whose
+/// [`check_not_noaccess`] comes first.
 fn check_no_mod_in_db_put_field(
     instance: &crate::server::record::RecordInstance,
     field: &str,
     at: &crate::server::record::record_instance::PutAddr,
+    value: &EpicsValue,
     tail: &mut PutTail,
 ) -> CaResult<()> {
+    check_not_noaccess(field, at, value, tail)?;
     if instance.refuses_link_put_under_hold(field) {
         return Ok(());
     }
     check_no_mod_in_db_put(instance, field, at, tail)
+}
+
+/// C `dbPut`'s `DBF_NOACCESS` refusal, the other half of `field_type >
+/// DBF_DEVICE` → `S_db_badDbrtype` (`dbAccess.c:1340-1347`). `dbPutField`
+/// hands only a link field to `dbPutFieldLink` (`:1261-1262`), so this field
+/// reaches the gate from every put entry, and ahead of the `SPC_NOMOD` every
+/// such field also carries.
+fn check_not_noaccess(
+    field: &str,
+    at: &crate::server::record::record_instance::PutAddr,
+    value: &EpicsValue,
+    tail: &mut PutTail,
+) -> CaResult<()> {
+    if at.noaccess() {
+        return Err(refuse_noaccess(field, value, tail));
+    }
+    Ok(())
+}
+
+/// The refusal half of [`check_not_noaccess`], out of line for
+/// [`refuse_link_field`]'s reason.
+#[cold]
+#[inline(never)]
+fn refuse_noaccess(field: &str, value: &EpicsValue, tail: &mut PutTail) -> CaError {
+    tail.report(PutReport::BadDbrtype {
+        dbr: value.dbr_code(),
+        field_type: crate::types::DbfCode::NoAccess,
+    });
+    CaError::BadDbrType(format!("dbPut: {field} is DBF_NOACCESS"))
 }
 
 /// C `dbPut`'s link-field refusal (`field_type > DBF_DEVICE` →
@@ -2554,6 +2587,25 @@ impl PvDatabase {
         }
     }
 
+    /// swait's `OUTN` is a `DBF_STRING` (`swaitRecord.dbd:158-165`), so no
+    /// link-field rule applies to its put, but the port keeps the name in the
+    /// OUT slot it dispatches the output through: the name a put stores is
+    /// the link it parses. Made under the hold from the converted value, so
+    /// every put route and request type stores; the relink takes no lock.
+    fn parse_outn_put(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        value: &EpicsValue,
+    ) -> Option<PreparedCommonLink> {
+        if field != "OUTN" || declared_field(rec.rdes().record_type, field).is_none() {
+            return None;
+        }
+        let mut common = PreparedCommonLink::for_put(field, value)?;
+        common.relink(|parsed, ftype| self.add_link(parsed, ftype));
+        Some(common)
+    }
+
     /// Drop `held`'s gate, then settle the put made under it.
     fn settle_held<T, E: AsRef<CaError>>(
         &self,
@@ -2967,16 +3019,19 @@ impl PvDatabase {
             .then(|| Self::link_before_put(&instance, field))
             .flatten();
         // Refused before `dbPutSpecial(paddr, 0)` returns: neither pass runs.
-        let pass0 = match &mut via {
-            PutVia::DbPut => check_not_link_field(field, at.field().desc, &value, tail)
-                .and_then(|()| check_no_mod_in_db_put(&instance, field, at, tail)),
-            PutVia::DbPutField { common, .. } => gate_link(&mut instance, field, common, at, tail),
-        }
-        .and_then(|()| {
-            let inst = &mut *instance;
-            inst.record.special(field, false, &inst.common)
-        })
-        .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
+        let pass0 = check_not_noaccess(field, at, &value, tail)
+            .and_then(|()| match &mut via {
+                PutVia::DbPut => check_not_link_field(field, at.field().desc, &value, tail)
+                    .and_then(|()| check_no_mod_in_db_put(&instance, field, at, tail)),
+                PutVia::DbPutField { common, .. } => {
+                    gate_link(&mut instance, field, common, at, tail)
+                }
+            })
+            .and_then(|()| {
+                let inst = &mut *instance;
+                inst.record.special(field, false, &inst.common)
+            })
+            .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);
             set_refused_processes(&mut via, rec, &instance, field);
@@ -3025,6 +3080,9 @@ impl PvDatabase {
                             PutVia::DbPutField { common, .. } => &mut **common,
                             PutVia::DbPut => &mut no_common,
                         };
+                        if common.is_none() {
+                            *common = self.parse_outn_put(rec, field, &v);
+                        }
                         put_common(&mut instance, field, v, common, &mut burst, tail)
                             .map(|r| common_result = r)
                     }
@@ -4272,7 +4330,7 @@ impl PvDatabase {
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route
             // ([`check_no_mod_in_db_put`]).
-            check_no_mod_in_db_put_field(&instance, &field, &at, tail)?;
+            check_no_mod_in_db_put_field(&instance, &field, &at, &value, tail)?;
         }
         let LinkPutParses {
             link,
@@ -4741,7 +4799,7 @@ impl PvDatabase {
                 // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
                 // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
                 // IPTR) writable, and dbCommon's with them.
-                check_no_mod_in_db_put_field(&instance, &field, &at, tail)?;
+                check_no_mod_in_db_put_field(&instance, &field, &at, &value, tail)?;
             }
             let LinkPutParses {
                 link,

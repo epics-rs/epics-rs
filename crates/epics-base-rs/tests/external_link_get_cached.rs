@@ -112,10 +112,11 @@ async fn add_ai_with_inp(db: &PvDatabase, name: &str, inp: &str) {
     db.add_record(name, Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(format!("{name}.INP"), EpicsValue::String(inp.into()))
+        .await
+        .unwrap();
     let rec = db.get_record(name).expect("just added");
     let mut inst = rec.write();
-    inst.put_common_field("INP", EpicsValue::String(inp.into()))
-        .unwrap();
     inst.common.udf = 0;
 }
 

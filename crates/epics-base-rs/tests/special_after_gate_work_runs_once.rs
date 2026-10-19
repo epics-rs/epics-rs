@@ -8,7 +8,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AfterGate, FieldDesc, ProcessOutcome, Record};
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue, PvString};
+
+/// A put reaches only a declared field, and a link class is declared, not
+/// served (`FieldDesc::new` derives it from the served `DBF_STRING`).
+static PROBE_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        declared_dbf: DbfCode::Outlink,
+        ..FieldDesc::new("OUT", DbFieldType::String, false)
+    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+];
 
 struct OutProbe {
     specials: Arc<AtomicUsize>,
@@ -37,7 +47,7 @@ impl Record for OutProbe {
         }
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        PROBE_FIELDS
     }
     fn special(
         &mut self,
@@ -95,28 +105,40 @@ async fn an_out_put_runs_special_once_and_its_work_once_after_the_gate() {
     db.put_pv_no_process("P.OUT", out("C")).await.unwrap();
     assert_eq!(counts(), (3, 3), "put_pv_no_process");
 
-    db.put_pv_and_post("P.OUT", out("D")).await.unwrap();
-    assert_eq!(counts(), (4, 4), "put_pv_and_post");
+    // `dbPut` refuses a link field before its special (`dbAccess.c`'s
+    // `dbPutFieldLink` is `dbPutField`'s alone).
+    let refused = |r: Result<(), CaError>, what: &str| {
+        assert!(matches!(r, Err(CaError::BadDbrType(_))), "{what}: {r:?}");
+    };
+    refused(
+        db.put_pv_and_post("P.OUT", out("D")).await,
+        "put_pv_and_post",
+    );
+    assert_eq!(counts(), (3, 3), "put_pv_and_post");
 
     let held = db.lock_for_put("P", "OUT", &out("E"));
     db.put_record_field_from_ca_no_notify_already_locked(held, out("E"))
         .unwrap();
     assert_eq!(
         counts(),
-        (5, 5),
+        (4, 4),
         "put_record_field_from_ca_no_notify_already_locked"
     );
 
     let held = db.lock_for_put("P", "OUT", &out("F"));
-    db.put_pv_already_locked(held, out("F")).unwrap();
-    assert_eq!(counts(), (6, 6), "put_pv_already_locked");
+    refused(
+        db.put_pv_already_locked(held, out("F")),
+        "put_pv_already_locked",
+    );
+    assert_eq!(counts(), (4, 4), "put_pv_already_locked");
 
     db.put_many_locked(&["P"], 2, |puts| {
         let p = puts.record(0).unwrap();
         puts.put_record_field_from_ca_no_notify(p, "OUT", out("G"))
             .unwrap();
-        puts.put_pv(p, "OUT", out("H")).unwrap();
-        assert_eq!(counts(), (8, 6), "the work waits for the gate");
+        puts.put_record_field_from_ca_no_notify(p, "OUT", out("H"))
+            .unwrap();
+        assert_eq!(counts(), (6, 4), "the work waits for the gate");
     });
-    assert_eq!(counts(), (8, 8), "put_many_locked runs it after");
+    assert_eq!(counts(), (6, 6), "put_many_locked runs it after");
 }

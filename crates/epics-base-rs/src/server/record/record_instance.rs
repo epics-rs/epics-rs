@@ -901,7 +901,7 @@ fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option
 }
 
 /// Coerce a db-loaded `String` for a numeric/menu **common** field to that
-/// field's canonical DBF type before [`RecordInstance::put_common_field`]
+/// field's canonical DBF type before `RecordInstance::put_common_field_prepared`
 /// dispatches on it.
 ///
 /// The db loader converts a record's own fields to their typed value
@@ -2961,6 +2961,10 @@ pub(crate) struct PutAddr {
     /// [`super::FieldDeclaration::field_is_dbaddr`]: `dbPut` takes its
     /// array arm whatever the request's count.
     dbaddr: bool,
+    /// C `field_type == DBF_NOACCESS` once `cvt_dbaddr` has run: declared
+    /// so ([`FieldDesc::unreadable`]) or carried by name alone
+    /// ([`RecordInstance::resolves_noaccess_name`]).
+    noaccess: bool,
     /// A write the faac1df1 change test watches: `cache_source`, or a
     /// `prop(YES)` field ([`RecordInstance::field_posts_property`]).
     watched: bool,
@@ -3023,7 +3027,9 @@ impl PutAddr {
             char_view: true,
             ..addr
         };
-        Some(Self::of(rec, field, addr, PutFn::General, udf))
+        // A name-only `DBF_NOACCESS` row is neither class `$` takes.
+        let at = Self::of(rec, field, addr, PutFn::General, udf);
+        (!at.noaccess).then_some(at)
     }
 
     fn of(rec: &RecordCell, field: &str, addr: FieldAddr, put: PutFn, udf: bool) -> Self {
@@ -3035,6 +3041,10 @@ impl PutAddr {
                 .desc
                 .is_some_and(|d| d.declared_special == super::record_trait::Special::DbAddr),
             no_mod: declared_no_mod(field, addr.desc),
+            noaccess: addr.desc.map_or_else(
+                || is_dbcommon_noaccess(field) || rdes.noaccess.contains(&field),
+                FieldDesc::unreadable,
+            ),
             watched: is_metadata_cache_source(field)
                 || RecordInstance::field_posts_property(addr.desc),
             cache_source: is_metadata_cache_source(field),
@@ -3065,6 +3075,13 @@ impl PutAddr {
     /// request's count.
     pub(crate) fn dbaddr(&self) -> bool {
         self.dbaddr
+    }
+
+    /// Whether the field is `DBF_NOACCESS`, which `dbPut` refuses as
+    /// `S_db_badDbrtype` on every entry.
+    #[inline(always)]
+    pub(crate) fn noaccess(&self) -> bool {
+        self.noaccess
     }
 
     /// Whether `dbPut` leaves this field's put-time post to the cycle.
@@ -5216,7 +5233,7 @@ struct RecordCold {
     /// back — a `caput dfanout.HOPR 10` sticks even though `dfanoutRecord.c`
     /// never touches HOPR. A Rust record models only the fields it has
     /// behaviour for, so a field it declares but never stores had nowhere for a
-    /// put to land: [`RecordInstance::put_common_field`]'s catch-all reported
+    /// put to land: `RecordInstance::put_common_field_prepared`'s catch-all reported
     /// `S_dbLib_fieldNotFound` and the client's put was refused, while a READ of
     /// the same field succeeded through `declared_default`. This map is that
     /// missing storage — one uniform mechanism for the whole family, not a
@@ -10034,12 +10051,11 @@ impl RecordInstance {
         self.record.implements_field(name)
     }
 
-    /// Set a common field value from a runtime `dbPut` (CA/PVA/`dbpf`/link).
-    /// Returns what scan index changes are needed.
-    ///
-    /// A `DBF_MENU` common field's string is converted by C's runtime
-    /// converter, `dbConvert.c::putStringMenu` — see `MenuBound::DbPut`.
-    pub fn put_common_field(
+    /// A runtime `dbPut` store with no NOMOD gate, for unit tests only: the
+    /// runtime put reaches the store through the database's gated put body
+    /// (`put_common_field_prepared`). Returns what scan index changes are needed.
+    #[cfg(test)]
+    pub(crate) fn put_common_field(
         &mut self,
         name: &str,
         value: EpicsValue,
@@ -10052,7 +10068,7 @@ impl RecordInstance {
     /// (`dbAccess.c::dbPutSpecial` SPC_SCAN, dbScan.c:236-248).
     ///
     /// Two callers reach it, and they are the two C sites that move a record
-    /// between scan lists: a `SCAN` put ([`Self::put_common_field`]) and the
+    /// between scan lists: a `SCAN` put (`Self::put_common_field_prepared`) and the
     /// simulation-mode scan swap (`recGblCheckSimm`, recGbl.c:427-437, which
     /// calls exactly the same `scanDelete`/`scanAdd` pair). Returns the delta
     /// for the scan-index owner (`PvDatabase::update_scan_index`) to apply once
@@ -10411,8 +10427,9 @@ impl RecordInstance {
     /// (`dbStaticRun.c::dbPutStringNum`; see `MenuBound::DbLoad`). It is what
     /// lets `field(SSCN,"65535")` — the menuScan "use SCAN" sentinel, out of
     /// the menu's 0-9 range — load, while `caput REC.SSCN 65535` is refused at
-    /// runtime exactly as C refuses it.
-    pub fn put_common_field_db_load(
+    /// runtime exactly as C refuses it. Crate-private: a store with no
+    /// runtime gate is only for a record no put can reach yet.
+    pub(crate) fn put_common_field_db_load(
         &mut self,
         name: &str,
         value: EpicsValue,
@@ -10753,10 +10770,16 @@ impl RecordInstance {
         // The put entries hand the declared spelling already; only another
         // spelling allocates, under the caller's hold.
         let name = upper_field(name);
-        // C's `dbPutString` at load runs no `special()`; only `dbPut` does.
+        // C `dbNameToAddr` finds only what the type's `.dbd` declares, so a
+        // `CommonFields` slot the type lacks (`bi.OUT`, `swait.OUT`,
+        // `histogram.INP`) is `S_dbLib_fieldNotFound`, as the read side has it.
+        if self.field_desc(&name).is_none() {
+            return Err(self.unknown_field_error(name.into_owned()));
+        }
+        // `special(name, false)` is the database put body's pass 0
+        // (`dbPutSpecial(paddr, 0)`), run once before this store.
         if matches!(bound, MenuBound::DbPut) {
             self.record.validate_put(&name, &value)?;
-            self.record.special(&name, false, &self.common)?;
         }
         // The db loader hands every common field to this path as a raw
         // `EpicsValue::String` (no per-field `FieldDesc` to parse against).
@@ -10910,11 +10933,6 @@ impl RecordInstance {
                     self.common.tpro = v;
                 }
             }
-            "BKPT" => {
-                if let EpicsValue::Char(v) = value {
-                    self.common.bkpt.set(v);
-                }
-            }
             "FLNK" => {
                 if let Some(link) = link {
                     std::mem::swap(&mut self.common.text.flnk, &mut link.text);
@@ -10922,14 +10940,6 @@ impl RecordInstance {
                 }
             }
             "INP" => {
-                // A record type whose C `.dbd` has no INP must refuse it, the
-                // way C's dbd does ("field not found" at load, record inert) —
-                // `histogram`'s input link is SVL, not INP
-                // (histogramRecord.dbd.pod:212). Without this the port accepts a
-                // `field(INP,...)` no C IOC can load.
-                if !self.record.declares_inp_link() {
-                    return Err(CaError::FieldNotFound("INP".to_string()));
-                }
                 if let Some(link) = link {
                     std::mem::swap(&mut self.common.text.inp, &mut link.text);
                     if !self.record_declares_field("INP") {
@@ -11044,24 +11054,6 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     self.common.text.asg = s.as_str_lossy().into_owned();
                 }
-            }
-            "ASL" => {
-                // C dbCommon.ASL is `epicsUInt32` in the .dbd but
-                // only ever 0 or 1; accept Char / Short / Long for
-                // the common put paths and clamp to {0, 1}.
-                // db_loader feeds every common field as
-                // `EpicsValue::String`; also accept that so a
-                // `.db` `field(ASL, "1")` directive isn't silently
-                // ignored at IOC load.
-                let n: i64 = match value {
-                    EpicsValue::Char(v) => v as i64,
-                    EpicsValue::Short(v) => v as i64,
-                    EpicsValue::Long(v) => v as i64,
-                    EpicsValue::Int64(v) => v,
-                    EpicsValue::String(s) => s.as_str_lossy().trim().parse().unwrap_or(0),
-                    _ => return Ok(CommonFieldPutResult::NoChange),
-                };
-                self.common.asl = if n != 0 { 1 } else { 0 };
             }
             "DESC" => {
                 if let EpicsValue::String(s) = value {
@@ -11249,14 +11241,9 @@ impl RecordInstance {
                     a.llsv = menu_ordinal_raw(&value);
                 }
             }
-            // swait-specific: OUTN is the output link name for swait records.
-            // Mirrors to common.text.out so the processing framework dispatches it.
+            // swait's OUTN, a `DBF_STRING` the port keeps in the OUT slot so the
+            // framework dispatches the output.
             "OUTN" => {
-                if self.record.record_type() != "swait" {
-                    // No OUTN field on any other record type — the same
-                    // `S_dbLib_fieldNotFound` the catch-all below reports.
-                    return Err(self.unknown_field_error(name.into_owned()));
-                }
                 if let Some(link) = link {
                     std::mem::swap(&mut self.common.text.out, &mut link.text);
                     // Bare OUT link is NPP — see the "OUT" arm.
@@ -11298,7 +11285,7 @@ impl RecordInstance {
     }
 
     /// The error C reports for a write to a field name that
-    /// [`Self::put_common_field`] does not own.
+    /// `Self::put_common_field_prepared` does not own.
     ///
     /// Two C outcomes, split by whether the name resolves at all:
     ///
@@ -18322,5 +18309,58 @@ record(stringout, "SOI") { field(OMSL, "closed_loop") field(DOL, "BAD MS")
             }
         }
         assert!(checked > 0);
+    }
+}
+
+/// `put_common_field`'s result is the scan-index move the database put applies.
+#[cfg(test)]
+mod scan_index_result_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+
+    #[test]
+    fn test_phas_change_returns_result() {
+        let rec = AiRecord::new(0.0);
+        let mut instance = RecordInstance::new("TEST", rec);
+        instance
+            .put_common_field("SCAN", EpicsValue::String("1 second".into()))
+            .unwrap();
+        let result = instance
+            .put_common_field("PHAS", EpicsValue::Short(5))
+            .unwrap();
+        assert!(matches!(
+            result,
+            CommonFieldPutResult::PhasChanged {
+                old_phas: 0,
+                new_phas: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_phas_change_passive_no_result() {
+        let rec = AiRecord::new(0.0);
+        let mut instance = RecordInstance::new("TEST", rec);
+        let result = instance
+            .put_common_field("PHAS", EpicsValue::Short(5))
+            .unwrap();
+        assert_eq!(result, CommonFieldPutResult::NoChange);
+    }
+
+    #[test]
+    fn test_scan_change_includes_phas() {
+        let rec = AiRecord::new(0.0);
+        let mut instance = RecordInstance::new("TEST", rec);
+        instance
+            .put_common_field("PHAS", EpicsValue::Short(3))
+            .unwrap();
+        let result = instance
+            .put_common_field("SCAN", EpicsValue::String("1 second".into()))
+            .unwrap();
+        match result {
+            CommonFieldPutResult::ScanChanged { phas, .. } => assert_eq!(phas, 3),
+            other => panic!("expected ScanChanged, got {:?}", other),
+        }
     }
 }

@@ -102,10 +102,8 @@ async fn r9_73_calcout_freezes_val_and_outputs_the_frozen_value() {
         .unwrap();
     c.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
     db.add_record("CO", Box::new(c)).await.unwrap();
-    db.get_record("CO")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
+    db.put_pv_no_process("CO.OUT", EpicsValue::String("SINK".into()))
+        .await
         .unwrap();
 
     process(&db, "CO").await;
@@ -166,10 +164,8 @@ async fn r9_73_acalcout_freezes_val_and_writes_no_output() {
         .unwrap();
     c.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
     db.add_record("AC", Box::new(c)).await.unwrap();
-    db.get_record("AC")
-        .unwrap()
-        .write()
-        .put_common_field("OUT", EpicsValue::String("SINK".into()))
+    db.put_pv_no_process("AC.OUT", EpicsValue::String("SINK".into()))
+        .await
         .unwrap();
 
     process(&db, "AC").await;

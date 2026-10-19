@@ -62,12 +62,10 @@ async fn completes_on(prio: i16) -> Vec<String> {
             .await
             .unwrap();
     }
-    {
-        let rec = db.get_record("AO").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("SINK".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("AO.FLNK", EpicsValue::String("SINK".into()))
+        .await
+        .unwrap();
+
     db.ioc_init().await;
     let pending: Pending = Arc::default();
     let passes = Arc::new(Mutex::new(Vec::new()));

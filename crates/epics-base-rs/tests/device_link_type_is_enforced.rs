@@ -251,17 +251,17 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         .await
         .unwrap();
 
-    let rec = database.get_record("AI:RT").unwrap();
-    let mut inst = rec.write();
-    let err = inst
-        .put_common_field("INP", EpicsValue::String("5".into()))
+    let err = database
+        .put_pv_no_process("AI:RT.INP", EpicsValue::String("5".into()))
+        .await
         .expect_err("an INST_IO device support cannot take a constant INP at runtime");
     assert!(
         err.to_string().contains("can't initialize link type"),
         "{err}"
     );
     assert_eq!(
-        inst.common.text.inp, "@instio parm",
+        database.get_record("AI:RT").unwrap().read().common.text.inp,
+        "@instio parm",
         "a refused put must leave the link exactly as it was — C's does"
     );
 }

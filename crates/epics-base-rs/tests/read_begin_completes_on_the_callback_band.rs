@@ -80,10 +80,8 @@ async fn completes_on(prio: i16) -> Vec<String> {
     db.add_record("SINK", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.get_record("AI")
-        .unwrap()
-        .write()
-        .put_common_field("FLNK", EpicsValue::String("SINK".into()))
+    db.put_pv_no_process("AI.FLNK", EpicsValue::String("SINK".into()))
+        .await
         .unwrap();
     db.ioc_init().await;
     let pending: Pending = Arc::default();

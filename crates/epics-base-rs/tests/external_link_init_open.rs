@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkSet, PvDatabase, RecordLoad};
 use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -105,25 +105,27 @@ impl LinkSet for CountingLset {
 }
 
 async fn add_ai(db: &PvDatabase, name: &str, inp: &str) {
-    db.add_record(name, Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("INP", EpicsValue::String(inp.into()))
-        .unwrap();
-    inst.common.udf = 0;
+    // As a `.db` loads it, so iocInit is what opens the link.
+    db.add_loaded_record(
+        name,
+        Box::new(AiRecord::new(0.0)),
+        RecordLoad::from_common_fields(vec![("INP".into(), EpicsValue::String(inp.into()))]),
+    )
+    .await
+    .unwrap();
+    db.get_record(name).expect("just added").write().common.udf = 0;
 }
 
 async fn add_ao(db: &PvDatabase, name: &str, out: &str) {
-    db.add_record(name, Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(out.into()))
-        .unwrap();
-    inst.common.udf = 0;
+    // As a `.db` loads it, so iocInit is what opens the link.
+    db.add_loaded_record(
+        name,
+        Box::new(AoRecord::new(0.0)),
+        RecordLoad::from_common_fields(vec![("OUT".into(), EpicsValue::String(out.into()))]),
+    )
+    .await
+    .unwrap();
+    db.get_record(name).expect("just added").write().common.udf = 0;
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -494,12 +496,12 @@ async fn external_forward_link_is_opened_at_init() {
     db.add_record("AI_FWD", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("ca://REMOTE:FWD.PROC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process(
+        "AI_FWD.FLNK",
+        EpicsValue::String("ca://REMOTE:FWD.PROC".into()),
+    )
+    .await
+    .unwrap();
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "an external FLNK must be staged at init");
@@ -531,12 +533,9 @@ async fn local_forward_link_stages_nothing() {
     db.add_record("AI_FWD_LOCAL", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD_LOCAL").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("FWD_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("AI_FWD_LOCAL.FLNK", EpicsValue::String("FWD_TGT".into()))
+        .await
+        .unwrap();
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 0, "a local FLNK resolves as a DB link");
@@ -568,12 +567,9 @@ async fn forward_link_never_registers_a_cp_holder() {
     db.add_record("AI_FWD_CP", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("AI_FWD_CP").expect("just added");
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("CP_SRC CP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("AI_FWD_CP.FLNK", EpicsValue::String("CP_SRC CP".into()))
+        .await
+        .unwrap();
 
     db.setup_cp_links().await;
     assert!(

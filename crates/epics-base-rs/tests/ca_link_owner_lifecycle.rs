@@ -71,11 +71,12 @@ async fn an_external_put_starts_no_worker() {
     )
     .await
     .unwrap();
+    db.put_pv_no_process("O.OUT", EpicsValue::String("ca://X".into()))
+        .await
+        .unwrap();
     {
         let rec = db.get_record("O").unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("ca://X".into()))
-            .unwrap();
         inst.common.udf = 0;
         inst.record
             .put_field("VAL", EpicsValue::Double(4.0))
@@ -83,8 +84,8 @@ async fn an_external_put_starts_no_worker() {
     }
     assert_eq!(
         db.setup_external_link_opens().await,
-        1,
-        "OUT is opened at init"
+        0,
+        "the OUT put staged the open, as dbCaAddLink does"
     );
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("O", &mut visited)

@@ -25,6 +25,8 @@
 //! `.VAL` and `.HIHI` are both listed in `calcRecord.c`'s switch, so both
 //! serve the record's unset `HOPR`/`LOPR` of 0/0.
 
+mod seeded;
+
 use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::{AlarmSeverity, RecordInstance};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
@@ -38,6 +40,7 @@ use epics_base_rs::server::records::sel::SelRecord;
 use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
 fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
     inst.snapshot_for_field_with(field, LinkBacking::none())
@@ -100,16 +103,18 @@ fn a_listed_val_class_field_keeps_the_records_own_limits() {
 /// would appear to route correctly while still reading the cache.
 #[test]
 fn an_unlisted_field_serves_nan_alarm_limits_not_the_records_bands() {
-    let mut inst = calc();
+    let rec = Seeded::new("T:CALC", Box::new(CalcRecord::new("0")));
     for (field, value) in [
         ("HIHI", EpicsValue::Double(90.0)),
         ("LOLO", EpicsValue::Double(10.0)),
         ("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16)),
         ("LLSV", EpicsValue::Short(AlarmSeverity::Major as i16)),
     ] {
-        inst.put_common_field(field, value)
+        rec.put(field, value)
             .unwrap_or_else(|e| panic!("put {field}: {e:?}"));
     }
+    let cell = rec.cell();
+    let inst = cell.read();
 
     // The cache now holds real bands, so VAL — listed at `calcRecord.c:255`
     // — serves them.

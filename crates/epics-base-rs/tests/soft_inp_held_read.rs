@@ -25,10 +25,11 @@ async fn ai_reading(db: &PvDatabase, name: &str, inp: &str) {
     db.add_record(name, Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(format!("{name}.INP"), EpicsValue::String(inp.into()))
+        .await
+        .unwrap();
     let rec = db.get_record(name).unwrap();
     let mut inst = rec.write();
-    inst.put_common_field("INP", EpicsValue::String(inp.into()))
-        .unwrap();
     inst.common.udf = 0;
 }
 

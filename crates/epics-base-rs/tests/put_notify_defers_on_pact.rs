@@ -549,12 +549,10 @@ async fn deleting_a_joined_record_ends_the_chain_put_notify() {
     db.add_record("SRC", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("ASY PP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC.OUT", EpicsValue::String("ASY PP".into()))
+        .await
+        .unwrap();
+
     db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("ASY2".into()))
         .await
         .unwrap();

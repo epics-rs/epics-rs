@@ -304,10 +304,11 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .await
         .unwrap();
     {
+        db.put_pv_no_process("CADST.INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
+            .await
+            .unwrap();
         let rec = db.get_record("CADST").expect("record exists");
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -373,10 +374,14 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .await
         .unwrap();
     {
+        db.put_pv_no_process(
+            "CALINK:CP:HOLDER.INP",
+            EpicsValue::String("CALINK:CP:SRC CP".into()),
+        )
+        .await
+        .unwrap();
         let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
-            .unwrap();
         inst.common.udf = 0;
         assert_eq!(
             inst.common.scan,

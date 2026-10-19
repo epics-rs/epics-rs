@@ -119,9 +119,8 @@ async fn add_holder(db: &PvDatabase, name: &str, inp: &str) -> Arc<AtomicUsize> 
     )
     .await
     .unwrap();
-    let rec = db.get_record(name).unwrap();
-    rec.write()
-        .put_common_field("INP", EpicsValue::String(inp.into()))
+    db.put_pv_no_process(format!("{name}.INP"), EpicsValue::String(inp.into()))
+        .await
         .unwrap();
     processes
 }

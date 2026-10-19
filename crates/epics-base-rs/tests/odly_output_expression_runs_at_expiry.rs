@@ -38,14 +38,13 @@ async fn calcout_with_ocal(db: &PvDatabase, name: &str, target: &str) {
     c.oopt = 0;
     c.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record(name, Box::new(c)).await.unwrap();
-    wire_out(db, name, target);
+    wire_out(db, name, target).await;
 }
 
-/// `OUT` is a common field, so it is set on the instance after `add_record`.
-fn wire_out(db: &PvDatabase, name: &str, target: &str) {
-    let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.put_common_field("OUT", EpicsValue::String(target.into()))
+/// `OUT` is a common field, so it is put through the database after `add_record`.
+async fn wire_out(db: &PvDatabase, name: &str, target: &str) {
+    db.put_pv_no_process(format!("{name}.OUT"), EpicsValue::String(target.into()))
+        .await
         .unwrap();
 }
 
@@ -137,7 +136,7 @@ async fn calcout_use_val_still_writes_at_expiry() {
     c.oopt = 0;
     c.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("CV", Box::new(c)).await.unwrap();
-    wire_out(&db, "CV", "TV");
+    wire_out(&db, "CV", "TV").await;
 
     db.put_pv_no_process("CV.A", EpicsValue::Double(2.0))
         .await

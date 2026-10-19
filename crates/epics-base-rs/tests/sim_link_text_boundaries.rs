@@ -192,14 +192,12 @@ async fn siol_override_store_text_follows_runtime_put() {
     )
     .await
     .unwrap();
-    {
-        let rec = db.get_record("OV_SIM").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("SIML", EpicsValue::String("SIM_ON".into()))
-            .unwrap();
-        inst.put_common_field("SIOL", EpicsValue::String("SRC_A".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("OV_SIM.SIML", EpicsValue::String("SIM_ON".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("OV_SIM.SIOL", EpicsValue::String("SRC_A".into()))
+        .await
+        .unwrap();
 
     process(&db, "OV_SIM").await;
     assert_eq!(

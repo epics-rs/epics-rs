@@ -65,12 +65,17 @@ async fn the_declared_tse_decides_whether_the_remote_time_survives() {
         db.add_record(name, Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.INP"),
+            EpicsValue::String("pva://REMOTE:PV".into()),
+        )
+        .await
+        .unwrap();
+        db.put_pv_no_process(format!("{name}.TSE"), EpicsValue::Short(tse))
+            .await
+            .unwrap();
         let rec = db.get_record(name).expect("record added");
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
-            .unwrap();
-        inst.put_common_field("TSE", EpicsValue::Short(tse))
-            .unwrap();
         inst.common.udf = 0;
     }
 

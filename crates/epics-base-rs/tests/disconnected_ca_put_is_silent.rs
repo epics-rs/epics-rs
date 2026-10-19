@@ -75,10 +75,11 @@ async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
         .await
         .unwrap();
     {
+        db.put_pv_no_process("R1.OUT", EpicsValue::String("ca://R2.PROC".into()))
+            .await
+            .unwrap();
         let rec = db.get_record("R1").unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("ca://R2.PROC".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
     db.process_record_with_links("R1", &mut ProcStack::new())

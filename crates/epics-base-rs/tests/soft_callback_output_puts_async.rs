@@ -101,10 +101,11 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64) {
         .await
         .unwrap();
     let rec = db.get_record(name).expect("just added");
-    let mut inst = rec.write();
-    inst.common.dtyp = "Async Soft Channel".into();
-    inst.put_common_field("OUT", EpicsValue::String(out.into()))
+    rec.write().common.dtyp = "Async Soft Channel".into();
+    db.put_pv_no_process(format!("{name}.OUT"), EpicsValue::String(out.into()))
+        .await
         .unwrap();
+    let mut inst = rec.write();
     inst.common.udf = 0;
     inst.record
         .put_field("VAL", EpicsValue::Double(val))

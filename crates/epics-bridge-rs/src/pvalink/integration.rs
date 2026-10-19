@@ -2546,15 +2546,15 @@ mod tests {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(epics_base_rs::server::record::ProcessOutcome::complete())
         }
-        fn get_field(&self, _name: &str) -> Option<EpicsValue> {
-            Some(EpicsValue::Double(0.0))
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            (name == "VAL").then_some(EpicsValue::Double(0.0))
         }
         fn put_field(
             &mut self,
-            _name: &str,
+            name: &str,
             _value: EpicsValue,
         ) -> epics_base_rs::error::CaResult<()> {
-            Ok(())
+            Err(epics_base_rs::error::CaError::FieldNotFound(name.into()))
         }
         fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
             &[]
@@ -3088,12 +3088,10 @@ mod tests {
         .await
         .unwrap();
         // Wire DEST.FLNK -> DOWNSTREAM.
-        {
-            let rec = db.get_record("DEST").expect("DEST exists");
-            let mut inst = rec.write();
-            inst.put_common_field("FLNK", EpicsValue::String("DOWNSTREAM".into()))
-                .expect("set FLNK");
-        }
+        db.put_pv_no_process("DEST.FLNK", EpicsValue::String("DOWNSTREAM".into()))
+            .await
+            .expect("set FLNK");
+
         // The forward links bind at iocInit, as C's do.
         db.ioc_init().await;
 
@@ -4725,20 +4723,31 @@ mod tests {
         );
     }
 
+    /// One `ao` per `(name, FLNK)`, loaded from `.db` text so the resolver
+    /// installed before iocInit is what opens each link.
+    async fn db_with_flnks(flnks: &[(&str, &str)]) -> Arc<PvDatabase> {
+        let text: String = flnks
+            .iter()
+            .map(|(name, flnk)| {
+                let flnk = flnk.replace('"', "\\\"");
+                format!("record(ao, \"{name}\") {{ field(FLNK, \"{flnk}\") }}\n")
+            })
+            .collect();
+        epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .register_link_type("pva", |_db| async { Vec::new() })
+            .db_string(&text, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0
+    }
+
     /// The STAT a record with `flnk` settles on, forwarding every 100 ms for
     /// 2 s to a PV no server has: long enough for the forward's link to
     /// open, so the refusal tested is the disconnected one.
     async fn forward_stat_toward_an_absent_pv(name: &str, flnk: &str) -> u16 {
-        use epics_base_rs::server::records::ao::AoRecord;
-        let db = Arc::new(PvDatabase::new());
-        db.add_record(name, Box::new(AoRecord::new(0.0)))
-            .await
-            .unwrap();
-        db.get_record(name)
-            .unwrap()
-            .write()
-            .put_common_field("FLNK", EpicsValue::String(flnk.into()))
-            .unwrap();
+        let db = db_with_flnks(&[(name, flnk)]).await;
         let _resolver = install_pvalink_resolver(&db).await;
         db.ioc_init().await;
         let mut stat = 0;
@@ -4809,19 +4818,13 @@ mod tests {
     #[epics_base_rs::epics_test]
     async fn forwards_sharing_a_channel_keep_their_own_retry() {
         use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
-        use epics_base_rs::server::records::ao::AoRecord;
-        let db = Arc::new(PvDatabase::new());
-        for (name, retry) in [("SRCA", true), ("SRCB", false), ("SRCC", true)] {
-            db.add_record(name, Box::new(AoRecord::new(0.0)))
-                .await
-                .unwrap();
-            let flnk = format!(r#"{{pva:{{pv:"ZZ:ABSENT:S", retry:{retry}}}}}"#);
-            db.get_record(name)
-                .unwrap()
-                .write()
-                .put_common_field("FLNK", EpicsValue::String(flnk.into()))
-                .unwrap();
-        }
+        let flnks = [("SRCA", true), ("SRCB", false), ("SRCC", true)].map(|(name, retry)| {
+            (
+                name,
+                format!(r#"{{pva:{{pv:"ZZ:ABSENT:S", retry:{retry}}}}}"#),
+            )
+        });
+        let db = db_with_flnks(&flnks.each_ref().map(|(n, f)| (*n, f.as_str()))).await;
         let _resolver = install_pvalink_resolver(&db).await;
         db.ioc_init().await;
         for _ in 0..20 {

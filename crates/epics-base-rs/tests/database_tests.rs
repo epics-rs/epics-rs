@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -41,11 +41,9 @@ async fn test_write_notify_follows_flnk() {
         db.add_record(name, Box::new(rec)).await.unwrap();
     }
 
-    if let Some(rec) = db.get_record("REC_A") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("REC_B".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("REC_A.FLNK", EpicsValue::String("REC_B".into()))
+        .await
+        .unwrap();
 
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
@@ -67,11 +65,9 @@ async fn test_inp_link_processing() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("DEST") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SOURCE".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("DEST.INP", EpicsValue::String("SOURCE".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DEST", &mut visited)
@@ -104,11 +100,9 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
     // Point INP at a record that doesn't exist. Soft Channel is the
     // default DTYP, so the read path runs through
     // `read_link_value_soft → get_pv("NO_SUCH_PV")` which returns Err.
-    if let Some(rec) = db.get_record("BROKEN") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("NO_SUCH_PV".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("BROKEN.INP", EpicsValue::String("NO_SUCH_PV".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("BROKEN", &mut visited)
@@ -167,10 +161,11 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
         inst.common.amsg = "src-msg".into();
     }
 
+    db.put_pv_no_process("DST.INP", EpicsValue::String("SRC NPP MS".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("DST") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC NPP MS".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -219,10 +214,11 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
         inst.common.amsg = "src-major".into();
     }
 
+    db.put_pv_no_process("DST.INP", EpicsValue::String("SRC NPP MSS".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("DST") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC NPP MSS".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -270,14 +266,17 @@ async fn test_out_link_ms_propagates_link_alarm_to_dest() {
     db.add_record("DST", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process("SRC.OUT", EpicsValue::String("DST PP MS".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(50.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("SRC") {
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("DST PP MS".into()))
-            .unwrap();
-        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
         inst.common.udf = 0;
     }
     if let Some(rec) = db.get_record("DST") {
@@ -329,15 +328,18 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
     db.add_record("DST", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(50.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+        .await
+        .unwrap();
+    // No MS-class modifier → NoMaximize.
+    db.put_pv_no_process("SRC.OUT", EpicsValue::String("DST PP".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("SRC") {
         let mut inst = rec.write();
-        // No MS-class modifier → NoMaximize.
-        inst.put_common_field("OUT", EpicsValue::String("DST PP".into()))
-            .unwrap();
-        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
         inst.common.udf = 0;
     }
     if let Some(rec) = db.get_record("DST") {
@@ -396,10 +398,11 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     db.add_record("PVADST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process("PVADST.INP", EpicsValue::String("pva://REMOTE:PV".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("PVADST") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:PV".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -457,10 +460,11 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     db.add_record("PVAQUIET", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process("PVAQUIET.INP", EpicsValue::String("pva://REMOTE:OK".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("PVAQUIET") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("pva://REMOTE:OK".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -556,10 +560,14 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     db.add_record("AO_PVAOUT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(
+        "AO_PVAOUT.OUT",
+        EpicsValue::String("pva://REMOTE:OUT".into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("AO_PVAOUT") {
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
-            .unwrap();
         inst.common.udf = 0;
         // Set VAL so process() has a value to drive out the OUT link.
         inst.record
@@ -610,10 +618,14 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
     db.add_record("AO_NOLSET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process(
+        "AO_NOLSET.OUT",
+        EpicsValue::String("pva://NOWHERE:PV".into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("AO_NOLSET") {
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("pva://NOWHERE:PV".into()))
-            .unwrap();
         inst.common.udf = 0;
         inst.record
             .put_field("VAL", EpicsValue::Double(1.0))
@@ -669,10 +681,14 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     // processing never observes a dropped channel; the test only
     // inspects the op captured at OUT-write time.
     let (tx, _rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    db.put_pv_no_process(
+        "AO_PVAOUT_NOTIFY.OUT",
+        EpicsValue::String("pva://REMOTE:OUT".into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("AO_PVAOUT_NOTIFY") {
         let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
-            .unwrap();
         inst.common.udf = 0;
         inst.record
             .put_field("VAL", EpicsValue::Double(7.0))
@@ -746,10 +762,14 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     }
     // Dest: MSS link to source. Subscribe to AMSG with ALARM mask
     // (C posts AMSG with stat_mask = DBE_ALARM on amsg-only change).
+    db.put_pv_no_process(
+        "DST_AMSG.INP",
+        EpicsValue::String("SRC_AMSG NPP MSS".into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("DST_AMSG") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC_AMSG NPP MSS".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -833,10 +853,14 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
         inst.common.amsg = "msg1".into();
     }
     // Dest: MSS link to source.
+    db.put_pv_no_process(
+        "DST_MASK.INP",
+        EpicsValue::String("SRC_MASK NPP MSS".into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("DST_MASK") {
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC_MASK NPP MSS".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -1181,11 +1205,9 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
     db.add_record("TGT", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("TGT") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC CP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("TGT.INP", EpicsValue::String("SRC CP".into()))
+        .await
+        .unwrap();
 
     calink_ioc::connect(&db).await;
 
@@ -1230,11 +1252,12 @@ async fn test_putf_propagates_through_db_out_link_to_passive_target() {
     db.add_record("PUTF_OUT_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("PUTF_OUT_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("PUTF_OUT_TGT PP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process(
+        "PUTF_OUT_SRC.OUT",
+        EpicsValue::String("PUTF_OUT_TGT PP".into()),
+    )
+    .await
+    .unwrap();
     // Target must be Passive for processTarget to run; AoRecord
     // defaults to Passive scan so no explicit set needed.
 
@@ -1289,11 +1312,9 @@ async fn test_putf_propagates_mid_cycle_via_async_target_out_link() {
     db.add_record("PROP_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("PROP_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("PROP_TGT PP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("PROP_SRC.OUT", EpicsValue::String("PROP_TGT PP".into()))
+        .await
+        .unwrap();
 
     // Drive CA put. SRC processes synchronously, OUT writes to TGT,
     // dispatches process; TGT returns AsyncPending so its process
@@ -1389,16 +1410,12 @@ async fn test_cycle_detection() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("CYCLE_A") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("CYCLE_B".into()))
-            .unwrap();
-    }
-    if let Some(rec) = db.get_record("CYCLE_B") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("CYCLE_A".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("CYCLE_A.FLNK", EpicsValue::String("CYCLE_B".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("CYCLE_B.FLNK", EpicsValue::String("CYCLE_A".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CYCLE_A", &mut visited)
@@ -1510,15 +1527,18 @@ async fn test_ao_ivoa_dont_drive() {
     ao.ivoa = 1;
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
-    if let Some(rec) = db.get_record("OUTPUT") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("TARGET".into()))
-            .unwrap();
-        inst.put_common_field("HIHI", EpicsValue::Double(100.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("OUTPUT.OUT", EpicsValue::String("TARGET".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("OUTPUT.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process(
+        "OUTPUT.HHSV",
+        EpicsValue::Short(AlarmSeverity::Invalid as i16),
+    )
+    .await
+    .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("OUTPUT", &mut visited)
@@ -1538,16 +1558,10 @@ async fn test_ao_ivoa_dont_drive() {
 /// back to `set_val` (VAL) — every other output record left OVAL/RVAL
 /// stale, so the soft-channel OUT writeback (which reads `OVAL.or(VAL)`)
 /// shipped the pre-IVOA value instead of IVOV.
-/// An `ASL` field value must land in `common.asl`. `db_loader::apply_fields`
-/// feeds every common field as `EpicsValue::String`; the ASL handler must
-/// parse string numerics or the directive is silently dropped at load.
-///
-/// NOT through `parse_db`: `ASL` is a per-FIELD `.dbd` attribute in C
-/// (`asl(ASL0)`), never a record field, so `field(ASL,"1")` in a `.db` is
-/// `ERROR: ai record 'ASLT:HIGH' doesn't have a field 'ASL'` on softIoc
-/// @`R7.0.10` — measured, and the port's loader now refuses it identically.
-/// The record-level `common.asl` the CA server and QSRV read is still real and
-/// still set programmatically, which is what this exercises.
+/// `ASL` is a per-FIELD `.dbd` attribute in C (`asl(ASL0)`), never a record
+/// field, so `field(ASL,"1")` is `ERROR: ai record 'ASLT:HIGH' doesn't have a
+/// field 'ASL'` on softIoc @`R7.0.10`. The load-API route refuses it too and
+/// leaves the record-level `common.asl` at its default.
 #[epics_macros_rs::epics_test]
 async fn test_db_load_records_asl_field() {
     use epics_base_rs::server::db_loader;
@@ -1564,23 +1578,15 @@ async fn test_db_load_records_asl_field() {
             Box::new(AiRecord::new(0.0));
         let mut common_fields = Vec::new();
         db_loader::apply_fields(&mut record, &fields, &mut common_fields).unwrap();
-        db.add_record(name, record).await.unwrap();
-        if let Some(rec) = db.get_record(name) {
-            let mut inst = rec.write();
-            for (n, v) in common_fields {
-                let _ = inst.put_common_field(&n, v);
-            }
-        }
+        let loaded = db
+            .add_loaded_record(name, record, RecordLoad::from_common_fields(common_fields))
+            .await;
+        assert_eq!(loaded.is_err(), name == "ASLT:HIGH", "{name}: {loaded:?}");
     }
 
-    let high = db.get_record("ASLT:HIGH").unwrap();
-    let low = db.get_record("ASLT:LOW").unwrap();
-    assert_eq!(
-        high.read().common.asl,
-        1,
-        "field(ASL, \"1\") must set ASL=1"
-    );
-    assert_eq!(low.read().common.asl, 0, "absent ASL defaults to 0");
+    for name in ["ASLT:HIGH", "ASLT:LOW"] {
+        assert_eq!(db.get_record(name).unwrap().read().common.asl, 0, "{name}");
+    }
 }
 
 #[epics_macros_rs::epics_test]
@@ -1597,15 +1603,15 @@ async fn test_ao_ivoa_set_to_ivov_writes_oval() {
     ao.ivov = 42.0;
     db.add_record("SRC", Box::new(ao)).await.unwrap();
 
-    if let Some(rec) = db.get_record("SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("TARGET".into()))
-            .unwrap();
-        inst.put_common_field("HIHI", EpicsValue::Double(1.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC.OUT", EpicsValue::String("TARGET".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut visited)
@@ -1680,15 +1686,18 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     //   CALC="A"    (same fields)      -> SEVR NO_ALARM, OUT target 0
     co.calc = "99.9".to_string();
     db.add_record("CO_SRC", Box::new(co)).await.unwrap();
-    if let Some(rec) = db.get_record("CO_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("OUT_TGT".into()))
-            .unwrap();
-        inst.put_common_field("HIHI", EpicsValue::Double(1.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("CO_SRC.OUT", EpicsValue::String("OUT_TGT".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("CO_SRC.HIHI", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process(
+        "CO_SRC.HHSV",
+        EpicsValue::Short(AlarmSeverity::Invalid as i16),
+    )
+    .await
+    .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("CO_SRC", &mut visited)
@@ -1758,13 +1767,15 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
     ai.siol = "SIM_VAL2".into();
     ai.sims = 1; // SIMM severity = MINOR
     db.add_record("SIM_AI2", Box::new(ai)).await.unwrap();
-    if let Some(rec) = db.get_record("SIM_AI2") {
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("SIM_AI2.HIHI", EpicsValue::Double(50.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process(
+        "SIM_AI2.HHSV",
+        EpicsValue::Short(AlarmSeverity::Major as i16),
+    )
+    .await
+    .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SIM_AI2", &mut visited)
@@ -2003,11 +2014,9 @@ async fn test_sim_mode_toggle() {
     ai.siol = "SIM_VAL".into();
     db.add_record("TEST_AI", Box::new(ai)).await.unwrap();
 
-    if let Some(rec) = db.get_record("TEST_AI") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("REAL_SRC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("TEST_AI.INP", EpicsValue::String("REAL_SRC".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TEST_AI", &mut visited)
@@ -2188,12 +2197,12 @@ async fn test_sdis_disable_skips_process() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("TARGET") {
-        let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("DISABLE_SW".into()))
-            .unwrap();
-        inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
-    }
+    db.put_pv_no_process("TARGET.SDIS", EpicsValue::String("DISABLE_SW".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TARGET.DISS", EpicsValue::Short(1))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
@@ -2250,12 +2259,12 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
         .unwrap();
 
     // Constant SDIS "1" — equal to the default DISV (1). C does NOT disable.
-    if let Some(rec) = db.get_record("TARGET") {
-        let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("1".into()))
-            .unwrap();
-        inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
-    }
+    db.put_pv_no_process("TARGET.SDIS", EpicsValue::String("1".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TARGET.DISS", EpicsValue::Short(1))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
@@ -2278,11 +2287,9 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
     db.add_record("SRC", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("TARGET") {
-        let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("SRC.VAL".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("TARGET.SDIS", EpicsValue::String("SRC.VAL".into()))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("TARGET", &mut visited)
         .await
@@ -2314,23 +2321,15 @@ async fn test_phas_scan_order() {
         .unwrap();
 
     for (name, phas) in &[("REC_C", 2i16), ("REC_A", 0), ("REC_B", 1)] {
-        if let Some(rec) = db.get_record(name) {
-            let mut inst = rec.write();
-            inst.put_common_field("PHAS", EpicsValue::Short(*phas))
-                .unwrap();
-            let result = inst
-                .put_common_field("SCAN", EpicsValue::String("1 second".into()))
-                .unwrap();
-            if let CommonFieldPutResult::ScanChanged {
-                old_scan,
-                new_scan,
-                phas: p,
-            } = result
-            {
-                drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p);
-            }
-        }
+        db.put_pv_no_process(format!("{name}.PHAS"), EpicsValue::Short(*phas))
+            .await
+            .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.SCAN"),
+            EpicsValue::String("1 second".into()),
+        )
+        .await
+        .unwrap();
     }
 
     let names = db.records_for_scan(ScanType::SEC1).await;
@@ -2344,10 +2343,9 @@ async fn test_disp_blocks_ca_put() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
 
     let result = db
         .put_record_field_from_ca("REC", "VAL", EpicsValue::Double(42.0))
@@ -2362,10 +2360,9 @@ async fn test_disp_allows_disp_write() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
 
     let result = db
         .put_record_field_from_ca("REC", "DISP", EpicsValue::Char(0))
@@ -2384,10 +2381,9 @@ async fn test_disp_bypassed_by_internal_put() {
         .await
         .unwrap();
 
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
 
     let result = db.put_pv("REC", EpicsValue::Double(42.0)).await;
     assert!(result.is_ok());
@@ -2415,11 +2411,9 @@ async fn test_proc_works_any_scan() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("SCAN", EpicsValue::String("1 second".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("REC.SCAN", EpicsValue::String("1 second".into()))
+        .await
+        .unwrap();
     let result = db
         .put_record_field_from_ca("REC", "PROC", EpicsValue::Char(1))
         .await;
@@ -2440,10 +2434,9 @@ async fn test_disp_blocks_proc_and_suppresses_processing() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
     let result = db
         .put_record_field_from_ca("REC", "PROC", EpicsValue::Char(1))
         .await;
@@ -2472,10 +2465,9 @@ async fn test_disp_gate_precedes_nomod_rejection() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
     let result = db
         .put_record_field_from_ca("REC", "PACT", EpicsValue::Char(1))
         .await;
@@ -2778,6 +2770,9 @@ async fn test_ivoa_dont_drive_skips_the_readback() {
         .await
         .unwrap();
     {
+        db.put_pv_no_process("LO_IVOA.HHSV", EpicsValue::Short(3))
+            .await
+            .unwrap();
         let rec = db.get_record("LO_IVOA").unwrap();
         let mut inst = rec.write();
         inst.common.dtyp = "MockDev".into();
@@ -2785,11 +2780,12 @@ async fn test_ivoa_dont_drive_skips_the_readback() {
             values: [10].into(),
         }));
         inst.record.put_field("IVOA", EpicsValue::Short(1)).unwrap();
-        // HIHI at INVALID: the readback cycle clears UDF first
-        // (devAsynInt32.c:631), so UDF_ALARM cannot be the source.
-        inst.put_common_field("HIHI", EpicsValue::Long(0)).unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(3)).unwrap();
     }
+    // HIHI at INVALID: the readback cycle clears UDF first
+    // (devAsynInt32.c:631), so UDF_ALARM cannot be the source.
+    db.put_pv_no_process("LO_IVOA.HIHI", EpicsValue::Long(0))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("LO_IVOA", &mut visited)
         .await
@@ -3000,40 +2996,22 @@ async fn test_phas_change_updates_scan_index() {
         .await
         .unwrap();
     for (name, phas) in &[("REC_A", 10i16), ("REC_B", 5)] {
-        if let Some(rec) = db.get_record(name) {
-            let mut inst = rec.write();
-            inst.put_common_field("PHAS", EpicsValue::Short(*phas))
-                .unwrap();
-            let result = inst
-                .put_common_field("SCAN", EpicsValue::String("1 second".into()))
-                .unwrap();
-            if let CommonFieldPutResult::ScanChanged {
-                old_scan,
-                new_scan,
-                phas: p,
-            } = result
-            {
-                drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p);
-            }
-        }
+        db.put_pv_no_process(format!("{name}.PHAS"), EpicsValue::Short(*phas))
+            .await
+            .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.SCAN"),
+            EpicsValue::String("1 second".into()),
+        )
+        .await
+        .unwrap();
     }
     let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_B", "REC_A"]);
 
-    if let Some(rec) = db.get_record("REC_A") {
-        let mut inst = rec.write();
-        let result = inst.put_common_field("PHAS", EpicsValue::Short(0)).unwrap();
-        if let CommonFieldPutResult::PhasChanged {
-            scan,
-            old_phas,
-            new_phas,
-        } = result
-        {
-            drop(inst);
-            db.update_scan_index("REC_A", scan, scan, old_phas, new_phas);
-        }
-    }
+    db.put_pv_no_process("REC_A.PHAS", EpicsValue::Short(0))
+        .await
+        .unwrap();
     let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_A", "REC_B"]);
 }
@@ -3044,17 +3022,14 @@ async fn test_scan_change_preserves_phas() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        inst.put_common_field("PHAS", EpicsValue::Short(3)).unwrap();
-        let result = inst
-            .put_common_field("SCAN", EpicsValue::String("1 second".into()))
-            .unwrap();
-        match result {
-            CommonFieldPutResult::ScanChanged { phas, .. } => assert_eq!(phas, 3),
-            other => panic!("expected ScanChanged, got {:?}", other),
-        }
-    }
+    db.put_pv_no_process("REC.PHAS", EpicsValue::Short(3))
+        .await
+        .unwrap();
+    db.put_pv_no_process("REC.SCAN", EpicsValue::String("1 second".into()))
+        .await
+        .unwrap();
+    assert_eq!(db.records_for_scan(ScanType::SEC1).await, vec!["REC"]);
+    assert_eq!(db.get_record("REC").unwrap().read().common.phas, 3);
 }
 
 #[epics_macros_rs::epics_test]
@@ -3063,11 +3038,10 @@ async fn test_phas_change_passive_no_index() {
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("REC") {
-        let mut inst = rec.write();
-        let result = inst.put_common_field("PHAS", EpicsValue::Short(5)).unwrap();
-        assert_eq!(result, CommonFieldPutResult::NoChange);
-    }
+    db.put_pv_no_process("REC.PHAS", EpicsValue::Short(5))
+        .await
+        .unwrap();
+    assert!(db.records_for_scan(ScanType::SEC1).await.is_empty());
 }
 
 // --- Async Processing Contract tests ---
@@ -3260,11 +3234,9 @@ async fn test_async_pending_skips_post_process() {
     db.add_record("FLNK_TARGET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("ASYNC") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("ASYNC.FLNK", EpicsValue::String("FLNK_TARGET".into()))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("ASYNC", &mut visited)
         .await
@@ -3287,11 +3259,9 @@ async fn test_complete_async_record() {
     let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
     tgt.init_record(0).unwrap();
     db.add_record("FLNK_TARGET", Box::new(tgt)).await.unwrap();
-    if let Some(rec) = db.get_record("ASYNC") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("ASYNC.FLNK", EpicsValue::String("FLNK_TARGET".into()))
+        .await
+        .unwrap();
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -3636,10 +3606,11 @@ async fn test_cp_burst_on_a_pact_target_sets_rpro() {
     .await
     .unwrap();
     {
+        db.put_pv_no_process("CPB_TGT.INP", EpicsValue::String("CPB_SRC CP".into()))
+            .await
+            .unwrap();
         let rec = db.get_record("CPB_TGT").unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CPB_SRC CP".into()))
-            .unwrap();
         // C alarms a record that HAS completed a cycle and then hangs mid-async;
         // a never-processed record still carries the init UDF severity and the
         // `sevr >= INVALID_ALARM` arm suppresses the alarm forever. Put the
@@ -4063,10 +4034,11 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
     db.add_record("DIS_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    db.put_pv_no_process("DIS_TGT.SDIS", EpicsValue::String("DIS_SW".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("DIS_TGT") {
         let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("DIS_SW".into()))
-            .unwrap();
         // Pre-set rpro=true, putf=true so the disable path's clear is
         // observable.
         inst.common.rpro = 1;
@@ -4105,11 +4077,9 @@ async fn test_sdis_disable_fires_put_notify_completion() {
     db.add_record("DIS_NOT_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("DIS_NOT_TGT") {
-        let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("DIS_NOT_SW".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("DIS_NOT_TGT.SDIS", EpicsValue::String("DIS_NOT_SW".into()))
+        .await
+        .unwrap();
 
     // Arm a put-notify wait-set on the disabled target (pending=1 for the
     // originating record). The disable path must take it and `leave`,
@@ -4162,11 +4132,9 @@ async fn test_put_notify_sync_chain_completes_immediately() {
     db.add_record("PN_SYNC_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("PN_SYNC_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("PN_SYNC_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("PN_SYNC_SRC.FLNK", EpicsValue::String("PN_SYNC_TGT".into()))
+        .await
+        .unwrap();
 
     let result = db
         .put_record_field_from_ca("PN_SYNC_SRC", "VAL", EpicsValue::Double(3.0))
@@ -4194,11 +4162,9 @@ async fn test_put_notify_defers_for_async_flnk_target() {
     db.add_record("PN_FLNK_TGT", Box::new(AsyncRecord { val: 0.0 }))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("PN_FLNK_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("PN_FLNK_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("PN_FLNK_SRC.FLNK", EpicsValue::String("PN_FLNK_TGT".into()))
+        .await
+        .unwrap();
 
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
@@ -4239,11 +4205,9 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
     db.add_record("PN_OUT_TGT", Box::new(AsyncRecord { val: 0.0 }))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("PN_OUT_SRC") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("PN_OUT_TGT PP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("PN_OUT_SRC.OUT", EpicsValue::String("PN_OUT_TGT PP".into()))
+        .await
+        .unwrap();
 
     let result = db
         .put_record_field_from_ca("PN_OUT_SRC", "VAL", EpicsValue::Double(5.0))
@@ -4568,12 +4532,12 @@ async fn test_sdis_disable_notifies_alarm() {
     db.add_record("TARGET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("TARGET") {
-        let mut inst = rec.write();
-        inst.put_common_field("SDIS", EpicsValue::String("DISABLE_SW".into()))
-            .unwrap();
-        inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
-    }
+    db.put_pv_no_process("TARGET.SDIS", EpicsValue::String("DISABLE_SW".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TARGET.DISS", EpicsValue::Short(1))
+        .await
+        .unwrap();
     let mut alarm_rx = {
         let rec = db.get_record("TARGET").unwrap();
         let mut inst = rec.write();
@@ -4639,9 +4603,8 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
         ("PINI_RUNNING", "RUNNING"),
         ("PINI_NO", "NO"),
     ] {
-        let rec = db.get_record(name).unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+        db.put_pv_no_process(format!("{name}.PINI"), EpicsValue::String(label.into()))
+            .await
             .unwrap_or_else(|e| panic!("PINI={label} must be accepted: {e:?}"));
     }
     // The stored value is the menu index, so `caget REC.PINI` reports RUN as 2
@@ -4875,12 +4838,9 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
     db.add_record("LNKAI", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("LNKAI").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("LNKWF".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("LNKAI.INP", EpicsValue::String("LNKWF".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("LNKAI", &mut visited)
@@ -4911,19 +4871,19 @@ async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
         .await
         .unwrap();
 
-    // The common-field owner itself.
+    // dbPutField without its process.
     {
-        let rec = db.get_record("BADFLD").unwrap();
-        let mut inst = rec.write();
-        let err = inst
-            .put_common_field("NOSUCH", EpicsValue::Double(1.0))
+        let err = db
+            .put_pv_no_process("BADFLD.NOSUCH", EpicsValue::Double(1.0))
+            .await
             .expect_err("an unknown field name must not report success");
         assert!(
             matches!(err, CaError::FieldNotFound(ref f) if f == "NOSUCH"),
             "expected FieldNotFound (S_dbLib_fieldNotFound), got {err:?}"
         );
         // Boundary: a *known* common field on the same record still succeeds.
-        inst.put_common_field("DESC", EpicsValue::String("ok".into()))
+        db.put_pv_no_process("BADFLD.DESC", EpicsValue::String("ok".into()))
+            .await
             .expect("a real dbCommon field must still be accepted");
     }
 
@@ -4990,22 +4950,22 @@ async fn r6_9_outn_is_swait_only() {
     db.add_record("OUTN_AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.add_record("OUTN_SW", Box::new(SwaitRecord::default()))
-        .await
-        .unwrap();
+    db.add_loaded_record(
+        "OUTN_SW",
+        Box::new(SwaitRecord::default()),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("TGT".into()))]),
+    )
+    .await
+    .expect("OUTN on swait must still be accepted");
 
-    let ao = db.get_record("OUTN_AO").unwrap();
-    let err = ao
-        .write()
-        .put_common_field("OUTN", EpicsValue::String("TGT".into()))
+    let err = db
+        .put_pv_no_process("OUTN_AO.OUTN", EpicsValue::String("TGT".into()))
+        .await
         .expect_err("OUTN on a non-swait record is not a field");
     assert!(matches!(err, CaError::FieldNotFound(ref f) if f == "OUTN"));
 
     let sw = db.get_record("OUTN_SW").unwrap();
-    let mut sw = sw.write();
-    sw.put_common_field("OUTN", EpicsValue::String("TGT".into()))
-        .expect("OUTN on swait must still be accepted");
-    assert_eq!(sw.common.text.out, "TGT");
+    assert_eq!(sw.read().common.text.out, "TGT");
 }
 
 /// R6-6 — C `piniProcess` (`iocInit.c:607-626`) sweeps the database once per
@@ -5035,14 +4995,20 @@ async fn test_pini_records_process_in_ascending_phas_order() {
         db.add_record(name, Box::new(AoRecord::new(val)))
             .await
             .unwrap();
+        db.put_pv_no_process(format!("{name}.PINI"), EpicsValue::String("YES".into()))
+            .await
+            .unwrap();
+        db.put_pv_no_process(format!("{name}.PHAS"), EpicsValue::Short(phas))
+            .await
+            .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.OUT"),
+            EpicsValue::String("PHAS_SINK".into()),
+        )
+        .await
+        .unwrap();
         let rec = db.get_record(name).unwrap();
         let mut inst = rec.write();
-        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
-            .unwrap();
-        inst.put_common_field("PHAS", EpicsValue::Short(phas))
-            .unwrap();
-        inst.put_common_field("OUT", EpicsValue::String("PHAS_SINK".into()))
-            .unwrap();
         inst.common.udf = 0;
     }
 
@@ -5077,11 +5043,11 @@ async fn test_pini_sweep_covers_every_phase_present() {
         db.add_record(name, Box::new(AoRecord::new(1.0)))
             .await
             .unwrap();
-        let rec = db.get_record(name).unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+        db.put_pv_no_process(format!("{name}.PINI"), EpicsValue::String("YES".into()))
+            .await
             .unwrap();
-        inst.put_common_field("PHAS", EpicsValue::Short(phas))
+        db.put_pv_no_process(format!("{name}.PHAS"), EpicsValue::Short(phas))
+            .await
             .unwrap();
     }
 
@@ -5116,31 +5082,32 @@ async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
         ("PAUSE", PiniMode::Pause),
         ("PAUSED", PiniMode::Paused),
     ] {
-        let mut inst = rec.write();
-        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+        db.put_pv_no_process("PREC.PINI", EpicsValue::String(label.into()))
+            .await
             .unwrap();
-        assert_eq!(inst.common.pini, expect.to_u16() as i16, "PINI={label}");
+        assert_eq!(
+            rec.read().common.pini,
+            expect.to_u16() as i16,
+            "PINI={label}"
+        );
     }
     // Numeric puts index the menu (DBR_ENUM write from a CA client).
-    {
-        let mut inst = rec.write();
-        inst.put_common_field("PINI", EpicsValue::Short(2)).unwrap();
-        assert_eq!(inst.common.pini, PiniMode::Run.to_u16() as i16);
-    }
+    db.put_pv_no_process("PREC.PINI", EpicsValue::Short(2))
+        .await
+        .unwrap();
+    assert_eq!(rec.read().common.pini, PiniMode::Run.to_u16() as i16);
     // A string outside the menu is an error, not a silent demotion to NO.
-    {
-        let mut inst = rec.write();
-        assert!(
-            inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
-                .is_err(),
-            "an out-of-menu PINI string must be rejected"
-        );
-        assert_eq!(
-            inst.common.pini,
-            PiniMode::Run.to_u16() as i16,
-            "the rejected put must not change PINI"
-        );
-    }
+    assert!(
+        db.put_pv_no_process("PREC.PINI", EpicsValue::String("MAYBE".into()))
+            .await
+            .is_err(),
+        "an out-of-menu PINI string must be rejected"
+    );
+    assert_eq!(
+        rec.read().common.pini,
+        PiniMode::Run.to_u16() as i16,
+        "the rejected put must not change PINI"
+    );
 }
 
 /// An asyn int32 readback delivers its value via `apply_raw_readback`
@@ -5489,11 +5456,9 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     db.add_record("SINK", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("SINK") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("DIRECT.B0".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SINK.INP", EpicsValue::String("DIRECT.B0".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SINK", &mut visited)
@@ -6279,8 +6244,8 @@ impl Record for WriteThenFlnkProducer {
             _ => None,
         }
     }
-    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
-        Ok(())
+    fn put_field(&mut self, name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Err(epics_base_rs::error::CaError::FieldNotFound(name.into()))
     }
     /// `OUT` is read back through `resolve_field`, which serves only what
     /// the record type declares.
@@ -6305,20 +6270,16 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
     db.add_record("WF_OBSERVER", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("WF_OBSERVER") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("WF_TARGET".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("WF_OBSERVER.INP", EpicsValue::String("WF_TARGET".into()))
+        .await
+        .unwrap();
     // Producer: WriteDbLink → WF_TARGET, FLNK → WF_OBSERVER.
     db.add_record("WF_PRODUCER", Box::new(WriteThenFlnkProducer))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("WF_PRODUCER") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("WF_OBSERVER".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("WF_PRODUCER.FLNK", EpicsValue::String("WF_OBSERVER".into()))
+        .await
+        .unwrap();
 
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
@@ -6628,16 +6589,15 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     db.add_record("CPIN_HOLDER", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("CPOUT_HOLDER") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("CPOUT_TGT PP CP".into()))
-            .unwrap();
-    }
-    if let Some(rec) = db.get_record("CPIN_HOLDER") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("CPOUT_TGT CP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process(
+        "CPOUT_HOLDER.OUT",
+        EpicsValue::String("CPOUT_TGT PP CP".into()),
+    )
+    .await
+    .unwrap();
+    db.put_pv_no_process("CPIN_HOLDER.INP", EpicsValue::String("CPOUT_TGT CP".into()))
+        .await
+        .unwrap();
     db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
 
@@ -6952,11 +6912,9 @@ async fn test_rpro_causes_reprocessing() {
     db.add_record("DEST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("DEST") {
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("SRC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("DEST.INP", EpicsValue::String("SRC".into()))
+        .await
+        .unwrap();
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("DEST", &mut visited)
         .await
@@ -7234,10 +7192,9 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read();
         assert_eq!(inst.get_common_field("UDFS"), Some(EpicsValue::Short(3)));
     }
-    {
-        let mut inst = rec.write();
-        inst.put_common_field("UDFS", EpicsValue::Short(1)).unwrap();
-    }
+    db.put_pv_no_process("REC.UDFS", EpicsValue::Short(1))
+        .await
+        .unwrap();
     {
         let inst = rec.read();
         assert_eq!(inst.get_common_field("UDFS"), Some(EpicsValue::Short(1)));
@@ -7253,13 +7210,15 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read();
         assert_eq!(inst.get_common_field("BKPT"), Some(EpicsValue::Char(0)));
     }
-    {
-        let mut inst = rec.write();
-        inst.put_common_field("BKPT", EpicsValue::Char(1)).unwrap();
-    }
+    // BKPT is DBF_NOACCESS and SPC_NOMOD: no put reaches it.
+    assert!(
+        db.put_pv_no_process("REC.BKPT", EpicsValue::Char(1))
+            .await
+            .is_err()
+    );
     {
         let inst = rec.read();
-        assert_eq!(inst.get_common_field("BKPT"), Some(EpicsValue::Char(1)));
+        assert_eq!(inst.get_common_field("BKPT"), Some(EpicsValue::Char(0)));
     }
 
     {
@@ -7289,14 +7248,12 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read();
         assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(0)));
     }
-    {
-        let mut inst = rec.write();
-        inst.put_common_field("RPRO", EpicsValue::Char(1)).unwrap();
-    }
-    {
-        let inst = rec.read();
-        assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::UChar(1)));
-    }
+    // RPRO is SPC_NOMOD, like PUTF.
+    assert!(matches!(
+        db.put_pv_no_process("REC.RPRO", EpicsValue::Char(1)).await,
+        Err(CaError::ReadOnlyField(_))
+    ));
+    assert_eq!(db.get_pv("REC.RPRO").unwrap(), EpicsValue::UChar(0));
 }
 
 /// SSCN (simulation-mode scan) is a `DBF_MENU`/`menuScan` field whose C dbd
@@ -7326,8 +7283,8 @@ async fn test_sscn_serves_menu_index_and_65535_sentinel() {
     );
 
     // A real menuScan index (2 == "I/O Intr") round-trips.
-    rec.write()
-        .put_common_field("SSCN", EpicsValue::Enum(2))
+    db.put_pv_no_process("REC.SSCN", EpicsValue::Enum(2))
+        .await
         .unwrap();
     assert_eq!(
         rec.read().get_common_field("SSCN"),
@@ -7335,8 +7292,8 @@ async fn test_sscn_serves_menu_index_and_65535_sentinel() {
     );
 
     // Putting the sentinel back restores "use SCAN".
-    rec.write()
-        .put_common_field("SSCN", EpicsValue::Enum(65535))
+    db.put_pv_no_process("REC.SSCN", EpicsValue::Enum(65535))
+        .await
         .unwrap();
     assert_eq!(
         rec.read().get_common_field("SSCN"),
@@ -7345,8 +7302,8 @@ async fn test_sscn_serves_menu_index_and_65535_sentinel() {
 
     // An out-of-menu index (>9, not 65535) is stored as itself — it is illegal,
     // but it is not the sentinel.
-    rec.write()
-        .put_common_field("SSCN", EpicsValue::Enum(12))
+    db.put_pv_no_process("REC.SSCN", EpicsValue::Enum(12))
+        .await
         .unwrap();
     assert_eq!(
         rec.read().get_common_field("SSCN"),
@@ -7728,15 +7685,13 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
     db.add_record("TS_DST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("TS_SRC") {
-        let mut inst = rec.write();
-        // Explicit `PP` — C `dbDbPutValue` processes the OUT-link
-        // target only on an explicit PP flag (a bare OUT link is NPP
-        // and would only write the value). This test exercises the
-        // cascade, so the PP modifier is required.
-        inst.put_common_field("OUT", EpicsValue::String("TS_DST PP".into()))
-            .unwrap();
-    }
+    // Explicit `PP` — C `dbDbPutValue` processes the OUT-link
+    // target only on an explicit PP flag (a bare OUT link is NPP
+    // and would only write the value). This test exercises the
+    // cascade, so the PP modifier is required.
+    db.put_pv_no_process("TS_SRC.OUT", EpicsValue::String("TS_DST PP".into()))
+        .await
+        .unwrap();
 
     let baseline = epics_base_rs::types::WallTime::now();
 
@@ -7881,13 +7836,14 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     db.add_record("LO_DST", Box::new(LongoutRecord::new(0)))
         .await
         .unwrap();
+    // Explicit `PP` — a bare OUT link is NPP (C `dbDbPutValue`);
+    // this test observes the cascade via the target's timestamp,
+    // so the OUT link must process the target.
+    db.put_pv_no_process("LO_SRC.OUT", EpicsValue::String("LO_DST PP".into()))
+        .await
+        .unwrap();
     if let Some(rec) = db.get_record("LO_SRC") {
         let mut inst = rec.write();
-        // Explicit `PP` — a bare OUT link is NPP (C `dbDbPutValue`);
-        // this test observes the cascade via the target's timestamp,
-        // so the OUT link must process the target.
-        inst.put_common_field("OUT", EpicsValue::String("LO_DST PP".into()))
-            .unwrap();
         inst.record.put_field("OOPT", EpicsValue::Short(1)).unwrap();
     }
 
@@ -7974,15 +7930,13 @@ async fn test_self_link_out_does_not_loop() {
     db.add_record("SELF_LO", Box::new(LongoutRecord::new(0)))
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("SELF_LO") {
-        let mut inst = rec.write();
-        // OUT="SELF_LO.VAL PP" → explicit PP so write_db_link_value
-        // attempts to re-process self; this is the case the visited
-        // HashSet recursion guard must catch. A bare OUT link is NPP
-        // (C `dbDbPutValue`) and would not exercise the guard at all.
-        inst.put_common_field("OUT", EpicsValue::String("SELF_LO PP".into()))
-            .unwrap();
-    }
+    // OUT="SELF_LO.VAL PP" → explicit PP so write_db_link_value
+    // attempts to re-process self; this is the case the visited
+    // HashSet recursion guard must catch. A bare OUT link is NPP
+    // (C `dbDbPutValue`) and would not exercise the guard at all.
+    db.put_pv_no_process("SELF_LO.OUT", EpicsValue::String("SELF_LO PP".into()))
+        .await
+        .unwrap();
 
     // 1-second timeout: if the self-link guard regresses, the
     // process call would never return (infinite recursion via
@@ -8868,11 +8822,9 @@ async fn test_simulation_mode_still_fires_forward_link() {
     ai.simm = 1;
     ai.siol = "SIM:SRC".into();
     db.add_record("SIM:AI", Box::new(ai)).await.unwrap();
-    if let Some(rec) = db.get_record("SIM:AI") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("SIM:FLNK_TARGET".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SIM:AI.FLNK", EpicsValue::String("SIM:FLNK_TARGET".into()))
+        .await
+        .unwrap();
 
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
@@ -8952,16 +8904,12 @@ async fn test_async_completion_flnk_cycle_terminates() {
         .await
         .unwrap();
     // A -> FLNK -> B -> FLNK -> A : a closed forward-link loop.
-    if let Some(rec) = db.get_record("ACYC:A") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("ACYC:B".into()))
-            .unwrap();
-    }
-    if let Some(rec) = db.get_record("ACYC:B") {
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("ACYC:A".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("ACYC:A.FLNK", EpicsValue::String("ACYC:B".into()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("ACYC:B.FLNK", EpicsValue::String("ACYC:A".into()))
+        .await
+        .unwrap();
 
     // Driving the async-completion path on A must terminate — pre-fix
     // it re-entered A through B's FLNK because `visited` was never
@@ -9212,11 +9160,9 @@ async fn test_bare_out_link_does_not_process_target() {
     db.add_record("TGT_OUT", Box::new(tgt)).await.unwrap();
 
     // Bare OUT link — no PP modifier.
-    if let Some(rec) = db.get_record("SRC_OUT") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("TGT_OUT.VAL".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC_OUT.OUT", EpicsValue::String("TGT_OUT.VAL".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC_OUT", &mut visited)
@@ -9246,11 +9192,9 @@ async fn test_pp_out_link_processes_passive_target() {
     tgt.init_record(0).unwrap();
     db.add_record("TGT_PP", Box::new(tgt)).await.unwrap();
 
-    if let Some(rec) = db.get_record("SRC_PP") {
-        let mut inst = rec.write();
-        inst.put_common_field("OUT", EpicsValue::String("TGT_PP.VAL PP".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC_PP.OUT", EpicsValue::String("TGT_PP.VAL PP".into()))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC_PP", &mut visited)
@@ -9547,10 +9491,11 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
         db.add_record("CADST", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
+        db.put_pv_no_process("CADST.INP", EpicsValue::String(inp.into()))
+            .await
+            .unwrap();
         if let Some(rec) = db.get_record("CADST") {
             let mut inst = rec.write();
-            inst.put_common_field("INP", EpicsValue::String(inp.into()))
-                .unwrap();
             inst.common.udf = 0;
         }
         let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -9748,12 +9693,17 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
         .unwrap();
 
     for (name, hihi) in [("SUB_HIHI", 50.0), ("SUB_OK", 200.0)] {
+        db.put_pv_no_process(format!("{name}.HIHI"), EpicsValue::Double(hihi))
+            .await
+            .unwrap();
+        db.put_pv_no_process(
+            format!("{name}.HHSV"),
+            EpicsValue::Short(AlarmSeverity::Major as i16),
+        )
+        .await
+        .unwrap();
         let arc = db.get_record(name).unwrap();
         let mut inst = arc.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(hihi))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
         let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
             record.put_field("VAL", EpicsValue::Double(100.0))?;
             Ok(0)
@@ -10799,12 +10749,9 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     src.put_field("A", EpicsValue::Double(42.0)).unwrap();
     src.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("CO6_SRC", Box::new(src)).await.unwrap();
-    {
-        let rec = db.get_record("CO6_SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("CO6_TGT".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("CO6_SRC.FLNK", EpicsValue::String("CO6_TGT".into()))
+        .await
+        .unwrap();
 
     // Delaying cycle: output is due + ODLY > 0, so the cycle defers. The
     // FLNK target must NOT process (C returns before recGblFwdLink). The

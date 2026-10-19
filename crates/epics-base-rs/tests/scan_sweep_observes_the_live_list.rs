@@ -252,10 +252,8 @@ async fn a_record_removed_at_the_cursor_does_not_stall_the_sweep() {
     )
     .await
     .unwrap();
-    db.get_record("M")
-        .unwrap()
-        .write()
-        .put_common_field("FLNK", EpicsValue::String("K".into()))
+    db.put_pv_no_process("M.FLNK", EpicsValue::String("K".into()))
+        .await
         .unwrap();
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;

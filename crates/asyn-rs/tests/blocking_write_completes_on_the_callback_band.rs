@@ -127,10 +127,8 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
     db.add_record("BLK:SINK", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.get_record("BLK:AO")
-        .unwrap()
-        .write()
-        .put_common_field("FLNK", EpicsValue::String("BLK:SINK".into()))
+    db.put_pv_no_process("BLK:AO.FLNK", EpicsValue::String("BLK:SINK".into()))
+        .await
         .unwrap();
     db.ioc_init().await;
     {

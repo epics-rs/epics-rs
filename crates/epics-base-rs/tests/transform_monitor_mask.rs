@@ -57,15 +57,13 @@ async fn transform_with_an_ms_input() -> PvDatabase {
     db.add_record("SRC", Box::new(AiRecord::new(1.0)))
         .await
         .unwrap();
-    {
-        // The alarm limits live in the INSTANCE's `analog_alarm` config.
-        let rec = db.get_record("SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(5.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-            .unwrap();
-    }
+    // The alarm limits live in the INSTANCE's `analog_alarm` config.
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+        .await
+        .unwrap();
 
     let mut t = TransformRecord::default();
     t.put_field("INPA", EpicsValue::String("SRC MS".into()))

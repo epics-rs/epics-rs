@@ -44,12 +44,10 @@ async fn rotated_compress_db() -> PvDatabase {
     db.add_record("CB", Box::new(CompressRecord::new(5, 4)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("CB").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("src".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("CB.INP", EpicsValue::String("src".into()))
+        .await
+        .unwrap();
+
     for i in 0..7 {
         db.put_pv("src", EpicsValue::Double(i as f64))
             .await

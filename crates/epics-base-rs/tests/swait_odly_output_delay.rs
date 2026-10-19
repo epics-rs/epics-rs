@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, ScanType};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -92,15 +92,14 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(9)).unwrap();
-    db.add_record("W_ODLY", Box::new(w)).await.unwrap();
-    // OUT/OUTN route through RecordInstance::put_common_field (populating
-    // parsed_out for output dispatch), not the record's put_field.
-    {
-        let r = db.get_record("W_ODLY").unwrap();
-        let mut inst = r.write();
-        inst.put_common_field("OUT", EpicsValue::String("W_TGT".into()))
-            .unwrap();
-    }
+    // OUTN as the loader stores it, populating parsed_out for output dispatch.
+    db.add_loaded_record(
+        "W_ODLY",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W_TGT".into()))]),
+    )
+    .await
+    .unwrap();
 
     // Delaying cycle: ODLY>0 defers. OUT not written, OEVT not posted.
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
@@ -171,13 +170,13 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(13)).unwrap();
-    db.add_record("W3_ODLY", Box::new(w)).await.unwrap();
-    {
-        let r = db.get_record("W3_ODLY").unwrap();
-        let mut inst = r.write();
-        inst.put_common_field("OUT", EpicsValue::String("W3_TGT".into()))
-            .unwrap();
-    }
+    db.add_loaded_record(
+        "W3_ODLY",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W3_TGT".into()))]),
+    )
+    .await
+    .unwrap();
 
     // Delaying cycle: PACT held, output deferred.
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
@@ -260,13 +259,13 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(17)).unwrap();
-    db.add_record("W4_ODLY", Box::new(w)).await.unwrap();
-    {
-        let r = db.get_record("W4_ODLY").unwrap();
-        let mut inst = r.write();
-        inst.put_common_field("OUT", EpicsValue::String("W4_TGT".into()))
-            .unwrap();
-    }
+    db.add_loaded_record(
+        "W4_ODLY",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W4_TGT".into()))]),
+    )
+    .await
+    .unwrap();
 
     // Subscribe to VAL (DBE_VALUE|DBE_LOG) BEFORE processing.
     let mut sub = DbSubscription::subscribe(&db, "W4_ODLY.VAL")
@@ -356,12 +355,10 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     db.add_record("W5_ODLY", Box::new(w)).await.unwrap();
-    {
-        let r = db.get_record("W5_ODLY").unwrap();
-        let mut inst = r.write();
-        inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("W5_ODLY.FLNK", EpicsValue::String("W5_FLNK".into()))
+        .await
+        .unwrap();
+
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
 
@@ -411,13 +408,13 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     // ODLY default 0 → synchronous.
     w.put_field("OEVT", EpicsValue::UShort(11)).unwrap();
-    db.add_record("W2_ODLY", Box::new(w)).await.unwrap();
-    {
-        let r = db.get_record("W2_ODLY").unwrap();
-        let mut inst = r.write();
-        inst.put_common_field("OUT", EpicsValue::String("W2_TGT".into()))
-            .unwrap();
-    }
+    db.add_loaded_record(
+        "W2_ODLY",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W2_TGT".into()))]),
+    )
+    .await
+    .unwrap();
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W2_ODLY", &mut v)

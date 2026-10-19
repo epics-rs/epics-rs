@@ -33,14 +33,13 @@ async fn invalid_source(db: &PvDatabase) {
     db.add_record("SRC", Box::new(AiRecord::new(200.0)))
         .await
         .unwrap();
-    {
-        let rec = db.get_record("SRC").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("HIHI", EpicsValue::Double(100.0))
-            .unwrap();
-        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
-            .unwrap();
-    }
+    db.put_pv_no_process("SRC.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("SRC.HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
+        .await
+        .unwrap();
+
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("SRC", &mut v).await.unwrap();
     assert_eq!(

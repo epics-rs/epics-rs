@@ -23,8 +23,8 @@ impl Record for Pending {
     fn get_field(&self, _: &str) -> Option<EpicsValue> {
         None
     }
-    fn put_field(&mut self, _: &str, _: EpicsValue) -> CaResult<()> {
-        Ok(())
+    fn put_field(&mut self, name: &str, _: EpicsValue) -> CaResult<()> {
+        Err(epics_base_rs::error::CaError::FieldNotFound(name.into()))
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {
         &[]
@@ -47,9 +47,10 @@ async fn db() -> PvDatabase {
     db
 }
 
-fn put(db: &PvDatabase, field: &str, value: EpicsValue) {
-    let rec = db.get_record("R").unwrap();
-    rec.write().put_common_field(field, value).unwrap();
+async fn put(db: &PvDatabase, field: &str, value: EpicsValue) {
+    db.put_pv_no_process(format!("R.{field}"), value)
+        .await
+        .unwrap();
 }
 
 /// Enter PACT, make `puts` inside the window, complete, and answer whether
@@ -65,7 +66,7 @@ async fn cycle(db: &PvDatabase, puts: &[(&str, EpicsValue)]) -> (bool, StampMode
         "in PACT"
     );
     for (field, value) in puts {
-        put(db, field, value.clone());
+        put(db, field, value.clone()).await;
     }
     db.complete_async_record("R").await.unwrap();
     let rec = db.get_record("R").unwrap();
@@ -111,7 +112,7 @@ async fn a_tse_put_during_pact_moves_the_completion_stamp() {
 async fn a_tsel_put_during_pact_moves_the_completion_stamp() {
     let db = db().await;
     let s = |v: &str| EpicsValue::String(v.into());
-    put(&db, "TSE", EpicsValue::Short(5));
+    put(&db, "TSE", EpicsValue::Short(5)).await;
     // Constant -> link: ZERO loads TSE 0, so the clock is read.
     assert_eq!(
         cycle(&db, &[("TSEL", s("ZERO"))]).await,

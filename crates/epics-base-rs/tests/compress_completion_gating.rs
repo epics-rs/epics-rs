@@ -40,12 +40,9 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
     let mut cmp = CompressRecord::new(1, 3);
     cmp.n = 4;
     db.add_record("cmp", Box::new(cmp)).await.unwrap();
-    {
-        let rec = db.get_record("cmp").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("INP", EpicsValue::String("src".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("cmp.INP", EpicsValue::String("src".into()))
+        .await
+        .unwrap();
 
     // Counter sink: `CALC="VAL+1"` increments its VAL once per process, so its
     // VAL is exactly the number of times the compress's FLNK fired it.
@@ -54,12 +51,10 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
         .unwrap();
 
     // Wire cmp.FLNK = cnt (dbCommon forward link).
-    {
-        let rec = db.get_record("cmp").unwrap();
-        let mut inst = rec.write();
-        inst.put_common_field("FLNK", EpicsValue::String("cnt".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("cmp.FLNK", EpicsValue::String("cnt".into()))
+        .await
+        .unwrap();
+
     // The forward links bind at iocInit, as C's do.
     db.ioc_init().await;
 

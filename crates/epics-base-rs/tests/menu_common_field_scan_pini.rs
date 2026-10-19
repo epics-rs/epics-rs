@@ -21,8 +21,8 @@
 //! from a `.db` while `caput REC.SSCN 65535` is refused at runtime.
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{RecordInstance, ScanType, SimModeScan};
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
+use epics_base_rs::server::record::{ScanType, SimModeScan};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -136,19 +136,34 @@ async fn pini_uses_the_menu_converter() {
 /// `dbPut` (`putStringMenu`, bound `val < nChoice`) does not.
 #[epics_macros_rs::epics_test]
 async fn sscn_sentinel_loads_from_db_but_is_refused_at_runtime() {
-    let mut inst = RecordInstance::new("SIM", AiRecord::default());
-    inst.put_common_field_db_load("SSCN", EpicsValue::String("65535".into()))
+    let db = PvDatabase::new();
+    let load = |sscn: &str| {
+        RecordLoad::from_common_fields(vec![("SSCN".into(), EpicsValue::String(sscn.into()))])
+    };
+    db.add_loaded_record("UNSET", Box::new(AiRecord::default()), load("65535"))
+        .await
         .expect("field(SSCN,\"65535\") is what the dbd initial() is");
-    assert!(inst.common.sscn.is_unset());
-    assert_eq!(inst.common.sscn.to_u16(), SimModeScan::DO_NOT_USE);
+    let unset = db.get_record("UNSET").unwrap().read().common.sscn;
+    assert!(unset.is_unset());
+    assert_eq!(unset.to_u16(), SimModeScan::DO_NOT_USE);
 
-    inst.put_common_field_db_load("SSCN", EpicsValue::String("1 second".into()))
+    db.add_loaded_record("SIM", Box::new(AiRecord::default()), load("1 second"))
+        .await
         .unwrap();
-    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::SEC1));
-
-    let err = inst
-        .put_common_field("SSCN", EpicsValue::String("65535".into()))
+    assert_eq!(
+        db.get_record("SIM").unwrap().read().common.sscn,
+        SimModeScan::from_scan(ScanType::SEC1)
+    );
+    db.put_pv_no_process("SIM.SSCN", EpicsValue::String("1 second".into()))
+        .await
+        .unwrap();
+    let err = db
+        .put_pv_no_process("SIM.SSCN", EpicsValue::String("65535".into()))
+        .await
         .expect_err("putStringMenu bounds the index by nChoice");
     assert!(matches!(err, CaError::BadChoice(_)), "got {err:?}");
-    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::SEC1));
+    assert_eq!(
+        db.get_record("SIM").unwrap().read().common.sscn,
+        SimModeScan::from_scan(ScanType::SEC1)
+    );
 }

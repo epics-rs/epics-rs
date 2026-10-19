@@ -24,7 +24,7 @@
 //! on a cycle whose output fires (ODLY delay-end included), so a non-firing
 //! cycle neither refreshes DOLD nor posts it.
 
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -52,13 +52,14 @@ async fn swait_db(dopt: i16, doln: &str, oopt: i16, odly: f32) -> PvDatabase {
             .unwrap();
     }
     w.put_field("DOLD", EpicsValue::Double(99.0)).unwrap();
-    db.add_record("W", Box::new(w)).await.unwrap();
-
-    // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    let r = db.get_record("W").unwrap();
-    r.write()
-        .put_common_field("OUT", EpicsValue::String("W_TGT".into()))
-        .unwrap();
+    // OUTN as the loader stores it (populates parsed_out).
+    db.add_loaded_record(
+        "W",
+        Box::new(w),
+        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W_TGT".into()))]),
+    )
+    .await
+    .unwrap();
     db
 }
 

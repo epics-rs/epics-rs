@@ -23,8 +23,10 @@
 //! and serving `EGU` for a field its rset skips is as much a wire divergence
 //! as serving `""` for one it fills.
 
-use epics_base_rs::server::database::LinkBacking;
-use epics_base_rs::server::record::{Record, RecordInstance};
+use std::sync::Arc;
+
+use epics_base_rs::server::database::{LinkBacking, PvDatabase};
+use epics_base_rs::server::record::{Record, RecordCell};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
@@ -46,19 +48,24 @@ use epics_base_rs::types::EpicsValue;
 /// `sub` and `dfanout` model no `PREC`/`EGU`/`HOPR`/`LOPR` at all — gets a
 /// `declared_overrides` entry, which is the db loader's own path and the only
 /// one `resolve_field` can reach.
-fn load<R: Record + 'static>(mut rec: R, fields: &[(&str, EpicsValue)]) -> RecordInstance {
+fn load<R: Record + 'static>(mut rec: R, fields: &[(&str, EpicsValue)]) -> Arc<RecordCell> {
     let mut unmodeled = Vec::new();
     for (name, value) in fields {
         if rec.put_field(name, value.clone()).is_err() {
             unmodeled.push((*name, value.clone()));
         }
     }
-    let mut inst = RecordInstance::new("T:REC", rec);
-    for (name, value) in unmodeled {
-        inst.put_common_field_db_load(name, value)
-            .unwrap_or_else(|e| panic!("field({name}) failed to load: {e:?}"));
-    }
-    inst
+    epics_base_rs::runtime::task::block_on_sync(async {
+        let db = PvDatabase::new();
+        db.add_record("T:REC", Box::new(rec)).await.unwrap();
+        for (name, value) in unmodeled {
+            db.put_pv_no_process(format!("T:REC.{name}"), value)
+                .await
+                .unwrap_or_else(|e| panic!("field({name}) failed to put: {e:?}"));
+        }
+        db.get_record("T:REC").unwrap()
+    })
+    .expect("a plain test thread")
 }
 
 fn prec(v: i16) -> EpicsValue {
@@ -73,8 +80,9 @@ fn limit(v: f64) -> EpicsValue {
     EpicsValue::Double(v)
 }
 
-fn units(inst: &RecordInstance, field: &str) -> String {
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+fn units(rec: &RecordCell, field: &str) -> String {
+    rec.read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .units()
         .unwrap_or_else(|| panic!("{field} serves no units leaf"))
@@ -82,23 +90,26 @@ fn units(inst: &RecordInstance, field: &str) -> String {
         .into_owned()
 }
 
-fn precision(inst: &RecordInstance, field: &str) -> i16 {
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+fn precision(rec: &RecordCell, field: &str) -> i16 {
+    rec.read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .precision()
         .unwrap_or_else(|| panic!("{field} serves no precision leaf"))
 }
 
 /// `(lower, upper)`, as [`Snapshot::display_limits`] returns them.
-fn display(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+fn display(rec: &RecordCell, field: &str) -> (f64, f64) {
+    rec.read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .display_limits()
         .unwrap_or_else(|| panic!("{field} serves no display limits"))
 }
 
-fn control(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field_with(field, LinkBacking::none())
+fn control(rec: &RecordCell, field: &str) -> (f64, f64) {
+    rec.read()
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .control_limits()
         .unwrap_or_else(|| panic!("{field} serves no control limits"))

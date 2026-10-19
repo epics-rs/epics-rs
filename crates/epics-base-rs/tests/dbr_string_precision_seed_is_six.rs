@@ -23,36 +23,38 @@
 //! the type but narrowed away by C's DBF gate.
 
 mod module_records;
+mod seeded;
 
-use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
+use seeded::Seeded;
 
-fn instance(record_type: &str) -> RecordInstance {
+fn instance(record_type: &str) -> Seeded {
     let rec = module_records::create_any(record_type).expect("record type is registered");
-    RecordInstance::new_boxed(format!("T:{record_type}"), rec)
+    Seeded::new(format!("T:{record_type}"), rec)
 }
 
 /// `caget -t` — the DBR_STRING form.
-fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
-    let snap = inst.snapshot_for_field(field).expect("field exists");
+fn dbr_string_of(rec: &Seeded, field: &str) -> String {
+    let snap = rec
+        .cell()
+        .read()
+        .snapshot_for_field(field)
+        .expect("field exists");
     let bytes = epics_base_rs::types::encode_dbr(0, &snap).expect("DBR_STRING encodes");
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn put(inst: &mut RecordInstance, name: &str, value: EpicsValue) {
-    if inst.record.put_field(name, value.clone()).is_ok() {
-        return;
-    }
-    inst.put_common_field(name, value)
+fn put(rec: &Seeded, name: &str, value: EpicsValue) {
+    rec.put(name, value)
         .unwrap_or_else(|e| panic!("{name}: {e:?}"));
 }
 
 /// The lead's trigger: `record(bi,"B"){field(AFTC,"2.5")}`, `caget -s B.AFTC`.
 #[test]
 fn a_record_type_with_no_get_precision_renders_doubles_at_six() {
-    let mut bi = instance("bi");
-    put(&mut bi, "AFTC", EpicsValue::Double(2.5));
+    let bi = instance("bi");
+    put(&bi, "AFTC", EpicsValue::Double(2.5));
     assert_eq!(
         dbr_string_of(&bi, "AFTC"),
         "2.500000",
@@ -63,12 +65,12 @@ fn a_record_type_with_no_get_precision_renders_doubles_at_six() {
 /// The same seed on two sibling NULL-slot types.
 #[test]
 fn the_seed_holds_across_the_null_slot_types() {
-    let mut mbbi = instance("mbbi");
-    put(&mut mbbi, "AFTC", EpicsValue::Double(0.25));
+    let mbbi = instance("mbbi");
+    put(&mbbi, "AFTC", EpicsValue::Double(0.25));
     assert_eq!(dbr_string_of(&mbbi, "AFTC"), "0.250000");
 
-    let mut li = instance("longin");
-    put(&mut li, "AFTC", EpicsValue::Double(3.0));
+    let li = instance("longin");
+    put(&li, "AFTC", EpicsValue::Double(3.0));
     assert_eq!(
         dbr_string_of(&li, "AFTC"),
         "3.000000",
@@ -80,15 +82,15 @@ fn the_seed_holds_across_the_null_slot_types() {
 /// not 6.
 #[test]
 fn a_supplied_slot_still_answers_prec() {
-    let mut ai = instance("ai");
-    put(&mut ai, "PREC", EpicsValue::Short(3));
-    put(&mut ai, "VAL", EpicsValue::Double(2.5));
+    let ai = instance("ai");
+    put(&ai, "PREC", EpicsValue::Short(3));
+    put(&ai, "VAL", EpicsValue::Double(2.5));
     assert_eq!(dbr_string_of(&ai, "VAL"), "2.500");
 
     // PREC=0 is a real answer, not "unsupplied" — it must not fall to 6.
-    let mut ai0 = instance("ai");
-    put(&mut ai0, "PREC", EpicsValue::Short(0));
-    put(&mut ai0, "VAL", EpicsValue::Double(2.5));
+    let ai0 = instance("ai");
+    put(&ai0, "PREC", EpicsValue::Short(0));
+    put(&ai0, "VAL", EpicsValue::Double(2.5));
     assert_eq!(dbr_string_of(&ai0, "VAL"), "3", "cvtDoubleToString rounds");
 }
 
@@ -96,9 +98,9 @@ fn a_supplied_slot_still_answers_prec() {
 /// (`swaitRecord.c`'s `ODLY`, DBF_FLOAT — the `getFloatString` path).
 #[test]
 fn a_per_field_literal_reaches_the_string_form() {
-    let mut sw = instance("swait");
-    put(&mut sw, "PREC", EpicsValue::Short(0));
-    put(&mut sw, "ODLY", EpicsValue::Float(1.5));
+    let sw = instance("swait");
+    put(&sw, "PREC", EpicsValue::Short(0));
+    put(&sw, "ODLY", EpicsValue::Float(1.5));
     assert_eq!(
         dbr_string_of(&sw, "ODLY"),
         "1.500",
@@ -112,8 +114,8 @@ fn a_per_field_literal_reaches_the_string_form() {
 /// slot-supplying type renders through the plain conversion.
 #[test]
 fn an_integer_field_renders_without_precision() {
-    let mut ai = instance("ai");
-    put(&mut ai, "PREC", EpicsValue::Short(3));
-    put(&mut ai, "RVAL", EpicsValue::Long(7));
+    let ai = instance("ai");
+    put(&ai, "PREC", EpicsValue::Short(3));
+    put(&ai, "RVAL", EpicsValue::Long(7));
     assert_eq!(dbr_string_of(&ai, "RVAL"), "7");
 }

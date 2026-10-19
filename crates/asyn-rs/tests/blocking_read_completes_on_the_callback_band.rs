@@ -141,12 +141,12 @@ async fn database(
         .await
         .unwrap();
     {
-        let cell = db.get_record("REC").unwrap();
-        let mut inst = cell.write();
-        inst.put_common_field("FLNK", EpicsValue::String("SINK".into()))
+        db.put_pv_no_process("REC.FLNK", EpicsValue::String("SINK".into()))
+            .await
             .unwrap();
         if pini {
-            inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+            db.put_pv_no_process("REC.PINI", EpicsValue::String("YES".into()))
+                .await
                 .unwrap();
         }
     }

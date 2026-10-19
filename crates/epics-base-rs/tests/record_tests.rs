@@ -1,5 +1,6 @@
 #![allow(unused_imports, clippy::all)]
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -672,20 +673,26 @@ fn test_resolve_field_priority() {
     assert!(instance.resolve_field("NONEXISTENT").is_none());
 }
 
-#[test]
-fn test_common_field_put() {
-    let rec = AiRecord::new(25.0);
-    let mut instance = RecordInstance::new("TEMP", rec);
+/// A database holding `rec` as `name`, for tests that put through it.
+async fn db_with(name: &str, rec: impl Record + 'static) -> PvDatabase {
+    let db = PvDatabase::new();
+    db.add_record(name, Box::new(rec)).await.unwrap();
+    db
+}
 
-    let result = instance
-        .put_common_field("SCAN", EpicsValue::String("1 second".into()))
+#[epics_macros_rs::epics_test]
+async fn test_common_field_put() {
+    let db = db_with("TEMP", AiRecord::new(25.0)).await;
+
+    db.put_pv_no_process("TEMP.SCAN", EpicsValue::String("1 second".into()))
+        .await
         .unwrap();
-    assert!(matches!(result, CommonFieldPutResult::ScanChanged { .. }));
+    db.put_pv_no_process("TEMP.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    let rec = db.get_record("TEMP").unwrap();
+    let instance = rec.read();
     assert_eq!(instance.common.scan, ScanType::SEC1);
-
-    instance
-        .put_common_field("HIHI", EpicsValue::Double(100.0))
-        .unwrap();
     assert_eq!(
         instance
             .common
@@ -697,25 +704,25 @@ fn test_common_field_put() {
     );
 }
 
-#[test]
-fn test_evaluate_alarms() {
+#[epics_macros_rs::epics_test]
+async fn test_evaluate_alarms() {
     use epics_base_rs::server::recgbl;
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP", rec);
+    let db = db_with("TEMP", AiRecord::new(0.0)).await;
+    db.put_pv_no_process("TEMP.HIHI", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TEMP.HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TEMP.HIGH", EpicsValue::Double(80.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TEMP.HSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
+        .await
+        .unwrap();
+    let rec = db.get_record("TEMP").unwrap();
+    let mut instance = rec.write();
     instance.common.udf = 0;
-
-    instance
-        .put_common_field("HIHI", EpicsValue::Double(100.0))
-        .unwrap();
-    instance
-        .put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
-        .unwrap();
-    instance
-        .put_common_field("HIGH", EpicsValue::Double(80.0))
-        .unwrap();
-    instance
-        .put_common_field("HSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
-        .unwrap();
 
     instance.evaluate_alarms();
     recgbl::rec_gbl_reset_alarms(&mut instance.common);
@@ -810,34 +817,35 @@ fn test_parse_link_v2() {
     assert_eq!(parse_link_v2("TEMP").constant_value(), None);
 }
 
-#[test]
-fn test_link_cache_invalidation() {
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP", rec);
+#[epics_macros_rs::epics_test]
+async fn test_link_cache_invalidation() {
+    let db = db_with("TEMP", AiRecord::new(0.0)).await;
+    // Local targets, so the put keeps a DB link rather than making a CA one.
+    for name in ["SOURCE", "OTHER"] {
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+    }
+    let rec = db.get_record("TEMP").unwrap();
+    let inp = |v: &str| db.put_pv_no_process("TEMP.INP", EpicsValue::String(v.into()));
 
-    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
-    instance
-        .put_common_field("INP", EpicsValue::String("SOURCE.VAL".into()))
-        .unwrap();
-    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
-        assert_eq!(db.target().record, "SOURCE");
+    assert_eq!(*rec.read().parsed_inp.link(), ParsedLink::None);
+    inp("SOURCE.VAL").await.unwrap();
+    if let ParsedLink::Db(link) = rec.read().parsed_inp.link() {
+        assert_eq!(link.target().record, "SOURCE");
     } else {
         panic!("expected Db link");
     }
 
-    instance
-        .put_common_field("INP", EpicsValue::String("OTHER".into()))
-        .unwrap();
-    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
-        assert_eq!(db.pvname(), "OTHER");
+    inp("OTHER").await.unwrap();
+    if let ParsedLink::Db(link) = rec.read().parsed_inp.link() {
+        assert_eq!(link.pvname(), "OTHER");
     } else {
         panic!("expected Db link");
     }
 
-    instance
-        .put_common_field("INP", EpicsValue::String("".into()))
-        .unwrap();
-    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
+    inp("").await.unwrap();
+    assert_eq!(*rec.read().parsed_inp.link(), ParsedLink::None);
 }
 
 #[test]
@@ -907,14 +915,14 @@ fn test_ai_no_conversion() {
     assert!((rec.val - 42.0).abs() < 1e-10);
 }
 
-#[test]
-fn test_common_fields_desc() {
-    let rec = AiRecord::new(25.0);
-    let mut instance = RecordInstance::new("TEMP", rec);
-
-    instance
-        .put_common_field("DESC", EpicsValue::String("Temperature".into()))
+#[epics_macros_rs::epics_test]
+async fn test_common_fields_desc() {
+    let db = db_with("TEMP", AiRecord::new(25.0)).await;
+    db.put_pv_no_process("TEMP.DESC", EpicsValue::String("Temperature".into()))
+        .await
         .unwrap();
+    let rec = db.get_record("TEMP").unwrap();
+    let instance = rec.read();
     match instance.get_common_field("DESC") {
         Some(EpicsValue::String(s)) => assert_eq!(s, "Temperature"),
         other => panic!("expected String, got {:?}", other),
@@ -925,41 +933,41 @@ fn test_common_fields_desc() {
     }
 }
 
-#[test]
-fn test_common_fields_new() {
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST", rec);
+#[epics_macros_rs::epics_test]
+async fn test_common_fields_new() {
+    let db = db_with("TEST", AiRecord::new(0.0)).await;
+    let rec = db.get_record("TEST").unwrap();
 
-    assert_eq!(instance.common.phas, 0);
-    instance
-        .put_common_field("PHAS", EpicsValue::Short(2))
+    assert_eq!(rec.read().common.phas, 0);
+    db.put_pv_no_process("TEST.PHAS", EpicsValue::Short(2))
+        .await
         .unwrap();
-    assert_eq!(instance.common.phas, 2);
+    assert_eq!(rec.read().common.phas, 2);
 
-    assert_eq!(instance.common.disv, 1);
+    assert_eq!(rec.read().common.disv, 1);
 
-    instance
-        .put_common_field("HYST", EpicsValue::Double(5.0))
+    db.put_pv_no_process("TEST.HYST", EpicsValue::Double(5.0))
+        .await
         .unwrap();
-    assert!((instance.common.hyst - 5.0).abs() < 1e-10);
+    assert!((rec.read().common.hyst - 5.0).abs() < 1e-10);
 }
 
-#[test]
-fn test_hyst_alarm_hysteresis() {
+#[epics_macros_rs::epics_test]
+async fn test_hyst_alarm_hysteresis() {
     use epics_base_rs::server::recgbl;
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP", rec);
+    let db = db_with("TEMP", AiRecord::new(0.0)).await;
+    db.put_pv_no_process("TEMP.HIGH", EpicsValue::Double(80.0))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TEMP.HSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
+        .await
+        .unwrap();
+    db.put_pv_no_process("TEMP.HYST", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    let rec = db.get_record("TEMP").unwrap();
+    let mut instance = rec.write();
     instance.common.udf = 0;
-
-    instance
-        .put_common_field("HIGH", EpicsValue::Double(80.0))
-        .unwrap();
-    instance
-        .put_common_field("HSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
-        .unwrap();
-    instance
-        .put_common_field("HYST", EpicsValue::Double(5.0))
-        .unwrap();
 
     instance.record.set_val(EpicsValue::Double(85.0)).unwrap();
     instance.evaluate_alarms();
@@ -1808,20 +1816,22 @@ fn test_lcnt_reset_on_success() {
     assert_eq!(instance.common.lcnt, 0);
 }
 
-#[test]
-fn test_proc_get_put() {
+#[epics_macros_rs::epics_test]
+async fn test_proc_get_put() {
     // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is retained
     // in `prec->proc` and served back as `DBF_UCHAR` (`UChar`), like DISP. A
     // fresh record reads the default 0; a stored byte round-trips. (The
     // `pp(TRUE)` force-process is orthogonal and driven by the put path.)
-    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
-    match instance.get_common_field("PROC") {
+    let db = db_with("TEST", AoRecord::new(0.0)).await;
+    let rec = db.get_record("TEST").unwrap();
+    match rec.read().get_common_field("PROC") {
         Some(EpicsValue::UChar(0)) => {}
         other => panic!("expected UChar(0), got {:?}", other),
     }
-    instance
-        .put_common_field("PROC", EpicsValue::Char(1))
+    db.put_pv_no_process("TEST.PROC", EpicsValue::Char(1))
+        .await
         .unwrap();
+    let instance = rec.read();
     assert_eq!(instance.common.proc_field, 1);
     match instance.get_common_field("PROC") {
         Some(EpicsValue::UChar(1)) => {}
@@ -1829,17 +1839,19 @@ fn test_proc_get_put() {
     }
 }
 
-#[test]
-fn test_disp_get_put() {
-    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
+#[epics_macros_rs::epics_test]
+async fn test_disp_get_put() {
+    let db = db_with("TEST", AoRecord::new(0.0)).await;
+    let rec = db.get_record("TEST").unwrap();
     // DISP is `DBF_UCHAR`: served as `UChar` (its declared type).
-    match instance.get_common_field("DISP") {
+    match rec.read().get_common_field("DISP") {
         Some(EpicsValue::UChar(0)) => {}
         other => panic!("expected UChar(0), got {:?}", other),
     }
-    instance
-        .put_common_field("DISP", EpicsValue::Char(1))
+    db.put_pv_no_process("TEST.DISP", EpicsValue::Char(1))
+        .await
         .unwrap();
+    let instance = rec.read();
     assert!(instance.common.disp != 0);
     match instance.get_common_field("DISP") {
         Some(EpicsValue::UChar(1)) => {}
@@ -1913,8 +1925,8 @@ impl Record for HookTrackingRecord {
     }
 }
 
-#[test]
-fn test_special_called_on_common_put() {
+#[epics_macros_rs::epics_test]
+async fn test_special_called_on_common_put() {
     let special_before = Arc::new(AtomicU32::new(0));
     let special_after = Arc::new(AtomicU32::new(0));
     let rec = HookTrackingRecord {
@@ -1924,16 +1936,16 @@ fn test_special_called_on_common_put() {
         on_put_count: Arc::new(AtomicU32::new(0)),
         reject_field: None,
     };
-    let mut instance = RecordInstance::new("TEST", rec);
-    instance
-        .put_common_field("DESC", EpicsValue::String("hello".into()))
+    let db = db_with("TEST", rec).await;
+    db.put_pv_no_process("TEST.DESC", EpicsValue::String("hello".into()))
+        .await
         .unwrap();
     assert_eq!(special_before.load(Ordering::SeqCst), 1);
     assert_eq!(special_after.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn test_validate_put_rejects_common_field() {
+#[epics_macros_rs::epics_test]
+async fn test_validate_put_rejects_common_field() {
     let rec = HookTrackingRecord {
         val: 0.0,
         special_before_count: Arc::new(AtomicU32::new(0)),
@@ -1941,13 +1953,15 @@ fn test_validate_put_rejects_common_field() {
         on_put_count: Arc::new(AtomicU32::new(0)),
         reject_field: Some("SCAN".into()),
     };
-    let mut instance = RecordInstance::new("TEST", rec);
-    let result = instance.put_common_field("SCAN", EpicsValue::String("1 second".into()));
+    let db = db_with("TEST", rec).await;
+    let result = db
+        .put_pv_no_process("TEST.SCAN", EpicsValue::String("1 second".into()))
+        .await;
     assert!(result.is_err());
 }
 
-#[test]
-fn test_on_put_called_for_common_field() {
+#[epics_macros_rs::epics_test]
+async fn test_on_put_called_for_common_field() {
     let on_put = Arc::new(AtomicU32::new(0));
     let rec = HookTrackingRecord {
         val: 0.0,
@@ -1956,59 +1970,11 @@ fn test_on_put_called_for_common_field() {
         on_put_count: on_put.clone(),
         reject_field: None,
     };
-    let mut instance = RecordInstance::new("TEST", rec);
-    instance
-        .put_common_field("DESC", EpicsValue::String("test".into()))
+    let db = db_with("TEST", rec).await;
+    db.put_pv_no_process("TEST.DESC", EpicsValue::String("test".into()))
+        .await
         .unwrap();
     assert_eq!(on_put.load(Ordering::SeqCst), 1);
-}
-
-// --- Scan Index tests ---
-
-#[test]
-fn test_phas_change_returns_result() {
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST", rec);
-    instance
-        .put_common_field("SCAN", EpicsValue::String("1 second".into()))
-        .unwrap();
-    let result = instance
-        .put_common_field("PHAS", EpicsValue::Short(5))
-        .unwrap();
-    assert!(matches!(
-        result,
-        CommonFieldPutResult::PhasChanged {
-            old_phas: 0,
-            new_phas: 5,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn test_phas_change_passive_no_result() {
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST", rec);
-    let result = instance
-        .put_common_field("PHAS", EpicsValue::Short(5))
-        .unwrap();
-    assert_eq!(result, CommonFieldPutResult::NoChange);
-}
-
-#[test]
-fn test_scan_change_includes_phas() {
-    let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST", rec);
-    instance
-        .put_common_field("PHAS", EpicsValue::Short(3))
-        .unwrap();
-    let result = instance
-        .put_common_field("SCAN", EpicsValue::String("1 second".into()))
-        .unwrap();
-    match result {
-        CommonFieldPutResult::ScanChanged { phas, .. } => assert_eq!(phas, 3),
-        other => panic!("expected ScanChanged, got {:?}", other),
-    }
 }
 
 // --- UDF Policy tests ---
@@ -2346,43 +2312,55 @@ fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
 // label, then a numeric index). Pre-fix `field(DISS,"MAJOR")` was dropped
 // silently (the arm bound only `Short`) and `field(PINI,"RUN")` set the flag
 // to false.
-#[test]
-fn test_put_dbcommon_menu_field_resolves_label() {
+#[epics_macros_rs::epics_test]
+async fn test_put_dbcommon_menu_field_resolves_label() {
     use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
 
-    let mut inst = RecordInstance::new("COMMON:PUT", AiRecord::new(1.0));
-    inst.put_common_field("DISS", EpicsValue::String("MAJOR".into()))
+    let db = db_with("COMMON:PUT", AiRecord::new(1.0)).await;
+    let rec = db.get_record("COMMON:PUT").unwrap();
+    let put = |f: &str, v| db.put_pv_no_process(format!("COMMON:PUT.{f}"), v);
+    put("DISS", EpicsValue::String("MAJOR".into()))
+        .await
         .unwrap();
-    assert_eq!(inst.common.diss, AlarmSeverity::Major as i16);
+    assert_eq!(rec.read().common.diss, AlarmSeverity::Major as i16);
 
-    inst.put_common_field("UDFS", EpicsValue::String("MINOR".into()))
+    put("UDFS", EpicsValue::String("MINOR".into()))
+        .await
         .unwrap();
-    assert_eq!(inst.common.udfs, AlarmSeverity::Minor as i16);
+    assert_eq!(rec.read().common.udfs, AlarmSeverity::Minor as i16);
 
-    inst.put_common_field("PINI", EpicsValue::String("RUN".into()))
-        .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::Run as i16);
+    put("PINI", EpicsValue::String("RUN".into())).await.unwrap();
+    assert_eq!(rec.read().common.pini, PiniMode::Run as i16);
     // Bare menu index, as C `epicsParseUInt16` accepts.
-    inst.put_common_field("PINI", EpicsValue::String("3".into()))
-        .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::Running as i16);
+    put("PINI", EpicsValue::String("3".into())).await.unwrap();
+    assert_eq!(rec.read().common.pini, PiniMode::Running as i16);
     // "NO" is a real choice — index 0, not a parse failure.
-    inst.put_common_field("PINI", EpicsValue::String("NO".into()))
-        .unwrap();
-    assert_eq!(inst.common.pini, PiniMode::No as i16);
+    put("PINI", EpicsValue::String("NO".into())).await.unwrap();
+    assert_eq!(rec.read().common.pini, PiniMode::No as i16);
     // A string naming no choice is C `S_db_badChoice`, not a silent NO.
     assert!(
-        inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
+        put("PINI", EpicsValue::String("MAYBE".into()))
+            .await
             .is_err()
     );
 
-    // ACKT is menu(menuYesNo), not a truthiness flag.
-    inst.put_common_field("ACKT", EpicsValue::String("NO".into()))
+    // ACKT is menu(menuYesNo), not a truthiness flag. It is SPC_NOMOD, so
+    // only a `.db` sets it by label.
+    for (label, ackt) in [("NO", false), ("YES", true)] {
+        let name = format!("COMMON:ACKT:{label}");
+        db.add_loaded_record(
+            &name,
+            Box::new(AiRecord::new(1.0)),
+            RecordLoad::from_common_fields(vec![("ACKT".into(), EpicsValue::String(label.into()))]),
+        )
+        .await
         .unwrap();
-    assert!(!inst.common.ackt);
-    inst.put_common_field("ACKT", EpicsValue::String("YES".into()))
-        .unwrap();
-    assert!(inst.common.ackt);
+        assert_eq!(
+            db.get_record(&name).unwrap().read().common.ackt,
+            ackt,
+            "{label}"
+        );
+    }
 }
 
 // MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value
@@ -2952,17 +2930,18 @@ fn test_bi_lalm_updates_when_cosv_set() {
 /// is stored and served back byte for byte, never U+FFFD-mangled. C
 /// `dbCommon` `field(DESC,DBF_STRING) size(41)` is a fixed `char[]`, so a
 /// non-UTF-8 description round-trips unchanged.
-#[test]
-fn desc_preserves_non_utf8_bytes() {
-    let rec = AiRecord::new(0.0);
-    let mut inst = RecordInstance::new("DESC:NONUTF8", rec);
+#[epics_macros_rs::epics_test]
+async fn desc_preserves_non_utf8_bytes() {
+    let db = db_with("DESC:NONUTF8", AiRecord::new(0.0)).await;
     let raw = vec![0xffu8, 0x00, 0x80];
-    inst.put_common_field(
-        "DESC",
+    db.put_pv_no_process(
+        "DESC:NONUTF8.DESC",
         EpicsValue::String(PvString::from_bytes(raw.clone())),
     )
+    .await
     .expect("DESC put");
-    match inst.get_common_field("DESC") {
+    let rec = db.get_record("DESC:NONUTF8").unwrap();
+    match rec.read().get_common_field("DESC") {
         Some(EpicsValue::String(s)) => assert_eq!(
             s.as_bytes(),
             raw.as_slice(),

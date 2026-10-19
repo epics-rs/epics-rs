@@ -230,7 +230,8 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
 /// `busy` (`busyRecord.dbd`) declares SIMM/SIML/SIOL but NO SSCN and NO
 /// OLDSIMM, and `busyRecord.c` calls neither recGblSaveSimm nor
 /// recGblCheckSimm — it has no `special()` at all. So a SIMM transition on a
-/// busy record must NOT move its SCAN, even with SSCN set. Same for `swait`.
+/// busy record must NOT move its SCAN, and an SSCN put is
+/// `S_dbLib_fieldNotFound`. Same for `swait`.
 #[epics_macros_rs::epics_test]
 async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     let db = PvDatabase::new();
@@ -240,9 +241,11 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     db.put_pv("BUSY.SCAN", EpicsValue::Enum(SCAN_1_SECOND))
         .await
         .unwrap();
-    db.put_pv("BUSY.SSCN", EpicsValue::Enum(SCAN_PASSIVE))
-        .await
-        .unwrap();
+    let sscn = db.put_pv("BUSY.SSCN", EpicsValue::Enum(SCAN_PASSIVE)).await;
+    assert!(
+        matches!(sscn, Err(epics_base_rs::error::CaError::FieldNotFound(_))),
+        "{sscn:?}"
+    );
 
     db.put_pv("BUSY.SIMM", EpicsValue::Short(1)).await.unwrap();
 
@@ -252,10 +255,6 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
         inst.common.scan,
         ScanType::SEC1,
         "busy's C support never reaches recGblCheckSimm"
-    );
-    assert_eq!(
-        inst.get_common_field("SSCN"),
-        Some(EpicsValue::Enum(SCAN_PASSIVE))
     );
 }
 

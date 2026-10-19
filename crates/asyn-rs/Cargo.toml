@@ -138,6 +138,10 @@ name = "octet_write_read_reads_its_command_record"
 required-features = ["epics"]
 
 [[test]]
+name = "octet_write_defines_the_record"
+required-features = ["epics"]
+
+[[test]]
 name = "asyn_monitor_posts_its_read_fields"
 required-features = ["epics"]
 

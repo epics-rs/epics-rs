@@ -8899,8 +8899,11 @@ impl PvDatabase {
                     );
                 }
 
-                if let Some(dev) = instance.device.as_mut() {
-                    dev.async_write_completed();
+                {
+                    let inst = &mut *instance;
+                    if let Some(dev) = inst.device.as_mut() {
+                        dev.async_write_completed_common(&mut inst.common);
+                    }
                 }
 
                 // ---- Output stage. C `process()` performs the record's output

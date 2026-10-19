@@ -14,7 +14,7 @@ use epics_base_rs::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
 };
 use epics_base_rs::server::device_support::{ReadStart, WriteStart};
-use epics_base_rs::server::record::{DevSup, Record, ScanType};
+use epics_base_rs::server::record::{CommonFields, DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -3047,6 +3047,16 @@ impl AsynDeviceSupport {
         e.is_queue_refused() && matches!(self.dset, Dset::Octet | Dset::Array)
     }
 
+    /// devAsynOctet's `processCommon` defines the record on every pass whose
+    /// result is success (devAsynOctet.c:817-818), outputs included; a refused
+    /// queue leaves that status at success. The other devAsyn outputs leave
+    /// UDF to the record.
+    fn define_on_write(&self, common: &mut CommonFields, landed: bool) {
+        if self.octet_output && landed {
+            common.udf = 0;
+        }
+    }
+
     fn write_now(&mut self, op: RequestOp) -> CaResult<()> {
         let ran = self.submit_traced(op);
         if let Err(e) = &ran {
@@ -4249,10 +4259,30 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn async_write_completed(&mut self) {
+    fn async_write_completed_common(&mut self, common: &mut CommonFields) {
         let wrote = self.device_job.write_alarm.lock().unwrap_or(Ok((0, 0)));
+        self.define_on_write(common, wrote.is_ok());
         (self.last_alarm_status, self.last_alarm_severity) = self.output_alarm(wrote);
         self.end_processing();
+    }
+
+    fn write_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) -> CaResult<()> {
+        let written = self.write(record);
+        self.define_on_write(common, written.is_ok());
+        written
+    }
+
+    fn write_begin_common(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        let start = self.write_begin(record, done);
+        if let Ok(WriteStart::Completed) = start {
+            self.define_on_write(common, true);
+        }
+        start
     }
 
     /// C `processAi` and its kin on an `ASYN_CANBLOCK` port: set PACT, queue

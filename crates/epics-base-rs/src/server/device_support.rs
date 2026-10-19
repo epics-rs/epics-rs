@@ -1228,6 +1228,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
         self.write(record)
     }
 
+    /// [`async_write_completed`](Self::async_write_completed) with the
+    /// record's `dbCommon`.
+    fn async_write_completed_common(&mut self, _common: &mut CommonFields) {
+        self.async_write_completed()
+    }
+
     /// Begin the record's input read — C devAsyn's `queueRequest` on a
     /// `canBlock` port with `pr->pact = 1` (devAsynInt32.c:838-842). Asked on
     /// every pass; on the pass a [`ReadStart::Pending`] completion re-entered,

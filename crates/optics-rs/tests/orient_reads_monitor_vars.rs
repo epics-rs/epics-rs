@@ -107,7 +107,7 @@ async fn boot_sim() -> (Arc<PvDatabase>, PvDatabase) {
         motor_rs::devices::register_controller_port(&asyn_rs::registry::open_owner(), &name, 1, ())
             .unwrap();
         motor_rs::devices::register_axis(axis).unwrap();
-        BlockingBridge::capture().spawn(poll_loop.run());
+        poll_loop.start();
     }
     let (name, factory) = motor_rs::motor_record_factory();
     let builder = IocBuilder::new()

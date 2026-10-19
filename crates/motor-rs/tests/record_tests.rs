@@ -1535,6 +1535,7 @@ fn test_retry_on_position_error() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     // MRES smaller than RDBD so enforceMinRetryDeadband (run at the top
     // of check_completion, C parity with do_work) leaves RDBD untouched.
     rec.conv.mres = 0.001;
@@ -1558,6 +1559,7 @@ fn test_miss_when_retries_exhausted() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     // MRES smaller than RDBD so enforceMinRetryDeadband is a no-op here.
     rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;
@@ -4122,6 +4124,7 @@ fn test_delaywait_finalizes_after_delay_expires() {
     // only the watchdog expiry (DELAY_REQ -> DELAY_ACK) plus the status
     // refresh it requests drive the post-settle evaluation.
     let mut rec = MotorRecord::new();
+    rec.timing.dly = 0.5;
     rec.stat.phase = MotionPhase::DelayWait;
     rec.stat.dmov = 0;
     rec.stat.msta = MstaFlags::DONE;
@@ -4264,6 +4267,7 @@ fn test_retry_when_diff_exceeds_rdbd() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     rec.retry.rdbd = 0.5;
     rec.retry.rtry = 3;
     rec.pos.dval = 10.0;
@@ -5291,6 +5295,34 @@ fn test_urip_rdbl_error_stops_in_flight_on_completion_check() {
 }
 
 #[test]
+fn test_urip_rdbl_error_stop_completes_without_a_retry() {
+    // C 3692-3694 sets stop = 1, which do_work's stop block consumes: pp
+    // TRUE and mip = MIP_STOP wholesale (1890-1907). The completion's
+    // postProcess leaves MIP_DONE, so the retry test runs no maybeRetry.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.retry.rtry = 3;
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.movn = 1;
+    rec.set_rdbl_error(true);
+    rec.check_completion();
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    let effects = complete_stop_at(&mut rec, 4.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert!(rec.stat.mip.is_empty());
+    assert_eq!(rec.pos.dval, 4.0);
+}
+
+#[test]
 fn test_urip_rdbl_error_does_not_affect_ueip_path() {
     // When URIP=No, RDBL error flag is irrelevant.
     let mut rec = MotorRecord::new();
@@ -5711,6 +5743,84 @@ fn test_parked_jog_request_survives_the_pp_pass_maybe_retry() {
         assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "dly {dly}");
         assert!(rec.stat.dmov != 0, "dly {dly}");
     }
+}
+
+#[test]
+fn test_parked_jog_request_retries_on_an_idle_status_pass() {
+    // C 1410-1440 on a stopped callback without pp: mip = MIP_JOG_REQ is
+    // not MIP_DONE, so DLY <= 0 runs maybeRetry against DVAL. A readback
+    // that drifted past RDBD arms MIP_RETRY over the request with DMOV
+    // FALSE (1077-1080); under Pause do_work returns (2237), and Go
+    // re-arms the jog from its button (1914-1918).
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 1.0;
+    rec.vel.jvel = 1.0;
+    rec.put_field("RTRY", EpicsValue::Short(3)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = live_axis(&mut rec);
+    rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Pause as i16))
+        .unwrap();
+    live_pass(&mut rec, &state, None);
+    live_pass(&mut rec, &state, Some(status_at(0.0, false)));
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(live_pass(&mut rec, &state, None).commands, []);
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ);
+
+    let drift = live_pass(&mut rec, &state, Some(status_at(5.0, false)));
+    assert_eq!(drift.commands, []);
+    assert_eq!(rec.stat.mip, MipFlags::RETRY);
+    assert_eq!(rec.retry.rcnt, 1);
+    assert!(rec.stat.dmov == 0);
+
+    rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Go as i16))
+        .unwrap();
+    let go = live_pass(&mut rec, &state, None);
+    assert!(
+        go.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        go.commands
+    );
+}
+
+#[test]
+fn test_idle_pause_under_dly_keeps_mip_stop_until_go() {
+    // C 1410-1456: an idle Pause's stop callback finds DMOV already TRUE,
+    // so with DLY > 0 neither the watchdog (1441) nor maybeRetry (1412)
+    // runs: MIP_STOP and a latched MISS stay, and JOGF does not arm
+    // (special 3045 needs MIP_DONE). Go re-arms the jog from its button
+    // (1914-1918).
+    let mut rec = MotorRecord::new();
+    rec.timing.dly = 0.5;
+    rec.vel.jvel = 1.0;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = live_axis(&mut rec);
+    rec.retry.miss = 1; // latched by an earlier give-up
+    rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Pause as i16))
+        .unwrap();
+    live_pass(&mut rec, &state, None);
+    let stopped = live_pass(&mut rec, &state, Some(status_at(0.0, false)));
+    assert!(stopped.schedule_delay.is_none());
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.retry.miss, 1);
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(live_pass(&mut rec, &state, None).commands, []);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Go as i16))
+        .unwrap();
+    let go = live_pass(&mut rec, &state, None);
+    assert!(
+        go.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        go.commands
+    );
 }
 
 #[test]
@@ -7610,10 +7720,10 @@ fn test_pause_during_backlash_move_syncs_at_completion() {
 fn test_idle_pause_sends_stop_axis_and_converges() {
     // C 1899-1911: the Pause pass sends STOP_AXIS unconditionally and
     // sets mip = MIP_STOP even on an idle axis ("just in case" — e.g. a
-    // servo still settling after an InPosition retry). The next
-    // completion pass collapses the bare MIP_STOP via maybeRetry's
-    // close-enough path (mip != DONE at 1432) without arming DLY
-    // (C 1457 needs a fresh M_DMOV mark).
+    // servo still settling after an InPosition retry). With DLY > 0 its
+    // stop callback finds DMOV already TRUE: no M_DMOV edge arms the
+    // watchdog (1441) and maybeRetry needs DLY <= 0 (1412), so MIP_STOP
+    // stays until Go collapses it (1921-1925).
     let mut rec = MotorRecord::new();
     rec.timing.dly = 1.0;
     rec.ctrl.spmg = SpmgMode::Pause;
@@ -7629,7 +7739,7 @@ fn test_idle_pause_sends_stop_axis_and_converges() {
         effects.schedule_delay.is_none(),
         "idle pause must not arm DLY"
     );
-    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
     assert!(rec.stat.dmov != 0);
 
     rec.ctrl.spmg = SpmgMode::Go;
@@ -9888,95 +9998,140 @@ mod retry_after_dly_settle {
         assert!(rec.stat.mip.contains(MipFlags::RETRY));
     }
 
-    // C 1427: `mip != MIP_DONE` gates maybeRetry on the post-delay
-    // pass. A home completion collapsed MIP via postProcess (894-906)
-    // before the delay armed, so its post-delay pass finalizes without
-    // the retry evaluation — a latched MISS survives (maybeRetry's
-    // close-enough branch, which clears it, is never reached).
-    #[test]
-    fn home_completion_post_delay_skips_retry_eval() {
-        let mut rec = MotorRecord::new();
-        rec.conv.mres = 0.1;
-        rec.retry.rtry = 3;
-        rec.retry.rdbd = 0.5;
-        rec.timing.dly = 0.2;
-        rec.stat.msta = MstaFlags::DONE;
-        rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
-        rec.do_process();
-        assert_eq!(rec.stat.phase, MotionPhase::Homing);
-        rec.retry.miss = 1; // latched by an earlier give-up
-
-        rec.stat.msta = MstaFlags::DONE;
-        rec.stat.movn = 0;
-        let effects = rec.check_completion();
-        assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
-        assert!(effects.schedule_delay.is_some(), "delay armed");
-
-        rec.set_event(MotorEvent::DelayExpired);
-        let _ = rec.do_process();
-        let effects = rec.check_completion();
-        assert!(
-            !effects
-                .commands
-                .iter()
-                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
-            "no retry from a home completion"
-        );
-        assert!(rec.stat.dmov != 0, "finalized after the settle");
-        assert!(rec.stat.mip.is_empty());
-        assert!(
-            rec.retry.miss != 0,
-            "MISS survives: C skips maybeRetry when mip == MIP_DONE (1427)"
-        );
-        assert_eq!(rec.retry.rcnt, 0);
-    }
-
-    // Same key for a commanded stop: C postProcess (827-849) cleared
-    // MIP_STOP before the delay, so the post-delay pass never runs
-    // maybeRetry — no retry dispatch, MISS untouched.
-    #[test]
-    fn stop_completion_post_delay_skips_retry_eval() {
+    fn dly_record() -> MotorRecord {
         let mut rec = MotorRecord::new();
         rec.internal.init_invariants_synced = true;
         rec.conv.mres = 0.1;
         rec.retry.rtry = 3;
         rec.retry.rdbd = 0.5;
         rec.timing.dly = 0.2;
-        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
-        rec.do_process();
-        rec.stat.msta = MstaFlags::MOVING;
-        rec.stat.movn = 1;
         rec.retry.miss = 1; // latched by an earlier give-up
+        rec
+    }
 
-        rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
-        rec.do_process();
-        assert!(rec.stat.mip.contains(MipFlags::STOP));
-
-        // Axis halts 2.0 short; pp syncs the drive fields, then DLY arms.
-        rec.stat.msta = MstaFlags::DONE;
-        rec.stat.movn = 0;
-        rec.pos.drbv = 8.0;
-        rec.pos.rbv = 8.0;
-        let effects = rec.check_completion();
+    /// C 1427 tests `mip != MIP_DONE` with the DELAY bits still set, so
+    /// every post-delay pass runs maybeRetry, whatever completed: landing
+    /// close enough clears MISS and ends a Move one-shot in Pause
+    /// (1083-1101); a readback that drifted during DLY retries (1077).
+    fn assert_post_delay_maybe_retry(rec: &mut MotorRecord, drift: bool) {
         assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
-        assert!(effects.schedule_delay.is_some(), "delay armed");
-
+        rec.ctrl.spmg = SpmgMode::Move;
+        rec.internal.lspg = SpmgMode::Move;
         rec.set_event(MotorEvent::DelayExpired);
         let _ = rec.do_process();
+        let at = rec.pos.dval + if drift { 2.0 } else { 0.0 };
+        rec.pos.drbv = at;
+        rec.pos.rbv = at;
         let effects = rec.check_completion();
-        assert!(
-            !effects
-                .commands
-                .iter()
-                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
-            "no retry from a stop completion"
-        );
-        assert!(rec.stat.dmov != 0, "finalized after the settle");
-        assert!(
-            rec.retry.miss != 0,
-            "MISS survives: C skips maybeRetry when mip == MIP_DONE (1427)"
-        );
-        assert_eq!(rec.retry.rcnt, 0);
+        let retried = effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. }));
+        assert_eq!(retried, drift, "{:?}", effects.commands);
+        if drift {
+            assert!(rec.stat.mip.contains(MipFlags::RETRY));
+            assert_eq!(rec.retry.rcnt, 1);
+            assert!(rec.retry.miss != 0, "the retry branch leaves MISS");
+        } else {
+            assert!(rec.stat.mip.is_empty());
+            assert!(rec.stat.dmov != 0);
+            assert!(rec.retry.miss == 0, "close enough clears MISS");
+            assert_eq!(rec.ctrl.spmg, SpmgMode::Pause);
+        }
+    }
+
+    #[test]
+    fn home_completion_post_delay_runs_maybe_retry() {
+        for drift in [false, true] {
+            let mut rec = dly_record();
+            rec.stat.msta = MstaFlags::DONE;
+            rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+            rec.do_process();
+            assert_eq!(rec.stat.phase, MotionPhase::Homing);
+
+            rec.stat.movn = 0;
+            let effects = rec.check_completion();
+            assert!(effects.schedule_delay.is_some(), "delay armed");
+            assert_post_delay_maybe_retry(&mut rec, drift);
+        }
+    }
+
+    #[test]
+    fn jog_stop_completion_post_delay_runs_maybe_retry() {
+        for drift in [false, true] {
+            let mut rec = dly_record();
+            rec.vel.jvel = 1.0;
+            rec.stat.msta = MstaFlags::DONE;
+            rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+            rec.do_process();
+            assert_eq!(rec.stat.phase, MotionPhase::Jog);
+            rec.stat.msta = MstaFlags::MOVING;
+            rec.stat.movn = 1;
+            rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+            rec.do_process();
+            assert_eq!(rec.stat.phase, MotionPhase::JogStopping);
+
+            rec.stat.msta = MstaFlags::DONE;
+            rec.stat.movn = 0;
+            rec.pos.drbv = 3.0;
+            rec.pos.rbv = 3.0;
+            let effects = rec.check_completion();
+            assert!(effects.schedule_delay.is_some(), "delay armed");
+            assert_post_delay_maybe_retry(&mut rec, drift);
+        }
+    }
+
+    #[test]
+    fn stop_completion_post_delay_runs_maybe_retry() {
+        for drift in [false, true] {
+            let mut rec = dly_record();
+            rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+            rec.do_process();
+            rec.stat.msta = MstaFlags::MOVING;
+            rec.stat.movn = 1;
+            rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+            rec.do_process();
+            assert!(rec.stat.mip.contains(MipFlags::STOP));
+
+            // Axis halts 2.0 short; pp syncs the drive fields, then DLY arms.
+            rec.stat.msta = MstaFlags::DONE;
+            rec.stat.movn = 0;
+            rec.pos.drbv = 8.0;
+            rec.pos.rbv = 8.0;
+            let effects = rec.check_completion();
+            assert!(effects.schedule_delay.is_some(), "delay armed");
+            assert_post_delay_maybe_retry(&mut rec, drift);
+        }
+    }
+
+    // C 1405-1409 collapses MIP_LOAD_P to DONE ahead of the watchdog, so a
+    // LOAD_POS completion never reaches a post-delay pass.
+    #[test]
+    fn load_pos_completion_skips_the_delay() {
+        let mut rec = MotorRecord::new();
+        rec.timing.dly = 0.2;
+        rec.retry.miss = 1;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.pos.val = 5.0;
+        rec.pos.dval = 5.0;
+        rec.pos.drbv = 5.0;
+        rec.internal.lval = 5.0;
+        rec.internal.ldvl = 5.0;
+        rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+        rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+        rec.plan_motion(CommandSource::Set);
+        assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+
+        rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
+            position: 0.0,
+            done: true,
+            ..Default::default()
+        });
+        let effects = rec.check_completion();
+        assert!(effects.schedule_delay.is_none());
+        assert!(rec.stat.mip.is_empty());
+        assert!(rec.stat.dmov != 0);
+        assert!(rec.retry.miss != 0, "no maybeRetry");
     }
 
     // DLY == 0: the evaluation runs on the completion pass itself.
@@ -10017,6 +10172,7 @@ mod miss_semantics {
     fn completed_short(rec: &mut MotorRecord) {
         rec.stat.msta = MstaFlags::DONE;
         rec.stat.phase = MotionPhase::MainMove;
+        rec.stat.mip = MipFlags::MOVE;
         rec.conv.mres = 0.001;
         rec.retry.rdbd = 0.1;
         rec.pos.dval = 10.0;
@@ -10444,6 +10600,7 @@ fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = 0;
     rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;
@@ -10495,6 +10652,7 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
     anchor(&mut rec, &state);
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = 0;
     rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;
@@ -10536,6 +10694,7 @@ fn test_new_target_after_miss_giveup_dispatches() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = 0;
     rec.conv.mres = 0.001;
     rec.retry.rdbd = 0.1;

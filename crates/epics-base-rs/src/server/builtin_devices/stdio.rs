@@ -104,11 +104,11 @@ impl DeviceSupport for StdioDeviceSupport {
         }
         // iocInit's `doResolveLinks` discards `add_xxx`'s -1 for an unknown
         // stream: no diagnostic, no alarm, and the record writes nothing.
-        let _ = self.add_record(rt);
+        let _ = self.add_record(record);
         Ok(DeviceInitOutcome::ok())
     }
 
-    fn add_record(&mut self, _record_type: &str) -> Result<(), LinkRefusal> {
+    fn add_record(&mut self, _record: &mut dyn Record) -> Result<(), LinkRefusal> {
         // `add_xxx` returns -1, printing nothing, for an OUT naming no
         // stream in `outStreams`.
         match self.stream {

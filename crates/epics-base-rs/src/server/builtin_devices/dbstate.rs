@@ -82,11 +82,12 @@ impl DeviceSupport for DbStateDeviceSupport {
                 "DTYP='Db State': unsupported record type '{rt}' (use bi or bo)"
             )));
         }
-        let _ = self.add_record(rt);
+        let _ = self.add_record(record);
         Ok(DeviceInitOutcome::ok())
     }
 
-    fn add_record(&mut self, record_type: &str) -> Result<(), LinkRefusal> {
+    fn add_record(&mut self, record: &mut dyn Record) -> Result<(), LinkRefusal> {
+        let record_type = record.record_type();
         // C `add_record` reads `inp/out.value.instio.string` (the post-`@`
         // content). An empty string leaves `dpvt = NULL` and the record never
         // resolves a state — read/write no-op.

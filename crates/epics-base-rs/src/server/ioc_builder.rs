@@ -15,7 +15,7 @@ use crate::types::EpicsValue;
 use super::cvt_bpt::BrkTable;
 use super::database::PvDatabase;
 use super::device_support;
-use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory, InitHookState};
+use super::ioc_app::{BuildWalk, DeviceSupportContext, DynamicDeviceSupportFactory, InitHookState};
 use super::{DeviceSupportFactory, RecordFactory};
 use super::{autosave, db_loader};
 
@@ -427,7 +427,7 @@ impl IocBuilder {
         Arc<PvDatabase>,
         Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     )> {
-        let (db, autosave_config, ()) = self
+        let (db, autosave_config, _) = self
             .build_through(begin_unsequenced, LinkInit::Caller)
             .await?;
         Ok((db, autosave_config))
@@ -443,7 +443,7 @@ impl IocBuilder {
         Arc<PvDatabase>,
         Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     )> {
-        let (db, autosave_config, ()) = self
+        let (db, autosave_config, _) = self
             .build_through(begin_unsequenced, LinkInit::Build)
             .await?;
         Ok((db, autosave_config))
@@ -631,9 +631,6 @@ impl IocBuilder {
     }
 }
 
-/// What a build announces its init hooks through: nothing for
-/// [`IocBuilder::build`], which is no `iocBuild`, and the one sequence every
-/// `iocBuild` walks for [`IocBuilder::build_ioc`].
 /// The `iocinit_begins` of [`IocBuilder::build`] and
 /// [`IocBuilder::build_served`], which say nothing of `iocBuild`. Port rule,
 /// no C line: C has no build outside `iocBuild`, whose `callbackInit`
@@ -641,11 +638,14 @@ impl IocBuilder {
 /// in `cbInit` itself — and leaves armed ones alone, without C's
 /// second-call warning. Before any build and after `callbackCleanup` a
 /// request is still refused.
-fn begin_unsequenced() -> Option<()> {
+fn begin_unsequenced() -> Option<BuildWalk> {
     crate::runtime::task::background_arm();
-    Some(())
+    Some(BuildWalk::new())
 }
 
+/// What a build reaches its init hook states through: one walk for every
+/// build, announcing for [`IocBuilder::build_ioc`]'s `iocBuild` and not for
+/// [`IocBuilder::build`], which is none.
 trait BuildSteps {
     fn reach(&mut self, state: InitHookState);
     fn ca_link_init(
@@ -655,8 +655,10 @@ trait BuildSteps {
     ) -> impl std::future::Future<Output = ()> + Send;
 }
 
-impl BuildSteps for () {
-    fn reach(&mut self, _state: InitHookState) {}
+impl BuildSteps for BuildWalk {
+    fn reach(&mut self, state: InitHookState) {
+        self.until(state).for_each(drop);
+    }
     async fn ca_link_init(
         &mut self,
         db: &Arc<PvDatabase>,
@@ -767,7 +769,7 @@ mod tests {
             .build_through(
                 move || {
                     begun.lock().unwrap().push("iocBuild_1".to_string());
-                    Some(())
+                    Some(BuildWalk::new())
                 },
                 LinkInit::Caller,
             )

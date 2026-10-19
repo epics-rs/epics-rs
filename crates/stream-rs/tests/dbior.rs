@@ -4,6 +4,8 @@
 //! difference is the version: C's names its StreamDevice checkout, rs's is
 //! `STREAM_VERSION`.
 
+#[path = "dbior/boot.rs"]
+mod boot;
 #[path = "dbior/harness.rs"]
 mod harness;
 
@@ -15,7 +17,7 @@ record(stringout, "R2") { field(DTYP, "stream") field(OUT, "@p.proto put dummy")
 #[test]
 fn dbior_stream_matches_c() {
     epics_base_rs::runtime::task::test_block_on(async {
-        let db = harness::boot(DB).await;
-        harness::assert_levels(&db, "dbior.out", &["0", "1", "2", "3", "100"]).await;
+        let db = boot::boot(DB).await;
+        harness::assert_levels(&db, "dbior.out", "stream", &["0", "1", "2", "3", "100"]).await;
     });
 }

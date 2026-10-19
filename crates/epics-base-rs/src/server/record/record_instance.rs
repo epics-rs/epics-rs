@@ -1507,11 +1507,10 @@ mod link_cache {
         /// The bound object stays: its dset extends with `devSoft_DSXT`,
         /// whose `add_record` binds nothing.
         Keep,
-        /// A fresh object whose `add_record` bound the new link: C's new
-        /// `dpvt`.
+        /// A fresh object for the new link, whose `add_record` the rebind
+        /// runs under the hold; one that refused is left here to be freed
+        /// after it.
         Bound(Box<dyn crate::server::device_support::DeviceSupport>),
-        /// `add_record` refused.
-        Refused(crate::error::LinkRefusal),
         /// `dev<T>SoftCallback`'s `add_record` refused; its line is printed
         /// after the hold.
         SoftRefused(AddRecordRefusal),
@@ -1624,7 +1623,7 @@ mod link_cache {
                     }
                     Err(refusal) => NewDset::SoftRefused(refusal),
                 }
-            } else if bound_here && !row.is_some_and(|row| row.dset.extends) {
+            } else if bound_here && !row.is_some_and(|row| row.dset.extends()) {
                 NewDset::Keep
             } else {
                 // A device address is text to its support; a name's bytes
@@ -1642,10 +1641,7 @@ mod link_cache {
                     out,
                 };
                 match db.resolve_device_support(&ctx) {
-                    Some(mut dev) => match dev.add_record(record_type) {
-                        Ok(()) => NewDset::Bound(dev),
-                        Err(refusal) => NewDset::Refused(refusal),
-                    },
+                    Some(dev) => NewDset::Bound(dev),
                     None => NewDset::Absent,
                 }
             };
@@ -8877,14 +8873,12 @@ impl RecordInstance {
         std::mem::take(&mut self.dpvt)
     }
 
-    /// C `doCloseLinks`' device half (`iocInit.c:689-699`): a dset with a
-    /// `dsxt` leaves its scan list and its `del_record` runs, whose status C
+    /// C `doCloseLinks`' device half (`iocInit.c:689-699`): a bound dset with
+    /// a `dsxt` leaves its scan list and its `del_record` runs, whose status C
     /// ignores here. True when it ran, so the caller takes PACT as C does.
     pub(crate) fn close_device(&mut self) -> bool {
-        use crate::server::device_support::IoIntrCmd;
-        if !super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str())
-            .is_some_and(|row| row.has_dsxt())
-        {
+        use crate::server::device_support::{BoundDsxt, IoIntrCmd};
+        if self.common.dtyp.bound_dsxt() != BoundDsxt::Has {
             return false;
         }
         // `scanDelete` (`dbScan.c:240-262`). Only an I/O Intr list's leave
@@ -10418,7 +10412,6 @@ impl RecordInstance {
         let rebound = match special {
             Err(e) => Err(e),
             Ok(passed) => match std::mem::replace(&mut prepared.dset, NewDset::Keep) {
-                NewDset::Refused(refusal) => Err(CaError::BadLink(refusal)),
                 NewDset::Keep => Ok(passed),
                 NewDset::SoftRefused(refusal) => {
                     let e = CaError::BadLink(crate::error::LinkRefusal::add_record(refusal.dset()));
@@ -10429,9 +10422,19 @@ impl RecordInstance {
                     prepared.retired = self.device.take();
                     Ok(passed)
                 }
-                NewDset::Bound(dev) => {
-                    prepared.retired = self.device.replace(dev);
-                    Ok(passed)
+                NewDset::Bound(mut dev) => {
+                    dev.set_record_info(&self.name.to_str_lossy(), self.common.scan);
+                    dev.apply_record_info(self.info());
+                    match dev.add_record(&mut *self.record) {
+                        Ok(()) => {
+                            prepared.retired = self.device.replace(dev);
+                            Ok(passed)
+                        }
+                        Err(refusal) => {
+                            prepared.dset = NewDset::Bound(dev);
+                            Err(CaError::BadLink(refusal))
+                        }
+                    }
                 }
             },
         };
@@ -10495,8 +10498,11 @@ impl RecordInstance {
         if link.device_dtyp_moved(self) {
             return Err(CaError::NoSupport);
         }
-        if super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str())
-            .is_some_and(|row| !row.has_dsxt())
+        // The new DTYP's dset and the bound one must both have a `dsxt`
+        // (`dbAccess.c:1149-1152`).
+        if self.common.dtyp.bound_dsxt() == crate::server::device_support::BoundDsxt::Lacks
+            || super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str())
+                .is_some_and(|row| !row.has_dsxt())
         {
             return Err(CaError::NoSupport);
         }

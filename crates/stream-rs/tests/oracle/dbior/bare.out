@@ -1,0 +1,49 @@
+==L0
+Driver: drvAsyn
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+==L1
+Driver: drvAsyn
+Driver: stream
+  StreamDevice 2.8.26 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+  connected records:
+==END

@@ -209,6 +209,20 @@ pub struct Dtyp {
     /// Stored with the class so the process cycle tests one byte; written only
     /// by [`Self::set_class`].
     skips_input_convert: bool,
+    /// The `dsxt` of the dset bound at init or by the last device-link put,
+    /// C's `dbDSETtoDevSup(prec->dset)->pdsxt`, which a later DTYP put does
+    /// not change. Written by [`Self::bind`], [`Self::rebind`] and
+    /// [`Self::detach`].
+    bound_dsxt: BoundDsxt,
+}
+
+/// Whether the record's bound dset extends with a `dsxt`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoundDsxt {
+    /// No dset (C `prec->dset == NULL`), or one no devSup row describes.
+    Unknown,
+    Has,
+    Lacks,
 }
 
 /// The DTYP text. A device-menu choice is the menu's own `&'static str`, so a
@@ -261,6 +275,7 @@ impl Dtyp {
             class: DsetClass::Named(None),
             soft: None,
             skips_input_convert: false,
+            bound_dsxt: BoundDsxt::Unknown,
         };
         dtyp.set_class(DsetClass::Named(classify_soft(&dtyp.name)));
         dtyp
@@ -299,11 +314,28 @@ impl Dtyp {
     /// Fix the class at init, as C's `dbInitRecord` fixes `prec->dset`.
     pub(crate) fn bind(&mut self, record_type: &str) -> Option<SoftDtyp> {
         let soft = match self.class {
-            DsetClass::Named(_) => served_soft(record_type, &self.name),
+            DsetClass::Named(_) => return self.bind_dset(record_type),
             _ => self.soft(),
         };
         self.set_class(DsetClass::Bound(soft));
         soft
+    }
+
+    /// Bind the dset the current name selects.
+    fn bind_dset(&mut self, record_type: &str) -> Option<SoftDtyp> {
+        let soft = served_soft(record_type, &self.name);
+        self.set_class(DsetClass::Bound(soft));
+        self.bound_dsxt = match crate::server::record::dev_sup_of(record_type, self.as_str()) {
+            Some(row) if row.has_dsxt() => BoundDsxt::Has,
+            Some(_) => BoundDsxt::Lacks,
+            None => BoundDsxt::Unknown,
+        };
+        soft
+    }
+
+    /// The bound dset's `dsxt` ([`Self::bound_dsxt`]).
+    pub(crate) fn bound_dsxt(&self) -> BoundDsxt {
+        self.bound_dsxt
     }
 
     /// C `dbPutFieldLink`'s device-link rebind (`dbAccess.c:1127-1199`): an
@@ -312,9 +344,7 @@ impl Dtyp {
     /// name again and stays bound; the caller must not run
     /// [`crate::server::record::Record::init_soft_dset`] for it.
     pub fn rebind(&mut self, record_type: &str) -> Option<SoftDtyp> {
-        let soft = served_soft(record_type, &self.name);
-        self.set_class(DsetClass::Bound(soft));
-        soft
+        self.bind_dset(record_type)
     }
 
     /// C `dev<T>SoftCallback::add_record` failing: only a record bound to
@@ -328,6 +358,7 @@ impl Dtyp {
     /// C `dbPutFieldLink`'s failure arm: the record has no dset.
     pub(crate) fn detach(&mut self) {
         self.set_class(DsetClass::Detached);
+        self.bound_dsxt = BoundDsxt::Unknown;
     }
 
     /// C `prec->dset == NULL` after `Self::detach`.
@@ -871,12 +902,13 @@ pub trait DeviceSupport: Send + Sync + 'static {
         Ok(())
     }
 
-    /// C's `dsxt->add_record` for a device that extends its dset (`devExtend`):
-    /// bind the per-link state from the link this object was built with. A
-    /// device-link put runs it on the fresh object before the record's hold
-    /// and fails on `Err` (`dbAccess.c:1196-1199`); init discards the status
-    /// as `doResolveLinks` does.
-    fn add_record(&mut self, _record_type: &str) -> Result<(), crate::error::LinkRefusal> {
+    /// C's `dsxt->add_record(precord)` for a device that extends its dset
+    /// (`devExtend`): bind the per-link state from the link this object was
+    /// built with. A device-link put runs it under the record's hold on the
+    /// fresh object, which already has its record info, and fails on `Err`
+    /// (`dbAccess.c:1196-1199`); init discards the status as `doResolveLinks`
+    /// does.
+    fn add_record(&mut self, _record: &mut dyn Record) -> Result<(), crate::error::LinkRefusal> {
         Ok(())
     }
 

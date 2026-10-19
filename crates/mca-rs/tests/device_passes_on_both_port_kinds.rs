@@ -30,14 +30,14 @@ static PORT: [DevSup; 1] = [DevSup {
     name: "devMcaPort",
     choice: "Port",
     link_type: DbLinkType::Constant,
-    dset: Dset::new(6, &[1, 2, 3, 4, 5], true),
+    dset: Dset::new(6, &[2, 3, 4, 5], true),
 }];
 
 static SINK: [DevSup; 1] = [DevSup {
     name: "devAoSink",
     choice: "Sink",
     link_type: DbLinkType::Constant,
-    dset: Dset::new(6, &[1, 2, 3, 4], false),
+    dset: Dset::new(6, &[2, 3, 4], false),
 }];
 
 type Log = Arc<Mutex<Vec<&'static str>>>;

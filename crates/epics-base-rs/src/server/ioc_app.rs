@@ -1421,6 +1421,18 @@ pub(crate) const BUILD_HOOK_STATES: [InitHookState; 13] = [
     InitHookState::AfterIocBuilt,
 ];
 
+/// The support pass C `iocBuild_2` runs just before announcing `state`:
+/// `initDrvSup`, `initDevSup` and `finishDevSup` (`iocInit.c:167-183`). A
+/// build that announces nothing still runs it.
+fn build_step(state: InitHookState) {
+    match state {
+        InitHookState::AfterInitDrvSup => crate::server::driver_support::init_drv_sup(),
+        InitHookState::AfterInitDevSup => crate::server::record::init_dev_sup(),
+        InitHookState::AfterFinishDevSup => crate::server::record::finish_dev_sup(),
+        _ => {}
+    }
+}
+
 /// C `iocBuild_1` and `iocBuild_3`, and the init hooks `iocBuild` announces,
 /// for every build path: [`IocApplication`]'s, the bare shell's
 /// `iocBuild`/`iocInit` and
@@ -1433,12 +1445,45 @@ pub(crate) const BUILD_HOOK_STATES: [InitHookState; 13] = [
 /// one, so record work done while holding it is after that line by
 /// construction.
 pub(crate) struct BuildSequence {
-    next: usize,
+    walk: BuildWalk,
     /// [`Self::ca_link_init`] has run, so `initHookAfterCaLinkInit` may be
     /// announced.
     links: bool,
     /// What [`Self::finish`] records as C `iocBuildMode`.
     mode: BuildMode,
+}
+
+/// The walk over [`BUILD_HOOK_STATES`] every build makes, announcing or
+/// not: each state reached runs its [`build_step`], in order, once.
+pub(crate) struct BuildWalk {
+    next: usize,
+}
+
+impl BuildWalk {
+    pub(crate) fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    /// Every state not yet passed up to and including `state`, each
+    /// yielded after its [`build_step`]. Panics on a state already passed.
+    pub(crate) fn until(
+        &mut self,
+        state: InitHookState,
+    ) -> impl Iterator<Item = InitHookState> + '_ {
+        let end = BUILD_HOOK_STATES[self.next..]
+            .iter()
+            .position(|s| *s == state)
+            .map(|i| self.next + i + 1)
+            .unwrap_or_else(|| panic!("{} reached out of iocBuild order", state.name()));
+        std::iter::from_fn(move || {
+            (self.next < end).then(|| {
+                let state = BUILD_HOOK_STATES[self.next];
+                self.next += 1;
+                build_step(state);
+                state
+            })
+        })
+    }
 }
 
 impl BuildSequence {
@@ -1459,7 +1504,7 @@ impl BuildSequence {
             return None;
         }
         let mut build = Self {
-            next: 0,
+            walk: BuildWalk::new(),
             links: false,
             mode,
         };
@@ -1489,34 +1534,25 @@ impl BuildSequence {
         &mut self,
         state: InitHookState,
     ) -> impl Iterator<Item = InitHookState> + '_ {
-        let end = BUILD_HOOK_STATES[self.next..]
+        let next = self.walk.next;
+        let end = BUILD_HOOK_STATES[next..]
             .iter()
             .position(|s| *s == state)
-            .map(|i| self.next + i + 1)
+            .map(|i| next + i + 1)
             .unwrap_or_else(|| panic!("{} announced out of iocBuild order", state.name()));
         assert!(
-            self.links
-                || !BUILD_HOOK_STATES[self.next..end].contains(&InitHookState::AfterCaLinkInit),
+            self.links || !BUILD_HOOK_STATES[next..end].contains(&InitHookState::AfterCaLinkInit),
             "initHookAfterCaLinkInit announced before dbCaLinkInit"
         );
-        std::iter::from_fn(move || {
-            (self.next < end).then(|| {
-                let state = BUILD_HOOK_STATES[self.next];
-                self.next += 1;
-                // C `iocBuild_2` runs `initDrvSup` just before this announce.
-                if state == InitHookState::AfterInitDrvSup {
-                    crate::server::driver_support::init_drv_sup();
-                }
-                if state == InitHookState::AfterInitDatabase {
-                    // C `initDatabase` ends with `epicsAtExit(exitDatabase,
-                    // NULL)` (`iocInit.c:580`), whose body is `iocShutdown`.
-                    crate::runtime::exit::at_exit("iocShutdown", || {
-                        ioc_shutdown();
-                    });
-                }
-                init_hook_announce(state);
-                state
-            })
+        self.walk.until(state).inspect(|state| {
+            if *state == InitHookState::AfterInitDatabase {
+                // C `initDatabase` ends with `epicsAtExit(exitDatabase,
+                // NULL)` (`iocInit.c:580`), whose body is `iocShutdown`.
+                crate::runtime::exit::at_exit("iocShutdown", || {
+                    ioc_shutdown();
+                });
+            }
+            init_hook_announce(*state)
         })
     }
 
@@ -1536,7 +1572,7 @@ impl BuildSequence {
         installers: Vec<LinkSetInstaller>,
     ) {
         assert_eq!(
-            BUILD_HOOK_STATES.get(self.next),
+            BUILD_HOOK_STATES.get(self.walk.next),
             Some(&InitHookState::AfterCaLinkInit),
             "dbCaLinkInit out of iocBuild order"
         );
@@ -1554,7 +1590,7 @@ impl BuildSequence {
     /// `initHookAfterIocBuilt`, whose observers read `iocBuilt`. A build
     /// that fails before this leaves `iocBuilding`, as C's does.
     pub(crate) fn finish(mut self) {
-        if self.next < BUILD_HOOK_STATES.len() - 1 {
+        if self.walk.next < BUILD_HOOK_STATES.len() - 1 {
             self.reach(InitHookState::AfterCaServerInit);
         }
         set_ioc_state(IocState::Built);
@@ -1942,9 +1978,6 @@ impl IocBuild {
         // a plain pre-init field write (C dbPut before init_record): this hook
         // fires before the startup script's `iocInit` line, and the records it
         // restores were loaded before that.
-        for dset in crate::server::record::unserved_dsets() {
-            crate::runtime::log::errlog_printf(&format!("device support {dset} not found\n"));
-        }
         announce!(InitHookState::AfterInitDevSup);
 
         // C: initDatabase() then initHookAfterInitDatabase (autosave

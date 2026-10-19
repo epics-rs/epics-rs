@@ -11971,7 +11971,10 @@ mod tests {
     #[test]
     fn asyn_device_menu_is_the_generated_table_plus_busy() {
         for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
-            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::devices(rt));
+            assert!(std::ptr::eq(
+                asyn_device_menu(rt).unwrap(),
+                crate::dbd_generated::devices(rt).unwrap()
+            ));
             assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&rt));
         }
         let busy = asyn_device_menu("busy").unwrap();
@@ -11990,7 +11993,7 @@ mod tests {
             ASYN_DEVICE_MENU_RECORD_TYPES.len(),
             crate::dbd_generated::DEVICE_MENU_RECORD_TYPES.len() + 1
         );
-        assert_eq!(asyn_device_menu("calcout"), None);
+        assert!(asyn_device_menu("calcout").is_none());
     }
 
     /// Mock array port: records every float32 array write and accepts any

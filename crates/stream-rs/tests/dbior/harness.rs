@@ -1,36 +1,15 @@
-//! A stream IOC booted on `tests/oracle/dbior`, and `dbior stream` on it
-//! against C's output for the same level, its version as rs's.
+//! `dbior` on a stream IOC against C's output in `tests/oracle/dbior` for
+//! the same level, its version as rs's.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
 use stream_rs::epics::STREAM_VERSION;
 
-const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle/dbior");
-
-/// streamApp's bus interfaces, as `dev::register_app` registers them, and
-/// `db` built and run.
-pub async fn boot(db: &str) -> Arc<PvDatabase> {
-    // SAFETY: set before the build, which is the only reader.
-    unsafe { std::env::set_var("STREAM_PROTOCOL_PATH", DIR) };
-    stream_rs::debug_interface::register();
-    stream_rs::dummy::register();
-    stream_rs::asyn::register();
-    let ioc = stream_rs::dev::register(IocBuilder::new())
-        .db_string(db, &HashMap::new())
-        .unwrap()
-        .build_ioc()
-        .await
-        .unwrap();
-    let db = ioc.database().clone();
-    assert!(ioc.run().await);
-    db
-}
+pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/oracle/dbior");
 
 /// C's bytes for `dbior stream <level>` in `oracle`, its version as rs's.
 pub fn c(oracle: &str, level: &str) -> Vec<u8> {
@@ -76,10 +55,10 @@ pub async fn shell(db: &Arc<PvDatabase>, line: &str) -> Vec<u8> {
     out
 }
 
-/// `dbior stream <level>` on `db` is `oracle`'s, byte for byte.
-pub async fn assert_levels(db: &Arc<PvDatabase>, oracle: &str, levels: &[&str]) {
+/// `dbior <driver> <level>` on `db` is `oracle`'s, byte for byte.
+pub async fn assert_levels(db: &Arc<PvDatabase>, oracle: &str, driver: &str, levels: &[&str]) {
     for level in levels {
-        let rs = shell(db, &format!("dbior stream {level}")).await;
+        let rs = shell(db, &format!("dbior {driver} {level}")).await;
         let c = c(oracle, level);
         assert!(
             rs == c,

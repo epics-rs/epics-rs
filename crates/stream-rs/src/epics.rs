@@ -1019,22 +1019,11 @@ static DRV_INIT: OnceLock<()> = OnceLock::new();
 /// Set by `streamExitHook`: no record is processed after the protocol ends.
 static TERMINATING: AtomicBool = AtomicBool::new(false);
 
-/// stream.dbd's `driver(stream)` and the stream dsets' `init`: iocInit runs
-/// them whether or not a record uses them, `drvStreamInit` in `initDrvSup`
-/// (iocInit.c:167), `streamInit(0)` in `initDevSup` (:173) and
-/// `streamInit(1)` in `finishDevSup` (:183). The driver is the `stream`
-/// drvet (StreamEpics.cc:276-280); base has no dset init pass, so the dset
-/// `init` runs from the hook each of those is announced before.
+/// stream.dbd's `driver(stream)`: the `stream` drvet (StreamEpics.cc:276-280),
+/// whose `drvStreamInit` iocInit runs in `initDrvSup` (iocInit.c:167) whether
+/// or not a record uses it.
 pub fn register_driver() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        register_driver_support("stream", Arc::new(Drvet));
-        init_hook_register(Arc::new(|state| match state {
-            InitHookState::AfterInitRecSup => stream_init(false),
-            InitHookState::AfterFinishDevSup => stream_init(true),
-            _ => {}
-        }))
-    });
+    register_driver_support("stream", Arc::new(Drvet));
 }
 
 /// `StreamVersion` (StreamVersion.c) as a build without git or `.VERSION`
@@ -1212,7 +1201,7 @@ fn init_hook(state: InitHookState) {
 
 /// `streamInit(after)`, the dset's `init`: errors are on while the
 /// protocol files are read.
-fn stream_init(after: bool) {
+pub(crate) fn stream_init(after: bool) {
     static OLD_STREAM_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static BEFORE: AtomicBool = AtomicBool::new(true);
     static AFTER: AtomicBool = AtomicBool::new(true);

@@ -16,7 +16,7 @@ pub static DEV_SCALCOUT_STREAM: DevSup = DevSup {
     name: "devscalcoutStream",
     choice: "stream",
     link_type: DbLinkType::InstIo,
-    dset: Dset::new(5, &[1, 2, 3, 4], false),
+    dset: Dset::new(5, &[2, 3, 4], false).with_init(crate::epics::stream_init),
 };
 
 /// A `DTYP "stream"` scalcout's device.

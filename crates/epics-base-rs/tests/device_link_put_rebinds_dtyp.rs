@@ -149,3 +149,35 @@ record(ai, "DG") { field(INP, "DS NPP") }
     assert_eq!(get(&db, "DG.SEVR"), 0.0, "DG.SEVR");
     assert_eq!(get(&db, "DG.PACT"), 0.0, "DG.PACT");
 }
+
+/// `dbAccess.c:1151-1152`: the BOUND dset needs a `dsxt` too, so a DTYP put
+/// to a soft device does not let the INP put past a record bound to one with
+/// none. softIoc R7.0.10: `dbpf DG.DTYP "Soft Channel"` then `dbpf DG.INP
+/// "DS NPP"` prints nothing and DG.INP stays "@TIME".
+#[epics_macros_rs::epics_test]
+async fn a_device_link_put_from_a_bound_device_without_dsxt_is_refused() {
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(ai, "DS") { field(VAL, "7") }
+record(ai, "DG") { field(DTYP, "General Time") field(INP, "@TIME") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    put(&db, "DG", "DTYP", "Soft Channel").await;
+    let refused = db
+        .put_record_field_from_ca("DG", "INP", EpicsValue::String("DS NPP".into()))
+        .await;
+    assert!(
+        matches!(refused, Err(epics_base_rs::error::CaError::NoSupport)),
+        "{refused:?}"
+    );
+    let inp = db.get_pv("DG.INP").unwrap();
+    assert_eq!(inp, EpicsValue::String("@TIME".into()), "DG.INP");
+}

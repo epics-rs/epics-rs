@@ -15,7 +15,7 @@ pub static DEV_MBBI_DIRECT_STREAM: DevSup = DevSup {
     name: "devmbbiDirectStream",
     choice: "stream",
     link_type: DbLinkType::InstIo,
-    dset: Dset::new(5, &[1, 2, 3, 4], false),
+    dset: Dset::new(5, &[2, 3, 4], false).with_init(crate::epics::stream_init),
 };
 
 /// A `DTYP "stream"` mbbiDirect's device.

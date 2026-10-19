@@ -18,7 +18,7 @@ pub static DEV_AO_STREAM: DevSup = DevSup {
     name: "devaoStream",
     choice: "stream",
     link_type: DbLinkType::InstIo,
-    dset: Dset::new(6, &[1, 2, 3, 4], false),
+    dset: Dset::new(6, &[2, 3, 4], false).with_init(crate::epics::stream_init),
 };
 
 /// A `DTYP "stream"` ao's device.

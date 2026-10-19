@@ -154,3 +154,39 @@ record(calc,"CL:pva"){field(INPA,"pva://X")}"#,
         [("CL:pva".to_string(), "INPA".to_string(), "X".to_string())]
     );
 }
+
+/// `doCloseLinks` asks the BOUND dset for its `dsxt`
+/// (`dbDSETtoDevSup(pdbRecordType, precord->dset)`, `iocInit.c:689-692`),
+/// which a DTYP put after init does not change: the record bound to the soft
+/// dset is closed and left PACT, the one bound to `General Time` (no
+/// `devExtend`) is not.
+#[epics_macros_rs::epics_test]
+async fn close_links_asks_the_bound_dset_not_the_dtyp() {
+    let ioc = IocBuilder::new()
+        .db_string(
+            r#"record(ai,"CL:was-soft"){field(INP,"1.5")}
+record(ai,"CL:was-time"){field(DTYP,"General Time") field(INP,"@TIME")}"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build_ioc()
+        .await
+        .unwrap();
+    let db = ioc.database().clone();
+    assert!(ioc.run().await);
+    for (rec, dtyp) in [
+        ("CL:was-soft", "General Time"),
+        ("CL:was-time", "Soft Channel"),
+    ] {
+        db.put_record_field_from_ca(
+            rec,
+            "DTYP",
+            epics_base_rs::types::EpicsValue::String(dtyp.into()),
+        )
+        .await
+        .unwrap();
+    }
+    epics_base_rs::runtime::exit::call_at_exits();
+    let pact = |rec: &str| db.get_record(rec).unwrap().read().is_processing();
+    assert_eq!((pact("CL:was-soft"), pact("CL:was-time")), (true, false));
+}

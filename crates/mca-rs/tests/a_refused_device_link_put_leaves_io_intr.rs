@@ -35,7 +35,7 @@ static MCA_PROBE: [DevSup; 1] = [DevSup {
     name: "devMcaIntrProbe",
     choice: "Intr Probe",
     link_type: DbLinkType::Constant,
-    dset: Dset::new(6, &[1, 2, 3, 4, 5], true),
+    dset: Dset::new(6, &[2, 3, 4, 5], true),
 }];
 
 static AI_PROBES: [DevSup; 2] = [
@@ -43,13 +43,13 @@ static AI_PROBES: [DevSup; 2] = [
         name: "devAiIntrProbe",
         choice: "Intr Probe",
         link_type: DbLinkType::Constant,
-        dset: Dset::new(6, &[1, 2, 3, 4], true),
+        dset: Dset::new(6, &[2, 3, 4], true),
     },
     DevSup {
         name: "devAiIntrNoDsxt",
         choice: "Intr NoDsxt",
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(6, &[1, 2, 3, 4], false),
+        dset: Dset::new(6, &[2, 3, 4], false),
     },
 ];
 
@@ -66,8 +66,8 @@ struct Probe {
 }
 
 impl DeviceSupport for Probe {
-    fn add_record(&mut self, record_type: &str) -> Result<(), LinkRefusal> {
-        if record_type == "mca" {
+    fn add_record(&mut self, record: &mut dyn Record) -> Result<(), LinkRefusal> {
+        if record.record_type() == "mca" {
             MCA_ADDS.fetch_add(1, Ordering::Relaxed);
         }
         match self.refuse {

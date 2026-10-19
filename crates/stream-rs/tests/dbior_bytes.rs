@@ -3,6 +3,8 @@
 //! conversion byte 0xE9 and a protocol string holding a raw 0xE9, both
 //! printed as that one byte.
 
+#[path = "dbior/boot.rs"]
+mod boot;
 #[path = "dbior/harness.rs"]
 mod harness;
 
@@ -24,10 +26,10 @@ impl StreamFormatConverter for HighConverter {
 fn dbior_stream_prints_high_bytes_as_c() {
     register_converter("HighConverter", b"\xe9", Box::new(HighConverter));
     epics_base_rs::runtime::task::test_block_on(async {
-        let db = harness::boot(
+        let db = boot::boot(
             r#"record(stringout, "R3") { field(DTYP, "stream") field(OUT, "@h.proto hi dummy") }"#,
         )
         .await;
-        harness::assert_levels(&db, "bytes.out", &["1", "2"]).await;
+        harness::assert_levels(&db, "bytes.out", "stream", &["1", "2"]).await;
     });
 }

@@ -197,11 +197,14 @@ pub fn register(builder: IocBuilder) -> IocBuilder {
     builder.register_dynamic_device_support(&devices(), device_support_factory)
 }
 
-/// `streamApp.dbd` on an IOC: [`register`]'s `device()` lines, the bus
-/// interfaces in CONFIG_STREAM's `BUSSES` order (C's registrars run in link
-/// order), and the iocsh commands of `streamRegistrar` and
+/// `streamApp.dbd` on an IOC: asyn.dbd, then [`register`]'s `device()`
+/// lines, in the Makefile's include order (streamApp/Makefile:45-69), which
+/// is C's `drvList` and `devList` order; the bus interfaces in
+/// CONFIG_STREAM's `BUSSES` order (C's registrars run in link order); and
+/// the iocsh commands of `streamRegistrar` and
 /// `AsynDriverInterfaceRegistrar`.
 pub fn register_app(app: IocApplication) -> IocApplication {
+    let app = asyn_rs::adapter::register_asyn_device_support(app);
     crate::debug_interface::register();
     crate::dummy::register();
     crate::asyn::register();

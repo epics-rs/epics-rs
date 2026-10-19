@@ -38,7 +38,12 @@ pub static DEV_MOTOR_ASYN: DevSup = DevSup {
 
 /// `struct motor_dset`: 8 slots, `report` and `get_ioint_info` NULL in
 /// `devMotorAsyn` (devMotorAsyn.c:83-95) and in every model-1 dset.
-const MOTOR_DSET: Dset = Dset::new(8, &[1, 2, 4, 5, 6, 7], false);
+const MOTOR_DSET: Dset = Dset::new(8, &[2, 4, 5, 6, 7], false).with_init(motor_init);
+
+/// devMotorAsyn's `init(after)`, `dbScanLockOK = (after!=0)`
+/// (devMotorAsyn.c:160-164): the latch is per database here, the
+/// `ScanControl::dev_sup_gate` the build's `finish_dev_sup` opens.
+fn motor_init(_after: bool) {}
 
 /// The rows [`device_support_factory`] serves through
 /// `register_dynamic_device_support`; model-1 rows are added by their

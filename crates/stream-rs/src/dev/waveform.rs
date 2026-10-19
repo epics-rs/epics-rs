@@ -20,7 +20,7 @@ pub static DEV_WAVEFORM_STREAM: DevSup = DevSup {
     name: "devwaveformStream",
     choice: "stream",
     link_type: DbLinkType::InstIo,
-    dset: Dset::new(5, &[1, 2, 3, 4], false),
+    dset: Dset::new(5, &[2, 3, 4], false).with_init(crate::epics::stream_init),
 };
 
 /// A `DTYP "stream"` waveform's device.

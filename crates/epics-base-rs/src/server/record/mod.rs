@@ -38,9 +38,9 @@ pub use device_menu_registry::{
     register_device_row,
 };
 pub(crate) use device_menu_registry::{
-    contributed_device_rows, dev_sup_of, device_menu_choices, has_contributed_device_menu,
-    has_device_object, has_no_device_support, load_dbd_device, merged_device_menu, served_choice,
-    unserved_dsets,
+    contributed_device_rows, dev_sup_of, device_menu_choices, finish_dev_sup,
+    has_contributed_device_menu, has_device_object, has_no_device_support, init_dev_sup,
+    load_dbd_device, merged_device_menu, served_choice,
 };
 pub use link::{
     CaLink, CalcArg, CalcLink, CalcVal, ConstLoadError, ConstantLink, DbLink, DbLinkType,

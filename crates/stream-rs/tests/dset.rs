@@ -6,7 +6,7 @@
 fn report_is_null() {
     for (rtype, devs) in stream_rs::dev::devices() {
         for dev in devs {
-            assert!(!dev.dset.funcs.contains(&0), "{rtype}: {dev:?}");
+            assert!(!dev.dset.funcs().contains(&0), "{rtype}: {dev:?}");
         }
     }
 }

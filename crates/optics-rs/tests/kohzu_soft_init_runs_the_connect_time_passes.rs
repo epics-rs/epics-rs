@@ -58,7 +58,7 @@ async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> Arc<PvDatabase> {
         name: "devMotorSoft",
         choice: "Soft Channel",
         link_type: DbLinkType::Constant,
-        dset: Dset::new(8, &[1, 2, 4, 5, 6, 7], false),
+        dset: Dset::new(8, &[2, 4, 5, 6, 7], false),
     };
     register_device_row("motor", &SOFT_MOTOR);
     let ioc = IocBuilder::new()

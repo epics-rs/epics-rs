@@ -29,28 +29,83 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use super::DbLinkType;
 
 /// What `dbDumpDevice` reads of a C `dset`: `number` entry points, which of
-/// them are non-NULL (slot indices, `report` = 0), and whether its `init`
-/// calls `devExtend`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// them besides `init` are non-NULL (slot indices, `report` = 0), whether its
+/// `init` calls `devExtend`; and `init` itself, the one entry point the
+/// build calls on the dset, whose presence is slot 1's. The fields are
+/// private so [`Self::new`] is the only way to make one:
+///
+/// ```compile_fail
+/// use epics_base_rs::server::record::Dset;
+/// const _: Dset = Dset { number: 5, funcs: &[1, 4], extends: true, init: None };
+/// ```
+#[derive(Debug, Clone, Copy)]
 pub struct Dset {
-    pub number: u8,
-    pub funcs: &'static [u8],
-    pub extends: bool,
+    number: u8,
+    funcs: &'static [u8],
+    extends: bool,
+    /// C `dset.init(int after)`: `initDevSup` calls it with `false` before
+    /// `initHookAfterInitDevSup`, `finishDevSup` with `true` before
+    /// `initHookAfterFinishDevSup` (`iocInit.c:441-480`), for every row of
+    /// every record type whether or not a record uses it. C ignores its
+    /// status, so it has none.
+    init: Option<fn(after: bool)>,
 }
 
 impl Dset {
+    /// A dset whose `funcs` may not name slot 1: `init` is [`Self::with_init`]'s,
+    /// or, for `extends`, the `devExtend` C's `init` is.
+    ///
+    /// ```compile_fail
+    /// use epics_base_rs::server::record::Dset;
+    /// const _: Dset = Dset::new(5, &[1, 4], false);
+    /// ```
     pub const fn new(number: u8, funcs: &'static [u8], extends: bool) -> Self {
+        let mut i = 0;
+        while i < funcs.len() {
+            assert!(funcs[i] != 1, "slot 1 is `init`: give it with `with_init`");
+            i += 1;
+        }
         Self {
             number,
             funcs,
             extends,
+            init: if extends { Some(dev_extend) } else { None },
         }
+    }
+
+    /// This dset with `init` in its init slot.
+    pub const fn with_init(self, init: fn(after: bool)) -> Self {
+        Self {
+            init: Some(init),
+            ..self
+        }
+    }
+
+    pub const fn number(&self) -> u8 {
+        self.number
+    }
+
+    pub const fn funcs(&self) -> &'static [u8] {
+        self.funcs
+    }
+
+    pub const fn extends(&self) -> bool {
+        self.extends
+    }
+
+    pub const fn init(&self) -> Option<fn(after: bool)> {
+        self.init
     }
 }
 
+/// An `init` that is `if (pass == 0) devExtend(&dsxt)` and nothing else: C
+/// can call `devExtend` only from `init`, and the port's dsxt is
+/// [`Dset::extends`], so nothing is left to run.
+fn dev_extend(_after: bool) {}
+
 /// One `device(rectype, link_type, name, "choice")` line: C's `devSup`, a
 /// row of the record type's `dbDeviceMenu`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DevSup {
     /// The dset symbol.
     pub name: &'static str,
@@ -64,17 +119,17 @@ impl DevSup {
     /// `dbInitDevSup` gives every `CONSTANT` device the soft `dsxt`; any
     /// other has one only if its `init` calls `devExtend`.
     pub fn has_dsxt(&self) -> bool {
-        self.link_type == DbLinkType::Constant || self.dset.extends
+        self.link_type == DbLinkType::Constant || self.dset.extends()
     }
 
     /// The dset's `init_record` (slot 2) is non-NULL.
     pub fn has_init_record(&self) -> bool {
-        self.dset.funcs.contains(&2)
+        self.dset.funcs().contains(&2)
     }
 
     /// The dset's `get_ioint_info` (slot 3) is non-NULL.
     pub fn has_get_ioint_info(&self) -> bool {
-        self.dset.funcs.contains(&3)
+        self.dset.funcs().contains(&3)
     }
 }
 
@@ -262,15 +317,53 @@ pub(crate) fn served_choice<'a>(record_type: &str, dtyp: &'a str) -> &'a str {
         .unwrap_or(dtyp)
 }
 
-/// The dset names C's `initDevSup` reports as `device support %s not found`
-/// (`iocInit.c:445-453`): the loaded rows whose name finds no dset.
-pub(crate) fn unserved_dsets() -> Vec<&'static str> {
-    loaded()
+/// Every row of every record type, in C's `recordTypeList` order (`strcmp`)
+/// and each type's `devList` order, with whether its name found a dset.
+fn dev_list() -> Vec<(&'static DevSup, bool)> {
+    let mut types: Vec<&str> = super::dbd_generated::DEVICE_MENU_RECORD_TYPES
+        .iter()
+        .copied()
+        .chain(contributed().iter().map(|(t, _)| *t))
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    let missing = |row: &DevSup| {
+        loaded()
+            .into_iter()
+            .flat_map(|loaded| loaded.values().flatten())
+            .any(|r| std::ptr::eq(r.row, row) && matches!(r.bound, Bound::Missing))
+    };
+    types
         .into_iter()
-        .flat_map(|loaded| loaded.values().flatten())
-        .filter(|r| matches!(r.bound, Bound::Missing))
-        .map(|r| r.row.name)
+        .flat_map(|rt| {
+            let declared = super::dbd_generated::devices(rt).unwrap_or_default();
+            declared
+                .iter()
+                .chain(menus_of(rt).iter().flat_map(|menu| menu.iter()))
+        })
+        .map(|row| (row, !missing(row)))
         .collect()
+}
+
+/// C `initDevSup` (`iocInit.c:441-462`): every row's dset `init(0)`, and
+/// `device support %s not found` for a loaded row whose name finds none.
+pub(crate) fn init_dev_sup() {
+    for (row, found) in dev_list() {
+        if !found {
+            crate::runtime::log::errlog_printf(&format!("device support {} not found\n", row.name));
+        } else if let Some(init) = row.dset.init() {
+            init(false);
+        }
+    }
+}
+
+/// C `finishDevSup` (`iocInit.c:464-481`): every row's dset `init(1)`.
+pub(crate) fn finish_dev_sup() {
+    for (row, _) in dev_list() {
+        if let Some(init) = row.dset.init() {
+            init(true);
+        }
+    }
 }
 
 /// The record types whose `.dbd` came with every `device()` line it has,

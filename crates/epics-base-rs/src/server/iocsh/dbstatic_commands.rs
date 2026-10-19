@@ -730,11 +730,15 @@ fn print_dev_sup(ctx: &CommandContext, row: &'static crate::server::record::DevS
         c_link_type_number(row.link_type)
     ));
     ctx.println(&format!("\tpdset:     {:p}", dset));
-    ctx.println(&format!("\t    number: {}", dset.number));
-    for i in 0..dset.number {
-        let func = match dset.funcs.iter().find(|&&slot| slot == i) {
-            Some(slot) => format!("{:p}", slot),
-            None => "(nil)".to_string(),
+    ctx.println(&format!("\t    number: {}", dset.number()));
+    for i in 0..dset.number() {
+        let func = match (i, dset.init()) {
+            (1, Some(init)) => format!("{:p}", init as *const ()),
+            (1, None) => "(nil)".to_string(),
+            _ => match dset.funcs().iter().find(|&&slot| slot == i) {
+                Some(slot) => format!("{:p}", slot),
+                None => "(nil)".to_string(),
+            },
         };
         let name = NAMES.get(usize::from(i)).copied().unwrap_or("");
         ctx.println(&format!("\t    func {i}: {func}{name}"));
@@ -2138,6 +2142,13 @@ variable(seqDLYprecision,int)
             "got:\n{out}"
         );
         assert!(out.ends_with("\tpdsxt:     (nil)\n"), "got:\n{out}");
+        // devAiSoftCallback's `init` (devAiSoftCallback.c:151) is the one
+        // the dset pass runs: its slot is the init slot's address.
+        let callback = out
+            .split("    device name:   ")
+            .find(|row| row.starts_with("devAiSoftCallback\n"))
+            .unwrap();
+        assert!(callback.contains("\t    func 1: 0x"), "got:\n{callback}");
         // C breaks out of the record-type walk once the named type is done
         // (`dbStaticLib.c:3484`).
         assert!(!out.contains("recordtype(bi)"), "got:\n{out}");

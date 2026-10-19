@@ -1737,10 +1737,7 @@ impl PortDriverBase {
         if !self.flags.destructible {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!(
-                    "port {} does not support shutting down (ASYN_DESTRUCTIBLE not set)",
-                    self.port_name
-                ),
+                message: "asynManager:shutdownPort: port does not support shutting down".into(),
             });
         }
         self.enabled.store(false, Ordering::Release);
@@ -3453,8 +3450,13 @@ pub trait PortDriver: Any + Send + Sync {
         Ok(())
     }
 
-    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
-        self.base().input_eos(user.addr).to_vec()
+    /// C `getInputEosFail` (asynOctetBase.c:116, :405-407) unless an EOS
+    /// layer holds the terminator, as [`Self::set_input_eos`] refuses.
+    fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        let base = self.base();
+        base.interpose_octet
+            .input_eos(user.addr)
+            .ok_or_else(|| eos_not_implemented(&base.port_name, "getInputEos"))
     }
 
     /// The output half of [`Self::set_input_eos`] — C `setOutputEosFail`
@@ -3475,8 +3477,13 @@ pub trait PortDriver: Any + Send + Sync {
         Ok(())
     }
 
-    fn get_output_eos(&self, user: &AsynUser) -> Vec<u8> {
-        self.base().output_eos(user.addr).to_vec()
+    /// The output half of [`Self::get_input_eos`] — C `getOutputEosFail`
+    /// (asynOctetBase.c:118, :413-415).
+    fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        let base = self.base();
+        base.interpose_octet
+            .output_eos(user.addr)
+            .ok_or_else(|| eos_not_implemented(&base.port_name, "getOutputEos"))
     }
 
     // --- asynGpib (IEEE-488 bus control) ---
@@ -4773,6 +4780,12 @@ pub(crate) mod tests {
                 self.base.set_output_eos(user.addr, eos);
                 Ok(())
             }
+            fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.base.input_eos(user.addr).to_vec())
+            }
+            fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.base.output_eos(user.addr).to_vec())
+            }
         }
         let mut drv = MultiDriver {
             base: PortDriverBase::new(
@@ -4793,16 +4806,17 @@ pub(crate) mod tests {
         drv.set_output_eos(&dev1, b"\r\n").unwrap();
         drv.set_input_eos(&dev2, b";").unwrap();
 
-        assert_eq!(drv.get_input_eos(&dev1), b"\n");
-        assert_eq!(drv.get_input_eos(&dev2), b";");
-        assert_eq!(drv.get_output_eos(&dev1), b"\r\n");
+        assert_eq!(drv.get_input_eos(&dev1).unwrap(), b"\n");
+        assert_eq!(drv.get_input_eos(&dev2).unwrap(), b";");
+        assert_eq!(drv.get_output_eos(&dev1).unwrap(), b"\r\n");
         // A device that was never configured has no terminator — C's
         // zero-initialised `eosInLen`.
         assert!(
             drv.get_input_eos(&AsynUser::default().with_addr(3))
+                .unwrap()
                 .is_empty()
         );
-        assert!(drv.get_output_eos(&dev2).is_empty());
+        assert!(drv.get_output_eos(&dev2).unwrap().is_empty());
     }
 
     /// The other boundary: a port that never declared `ASYN_MULTIDEVICE` has no
@@ -4822,8 +4836,16 @@ pub(crate) mod tests {
             .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         drv.set_input_eos(&AsynUser::default().with_addr(-1), b"\n")
             .unwrap();
-        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(0)), b"\n");
-        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(7)), b"\n");
+        assert_eq!(
+            drv.get_input_eos(&AsynUser::default().with_addr(0))
+                .unwrap(),
+            b"\n"
+        );
+        assert_eq!(
+            drv.get_input_eos(&AsynUser::default().with_addr(7))
+                .unwrap(),
+            b"\n"
+        );
     }
 
     /// R18-71. C's `asynOctetBase::initOverride` (asynOctetBase.c:115-118)
@@ -4864,8 +4886,17 @@ pub(crate) mod tests {
         );
         // Refused means nothing was cached: a later read must not silently
         // believe the port terminates.
-        assert!(bare.get_input_eos(&AsynUser::default()).is_empty());
-        assert!(bare.get_output_eos(&AsynUser::default()).is_empty());
+        let err = bare.get_input_eos(&AsynUser::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("test getInputEos not implemented"),
+            "{err}"
+        );
+        let err = bare.get_output_eos(&AsynUser::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("test getOutputEos not implemented"),
+            "{err}"
+        );
 
         // Boundary 2: the layer takes input only — and OEOS still lands.
         // C's `setOutputEos` (:345-364) has no `processEosOut` test; the flag
@@ -4879,10 +4910,10 @@ pub(crate) mod tests {
                 false,
             )));
         half.set_input_eos(&AsynUser::default(), b"\n").unwrap();
-        assert_eq!(half.get_input_eos(&AsynUser::default()), b"\n");
+        assert_eq!(half.get_input_eos(&AsynUser::default()).unwrap(), b"\n");
         half.set_output_eos(&AsynUser::default(), b"\r\n")
             .expect("processOut = 0 still stores OEOS");
-        assert_eq!(half.get_output_eos(&AsynUser::default()), b"\r\n");
+        assert_eq!(half.get_output_eos(&AsynUser::default()).unwrap(), b"\r\n");
 
         // Boundary 3: a length the storing layer refuses. C's `switch
         // (eoslen)` answers `"<port> illegal eoslen <n>"` *before* assigning
@@ -4891,12 +4922,12 @@ pub(crate) mod tests {
             .set_output_eos(&AsynUser::default(), b"\r\n\0")
             .expect_err("eoslen 3 is past eosOut[2]");
         assert!(err.to_string().contains("test illegal eoslen 3"), "{err}");
-        assert_eq!(half.get_output_eos(&AsynUser::default()), b"\r\n");
+        assert_eq!(half.get_output_eos(&AsynUser::default()).unwrap(), b"\r\n");
         let err = half
             .set_input_eos(&AsynUser::default(), b"abc")
             .expect_err("eoslen 3 is past eosIn[2]");
         assert!(err.to_string().contains("test illegal eoslen 3"), "{err}");
-        assert_eq!(half.get_input_eos(&AsynUser::default()), b"\n");
+        assert_eq!(half.get_input_eos(&AsynUser::default()).unwrap(), b"\n");
 
         // Boundary 4: no layer at all refuses every length with the Fail
         // stub's words, not the length rule's — the rule belongs to the layer
@@ -5193,7 +5224,11 @@ pub(crate) mod tests {
         );
         match base.shutdown_lifecycle() {
             Err(AsynError::Status { message, .. }) => {
-                assert!(message.contains("ASYN_DESTRUCTIBLE"), "msg={message}");
+                // asynManager.c:2274-2275.
+                assert_eq!(
+                    message,
+                    "asynManager:shutdownPort: port does not support shutting down"
+                );
             }
             other => panic!("expected ASYN_DESTRUCTIBLE refusal, got {other:?}"),
         }

@@ -371,11 +371,8 @@ impl PortDriver for DrvAsynUsbtmcPort {
     /// reports `eoslen` 0, otherwise the single byte. Reads the same field
     /// `set_input_eos` writes, so the readback cannot disagree with what the
     /// next request header will carry.
-    fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        match self.term_char {
-            Some(c) => vec![c],
-            None => Vec::new(),
-        }
+    fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.term_char.into_iter().collect())
     }
 
     /// C `asynOctetSetOutputEos` (`drvAsynUSBTMC.c:1004-1016`): up to
@@ -405,8 +402,8 @@ impl PortDriver for DrvAsynUsbtmcPort {
 
     /// C `asynOctetGetOutputEos` (`drvAsynUSBTMC.c:1018-1028`) — reads back
     /// the same field the setter wrote.
-    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        self.output_eos.clone()
+    fn get_output_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.output_eos.clone())
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -530,7 +527,7 @@ mod tests {
 
         drv.set_input_eos(&user, b"\n").unwrap();
         assert_eq!(drv.term_char(), Some(b'\n'));
-        assert_eq!(drv.get_input_eos(&user), b"\n".to_vec());
+        assert_eq!(drv.get_input_eos(&user).unwrap(), b"\n".to_vec());
         assert_eq!(
             build_request_bulk_in_header(1, 512, drv.term_char())[8],
             BULK_IN_TERM_CHAR_ENABLED,
@@ -550,7 +547,7 @@ mod tests {
         // eoslen 0 is C's `termChar = -1`.
         drv.set_input_eos(&user, b"").unwrap();
         assert_eq!(drv.term_char(), None);
-        assert!(drv.get_input_eos(&user).is_empty());
+        assert!(drv.get_input_eos(&user).unwrap().is_empty());
     }
 
     #[test]

@@ -8083,9 +8083,9 @@ mod tests {
             ) -> crate::error::AsynResult<()> {
                 Ok(())
             }
-            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+            fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
                 // 12 escaped characters into a 10-byte inputEosTranslate.
-                b"\r\n\r\n\r\n".to_vec()
+                Ok(b"\r\n\r\n\r\n".to_vec())
             }
         }
 
@@ -8521,8 +8521,8 @@ mod tests {
                     message: "ieos boom".to_string(),
                 })
             }
-            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
-                b"\r\n".to_vec()
+            fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(b"\r\n".to_vec())
             }
             fn set_output_eos(
                 &mut self,
@@ -8534,8 +8534,8 @@ mod tests {
                     message: "oeos boom".to_string(),
                 })
             }
-            fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
-                b"\n".to_vec()
+            fn get_output_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(b"\n".to_vec())
             }
         }
 
@@ -11960,8 +11960,8 @@ A.OEOS
                 self.ieos = eos.to_vec();
                 Ok(())
             }
-            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
-                self.ieos.clone()
+            fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+                Ok(self.ieos.clone())
             }
         }
 

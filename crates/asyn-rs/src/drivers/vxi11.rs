@@ -417,28 +417,13 @@ impl PortDriver for DrvVxi11Port {
     /// C `vxiGetEos` (`drvVxi11.c:1331-1358`): `eos == -1` reports length 0,
     /// otherwise the one byte the link holds. Same field `set_input_eos`
     /// writes and the `device_read` request will read.
-    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
-        match self.input_eos_for(user.addr) {
-            Some(c) => vec![c],
-            None => Vec::new(),
-        }
+    fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.input_eos_for(user.addr).into_iter().collect())
     }
 
-    /// C parity: `asynGpib`'s octet vtable leaves `setOutputEos`/`getOutputEos`
-    /// NULL (`asynGpib.c:132` — `...setInputEos, getInputEos, 0, 0`), so a GPIB
-    /// port has no output terminator to set. Refuse rather than cache bytes
-    /// nothing will ever append, exactly as the sibling GPIB port does
-    /// (`super::prologix`).
-    fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "output EOS not supported on a GPIB port".into(),
-        })
-    }
-
-    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
-        Vec::new()
-    }
+    // `asynGpib`'s octet table leaves setOutputEos/getOutputEos NULL
+    // (asynGpib.c:132) and hands it to asynOctetBase (:601), whose Fail
+    // stubs are the PortDriver defaults.
 
     fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
         Err(Self::no_transport("vxiUniversalCmd"))
@@ -689,9 +674,10 @@ mod tests {
         assert_eq!(drv.input_eos_for(3), Some(b'\n'));
         assert_eq!(drv.input_eos_for(7), Some(b';'));
         assert_eq!(drv.input_eos_for(11), None, "an untouched link stays at -1");
-        assert_eq!(drv.get_input_eos(&a3), b"\n".to_vec());
+        assert_eq!(drv.get_input_eos(&a3).unwrap(), b"\n".to_vec());
         assert!(
             drv.get_input_eos(&AsynUser::default().with_addr(11))
+                .unwrap()
                 .is_empty()
         );
 
@@ -725,7 +711,15 @@ mod tests {
         let mut drv =
             DrvVxi11Port::configure("V1", "gw.example", 0, "1.0", "gpib0", 0, false).unwrap();
         let user = AsynUser::default();
-        assert!(drv.set_output_eos(&user, b"\n").is_err());
-        assert!(drv.get_output_eos(&user).is_empty());
+        let err = drv.set_output_eos(&user, b"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("V1 setOutputEos not implemented"),
+            "{err}"
+        );
+        let err = drv.get_output_eos(&user).unwrap_err();
+        assert!(
+            err.to_string().contains("V1 getOutputEos not implemented"),
+            "{err}"
+        );
     }
 }

@@ -414,6 +414,17 @@ impl OctetInterpose for EosInterpose {
         EosSet::Stored
     }
 
+    /// C `getInputEos` (asynInterposeEos.c:314-344) answers only with
+    /// `processEosIn` on, as [`Self::set_input_eos`] stores only then.
+    fn input_eos(&self, addr: i32) -> Option<&[u8]> {
+        self.process_in.then(|| self.get_input_eos(addr))
+    }
+
+    /// C `getOutputEos` (:366-391) has no flag test, as `setOutputEos` has none.
+    fn output_eos(&self, addr: i32) -> Option<&[u8]> {
+        Some(self.get_output_eos(addr))
+    }
+
     /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
     /// `asynExceptionConnect` the interpose drops its read-ahead buffer and
     /// its partial-EOS match position. Without it the first read on a

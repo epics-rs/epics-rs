@@ -166,7 +166,9 @@ impl InputEos {
             .map(|key| {
                 (
                     key,
-                    driver.get_input_eos(&AsynUser::default().with_addr(key)),
+                    driver
+                        .get_input_eos(&AsynUser::default().with_addr(key))
+                        .unwrap_or_default(),
                 )
             })
             .collect();
@@ -2114,7 +2116,8 @@ impl PortActor {
                 // (:1532 "getOutputEos can return an error if the driver does
                 // not implement it"). Clearing unconditionally turned every
                 // binary transfer on such a port into that refusal.
-                let saved = self.driver.get_output_eos(user);
+                // A refused getOutputEos leaves C's saveEosLen at 0.
+                let saved = self.driver.get_output_eos(user).unwrap_or_default();
                 let bracket = !saved.is_empty();
                 if bracket {
                     self.driver.set_output_eos(user, &[])?;
@@ -2133,7 +2136,7 @@ impl PortActor {
                 // stop the read early or strip bytes belonging to the binary
                 // payload. Guarded by `saveEosLen` exactly as C guards it
                 // (:1570, :1575) — see `OctetWriteBinary` above.
-                let saved = self.driver.get_input_eos(user);
+                let saved = self.driver.get_input_eos(user).unwrap_or_default();
                 let bracket = !saved.is_empty();
                 if bracket {
                     self.set_input_eos(user, &[])?;
@@ -2681,12 +2684,12 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetInputEos => {
-                let eos = self.driver.get_input_eos(user);
+                let eos = self.driver.get_input_eos(user)?;
                 let n = eos.len();
                 Ok(RequestResult::octet_read(eos, n))
             }
             RequestOp::GetOutputEos => {
-                let eos = self.driver.get_output_eos(user);
+                let eos = self.driver.get_output_eos(user)?;
                 let n = eos.len();
                 Ok(RequestResult::octet_read(eos, n))
             }

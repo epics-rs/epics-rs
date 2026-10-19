@@ -175,6 +175,18 @@ pub trait OctetInterpose: Send + Sync {
         EosSet::NotTaken
     }
 
+    /// The input terminator this layer holds for the device, or `None` when
+    /// C's `getInputEos` would delegate to the layer below
+    /// (asynInterposeEos.c:319-321) — the read twin of [`EosSet::NotTaken`].
+    fn input_eos(&self, _addr: i32) -> Option<&[u8]> {
+        None
+    }
+
+    /// The output twin of [`Self::input_eos`].
+    fn output_eos(&self, _addr: i32) -> Option<&[u8]> {
+        None
+    }
+
     /// Drop every piece of state scoped to the *current* link, because the
     /// port's connection state just changed (connected → disconnected or
     /// back). Default no-op: a layer whose state is pure configuration
@@ -269,6 +281,10 @@ impl OctetInterposeStack {
         }
     }
 
+    fn chain(&self, addr: i32) -> Option<&Vec<Box<dyn OctetInterpose>>> {
+        self.chains.get(&self.chain_key(addr))
+    }
+
     fn chain_mut(&mut self, addr: i32) -> Option<&mut Vec<Box<dyn OctetInterpose>>> {
         let key = self.chain_key(addr);
         self.chains.get_mut(&key).filter(|c| !c.is_empty())
@@ -320,6 +336,26 @@ impl OctetInterposeStack {
             }
         }
         answer
+    }
+
+    /// The input terminator the addressed device's chain answers with: the
+    /// outermost layer that holds one, `None` when every layer delegates to
+    /// the driver.
+    pub fn input_eos(&self, addr: i32) -> Option<Vec<u8>> {
+        let chain = self.chain(addr)?;
+        chain
+            .iter()
+            .find_map(|l| l.input_eos(addr))
+            .map(<[u8]>::to_vec)
+    }
+
+    /// The output twin of [`Self::input_eos`].
+    pub fn output_eos(&self, addr: i32) -> Option<Vec<u8>> {
+        let chain = self.chain(addr)?;
+        chain
+            .iter()
+            .find_map(|l| l.output_eos(addr))
+            .map(<[u8]>::to_vec)
     }
 
     /// Tell every layer, on every device's chain, that the port's connection

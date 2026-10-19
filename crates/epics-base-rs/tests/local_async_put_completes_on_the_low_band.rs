@@ -40,7 +40,6 @@ async fn the_completing_pass_does_not_wait_for_the_records_band() {
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
     let (release, held) = std::sync::mpsc::channel::<()>();
     let (busy, is_busy) = std::sync::mpsc::channel();
     let hold = spawn_blocking_background(CallbackPriority::High, move |_| {
@@ -79,7 +78,6 @@ async fn the_completing_pass_waits_for_the_low_band() {
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
     let (release, held) = std::sync::mpsc::channel::<()>();
     let (busy, is_busy) = std::sync::mpsc::channel();
     let hold = spawn_blocking_background(CallbackPriority::Low, move |_| {
@@ -136,7 +134,6 @@ record(ao, "TGT") { field(SCAN, "Event") field(EVNT, "117") }
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
     let (releases, holds) = hold(&[CallbackPriority::Low, CallbackPriority::High]);
 
     db.put_record_field_from_ca("OUT", "VAL", EpicsValue::Double(4.0))
@@ -178,7 +175,6 @@ async fn refused(disp: &str) -> std::sync::Arc<epics_base_rs::server::database::
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
     db
 }
 
@@ -300,7 +296,6 @@ record(calcout, "DLY") { field(CALC, "1") field(ODLY, "0.5") }
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
 
     db.put_record_field_from_ca("OUT", "VAL", EpicsValue::String("A+".into()))
         .await
@@ -324,17 +319,4 @@ record(calcout, "DLY") { field(CALC, "1") field(ODLY, "0.5") }
     );
     assert!(waited, "OUT completed before the chain did");
     assert!(!out.read().is_processing(), "OUT completed with the chain");
-}
-
-/// iocInit's open pass, then each external link connected: C opens every CA
-/// link at `dbCaAddLink` and refuses its puts until it connects.
-async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
-    db.setup_external_link_opens().await;
-    for name in db.external_link_pv_names().await {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while db.external_link_metadata(name.as_bytes()).is_none() {
-            assert!(std::time::Instant::now() < deadline, "{name} connects");
-            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
 }

@@ -1178,14 +1178,17 @@ impl LinkSet for CaLinkResolver {
     /// Both flavours are closed by refusing here; neither needs a second,
     /// later check.
     ///
-    /// A link this resolver has not opened is refused too: C opens every CA
-    /// link at `dbCaAddLink` (iocInit's open pass, or a relink here) and
-    /// refuses its puts until it connects.
+    /// A link this resolver has never opened reports `Unopened` rather than
+    /// `Refused`: C opens at `dbCaAddLink` (record init) so the `caLink`
+    /// always exists by the first put, while this resolver opens lazily
+    /// inside `put_value` / `get_value`. Reporting `Refused` would refuse
+    /// the very write whose staging performs the open, and the link would
+    /// never connect.
     fn put_admission(&self, name: &[u8]) -> PutAdmission {
         let name = strip_ca_scheme(name);
         let links = self.links.read();
         match links.get(name) {
-            None => PutAdmission::Refused,
+            None => PutAdmission::Unopened,
             Some(link) if link.is_connected() && link.has_write_access() => PutAdmission::Connected,
             Some(_) => PutAdmission::Refused,
         }

@@ -40,7 +40,6 @@ async fn a_string_that_is_not_a_number_alarms_and_writes_nothing() {
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
 
     // A number converts and lands, once the link is up.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -65,17 +64,4 @@ async fn a_string_that_is_not_a_number_alarms_and_writes_nothing() {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(num(&db, "TGT"), 0.0);
-}
-
-/// iocInit's open pass, then each external link connected: C opens every CA
-/// link at `dbCaAddLink` and refuses its puts until it connects.
-async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
-    db.setup_external_link_opens().await;
-    for name in db.external_link_pv_names().await {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while db.external_link_metadata(name.as_bytes()).is_none() {
-            assert!(std::time::Instant::now() < deadline, "{name} connects");
-            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
 }

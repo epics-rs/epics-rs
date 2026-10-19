@@ -36,7 +36,6 @@ async fn a_second_links_put_callback_restarts_the_target_past_the_blocker_timeou
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
-    open_links(&db).await;
 
     db.put_record_field_from_ca("OUT1", "VAL", EpicsValue::Double(1.0))
         .await
@@ -72,17 +71,4 @@ async fn a_second_links_put_callback_restarts_the_target_past_the_blocker_timeou
     );
     assert_eq!(db.get_pv("TGT.A").unwrap(), EpicsValue::Double(2.0));
     assert!(out2.read().is_processing(), "OUT2 waits for that pass");
-}
-
-/// iocInit's open pass, then each external link connected: C opens every CA
-/// link at `dbCaAddLink` and refuses its puts until it connects.
-async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
-    db.setup_external_link_opens().await;
-    for name in db.external_link_pv_names().await {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while db.external_link_metadata(name.as_bytes()).is_none() {
-            assert!(std::time::Instant::now() < deadline, "{name} connects");
-            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
 }

@@ -180,10 +180,6 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
-        "tests/a_put_to_an_unopened_remote_link_is_refused.rs",
-    ),
-    (
-        "epics-ca-rs",
         "tests/a_string_put_to_an_enum_link_goes_as_dbr_string.rs",
     ),
     (

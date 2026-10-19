@@ -299,6 +299,7 @@ impl LinkSet for CaLinks {
         }
         match self.network.read().as_deref() {
             Some(net) => net.put_admission(name),
+            None if self.serves(name) => PutAdmission::Unopened,
             None => PutAdmission::Refused,
         }
     }

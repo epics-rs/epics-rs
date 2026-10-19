@@ -4865,7 +4865,11 @@ mod tests {
             .build()
             .unwrap();
         let write = |v: &str| rt.block_on(port.write_octet(name, 0, v.as_bytes().to_vec()));
-        let read = || rt.block_on(port.read_octet(name, 0, 64)).unwrap();
+        let read = || {
+            let (data, status) = rt.block_on(port.read_octet(name, 0, 64)).into_parts();
+            status.unwrap();
+            data
+        };
         // asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
         assert!(write("good").is_ok());
         assert!(write("old").is_err());
@@ -6888,11 +6892,11 @@ mod tests {
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"NOPE".to_vec()))
                 .is_ok()
         );
-        assert_eq!(
-            rt.block_on(port.read_octet(p.nd_array_port, 0, 16))
-                .unwrap(),
-            b"NOPE\0"
-        );
+        let (data, status) = rt
+            .block_on(port.read_octet(p.nd_array_port, 0, 16))
+            .into_parts();
+        status.unwrap();
+        assert_eq!(data, b"NOPE\0");
         // A multi-device upstream takes an address it publishes nothing at,
         // as `locateDevice` allocates one (asynManager.c:571-589).
         for addr in 0..3 {
@@ -8750,6 +8754,7 @@ mod tests {
             .unwrap();
         assert!(
             rt.block_on(port.read_octet(p.full_file_name, 0, 256))
+                .status()
                 .is_err()
         );
         // NDPluginDriver.cpp:152-160 leaves EnableCallbacks to the template,
@@ -9331,11 +9336,11 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            assert_eq!(
-                rt.block_on(port.read_octet(handle.ndarray_params.codec, 0, 16))
-                    .unwrap(),
-                b"\0"
-            );
+            let (data, status) = rt
+                .block_on(port.read_octet(handle.ndarray_params.codec, 0, 16))
+                .into_parts();
+            status.unwrap();
+            assert_eq!(data, b"\0");
         }
     }
 

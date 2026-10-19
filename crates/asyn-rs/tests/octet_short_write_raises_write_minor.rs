@@ -45,10 +45,14 @@ impl PortDriver for ShortWriter {
     fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         Ok(data.len() - usize::from(data.starts_with(b"short")))
     }
-    fn read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn read_octet(
+        &mut self,
+        _user: &AsynUser,
+        buf: &mut [u8],
+    ) -> asyn_rs::interpose::OctetReadResult {
         self.reads.fetch_add(1, Ordering::SeqCst);
         buf[..5].copy_from_slice(b"REPLY");
-        Ok(5)
+        asyn_rs::interpose::OctetReadResult::ok(5, asyn_rs::interpose::EomReason::empty())
     }
 }
 

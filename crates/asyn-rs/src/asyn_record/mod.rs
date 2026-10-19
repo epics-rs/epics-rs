@@ -44,7 +44,9 @@ use crate::exception::{AsynException, ExceptionCallbackGuard};
 use crate::interpose::EomReason;
 use crate::manager::ErrorMessage;
 use crate::port_handle::PortHandle;
-use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
+use crate::request::{
+    CellBody, PortCalls, ReadEntry, RequestCell, RequestOp, RequestResult, Unrun, octet_outcome,
+};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 use crate::user::AsynUser;
 
@@ -1439,10 +1441,12 @@ fn io_read_op(plan: &IoPlan) -> RequestOp {
             if plan.ifmt == ASYN_FMT_BINARY {
                 RequestOp::OctetReadBinary {
                     buf_size: plan.octet_buf_size,
+                    entry: ReadEntry::new(),
                 }
             } else {
                 RequestOp::OctetRead {
                     buf_size: plan.octet_buf_size,
+                    entry: ReadEntry::new(),
                 }
             }
         }
@@ -1477,7 +1481,10 @@ fn io_phase_op(plan: &mut IoPlan, phase: IoPhase) -> RequestOp {
         },
         // C reads the response byte through asynOctet, not asynGpib
         // (asynRecord.c:1729-1731) — one byte, into SPR.
-        IoPhase::GpibSerialPollRead => RequestOp::OctetRead { buf_size: 1 },
+        IoPhase::GpibSerialPollRead => RequestOp::OctetRead {
+            buf_size: 1,
+            entry: ReadEntry::new(),
+        },
         IoPhase::GpibSerialPollDisable => RequestOp::GpibUniversalCmd {
             cmd: crate::interfaces::gpib::IBSPD,
         },
@@ -1574,27 +1581,13 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // the assignments. So a device that emits a partial line and then
             // goes quiet lands AINP="abc", NORD=3 *and* a READ_ALARM.
             //
-            // Rust splits the transfer from the status across `Result`, so
-            // recover the transfer from both arms first (an error that moved
-            // bytes carries them in `AsynError::PartialRead`; one that moved
-            // none reports a zero transfer, which is exactly C's memset
-            // buffer) and run the one assignment tail below. Register reads
-            // keep their stale-on-error fields, matching their C handlers
-            // which never memset.
-            let (data, eom, err) = match res {
-                Ok(result) => (
-                    result.data.unwrap_or_default(),
-                    result.eom_reason,
-                    None::<crate::error::AsynError>,
-                ),
-                Err(e) => {
-                    let (data, eom) = match e.partial_read() {
-                        Some(p) => (p.data.clone(), p.eom_reason.bits()),
-                        None => (Vec::new(), 0),
-                    };
-                    (data, eom, Some(e))
-                }
-            };
+            // A read that never ran reports a zero transfer, which is exactly
+            // C's memset buffer. Register reads keep their stale-on-error
+            // fields, matching their C handlers which never memset.
+            let read = octet_outcome(res);
+            let eom = read.eom().bits();
+            let (data, status) = read.into_parts();
+            let err = status.err();
 
             // C `nbytesTransferred` — the count every read-side diagnostic and
             // field assignment below is built from. Taken before `data` is
@@ -1888,13 +1881,8 @@ fn record_phase_result(
             // other than one byte is the error — the record keeps the last SPR
             // in that case, because C only ever wrote through the pointer if the
             // driver moved a byte.
-            let (data, err) = match res {
-                Ok(result) => (result.data.unwrap_or_default(), None),
-                Err(e) => (
-                    e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-                    Some(e),
-                ),
-            };
+            let (data, status) = octet_outcome(res).into_parts();
+            let err = status.err();
             if let Some(byte) = data.first() {
                 out.spr = Some(i32::from(*byte));
             }
@@ -6978,14 +6966,18 @@ mod tests {
             self.calls.lock().unwrap().addressed.push(data.to_vec());
             self.check()
         }
-        fn read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
             self.calls.lock().unwrap().reads += 1;
             match self.poll_byte {
                 Some(b) if !buf.is_empty() => {
                     buf[0] = b;
-                    Ok(1)
+                    crate::interpose::OctetReadResult::ok(1, crate::interpose::EomReason::empty())
                 }
-                _ => Ok(0),
+                _ => crate::interpose::OctetReadResult::ok(0, crate::interpose::EomReason::empty()),
             }
         }
     }
@@ -7962,14 +7954,14 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 let n = PAYLOAD.len().min(buf.len());
                 buf[..n].copy_from_slice(&PAYLOAD[..n]);
-                Ok((n, EomReason::END))
+                crate::interpose::OctetReadResult::ok(n, EomReason::END)
             }
         }
 
@@ -8059,16 +8051,16 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 // 100 CRLF pairs: 400 escaped characters into a 40-byte TINP.
                 let payload: Vec<u8> = b"\r\n".repeat(100);
                 let n = payload.len().min(buf.len());
                 buf[..n].copy_from_slice(&payload[..n]);
-                Ok((n, EomReason::END))
+                crate::interpose::OctetReadResult::ok(n, EomReason::END)
             }
             fn set_input_eos(
                 &mut self,
@@ -8163,12 +8155,12 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 _buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
-                Err(AsynError::Status {
+            ) -> crate::interpose::OctetReadResult {
+                crate::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "read boom".into(),
                 })
@@ -8627,13 +8619,13 @@ mod tests {
             ) -> crate::error::AsynResult<usize> {
                 Ok(data.len())
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 buf[..2].copy_from_slice(b"OK");
-                Ok((2, EomReason::END))
+                crate::interpose::OctetReadResult::ok(2, EomReason::END)
             }
         }
 
@@ -8694,7 +8686,7 @@ mod tests {
     #[test]
     fn octet_read_error_errs_matches_c_report_error() {
         use crate::error::{AsynError, AsynStatus};
-        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interpose::{EomReason, OctetReadResult};
         use crate::interrupt::InterruptManager;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -8715,29 +8707,31 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
-                _buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 self.n += 1;
                 match self.n {
-                    1 => Err(AsynError::Status {
+                    1 => OctetReadResult::failed(AsynError::Status {
                         status: AsynStatus::Timeout,
                         message: "read timeout".into(),
                     }),
-                    2 => Err(AsynError::Status {
+                    2 => OctetReadResult::failed(AsynError::Status {
                         status: AsynStatus::Overflow,
                         message: "buffer full".into(),
                     }),
-                    _ => Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "device fault".into(),
+                    _ => {
+                        buf[..2].copy_from_slice(b"xy");
+                        OctetReadResult {
+                            status: Err(AsynError::Status {
+                                status: AsynStatus::Error,
+                                message: "device fault".into(),
+                            }),
+                            ..OctetReadResult::ok(2, EomReason::empty())
+                        }
                     }
-                    .with_partial_read(PartialOctetRead {
-                        data: b"xy".to_vec(),
-                        eom_reason: EomReason::empty(),
-                    })),
                 }
             }
         }
@@ -8804,7 +8798,7 @@ mod tests {
     #[test]
     fn octet_partial_read_delivers_bytes_with_the_timeout() {
         use crate::error::{AsynError, AsynStatus};
-        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interpose::{EomReason, OctetReadResult};
         use crate::interrupt::InterruptManager;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -8825,21 +8819,20 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 buf[..3].copy_from_slice(b"abc");
                 buf[3] = 0;
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    ..OctetReadResult::ok(3, EomReason::empty())
                 }
-                .with_partial_read(PartialOctetRead {
-                    data: b"abc".to_vec(),
-                    eom_reason: EomReason::empty(),
-                }))
             }
         }
 
@@ -9143,11 +9136,14 @@ mod tests {
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<usize> {
+            ) -> crate::interpose::OctetReadResult {
                 self.log.lock().unwrap().reads += 1;
                 let data = b"hi";
                 buf[..data.len()].copy_from_slice(data);
-                Ok(data.len())
+                crate::interpose::OctetReadResult::ok(
+                    data.len(),
+                    crate::interpose::EomReason::empty(),
+                )
             }
             fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
                 self.connects.fetch_add(1, Ordering::SeqCst);
@@ -9843,12 +9839,12 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 _buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
-                Err(boom())
+            ) -> crate::interpose::OctetReadResult {
+                crate::interpose::OctetReadResult::failed(boom())
             }
             fn io_write_octet(
                 &mut self,
@@ -9977,17 +9973,17 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 *self.requested.lock().unwrap() = Some(buf.len());
                 let n = self.fill.min(buf.len());
                 for b in buf[..n].iter_mut() {
                     *b = b'Z';
                 }
-                Ok((n, self.eom))
+                crate::interpose::OctetReadResult::ok(n, self.eom)
             }
         }
 
@@ -10102,10 +10098,10 @@ mod tests {
                 &mut self,
                 user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<usize> {
+            ) -> crate::interpose::OctetReadResult {
                 *self.seen.lock().unwrap() = Some(user.timeout);
                 buf[0] = b'x';
-                Ok(1)
+                crate::interpose::OctetReadResult::ok(1, crate::interpose::EomReason::empty())
             }
         }
 
@@ -10175,10 +10171,10 @@ mod tests {
                 &mut self,
                 user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<usize> {
+            ) -> crate::interpose::OctetReadResult {
                 *self.seen.lock().unwrap() = Some(user.timeout);
                 buf[0] = b'x';
-                Ok(1)
+                crate::interpose::OctetReadResult::ok(1, crate::interpose::EomReason::empty())
             }
         }
 
@@ -10279,16 +10275,16 @@ mod tests {
                 self.log.lock().unwrap().push("write");
                 Ok(data.len())
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 self.log.lock().unwrap().push("read");
                 let resp = b"OK";
                 let n = resp.len().min(buf.len());
                 buf[..n].copy_from_slice(&resp[..n]);
-                Ok((n, EomReason::EOS))
+                crate::interpose::OctetReadResult::ok(n, EomReason::EOS)
             }
         }
 
@@ -12632,11 +12628,11 @@ A.OEOS
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<usize> {
+            ) -> crate::interpose::OctetReadResult {
                 let resp = b"12.345";
                 let n = resp.len().min(buf.len());
                 buf[..n].copy_from_slice(&resp[..n]);
-                Ok(n)
+                crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
             }
         }
 

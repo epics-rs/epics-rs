@@ -81,7 +81,7 @@ fn bench_actor_octet_roundtrip(c: &mut Criterion) {
     c.bench_function("actor_octet_roundtrip", |b| {
         b.iter(|| {
             sio.write_octet(2, data).unwrap();
-            let _ = sio.read_octet(2, 64).unwrap();
+            sio.read_octet(2, 64).into_parts().1.unwrap();
         });
     });
 }

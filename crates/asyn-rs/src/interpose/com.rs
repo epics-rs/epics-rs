@@ -257,9 +257,10 @@ impl Default for ComInterpose {
 /// 0-byte-is-EOF rule this has. Not a deviation any more.
 fn next_char(next: &mut dyn OctetNext, user: &AsynUser) -> Result<u8, String> {
     let mut c = [0u8; 1];
-    match next.read(user, &mut c) {
-        Ok(r) if r.nbytes_transferred >= 1 => Ok(c[0]),
-        Ok(_) => Err("no data".into()),
+    let r = next.read(user, &mut c);
+    match r.status {
+        Ok(()) if r.nbytes_transferred >= 1 => Ok(c[0]),
+        Ok(()) => Err("no data".into()),
         Err(e) => Err(e.message()),
     }
 }
@@ -290,9 +291,13 @@ impl OctetInterpose for ComInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         let maxchars = buf.len();
-        let r = next.read(user, buf)?;
+        let r = next.read(user, buf);
+        // C :208-209 returns the lower layer's failure as it stands.
+        if r.status.is_err() {
+            return r;
+        }
         let mut n_read = r.nbytes_transferred;
         let mut eom = r.eom_reason;
 
@@ -333,7 +338,7 @@ impl OctetInterpose for ComInterpose {
             if c != i32::from(IAC) {
                 // :226-230 — C overwrites the lower layer's message with this
                 // one, including when `c` was EOF.
-                return Err(asyn_error("Missing IAC"));
+                return OctetReadResult::failed(asyn_error("Missing IAC"));
             }
 
             // :231-232
@@ -367,11 +372,12 @@ impl OctetInterpose for ComInterpose {
         if n_read == maxchars {
             eom.insert(EomReason::CNT);
         }
-        Ok(OctetReadResult {
+        OctetReadResult {
             nbytes_transferred: n_read,
             eom_reason: eom,
             taken_back: r.taken_back,
-        })
+            status: Ok(()),
+        }
     }
 
     /// C `writeIt` (:136-195) — double every IAC, then report the count the
@@ -1155,13 +1161,14 @@ mod tests {
     }
 
     impl OctetNext for FakeServer {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             if buf.is_empty() {
-                return Ok(OctetReadResult {
+                return OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::empty(),
                     taken_back: 0,
-                });
+                    status: Ok(()),
+                };
             }
             let mut n = 0;
             while n < buf.len() {
@@ -1174,12 +1181,12 @@ mod tests {
                 }
             }
             if n == 0 {
-                return Err(AsynError::Status {
+                return OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "read timeout".into(),
                 });
             }
-            Ok(OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: if n == buf.len() {
                     EomReason::CNT
@@ -1187,7 +1194,8 @@ mod tests {
                     EomReason::empty()
                 },
                 taken_back: 0,
-            })
+                status: Ok(()),
+            }
         }
 
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1264,7 +1272,7 @@ mod tests {
     fn short_write_reports_the_stuffed_count_c_reports() {
         struct ShortWrite;
         impl OctetNext for ShortWrite {
-            fn read(&mut self, _u: &AsynUser, _b: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _u: &AsynUser, _b: &mut [u8]) -> OctetReadResult {
                 unreachable!()
             }
             fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1297,7 +1305,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 3);
         assert_eq!(&buf[..3], &[b'A', IAC, b'B']);
     }
@@ -1314,7 +1322,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 2];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 2);
         assert_eq!(&buf[..2], &[b'A', IAC]);
         assert!(base.to_read.is_empty(), "the partner byte was consumed");
@@ -1331,7 +1339,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 1];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 1);
         assert_eq!(buf[0], IAC);
     }
@@ -1344,7 +1352,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 3);
         assert_eq!(&buf[..3], &[IAC, IAC, b'Z']);
     }
@@ -1376,7 +1384,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 4];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         // Base filled all 4 and reported CNT; after unstuffing only 3 remain.
         assert_eq!(r.nbytes_transferred, 3);
         assert!(!r.eom_reason.contains(EomReason::CNT));
@@ -1390,7 +1398,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 4];
 
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 4);
         assert!(r.eom_reason.contains(EomReason::CNT));
     }
@@ -2000,7 +2008,7 @@ mod tests {
             seen: Vec<Option<Duration>>,
         }
         impl OctetNext for TimeoutSpy {
-            fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 self.seen.push(user.timeout);
                 self.inner.read(user, buf)
             }
@@ -2096,7 +2104,7 @@ mod tests {
         let mut server = FakeServer::new(&[b'A', IAC, IAC, b'B']);
         let mut com = ComInterpose::new();
         let mut buf = [0u8; 8];
-        let r = com.read(&user, &mut buf, &mut server).unwrap();
+        let r = com.read(&user, &mut buf, &mut server).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], &[b'A', IAC, b'B']);
 
         let contents = std::fs::read_to_string(&temp).unwrap();
@@ -2120,7 +2128,7 @@ mod tests {
             TraceFile::File(Arc::new(Mutex::new(file))),
         );
         let mut server = FakeServer::new(b"AB");
-        com.read(&user, &mut buf, &mut server).unwrap();
+        let _ = com.read(&user, &mut buf, &mut server).expect_ok();
         assert_eq!(std::fs::read_to_string(&temp2).unwrap(), "");
         let _ = std::fs::remove_file(&temp2);
     }

@@ -8,7 +8,6 @@ pub mod gpib;
 pub mod int32;
 pub mod int64;
 pub mod motor;
-pub mod octet;
 // No `option` module: the asynOption interface has no trait of its own. A
 // driver implements it by overriding `PortDriver::get_option` / `set_option`
 // and declaring `Capability::Option`, which is what `PortHandle::has_interface`

@@ -1115,7 +1115,8 @@ mod tests {
             .await
             .expect("the store takes the batch");
         // asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
-        let got = port.read_octet(reason, 0, 32).await.expect("octet read");
+        let (got, status) = port.read_octet(reason, 0, 32).await.into_parts();
+        status.expect("octet read");
         assert_eq!(
             got.as_slice(),
             b"\xff\xfe\0",
@@ -1126,7 +1127,8 @@ mod tests {
         let batch =
             decode_for_subscribers(b"hello", &subscribers, &bound, "sensor/raw", &mut |_| {});
         port.set_params_and_notify(0, batch).await.unwrap();
-        let got = port.read_octet(reason, 0, 32).await.unwrap();
+        let (got, status) = port.read_octet(reason, 0, 32).await.into_parts();
+        status.unwrap();
         assert_eq!(got.as_slice(), b"hello\0");
 
         rt.shutdown();

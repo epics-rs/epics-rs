@@ -296,8 +296,8 @@ impl SerialIoStateWin32 {
     }
 }
 
-impl OctetNext for SerialIoStateWin32 {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+impl SerialIoStateWin32 {
+    fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
         let handle = self.handle_or_err()?;
         // C readIt (drvAsynSerialPortWin32.c): reject maxchars == 0 before
         // touching the device (same wording as the serial driver).
@@ -323,7 +323,7 @@ impl OctetNext for SerialIoStateWin32 {
         if ok == 0 {
             // A broken device surfaces as a ReadFile error rather than a
             // 0-byte return, but C-Win32 readIt reports it with the handle
-            // still open — see `io_read_octet_eom` for why this backend does
+            // still open — see `io_read_octet` for why this backend does
             // not tear down on a failed read.
             return Err(io_err());
         }
@@ -336,16 +336,19 @@ impl OctetNext for SerialIoStateWin32 {
             });
         }
         self.n_read += n_read as u64;
-        Ok(OctetReadResult {
-            nbytes_transferred: n_read as usize,
-            // C parity: CNT only when the requested count was reached.
-            eom_reason: if n_read as usize >= buf.len() {
-                EomReason::CNT
-            } else {
-                EomReason::empty()
-            },
-            taken_back: 0,
-        })
+        // C parity: CNT only when the requested count was reached.
+        let eom = if n_read as usize >= buf.len() {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n_read as usize, eom))
+    }
+}
+
+impl OctetNext for SerialIoStateWin32 {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.recv(user, buf).into()
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -760,10 +763,6 @@ impl PortDriver for DrvAsynSerialPort {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.io_read_octet_eom(user, buf).map(|(n, _eom)| n)
-    }
-
     /// The raw device read — the **bottom** of the port's octet chain, C
     /// `drvAsynSerialPortWin32.c::readIt` below the interposes the manager
     /// installed on top of it. The chain is run by the port
@@ -779,20 +778,18 @@ impl PortDriver for DrvAsynSerialPort {
     /// twin sees those as a short `read()` and reserves its errno branch for a
     /// dead device, which is why it does close on both directions
     /// (`drvAsynSerialPort.c:959`).
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         user.print(
             TraceMask::FLOW,
             file!(),
             line!(),
             format_args!("{} read.\n", self.config.device),
         );
-        self.base.check_ready()?;
+        if let Err(e) = self.base.check_ready() {
+            return OctetReadResult::failed(e);
+        }
         let result = self.io.read(user, buf);
-        let n_read = result.as_ref().map_or(0, |r| r.nbytes_transferred);
+        let n_read = result.nbytes_transferred;
         if n_read > 0 {
             let label = format!("{} read {n_read}\n", self.config.device);
             user.print_io(
@@ -807,8 +804,9 @@ impl PortDriver for DrvAsynSerialPort {
         // exit but the refusals before the loop.
         if !buf.is_empty() {
             let status = result
+                .status
                 .as_ref()
-                .map_or_else(|e| e.status(), |_| AsynStatus::Success);
+                .map_or_else(|e| e.status(), |()| AsynStatus::Success);
             user.print(
                 TraceMask::FLOW,
                 file!(),
@@ -819,7 +817,7 @@ impl PortDriver for DrvAsynSerialPort {
                 ),
             );
         }
-        result.map(|r| (r.nbytes_transferred, r.eom_reason))
+        result
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1352,7 +1350,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
         let err = drv
-            .io_read_octet_eom(&user, &mut buf)
+            .io_read_octet(&user, &mut buf)
+            .status
             .expect_err("a read with no handle must fail");
         assert!(
             err.is_fatal_transport(),
@@ -1366,7 +1365,8 @@ mod tests {
         // Still reaching the device rather than the base gate: the second read
         // carries the device layer's message, not `port ... not connected`.
         let again = drv
-            .io_read_octet_eom(&user, &mut buf)
+            .io_read_octet(&user, &mut buf)
+            .status
             .expect_err("a second read must still reach the device");
         assert!(
             again.to_string().contains("serial port not open"),

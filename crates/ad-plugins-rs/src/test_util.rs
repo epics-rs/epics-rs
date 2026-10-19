@@ -205,7 +205,9 @@ pub(crate) fn begin_params<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
         .build()
         .unwrap()
         .block_on(port.read_octet(p.codec, 0, 64))
-        .unwrap();
+        .into_parts();
+    codec.1.unwrap();
+    let codec = codec.0;
     BeginParams {
         n_dimensions: int(p.n_dimensions),
         data_type: int(p.data_type),

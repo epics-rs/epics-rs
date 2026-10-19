@@ -47,8 +47,8 @@ impl PortDriver for Failing {
     fn write_int32_array(&mut self, _: &AsynUser, _: &[i32]) -> AsynResult<()> {
         failed()
     }
-    fn read_octet(&mut self, _: &AsynUser, _: &mut [u8]) -> AsynResult<usize> {
-        failed()
+    fn read_octet(&mut self, _: &AsynUser, _: &mut [u8]) -> asyn_rs::interpose::OctetReadResult {
+        asyn_rs::interpose::OctetReadResult::failed(failed::<()>().unwrap_err())
     }
     fn read_int32_array(&mut self, _: &AsynUser, _: &mut [i32]) -> AsynResult<usize> {
         failed()

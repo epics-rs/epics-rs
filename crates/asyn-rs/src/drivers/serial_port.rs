@@ -880,8 +880,8 @@ fn write_until(
     Ok(())
 }
 
-impl OctetNext for SerialIoState {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+impl SerialIoState {
+    fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
         let fd = self.fd_or_err()?;
         // C readIt (drvAsynSerialPort.c:871-875): reject maxchars == 0 with
         // asynError right after the fd check and before touching the device.
@@ -898,16 +898,19 @@ impl OctetNext for SerialIoState {
 
         let n = read_until(&fd, buf, user.timeout.map(|t| Instant::now() + t))?;
         self.n_read += n as u64; // C parity: tty->nRead += thisRead
-        Ok(OctetReadResult {
-            nbytes_transferred: n,
-            // C parity: CNT only when the requested count was reached.
-            eom_reason: if n >= buf.len() {
-                EomReason::CNT
-            } else {
-                EomReason::empty()
-            },
-            taken_back: 0,
-        })
+        // C parity: CNT only when the requested count was reached.
+        let eom = if n >= buf.len() {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n, eom))
+    }
+}
+
+impl OctetNext for SerialIoState {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.recv(user, buf).into()
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1386,32 +1389,23 @@ impl PortDriver for DrvAsynSerialPort {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.io_read_octet_eom(user, buf).map(|(n, _eom)| n)
-    }
-
     /// The raw device read — the **bottom** of the port's octet chain, C
     /// `drvAsynSerialPort.c::readIt` below the interposes the manager installed
     /// on top of it. The interpose chain is run by the port
     /// (`crate::port::octet_read_chain`), not from here: a driver that
     /// dispatched its own chain gave every other driver a chain that never ran.
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         user.print(
             TraceMask::FLOW,
             file!(),
             line!(),
             format_args!("{} read.\n", self.device),
         );
-        self.require_fd()?;
+        if let Err(e) = self.require_fd() {
+            return OctetReadResult::failed(e);
+        }
         let result = self.io.read(user, buf);
-        let n_read = match &result {
-            Ok(r) => r.nbytes_transferred,
-            Err(e) => e.partial_read().map_or(0, |p| p.nbytes_transferred()),
-        };
+        let n_read = result.nbytes_transferred;
         if n_read > 0 {
             let label = format!("{} read {n_read}\n", self.device);
             user.print_io(
@@ -1422,7 +1416,7 @@ impl PortDriver for DrvAsynSerialPort {
                 line!(),
             );
         }
-        if let Err(e) = &result {
+        if let Err(e) = &result.status {
             // C parity: drvAsynSerialPort.c::closeConnection on a fatal
             // read error / EOF so the actor's auto-reconnect re-opens the
             // device. EINTR/EAGAIN are already retried inside
@@ -1435,8 +1429,9 @@ impl PortDriver for DrvAsynSerialPort {
         // exit but the refusals before the loop.
         if !buf.is_empty() {
             let status = result
+                .status
                 .as_ref()
-                .map_or_else(|e| e.status(), |_| AsynStatus::Success);
+                .map_or_else(|e| e.status(), |()| AsynStatus::Success);
             user.print(
                 TraceMask::FLOW,
                 file!(),
@@ -1444,7 +1439,7 @@ impl PortDriver for DrvAsynSerialPort {
                 format_args!("{} read {n_read}, return {}\n", self.device, status as i32),
             );
         }
-        result.map(|r| (r.nbytes_transferred, r.eom_reason))
+        result
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1997,7 +1992,7 @@ mod tests {
         let mut user = AsynUser::default();
         let mut buf = [0u8; 8];
         for err in [
-            drv.io_read_octet_eom(&user, &mut buf).unwrap_err(),
+            drv.io_read_octet(&user, &mut buf).unwrap_err(),
             drv.write_octet(&mut user, b"x").unwrap_err(),
         ] {
             match err {
@@ -2458,7 +2453,7 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        assert!(drv.read_octet(&user, &mut buf).is_err());
+        assert!(drv.io_read_octet(&user, &mut buf).into_count().is_err());
         let mut user = AsynUser::new(0);
         assert!(drv.write_octet(&mut user, b"hello").is_err());
     }
@@ -2561,7 +2556,7 @@ mod tests {
 
         let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut empty: [u8; 0] = [];
-        let res = drv.read_octet(&ruser, &mut empty);
+        let res = drv.io_read_octet(&ruser, &mut empty).into_count();
         assert!(
             matches!(
                 res,
@@ -2662,7 +2657,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut rbuf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut rbuf).unwrap();
+        let n = drv.io_read_octet(&user, &mut rbuf).into_count().unwrap();
         assert_eq!(&rbuf[..n], b"world");
     }
 
@@ -2679,7 +2674,7 @@ mod tests {
         // Don't write anything — read should timeout
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(100));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         match err {
             AsynError::Status {
                 status: AsynStatus::Timeout,
@@ -2707,7 +2702,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         assert!(
             err.is_fatal_transport(),
             "expected a fatal transport error, got {err:?}"
@@ -2747,58 +2742,10 @@ mod tests {
         );
     }
 
-    /// R7-47 (same defect family as the IP port's `is_timeout`): reads and
-    /// writes dispatch through the interpose chain, and `configure` installs
-    /// the EOS interpose by default — which wraps a lower-layer hangup as
-    /// `PartialRead` (C `asynInterposeEos.c:242-253` returns the lower status
-    /// unchanged). Classifying by the error *variant* read that hangup as
-    /// non-fatal and left a dead fd reporting `connected`; the status is the
-    /// contract.
+    /// R8-48: a real errno behind the write carrier stays fatal; the carrier
+    /// used to flatten it to a bare status=Error.
     #[test]
-    fn fatal_transport_error_sees_through_the_eos_interpose_wrapper() {
-        use crate::interpose::PartialOctetRead;
-
-        let wrapped_hangup = AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "hangup".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"AB".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(
-            wrapped_hangup.is_fatal_transport(),
-            "a hangup wrapped by the EOS interpose is still fatal"
-        );
-
-        // Boundary: a timeout — wrapped the same way — must stay non-fatal, or
-        // every EOS-port read timeout would tear the link down.
-        let wrapped_timeout = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"AB".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(
-            !wrapped_timeout.is_fatal_transport(),
-            "a partial-line timeout leaves the fd intact (C returns asynTimeout)"
-        );
-
-        // R8-48 boundary — the case the status-only rule still missed: a real
-        // errno (`Io`, not a status variant) is what a mid-line hangup actually
-        // looks like, and the carrier used to flatten it to a bare
-        // status=Error. Both partial carriers must let the errno through.
-        let wrapped_errno =
-            AsynError::Io(std::io::Error::other("EIO")).with_partial_read(PartialOctetRead {
-                data: b"AB".to_vec(),
-                eom_reason: EomReason::empty(),
-            });
-        assert!(
-            wrapped_errno.is_fatal_transport(),
-            "an errno behind the read carrier is still fatal"
-        );
+    fn fatal_transport_error_sees_through_the_write_carrier() {
         let half_written = AsynError::Io(std::io::Error::other("EIO")).with_partial_write(2);
         assert!(
             half_written.is_fatal_transport(),
@@ -2833,9 +2780,7 @@ mod tests {
         // The EOS layer is the port's, not the driver's: a caller enters the
         // chain at the top and the driver is its base (C findInterface,
         // asynManager.c:1494-1503). `PortActor` does exactly this.
-        let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf).unwrap();
         // EOS should strip the terminator
         assert_eq!(&buf[..n], b"OK");
     }
@@ -3128,10 +3073,11 @@ mod tests {
 
         // Read via PortHandle
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        let result = ph
-            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 32 }, user)
-            .unwrap();
-        assert_eq!(result.data.as_deref(), Some(b"pong".as_slice()));
+        let (data, status) = ph
+            .submit_octet_read_blocking(crate::request::OctetReadOp::Read { buf_size: 32 }, user)
+            .into_parts();
+        status.unwrap();
+        assert_eq!(data, b"pong");
 
         runtime_handle.shutdown_and_wait();
     }
@@ -3250,7 +3196,7 @@ mod tests {
         // The read times out (nothing is driving the master end); what matters
         // is the fd's mode on the way out, not the outcome.
         let mut buf = [0u8; 8];
-        let _ = drv.read_octet(&user, &mut buf);
+        let _ = drv.io_read_octet(&user, &mut buf);
         nonblocking("after read");
     }
 
@@ -3524,7 +3470,7 @@ mod tests {
         let mut buf = [0u8; 32];
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(200));
         let start = Instant::now();
-        let res = drv.read_octet(&user, &mut buf);
+        let res = drv.io_read_octet(&user, &mut buf).into_count();
         let elapsed = start.elapsed();
         let _ = waker.join();
 
@@ -3728,7 +3674,7 @@ mod tests {
         let mut buf = [0u8; 8];
         let user = AsynUser::new(0).with_timeout(Duration::from_micros(500));
         let start = Instant::now();
-        let res = drv.read_octet(&user, &mut buf);
+        let res = drv.io_read_octet(&user, &mut buf).into_count();
         let elapsed = start.elapsed();
 
         let err = match res {
@@ -3786,7 +3732,7 @@ mod tests {
         unsafe { libc::write(master, msg.as_ptr() as *const libc::c_void, msg.len()) };
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut rbuf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut rbuf).unwrap();
+        let n = drv.io_read_octet(&user, &mut rbuf).into_count().unwrap();
         assert!(n > 0);
         assert_eq!(drv.io.n_read, n as u64, "n_read must track bytes read");
 

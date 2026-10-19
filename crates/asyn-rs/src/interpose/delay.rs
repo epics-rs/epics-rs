@@ -48,7 +48,7 @@ impl OctetInterpose for DelayInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         next.read(user, buf)
     }
 
@@ -108,12 +108,13 @@ mod tests {
     }
 
     impl OctetNext for RecordingBase {
-        fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-            Ok(OctetReadResult {
+        fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
                 taken_back: 0,
-            })
+                status: Ok(()),
+            }
         }
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.push(data.to_vec());

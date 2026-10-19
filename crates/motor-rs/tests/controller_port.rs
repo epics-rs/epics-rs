@@ -240,11 +240,13 @@ fn a_driver_write_octet_override_runs_in_place_of_the_base() {
     assert_eq!(io.write_octet(send, b"AX RP").unwrap(), 5);
     assert_eq!(*sent.lock().unwrap(), [b"AX RP".to_vec()]);
     // Never stored, so still undefined.
-    assert!(io.read_octet(send, 16).is_err());
+    assert!(io.read_octet(send, 16).status().is_err());
     // The base still stores what the override passes on.
     let message = index::PROFILE_BUILD_MESSAGE;
     io.write_octet(message, b"built").unwrap();
-    assert_eq!(io.read_octet(message, 16).unwrap(), b"built\0");
+    let (data, status) = io.read_octet(message, 16).into_parts();
+    status.unwrap();
+    assert_eq!(data, b"built\0");
 }
 
 /// phytronController's shape: a per-axis option it answers itself, the

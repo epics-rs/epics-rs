@@ -31,6 +31,7 @@
 //! [`connect`]: NullOctetPort::connect
 
 use crate::error::AsynResult;
+use crate::interpose::{EomReason, OctetReadResult};
 use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
@@ -92,8 +93,8 @@ impl PortDriver for NullOctetPort {
     }
 
     /// No backing transport: a read yields no bytes.
-    fn read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-        Ok(0)
+    fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+        OctetReadResult::ok(0, EomReason::empty())
     }
 
     /// No backing transport: a write is accepted and discarded.

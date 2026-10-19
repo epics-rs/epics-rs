@@ -454,7 +454,8 @@ async fn test_octet_write_read() {
     h.write_octet(reason, 0, b"Hello, EPICS!".to_vec())
         .await
         .unwrap();
-    let data = h.read_octet(reason, 0, 64).await.unwrap();
+    let (data, status) = h.read_octet(reason, 0, 64).await.into_parts();
+    status.unwrap();
     // C asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
     assert_eq!(data, b"Hello, EPICS!\0");
 }
@@ -468,7 +469,8 @@ async fn test_octet_overwrite() {
         .unwrap();
     h.write_octet(reason, 0, b"first".to_vec()).await.unwrap();
     h.write_octet(reason, 0, b"second".to_vec()).await.unwrap();
-    let data = h.read_octet(reason, 0, 64).await.unwrap();
+    let (data, status) = h.read_octet(reason, 0, 64).await.into_parts();
+    status.unwrap();
     assert_eq!(data, b"second\0");
 }
 

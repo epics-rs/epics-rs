@@ -52,7 +52,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interpose::EomReason;
+use crate::interpose::{EomReason, OctetReadResult};
 use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
@@ -328,6 +328,127 @@ impl DrvAsynPrologixPort {
             }
         }
     }
+
+    /// Octet read that also reports the end-of-message reason; the single
+    /// owner of the prologix read path, which `io_read_octet` delegates to.
+    /// C `prologixRead` (drvPrologixGPIB.c:334-349) returns `eomReason`
+    /// (END/EOS/CNT) alongside the byte count: the GPIB EOI / EOS boundary.
+    fn read_eom(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
+        self.base.check_ready()?;
+        // Drain bytes left over from a previous read whose buffer was
+        // too small before issuing a new bridge `++read` — otherwise
+        // that data is lost and the next read returns fresh device
+        // output out of order.
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.read_carry.is_empty() {
+                let remaining = st.read_carry.len();
+                let n = remaining.min(buf.len());
+                buf[..n].copy_from_slice(&st.read_carry[..n]);
+                st.read_carry.drain(..n);
+                let eom = read_eom(remaining, buf.len(), st.eos.is_some());
+                return Ok((n, eom));
+            }
+        }
+        self.set_address(user)?;
+        let eos = self.state.lock().unwrap().eos;
+        // Issue the bridge `++read` command. Two flavours mirror C
+        // asyn — explicit EOS char vs `eoi` (use the EOI line as
+        // terminator and rely on EOT marker to wrap up).
+        let cmd = match eos {
+            Some(c) => format!("++read {c}\n"),
+            None => "++read eoi\n".to_string(),
+        };
+        let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
+        self.inner.write_octet(&mut bridge_user, cmd.as_bytes())?;
+
+        // Loop reading from the bridge until the terminator byte
+        // appears at the end of the most recent chunk. With no eos,
+        // C asyn does an extra 5ms-timeout read to disambiguate a
+        // binary EOT byte from the real end-of-message — when it
+        // times out, EOM is confirmed.
+        let terminator = eos.unwrap_or(EOT_MARKER);
+        let mut acc: Vec<u8> = Vec::with_capacity(4096);
+        let mut chunk = vec![0u8; 4096];
+        // C takes `pasynUser->timeout` verbatim (`double timeout =
+        // pasynUser->timeout`, drvPrologixGPIB.c:253) and re-arms the loop
+        // variable from it after every non-terminator chunk (`:326`). Zero is
+        // the non-blocking poll the caller asked for — reachable from asynRecord
+        // with TMOT 0, and from device support that leaves the timeout unset —
+        // and coercing it to a second made a record that asked to poll block for
+        // one, then return data where C returns `asynTimeout` at once (DRV-54).
+        let user_timeout = user.timeout;
+        let mut read_timeout = user_timeout;
+        let mut at_eot = false;
+        loop {
+            let ru = AsynUser::default().with_timeout_opt(read_timeout);
+            // C adds a chunk's count only on asynSuccess (drvPrologixGPIB.c:299-303).
+            let read = self.inner.io_read_octet(&ru, &mut chunk);
+            match read.status.map(|()| read.nbytes_transferred) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&chunk[..n]);
+                    if let Some(&last) = acc.last() {
+                        if last == terminator {
+                            if eos.is_some() {
+                                break;
+                            }
+                            // Binary-mode terminator ambiguity — try
+                            // one more short-timeout read.
+                            read_timeout = Some(Duration::from_millis(5));
+                            at_eot = true;
+                            continue;
+                        }
+                    }
+                    read_timeout = user_timeout;
+                    at_eot = false;
+                }
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                }) if at_eot => break,
+                Err(e) => {
+                    // C `prologixRead` (drvPrologixGPIB.c:297-303): a failed
+                    // chunk read `return status` *without* touching
+                    // `pdpvt->bufCount`, which line 303 has already advanced
+                    // over every chunk that did arrive. Those bytes stay in
+                    // `pdpvt->buf`, and because the accumulate block is gated on
+                    // `bufCount == 0` (:250) the next `prologixRead` skips the
+                    // bridge entirely and delivers them. The retention is
+                    // deliberate: the resize-failure path two lines up (:288-290)
+                    // *does* reset `bufCount = 0` before returning.
+                    //
+                    // The bytes are staged verbatim — C's `bufCount--` that drops
+                    // the EOT marker (:330-331) is below the loop and never runs
+                    // on this path, so a marker already in `acc` is served as data.
+                    if !acc.is_empty() {
+                        self.stage_read_carry(acc);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // Strip the trailing terminator: the EOT marker in EOI mode (it's
+        // framing, not data) or the matched eos byte in EOS mode. Mirrors
+        // the asynGpib read layer (asynGpib.c:415-419) and the standard
+        // EosInterpose, both of which remove the matched terminator before
+        // the record sees the data; streamDevice and asynRecord expect the
+        // eos-stripped form.
+        if acc.last() == Some(&terminator) {
+            acc.pop();
+        }
+        let remaining = acc.len();
+        let n = remaining.min(buf.len());
+        buf[..n].copy_from_slice(&acc[..n]);
+        if n < remaining {
+            // Caller's buffer was too small — stash the remainder so the
+            // next read_octet returns it instead of dropping device data.
+            // (C keeps the whole reply in `buf` and advances `bufIndex`, :347.)
+            self.stage_read_carry(acc.split_off(n));
+        }
+        let eom = read_eom(remaining, buf.len(), eos.is_some());
+        Ok((n, eom))
+    }
 }
 
 /// Owns the inner IP port's connection for the length of the `++ver`
@@ -456,7 +577,8 @@ impl PortDriver for DrvAsynPrologixPort {
             let mut buf = [0u8; 64];
             loop {
                 let ru = AsynUser::default().with_timeout(Duration::from_millis(500));
-                let n = link.port().read_octet(&ru, &mut buf)?;
+                let read = link.port().io_read_octet(&ru, &mut buf);
+                let n = read.status.map(|()| read.nbytes_transferred)?;
                 if n == 0 {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
@@ -586,135 +708,8 @@ impl PortDriver for DrvAsynPrologixPort {
         Ok(data.len())
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.io_read_octet_eom(user, buf).map(|(n, _)| n)
-    }
-
-    /// Octet read that also reports the end-of-message reason. Single
-    /// owner of the prologix read path; [`read_octet`] delegates here
-    /// and discards the EOM. C `prologixRead` (drvPrologixGPIB.c:334-349)
-    /// returns `eomReason` (END/EOS/CNT) alongside the byte count; the
-    /// default actor synthesis would report CNT-only and lose the GPIB
-    /// EOI / EOS message boundary.
-    ///
-    /// [`read_octet`]: PortDriver::read_octet
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
-        self.base.check_ready()?;
-        // Drain bytes left over from a previous read whose buffer was
-        // too small before issuing a new bridge `++read` — otherwise
-        // that data is lost and the next read returns fresh device
-        // output out of order.
-        {
-            let mut st = self.state.lock().unwrap();
-            if !st.read_carry.is_empty() {
-                let remaining = st.read_carry.len();
-                let n = remaining.min(buf.len());
-                buf[..n].copy_from_slice(&st.read_carry[..n]);
-                st.read_carry.drain(..n);
-                let eom = read_eom(remaining, buf.len(), st.eos.is_some());
-                return Ok((n, eom));
-            }
-        }
-        self.set_address(user)?;
-        let eos = self.state.lock().unwrap().eos;
-        // Issue the bridge `++read` command. Two flavours mirror C
-        // asyn — explicit EOS char vs `eoi` (use the EOI line as
-        // terminator and rely on EOT marker to wrap up).
-        let cmd = match eos {
-            Some(c) => format!("++read {c}\n"),
-            None => "++read eoi\n".to_string(),
-        };
-        let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
-        self.inner.write_octet(&mut bridge_user, cmd.as_bytes())?;
-
-        // Loop reading from the bridge until the terminator byte
-        // appears at the end of the most recent chunk. With no eos,
-        // C asyn does an extra 5ms-timeout read to disambiguate a
-        // binary EOT byte from the real end-of-message — when it
-        // times out, EOM is confirmed.
-        let terminator = eos.unwrap_or(EOT_MARKER);
-        let mut acc: Vec<u8> = Vec::with_capacity(4096);
-        let mut chunk = vec![0u8; 4096];
-        // C takes `pasynUser->timeout` verbatim (`double timeout =
-        // pasynUser->timeout`, drvPrologixGPIB.c:253) and re-arms the loop
-        // variable from it after every non-terminator chunk (`:326`). Zero is
-        // the non-blocking poll the caller asked for — reachable from asynRecord
-        // with TMOT 0, and from device support that leaves the timeout unset —
-        // and coercing it to a second made a record that asked to poll block for
-        // one, then return data where C returns `asynTimeout` at once (DRV-54).
-        let user_timeout = user.timeout;
-        let mut read_timeout = user_timeout;
-        let mut at_eot = false;
-        loop {
-            let ru = AsynUser::default().with_timeout_opt(read_timeout);
-            match self.inner.read_octet(&ru, &mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&chunk[..n]);
-                    if let Some(&last) = acc.last() {
-                        if last == terminator {
-                            if eos.is_some() {
-                                break;
-                            }
-                            // Binary-mode terminator ambiguity — try
-                            // one more short-timeout read.
-                            read_timeout = Some(Duration::from_millis(5));
-                            at_eot = true;
-                            continue;
-                        }
-                    }
-                    read_timeout = user_timeout;
-                    at_eot = false;
-                }
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    ..
-                }) if at_eot => break,
-                Err(e) => {
-                    // C `prologixRead` (drvPrologixGPIB.c:297-303): a failed
-                    // chunk read `return status` *without* touching
-                    // `pdpvt->bufCount`, which line 303 has already advanced
-                    // over every chunk that did arrive. Those bytes stay in
-                    // `pdpvt->buf`, and because the accumulate block is gated on
-                    // `bufCount == 0` (:250) the next `prologixRead` skips the
-                    // bridge entirely and delivers them. The retention is
-                    // deliberate: the resize-failure path two lines up (:288-290)
-                    // *does* reset `bufCount = 0` before returning.
-                    //
-                    // The bytes are staged verbatim — C's `bufCount--` that drops
-                    // the EOT marker (:330-331) is below the loop and never runs
-                    // on this path, so a marker already in `acc` is served as data.
-                    if !acc.is_empty() {
-                        self.stage_read_carry(acc);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        // Strip the trailing terminator: the EOT marker in EOI mode (it's
-        // framing, not data) or the matched eos byte in EOS mode. Mirrors
-        // the asynGpib read layer (asynGpib.c:415-419) and the standard
-        // EosInterpose, both of which remove the matched terminator before
-        // the record sees the data; streamDevice and asynRecord expect the
-        // eos-stripped form.
-        if acc.last() == Some(&terminator) {
-            acc.pop();
-        }
-        let remaining = acc.len();
-        let n = remaining.min(buf.len());
-        buf[..n].copy_from_slice(&acc[..n]);
-        if n < remaining {
-            // Caller's buffer was too small — stash the remainder so the
-            // next read_octet returns it instead of dropping device data.
-            // (C keeps the whole reply in `buf` and advances `bufIndex`, :347.)
-            self.stage_read_carry(acc.split_off(n));
-        }
-        let eom = read_eom(remaining, buf.len(), eos.is_some());
-        Ok((n, eom))
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.read_eom(user, buf).into()
     }
 
     // --- asynGpib, C `prologixMethods` (drvPrologixGPIB.c:527-545) ---
@@ -1044,7 +1039,7 @@ mod tests {
             .with_timeout(Duration::ZERO);
         let mut buf = [0u8; 64];
         let start = std::time::Instant::now();
-        let res = drv.read_octet(&user, &mut buf);
+        let res = drv.io_read_octet(&user, &mut buf).into_count();
         let elapsed = start.elapsed();
 
         assert!(res.is_err(), "a poll of a silent bridge cannot succeed");
@@ -1359,7 +1354,7 @@ mod tests {
     }
 
     /// DRV-47: serving a staged `read_carry` remainder through
-    /// `io_read_octet_eom` must report the boundary — CNT while the
+    /// `io_read_octet` must report the boundary — CNT while the
     /// caller buffer is too small, END once the remainder is fully
     /// drained (binary/EOI mode, no eos char).
     #[test]
@@ -1377,7 +1372,7 @@ mod tests {
 
         // Buffer too small (4 < 6): partial -> CNT, no END.
         let mut small = [0u8; 4];
-        let (n, eom) = drv.io_read_octet_eom(&user, &mut small).unwrap();
+        let (n, eom) = drv.io_read_octet(&user, &mut small).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&small[..4], b"RESU");
         assert!(eom.contains(EomReason::CNT));
@@ -1385,7 +1380,7 @@ mod tests {
 
         // Remainder fits -> END, no CNT.
         let mut rest = [0u8; 16];
-        let (n, eom) = drv.io_read_octet_eom(&user, &mut rest).unwrap();
+        let (n, eom) = drv.io_read_octet(&user, &mut rest).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&rest[..2], b"LT");
         assert!(eom.contains(EomReason::END));
@@ -1439,7 +1434,7 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"42.5\n",
@@ -1503,7 +1498,7 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"OK",
@@ -1572,9 +1567,7 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_millis(300));
         let mut buf = [0u8; 64];
-        let err = drv
-            .io_read_octet_eom(&user, &mut buf)
-            .expect_err("incomplete reply must fail the read");
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1595,9 +1588,8 @@ mod tests {
 
         // The next call serves them without going back to the bridge — C's
         // `bufCount != 0` short-circuit.
-        let (n, _eom) = drv
-            .io_read_octet_eom(&user, &mut buf)
-            .expect("staged bytes are served from the carry");
+        // Staged bytes are served from the carry.
+        let (n, _eom) = drv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"PARTI");
 
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();

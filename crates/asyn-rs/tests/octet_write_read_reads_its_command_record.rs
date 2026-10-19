@@ -36,12 +36,16 @@ impl PortDriver for Echo {
         self.writes.lock().unwrap().push(data.to_vec());
         Ok(data.len())
     }
-    fn read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn read_octet(
+        &mut self,
+        _user: &AsynUser,
+        buf: &mut [u8],
+    ) -> asyn_rs::interpose::OctetReadResult {
         let writes = self.writes.lock().unwrap();
         let last = writes.last().map_or(&[][..], Vec::as_slice);
         let n = last.len().min(buf.len());
         buf[..n].copy_from_slice(&last[..n]);
-        Ok(n)
+        asyn_rs::interpose::OctetReadResult::ok(n, asyn_rs::interpose::EomReason::empty())
     }
 }
 

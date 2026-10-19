@@ -24,7 +24,7 @@ use crate::interrupt::InterruptValue;
 use crate::param::ParamValue;
 use crate::port::{PortDriver, QueueGate, QueuePriority};
 use crate::request::{
-    CancelToken, CellQueue, Claim, PortCalls, RequestCell, RequestOp, RequestResult,
+    CancelToken, CellQueue, Claim, OctetRead, PortCalls, RequestCell, RequestOp, RequestResult,
 };
 use crate::user::{AsynUser, ConnectCheck};
 
@@ -2079,11 +2079,10 @@ impl PortActor {
     /// runs per lower-level read, on the raw driver chunk. That position is
     /// `DriverOctetLink::read`; firing it here instead handed
     /// interrupt users the post-EOS message and the EOS eomReason (R19-112).
-    fn octet_read(&mut self, user: &AsynUser, buf_size: usize) -> AsynResult<RequestResult> {
+    fn octet_read(&mut self, user: &AsynUser, buf_size: usize) -> OctetRead {
         let mut buf = vec![0u8; buf_size];
-        let r = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf)?;
-        buf.truncate(r.nbytes_transferred);
-        Ok(RequestResult::octet_read_chain(buf, &r))
+        let r = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf);
+        OctetRead::from_chain(buf, r)
     }
 
     /// The port's octet write: through the interpose chain, ending at the driver
@@ -2122,7 +2121,10 @@ impl PortActor {
                 let n = self.octet_write(user, data)?;
                 Ok(RequestResult::write_n(n))
             }
-            RequestOp::OctetRead { buf_size } => self.octet_read(user, *buf_size),
+            RequestOp::OctetRead { buf_size, .. } => Ok(RequestResult::octet_read(
+                self.octet_read(user, *buf_size),
+                0,
+            )),
             RequestOp::OctetWriteBinary { data } => {
                 // C parity: asynRecord binary output (asynRecord.c:1528-1541).
                 // Save the driver's output EOS, clear it for the raw write,
@@ -2150,7 +2152,7 @@ impl PortActor {
                 let n = res?;
                 Ok(RequestResult::write_n(n))
             }
-            RequestOp::OctetReadBinary { buf_size } => {
+            RequestOp::OctetReadBinary { buf_size, .. } => {
                 // C parity: asynRecord binary input (asynRecord.c:1564-1577).
                 // Save the driver's input EOS, clear it for the read, and
                 // restore it on every exit path so a configured IEOS does not
@@ -2162,16 +2164,17 @@ impl PortActor {
                 if bracket {
                     self.set_input_eos(user, &[])?;
                 }
-                let res = self.octet_read(user, *buf_size);
+                let read = self.octet_read(user, *buf_size);
                 if bracket {
                     let _ = self.set_input_eos(user, &saved);
                 }
-                res
+                Ok(RequestResult::octet_read(read, 0))
             }
             RequestOp::OctetWriteRead {
                 data,
                 buf_size,
                 flush,
+                ..
             } => {
                 // Two C patterns share this op, distinguished by `flush`:
                 //   flush=true  — asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
@@ -2201,8 +2204,11 @@ impl PortActor {
                 if !*flush && sent != data.len() {
                     return Ok(RequestResult::write_n(sent));
                 }
-                self.octet_read(user, *buf_size)
-                    .map_err(|e| e.in_octet_step(OctetStep::Read))
+                let read = self.octet_read(user, *buf_size);
+                Ok(RequestResult::octet_read(
+                    read.in_octet_step(OctetStep::Read),
+                    sent,
+                ))
             }
             RequestOp::Int32Write { value } => {
                 self.driver.io_write_int32(user, *value)?;
@@ -2706,13 +2712,11 @@ impl PortActor {
             }
             RequestOp::GetInputEos => {
                 let eos = self.driver.get_input_eos(user)?;
-                let n = eos.len();
-                Ok(RequestResult::octet_read(eos, n))
+                Ok(RequestResult::eos_read(eos))
             }
             RequestOp::GetOutputEos => {
                 let eos = self.driver.get_output_eos(user)?;
-                let n = eos.len();
-                Ok(RequestResult::octet_read(eos, n))
+                Ok(RequestResult::eos_read(eos))
             }
             // The asynGpib command interface. C reaches the driver's
             // `asynGpibPort` methods through asynGpib's pass-through
@@ -2737,9 +2741,10 @@ impl PortActor {
             }
         };
 
-        // Attach alarm/timestamp metadata on successful reads
-        if is_read {
-            if let Ok(r) = result {
+        // Attach alarm/timestamp metadata on successful reads; a failed octet
+        // read carries its status inside the reply.
+        match result {
+            Ok(r) if is_read && r.octet_error().is_none() => {
                 let (status, alarm_status, alarm_severity) = self
                     .driver
                     .base()
@@ -2764,11 +2769,10 @@ impl PortActor {
                 // `status` to emit an Error reply — is unaffected.
                 let mut out = r.with_alarm(alarm_status, alarm_severity, ts);
                 out.aux_status = status;
-                return Ok(out);
+                Ok(out)
             }
+            other => other,
         }
-
-        result
     }
 }
 
@@ -2904,6 +2908,7 @@ mod tests {
     use crate::param::ParamType;
     use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
+    use crate::request::OctetReadOp;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3304,8 +3309,11 @@ mod tests {
         .unwrap();
 
         let user = AsynUser::new(2).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 256 }, user).unwrap();
-        assert_eq!(&result.data.unwrap()[..5], b"hello");
+        let result =
+            send_and_wait(&tx, OctetReadOp::Read { buf_size: 256 }.into_op(), user).unwrap();
+        let (data, status) = result.into_read().into_parts();
+        status.unwrap();
+        assert_eq!(&data[..5], b"hello");
     }
 
     /// C parity: asynRecord binary I/O (asynRecord.c:1528-1577) saves the
@@ -3330,12 +3338,16 @@ mod tests {
                 *self.write_eos.lock() = self.base().output_eos(_user.addr).to_vec();
                 Ok(data.len())
             }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 *self.read_eos.lock() = self.base().input_eos(_user.addr).to_vec();
                 let resp = [0x01u8, 0x02];
                 let n = resp.len().min(buf.len());
                 buf[..n].copy_from_slice(&resp[..n]);
-                Ok(n)
+                crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
             }
         }
 
@@ -3386,7 +3398,12 @@ mod tests {
             write_eos.lock().is_empty(),
             "binary write must see the output EOS suppressed"
         );
-        send_and_wait(&tx, RequestOp::OctetReadBinary { buf_size: 16 }, mk()).unwrap();
+        let read = send_and_wait(
+            &tx,
+            OctetReadOp::ReadBinary { buf_size: 16 }.into_op(),
+            mk(),
+        );
+        read.unwrap().into_read().status().as_ref().unwrap();
         assert!(
             read_eos.lock().is_empty(),
             "binary read must see the input EOS suppressed"
@@ -3406,7 +3423,8 @@ mod tests {
             b"\r\n",
             "output EOS must be restored after a binary write"
         );
-        send_and_wait(&tx, RequestOp::OctetRead { buf_size: 16 }, mk()).unwrap();
+        let read = send_and_wait(&tx, OctetReadOp::Read { buf_size: 16 }.into_op(), mk());
+        read.unwrap().into_read().status().as_ref().unwrap();
         assert_eq!(
             &*read_eos.lock(),
             b"\n",
@@ -3446,12 +3464,16 @@ mod tests {
                 self.sequence.lock().push("write");
                 Ok(data.len())
             }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 self.sequence.lock().push("read");
                 let resp = b"RSP";
                 let n = resp.len().min(buf.len());
                 buf[..n].copy_from_slice(&resp[..n]);
-                Ok(n)
+                crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
             }
         }
 
@@ -3474,15 +3496,17 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(
             &tx,
-            RequestOp::OctetWriteRead {
+            OctetReadOp::WriteRead {
                 data: b"CMD".to_vec(),
                 buf_size: 16,
-                flush: true,
-            },
+            }
+            .into_op(),
             user,
         )
         .unwrap();
-        assert_eq!(result.data.unwrap(), b"RSP".to_vec());
+        let (data, status) = result.into_read().into_parts();
+        status.unwrap();
+        assert_eq!(data, b"RSP");
         assert_eq!(flush_calls.load(Ordering::Relaxed), 1, "flush called once");
         assert_eq!(write_calls.load(Ordering::Relaxed), 1);
         // Order must be: flush, then write, then read.
@@ -3492,7 +3516,7 @@ mod tests {
 
     /// C parity: `asynOctet::read` returns `nbytes` together with
     /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). Drivers
-    /// that override `io_read_octet_eom` must have their EOM flags
+    /// that override `io_read_octet` must have their EOM flags
     /// propagated through `RequestResult::eom_reason` so consumers
     /// (e.g. asynRecord `EOMR`) can distinguish "byte count" /
     /// "EOS match" / "END indicator" terminations.
@@ -3510,17 +3534,17 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 let payload = b"ABC";
                 let n = payload.len().min(buf.len());
                 buf[..n].copy_from_slice(&payload[..n]);
                 // Driver explicitly reports both EOS match and END indicator
                 // (e.g. a GPIB END line plus terminator detection).
-                Ok((n, EomReason::EOS | EomReason::END))
+                crate::interpose::OctetReadResult::ok(n, EomReason::EOS | EomReason::END)
             }
         }
         let drv = EomDriver {
@@ -3534,57 +3558,16 @@ mod tests {
         };
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 16 }, user).unwrap();
-        assert_eq!(result.data.as_deref(), Some(&b"ABC"[..]));
-        let eom = EomReason::from_bits_truncate(result.eom_reason);
+        let read = send_and_wait(&tx, OctetReadOp::Read { buf_size: 16 }.into_op(), user)
+            .unwrap()
+            .into_read();
+        let eom = read.eom();
+        let (data, status) = read.into_parts();
+        status.unwrap();
+        assert_eq!(data, b"ABC");
         assert!(eom.contains(EomReason::EOS));
         assert!(eom.contains(EomReason::END));
         assert!(!eom.contains(EomReason::CNT));
-    }
-
-    /// Default `io_read_octet_eom` (drivers that override only the
-    /// non-eom `io_read_octet`) must synthesize `CNT` when the
-    /// buffer filled — C `asynOctetSyncIO::read` synthesises the
-    /// same flag at the syncIO level (`asynOctetSyncIO.c:213-217`).
-    #[test]
-    fn actor_octet_read_eom_default_synthesizes_cnt_on_buffer_full() {
-        use crate::interpose::EomReason;
-
-        struct FillDriver {
-            base: PortDriverBase,
-        }
-        impl PortDriver for FillDriver {
-            fn base(&self) -> &PortDriverBase {
-                &self.base
-            }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.base
-            }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-                // Always fill the buffer to completion.
-                for b in buf.iter_mut() {
-                    *b = b'X';
-                }
-                Ok(buf.len())
-            }
-        }
-        let drv = FillDriver {
-            base: PortDriverBase::new(
-                "fill_test",
-                1,
-                PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            ),
-        };
-        let tx = spawn_actor(drv);
-        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 4 }, user).unwrap();
-        assert_eq!(result.nbytes, 4);
-        let eom = EomReason::from_bits_truncate(result.eom_reason);
-        assert!(eom.contains(EomReason::CNT));
-        assert!(!eom.contains(EomReason::EOS));
-        assert!(!eom.contains(EomReason::END));
     }
 
     /// A "\r\n" split across two OctetReads: the second reply takes back
@@ -3603,9 +3586,13 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 buf[..4].copy_from_slice(b"AB\r\n");
-                Ok(4)
+                crate::interpose::OctetReadResult::ok(4, crate::interpose::EomReason::empty())
             }
         }
         let mut drv = LineDriver {
@@ -3624,10 +3611,13 @@ mod tests {
             })));
         let tx = spawn_actor(drv);
         let user = || AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let first = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 3 }, user()).unwrap();
-        assert_eq!((first.nbytes, first.taken_back), (3, 0));
-        let second = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 3 }, user()).unwrap();
-        assert_eq!((second.nbytes, second.taken_back), (0, 1));
+        let read = || {
+            let read = send_and_wait(&tx, OctetReadOp::Read { buf_size: 3 }.into_op(), user());
+            let read = read.unwrap().into_read();
+            (read.nbytes_transferred(), read.taken_back())
+        };
+        assert_eq!(read(), (3, 0));
+        assert_eq!(read(), (0, 1));
     }
 
     #[test]
@@ -4932,12 +4922,13 @@ mod tests {
         }
         struct Sink;
         impl OctetNext for Sink {
-            fn read(&mut self, _u: &AsynUser, _b: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Ok(OctetReadResult {
+            fn read(&mut self, _u: &AsynUser, _b: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: crate::interpose::EomReason::CNT,
                     taken_back: 0,
-                })
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())

@@ -11,9 +11,7 @@ use crate::error::AsynResult;
 use crate::port::eos_device_key;
 use crate::user::AsynUser;
 
-use super::{
-    EomReason, EosSet, MAX_EOS_LEN, OctetInterpose, OctetNext, OctetReadResult, PartialOctetRead,
-};
+use super::{EomReason, EosSet, MAX_EOS_LEN, OctetInterpose, OctetNext, OctetReadResult};
 
 /// Fixed internal buffer size matching C asyn's INPUT_SIZE.
 const INPUT_BUFFER_SIZE: usize = 2048;
@@ -178,7 +176,7 @@ impl OctetInterpose for EosInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         // C parity (`asynInterposeEos.c::readIt:191`): an installed EOS
         // interpose is always `processEosIn==1`, so the read ALWAYS runs the
         // buffering loop below — even with no terminator set. The "no EOS"
@@ -199,11 +197,12 @@ impl OctetInterpose for EosInterpose {
         if maxchars == 0 {
             // A zero-length destination buffer can store nothing — return
             // here so the scan loop never indexes `buf[0]` and panics.
-            return Ok(OctetReadResult {
+            return OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
                 taken_back: 0,
-            });
+                status: Ok(()),
+            };
         }
         // C's `eosPvt` for the device this read addresses: its terminator, its
         // read-ahead buffer, its match position. Nothing below can reach
@@ -212,6 +211,7 @@ impl OctetInterpose for EosInterpose {
         let mut n_read: usize = 0;
         let mut taken_back = 0;
         let mut eom = EomReason::empty();
+        let mut status = Ok(());
 
         loop {
             // Process buffered data character by character
@@ -270,35 +270,13 @@ impl OctetInterpose for EosInterpose {
             // lower-layer read `break`s the loop and falls through to the
             // SAME tail as a successful one — null-terminate, `*eomReason =
             // eom`, `*nbytesTransferred = nRead` — and only then `return
-            // status`. So the caller gets the error AND everything already
-            // transferred: the classic partial-line timeout reaches
-            // asynRecord as `asynTimeout` with `AINP="abc"`, `NORD=3`
-            // (asynRecord.c:1591,1627 assign `eomr`/`nord` regardless of
-            // status).
-            //
-            // `?` here would return the bare error and drop both the count
-            // and the eom reason. The bytes are not recoverable afterwards —
-            // `in_buf_tail` has already advanced past them at asynInterposeEos.c:197 — so
-            // dropping the count loses the data outright. Run C's tail, then
-            // hand the error back with the partial attached.
-            //
-            // The partial carries a *copy* of the bytes, not just the count:
-            // `buf` here is the caller's buffer, but every dispatch hop above
-            // (`port_actor`'s scratch `Vec`, `SyncIO`'s) owns a different one
-            // and drops it on `?`. Only bytes that travel inside the error
-            // reach the record.
-            let result = match next.read(user, &mut dev.in_buf[..]) {
-                Ok(r) => r,
-                Err(e) => {
-                    if n_read < maxchars {
-                        buf[n_read] = 0;
-                    }
-                    return Err(e.with_partial_read(PartialOctetRead {
-                        data: buf[..n_read].to_vec(),
-                        eom_reason: eom,
-                    }));
-                }
-            };
+            // status`. The classic partial-line timeout reaches asynRecord as
+            // `asynTimeout` with `AINP="abc"`, `NORD=3` (asynRecord.c:1591,1627).
+            let result = next.read(user, &mut dev.in_buf[..]);
+            if let Err(e) = result.status {
+                status = Err(e);
+                break;
+            }
 
             // Filter out CNT from lower layer — the lower read may have set CNT
             // because available data exceeded our buffer size. This is not a
@@ -324,11 +302,12 @@ impl OctetInterpose for EosInterpose {
             buf[n_read] = 0;
         }
 
-        Ok(OctetReadResult {
+        OctetReadResult {
             nbytes_transferred: n_read,
             eom_reason: eom,
             taken_back,
-        })
+            status,
+        }
     }
 
     fn write(
@@ -470,16 +449,17 @@ mod tests {
     }
 
     impl OctetNext for MockOctetBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let avail = self.data.len() - self.pos;
             let n = avail.min(buf.len());
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
-            Ok(OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::CNT,
                 taken_back: 0,
-            })
+                status: Ok(()),
+            }
         }
 
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -549,11 +529,11 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"hello");
         assert!(r.eom_reason.contains(EomReason::EOS));
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"world");
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
@@ -568,11 +548,11 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"cmd1");
         assert!(r.eom_reason.contains(EomReason::EOS));
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"cmd2");
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
@@ -592,11 +572,11 @@ mod tests {
         let mut buf = [0u8; 3];
 
         // First read fills the 3-byte buffer with "AB\r" (partial match).
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
 
         // Second read consumes the trailing "\n", completing the EOS.
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!((r.nbytes_transferred, r.taken_back), (0, 1));
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
@@ -623,7 +603,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"data");
     }
 
@@ -666,7 +646,7 @@ mod tests {
         let user = AsynUser::default();
 
         let mut buf = [0u8; 16];
-        let first = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let first = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..first.nbytes_transferred], b"AB");
         assert!(first.eom_reason.contains(EomReason::EOS));
         assert_ne!(
@@ -679,7 +659,7 @@ mod tests {
         // the buffered "CD\n", not skip to the (now empty) lower layer.
         interpose.set_input_eos(0, b"");
         let mut buf2 = [0u8; 16];
-        let second = interpose.read(&user, &mut buf2, &mut base).unwrap();
+        let second = interpose.read(&user, &mut buf2, &mut base).expect_ok();
         assert_eq!(
             &buf2[..second.nbytes_transferred],
             b"CD\n",
@@ -703,7 +683,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut old_link).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"OLD1");
         assert_ne!(
             interpose.peek(0).in_buf_tail,
@@ -718,7 +698,7 @@ mod tests {
         assert_eq!(interpose.peek(0).in_buf_tail, 0);
 
         let mut new_link = MockOctetBase::new(b"NEW1\n");
-        let r = interpose.read(&user, &mut buf, &mut new_link).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut new_link).expect_ok();
         assert_eq!(
             &buf[..r.nbytes_transferred],
             b"NEW1",
@@ -742,7 +722,7 @@ mod tests {
         // Old link ends mid-terminator: "AB\r" leaves eos_in_match == 1.
         let mut old_link = MockOctetBase::new(b"AB\r");
         let mut buf = [0u8; 32];
-        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut old_link).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
         assert_eq!(
             interpose.peek(0).eos_in_match,
@@ -758,7 +738,7 @@ mod tests {
         // after the reset it is ordinary data.
         let mut new_link = MockOctetBase::new(b"\nHELLO\r\n");
         let mut buf2 = [0u8; 32];
-        let r = interpose.read(&user, &mut buf2, &mut new_link).unwrap();
+        let r = interpose.read(&user, &mut buf2, &mut new_link).expect_ok();
         assert_eq!(
             &buf2[..r.nbytes_transferred],
             b"\nHELLO",
@@ -786,13 +766,13 @@ mod tests {
         // returns "AB" on its own terminator and holds "CD;" as read-ahead.
         let mut base = MockOctetBase::new(b"AB\nCD;");
         let mut buf = [0u8; 16];
-        let r = interpose.read(&dev1, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&dev1, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"AB");
         assert!(r.eom_reason.contains(EomReason::EOS));
 
         // Device 2 reads with the stream exhausted. With a port-wide buffer it
         // would be handed device 1's "CD" and stop on device 2's ';'.
-        let r = interpose.read(&dev2, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&dev2, &mut buf, &mut base).expect_ok();
         assert_eq!(
             r.nbytes_transferred, 0,
             "a device must never be served another device's read-ahead"
@@ -800,7 +780,7 @@ mod tests {
 
         // Device 1's own next read still gets its buffered remainder, on its
         // own terminator ('\n' — not device 2's ';').
-        let r = interpose.read(&dev1, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&dev1, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"CD;");
         assert!(!r.eom_reason.contains(EomReason::EOS));
     }
@@ -839,7 +819,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0xFFu8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 2);
         assert_eq!(&buf[..2], b"hi");
         // Null terminated after data
@@ -857,7 +837,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         // Should get "a\rb" — the lone \r doesn't match \r\n, resync finds real \r\n
         assert_eq!(&buf[..r.nbytes_transferred], b"a\rb");
         assert!(r.eom_reason.contains(EomReason::EOS));
@@ -872,24 +852,26 @@ mod tests {
             idx: usize,
         }
         impl OctetNext for CntBase {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 if self.idx < self.chunks.len() {
                     let chunk = &self.chunks[self.idx];
                     self.idx += 1;
                     let n = chunk.len().min(buf.len());
                     buf[..n].copy_from_slice(&chunk[..n]);
-                    Ok(OctetReadResult {
+                    OctetReadResult {
                         nbytes_transferred: n,
                         // Lower layer reports CNT (its buffer was full)
                         eom_reason: EomReason::CNT,
                         taken_back: 0,
-                    })
+                        status: Ok(()),
+                    }
                 } else {
-                    Ok(OctetReadResult {
+                    OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::empty(),
                         taken_back: 0,
-                    })
+                        status: Ok(()),
+                    }
                 }
             }
             fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
@@ -912,7 +894,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"hello");
         assert!(r.eom_reason.contains(EomReason::EOS));
         // CNT from lower layer should NOT be in the result
@@ -927,18 +909,19 @@ mod tests {
         served: bool,
     }
     impl OctetNext for PartialThenErrBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             if !self.served {
                 self.served = true;
                 buf[..self.chunk.len()].copy_from_slice(&self.chunk);
-                return Ok(OctetReadResult {
+                return OctetReadResult {
                     nbytes_transferred: self.chunk.len(),
                     // No CNT/EOS — short read, EOS layer keeps reading.
                     eom_reason: EomReason::empty(),
                     taken_back: 0,
-                });
+                    status: Ok(()),
+                };
             }
-            Err(self.err.take().expect("base read called twice after error"))
+            OctetReadResult::failed(self.err.take().expect("base read called twice after error"))
         }
         fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
             Ok(0)
@@ -974,28 +957,19 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0xFFu8; 64];
 
-        let err = interpose
-            .read(&user, &mut buf, &mut base)
-            .expect_err("lower-layer timeout must surface even with partial data");
+        let r = interpose.read(&user, &mut buf, &mut base);
 
-        // The status is preserved (this much the old test checked)...
+        let err = r
+            .status
+            .expect_err("lower-layer timeout must surface even with partial data");
         assert_eq!(err.status(), AsynStatus::Timeout);
         // ...and so is everything C hands back alongside it.
-        let partial = err
-            .partial_read()
-            .expect("a read that transferred bytes before failing must report them");
         assert_eq!(
-            partial.nbytes_transferred(),
-            3,
+            r.nbytes_transferred, 3,
             "C publishes *nbytesTransferred = nRead on the error path"
         );
         assert_eq!(
-            partial.data, b"abc",
-            "the bytes travel with the error, not only in the caller's buffer — \
-             every dispatch hop above this one owns a different buffer"
-        );
-        assert_eq!(
-            partial.eom_reason,
+            r.eom_reason,
             EomReason::empty(),
             "no EOS was matched and the buffer never filled"
         );
@@ -1030,14 +1004,9 @@ mod tests {
         // A zero-byte Ok read breaks the loop, so drive the error directly:
         // mark the chunk as served so the first call returns the error.
         base.served = true;
-        let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
-        assert_eq!(err.status(), AsynStatus::Disconnected);
-        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred()), Some(0));
-        assert_eq!(
-            err.partial_read().map(|p| p.data.as_slice()),
-            Some(&[][..]),
-            "a zero transfer is reported as an empty partial, not omitted"
-        );
+        let r = interpose.read(&user, &mut buf, &mut base);
+        assert_eq!(r.status.unwrap_err().status(), AsynStatus::Disconnected);
+        assert_eq!(r.nbytes_transferred, 0);
         assert_eq!(buf[0], 0, "null-terminated with zero bytes read");
     }
 
@@ -1059,25 +1028,19 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
+        let r = interpose.read(&user, &mut buf, &mut base);
+        let err = r.status.unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
-        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred()), Some(2));
-        assert_eq!(
-            err.partial_read().map(|p| p.data.as_slice()),
-            Some(&b"XY"[..])
-        );
+        assert_eq!(r.nbytes_transferred, 2);
         assert_eq!(&buf[..2], b"XY");
         assert!(
             err.to_string().contains("cable yanked"),
             "the underlying cause must survive the fold, got {err}"
         );
-        // R8-48: the carrier must not hide *which kind* of failure it wraps.
-        // The drivers tear the link down on a real errno and leave it up on a
-        // timeout; a hangup that arrives mid-line — wrapped — is still a
-        // hangup, and asking through `is_fatal_transport` is what keeps it one.
+        // R8-48: a hangup that arrives mid-line is still a hangup.
         assert!(
             err.is_fatal_transport(),
-            "an errno behind the partial carrier must still disconnect, got {err:?}"
+            "an errno after a partial line must still disconnect, got {err:?}"
         );
     }
 
@@ -1093,7 +1056,7 @@ mod tests {
             accept: usize,
         }
         impl OctetNext for StallingBase {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
                 unreachable!("write-only test")
             }
             fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
@@ -1142,14 +1105,14 @@ mod tests {
         let mut buf = [0u8; 4]; // small buffer
 
         // First read fills user buffer → CNT
-        let r = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(r.nbytes_transferred, 4);
         assert_eq!(&buf[..4], b"abcd");
         assert!(r.eom_reason.contains(EomReason::CNT));
 
         // Second read gets rest up to EOS (need larger buffer to fit remaining data)
         let mut buf2 = [0u8; 64];
-        let r = interpose.read(&user, &mut buf2, &mut base).unwrap();
+        let r = interpose.read(&user, &mut buf2, &mut base).expect_ok();
         assert_eq!(&buf2[..r.nbytes_transferred], b"efgh");
         assert!(r.eom_reason.contains(EomReason::EOS));
     }

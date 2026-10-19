@@ -60,7 +60,8 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
         .unwrap();
 
     let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(2));
-    let data = io.read_octet(0, 32).expect("read failed");
+    let (data, status) = io.read_octet(0, 32).into_parts();
+    status.expect("read failed");
     assert_eq!(data, b"READBACK-1");
 
     let got = seen.lock().unwrap().clone();

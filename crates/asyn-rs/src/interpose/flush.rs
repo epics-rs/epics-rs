@@ -40,7 +40,7 @@ impl OctetInterpose for FlushTimeoutInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         // Pure pass-through (C parity: readIt just delegates to lower layer)
         next.read(user, buf)
     }
@@ -67,10 +67,9 @@ impl OctetInterpose for FlushTimeoutInterpose {
         // calls `pasynOctetDrv->read` with the returned `asynStatus`
         // **discarded entirely**, and breaks on `if(nbytesTransferred==0)`.
         // `asynOctet::read` writes that count out even when it fails
-        // (asynInterposeEos.c:242-253), and this port carries the same count in
-        // `PartialRead` — so a failing read that still delivered bytes has
-        // drained them and the loop must go on. Deciding from the `Result`
-        // variant instead left those bytes in the input path, where they became
+        // (asynInterposeEos.c:242-253), so a failing read that still delivered
+        // bytes has drained them and the loop must go on. Deciding from the
+        // status instead left those bytes in the input path, where they became
         // the next transaction's reply and put every later one off by one.
         //
         // Recomputing `drained` inside the loop is C's per-iteration
@@ -78,10 +77,7 @@ impl OctetInterpose for FlushTimeoutInterpose {
         // again if the layer below leaves one behind.
         let mut buffer = [0u8; 100];
         loop {
-            let drained = match next.read(user, &mut buffer) {
-                Ok(result) => result.nbytes_transferred,
-                Err(e) => e.partial_read().map_or(0, |p| p.nbytes_transferred()),
-            };
+            let drained = next.read(user, &mut buffer).nbytes_transferred;
             if drained == 0 {
                 break;
             }
@@ -100,7 +96,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::error::{AsynError, AsynStatus};
-    use crate::interpose::{EomReason, PartialOctetRead};
+    use crate::interpose::EomReason;
 
     struct FlushableBase {
         read_count: Arc<AtomicUsize>,
@@ -117,23 +113,25 @@ mod tests {
     }
 
     impl OctetNext for FlushableBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let n = self.read_count.fetch_add(1, Ordering::Relaxed);
             if n < self.reads_with_data {
                 let msg = b"stale";
                 let len = msg.len().min(buf.len());
                 buf[..len].copy_from_slice(&msg[..len]);
-                Ok(OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: len,
                     eom_reason: EomReason::CNT,
                     taken_back: 0,
-                })
+                    status: Ok(()),
+                }
             } else {
-                Ok(OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::CNT,
                     taken_back: 0,
-                })
+                    status: Ok(()),
+                }
             }
         }
 
@@ -164,7 +162,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let result = interpose.read(&user, &mut buf, &mut base).unwrap();
+        let result = interpose.read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(&buf[..result.nbytes_transferred], b"stale");
     }
 
@@ -200,8 +198,7 @@ mod tests {
         /// A successful read of `n` bytes.
         Ok(usize),
         /// A failing status that still transferred `n` bytes — what the EOS
-        /// interpose returns for a timeout part-way through a line
-        /// (`interpose/mod.rs` `PartialOctetRead`).
+        /// interpose returns for a timeout part-way through a line.
         ErrWith(usize),
         /// A failing status that transferred nothing.
         ErrEmpty,
@@ -216,7 +213,7 @@ mod tests {
     }
 
     impl OctetNext for ScriptedBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let step = self.steps.get(self.reads).copied().unwrap_or(Step::Ok(0));
             self.reads += 1;
             let timeout = || AsynError::Status {
@@ -229,19 +226,17 @@ mod tests {
                 n
             };
             match step {
-                Step::Ok(n) => Ok(OctetReadResult {
+                Step::Ok(n) => OctetReadResult {
                     nbytes_transferred: deliver(buf, n),
                     eom_reason: EomReason::CNT,
                     taken_back: 0,
-                }),
-                Step::ErrWith(n) => {
-                    let n = deliver(buf, n);
-                    Err(timeout().with_partial_read(PartialOctetRead {
-                        data: vec![b'x'; n],
-                        eom_reason: EomReason::empty(),
-                    }))
-                }
-                Step::ErrEmpty => Err(timeout()),
+                    status: Ok(()),
+                },
+                Step::ErrWith(n) => OctetReadResult {
+                    status: Err(timeout()),
+                    ..OctetReadResult::ok(deliver(buf, n), EomReason::empty())
+                },
+                Step::ErrEmpty => OctetReadResult::failed(timeout()),
             }
         }
 

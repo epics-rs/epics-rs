@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use asyn_rs::drivers::serial_port::DrvAsynSerialPort;
 use asyn_rs::port::PortDriver;
-use asyn_rs::request::RequestOp;
+use asyn_rs::request::{OctetReadOp, RequestOp};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::services::PortServices;
 use asyn_rs::trace::{TraceFile, TraceMask};
@@ -68,7 +68,9 @@ fn every_driver_line_is_c_s_text() {
     let n = unsafe { libc::write(master, b"xyz".as_ptr().cast(), 3) };
     assert_eq!(n, 3);
     handle
-        .submit_blocking(RequestOp::OctetRead { buf_size: 10 }, user())
+        .submit_octet_read_blocking(OctetReadOp::Read { buf_size: 10 }, user())
+        .into_parts()
+        .1
         .unwrap();
     handle.disconnect_blocking().unwrap();
     unsafe { libc::close(master) };

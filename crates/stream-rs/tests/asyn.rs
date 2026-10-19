@@ -13,7 +13,7 @@ use std::time::Duration;
 use asyn_rs::interfaces::{Capability, InterfaceMask, octet_transport_capabilities};
 use asyn_rs::manager::{PortManager, claim_port_driver};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::request::RequestOp;
+use asyn_rs::request::{OctetReadOp, RequestOp};
 use asyn_rs::user::AsynUser;
 use stream_rs::bus::{self, Client, OwnedReadInput, ReadInput, StreamIoStatus};
 use stream_rs::error::{
@@ -940,11 +940,7 @@ impl PortDriver for Script {
         self.base_mut().set_addr_connected(user.addr, false);
         Ok(())
     }
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> asyn_rs::error::AsynResult<(usize, EomReason)> {
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         let mut book = self.book.lock().unwrap();
         book.read_sizes.push(buf.len());
         let read = book
@@ -954,25 +950,21 @@ impl PortDriver for Script {
         match read {
             Ok((data, eom)) => {
                 buf[..data.len()].copy_from_slice(data);
-                Ok((data.len(), eom))
+                OctetReadResult::ok(data.len(), eom)
             }
             Err((status, message, data)) => {
                 if book.drops {
                     drop(book);
                     self.base_mut().set_addr_connected(user.addr, false);
                 }
-                let e = asyn_rs::error::AsynError::Status {
-                    status,
-                    message: message.into(),
-                };
-                Err(if data.is_empty() {
-                    e
-                } else {
-                    e.with_partial_read(PartialOctetRead {
-                        data: data.to_vec(),
-                        eom_reason: EomReason::empty(),
-                    })
-                })
+                buf[..data.len()].copy_from_slice(data);
+                OctetReadResult {
+                    status: Err(asyn_rs::error::AsynError::Status {
+                        status,
+                        message: message.into(),
+                    }),
+                    ..OctetReadResult::ok(data.len(), EomReason::empty())
+                }
             }
         }
     }
@@ -1099,7 +1091,7 @@ fn scripted_write(
 
 use asyn_rs::error::AsynStatus::{Disabled, Disconnected, Error as AsynErr, Overflow, Timeout};
 use asyn_rs::interpose::eos::EosInterpose;
-use asyn_rs::interpose::{EomReason, PartialOctetRead};
+use asyn_rs::interpose::{EomReason, OctetReadResult};
 
 /// A write that fails is tried once more after connectToAsynPort, which
 /// connects nothing on a port still up (AsynDriverInterface.cc:662-686,
@@ -2089,8 +2081,8 @@ fn input(
 ) {
     book.lock().unwrap().reads.push_back(Ok((data, eom)));
     // What the reader itself gets is the EOS layer's business.
-    let _ = handle.submit_blocking(
-        RequestOp::OctetRead { buf_size: 64 },
+    let _ = handle.submit_octet_read_blocking(
+        OctetReadOp::Read { buf_size: 64 },
         AsynUser::new(0).with_timeout(Duration::from_millis(100)),
     );
 }

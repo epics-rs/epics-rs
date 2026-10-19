@@ -917,20 +917,34 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Submit an octet read and take its whole outcome: the bytes it
+    /// transferred and the status beside them (C `asynOctet::read`).
+    pub async fn submit_octet_read(
+        &self,
+        op: crate::request::OctetReadOp,
+        user: AsynUser,
+    ) -> crate::request::OctetRead {
+        crate::request::octet_outcome(self.submit_async(op.into_op(), user).await)
+    }
+
+    /// Blocking [`Self::submit_octet_read`].
+    pub fn submit_octet_read_blocking(
+        &self,
+        op: crate::request::OctetReadOp,
+        user: AsynUser,
+    ) -> crate::request::OctetRead {
+        crate::request::octet_outcome(self.submit_blocking(op.into_op(), user))
+    }
+
     pub async fn read_octet(
         &self,
         reason: usize,
         addr: i32,
         buf_size: usize,
-    ) -> AsynResult<Vec<u8>> {
+    ) -> crate::request::OctetRead {
         let user = AsynUser::new(reason).with_addr(addr);
-        let result = self
-            .submit_async(RequestOp::OctetRead { buf_size }, user)
-            .await?;
-        result.data.ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "octet read returned no data".into(),
-        })
+        self.submit_octet_read(crate::request::OctetReadOp::Read { buf_size }, user)
+            .await
     }
 
     /// One locked, flush-first write/read pair — C
@@ -956,47 +970,16 @@ impl PortHandle {
         addr: i32,
         data: &[u8],
         buf_size: usize,
-    ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
+    ) -> crate::request::OctetRead {
         let user = AsynUser::new(reason).with_addr(addr).locking_port(self);
-        let result = self
-            .submit_async(
-                RequestOp::OctetWriteRead {
-                    data: data.to_vec(),
-                    buf_size,
-                    flush: true,
-                },
-                user,
-            )
-            .await?;
-        let data = result.data.ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "octet write/read returned no data".into(),
-        })?;
-        let eom = crate::interpose::EomReason::from_bits_truncate(result.eom_reason);
-        Ok((data, eom))
-    }
-
-    /// Read variant that also surfaces the end-of-message reason
-    /// flags. C parity: `asynOctet::read(... int *eomReason)`
-    /// (`interfaces/asynOctet.h:38-40`) — consumers like asynRecord
-    /// (`EOMR` field, `asynRecord.c`) need the flag bitmap to tell
-    /// "byte count reached" from "EOS matched" from "END asserted".
-    pub async fn read_octet_eom(
-        &self,
-        reason: usize,
-        addr: i32,
-        buf_size: usize,
-    ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
-        let user = AsynUser::new(reason).with_addr(addr);
-        let result = self
-            .submit_async(RequestOp::OctetRead { buf_size }, user)
-            .await?;
-        let data = result.data.ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "octet read returned no data".into(),
-        })?;
-        let eom = crate::interpose::EomReason::from_bits_truncate(result.eom_reason);
-        Ok((data, eom))
+        self.submit_octet_read(
+            crate::request::OctetReadOp::WriteRead {
+                data: data.to_vec(),
+                buf_size,
+            },
+            user,
+        )
+        .await
     }
 
     /// Returns the number of bytes transferred (C `asynOctet::write`'s
@@ -3271,20 +3254,29 @@ mod tests {
                     message: "line down".into(),
                 })
             }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 if !self.base.is_connected() {
-                    return Err(AsynError::Status {
+                    return crate::interpose::OctetReadResult::failed(AsynError::Status {
                         status: AsynStatus::Error,
                         message: "disconnected:".into(),
                     });
                 }
                 buf[0] = b'x';
-                Ok(1)
+                crate::interpose::OctetReadResult::ok(1, crate::interpose::EomReason::empty())
             }
         }
 
         let read = |calls: &mut dyn PortCalls| {
-            calls.call(&RequestOp::OctetRead { buf_size: 4 }, AsynUser::new(0))
+            calls
+                .octet_read(
+                    crate::request::OctetReadOp::Read { buf_size: 4 },
+                    AsynUser::new(0),
+                )
+                .into_parts()
         };
         let connects = Arc::new(AtomicUsize::new(0));
         let flags = PortFlags {
@@ -3318,7 +3310,7 @@ mod tests {
         assert_eq!(registered, 2);
 
         // Down: the driver's error, not the gate's asynDisconnected.
-        match handle.lock_port_blocking(read).unwrap() {
+        match handle.lock_port_blocking(read).unwrap().1 {
             Err(AsynError::Status { status, message }) => {
                 assert_eq!(status, AsynStatus::Error);
                 assert_eq!(message, "disconnected:");
@@ -3338,8 +3330,10 @@ mod tests {
         let (a, b) = handle
             .lock_port_blocking(move |calls| (read(calls), read(calls)))
             .unwrap();
-        assert_eq!(a.unwrap().data.as_deref(), Some(&b"x"[..]));
-        assert_eq!(b.unwrap().data.as_deref(), Some(&b"x"[..]));
+        for (data, status) in [a, b] {
+            status.unwrap();
+            assert_eq!(data, b"x");
+        }
         // asynManager.c:1789/:1817, one pair per hold.
         let trace = std::fs::read_to_string(&trace_path).unwrap();
         assert_eq!(trace.matches("lock_port lockPort\n").count(), 2);
@@ -3470,7 +3464,8 @@ mod tests {
     async fn handle_async_octet() {
         let handle = make_handle(TestDriver::new());
         handle.write_octet(2, 0, b"test".to_vec()).await.unwrap();
-        let data = handle.read_octet(2, 0, 256).await.unwrap();
+        let (data, status) = handle.read_octet(2, 0, 256).await.into_parts();
+        status.unwrap();
         assert_eq!(&data[..4], b"test");
     }
 

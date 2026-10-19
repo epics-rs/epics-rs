@@ -42,11 +42,12 @@ use tokio::sync::Notify;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use asyn_rs::interfaces::InterfaceType;
-use asyn_rs::interpose::EomReason;
+use asyn_rs::interpose::{EomReason, OctetReadResult};
 use asyn_rs::interrupt::{InterruptClient, InterruptFilter, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUser, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::request::OctetRead;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::sync_io::SyncIOHandle;
@@ -306,9 +307,7 @@ impl SyncIoTransport {
         let mut first = first;
         let mut read_chunk = move |need: usize| match first.take() {
             Some(buf) => Ok(buf),
-            None => handle
-                .read_octet(0, need)
-                .or_else(|e| rescue(e, true, failure)),
+            None => rescue(handle.read_octet(0, need), true, failure),
         };
         match self.mbap.as_mut() {
             // Modbus/TCP: one read is a slice of the stream, not a frame.
@@ -324,21 +323,34 @@ impl SyncIoTransport {
     }
 }
 
-/// The bytes a failing octet read still delivered, or the failure itself when
-/// it delivered none.
+/// The bytes an octet read delivered, failing or not, or the failure itself
+/// when it delivered none; when nothing is rescued, `failure` keeps what C
+/// `writeRead` would report beside the status. `wrote` is whether an earlier
+/// step already sent the request.
 ///
 /// C `asynOctetSyncIO`'s `writeRead` publishes `*nbytesIn` beside a failing
 /// status (asynOctetSyncIO.c:262-269), and `modbusInterpose::readIt` reads them
 /// back: a reply shorter than the `replySize` the read asked for leaves the EOS
 /// layer waiting out the timeout, so C rescues the transfer for the Modbus
-/// exception that case really is (modbusInterpose.c:350-354). `asyn-rs` carries
-/// the same transfer in [`AsynError::partial_read`], which lets the framing
+/// exception that case really is (modbusInterpose.c:350-354). Here the framing
 /// layer's own completeness test — the MBAP `cmd_length`, or the RTU CRC —
-/// decide, instead of C's hard-coded nine bytes.
-fn partial_bytes(e: AsynError) -> crate::error::ModbusResult<Vec<u8>> {
-    match e.partial_read().map(|p| p.data.clone()) {
-        Some(data) if !data.is_empty() => Ok(data),
-        _ => Err(from_asyn(e)),
+/// decides, instead of C's hard-coded nine bytes.
+fn rescue(
+    read: OctetRead,
+    wrote: bool,
+    failure: &mut Option<TransportFailure>,
+) -> crate::error::ModbusResult<Vec<u8>> {
+    let (data, status) = read.into_parts();
+    match status {
+        Err(e) if data.is_empty() => {
+            *failure = Some(TransportFailure {
+                wrote: wrote || e.octet_step() == Some(OctetStep::Read),
+                nread: 0,
+                message: e.message(),
+            });
+            Err(from_asyn(e))
+        }
+        _ => Ok(data),
     }
 }
 
@@ -349,26 +361,6 @@ fn octet_failure(e: AsynError) -> ModbusError {
         ModbusError::Io(status, _) => ModbusError::Io(status, message),
         other => other,
     }
-}
-
-/// [`partial_bytes`], keeping in `failure` what C `writeRead` would report
-/// beside the status when nothing is rescued. `wrote` is whether an earlier
-/// step already sent the request.
-fn rescue(
-    e: AsynError,
-    wrote: bool,
-    failure: &mut Option<TransportFailure>,
-) -> crate::error::ModbusResult<Vec<u8>> {
-    let noted = TransportFailure {
-        wrote: wrote || e.octet_step() == Some(OctetStep::Read),
-        nread: e.partial_read().map_or(0, |p| p.data.len()),
-        message: e.message(),
-    };
-    let rescued = partial_bytes(e);
-    if rescued.is_err() {
-        *failure = Some(noted);
-    }
-    rescued
 }
 
 impl OctetTransport for SyncIoTransport {
@@ -459,10 +451,11 @@ impl OctetTransport for SyncIoTransport {
             std::thread::sleep(self.write_delay);
         }
         self.failure = None;
-        let first = self
-            .handle
-            .write_read(0, data, expected)
-            .or_else(|e| rescue(e, false, &mut self.failure))?;
+        let first = rescue(
+            self.handle.write_read(0, data, expected),
+            false,
+            &mut self.failure,
+        )?;
         if first.is_empty() {
             return Err(ModbusError::Timeout);
         }
@@ -835,6 +828,37 @@ impl ModbusPortDriver {
     /// The poller's own fan-out does NOT go through here: C's `readPoller`
     /// runs the interrupt callbacks with the failed status attached
     /// (`drvModbusAsyn.cpp:1647`) rather than suppressing them.
+    fn read_string_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        if self.is_absolute() {
+            // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
+            // `doModbusIO(..., min((int)maxChars, modbusLength_))`: the request
+            // length in REGISTERS equals the string CHAR count, because
+            // `readPlcString` (drvModbusAsyn.cpp:3001-3052) advances `offset`
+            // by exactly one register per loop iteration regardless of
+            // encoding. The single-byte encodings (`StringHigh`/`StringLow`/
+            // `ZStringHigh`/`ZStringLow`) therefore need one register per char,
+            // so the word count must be `buf.len()` (the char count) — not
+            // `div_ceil(2)`, which would under-read them by half. The two-byte
+            // encodings are over-read harmlessly, exactly as C over-reads them.
+            // `read_absolute_words` clamps the count to `config.length`,
+            // matching C's `min(maxChars, modbusLength_)`.
+            let words = buf.len().max(1);
+            let regs = self.read_absolute_words(user.addr, words)?;
+            let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
+        let regs = &self.polled_data()?[user.addr as usize..];
+        // String length comes from the record buffer (`NELM`).
+        let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
     fn polled_data(&self) -> AsynResult<&[u16]> {
         if self.io_status != AsynStatus::Success {
             return Err(AsynError::Status {
@@ -1660,51 +1684,15 @@ impl PortDriver for ModbusPortDriver {
         Ok(if mask == 0 { raw } else { raw & mask })
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        if self.is_absolute() {
-            // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
-            // `doModbusIO(..., min((int)maxChars, modbusLength_))`: the request
-            // length in REGISTERS equals the string CHAR count, because
-            // `readPlcString` (drvModbusAsyn.cpp:3001-3052) advances `offset`
-            // by exactly one register per loop iteration regardless of
-            // encoding. The single-byte encodings (`StringHigh`/`StringLow`/
-            // `ZStringHigh`/`ZStringLow`) therefore need one register per char,
-            // so the word count must be `buf.len()` (the char count) — not
-            // `div_ceil(2)`, which would under-read them by half. The two-byte
-            // encodings are over-read harmlessly, exactly as C over-reads them.
-            // `read_absolute_words` clamps the count to `config.length`,
-            // matching C's `min(maxChars, modbusLength_)`.
-            let words = buf.len().max(1);
-            let regs = self.read_absolute_words(user.addr, words)?;
-            let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            return Ok(n);
-        }
-        let regs = &self.polled_data()?[user.addr as usize..];
-        // String length comes from the record buffer (`NELM`).
-        let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
-    }
-
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
-        // C `readOctet` sets `*eomReason = ASYN_EOM_CNT` on every successful
-        // P_Data read (drvModbusAsyn.cpp:1480), and the poller octet callback
-        // passes `ASYN_EOM_CNT` too (:1921): a register-snapshot read is always
-        // a complete logical message, never a stream fragment. The generic
-        // `PortDriver::io_read_octet_eom` only synthesises `CNT` when the buffer
-        // fills, so a modbus string shorter than the record buffer would lose
-        // the flag. Override to flag every successful read complete.
-        let n = self.read_octet(user, buf)?;
-        Ok((n, EomReason::CNT))
+    /// C `readOctet` sets `*eomReason = ASYN_EOM_CNT` on every successful
+    /// P_Data read (drvModbusAsyn.cpp:1480), and the poller octet callback
+    /// passes `ASYN_EOM_CNT` too (:1921): a register-snapshot read is always
+    /// a complete logical message, never a stream fragment. It moves the
+    /// string or fails having moved none.
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.read_string_octet(user, buf)
+            .map(|n| (n, EomReason::CNT))
+            .into()
     }
 
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -2773,11 +2761,15 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> asyn_rs::interpose::OctetReadResult {
             let frame = self.pending.lock().unwrap().pop_front().unwrap_or_default();
             let n = frame.len().min(buf.len());
             buf[..n].copy_from_slice(&frame[..n]);
-            Ok(n)
+            asyn_rs::interpose::OctetReadResult::ok(n, asyn_rs::interpose::EomReason::empty())
         }
     }
 
@@ -2842,12 +2834,16 @@ mod tests {
             g.ops.push((tag, "write"));
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> asyn_rs::interpose::OctetReadResult {
             let mut g = self.shared.lock().unwrap();
             let tag = g.last_written;
             g.ops.push((tag, "read"));
             buf[0] = tag;
-            Ok(1)
+            asyn_rs::interpose::OctetReadResult::ok(1, asyn_rs::interpose::EomReason::empty())
         }
     }
 
@@ -2947,8 +2943,12 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(AsynError::Status {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> asyn_rs::interpose::OctetReadResult {
+            asyn_rs::interpose::OctetReadResult::failed(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "no reply within the read deadline".into(),
             })
@@ -3156,17 +3156,21 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> asyn_rs::interpose::OctetReadResult {
             let mut g = self.chunks.lock().unwrap();
             if g.is_empty() {
-                return Err(AsynError::Status {
+                return asyn_rs::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "no more chunks".into(),
                 });
             }
             let c = g.remove(0);
             buf[..c.len()].copy_from_slice(&c);
-            Ok(c.len())
+            asyn_rs::interpose::OctetReadResult::ok(c.len(), asyn_rs::interpose::EomReason::empty())
         }
     }
 
@@ -3319,16 +3323,23 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> asyn_rs::interpose::OctetReadResult {
             *self.reads.lock().unwrap() += 1;
             let chunk = self.chunks.lock().unwrap().pop_front();
             match chunk {
                 Some(c) => {
                     let n = c.len().min(buf.len());
                     buf[..n].copy_from_slice(&c[..n]);
-                    Ok(n)
+                    asyn_rs::interpose::OctetReadResult::ok(
+                        n,
+                        asyn_rs::interpose::EomReason::empty(),
+                    )
                 }
-                None => Err(AsynError::Status {
+                None => asyn_rs::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "nothing left on the link".into(),
                 }),
@@ -4690,9 +4701,9 @@ mod tests {
         user.addr = 0x3000;
         // The record buffer (`NELM`) holds 10 chars.
         let mut buf = [0u8; 10];
-        let n = driver
-            .read_octet(&user, &mut buf)
-            .expect("absolute octet read must succeed");
+        let read = driver.read_octet(&user, &mut buf);
+        read.status.expect("absolute octet read must succeed");
+        let n = read.nbytes_transferred;
         // Full 10-char string, not truncated to 5 by a `div_ceil(2)` request.
         assert_eq!(n, 10, "single-byte string must read all 10 chars");
         assert_eq!(&buf, b"ABCDEFGHIJ");
@@ -4709,7 +4720,7 @@ mod tests {
         );
     }
 
-    /// `io_read_octet_eom` must report `ASYN_EOM_CNT` even when the decoded
+    /// `io_read_octet` must report `ASYN_EOM_CNT` even when the decoded
     /// string is SHORTER than the record buffer — mirroring C `readOctet`
     /// (drvModbusAsyn.cpp:1480) which sets `*eomReason = ASYN_EOM_CNT`
     /// unconditionally. The generic `PortDriver` synthesis would return `empty`
@@ -4733,9 +4744,9 @@ mod tests {
         let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x3000;
         let mut buf = [0u8; 10];
-        let (n, eom) = driver
-            .io_read_octet_eom(&user, &mut buf)
-            .expect("absolute octet read must succeed");
+        let r = driver.io_read_octet(&user, &mut buf);
+        r.status.expect("absolute octet read must succeed");
+        let (n, eom) = (r.nbytes_transferred, r.eom_reason);
         assert_eq!(n, 4, "string truncates at the embedded NUL to 4 chars");
         assert!(n < buf.len(), "test must exercise the not-full-buffer case");
         assert_eq!(
@@ -4927,6 +4938,7 @@ mod tests {
         let mut octets = [0u8; 4];
         driver
             .read_octet(&string_user, &mut octets)
+            .status
             .expect("a string read must serve the block too");
 
         // Boundary B — the poll failed: every one of the seven reports it.
@@ -4970,7 +4982,7 @@ mod tests {
             AsynStatus::Timeout
         );
         assert_eq!(
-            failed(driver.read_octet(&string_user, &mut octets).map(|_| ())),
+            failed(driver.read_octet(&string_user, &mut octets).status),
             AsynStatus::Timeout
         );
 
@@ -4988,6 +5000,7 @@ mod tests {
         assert_eq!(f64s[0], 21845.0);
         driver
             .read_octet(&string_user, &mut octets)
+            .status
             .expect("a string read must serve the recovered block too");
     }
 
@@ -5628,7 +5641,7 @@ mod tests {
         assert!(driver.read_float64(&user).is_err());
         assert!(driver.read_uint32_digital(&user, 0).is_err());
         let mut sbuf = [0u8; 8];
-        assert!(driver.read_octet(&user, &mut sbuf).is_err());
+        assert!(driver.read_octet(&user, &mut sbuf).status.is_err());
 
         let mut wuser = AsynUser::new(reason).with_drv_user(reason_du.clone());
         wuser.addr = 100;
@@ -8155,7 +8168,10 @@ mod tests {
                         "read_uint32_digital",
                         $d.read_uint32_digital(&nuser, 0).is_ok(),
                     ),
-                    ("read_octet", $d.read_octet(&suser, &mut sbuf).is_ok()),
+                    (
+                        "read_octet",
+                        $d.read_octet(&suser, &mut sbuf).status.is_ok(),
+                    ),
                     (
                         "read_int32_array",
                         $d.read_int32_array(&nuser, &mut i32s).is_ok(),

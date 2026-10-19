@@ -25,7 +25,9 @@ use crate::interrupt::{
 };
 use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
-use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
+use crate::request::{
+    CellBody, OctetRead, PortCalls, ReadEntry, RequestCell, RequestOp, RequestResult, Unrun,
+};
 use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 
 /// C `MAX_STRING_SIZE`, a stringin/stringout VAL.
@@ -1589,8 +1591,8 @@ fn resolve_intr_alarm(
 /// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
 fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
     // `AsynError::status()` is the single owner of error → asynStatus, so a
-    // status-carrying variant added later (e.g. `PartialRead`, which reports
-    // a real timeout alongside the bytes it did receive) keeps its condition
+    // status-carrying variant (e.g. `PartialWrite`, which reports a real
+    // timeout alongside the bytes the device accepted) keeps its condition
     // code instead of silently falling into the generic asynError branch.
     // Non-status variants map to `AsynStatus::Error`, which
     // `asyn_status_to_alarm_with_default` resolves to C's default branch.
@@ -1922,7 +1924,7 @@ impl<'a> Sent<'a> {
     /// port returns a short write without read data, as the write-read's
     /// read is never made.
     fn came_up_short(&self, r: &RequestResult) -> bool {
-        self.write && self.len != r.nbytes && r.data.is_none()
+        self.write && self.len != r.nbytes && r.octet().is_none()
     }
 
     /// The short write's `recGblSetSevr(precord, WRITE_ALARM, MINOR_ALARM)`
@@ -2061,17 +2063,21 @@ impl ProcessLine<'_> {
         use crate::trace::TraceMask;
         let rec = self.record;
         // C prints `pasynUser->errorMessage`, the driver's own text.
-        let error_message = ran.err().map(AsynError::message_display);
-        let failure: Option<(AsynStatus, &dyn std::fmt::Display)> = match (ran, &error_message) {
-            (Ok(r), _) if r.aux_status != AsynStatus::Success => Some((r.aux_status, &r.message)),
-            (Err(e), Some(message)) => Some((e.status(), message)),
-            _ => None,
-        };
+        let failed = ran.map_or_else(Some, RequestResult::octet_error);
+        let error_message = failed.map(AsynError::message_display);
+        let failure: Option<(AsynStatus, &dyn std::fmt::Display)> =
+            match (ran, failed, &error_message) {
+                (_, Some(e), Some(message)) => Some((e.status(), message)),
+                (Ok(r), _, _) if r.aux_status != AsynStatus::Success => {
+                    Some((r.aux_status, &r.message))
+                }
+                _ => None,
+            };
         let mut last = last.0.lock();
         match (self.file, failure, ran) {
             (Dset::Octet, Some((_, message)), _) => {
                 use crate::error::OctetStep;
-                let step = match ran.err().and_then(AsynError::octet_step) {
+                let step = match failed.and_then(AsynError::octet_step) {
                     Some(step) => step,
                     None if sent.read => OctetStep::Read,
                     None => OctetStep::Write,
@@ -2123,13 +2129,16 @@ impl ProcessLine<'_> {
                         );
                     }
                 }
-                if let (true, Some(data)) = (sent.read, r.data.as_deref()) {
+                if let (true, Some(read)) = (sent.read, r.octet()) {
                     self.print_io(
                         TraceMask::IO_DEVICE,
-                        &data[..r.nbytes.min(data.len())],
+                        read.data(),
                         file!(),
                         line!(),
-                        format_args!("{rec} devAsynOctet::readIt eomReason {}\n", r.eom_reason),
+                        format_args!(
+                            "{rec} devAsynOctet::readIt eomReason {}\n",
+                            read.eom().bits()
+                        ),
                     );
                 }
             }
@@ -2495,15 +2504,18 @@ impl AsynDeviceSupport {
                     },
                     buf_size: self.octet_max_size,
                     flush: false,
+                    entry: ReadEntry::new(),
                 },
                 // asynOctetWriteRead: the command is read where the request runs.
                 None if self.device_job.write_read.get().is_some() => RequestOp::OctetWriteRead {
                     data: self.recycled(),
                     buf_size: self.octet_max_size,
                     flush: false,
+                    entry: ReadEntry::new(),
                 },
                 None => RequestOp::OctetRead {
                     buf_size: self.octet_max_size,
+                    entry: ReadEntry::new(),
                 },
             }),
             "asynUInt32Digital" => Some(RequestOp::UInt32DigitalRead { mask: self.mask }),
@@ -2617,16 +2629,21 @@ impl AsynDeviceSupport {
         Ok(Some(val))
     }
 
+    fn octet_value(&self, d: &[u8]) -> EpicsValue {
+        let n = d.len().min(self.octet_read_cap());
+        EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&d[..n]))
+    }
+
     /// Extract an EpicsValue from a RequestResult based on interface type.
     fn result_to_value(&self, result: &RequestResult) -> Option<EpicsValue> {
         match self.iface_type.as_str() {
             "asynInt32" => result.int_val.map(EpicsValue::Long),
             "asynInt64" => result.int64_val.map(EpicsValue::Int64),
             "asynFloat64" => result.float_val.map(EpicsValue::Double),
-            "asynOctet" => result.data.as_ref().map(|d| {
-                let n = result.nbytes.min(d.len()).min(self.octet_read_cap());
-                EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&d[..n]))
-            }),
+            "asynOctet" => result
+                .octet()
+                .filter(|read| read.status().is_ok())
+                .map(|read| self.octet_value(read.data())),
             "asynUInt32Digital" => result.uint_val.map(|v| EpicsValue::Long(v as i32)),
             "asynEnum" => result.enum_index.map(|v| EpicsValue::Enum(v as u16)),
             // One copy each, straight into the shared buffer: cloning the
@@ -4044,53 +4061,22 @@ impl DeviceSupport for AsynDeviceSupport {
         };
         if let Some(ran) = ran {
             match ran {
-                Ok(result) => {
-                    // Gate the value store on the device read status, mirroring
-                    // C processAi: `if (result.status == asynSuccess) { pr->rval
-                    // = value } else { return -1 }` keeps the prior value on a
-                    // non-success read (devAsynInt32.c:848-855). The alarm/time
-                    // are applied unconditionally (C maps the alarm and
-                    // recGblSetSevr's it before the status gate, :844-847) — same
-                    // store-only gate as the I/O Intr ring.
-                    if result.aux_status == AsynStatus::Success {
-                        if let Some(val) = self.result_to_value(&result) {
-                            let wrote_val = self.store_read_value(record, val);
-                            read_outcome = stored(wrote_val);
-                        } else if self.iface_type == "asynOctet" {
-                            // A write-read whose write came up short read
-                            // nothing, and processCommon still succeeds
-                            // (devAsynOctet.c:853-860, :816-818).
-                            read_outcome = stored(true);
-                        }
-                    }
-                    self.last_alarm_status = result.alarm_status;
-                    self.last_alarm_severity = result.alarm_severity;
-                    self.last_ts = result.timestamp.map(Into::into);
-                }
-                // `processCommon` succeeds, defining the record (devAsynOctet.c:816-818,
-                // devAsynXXXArray.cpp:334-336).
-                Err(e) if self.drop_refusal(&e) => read_outcome = stored(true),
-                Err(e) => {
-                    // A failed octet read that still transferred bytes hands
-                    // them to the record. C `devAsynOctet::readIt`
-                    // (devAsynOctet.c:693-717) passes the record's own value
-                    // buffer straight to `pasynOctet->read`, so on an
-                    // `asynTimeout` after a partial line the driver has
-                    // *already* written those bytes into `psi->val` /
-                    // `pwf->bptr`; readIt returns the failing status but the
-                    // data is in the record. Only the success-gated fields
-                    // (UDF, NORD/LEN — callbackSiRead:924-931,
-                    // callbackWfRead:1055-1061) stay untouched, which is why
-                    // the store below pairs with `DeviceUdf::Untouched`.
-                    // Dropping the value on the error path is what R6-48's
-                    // partial never reached.
-                    if let Some(partial) = e.partial_read() {
-                        let result = RequestResult::octet_read_eom(
-                            partial.data.clone(),
-                            partial.nbytes_transferred(),
-                            partial.eom_reason.bits(),
-                        );
-                        if let Some(val) = self.result_to_value(&result) {
+                Ok(mut result) => {
+                    let failed = result.octet.take_if(|r| r.status().is_err());
+                    if let Some((data, Err(e))) = failed.map(OctetRead::into_parts) {
+                        // A failed octet read that still transferred bytes hands
+                        // them to the record. C `devAsynOctet::readIt`
+                        // (devAsynOctet.c:693-717) passes the record's own value
+                        // buffer straight to `pasynOctet->read`, so on an
+                        // `asynTimeout` after a partial line the driver has
+                        // *already* written those bytes into `psi->val` /
+                        // `pwf->bptr`; readIt returns the failing status but the
+                        // data is in the record. Only the success-gated fields
+                        // (UDF, NORD/LEN — callbackSiRead:924-931,
+                        // callbackWfRead:1055-1061) stay untouched, which is why
+                        // the store below pairs with `DeviceUdf::Untouched`.
+                        if !data.is_empty() {
+                            let val = self.octet_value(&data);
                             let wrote_val = self.store_read_value(record, val);
                             read_outcome = if wrote_val {
                                 DeviceReadOutcome::computed(DeviceUdf::Untouched)
@@ -4098,7 +4084,37 @@ impl DeviceSupport for AsynDeviceSupport {
                                 DeviceReadOutcome::ok()
                             };
                         }
+                        let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
+                        self.last_alarm_status = alarm_status;
+                        self.last_alarm_severity = alarm_severity;
+                    } else {
+                        // Gate the value store on the device read status, mirroring
+                        // C processAi: `if (result.status == asynSuccess) { pr->rval
+                        // = value } else { return -1 }` keeps the prior value on a
+                        // non-success read (devAsynInt32.c:848-855). The alarm/time
+                        // are applied unconditionally (C maps the alarm and
+                        // recGblSetSevr's it before the status gate, :844-847) — same
+                        // store-only gate as the I/O Intr ring.
+                        if result.aux_status == AsynStatus::Success {
+                            if let Some(val) = self.result_to_value(&result) {
+                                let wrote_val = self.store_read_value(record, val);
+                                read_outcome = stored(wrote_val);
+                            } else if self.iface_type == "asynOctet" {
+                                // A write-read whose write came up short read
+                                // nothing, and processCommon still succeeds
+                                // (devAsynOctet.c:853-860, :816-818).
+                                read_outcome = stored(true);
+                            }
+                        }
+                        self.last_alarm_status = result.alarm_status;
+                        self.last_alarm_severity = result.alarm_severity;
+                        self.last_ts = result.timestamp.map(Into::into);
                     }
+                }
+                // `processCommon` succeeds, defining the record (devAsynOctet.c:816-818,
+                // devAsynXXXArray.cpp:334-336).
+                Err(e) if self.drop_refusal(&e) => read_outcome = stored(true),
+                Err(e) => {
                     // Convert asyn error to EPICS alarm (C parity: asynStatusToEpicsAlarm)
                     let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
                     self.last_alarm_status = alarm_status;
@@ -9462,10 +9478,13 @@ mod tests {
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> crate::error::AsynResult<usize> {
+            ) -> crate::interpose::OctetReadResult {
                 let bytes = b"HELLO";
                 buf[..bytes.len()].copy_from_slice(bytes);
-                Ok(bytes.len())
+                crate::interpose::OctetReadResult::ok(
+                    bytes.len(),
+                    crate::interpose::EomReason::empty(),
+                )
             }
         }
 
@@ -11759,11 +11778,15 @@ mod tests {
         }
         // A defined driver value, so an initial readback that DOES run
         // succeeds and is visible in the record (the gate tests below).
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
             let v = b"DRIVER";
             let n = v.len().min(buf.len());
             buf[..n].copy_from_slice(&v[..n]);
-            Ok(n)
+            crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
         }
         fn io_read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
             Ok(7)
@@ -12264,11 +12287,15 @@ mod tests {
             self.sequence.lock().unwrap().push("write");
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
             self.sequence.lock().unwrap().push("read");
             let n = self.reply.len().min(buf.len());
             buf[..n].copy_from_slice(&self.reply[..n]);
-            Ok(n)
+            crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
         }
     }
 
@@ -12330,7 +12357,7 @@ mod tests {
 
         // No command → plain read.
         match ads.read_op(&epics_base_rs::server::records::ai::AiRecord::new(0.0)) {
-            Some(RequestOp::OctetRead { buf_size }) => assert_eq!(buf_size, 128),
+            Some(RequestOp::OctetRead { buf_size, .. }) => assert_eq!(buf_size, 128),
             other => panic!("expected OctetRead, got {other:?}"),
         }
 
@@ -12341,6 +12368,7 @@ mod tests {
                 data,
                 buf_size,
                 flush,
+                ..
             }) => {
                 assert_eq!(data, b"*IDN?\r\n".to_vec());
                 assert_eq!(buf_size, 128);
@@ -12446,7 +12474,7 @@ mod tests {
     #[test]
     fn octet_partial_read_stores_the_bytes_and_the_timeout_alarm() {
         use crate::error::{AsynError, AsynResult, AsynStatus};
-        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interpose::{EomReason, OctetReadResult};
         use crate::user::AsynUser;
         use epics_base_rs::server::records::stringin::StringinRecord;
 
@@ -12458,20 +12486,19 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 buf[..3].copy_from_slice(b"abc");
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    ..OctetReadResult::ok(3, EomReason::empty())
                 }
-                .with_partial_read(PartialOctetRead {
-                    data: b"abc".to_vec(),
-                    eom_reason: EomReason::empty(),
-                }))
             }
         }
 

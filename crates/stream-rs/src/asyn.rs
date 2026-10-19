@@ -17,7 +17,7 @@ use asyn_rs::manager::DeviceUser;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port::QueuePriority;
 use asyn_rs::port_handle::PortHandle;
-use asyn_rs::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use asyn_rs::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
 use epics_base_rs::runtime::time::thread_sleep_quantum;
@@ -636,22 +636,14 @@ impl Inner {
                     "AsynDriverInterface::writeHandler({}): reading old input\n",
                     self.client_name
                 ));
-                let read = port.call(
-                    &RequestOp::OctetRead { buf_size: 256 },
-                    self.user_timed(Duration::ZERO),
-                );
-                let (status, received) = match &read {
-                    Ok(r) => (
-                        AsynStatus::Success,
-                        r.data
-                            .as_deref()
-                            .map_or(&[][..], |d| &d[..r.nbytes.min(d.len())]),
-                    ),
-                    Err(e) => (
-                        e.status(),
-                        e.partial_read().map_or(&[][..], |p| &p.data[..]),
-                    ),
-                };
+                let (received, read) = port
+                    .octet_read(
+                        OctetReadOp::Read { buf_size: 256 },
+                        self.user_timed(Duration::ZERO),
+                    )
+                    .into_parts();
+                let received = &received[..];
+                let status = read.map_or_else(|e| e.status(), |()| AsynStatus::Success);
                 if status == AsynStatus::Error || received.is_empty() {
                     break;
                 }
@@ -1007,31 +999,18 @@ impl Inner {
             // C's `received` is `buffer.len() - taken_back`: -1 when the EOS
             // layer takes back a terminator byte the last read delivered
             // (asynInterposeEos.c:201-204).
-            let (mut status, mut buffer, mut taken_back, mut eom_reason, message) = match port.call(
-                &RequestOp::OctetRead {
+            let read = port.octet_read(
+                OctetReadOp::Read {
                     buf_size: bytes_to_read,
                 },
                 self.user_timed(Duration::from_secs_f64(timeout)),
-            ) {
-                Ok(r) => {
-                    let mut data = r.data.unwrap_or_default();
-                    data.truncate(r.nbytes);
-                    (
-                        AsynStatus::Success,
-                        data,
-                        r.taken_back,
-                        EomReason::from_bits_truncate(r.eom_reason),
-                        String::new(),
-                    )
-                }
-                Err(e) => {
-                    let (data, eom) = e
-                        .partial_read()
-                        .map_or((Vec::new(), EomReason::empty()), |p| {
-                            (p.data.clone(), p.eom_reason)
-                        });
-                    (e.status(), data, 0, eom, e.message())
-                }
+            );
+            let mut taken_back = read.taken_back();
+            let mut eom_reason = read.eom();
+            let (mut buffer, read) = read.into_parts();
+            let (mut status, message) = match read {
+                Ok(()) => (AsynStatus::Success, String::new()),
+                Err(e) => (e.status(), e.message()),
             };
             let (io_action, connected) = {
                 let state = self.state.lock();

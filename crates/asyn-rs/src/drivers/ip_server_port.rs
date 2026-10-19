@@ -448,7 +448,7 @@ impl ClientSlot {
     /// `closeConnection` half of it — the single owner of "a client slot dies on
     /// a read", shared by the parent's addressed read
     /// ([`DrvAsynIPServerPort::base_read_octet`]) and the child port's
-    /// ([`DrvAsynIPSubport::read_octet`]).
+    /// ([`DrvAsynIPSubport::io_read_octet`]).
     ///
     /// C serves each accepted connection with a full `drvAsynIPPort` child
     /// (drvAsynIPServerPort.c:703-729), so the read that runs is
@@ -1445,28 +1445,15 @@ impl PortDriver for DrvAsynIPServerPort {
         Ok(())
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         if self.config.protocol == IpServerProtocol::Udp {
-            return Ok(self.udp_read(user, buf)?.0);
+            // A datagram boundary carries END.
+            self.udp_read(user, buf).into()
+        } else {
+            // TCP: surface the real end-of-message reason from the slot read
+            // (CNT when the caller buffer filled, empty on a short read).
+            self.base_read_octet(user, buf).into()
         }
-        let res = self.base_read_octet(user, buf)?;
-        Ok(res.nbytes_transferred)
-    }
-
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
-        if self.config.protocol == IpServerProtocol::Udp {
-            // The default synthesis reports CNT only, never the END a
-            // datagram boundary carries.
-            return self.udp_read(user, buf);
-        }
-        // TCP: surface the real end-of-message reason from the slot read
-        // (CNT when the caller buffer filled, empty on a short read).
-        let res = self.base_read_octet(user, buf)?;
-        Ok((res.nbytes_transferred, res.eom_reason))
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1556,23 +1543,23 @@ impl PortDriver for DrvAsynIPServerPort {
 }
 
 impl DrvAsynIPServerPort {
-    fn base_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn base_read_octet(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
         let arc = self.slot_arc(user.addr)?;
-        match arc.read_or_close(buf, user.timeout, &self.server_info) {
-            Ok(n) => Ok(OctetReadResult {
-                nbytes_transferred: n,
-                // C parity: CNT only when the requested count was
-                // reached; a short read leaves the reason empty so the
-                // EOS interpose keeps reading.
-                eom_reason: if n >= buf.len() {
-                    EomReason::CNT
-                } else {
-                    EomReason::empty()
-                },
-                taken_back: 0,
-            }),
-            Err(f) => Err(f.error),
-        }
+        let n = arc
+            .read_or_close(buf, user.timeout, &self.server_info)
+            .map_err(|f| f.error)?;
+        // C parity: CNT only when the requested count was reached; a short
+        // read leaves the reason empty so the EOS interpose keeps reading.
+        let eom = if n >= buf.len() {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        Ok((n, eom))
     }
 
     /// C `readIt` (drvAsynIPServerPort.c:166-250), the UDP server's read:
@@ -1913,10 +1900,13 @@ impl PortDriver for DrvAsynIPSubport {
         Ok(())
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    /// A slot read moves bytes or fails having moved none; CNT marks a
+    /// filled buffer (`read_or_close` refuses an empty one).
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         match self.slot.read_or_close(buf, user.timeout, &self.host_info) {
-            Ok(n) => Ok(n),
-            Err(f) => Err(self.finish_slot_failure(f)),
+            Ok(n) if n == buf.len() => OctetReadResult::ok(n, EomReason::CNT),
+            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Err(f) => OctetReadResult::failed(self.finish_slot_failure(f)),
         }
     }
 
@@ -2353,7 +2343,8 @@ mod tests {
 
         let mut buf = [0u8; 16];
         let n = srv
-            .read_octet(&AsynUser::default().with_addr(0), &mut buf)
+            .io_read_octet(&AsynUser::default().with_addr(0), &mut buf)
+            .into_count()
             .unwrap();
         assert_eq!(
             n, 0,
@@ -2392,7 +2383,7 @@ mod tests {
             .with_addr(idx as i32)
             .with_timeout(Duration::from_millis(100));
         let mut buf = [0u8; 64];
-        match srv.read_octet(&read_user, &mut buf) {
+        match srv.io_read_octet(&read_user, &mut buf).into_count() {
             Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 ..
@@ -2453,7 +2444,7 @@ mod tests {
         // slot is torn down in the same step the fatal status appears (read_or_close
         // clears it on this thread before returning).
         let err = read_until_slot_torn_down(|| {
-            let res = srv.read_octet(&read_user, &mut buf);
+            let res = srv.io_read_octet(&read_user, &mut buf).into_count();
             (res, !srv.slots[0].is_occupied())
         });
         assert!(
@@ -2486,7 +2477,7 @@ mod tests {
         let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         wait_for_slot(&srv, 0);
         let user = AsynUser::default().with_timeout(Duration::from_millis(50));
-        let err = child.read_octet(&user, &mut [0u8; 8]).unwrap_err();
+        let err = child.io_read_octet(&user, &mut [0u8; 8]).unwrap_err();
         assert_eq!(
             err.message(),
             format!(
@@ -2523,7 +2514,7 @@ mod tests {
         wait_for_slot(&srv, 0);
         let user = AsynUser::default().with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 64];
-        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        let err = child.io_read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         // C `readIt`'s `"%s timeout: %s"` with the recv errno's `strerror`
         // (drvAsynIPPort.c:861-865).
@@ -2553,7 +2544,7 @@ mod tests {
 
         // A zero-timeout poll is exempt (C's `pasynUser->timeout > 0`).
         let poll_user = AsynUser::default().with_timeout(Duration::ZERO);
-        let err = child.read_octet(&poll_user, &mut buf).unwrap_err();
+        let err = child.io_read_octet(&poll_user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
             srv.slots[0].is_occupied(),
@@ -2562,7 +2553,7 @@ mod tests {
 
         // …but a real timed read now closes the connection, and C reports that
         // branch as asynError, never as a retryable asynTimeout (:855-860).
-        let err = child.read_octet(&user, &mut buf).unwrap_err();
+        let err = child.io_read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
         // `"%s read error: %s"` (drvAsynIPPort.c:852-859).
         assert!(
@@ -2634,7 +2625,7 @@ mod tests {
         let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
         let mut buf = [0u8; 64];
         read_until_slot_torn_down(|| {
-            let res = child.read_octet(&read_user, &mut buf);
+            let res = child.io_read_octet(&read_user, &mut buf).into_count();
             (res, !child.base().is_connected())
         });
         assert_eq!(
@@ -2790,7 +2781,7 @@ mod tests {
         // either C teardown status (fatal-errno asynError on Linux, recv==0 EOF
         // asynDisconnected on macOS) — never a retryable Timeout.
         let err = read_until_slot_torn_down(|| {
-            let res = child.read_octet(&read_user, &mut buf);
+            let res = child.io_read_octet(&read_user, &mut buf).into_count();
             (res, !child.base().is_connected())
         });
         assert!(
@@ -2830,7 +2821,8 @@ mod tests {
 
         client2.write_all(b"world\n").unwrap();
         let n = child
-            .read_octet(&read_user, &mut buf)
+            .io_read_octet(&read_user, &mut buf)
+            .into_count()
             .expect("the revived child must read from the new client's socket");
         assert_eq!(&buf[..n], b"world\n");
 
@@ -2901,15 +2893,11 @@ mod tests {
         let mut buf = [0u8; 64];
         // First read stops at the terminator — it does NOT run to the buffer
         // bound and swallow line2.
-        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"line1");
         assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
         // Second read returns the buffered second line, no further socket read.
-        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"line2");
         assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
 
@@ -3038,7 +3026,7 @@ mod tests {
 
         let read_user = AsynUser::default().with_timeout(Duration::from_millis(100));
         let mut buf = [0u8; 64];
-        match sub.read_octet(&read_user, &mut buf) {
+        match sub.io_read_octet(&read_user, &mut buf).into_count() {
             Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 ..
@@ -3151,7 +3139,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut buf = [0u8; 64];
         while got.len() < 2 && std::time::Instant::now() < deadline {
-            let n = srv.read_octet(&user, &mut buf).unwrap();
+            let n = srv.io_read_octet(&user, &mut buf).into_count().unwrap();
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -3195,15 +3183,12 @@ mod tests {
             .with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 64];
         let start = Instant::now();
-        let n = srv.read_octet(&user, &mut buf).unwrap();
+        let n = srv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert!(start.elapsed() >= Duration::from_millis(1), "read_octet");
         assert_eq!(n, 0, "empty UDP cache must return 0 bytes, not error");
         let start = Instant::now();
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut buf).unwrap();
-        assert!(
-            start.elapsed() >= Duration::from_millis(1),
-            "io_read_octet_eom"
-        );
+        let (n, eom) = srv.io_read_octet(&user, &mut buf).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1), "io_read_octet");
         assert_eq!((n, eom), (0, EomReason::empty()));
         srv.disconnect(&AsynUser::default()).unwrap();
     }
@@ -3222,18 +3207,20 @@ mod tests {
         let user = AsynUser::default().with_addr(0);
         let mut buf = [0u8; 16];
         let disconnected = |e: AsynError| e.status() == AsynStatus::Disconnected;
-        assert!(disconnected(srv.read_octet(&user, &mut buf).unwrap_err()));
         assert!(disconnected(
-            srv.io_read_octet_eom(&user, &mut buf).unwrap_err()
+            srv.io_read_octet(&user, &mut buf).unwrap_err()
+        ));
+        assert!(disconnected(
+            srv.io_read_octet(&user, &mut buf).unwrap_err()
         ));
         assert_eq!(srv.udp_cache_pending(), 4);
     }
 
     /// DRV-23 regression: a UDP datagram is a message boundary.
-    /// `io_read_octet_eom` must report `ASYN_EOM_END` when the datagram
+    /// `io_read_octet` must report `ASYN_EOM_END` when the datagram
     /// is fully drained and `ASYN_EOM_CNT` when the caller buffer is too
     /// small and more of the datagram remains (C drvAsynIPServerPort.c
-    /// readIt:212-217). The default synthesis reports CNT-only, never END.
+    /// readIt:212-217).
     #[test]
     fn udp_server_read_eom_reports_end_at_datagram_boundary() {
         let mut srv = DrvAsynIPServerPort::new("udp_srv_eom", "127.0.0.1:0 UDP").unwrap();
@@ -3249,7 +3236,7 @@ mod tests {
 
         // Caller buffer too small (3 < 5): partial drain -> CNT, no END.
         let mut small = [0u8; 3];
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut small).unwrap();
+        let (n, eom) = srv.io_read_octet(&user, &mut small).unwrap();
         assert_eq!(n, 3);
         assert_eq!(&small[..3], b"hel");
         assert!(eom.contains(EomReason::CNT), "partial drain must flag CNT");
@@ -3260,7 +3247,7 @@ mod tests {
 
         // Remainder fits: full drain -> END, no CNT.
         let mut rest = [0u8; 16];
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut rest).unwrap();
+        let (n, eom) = srv.io_read_octet(&user, &mut rest).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&rest[..2], b"lo");
         assert!(
@@ -3274,7 +3261,7 @@ mod tests {
 
         // Empty cache -> (0, empty): a poll, no boundary to report.
         let mut buf = [0u8; 16];
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, eom) = srv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(n, 0);
         assert!(eom.is_empty(), "empty cache poll reports no EOM");
 
@@ -3287,21 +3274,21 @@ mod tests {
             cache.pos = 0;
         }
         let mut exact = [0u8; 4];
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut exact).unwrap();
+        let (n, eom) = srv.io_read_octet(&user, &mut exact).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&exact, b"abcd");
         assert!(eom.contains(EomReason::END), "exact fit must flag END");
         assert!(eom.contains(EomReason::CNT), "exact fit must also flag CNT");
         // And the datagram is gone afterwards (a poll returns empty).
         let mut after = [0u8; 4];
-        let (n, eom) = srv.io_read_octet_eom(&user, &mut after).unwrap();
+        let (n, eom) = srv.io_read_octet(&user, &mut after).unwrap();
         assert_eq!(n, 0);
         assert!(eom.is_empty());
     }
 
     /// DRV-55 (UDP-server sibling): C readIt (drvAsynIPServerPort.c:181-185)
     /// rejects maxchars == 0 with asynError before draining the cache. The
-    /// UDP read entries (`read_octet`/`io_read_octet_eom`) bypass
+    /// UDP read entries (`read_octet`/`io_read_octet`) bypass
     /// `base_read_octet`, so they must carry the guard themselves — an empty
     /// buffer must error, NOT silently return a zero-byte read that leaves the
     /// cached datagram in place.
@@ -3319,7 +3306,7 @@ mod tests {
         let mut empty: [u8; 0] = [];
         assert!(
             matches!(
-                srv.read_octet(&user, &mut empty),
+                srv.io_read_octet(&user, &mut empty).into_count(),
                 Err(AsynError::Status {
                     status: AsynStatus::Error,
                     ..
@@ -3330,18 +3317,18 @@ mod tests {
         let mut empty_eom: [u8; 0] = [];
         assert!(
             matches!(
-                srv.io_read_octet_eom(&user, &mut empty_eom),
+                srv.io_read_octet(&user, &mut empty_eom).status,
                 Err(AsynError::Status {
                     status: AsynStatus::Error,
                     ..
                 })
             ),
-            "UDP io_read_octet_eom with maxchars==0 must return asynError"
+            "UDP io_read_octet with maxchars==0 must return asynError"
         );
 
         // The cached datagram must be untouched by the rejected reads.
         let mut buf = [0u8; 16];
-        let n = srv.read_octet(&user, &mut buf).unwrap();
+        let n = srv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(
             &buf[..n],
             b"keepme",
@@ -3468,7 +3455,7 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = srv.read_octet(&user, &mut buf).unwrap();
+        let n = srv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"hello-server");
         srv.write_octet(&mut user, b"hello-client").unwrap();
 

@@ -52,10 +52,14 @@ impl PortDriver for Device {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(0xF & mask)
     }
-    fn read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn read_octet(
+        &mut self,
+        _user: &AsynUser,
+        buf: &mut [u8],
+    ) -> asyn_rs::interpose::OctetReadResult {
         self.reads.fetch_add(1, Ordering::SeqCst);
         buf[..2].copy_from_slice(b"ok");
-        Ok(2)
+        asyn_rs::interpose::OctetReadResult::ok(2, asyn_rs::interpose::EomReason::empty())
     }
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         self.reads.fetch_add(1, Ordering::SeqCst);

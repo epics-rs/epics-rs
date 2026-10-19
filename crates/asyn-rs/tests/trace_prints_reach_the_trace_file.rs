@@ -46,8 +46,8 @@ impl PortDriver for TestPort {
         &mut self,
         _user: &asyn_rs::user::AsynUser,
         _buf: &mut [u8],
-    ) -> asyn_rs::error::AsynResult<usize> {
-        Err(asyn_rs::error::AsynError::Status {
+    ) -> asyn_rs::interpose::OctetReadResult {
+        asyn_rs::interpose::OctetReadResult::failed(asyn_rs::error::AsynError::Status {
             status: asyn_rs::error::AsynStatus::Timeout,
             message: "no reply".into(),
         })
@@ -779,7 +779,6 @@ fn a_default_read_prints_the_io_line() {
     }
     for (reason, op) in [
         (0, RequestOp::Float64Read),
-        (1, RequestOp::OctetRead { buf_size: 40 }),
         (3, RequestOp::Int32Read),
         (4, RequestOp::Int64Read),
         (5, RequestOp::UInt32DigitalRead { mask: 0x0F }),
@@ -788,6 +787,15 @@ fn a_default_read_prints_the_io_line() {
             .submit_blocking(op, AsynUser::new(reason))
             .unwrap();
     }
+
+    fx.handle
+        .submit_octet_read_blocking(
+            asyn_rs::request::OctetReadOp::Read { buf_size: 40 },
+            AsynUser::new(1),
+        )
+        .into_parts()
+        .1
+        .unwrap();
 
     let log = fx.log();
     for expected in [

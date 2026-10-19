@@ -233,15 +233,19 @@ impl SyncIOHandle {
         Ok(())
     }
 
-    pub fn read_octet(&self, reason: usize, buf_size: usize) -> AsynResult<Vec<u8>> {
-        let user = self.user(reason);
-        let result = self
-            .port()?
-            .submit_blocking(RequestOp::OctetRead { buf_size }, user)?;
-        result.data.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "octet read returned no data".into(),
-        })
+    pub fn read_octet(&self, reason: usize, buf_size: usize) -> crate::request::OctetRead {
+        self.octet_read(reason, crate::request::OctetReadOp::Read { buf_size })
+    }
+
+    fn octet_read(
+        &self,
+        reason: usize,
+        op: crate::request::OctetReadOp,
+    ) -> crate::request::OctetRead {
+        match self.port() {
+            Ok(port) => port.submit_octet_read_blocking(op, self.user(reason)),
+            Err(e) => crate::request::OctetRead::failed(e),
+        }
     }
 
     /// Returns the number of bytes transferred (C `asynOctet::write`'s
@@ -264,20 +268,19 @@ impl SyncIOHandle {
     /// reply survives into this exchange. Protocol drivers doing
     /// request/response must call this rather than `write_octet` followed
     /// by `read_octet`.
-    pub fn write_read(&self, reason: usize, data: &[u8], buf_size: usize) -> AsynResult<Vec<u8>> {
-        let user = self.user(reason);
-        let result = self.port()?.submit_blocking(
-            RequestOp::OctetWriteRead {
+    pub fn write_read(
+        &self,
+        reason: usize,
+        data: &[u8],
+        buf_size: usize,
+    ) -> crate::request::OctetRead {
+        self.octet_read(
+            reason,
+            crate::request::OctetReadOp::WriteRead {
                 data: data.to_vec(),
                 buf_size,
-                flush: true,
             },
-            user,
-        )?;
-        result.data.ok_or_else(|| crate::error::AsynError::Status {
-            status: crate::error::AsynStatus::Error,
-            message: "octet write/read returned no data".into(),
-        })
+        )
     }
 
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
@@ -439,7 +442,8 @@ mod tests {
     fn test_sync_io_octet_roundtrip() {
         let (sio, _rt) = make_sync_io();
         sio.write_octet(2, b"hello").unwrap();
-        let data = sio.read_octet(2, 32).unwrap();
+        let (data, status) = sio.read_octet(2, 32).into_parts();
+        status.unwrap();
         assert_eq!(&data[..5], b"hello");
     }
 
@@ -484,11 +488,18 @@ mod tests {
                 self.seq.lock().unwrap().push("write");
                 Ok(data.len())
             }
-            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::interpose::OctetReadResult {
                 self.seq.lock().unwrap().push("read");
                 let resp = b"RSP";
                 buf[..resp.len()].copy_from_slice(resp);
-                Ok(resp.len())
+                crate::interpose::OctetReadResult::ok(
+                    resp.len(),
+                    crate::interpose::EomReason::empty(),
+                )
             }
         }
 
@@ -506,9 +517,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
         let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let reply = sio
-            .write_read(0, b"CMD", 16)
-            .expect("the exchange must run");
+        let (reply, status) = sio.write_read(0, b"CMD", 16).into_parts();
+        status.expect("the exchange must run");
         assert_eq!(reply, b"RSP".to_vec());
         assert_eq!(*seq.lock().unwrap(), vec!["flush", "write", "read"]);
     }
@@ -598,9 +608,15 @@ mod tests {
         assert_eq!(msg(sio.write_int32(0, 1).unwrap_err()), refused);
         assert_eq!(msg(sio.read_float64(0).unwrap_err()), refused);
         assert_eq!(msg(sio.write_float64(0, 1.0).unwrap_err()), refused);
-        assert_eq!(msg(sio.read_octet(0, 8).unwrap_err()), refused);
+        assert_eq!(
+            msg(sio.read_octet(0, 8).into_parts().1.unwrap_err()),
+            refused
+        );
         assert_eq!(msg(sio.write_octet(0, b"x").unwrap_err()), refused);
-        assert_eq!(msg(sio.write_read(0, b"x", 8).unwrap_err()), refused);
+        assert_eq!(
+            msg(sio.write_read(0, b"x", 8).into_parts().1.unwrap_err()),
+            refused
+        );
         assert_eq!(msg(sio.read_uint32_digital(0, 1).unwrap_err()), refused);
         assert_eq!(msg(sio.write_uint32_digital(0, 1, 1).unwrap_err()), refused);
         assert_eq!(msg(sio.read_int64(0).unwrap_err()), refused);
@@ -696,7 +712,10 @@ mod tests {
         );
         let refused = "asynOctet interface not supported";
         assert_eq!(refusal(status.unwrap_err()), refused);
-        assert_eq!(refusal(sio.read_octet(0, 8).unwrap_err()), refused);
+        assert_eq!(
+            refusal(sio.read_octet(0, 8).into_parts().1.unwrap_err()),
+            refused
+        );
     }
 
     /// asynCommonSyncIO.c:76-80 checks asynCommon alone, in its own words.
@@ -831,14 +850,13 @@ mod tests {
     /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransferred`
     /// alongside the failing status — `pasynOctet->read` fills the caller's
     /// buffer before returning `asynTimeout`, so a partial line is not lost to
-    /// a SyncIO caller. `read_octet`'s `Err` must therefore carry the transfer:
-    /// the bytes ride inside `AsynError::PartialRead`, not in a buffer that `?`
-    /// drops on the way out of the actor.
+    /// a SyncIO caller, so `read_octet` hands back the bytes beside the
+    /// status.
     #[test]
     fn read_octet_error_carries_the_partial_transfer() {
         use crate::error::{AsynError, AsynResult, AsynStatus};
         use crate::interfaces::InterfaceType;
-        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interpose::{EomReason, OctetReadResult};
         use crate::user::AsynUser;
 
         struct PartialThenTimeout(PortDriverBase);
@@ -849,20 +867,15 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn io_read_octet_eom(
-                &mut self,
-                _user: &AsynUser,
-                buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 buf[..3].copy_from_slice(b"abc");
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    ..OctetReadResult::ok(3, EomReason::empty())
                 }
-                .with_partial_read(PartialOctetRead {
-                    data: b"abc".to_vec(),
-                    eom_reason: EomReason::empty(),
-                }))
             }
         }
 
@@ -880,16 +893,12 @@ mod tests {
         let sio =
             SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
 
-        let err = sio.read_octet(0, 32).unwrap_err();
+        let (data, status) = sio.read_octet(0, 32).into_parts();
         assert_eq!(
-            err.status(),
+            status.unwrap_err().status(),
             AsynStatus::Timeout,
             "the timeout still surfaces"
         );
-        let partial = err
-            .partial_read()
-            .expect("the transfer must survive the actor dispatch and reach the caller");
-        assert_eq!(partial.data, b"abc");
-        assert_eq!(partial.nbytes_transferred(), 3);
+        assert_eq!(data, b"abc", "the transfer must reach the caller");
     }
 }

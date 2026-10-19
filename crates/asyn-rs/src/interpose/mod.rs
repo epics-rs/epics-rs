@@ -19,7 +19,7 @@ pub mod flush;
 
 use bitflags::bitflags;
 
-use crate::error::AsynResult;
+use crate::error::{AsynError, AsynResult};
 use crate::user::AsynUser;
 
 bitflags! {
@@ -35,8 +35,12 @@ bitflags! {
     }
 }
 
-/// Result of an octet read operation.
-#[derive(Debug, Clone)]
+/// Result of an octet read operation: C `asynOctet::read`'s
+/// `*nbytesTransferred` and `*eomReason`, and the status returned beside them.
+/// A failing read still reports what it transferred (asynInterposeEos.c:242-257),
+/// so the count is not on the error side of a `Result` where `?` would drop it.
+#[must_use = "a failed octet read still reports the bytes it transferred"]
+#[derive(Debug)]
 pub struct OctetReadResult {
     /// Number of bytes actually transferred into the buffer.
     pub nbytes_transferred: usize,
@@ -47,38 +51,81 @@ pub struct OctetReadResult {
     pub taken_back: usize,
     /// Reason(s) the read terminated.
     pub eom_reason: EomReason,
+    /// The read's `asynStatus`.
+    pub status: AsynResult<()>,
 }
 
-/// The transfer an octet read completed *before* it failed — C's
-/// `*nbytesTransferred` / `*eomReason`, which `asynOctet::read` writes out
-/// even when it returns a failing `asynStatus`
-/// (`asynInterposeEos.c:242-253`).
-///
-/// This owns the bytes rather than pointing at the caller's buffer: it rides
-/// inside [`crate::error::AsynError::PartialRead`], so the data and the
-/// status are one value and a `?` on the read cannot deliver the failure
-/// while dropping the bytes. Every dispatch hop between the interpose and a
-/// record (`port_actor` → `PortHandle` → device support / `SyncIO`) hands the
-/// error on by value, so the transfer arrives with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartialOctetRead {
-    /// The bytes transferred into the caller's buffer before the failure.
-    pub data: Vec<u8>,
-    /// The end-of-message reason accumulated up to the failure.
-    pub eom_reason: EomReason,
+impl OctetReadResult {
+    /// A read that succeeded with `nbytes_transferred` bytes.
+    pub fn ok(nbytes_transferred: usize, eom_reason: EomReason) -> Self {
+        Self {
+            nbytes_transferred,
+            taken_back: 0,
+            eom_reason,
+            status: Ok(()),
+        }
+    }
+
+    /// Panic on a failed read; test-only, where the read must have succeeded.
+    #[cfg(test)]
+    pub(crate) fn expect_ok(self) -> Self {
+        if let Err(e) = &self.status {
+            panic!("octet read failed: {e:?}");
+        }
+        self
+    }
+
+    /// The count and eom of a read that must have succeeded; test-only.
+    #[cfg(test)]
+    pub(crate) fn unwrap(self) -> (usize, EomReason) {
+        let r = self.expect_ok();
+        (r.nbytes_transferred, r.eom_reason)
+    }
+
+    /// The failure of a read that must have failed; test-only.
+    #[cfg(test)]
+    pub(crate) fn unwrap_err(self) -> AsynError {
+        match self.status {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "octet read succeeded with {} bytes",
+                self.nbytes_transferred
+            ),
+        }
+    }
+
+    /// The count, or the failure of a read whose failed bytes the test does
+    /// not inspect; test-only.
+    #[cfg(test)]
+    pub(crate) fn into_count(self) -> AsynResult<usize> {
+        self.status.map(|()| self.nbytes_transferred)
+    }
+
+    /// A read that failed having transferred nothing.
+    pub fn failed(e: AsynError) -> Self {
+        Self {
+            nbytes_transferred: 0,
+            taken_back: 0,
+            eom_reason: EomReason::empty(),
+            status: Err(e),
+        }
+    }
 }
 
-impl PartialOctetRead {
-    /// C's `*nbytesTransferred` for this failed read.
-    pub fn nbytes_transferred(&self) -> usize {
-        self.data.len()
+/// A single transfer: it moved `n` bytes, or failed having moved none.
+impl From<AsynResult<(usize, EomReason)>> for OctetReadResult {
+    fn from(r: AsynResult<(usize, EomReason)>) -> Self {
+        match r {
+            Ok((n, eom)) => Self::ok(n, eom),
+            Err(e) => Self::failed(e),
+        }
     }
 }
 
 /// "Next layer" interface — implemented by both the base driver adapter
 /// and by `InterposeChain` to allow recursive dispatch.
 pub trait OctetNext: Send + Sync {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult>;
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult;
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize>;
     fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()>;
 }
@@ -128,7 +175,7 @@ pub trait OctetInterpose: Send + Sync {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult>;
+    ) -> OctetReadResult;
 
     fn write(
         &mut self,
@@ -389,7 +436,7 @@ impl OctetInterposeStack {
         user: &AsynUser,
         buf: &mut [u8],
         base: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         let addr = user.addr;
         let Some(layers) = self.chain_mut(addr) else {
             return base.read(user, buf);
@@ -452,7 +499,7 @@ struct InterposeChain<'a> {
 }
 
 impl OctetNext for InterposeChain<'_> {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         if let Some((first, rest)) = self.layers.split_first_mut() {
             let mut next = InterposeChain {
                 layers: rest,
@@ -512,14 +559,15 @@ mod tests {
     }
 
     impl OctetNext for MockBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let n = self.read_data.len().min(buf.len());
             buf[..n].copy_from_slice(&self.read_data[..n]);
-            Ok(OctetReadResult {
+            OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::CNT,
                 taken_back: 0,
-            })
+                status: Ok(()),
+            }
         }
 
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -542,7 +590,7 @@ mod tests {
             user: &AsynUser,
             buf: &mut [u8],
             next: &mut dyn OctetNext,
-        ) -> AsynResult<OctetReadResult> {
+        ) -> OctetReadResult {
             next.read(user, buf)
         }
         fn write(
@@ -567,7 +615,7 @@ mod tests {
             user: &AsynUser,
             buf: &mut [u8],
             next: &mut dyn OctetNext,
-        ) -> AsynResult<OctetReadResult> {
+        ) -> OctetReadResult {
             next.read(user, buf)
         }
         fn write(
@@ -591,7 +639,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let result = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let result = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(result.nbytes_transferred, 5);
         assert_eq!(&buf[..5], b"hello");
     }
@@ -605,7 +653,7 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
 
-        let result = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let result = stack.dispatch_read(&user, &mut buf, &mut base).expect_ok();
         assert_eq!(result.nbytes_transferred, 5);
         assert_eq!(&buf[..5], b"world");
     }
@@ -670,7 +718,7 @@ mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -727,7 +775,7 @@ mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -808,12 +856,13 @@ mod tests {
     fn every_layer_above_eos_passes_taken_back_up() {
         struct TakesBack;
         impl OctetNext for TakesBack {
-            fn read(&mut self, _: &AsynUser, _: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Ok(OctetReadResult {
+            fn read(&mut self, _: &AsynUser, _: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::EOS,
                     taken_back: 1,
-                })
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
@@ -834,7 +883,7 @@ mod tests {
             let mut buf = [0u8; 4];
             let r = stack
                 .dispatch_read(&AsynUser::default(), &mut buf, &mut TakesBack)
-                .unwrap();
+                .expect_ok();
             assert_eq!((r.nbytes_transferred, r.taken_back), (0, 1));
         }
     }

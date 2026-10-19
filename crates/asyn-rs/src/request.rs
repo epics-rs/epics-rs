@@ -68,6 +68,11 @@ impl<F: ?Sized> std::fmt::Debug for OnceCall<F> {
 /// process to process.
 pub trait PortCalls {
     fn call(&mut self, op: &RequestOp, user: crate::user::AsynUser) -> AsynResult<RequestResult>;
+
+    /// An octet read on the port, its bytes beside its status.
+    fn octet_read(&mut self, op: OctetReadOp, user: crate::user::AsynUser) -> OctetRead {
+        octet_outcome(self.call(&op.into_op(), user))
+    }
 }
 
 /// Why a queued [`RequestCell`] left its queue without running — the three
@@ -865,6 +870,148 @@ impl ParamSetValue {
     }
 }
 
+/// The octet read ops' proof of origin: only asyn-rs builds one, so an octet
+/// read reaches a port only through [`OctetReadOp`] and the entry points that
+/// answer it with an [`OctetRead`]. A generic `submit` replies with
+/// `AsynResult<RequestResult>`, where a `?` on a timeout would drop the bytes C
+/// hands back beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadEntry(());
+
+impl ReadEntry {
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
+}
+
+/// An octet read as a caller asks for it — C `asynOctet::read`, asynRecord's
+/// binary read, and `asynOctetSyncIO::writeRead`.
+#[derive(Debug, Clone)]
+pub enum OctetReadOp {
+    Read {
+        buf_size: usize,
+    },
+    /// See [`RequestOp::OctetReadBinary`].
+    ReadBinary {
+        buf_size: usize,
+    },
+    /// `asynOctetSyncIO::writeRead`: flush, write, read, as one request
+    /// ([`RequestOp::OctetWriteRead`] with `flush`).
+    WriteRead {
+        data: Vec<u8>,
+        buf_size: usize,
+    },
+}
+
+impl OctetReadOp {
+    /// Crate-only: a submitted octet read op is answered only through
+    /// [`octet_outcome`].
+    pub(crate) fn into_op(self) -> RequestOp {
+        let entry = ReadEntry(());
+        match self {
+            OctetReadOp::Read { buf_size } => RequestOp::OctetRead { buf_size, entry },
+            OctetReadOp::ReadBinary { buf_size } => RequestOp::OctetReadBinary { buf_size, entry },
+            OctetReadOp::WriteRead { data, buf_size } => RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush: true,
+                entry,
+            },
+        }
+    }
+}
+
+/// C `asynOctet::read`'s whole outcome: the bytes and the eom reason it writes
+/// out, and the status it returns beside them. C gives `*nbytesTransferred`
+/// whatever the status (asynInterposeEos.c:255-257) and drivers publish those
+/// bytes on a timeout (mar345.cpp:262-268), so the bytes come only out of
+/// [`Self::into_parts`], next to the status.
+#[must_use = "an octet read hands back its bytes even when it fails"]
+#[derive(Debug)]
+pub struct OctetRead {
+    data: Vec<u8>,
+    eom: crate::interpose::EomReason,
+    taken_back: usize,
+    status: AsynResult<()>,
+}
+
+impl OctetRead {
+    pub fn new(data: Vec<u8>, eom: crate::interpose::EomReason, status: AsynResult<()>) -> Self {
+        Self {
+            data,
+            eom,
+            taken_back: 0,
+            status,
+        }
+    }
+
+    /// A read that moved nothing: it never ran, or failed before the read.
+    pub fn failed(e: AsynError) -> Self {
+        Self::new(Vec::new(), crate::interpose::EomReason::empty(), Err(e))
+    }
+
+    /// The chain's outcome, `buf` cut to the bytes it transferred.
+    pub(crate) fn from_chain(mut buf: Vec<u8>, r: crate::interpose::OctetReadResult) -> Self {
+        buf.truncate(r.nbytes_transferred);
+        Self {
+            data: buf,
+            eom: r.eom_reason,
+            taken_back: r.taken_back,
+            status: r.status,
+        }
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn status(&self) -> &AsynResult<()> {
+        &self.status
+    }
+
+    /// The bytes and the status, together.
+    pub fn into_parts(self) -> (Vec<u8>, AsynResult<()>) {
+        (self.data, self.status)
+    }
+
+    pub fn eom(&self) -> crate::interpose::EomReason {
+        self.eom
+    }
+
+    /// See [`crate::interpose::OctetReadResult::taken_back`].
+    pub fn taken_back(&self) -> usize {
+        self.taken_back
+    }
+
+    /// C `*nbytesTransferred`, before [`Self::taken_back`].
+    pub fn nbytes_transferred(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Tag a failure with the octet step it came from.
+    pub(crate) fn in_octet_step(mut self, step: crate::error::OctetStep) -> Self {
+        self.status = self.status.map_err(|e| e.in_octet_step(step));
+        self
+    }
+}
+
+/// The [`OctetRead`] a submitted octet read op answered: the actor's, or an
+/// empty failure for a request that never reached the read. Only devAsynOctet's
+/// unflushed write-read skips the read (on a short write), and it reads the
+/// result itself.
+pub(crate) fn octet_outcome(ran: AsynResult<RequestResult>) -> OctetRead {
+    match ran {
+        Ok(RequestResult {
+            octet: Some(read), ..
+        }) => read,
+        Ok(_) => OctetRead::failed(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "octet request made no read".into(),
+        }),
+        Err(e) => OctetRead::failed(e),
+    }
+}
+
 /// Operation the worker thread will dispatch to the port driver.
 #[derive(Debug, Clone)]
 pub enum RequestOp {
@@ -873,10 +1020,12 @@ pub enum RequestOp {
     },
     OctetRead {
         buf_size: usize,
+        entry: ReadEntry,
     },
     OctetWriteRead {
         data: Vec<u8>,
         buf_size: usize,
+        entry: ReadEntry,
         /// Whether to drain the driver's input buffer before the write.
         /// `true` = `asynOctetSyncIO::writeRead` (flush → write → read), the
         /// StreamDevice/asynRecord pattern that discards stale warm-line bytes.
@@ -901,6 +1050,7 @@ pub enum RequestOp {
     /// the EOS is restored on every exit path.
     OctetReadBinary {
         buf_size: usize,
+        entry: ReadEntry,
     },
     Int32Write {
         value: i32,
@@ -1242,11 +1392,12 @@ pub enum RequestOp {
 pub struct RequestResult {
     pub status: AsynStatus,
     pub message: String,
+    /// Bytes an octet write moved: the write, or a write-read's write half.
     pub nbytes: usize,
-    /// An octet read's [`crate::interpose::OctetReadResult::taken_back`]: C's
-    /// `*nbytesTransferred` is `nbytes - taken_back`.
-    pub taken_back: usize,
     pub data: Option<Vec<u8>>,
+    /// An octet read op's outcome, bytes and status together. `None` on an
+    /// unflushed write-read whose write came up short, which reads nothing.
+    pub(crate) octet: Option<OctetRead>,
     pub int_val: Option<i32>,
     pub int64_val: Option<i64>,
     pub float_val: Option<f64>,
@@ -1296,15 +1447,6 @@ pub struct RequestResult {
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
     pub bounds: Option<(i64, i64)>,
-    /// End-of-message reason flags from an octet read.
-    ///
-    /// C parity: `asynOctet::read` returns `nbytes` together with
-    /// `int *eomReason` (`interfaces/asynOctet.h:38-40`). The flags
-    /// `ASYN_EOM_CNT | ASYN_EOM_EOS | ASYN_EOM_END` mirror
-    /// [`crate::interpose::EomReason`]. Stored as `u32` so the
-    /// request layer stays bitflag-crate-free; converters live on
-    /// `EomReason::from_bits_truncate`.
-    pub eom_reason: u32,
     /// The bound `dpCommon`'s cells (from ConnectUser).
     pub dp: Option<crate::port::DpCells>,
 }
@@ -1315,8 +1457,8 @@ impl RequestResult {
             status: AsynStatus::Success,
             message: String::new(),
             nbytes: 0,
-            taken_back: 0,
             data: None,
+            octet: None,
             int_val: None,
             int64_val: None,
             float_val: None,
@@ -1338,7 +1480,6 @@ impl RequestResult {
             aux_status: AsynStatus::Success,
             option_value: None,
             bounds: None,
-            eom_reason: 0,
             dp: None,
         }
     }
@@ -1358,38 +1499,38 @@ impl RequestResult {
         }
     }
 
-    pub fn octet_read(buf: Vec<u8>, nbytes: usize) -> Self {
+    /// An octet read op's reply: `nbytes` is its write half's count.
+    pub fn octet_read(read: OctetRead, nbytes: usize) -> Self {
         Self {
             nbytes,
-            data: Some(buf),
+            octet: Some(read),
             ..Self::base()
         }
     }
 
-    /// Variant of [`Self::octet_read`] that carries the
-    /// end-of-message reason flags returned by
-    /// [`crate::port::PortDriver::io_read_octet_eom`]. The raw `u32`
-    /// is decoded with `EomReason::from_bits_truncate` on the
-    /// consumer side.
-    pub fn octet_read_eom(buf: Vec<u8>, nbytes: usize, eom_reason: u32) -> Self {
+    /// A `GetInputEos`/`GetOutputEos` reply: the terminator in `data`.
+    pub fn eos_read(eos: Vec<u8>) -> Self {
         Self {
-            nbytes,
-            data: Some(buf),
-            eom_reason,
+            nbytes: eos.len(),
+            data: Some(eos),
             ..Self::base()
         }
     }
 
-    /// An octet read through the port's interpose chain, `buf` already cut to
-    /// the bytes `r` transferred.
-    pub fn octet_read_chain(buf: Vec<u8>, r: &crate::interpose::OctetReadResult) -> Self {
-        Self {
-            nbytes: r.nbytes_transferred,
-            taken_back: r.taken_back,
-            data: Some(buf),
-            eom_reason: r.eom_reason.bits(),
-            ..Self::base()
-        }
+    /// The octet read a test's reply must carry.
+    #[cfg(test)]
+    pub(crate) fn into_read(self) -> OctetRead {
+        self.octet.expect("the reply carries an octet read")
+    }
+
+    /// The failure of the octet read this reply carries.
+    pub fn octet_error(&self) -> Option<&AsynError> {
+        self.octet.as_ref()?.status().as_ref().err()
+    }
+
+    /// The octet read this reply carries, if the op made one.
+    pub fn octet(&self) -> Option<&OctetRead> {
+        self.octet.as_ref()
     }
 
     pub fn int32_read(value: i32) -> Self {
@@ -2029,14 +2170,40 @@ mod tests {
     #[test]
     fn octet_read_chain_keeps_the_taken_back_byte() {
         use crate::interpose::{EomReason, OctetReadResult};
-        let r = RequestResult::octet_read_chain(
-            Vec::new(),
-            &OctetReadResult {
+        let r = OctetRead::from_chain(
+            vec![0; 4],
+            OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::EOS,
                 taken_back: 1,
+                status: Ok(()),
             },
         );
-        assert_eq!((r.nbytes, r.taken_back, r.eom_reason), (0, 1, 0x02));
+        assert_eq!(
+            (r.nbytes_transferred(), r.taken_back(), r.eom()),
+            (0, 1, EomReason::EOS)
+        );
+    }
+
+    /// The bytes ride beside a failing status, so a timeout after a partial
+    /// line still hands them over (asynInterposeEos.c:255-257).
+    #[test]
+    fn a_failed_read_keeps_its_bytes() {
+        use crate::interpose::{EomReason, OctetReadResult};
+        let r = OctetRead::from_chain(
+            b"abcxx".to_vec(),
+            OctetReadResult {
+                nbytes_transferred: 3,
+                eom_reason: EomReason::empty(),
+                taken_back: 0,
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+            },
+        );
+        let (data, status) = r.into_parts();
+        assert_eq!(data, b"abc");
+        assert_eq!(status.unwrap_err().status(), AsynStatus::Timeout);
     }
 }

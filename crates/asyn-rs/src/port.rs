@@ -3129,16 +3129,29 @@ pub trait PortDriver: Any + Send + Sync {
 
     /// C `asynPortDriver::readOctet`: `getStringParam(maxChars)` keeps at most
     /// `maxChars - 1` bytes and the NUL, and `*nActual = strlen(value) + 1`
-    /// counts that NUL — a waveform's NORD includes it.
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    /// counts that NUL — a waveform's NORD includes it. The eomReason is
+    /// always `ASYN_EOM_END`.
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         let base = self.base();
-        let addr = base.parse_user(user)?;
+        let addr = match base.parse_user(user) {
+            Ok(addr) => addr,
+            Err(e) => return OctetReadResult::failed(e),
+        };
         let params = &base.params;
-        let bytes = base.get_string_param(user.reason, addr).map_err(|e| {
-            param_access_error(params, user, "readOctet", e, format_args!("value="))
-        })?;
+        let bytes = match base.get_string_param(user.reason, addr) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return OctetReadResult::failed(param_access_error(
+                    params,
+                    user,
+                    "readOctet",
+                    e,
+                    format_args!("value="),
+                ));
+            }
+        };
         let Some(room) = buf.len().checked_sub(1) else {
-            return Ok(0);
+            return OctetReadResult::ok(0, EomReason::END);
         };
         let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
         let n = text.len().min(room);
@@ -3149,7 +3162,7 @@ pub trait PortDriver: Any + Send + Sync {
             "readOctet",
             format_args!("{}", crate::fixed_text::LossyText(&buf[..n])),
         );
-        Ok(n + 1)
+        OctetReadResult::ok(n + 1, EomReason::END)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3310,32 +3323,12 @@ pub trait PortDriver: Any + Send + Sync {
     // Default: delegate to cache-based read_*/write_* for backward compat.
     // Real I/O drivers override these for actual hardware access.
 
-    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    /// The octet read the port runs, below its interpose chain (C
+    /// `asynOctet::read`). The count rides beside the status, so a read that
+    /// times out after transferring bytes reports them; drivers with real
+    /// end-of-message information (EOS match, GPIB END, a full buffer) set it.
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         self.read_octet(user, buf)
-    }
-
-    /// Octet read that also reports the end-of-message reason — C
-    /// parity for `asynOctet::read(... int *eomReason)`
-    /// (`asynOctet.h:38-40`). The default implementation delegates to
-    /// [`Self::io_read_octet`] and reconstructs a synthetic
-    /// [`EomReason`]: `CNT` when the buffer filled, `empty` otherwise.
-    /// Drivers that have native EOM information
-    /// (`asynOctetSyncIO::read`, GPIB END, EOS match) must
-    /// override this method so consumers — `asynRecord::EOMR`,
-    /// `asynOctetSyncIO::read` mirrors — receive the real flags.
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
-        let cap = buf.len();
-        let n = self.io_read_octet(user, buf)?;
-        let eom = if n >= cap && cap > 0 {
-            EomReason::CNT
-        } else {
-            EomReason::empty()
-        };
-        Ok((n, eom))
     }
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3617,8 +3610,12 @@ impl OctetNext for DriverOctetLink<'_> {
     /// read, not one per EOS-completed message. Firing above the chain (as the
     /// port actor used to) handed an I/O-Intr record `"abc"`/EOMR=EOS where C
     /// hands it `"abc\r\n"`/EOMR=CNT|END.
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-        let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        let r = self.driver.io_read_octet(user, buf);
+        if r.status.is_err() {
+            return r;
+        }
+        let (nbytes_transferred, eom_reason) = (r.nbytes_transferred, r.eom_reason);
         if self.driver.base().octet_interrupt_process {
             let raw = &buf[..nbytes_transferred];
             // C's rule for a device read: `addr` decides, `reason` is never
@@ -3641,11 +3638,7 @@ impl OctetNext for DriverOctetLink<'_> {
                 },
             );
         }
-        Ok(OctetReadResult {
-            nbytes_transferred,
-            eom_reason,
-            taken_back: 0,
-        })
+        r
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3698,7 +3691,7 @@ pub(crate) fn octet_read_chain(
     driver: &mut dyn PortDriver,
     user: &AsynUser,
     buf: &mut [u8],
-) -> AsynResult<OctetReadResult> {
+) -> OctetReadResult {
     with_octet_chain(driver, |chain, link| chain.dispatch_read(user, buf, link))
 }
 
@@ -3765,7 +3758,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A driver whose `io_read_octet_eom` hands back one scripted chunk per
+    /// A driver whose `io_read_octet` hands back one scripted chunk per
     /// call, with the driver-level eomReason C would report (CNT when the
     /// caller's buffer filled, END never — a stream driver has no message
     /// boundary). The EOS layer above it is what turns chunks into messages.
@@ -3801,11 +3794,7 @@ pub(crate) mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let chunk = self.chunks.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
             let n = chunk.len().min(buf.len());
@@ -3815,7 +3804,7 @@ pub(crate) mod tests {
             } else {
                 EomReason::empty()
             };
-            Ok((n, eom))
+            OctetReadResult::ok(n, eom)
         }
     }
 
@@ -3855,9 +3844,7 @@ pub(crate) mod tests {
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
-        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
 
         // The CALLER gets the EOS-terminated message, terminator stripped.
         assert_eq!(&buf[..n], b"abc");
@@ -3892,12 +3879,8 @@ pub(crate) mod tests {
             .unwrap();
         let user = AsynUser::default();
         let mut buf = [0u8; 4];
-        octet_read_chain(&mut drv, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
-        octet_read_chain(&mut drv, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+        octet_read_chain(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(*seen.lock().unwrap(), [EomReason::CNT, EomReason::empty()]);
     }
 
@@ -3969,9 +3952,7 @@ pub(crate) mod tests {
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
-        let (n, _eom) = octet_read_chain(&mut drv, &user, &mut buf)
-            .map(|r| (r.nbytes_transferred, r.eom_reason))
-            .unwrap();
+        let (n, _eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
 
         assert_eq!(&buf[..n], RAW, "the caller gets the device bytes");
         assert_eq!(
@@ -4130,12 +4111,16 @@ pub(crate) mod tests {
         drv.write_octet(&mut user, b"hello").unwrap();
         let user = AsynUser::new(2);
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
-        // C readOctet: `*nActual = strlen(value) + 1`.
+        let (n, eom) = drv.read_octet(&user, &mut buf).unwrap();
+        // C readOctet: `*nActual = strlen(value) + 1`, `*eomReason = END`.
         assert_eq!(&buf[..n], b"hello\0");
+        assert_eq!(eom, EomReason::END);
         // getStringParam(maxChars) keeps maxChars - 1 bytes and the NUL.
         let mut short = [0xffu8; 4];
-        assert_eq!(drv.read_octet(&user, &mut short).unwrap(), 4);
+        assert_eq!(
+            drv.read_octet(&user, &mut short).unwrap(),
+            (4, EomReason::END)
+        );
         assert_eq!(&short, b"hel\0");
     }
 
@@ -4648,7 +4633,7 @@ pub(crate) mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -4688,16 +4673,17 @@ pub(crate) mod tests {
             pos: usize,
         }
         impl OctetNext for RawSource {
-            fn read(&mut self, _u: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _u: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 let avail = self.data.len() - self.pos;
                 let n = avail.min(buf.len());
                 buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
                 self.pos += n;
-                Ok(OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: n,
                     eom_reason: EomReason::CNT,
                     taken_back: 0,
-                })
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
@@ -4729,7 +4715,7 @@ pub(crate) mod tests {
             .base_mut()
             .interpose_octet
             .dispatch_read(&user, &mut buf, &mut src)
-            .unwrap();
+            .expect_ok();
         assert_eq!(&buf[..r.nbytes_transferred], b"ab");
         assert!(r.eom_reason.contains(EomReason::EOS));
 
@@ -4746,7 +4732,7 @@ pub(crate) mod tests {
             .base_mut()
             .interpose_octet
             .dispatch_read(&user, &mut buf2, &mut src2)
-            .unwrap();
+            .expect_ok();
         assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
         assert!(!r2.eom_reason.contains(EomReason::EOS));
     }
@@ -4961,7 +4947,7 @@ pub(crate) mod tests {
                 user: &AsynUser,
                 buf: &mut [u8],
                 next: &mut dyn OctetNext,
-            ) -> AsynResult<OctetReadResult> {
+            ) -> OctetReadResult {
                 next.read(user, buf)
             }
             fn write(
@@ -5966,6 +5952,7 @@ pub(crate) mod tests {
         let mut buf = [0u8; 16];
         assert!(matches!(
             drv.read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf)
+                .status
                 .as_ref()
                 .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
@@ -6002,7 +5989,7 @@ pub(crate) mod tests {
                 .unwrap(),
             1.5
         );
-        let n = drv
+        let (n, _) = drv
             .read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf)
             .unwrap();
         assert_eq!(&buf[..n], b"hi\0");

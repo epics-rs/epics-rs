@@ -680,7 +680,7 @@ impl IpIoInner {
 }
 
 impl IpIoState {
-    fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
         // C readIt (drvAsynIPPort.c:776-785) asks the socket, not the manager:
         // the enabled/connected gate is `queueRequest`'s, and a reader under
         // `lockPort` never passes it.
@@ -716,23 +716,18 @@ impl IpIoState {
                     // then closes the fd). Returning an error here would hide
                     // END from close-delimited protocols (HTTP/1.0) that use
                     // connection-close as the message terminator.
-                    Ok(0) => Ok(OctetReadResult {
-                        nbytes_transferred: 0,
-                        eom_reason: EomReason::END,
-                        taken_back: 0,
-                    }),
-                    Ok(n) => Ok(OctetReadResult {
-                        nbytes_transferred: n,
+                    Ok(0) => Ok((0, EomReason::END)),
+                    Ok(n) => {
                         // C parity: CNT means the requested count was
                         // reached. A short read leaves the reason empty
                         // so the EOS interpose keeps reading.
-                        eom_reason: if n >= buf.len() {
+                        let eom = if n >= buf.len() {
                             EomReason::CNT
                         } else {
                             EomReason::empty()
-                        },
-                        taken_back: 0,
-                    }),
+                        };
+                        Ok((n, eom))
+                    }
                     Err(e) => Err(classify_read_error(e)),
                 }
             }
@@ -755,18 +750,17 @@ impl IpIoState {
                     // close — the EOF/ASYN_EOM_END branch (line 815) is
                     // SOCK_STREAM only. Report a successful zero-byte read and
                     // leave the socket open (no teardown).
-                    Ok((n, _src)) => Ok(OctetReadResult {
-                        nbytes_transferred: n,
+                    Ok((n, _src)) => {
                         // C parity: CNT means the requested count was
                         // reached. A short read leaves the reason empty
                         // so the EOS interpose keeps reading.
-                        eom_reason: if n >= buf.len() {
+                        let eom = if n >= buf.len() {
                             EomReason::CNT
                         } else {
                             EomReason::empty()
-                        },
-                        taken_back: 0,
-                    }),
+                        };
+                        Ok((n, eom))
+                    }
                     Err(e) => Err(classify_read_error(e)),
                 }
             }
@@ -783,23 +777,18 @@ impl IpIoState {
                 match r {
                     // Unix-domain stream EOF = peer closed = END, the same
                     // stream semantics as the TCP arm above.
-                    Ok(0) => Ok(OctetReadResult {
-                        nbytes_transferred: 0,
-                        eom_reason: EomReason::END,
-                        taken_back: 0,
-                    }),
-                    Ok(n) => Ok(OctetReadResult {
-                        nbytes_transferred: n,
+                    Ok(0) => Ok((0, EomReason::END)),
+                    Ok(n) => {
                         // C parity: CNT means the requested count was
                         // reached. A short read leaves the reason empty
                         // so the EOS interpose keeps reading.
-                        eom_reason: if n >= buf.len() {
+                        let eom = if n >= buf.len() {
                             EomReason::CNT
                         } else {
                             EomReason::empty()
-                        },
-                        taken_back: 0,
-                    }),
+                        };
+                        Ok((n, eom))
+                    }
                     Err(e) => Err(classify_read_error(e)),
                 }
             }
@@ -885,18 +874,16 @@ fn trace_read(user: &AsynUser, device: &str, from: Option<std::net::SocketAddr>,
 }
 
 impl OctetNext for IpIoState {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         user.print(
             TraceMask::FLOW,
             file!(),
             line!(),
             format_args!("{} read.\n", self.host_info),
         );
-        let result = self.recv(user, buf);
-        if let Ok(r) = &result {
-            self.n_read += r.nbytes_transferred as u64;
-        }
-        result
+        let r = OctetReadResult::from(self.recv(user, buf));
+        self.n_read += r.nbytes_transferred as u64;
+        r
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1093,7 +1080,7 @@ struct ComLink<'a> {
 }
 
 impl OctetNext for ComLink<'_> {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         self.com.read(user, buf, self.io)
     }
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1182,9 +1169,8 @@ fn classify_read_failure(
     timeout: Option<Duration>,
     device_name: &str,
 ) -> ReadFailure {
-    // Classify by the carried status, not the variant: an interpose below may
-    // wrap the lower-layer timeout in `PartialRead`, and a variant match would
-    // miss it.
+    // Classify by the carried status, not the variant: a wrapped lower-layer
+    // timeout would miss a variant match.
     let is_timeout = e.status() == AsynStatus::Timeout;
     // C tests the *sign*: `(tty->disconnectOnReadTimeout) && (pasynUser->timeout
     // > 0)` (drvAsynIPPort.c:853). A negative timeout — `None` here — is not
@@ -1198,11 +1184,8 @@ fn classify_read_failure(
             error: e,
         };
     }
-    // C writes `pasynUser->errorMessage` and the status together (:852-866)
-    // — while the partial transfer already in the caller's buffer stands, because
-    // `*nbytesTransferred = thisRead` (:878) runs on both branches. So restamp the
-    // failure and re-attach whatever the read did deliver.
-    let partial = e.partial_read().cloned();
+    // C writes `pasynUser->errorMessage` and the status together (:852-866);
+    // the count beside it (:878) stands, and rides in the read's result.
     let cause = sock_err_cause(&e);
     let restamped = if disconnect {
         AsynError::Status {
@@ -1217,10 +1200,7 @@ fn classify_read_failure(
     };
     ReadFailure {
         disconnect,
-        error: match partial {
-            Some(p) => restamped.with_partial_read(p),
-            None => restamped,
-        },
+        error: restamped,
     }
 }
 
@@ -1250,22 +1230,21 @@ struct NegotiationLink<'a> {
 }
 
 impl OctetNext for NegotiationLink<'_> {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-        match self.io.read(user, buf) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                let failure = classify_read_failure(
-                    e,
-                    self.disconnect_on_read_timeout,
-                    user.timeout,
-                    &self.io.host_info,
-                );
-                if failure.disconnect {
-                    self.teardown = Some("Read error");
-                }
-                Err(failure.error)
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        let mut r = self.io.read(user, buf);
+        if let Err(e) = r.status {
+            let failure = classify_read_failure(
+                e,
+                self.disconnect_on_read_timeout,
+                user.timeout,
+                &self.io.host_info,
+            );
+            if failure.disconnect {
+                self.teardown = Some("Read error");
             }
+            r.status = Err(failure.error);
         }
+        r
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1434,11 +1413,9 @@ pub(crate) fn nonblock_failure_text(device: &str, e: &std::io::Error) -> String 
     )
 }
 
-/// The `sockerrmsg` a failed read carries up to [`classify_read_failure`]:
-/// the socket error's text through any partial-read carrier.
+/// The `sockerrmsg` a failed read carries up to [`classify_read_failure`].
 fn sock_err_cause(e: &AsynError) -> String {
     match e {
-        AsynError::PartialRead { source, .. } => sock_err_cause(source),
         AsynError::Io(io) => super::errno_text(io),
         other => other.message(),
     }
@@ -1524,71 +1501,50 @@ impl DrvAsynIPPort {
         );
     }
 
-    /// Shared read core for [`PortDriver::read_octet`] (which drops the EOM
-    /// reason) and [`PortDriver::io_read_octet_eom`] (which keeps it).
+    /// The read core behind [`PortDriver::io_read_octet`].
     /// Dispatches the interpose chain once and applies the C
     /// `closeConnection` teardown on a fatal error, a
     /// `disconnectOnReadTimeout` timeout, or a TCP EOF (which the base read
-    /// reports as `ASYN_EOM_END`). Returning the real `eom_reason` here is
-    /// what lets END/EOS reach the actor — the `usize`-only `read_octet`
-    /// would otherwise discard it, so END was never emitted anywhere.
-    fn read_octet_core(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
+    /// reports as `ASYN_EOM_END`).
+    fn read_octet_core(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         // HTTP connect-per-transaction: open the socket if there isn't one
         // (C readIt, drvAsynIPPort.c:776-780). The link stays logically
         // connected, so this keys off the socket, not `connected`.
         if self.per_transaction() && self.io.inner.is_none() {
-            self.connect_it(user)?;
-        }
-        let result = self.with_base_link(|link| link.read(user, buf));
-        match result {
-            Ok(r) => {
-                // C drvAsynIPPort.c::readIt (815-819): a TCP EOF (reported
-                // as ASYN_EOM_END by the base read) is the *only* thing that
-                // closes the connection on a successful read. HTTP is
-                // connect-per-transaction but the response still ends on the
-                // server's close (HTTP/1.0 connection-close = EOF), so it
-                // must drop on EOF too — and ONLY on EOF. Dropping after
-                // every HTTP read (the old `|| Http`) truncated multi-segment
-                // responses: a first read returning one TCP segment (no END)
-                // tore the socket down before the caller could read the rest.
-                // `drop_connection` keeps the logical connection up for HTTP
-                // (no Connect-exception flap); the socket reopens lazily on
-                // the next write.
-                let eof = r.eom_reason.contains(EomReason::END);
-                if eof && self.base.is_connected() {
-                    self.drop_connection(user, "Read from broken connection", false);
-                }
-                Ok((r.nbytes_transferred, r.eom_reason))
-            }
-            Err(e) => {
-                // Classify by the carried status, not by the variant — the
-                // same rule `is_fatal_transport_error` already follows. The
-                // read below is dispatched through the interpose chain, and
-                // `drvAsynIPPortConfigure` installs the EOS interpose by
-                // default (iocsh.rs), which wraps *every* lower-layer failure
-                // — including a zero-byte recv timeout — as `PartialRead`
-                // (C `asynInterposeEos.c:242-253` likewise returns the
-                // lower-layer `asynTimeout`, unchanged, alongside the count).
-                // A variant match therefore never saw a timeout on a default
-                // IP port and `disconnectOnReadTimeout` could not fire; C runs
-                // its test inside readIt, below the interpose, where the raw
-                // recv timeout is visible (drvAsynIPPort.c:851-860).
-                let failure = classify_read_failure(
-                    e,
-                    self.disconnect_on_read_timeout,
-                    user.timeout,
-                    &self.io.host_info,
-                );
-                if failure.disconnect && self.base.is_connected() {
-                    self.drop_connection(user, "Read error", false);
-                }
-                Err(failure.error)
+            if let Err(e) = self.connect_it(user) {
+                return OctetReadResult::failed(e);
             }
         }
+        let mut r = self.with_base_link(|link| link.read(user, buf));
+        if let Err(e) = r.status {
+            // C runs its test inside readIt, below the interpose, where the
+            // raw recv timeout is visible (drvAsynIPPort.c:851-860).
+            let failure = classify_read_failure(
+                e,
+                self.disconnect_on_read_timeout,
+                user.timeout,
+                &self.io.host_info,
+            );
+            if failure.disconnect && self.base.is_connected() {
+                self.drop_connection(user, "Read error", false);
+            }
+            r.status = Err(failure.error);
+        } else if r.eom_reason.contains(EomReason::END) && self.base.is_connected() {
+            // C drvAsynIPPort.c::readIt (815-819): a TCP EOF (reported
+            // as ASYN_EOM_END by the base read) is the *only* thing that
+            // closes the connection on a successful read. HTTP is
+            // connect-per-transaction but the response still ends on the
+            // server's close (HTTP/1.0 connection-close = EOF), so it
+            // must drop on EOF too — and ONLY on EOF. Dropping after
+            // every HTTP read (the old `|| Http`) truncated multi-segment
+            // responses: a first read returning one TCP segment (no END)
+            // tore the socket down before the caller could read the rest.
+            // `drop_connection` keeps the logical connection up for HTTP
+            // (no Connect-exception flap); the socket reopens lazily on
+            // the next write.
+            self.drop_connection(user, "Read from broken connection", false);
+        }
+        r
     }
 
     /// Create a new IP port driver.
@@ -2067,15 +2023,7 @@ impl PortDriver for DrvAsynIPPort {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.read_octet_core(user, buf).map(|(n, _eom)| n)
-    }
-
-    fn io_read_octet_eom(
-        &mut self,
-        user: &AsynUser,
-        buf: &mut [u8],
-    ) -> AsynResult<(usize, EomReason)> {
+    fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         // Override the synthetic default so the real END/EOS reason from the
         // base read + interpose chain reaches the actor (C reports eomReason
         // from readIt; END marks a TCP EOF, EOS an input-EOS match).
@@ -2253,7 +2201,8 @@ mod tests {
     /// ends at, so a test that wants the EOS layer must enter above it, exactly
     /// as `PortActor` does.
     fn chain_read(drv: &mut DrvAsynIPPort, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        crate::port::octet_read_chain(drv, user, buf).map(|r| r.nbytes_transferred)
+        let r = crate::port::octet_read_chain(drv, user, buf);
+        r.status.map(|()| r.nbytes_transferred)
     }
 
     /// Gated with its only caller,
@@ -2265,7 +2214,8 @@ mod tests {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        crate::port::octet_read_chain(drv, user, buf).map(|r| (r.nbytes_transferred, r.eom_reason))
+        let r = crate::port::octet_read_chain(drv, user, buf);
+        r.status.map(|()| (r.nbytes_transferred, r.eom_reason))
     }
 
     fn chain_flush(drv: &mut DrvAsynIPPort, user: &mut AsynUser) -> AsynResult<()> {
@@ -2422,7 +2372,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"hello");
 
         handle.join().unwrap();
@@ -2456,7 +2406,7 @@ mod tests {
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"hello").unwrap();
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(n, 5);
         handle.join().unwrap();
 
@@ -2512,7 +2462,7 @@ mod tests {
         assert!(drv.io.inner.is_none());
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 5];
-        let (n, _) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, _) = drv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"HELLO");
         server.join().unwrap();
     }
@@ -2596,7 +2546,7 @@ mod tests {
 
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 4];
-        let (n1, eom1) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        let (n1, eom1) = drv.io_read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(&buf[..n1], b"AAAA");
         assert!(!eom1.contains(EomReason::END), "first chunk is not EOF");
         // The bug tore the socket down here; the fix keeps it up so the rest
@@ -2610,7 +2560,7 @@ mod tests {
             "socket must remain open mid-response"
         );
 
-        let (n2, _) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        let (n2, _) = drv.io_read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(
             &buf[..n2],
             b"BBBB",
@@ -2619,7 +2569,7 @@ mod tests {
 
         // Third read hits the server's EOF -> END; the socket is released but
         // the logical connection stays up (connect-per-transaction = no flap).
-        let (n3, eom3) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        let (n3, eom3) = drv.io_read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(n3, 0);
         assert!(eom3.contains(EomReason::END));
         assert!(
@@ -2635,7 +2585,7 @@ mod tests {
             "socket must reopen lazily for the next transaction"
         );
         let mut buf2 = [0u8; 16];
-        let (n4, _) = drv.io_read_octet_eom(&ruser, &mut buf2).unwrap();
+        let (n4, _) = drv.io_read_octet(&ruser, &mut buf2).unwrap();
         assert_eq!(&buf2[..n4], b"CCCC");
 
         handle.join().unwrap();
@@ -2655,7 +2605,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(100));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         match err {
             AsynError::Status {
                 status: AsynStatus::Timeout,
@@ -2683,7 +2633,7 @@ mod tests {
         let mut buf = [0u8; 32];
         // C drvAsynIPPort.c::readIt (815-821): a TCP EOF returns success
         // with zero bytes and ASYN_EOM_END, then closes the connection.
-        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet(&user, &mut buf).unwrap();
         assert_eq!(n, 0);
         assert!(eom.contains(EomReason::END));
         // closeConnection ran, so the actor's reconnect can re-open it.
@@ -2772,7 +2722,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n1 = drv.read_octet(&user, &mut buf).unwrap();
+        let n1 = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert!(n1 > 0);
         assert!(n1 <= 5);
 
@@ -2894,7 +2844,7 @@ mod tests {
         // Data path in: 4 wire bytes unstuff to 3.
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 16];
-        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        let n = drv.io_read_octet(&ruser, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], &[b'X', IAC, b'Y']);
 
         server.join().unwrap();
@@ -3113,16 +3063,16 @@ mod tests {
     /// *normal* configuration, not a corner case. C runs its disconnect test
     /// inside readIt, below the interpose, on the raw recv timeout
     /// (drvAsynIPPort.c:851-860); asyn-rs runs it above the interpose, where
-    /// the same timeout arrives wrapped as `PartialRead` — so the test must
-    /// key off `e.status()`, not the error variant. Matching by variant made
-    /// the option inert on every default IP port.
+    /// the same timeout arrives with the interpose's transfer beside it — so
+    /// the test must key off `e.status()`, not the error variant. Matching by
+    /// variant made the option inert on every default IP port.
     #[test]
     fn disconnect_on_read_timeout_fires_through_the_eos_interpose() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
 
         let (listener, port) = start_echo_server();
         // The peer accepts and then says nothing: the read must time out with
-        // zero bytes, which the EOS interpose reports as PartialRead(Timeout, 0).
+        // zero bytes, which the EOS interpose reports as a Timeout with 0 bytes.
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             thread::sleep(Duration::from_millis(300));
@@ -3142,7 +3092,8 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
         let err = drv
-            .read_octet(&user, &mut buf)
+            .io_read_octet(&user, &mut buf)
+            .into_count()
             .expect_err("a silent peer must time the read out");
         // R11-47: the branch that closes the socket is the branch that reports
         // asynError (drvAsynIPPort.c:805) — the lower layer's asynTimeout does
@@ -3189,7 +3140,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         // R11-47 negative control: the non-teardown branch keeps C's asynTimeout
         // (drvAsynIPPort.c:865) — the restamp is the teardown branch's, not every
         // failed read's.
@@ -3215,36 +3166,43 @@ mod tests {
     /// regardless of status (asynRecord.c:1591,1627).
     #[test]
     fn a_torn_down_read_reports_asyn_error_and_still_carries_the_partial_bytes() {
-        use crate::interpose::PartialOctetRead;
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+        use std::io::Write;
 
-        let timeout = Duration::from_millis(50);
-        let partial = PartialOctetRead {
-            data: b"OK\n".to_vec(),
-            eom_reason: EomReason::empty(),
-        };
-        let timed_out = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(partial);
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"OK").unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
 
-        let f = classify_read_failure(timed_out, true, Some(timeout), "127.0.0.1:5001");
-        assert!(f.disconnect, "disconnectOnReadTimeout + timeout > 0");
-        assert_eq!(f.error.status(), AsynStatus::Error, "C :860");
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 32];
+        let r = crate::port::octet_read_chain(&mut drv, &user, &mut buf);
         assert_eq!(
-            f.error.message(),
-            "127.0.0.1:5001 read error: read timeout",
-            "C :856-858"
-        );
-        assert_eq!(
-            f.error.partial_read().map(|p| p.nbytes_transferred()),
-            Some(3),
+            &buf[..r.nbytes_transferred],
+            b"OK",
             "the transfer C writes out at :878 survives the restamp"
         );
+        let e = r.unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Error, "C :860");
+        assert_eq!(
+            e.message(),
+            format!("127.0.0.1:{port} read error: {}", would_block_text()),
+            "C :856-858"
+        );
+        assert!(!drv.base().is_connected());
+        handle.join().unwrap();
     }
 
-    /// R11-47 boundary: the three inputs of C's `should_disconnect` disjunct, each
-    /// at its own boundary, and the status each produces.
     #[test]
     fn the_read_failure_rule_matches_c_should_disconnect_at_every_boundary() {
         let timeout = || AsynError::Status {
@@ -3289,7 +3247,7 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:9999").unwrap();
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        assert!(drv.read_octet(&user, &mut buf).is_err());
+        assert!(drv.io_read_octet(&user, &mut buf).into_count().is_err());
         let mut user = AsynUser::new(0);
         assert!(drv.write_octet(&mut user, b"hello").is_err());
     }
@@ -3339,7 +3297,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"ping");
 
         handle.join().unwrap();
@@ -3383,7 +3341,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"pong");
 
         handle.join().unwrap();
@@ -3412,14 +3370,14 @@ mod tests {
         server.send_to(&[], src).unwrap();
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        let n = drv.io_read_octet(&ruser, &mut buf).into_count().unwrap();
         assert_eq!(n, 0);
         // The port must remain open — a 0-byte datagram is not EOF.
         assert!(drv.base().is_connected());
 
         // And it can still read a subsequent real datagram.
         server.send_to(b"world", src).unwrap();
-        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        let n = drv.io_read_octet(&ruser, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"world");
     }
 
@@ -3472,7 +3430,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
-        let _ = drv.read_octet(&user, &mut buf);
+        let _ = drv.io_read_octet(&user, &mut buf);
         assert!(!drv.base().is_connected());
     }
 
@@ -3545,7 +3503,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::ZERO);
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        let err = drv.io_read_octet(&user, &mut buf).unwrap_err();
         match err {
             AsynError::Status {
                 status: AsynStatus::Timeout,
@@ -3869,7 +3827,7 @@ mod tests {
 
         let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut empty: [u8; 0] = [];
-        let res = drv.read_octet(&ruser, &mut empty);
+        let res = drv.io_read_octet(&ruser, &mut empty).into_count();
         assert!(
             matches!(
                 res,
@@ -4669,7 +4627,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
         assert_eq!(&buf[..n], b"unix_hello");
 
         handle.join().unwrap();
@@ -4718,7 +4676,7 @@ mod tests {
         drv.write_octet(&mut wuser, b"CMD").unwrap();
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        let n = drv.io_read_octet(&ruser, &mut buf).into_count().unwrap();
         assert_eq!(
             &buf[..n],
             b"RESPONSE",
@@ -4821,7 +4779,7 @@ mod tests {
         let mut buf = [0u8; 8];
         for (err, text) in [
             (
-                drv.io_read_octet_eom(&user, &mut buf).unwrap_err(),
+                drv.io_read_octet(&user, &mut buf).unwrap_err(),
                 "127.0.0.1:9999 disconnected:",
             ),
             (

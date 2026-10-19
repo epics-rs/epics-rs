@@ -431,6 +431,13 @@ impl OctetDevice {
         self.sio.port()?.submit_blocking(op, self.user())
     }
 
+    fn octet_read(&self, op: crate::request::OctetReadOp) -> crate::request::OctetRead {
+        match self.sio.port() {
+            Ok(port) => port.submit_octet_read_blocking(op, self.user()),
+            Err(e) => crate::request::OctetRead::failed(e),
+        }
+    }
+
     fn trace_error(&self, args: std::fmt::Arguments<'_>) {
         self.sio.print(self.reason as i32, TraceMask::ERROR, args);
     }
@@ -540,15 +547,15 @@ fn octet_connect(mgr: &PortManager, ctx: &CommandContext, args: &[ArgValue]) -> 
 }
 
 /// C's success print for a read (:420-422, :494-496).
-fn print_octet_read(ctx: &CommandContext, r: &crate::request::RequestResult) {
-    ctx.println(&format!("eomReason {:#x}", r.eom_reason));
-    ctx.println(&print_escaped(r.data.as_deref().unwrap_or_default()));
+fn print_octet_read(ctx: &CommandContext, eom: crate::interpose::EomReason, data: &[u8]) {
+    ctx.println(&format!("eomReason {:#x}", eom.bits()));
+    ctx.println(&print_escaped(data));
 }
 
 /// The asynOctet named-device commands (asynShellCommands.c:330-516,
 /// :1010-1085).
 fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
-    use crate::request::RequestOp;
+    use crate::request::{OctetReadOp, RequestOp};
     let string = |name| ArgDesc {
         name,
         arg_type: ArgType::String,
@@ -598,11 +605,13 @@ fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     return Ok(CommandOutcome::Continue);
                 };
                 let buf_size = dev.read_len(arg_int(args, 1).unwrap_or(0));
-                match dev.submit(RequestOp::OctetRead { buf_size }) {
-                    Ok(r) => print_octet_read(ctx, &r),
-                    Err(e) => dev.trace_error(format_args!(
+                let read = dev.octet_read(OctetReadOp::Read { buf_size });
+                let eom = read.eom();
+                match read.into_parts() {
+                    (data, Ok(())) => print_octet_read(ctx, eom, &data),
+                    (data, Err(e)) => dev.trace_error(format_args!(
                         "Error reading, ninp={} error {}\n",
-                        e.partial_read().map_or(0, |p| p.nbytes_transferred()),
+                        data.len(),
                         e.message_display()
                     )),
                 }
@@ -659,20 +668,18 @@ fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 };
                 let len = data.len();
                 let buf_size = dev.read_len(arg_int(args, 2).unwrap_or(0));
-                match dev.submit(RequestOp::OctetWriteRead {
-                    data,
-                    buf_size,
-                    flush: true,
-                }) {
-                    Ok(r) => print_octet_read(ctx, &r),
-                    Err(e) => {
+                let read = dev.octet_read(OctetReadOp::WriteRead { data, buf_size });
+                let eom = read.eom();
+                match read.into_parts() {
+                    (data, Ok(())) => print_octet_read(ctx, eom, &data),
+                    (data, Err(e)) => {
                         let nout = match e.octet_step() {
                             Some(crate::error::OctetStep::Read) => len,
                             _ => e.partial_write().unwrap_or(0),
                         };
                         dev.trace_error(format_args!(
                             "Error in WriteRead, nout {nout} ninp={} error {}\n",
-                            e.partial_read().map_or(0, |p| p.nbytes_transferred()),
+                            data.len(),
                             e.message_display()
                         ));
                     }
@@ -2746,11 +2753,15 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> crate::interpose::OctetReadResult {
             let n = (self.input.len() - self.pos).min(buf.len());
             buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
             self.pos += n;
-            Ok(n)
+            crate::interpose::OctetReadResult::ok(n, crate::interpose::EomReason::empty())
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.lock().unwrap().extend_from_slice(data);
@@ -3336,10 +3347,11 @@ mod tests {
         let user = AsynUser::default()
             .with_addr(0)
             .with_timeout(SHELL_IO_TIMEOUT);
-        let first = handle
-            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 32 }, user)
-            .unwrap();
-        assert_eq!(first.data.as_deref(), Some(&b"line1"[..]));
+        let (first, status) = handle
+            .submit_octet_read_blocking(crate::request::OctetReadOp::Read { buf_size: 32 }, user)
+            .into_parts();
+        status.unwrap();
+        assert_eq!(first, b"line1");
 
         // processOut = 0: the write is handed to the driver verbatim — the
         // output terminator is NOT appended, even though OEOS is set.
@@ -3403,11 +3415,13 @@ mod tests {
         let user = AsynUser::default()
             .with_addr(0)
             .with_timeout(SHELL_IO_TIMEOUT);
-        let after = handle
-            .submit_blocking(crate::request::RequestOp::OctetRead { buf_size: 16 }, user)
-            .unwrap();
+        let (after, status) = handle
+            .submit_octet_read_blocking(crate::request::OctetReadOp::Read { buf_size: 16 }, user)
+            .into_parts();
+        status.unwrap();
         assert_eq!(
-            after.nbytes, 0,
+            after.len(),
+            0,
             "the flush layer must have drained the driver's stale input"
         );
 
@@ -4335,21 +4349,23 @@ mod tests {
             echo: VecDeque<u8>,
         }
         impl OctetNext for EchoingLink {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
                 match self.echo.pop_front() {
                     Some(b) => {
                         buf[0] = b;
-                        Ok(OctetReadResult {
+                        OctetReadResult {
                             nbytes_transferred: 1,
                             eom_reason: EomReason::CNT,
                             taken_back: 0,
-                        })
+                            status: Ok(()),
+                        }
                     }
-                    None => Ok(OctetReadResult {
+                    None => OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::empty(),
                         taken_back: 0,
-                    }),
+                        status: Ok(()),
+                    },
                 }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -4379,13 +4395,12 @@ mod tests {
             fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.link.write(user, data)
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 user: &AsynUser,
                 buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
-                let r = self.link.read(user, buf)?;
-                Ok((r.nbytes_transferred, r.eom_reason))
+            ) -> crate::interpose::OctetReadResult {
+                self.link.read(user, buf)
             }
         }
 
@@ -4473,12 +4488,13 @@ mod tests {
             sizes: Arc<Mutex<Vec<usize>>>,
         }
         impl OctetNext for CountingLink {
-            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                Ok(OctetReadResult {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> OctetReadResult {
+                OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::empty(),
                     taken_back: 0,
-                })
+                    status: Ok(()),
+                }
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.sizes.lock().unwrap().push(data.len());
@@ -4712,13 +4728,13 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],
-        ) -> AsynResult<(usize, crate::interpose::EomReason)> {
+        ) -> crate::interpose::OctetReadResult {
             buf[..3].copy_from_slice(b"x\r\n");
-            Ok((3, crate::interpose::EomReason::END))
+            crate::interpose::OctetReadResult::ok(3, crate::interpose::EomReason::END)
         }
     }
 
@@ -4762,12 +4778,13 @@ mod tests {
     }
 
     fn read_line(handle: &crate::port_handle::PortHandle) {
-        handle
-            .submit_blocking(
-                crate::request::RequestOp::OctetRead { buf_size: 16 },
+        let (_, status) = handle
+            .submit_octet_read_blocking(
+                crate::request::OctetReadOp::Read { buf_size: 16 },
                 AsynUser::new(0).with_timeout(std::time::Duration::from_secs(1)),
             )
-            .expect("read");
+            .into_parts();
+        status.expect("read");
     }
 
     /// The terminator a port was given is what an interrupt callback inside
@@ -5691,11 +5708,11 @@ mod tests {
                 self.queued.extend(data.iter().copied());
                 Ok(data.len())
             }
-            fn io_read_octet_eom(
+            fn io_read_octet(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
-            ) -> AsynResult<(usize, EomReason)> {
+            ) -> crate::interpose::OctetReadResult {
                 let n = buf.len().min(self.queued.len());
                 for (b, q) in buf.iter_mut().zip(self.queued.drain(..n)) {
                     *b = q;
@@ -5705,7 +5722,7 @@ mod tests {
                 } else {
                     EomReason::empty()
                 };
-                Ok((n, eom))
+                crate::interpose::OctetReadResult::ok(n, eom)
             }
         }
 
@@ -5748,6 +5765,69 @@ mod tests {
              device name not found\n\
              device name not specified\n\
              Entry not found\n"
+        );
+    }
+
+    /// asynShellCommands.c:419/:494 print `nread` on a failed read, so a
+    /// read that delivered bytes before it timed out reports them in `ninp=`.
+    #[test]
+    fn a_failed_octet_read_reports_the_bytes_it_delivered() {
+        use crate::interpose::{EomReason, OctetReadResult};
+        use crate::trace::TraceFile;
+
+        /// Every read delivers `abc` and then times out.
+        struct Cut {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Cut {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+                buf[..3].copy_from_slice(b"abc");
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "cut".into(),
+                    }),
+                    ..OctetReadResult::ok(3, EomReason::empty())
+                }
+            }
+        }
+
+        let port = "octet_cut_port";
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            Cut {
+                base: shell_test_base(port),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let file = Arc::new(Mutex::new(log.reopen().unwrap()));
+        let trace = mgr.find_port_handle(port).unwrap().trace().clone();
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        shell_output(
+            mgr,
+            &[
+                &format!("asynOctetConnect cut_dev {port}"),
+                "asynOctetRead cut_dev 8",
+                "asynOctetWriteRead cut_dev xy 8",
+            ],
+        );
+        let log = std::fs::read_to_string(log.path()).unwrap();
+        assert!(log.contains("Error reading, ninp=3 error"), "{log}");
+        assert!(
+            log.contains("Error in WriteRead, nout 2 ninp=3 error"),
+            "{log}"
         );
     }
 }

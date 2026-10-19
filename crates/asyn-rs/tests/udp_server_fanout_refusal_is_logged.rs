@@ -70,7 +70,9 @@ fn a_refused_fanout_option_is_logged_and_the_udp_server_still_binds() {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut buf = [0u8; 16];
     let n = loop {
-        let n = srv.read_octet(&user, &mut buf).unwrap();
+        let read = srv.io_read_octet(&user, &mut buf);
+        read.status.unwrap();
+        let n = read.nbytes_transferred;
         if n > 0 || std::time::Instant::now() > deadline {
             break n;
         }

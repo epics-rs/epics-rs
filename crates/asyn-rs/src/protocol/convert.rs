@@ -2,7 +2,7 @@
 
 use crate::error::AsynStatus;
 use crate::interrupt::InterruptValue;
-use crate::request::{RequestOp, RequestResult};
+use crate::request::{ReadEntry, RequestOp, RequestResult};
 
 use super::command::PortCommand;
 use super::event::EventPayload;
@@ -21,7 +21,7 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Int64Write { value } => Self::Int64Write { value: *value },
             RequestOp::Float64Read => Self::Float64Read,
             RequestOp::Float64Write { value } => Self::Float64Write { value: *value },
-            RequestOp::OctetRead { buf_size } => Self::OctetRead {
+            RequestOp::OctetRead { buf_size, .. } => Self::OctetRead {
                 buf_size: *buf_size,
             },
             RequestOp::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
@@ -29,13 +29,14 @@ impl From<&RequestOp> for PortCommand {
                 data,
                 buf_size,
                 flush,
+                ..
             } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
                 flush: *flush,
             },
             RequestOp::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
-            RequestOp::OctetReadBinary { buf_size } => Self::OctetReadBinary {
+            RequestOp::OctetReadBinary { buf_size, .. } => Self::OctetReadBinary {
                 buf_size: *buf_size,
             },
             RequestOp::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },
@@ -162,6 +163,7 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Float64Write { value } => Self::Float64Write { value: *value },
             PortCommand::OctetRead { buf_size } => Self::OctetRead {
                 buf_size: *buf_size,
+                entry: ReadEntry::new(),
             },
             PortCommand::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
             PortCommand::OctetWriteRead {
@@ -172,10 +174,12 @@ impl From<&PortCommand> for RequestOp {
                 data: data.clone(),
                 buf_size: *buf_size,
                 flush: *flush,
+                entry: ReadEntry::new(),
             },
             PortCommand::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             PortCommand::OctetReadBinary { buf_size } => Self::OctetReadBinary {
                 buf_size: *buf_size,
+                entry: ReadEntry::new(),
             },
             PortCommand::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },
             PortCommand::UInt32DigitalWrite { value, mask } => Self::UInt32DigitalWrite {
@@ -317,11 +321,24 @@ pub fn result_to_reply(result: &RequestResult, request_id: u64) -> PortReply {
             code: ReplyStatus::from(result.status),
             detail: result.message.clone(),
         }
+    } else if let Some(read) = &result.octet {
+        match read.status() {
+            Ok(()) => ReplyPayload::OctetData {
+                data: read.data().to_vec(),
+                nbytes: read.nbytes_transferred(),
+                eom_reason: read.eom().bits(),
+            },
+            // The wire reply has no slot for a failed read's bytes.
+            Err(e) => ReplyPayload::Error {
+                code: ReplyStatus::from(e.status()),
+                detail: e.to_string(),
+            },
+        }
     } else if let Some(data) = &result.data {
         ReplyPayload::OctetData {
             data: data.clone(),
             nbytes: result.nbytes,
-            eom_reason: result.eom_reason,
+            eom_reason: 0,
         }
     } else if let Some(v) = result.int_val {
         ReplyPayload::Value(ParamValue::Int32(v))
@@ -401,6 +418,8 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+    use crate::interpose::EomReason;
+    use crate::request::OctetRead;
 
     #[test]
     fn request_op_to_command_roundtrip() {
@@ -411,7 +430,10 @@ mod tests {
             RequestOp::Int64Write { value: i64::MAX },
             RequestOp::Float64Read,
             RequestOp::Float64Write { value: 3.14 },
-            RequestOp::OctetRead { buf_size: 256 },
+            RequestOp::OctetRead {
+                buf_size: 256,
+                entry: ReadEntry::new(),
+            },
             RequestOp::OctetWrite {
                 data: vec![1, 2, 3],
             },
@@ -419,6 +441,7 @@ mod tests {
                 data: vec![4, 5],
                 buf_size: 128,
                 flush: true,
+                entry: ReadEntry::new(),
             },
             RequestOp::UInt32DigitalRead { mask: 0xFF },
             RequestOp::UInt32DigitalWrite {
@@ -512,7 +535,8 @@ mod tests {
 
     #[test]
     fn result_to_reply_octet_carries_eom_reason() {
-        let result = RequestResult::octet_read_eom(vec![0x41], 1, 0x01 | 0x02);
+        let read = OctetRead::new(vec![0x41], EomReason::CNT | EomReason::EOS, Ok(()));
+        let result = RequestResult::octet_read(read, 0);
         let reply = result_to_reply(&result, 9);
         assert_eq!(
             reply.payload,
@@ -526,7 +550,8 @@ mod tests {
 
     #[test]
     fn result_to_reply_octet_read() {
-        let result = RequestResult::octet_read(vec![0x48, 0x65], 2);
+        let read = OctetRead::new(vec![0x48, 0x65], EomReason::empty(), Ok(()));
+        let result = RequestResult::octet_read(read, 0);
         let reply = result_to_reply(&result, 4);
         assert_eq!(
             reply.payload,
@@ -536,6 +561,26 @@ mod tests {
                 eom_reason: 0,
             }
         );
+    }
+
+    #[test]
+    fn result_to_reply_failed_octet_read_is_an_error() {
+        let read = OctetRead::new(
+            b"ab".to_vec(),
+            EomReason::empty(),
+            Err(crate::error::AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "t".into(),
+            }),
+        );
+        let reply = result_to_reply(&RequestResult::octet_read(read, 0), 4);
+        assert!(matches!(
+            reply.payload,
+            ReplyPayload::Error {
+                code: ReplyStatus::Timeout,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -7,11 +7,11 @@
 //! long-lived loop owns a dedicated OS thread. Three facilities, in the order
 //! C `iocInit` starts its equivalents:
 //!
-//! 1. **Background executor** — `runtime::task::background_init()` (C
-//!    `callbackInit`, `callback.c:286`): the callback pool
-//!    (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer and the scanOnce
-//!    worker. Started *first* so no record processing can defer a tail into a
-//!    facility that does not exist yet.
+//! 1. **Background executor** — `runtime::task::background_init()`, which
+//!    `build_ioc`'s `iocBuild` runs (C `callbackInit`, `callback.c:286`):
+//!    the callback pool (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer and
+//!    the scanOnce worker. Started before any record initialises, so no record processing
+//!    can defer a tail into a facility that does not exist yet.
 //! 2. **Database** — a small in-process database built through the ordinary
 //!    [`IocBuilder`](epics_base_rs::server::ioc_builder::IocBuilder), driven to completion with
 //!    [`block_on_sync`](epics_base_rs::runtime::task::block_on_sync), which on
@@ -280,7 +280,7 @@ mod ioc {
     use epics_base_rs::error::CaResult;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::task::StackSizeClass;
-    use epics_base_rs::runtime::task::{background_init, block_on_sync};
+    use epics_base_rs::runtime::task::block_on_sync;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
     #[cfg(feature = "bringup-probes")]
@@ -603,8 +603,8 @@ mod ioc {
         //     the rule so this binary and `realtime-ca-ioc` cannot come to
         //     disagree about it.
         //
-        //     SAFETY (edition 2024): the entry thread, before `background_init`
-        //     or any server has started anything, so no concurrent reader or
+        //     SAFETY (edition 2024): the entry thread, before the build or
+        //     any server has started anything, so no concurrent reader or
         //     writer of the environment exists.
         let boot_args: Vec<String> =
             unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
@@ -657,7 +657,7 @@ mod ioc {
         // controls the same way.
         //
         // SAFETY (edition 2024): this runs on the single init thread before
-        // `background_init` starts any other thread, so no concurrent
+        // the build starts any other thread, so no concurrent
         // reader/writer of the environment exists.
         #[cfg(feature = "bringup-probes")]
         if std::env::var_os("EPICS_PVA_NAME_SERVERS").is_none() {
@@ -689,9 +689,6 @@ mod ioc {
         {
             eprintln!("epics-rs: {why}");
         }
-
-        // (1) C `callbackInit` (callback.c:286). Idempotent.
-        background_init();
 
         // (1b-rig) PARALLEL SCAN HELPERS, under `bringup-probes` only
         //      (measurement rig, not IOC content — same rule as the probe
@@ -788,7 +785,7 @@ mod ioc {
         //      name servers alone (`EPICS_PVA_NAME_SERVERS`): the UDP SEARCH
         //      transport is compiled out (design §4.2, `SearchTransport::
         //      NameServersOnly`), and every task the resolver spawns lands on the
-        //      callback pool `background_init` started above via
+        //      callback pool via
         //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
         //      number of pva:// links pre-registered from the loaded database.
         let composite = CompositeSource::new();

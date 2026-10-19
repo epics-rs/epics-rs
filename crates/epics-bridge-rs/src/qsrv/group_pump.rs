@@ -546,6 +546,8 @@ mod tests {
     #[cfg(exec_backend)]
     #[tokio::test]
     async fn drain_delivers_while_the_medium_band_worker_is_occupied() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_base_rs::runtime::task::background_init();
         // Pin the Medium band's ONLY worker (DEFAULT_THREADS_PER_PRIORITY
         // = 1): the closure holds it until released, so nothing spawned onto
         // the band can run for the duration of the test.

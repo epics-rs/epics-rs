@@ -541,6 +541,8 @@ async fn test_pva_out_link_writes_value_through_link_set() {
 
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -650,6 +652,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
 
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -1169,6 +1173,8 @@ async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
 #[epics_macros_rs::epics_test]
 async fn test_putf_stays_off_for_cp_chained_targets() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -2120,6 +2126,8 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
 
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(CapturingLset {
@@ -3608,6 +3616,8 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
 #[epics_macros_rs::epics_test]
 async fn test_cp_burst_on_a_pact_target_sets_rpro() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let writes: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     db.add_record("CPB_SRC", Box::new(AoRecord::new(0.0)))
         .await
@@ -6540,6 +6550,8 @@ async fn test_sel_nvl_link_high_index_unsigned() {
 #[epics_macros_rs::epics_test]
 async fn test_dol_cp_link_registration() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("MTR", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6576,6 +6588,8 @@ async fn connect_and_move_src(db: &PvDatabase, last: &str) {
 #[epics_macros_rs::epics_test]
 async fn test_dol_cp_link_triggers_processing() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
         .await
         .unwrap();
@@ -6601,6 +6615,8 @@ async fn test_dol_cp_link_triggers_processing() {
 #[epics_macros_rs::epics_test]
 async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("CPOUT_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6652,6 +6668,8 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
 #[epics_macros_rs::epics_test]
 async fn test_cpp_link_registration_is_passive_only() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6677,6 +6695,8 @@ async fn test_cpp_link_registration_is_passive_only() {
 #[epics_macros_rs::epics_test]
 async fn test_cpp_link_skips_nonpassive_target() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
         .await
         .unwrap();
@@ -6712,6 +6732,8 @@ async fn test_cpp_link_skips_nonpassive_target() {
 #[epics_macros_rs::epics_test]
 async fn test_cpp_link_processes_passive_target() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
         .await
         .unwrap();
@@ -6733,6 +6755,8 @@ async fn test_cpp_link_processes_passive_target() {
 #[epics_macros_rs::epics_test]
 async fn test_cp_link_processes_nonpassive_target() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
         .await
         .unwrap();
@@ -6786,6 +6810,8 @@ record(calc, "DST") { field(INPA, "SRC CP") field(INPB, "SRC CPP") }
 async fn test_seq_dol_cp_link_registration() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SENSOR", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6804,6 +6830,8 @@ async fn test_seq_dol_cp_link_registration() {
 async fn test_sel_nvl_cp_link_registration() {
     use epics_base_rs::server::records::sel::SelRecord;
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("INDEX_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6821,6 +6849,8 @@ async fn test_sel_nvl_cp_link_registration() {
 #[epics_macros_rs::epics_test]
 async fn test_sdis_cp_link_registration() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("DISABLE_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -6953,6 +6983,8 @@ async fn test_rpro_causes_reprocessing() {
 #[epics_macros_rs::epics_test]
 async fn test_tsel_cp_link_registration() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("TSE_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

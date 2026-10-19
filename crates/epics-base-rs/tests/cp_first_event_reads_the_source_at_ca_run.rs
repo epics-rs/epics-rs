@@ -103,17 +103,11 @@ async fn a_pending_interrupt_processes_before_the_first_event() {
     db.initialize_link_locality().await;
     setup_cp_links(&db, 1).await;
     db.scan_control().run();
-    // The first poll releases the link, so its read is woken before the
-    // interrupts land on the pump.
-    let mut ca_run = std::pin::pin!(db.process_cp_links_on_connect());
-    std::future::poll_fn(|cx| {
-        let _ = ca_run.as_mut().poll(cx);
-        std::task::Poll::Ready(())
-    })
-    .await;
+    // Queued before `dbCaRun`: once the link is released its turn may reach
+    // the pump at once, on a band thread, and would then rightly read UDF.
     pulse.try_send(()).unwrap();
     pulse.try_send(()).unwrap();
-    ca_run.await;
+    db.process_cp_links_on_connect().await;
     db.ca_sync().await;
 
     assert_eq!(num(&db, "SRC.SEVR"), 0.0, "the source processed");

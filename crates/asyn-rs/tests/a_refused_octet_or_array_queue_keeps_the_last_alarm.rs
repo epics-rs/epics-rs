@@ -125,6 +125,8 @@ async fn failed_then_refused(case: Case) -> [(u16, AlarmSeverity); 2] {
     dev.set_record_info("A:R", ScanType::Passive);
     dev.init(&mut *rec).unwrap();
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("A:R", rec).await.unwrap();
     db.ioc_init().await;
     {

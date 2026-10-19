@@ -2,7 +2,9 @@
 mod access_commands;
 /// C `asInit` (`asDbLib.c:151-154`) with no shell around it — `iocBuild_2`
 /// is its other caller (`iocInit.c:187`).
-pub(crate) use access_commands::as_init;
+#[cfg(test)]
+pub(crate) use access_commands::AsInitOutcome;
+pub(crate) use access_commands::{as_init, as_shutdown};
 mod breakpoint_commands;
 mod commands;
 pub use commands::{DbLoadRecordsHook, db_load_records_hook, set_db_load_records_hook};
@@ -440,12 +442,26 @@ static COMMAND_REGISTRY: std::sync::OnceLock<Arc<RwLock<CommandRegistry>>> =
 /// The process's command table, built with the base command set on first use —
 /// C's `iocshRegisterCommon` plus the `*IocRegister.c` registrars, all of which
 /// have run before softMain reads a script.
-fn command_registry() -> &'static Arc<RwLock<CommandRegistry>> {
+pub(crate) fn command_registry() -> &'static Arc<RwLock<CommandRegistry>> {
     COMMAND_REGISTRY.get_or_init(|| {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
         Arc::new(RwLock::new(registry))
     })
+}
+
+/// C `iocshFree` (`iocsh.cpp:785-804`), from an isolated `iocShutdown`: the
+/// command and variable tables go back to what they are born holding — the
+/// base set, which C's next `registerRecordDeviceDriver` registers again
+/// through `iocshRegisterCommon` — so nothing a registrar of this IOC added
+/// is left for the next one.
+pub(crate) fn iocsh_free() {
+    vars::free();
+    let mut registry = CommandRegistry::new();
+    commands::register_builtins(&mut registry);
+    *command_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = registry;
 }
 
 /// Register `def` on the process's command table — C `iocshRegister`

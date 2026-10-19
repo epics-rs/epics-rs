@@ -77,9 +77,10 @@ pub struct BackgroundExecutor {
 }
 
 impl BackgroundExecutor {
-    /// Start all three facilities with their C-default sizing.
+    /// Start all three facilities with their C-default sizing, the
+    /// callback bands at C `cbInit` until [`CallbackPool::init`].
     pub fn new() -> Self {
-        let callbacks = CallbackPool::new();
+        let callbacks = CallbackPool::new_uninitialized();
         let timer = DelayedTimer::new(callbacks.handle());
         let scan_once = ScanOnceQueue::new();
         BackgroundExecutor {
@@ -177,6 +178,7 @@ mod tests {
     #[test]
     fn executor_routes_all_three_facilities() {
         let exec = BackgroundExecutor::new();
+        exec.callbacks().init();
         let h = exec.handle();
 
         let (tx, rx) = mpsc::channel();

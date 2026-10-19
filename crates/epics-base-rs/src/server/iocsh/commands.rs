@@ -12339,6 +12339,8 @@ record(aSub, "AC") { field(SUBL, "") }"#,
     /// these commands.
     #[test]
     fn an_async_soft_input_waits_for_its_notify() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
         let (db, ctx) = make_ctx();
         load_records(
             &ctx,
@@ -12406,6 +12408,8 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
     /// (8f5015b66).
     #[test]
     fn an_async_soft_input_processes_its_target_once() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
         let (db, ctx) = make_ctx();
         load_records(
             &ctx,
@@ -12443,6 +12447,8 @@ record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
     /// (`dbNotifyCancel`, `:400-410`). `softIoc` R7.0.10-146 (8f5015b66).
     #[test]
     fn an_async_soft_input_restarts_a_busy_target() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        crate::runtime::task::background_init();
         let (db, ctx) = make_ctx();
         load_records(
             &ctx,

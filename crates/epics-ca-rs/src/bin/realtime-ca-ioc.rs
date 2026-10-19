@@ -5,12 +5,12 @@
 //! front-end is touched, and every long-lived loop owns a dedicated OS thread.
 //! Four facilities, started in the order C `iocInit` starts its equivalents:
 //!
-//! 1. **Background executor** — `runtime::task::background_init()` (C
-//!    `callbackInit`, `callback.c:286`): the callback pool
-//!    (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer, and the scanOnce
-//!    worker. Started *first* so no record processing can defer a tail into a
-//!    facility that does not exist yet. On this build the `runtime::task`
-//!    spawn/sleep/interval seam routes into it, so asynchronous record
+//! 1. **Background executor** — `runtime::task::background_init()`, which
+//!    `build_ioc`'s `iocBuild` runs (C `callbackInit`, `callback.c:286`):
+//!    the callback pool (`cbLow`/`cbMedium`/`cbHigh`), the delayed timer,
+//!    and the scanOnce worker. Started before any record initialises, so no
+//!    record processing can defer a tail into a facility that does not exist
+//!    yet. On this build the `runtime::task` spawn/sleep/interval seam routes into it, so asynchronous record
 //!    completion (put-callback tails, ODLY re-processing) runs on those std
 //!    threads rather than on a tokio runtime.
 //! 2. **Database** — a small in-process database built through the ordinary
@@ -495,7 +495,7 @@ mod ioc {
     use epics_base_rs::runtime::net::cas_server_port;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::task::StackSizeClass;
-    use epics_base_rs::runtime::task::{background_init, block_on_sync};
+    use epics_base_rs::runtime::task::block_on_sync;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
     #[cfg(feature = "bringup-probes")]
@@ -1034,8 +1034,8 @@ mod ioc {
         //     the rule so this binary and `realtime-pva-ioc` cannot come to
         //     disagree about it.
         //
-        //     SAFETY (edition 2024): the entry thread, before `background_init`
-        //     or any server has started anything, so no concurrent reader or
+        //     SAFETY (edition 2024): the entry thread, before the build or
+        //     any server has started anything, so no concurrent reader or
         //     writer of the environment exists.
         let boot_args: Vec<String> =
             unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
@@ -1095,7 +1095,7 @@ mod ioc {
         // resolver lazily builds reads them once at construction.
         //
         // SAFETY (edition 2024): this runs on the single init thread
-        // before `background_init` starts any other thread, so no
+        // before the build starts any other thread, so no
         // concurrent reader or writer of the environment exists.
         //
         // Only for the built-in database: its C6 probe records are what the
@@ -1141,11 +1141,6 @@ mod ioc {
         {
             eprintln!("epics-rs: {why}");
         }
-
-        // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
-        //     timer and scanOnce worker exist before any record can defer a
-        //     tail into them. Idempotent.
-        background_init();
 
         // (2) The database — every boot argument that was not an
         //     `epicsEnvSet` is a `.db` to load, in order (C `dbLoadRecords`).

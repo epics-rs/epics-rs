@@ -73,6 +73,8 @@ async fn build(fails: bool) -> PvDatabase {
 
 async fn build_with(fails: bool, reports: Option<u16>, async_write: bool) -> PvDatabase {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

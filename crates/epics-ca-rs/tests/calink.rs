@@ -358,6 +358,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
 
     pin_env(port);
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
 
     // Passive ai holder with a bare ` CP` INP link to the remote PV. `CP` is
     // the whole modifier: C's process-class chain (`dbStaticLib.c:2369-2373`)

@@ -157,6 +157,8 @@ async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission)
 #[epics_macros_rs::epics_test]
 async fn a_refused_put_callback_aborts_the_whole_sequence() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     three_step_sseq(&db, "SS_REF", PutAdmission::Refused).await;
 
     let mut abort_rx = db
@@ -221,6 +223,8 @@ async fn the_refusal_is_printed_on_stdout() {
     use std::os::fd::AsRawFd;
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     three_step_sseq(&db, "SS_OUT", PutAdmission::Refused).await;
     let out = tempfile::NamedTempFile::new().unwrap();
     let err = tempfile::NamedTempFile::new().unwrap();
@@ -255,6 +259,8 @@ async fn the_refusal_is_printed_on_stdout() {
 #[epics_macros_rs::epics_test]
 async fn an_admitted_put_callback_still_waits_and_completes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     three_step_sseq(&db, "SS_OK", PutAdmission::Connected).await;
 
     let mut wtg_rx = db

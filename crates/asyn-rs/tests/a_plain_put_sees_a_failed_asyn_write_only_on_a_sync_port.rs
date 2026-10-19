@@ -87,6 +87,8 @@ async fn ioc_gated(port: &str, can_block: bool, gate: Gate) -> PvDatabase {
     ads.set_record_info("A:AO", ScanType::Passive);
     ads.init(&mut rec).unwrap();
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("A:AO", Box::new(rec)).await.unwrap();
     db.ioc_init().await;
     let cell = db.get_record("A:AO").unwrap();

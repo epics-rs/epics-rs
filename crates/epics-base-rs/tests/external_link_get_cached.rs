@@ -142,6 +142,8 @@ async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(
@@ -183,6 +185,8 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(
@@ -225,6 +229,8 @@ async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // `on_open: None` — the open runs but the cache stays empty.
     db.register_link_set("ca", Arc::new(LazyLset::new(None, &opens, &reads)))
         .await;
@@ -250,6 +256,8 @@ async fn distinct_links_are_each_opened_once() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(LazyLset::new(Some(EpicsValue::Double(1.0)), &opens, &reads)),

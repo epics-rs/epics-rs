@@ -4,7 +4,7 @@
 //! none. Each record bumps CNT, so its VAL is the step it last processed at.
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_app::{ioc_pause, ioc_run, ioc_shutdown};
+use epics_base_rs::server::ioc_app::{BuildMode, ioc_pause, ioc_run, ioc_shutdown};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use std::collections::HashMap;
@@ -59,10 +59,12 @@ async fn every_pause_and_run_runs_its_pini_passes() {
 /// C registers `piniProcessHook` once (`initHookRegister` ignores a known
 /// function) and it walks the one `pdbbase`, so after `iocShutdown` and a
 /// second build only the second database runs passes, and runs each once.
+/// Both builds are isolated, as `testdb` boots every IOC of one process.
 #[epics_macros_rs::epics_test]
 async fn a_rebuild_runs_its_passes_on_the_new_database_only() {
     let build = || async {
         IocBuilder::new()
+            .build_mode(BuildMode::Isolated)
             .db_string(DB, &HashMap::new())
             .unwrap()
             .build_ioc()

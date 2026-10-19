@@ -314,6 +314,8 @@ fn read_short(db_value: Option<EpicsValue>) -> i16 {
 #[epics_macros_rs::epics_test]
 async fn sseq_waitn_blocks_until_downstream_completes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // Step-1 target: a CA link whose put-callback the lset holds open until
     // the test completes it (C `dbCaPutLinkCallback`). Step-2 target: a plain
     // sync AO.
@@ -395,6 +397,8 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
 #[epics_macros_rs::epics_test]
 async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let c1 = Arc::new(AtomicU32::new(0));
     let c2 = Arc::new(AtomicU32::new(0));
     let c3 = Arc::new(AtomicU32::new(0));
@@ -482,6 +486,8 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
 #[epics_macros_rs::epics_test]
 async fn sseq_abort_during_delay_finishes_without_dispatch() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let count = Arc::new(AtomicU32::new(0));
     db.add_record(
         "SSEQ_AB_TGT",
@@ -547,6 +553,8 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
 #[epics_macros_rs::epics_test]
 async fn sseq_second_abort_escapes_hung_wait_callback() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // CA target whose put-callback is never completed — the WAIT step parks
     // forever.
     let _hold = ca_hold(&db).await;
@@ -608,6 +616,8 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
 #[epics_macros_rs::epics_test]
 async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let count = Arc::new(AtomicU32::new(0));
     db.add_record(
         "SSEQ_SELN_TGT",
@@ -666,6 +676,8 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
 #[epics_macros_rs::epics_test]
 async fn sseq_link_status_loc_vs_con() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // A local target (ao VAL is DBF_DOUBLE = 10 in C dbStatic numbering,
     // dbFldTypes.h:35) so a DB link to it resolves to LOC with a known field
     // type. DTn/LTn report the dbStatic DBF_* index, not the CA DBR value (6).
@@ -729,6 +741,8 @@ async fn sseq_link_status_loc_vs_con() {
 #[epics_macros_rs::epics_test]
 async fn sseq_link_status_reclassifies_on_special() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SSEQ_SP_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -774,6 +788,8 @@ async fn sseq_link_status_reclassifies_on_special() {
 #[epics_macros_rs::epics_test]
 async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let _hold = ca_hold(&db).await;
     db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
         .await
@@ -833,6 +849,8 @@ async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
 #[epics_macros_rs::epics_test]
 async fn sseq_waitn_on_local_db_link_does_not_wait() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     // Local target that never finishes its own processing.
     db.add_record("SSEQ_WDB_HOLD", Box::new(AsyncHold { val: 0.0 }))
         .await
@@ -896,6 +914,8 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
 #[epics_macros_rs::epics_test]
 async fn sseq_wait_full_barrier_serialises_steps() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -961,6 +981,8 @@ async fn sseq_wait_full_barrier_serialises_steps() {
 #[epics_macros_rs::epics_test]
 async fn sseq_after_n_overlaps_then_barriers() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1038,6 +1060,8 @@ async fn sseq_after_n_overlaps_then_barriers() {
 #[epics_macros_rs::epics_test]
 async fn sseq_end_drain_waits_for_all_in_flight() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1096,6 +1120,8 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
 #[epics_macros_rs::epics_test]
 async fn sseq_abort_drains_in_flight_before_finish() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
@@ -1175,6 +1201,8 @@ async fn sseq_abort_drains_in_flight_before_finish() {
 #[epics_macros_rs::epics_test]
 async fn sseq_after_n_does_not_block_lower_index_step() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let hold = ca_hold(&db).await;
     // A sync AO target so step 2's NoWait write lands observably.
     db.add_record("SSEQ_NB_TGT2", Box::new(AoRecord::new(0.0)))
@@ -1236,6 +1264,8 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
 #[epics_macros_rs::epics_test]
 async fn sseq_werr_follows_c_check_links_schedule() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

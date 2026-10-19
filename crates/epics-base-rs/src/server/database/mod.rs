@@ -2254,25 +2254,38 @@ impl PvDatabase {
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
     /// announces `initHookAfterCaLinkInit`: the `dbCaLink` worker exists from
-    /// init, not from the first external link put. Otherwise an IOC whose
-    /// output links are all local has no `dbCaLink` task where C always has
-    /// one — visible in `taskwdShow`.
+    /// init, and only a build or this call starts it — never record
+    /// processing, which would spawn it under the record's hold. A database
+    /// no build has initialised calls it itself, as a C test calls
+    /// `testIocInitOk`; until then its external opens and puts wait queued.
     ///
     /// Returns false, having started nothing, when this database captured no
     /// reactor: the owner's network work has nowhere to run, which is the same
     /// condition [`Self::stage_external_link_open`] already refuses on.
-    pub(crate) fn ca_link_init(&self) -> bool {
+    pub fn ca_link_init(&self) -> bool {
         if self.inner.link_puts.network().is_none() {
             return false;
         }
         if let Some(started) = self
             .inner
             .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner))
+            .start_owner(std::sync::Arc::downgrade(&self.inner))
         {
             started.wait();
         }
         true
+    }
+
+    /// C `dbCaLinkInitIsolated`'s half beyond [`Self::ca_link_init`]: a CA
+    /// link reaches only the names this database serves.
+    pub(crate) fn ca_link_isolate(&self) {
+        self.inner.ca_links.isolate();
+    }
+
+    /// C `dbCaShutdown` (`dbCa.c:324-333`), from `iocShutdown` before
+    /// `initHookAfterStopLinks`: the `dbCaLink` worker drains and is joined.
+    pub(crate) fn ca_link_shutdown(&self) {
+        self.inner.link_puts.shutdown();
     }
 
     /// Single owner of the "this external link needs opening" transition —
@@ -2313,9 +2326,6 @@ impl PvDatabase {
         if self.inner.link_puts.network().is_none() {
             return false;
         }
-        self.inner
-            .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
         // C `dbInitLink` adds a local CA link with `DBCA_CALLBACK_INIT_START`
         // (`dbLink.c:127-129`), which `dbCaRun` waits for. Registered as the
         // open is queued, so nothing the open does can report it first.
@@ -5597,6 +5607,28 @@ mod tests {
             out.contains("dbCaLink"),
             "the owner was not registered when ca_link_init returned:\n{out}"
         );
+    }
+
+    /// C `dbCaShutdown` then a rebuild's `dbCaLinkInit` (`dbCa.c:324-355`):
+    /// the stopped worker is gone from the watchdog table and the rebuild
+    /// starts a fresh one.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuild_after_ca_link_shutdown_gets_a_fresh_worker() {
+        fn up() -> bool {
+            let up = std::cell::Cell::new(false);
+            crate::runtime::taskwd::taskwd_show(1, &|line| {
+                up.set(up.get() || line.contains("dbCaLink"))
+            });
+            up.get()
+        }
+        let db = PvDatabase::new();
+        assert!(db.ca_link_init());
+        assert!(up());
+        db.ca_link_shutdown();
+        assert!(!up(), "the stopped worker is still registered");
+        assert!(db.ca_link_init());
+        assert!(up(), "the rebuild started no worker");
     }
 
     /// The other boundary: a database that captured no reactor has nowhere to

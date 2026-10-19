@@ -3867,6 +3867,23 @@ impl RecordCell {
         }
     }
 
+    /// [`Self::write`] for a sweep over every record, which may run inside
+    /// a frame of one: `None` when this thread already borrows the record.
+    /// Holding the set proves no other thread does.
+    pub(crate) fn try_write(&self) -> Option<RecordMut<'_>> {
+        use std::sync::atomic::Ordering;
+        let set = self.lock_record.acquire();
+        if self.borrow.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        self.borrow.store(-1, Ordering::Relaxed);
+        live_borrows::taken();
+        Some(RecordMut {
+            cell: self,
+            _set: Some(set),
+        })
+    }
+
     /// [`Self::write`] for a put that may run inside a frame: under `held`,
     /// when this record is in that set, only the borrow flag is touched, as
     /// [`Self::write_in`]; any other record takes [`Self::write`]'s acquire.
@@ -8858,6 +8875,34 @@ impl RecordInstance {
         self.reprocess_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         std::mem::take(&mut self.dpvt)
+    }
+
+    /// C `doCloseLinks`' device half (`iocInit.c:689-699`): a dset with a
+    /// `dsxt` leaves its scan list and its `del_record` runs, whose status C
+    /// ignores here. True when it ran, so the caller takes PACT as C does.
+    pub(crate) fn close_device(&mut self) -> bool {
+        use crate::server::device_support::IoIntrCmd;
+        if !super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str())
+            .is_some_and(|row| row.has_dsxt())
+        {
+            return false;
+        }
+        // `scanDelete` (`dbScan.c:240-262`). Only an I/O Intr list's leave
+        // reaches the device; a periodic or event list is not left here, and
+        // PACT plus the scan stop that follows end its scans.
+        if self.common.scan == ScanType::IoIntr
+            && let Some(dev) = self.device.as_mut()
+        {
+            dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Delete);
+            let posts = dev.take_device_posts();
+            self.post_device_values(posts);
+            self.record.set_io_intr_scan(false);
+        }
+        if let Some(dev) = self.device.as_mut() {
+            let _ = dev.del_record();
+        }
+        drop(self.del_record());
+        true
     }
 
     /// C's `PN_LINK`: a SoftCallback `add_record` that allocated its devPvt

@@ -75,6 +75,8 @@ async fn failed_write(port: &str, can_block: bool, record_type: &str) -> (u16, A
     dev.set_record_info("A:ARR", ScanType::Passive);
     dev.init(&mut rec).unwrap();
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("A:ARR", Box::new(rec)).await.unwrap();
     db.ioc_init().await;
     {

@@ -2315,6 +2315,58 @@ impl PvDatabase {
         });
     }
 
+    /// C `doCloseLinks` over every record (`iocInit.c:665-704`), from
+    /// `iocShutdown` before `initHookAfterCloseLinks`: under each record's
+    /// hold its CA and JSON links are removed as `dbRemoveLink` removes them
+    /// ([`Self::remove_put_link`]'s lset call, then the
+    /// [`ParsedLink::Removed`](crate::server::record::ParsedLink::Removed)
+    /// the record keeps), its dsxt device is closed, and a record either
+    /// touched is left PACT, so nothing processes it again. An `isolated`
+    /// build's DB links are removed too (`iocInit.c:680`); the lock sets
+    /// are not split, as C's `dbDbRemoveLink` splits them (`dbDbLink.c:141`).
+    pub(crate) fn close_links(&self, isolated: bool) {
+        use crate::server::record::DbLinkType;
+        let cells: Vec<Arc<super::RecordCell>> =
+            self.inner.records.read().values().cloned().collect();
+        for rec in cells {
+            // An `epicsExit` from inside a record's processing reaches here
+            // on the thread that is processing it. C locks that record again
+            // and closes it; this port cannot alias the frame's borrow, so
+            // the record is left as it is.
+            let Some(mut inst) = rec.try_write() else {
+                continue;
+            };
+            let mut locked = false;
+            for (field, raw, ftype) in Self::link_field_texts(&inst) {
+                let Some(link) = inst.stored_link_shared(&field).cloned() else {
+                    continue;
+                };
+                match link.link_type_after_init(&raw, ftype) {
+                    DbLinkType::CaLink | DbLinkType::JsonLink => {}
+                    DbLinkType::DbLink if isolated => {}
+                    _ => continue,
+                }
+                locked = true;
+                if let Some((scheme, body)) = Self::scheme_link_name(&link) {
+                    let holder = super::LinkHolder::new(
+                        inst.record.record_type(),
+                        inst.name.as_bytes(),
+                        &field,
+                    );
+                    super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+                        lset.remove_link(holder, body);
+                        Some(())
+                    });
+                }
+                inst.bind_no_lset(&field);
+            }
+            locked |= inst.close_device();
+            if locked {
+                inst.enter_pact();
+            }
+        }
+    }
+
     /// A record's own post of `field` under its hold: the put, then the open
     /// of the link it installed. C's `dbPut` refuses a link field
     /// (`dbAccess.c:1340`); only `dbPutFieldLink` changes one, and it opens it
@@ -3532,9 +3584,6 @@ impl PvDatabase {
 
         let (scheme, body) = self.external_put_gate(name)?;
 
-        self.inner
-            .link_puts
-            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
         let key = LinkKey {
             link,
             channel: Channel {
@@ -5772,6 +5821,8 @@ mod nonlocal_db_link_write_tests {
     #[epics_macros_rs::epics_test]
     async fn nonlocal_db_out_link_writes_through_external_put() {
         let db = PvDatabase::new();
+        // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+        db.ca_link_init();
         let puts = Arc::new(Mutex::new(Vec::new()));
         db.register_link_set("ca", Arc::new(RecordingLset { puts: puts.clone() }))
             .await;

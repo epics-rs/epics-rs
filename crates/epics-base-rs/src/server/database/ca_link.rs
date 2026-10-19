@@ -60,6 +60,8 @@ pub(crate) struct CaLinks {
     db: Weak<PvDatabaseInner>,
     routes: RwLock<HashMap<RecordName, Route>>,
     network: RwLock<Option<DynLinkSet>>,
+    /// [`Self::isolate`] ran: `network` stays empty.
+    isolated: AtomicBool,
     /// `dbCaTask` connects no channel before `dbCaRun` (`dbCa.c:1171-1173`),
     /// so until then every link, local or network, reads as unconnected
     /// (`dbCa.c:459`), whatever its channel has already delivered.
@@ -75,13 +77,25 @@ impl CaLinks {
             db,
             routes: RwLock::new(HashMap::new()),
             network: RwLock::new(None),
+            isolated: AtomicBool::new(false),
             ca_run,
         }
     }
 
-    /// Install the half that serves names this database does not.
+    /// Install the half that serves names this database does not; refused
+    /// once [`Self::isolate`] ran.
     pub(crate) fn set_network(&self, lset: DynLinkSet) {
-        *self.network.write() = Some(lset);
+        if !self.isolated.load(Ordering::Acquire) {
+            *self.network.write() = Some(lset);
+        }
+    }
+
+    /// C `dbServiceIsolate` (`dbCa.c:343`): a name this database does not
+    /// serve gets `dbChannelNOOP`, a channel that never connects
+    /// (`dbContext.cpp:95-97`), instead of the network context.
+    pub(crate) fn isolate(&self) {
+        self.isolated.store(true, Ordering::Release);
+        *self.network.write() = None;
     }
 
     /// Whether a `ca` link to `name` has anything to connect to: a name

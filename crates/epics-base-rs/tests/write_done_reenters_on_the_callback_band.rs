@@ -55,6 +55,8 @@ impl DeviceSupport for Sink {
 
 async fn completes_on(prio: i16) -> Vec<String> {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     for name in ["AO", "SINK"] {
         db.add_record(name, Box::new(AoRecord::new(0.0)))
             .await
@@ -137,6 +139,8 @@ async fn a_low_prio_write_completes_once_on_cb_low() {
 #[epics_macros_rs::epics_test]
 async fn a_completion_after_the_scan_stopped_processes_nothing() {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

@@ -134,6 +134,8 @@ async fn database(
     dev.init(&mut *rec).unwrap();
 
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("REC", rec).await.unwrap();
     db.add_record("SINK", Box::new(AoRecord::new(0.0)))
         .await

@@ -55,6 +55,8 @@ pub struct IocBuilder {
     database: Option<Arc<PvDatabase>>,
     /// [`Self::register_server_init`], in registration order.
     server_inits: Vec<(&'static str, BuilderServerInit)>,
+    /// [`Self::build_mode`].
+    build_mode: crate::server::ioc_app::BuildMode,
 }
 
 /// A server's `dbServer.init` for [`IocBuilder::build_ioc`].
@@ -149,7 +151,16 @@ impl IocBuilder {
             json_link_types: Vec::new(),
             database: None,
             server_inits: Vec::new(),
+            build_mode: crate::server::ioc_app::BuildMode::Servers,
         }
+    }
+
+    /// How [`Self::build_ioc`] builds: C `iocBuild` (the default) or
+    /// `iocBuildIsolated`, whose IOC runs no [`Self::register_server_init`]
+    /// server and can be shut down and built again in the same process.
+    pub fn build_mode(mut self, mode: crate::server::ioc_app::BuildMode) -> Self {
+        self.build_mode = mode;
+        self
     }
 
     /// A server's `dbServer.init`, which [`Self::build_ioc`] runs at C's
@@ -416,7 +427,9 @@ impl IocBuilder {
         Arc<PvDatabase>,
         Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     )> {
-        let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Caller).await?;
+        let (db, autosave_config, ()) = self
+            .build_through(begin_unsequenced, LinkInit::Caller)
+            .await?;
         Ok((db, autosave_config))
     }
 
@@ -430,7 +443,9 @@ impl IocBuilder {
         Arc<PvDatabase>,
         Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     )> {
-        let (db, autosave_config, ()) = self.build_through(|| Some(()), LinkInit::Build).await?;
+        let (db, autosave_config, ()) = self
+            .build_through(begin_unsequenced, LinkInit::Build)
+            .await?;
         Ok((db, autosave_config))
     }
 
@@ -444,9 +459,14 @@ impl IocBuilder {
     /// Once per process: a second call is refused as C's `iocBuild` is.
     pub async fn build_ioc(mut self) -> CaResult<BareIoc> {
         let server_inits = std::mem::take(&mut self.server_inits);
+        let mode = self.build_mode;
         let (db, autosave_config, mut build) = self
             .build_through(
-                || crate::server::ioc_app::BuildSequence::begin(|line| println!("{line}")),
+                || {
+                    crate::server::ioc_app::BuildSequence::begin_mode(mode, |line| {
+                        println!("{line}")
+                    })
+                },
                 LinkInit::Build,
             )
             .await?;
@@ -454,8 +474,11 @@ impl IocBuilder {
         crate::server::ioc_app::initial_process(&db);
         build.reach(InitHookState::AfterInitialProcess);
         let mut servers = crate::server::ioc_app::InitializedServers::default();
-        for (name, init) in server_inits {
-            servers.push(name, init().await?);
+        // C `iocBuildIsolated` has no `dbInitServers` (`iocInit.c:232-247`).
+        if mode == crate::server::ioc_app::BuildMode::Servers {
+            for (name, init) in server_inits {
+                servers.push(name, init().await?);
+            }
         }
         build.finish();
         Ok(BareIoc {
@@ -579,8 +602,8 @@ impl IocBuilder {
         // C `iocBuild` runs `dbCaLinkInit` right after `iocBuild_1`
         // (`iocInit.c:217`), so a link set exists before `init_record` and the
         // link passes below.
-        begun.reach(InitHookState::AfterCaLinkInit);
-        crate::server::ioc_app::ca_link_init(&db, self.link_set_installers).await;
+        begun.reach(InitHookState::AfterCallbackInit);
+        begun.ca_link_init(&db, self.link_set_installers).await;
         begun.reach(InitHookState::AfterInitDevSup);
 
         // 5. C `initDatabase`, through the owner every `iocBuild` shares;
@@ -611,17 +634,48 @@ impl IocBuilder {
 /// What a build announces its init hooks through: nothing for
 /// [`IocBuilder::build`], which is no `iocBuild`, and the one sequence every
 /// `iocBuild` walks for [`IocBuilder::build_ioc`].
+/// The `iocinit_begins` of [`IocBuilder::build`] and
+/// [`IocBuilder::build_served`], which say nothing of `iocBuild`. Port rule,
+/// no C line: C has no build outside `iocBuild`, whose `callbackInit`
+/// (`iocInit.c:151`) arms the bands, so a build without one arms bands still
+/// in `cbInit` itself — and leaves armed ones alone, without C's
+/// second-call warning. Before any build and after `callbackCleanup` a
+/// request is still refused.
+fn begin_unsequenced() -> Option<()> {
+    crate::runtime::task::background_arm();
+    Some(())
+}
+
 trait BuildSteps {
     fn reach(&mut self, state: InitHookState);
+    fn ca_link_init(
+        &mut self,
+        db: &Arc<PvDatabase>,
+        installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 impl BuildSteps for () {
     fn reach(&mut self, _state: InitHookState) {}
+    async fn ca_link_init(
+        &mut self,
+        db: &Arc<PvDatabase>,
+        installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
+    ) {
+        crate::server::ioc_app::install_link_sets(db, installers).await;
+    }
 }
 
 impl BuildSteps for crate::server::ioc_app::BuildSequence {
     fn reach(&mut self, state: InitHookState) {
         crate::server::ioc_app::BuildSequence::reach(self, state);
+    }
+    async fn ca_link_init(
+        &mut self,
+        db: &Arc<PvDatabase>,
+        installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
+    ) {
+        crate::server::ioc_app::BuildSequence::ca_link_init(self, db, installers).await;
     }
 }
 

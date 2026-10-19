@@ -81,6 +81,21 @@ pub(crate) fn reset_as_state_for_test() {
     *as_state().lock().unwrap() = AsState::default();
 }
 
+/// C `asShutdown` (`asDbLib.c:157-164`), from an isolated `iocShutdown`:
+/// `firstTime` back to TRUE, so the next IOC's first bare `asInit` is again
+/// the silent "never turned on" one. C's other half, freeing `pasbase`, has
+/// nothing to free here: the live policy is the IOC's own
+/// [`AcfCell`](crate::server::access_security::AcfCell), which no later IOC
+/// is handed.
+///
+/// Deviation, a C bug not copied: C's `firstTime` is cleared only by the
+/// `epicsThreadOnce` at `asDbLib.c:126`, which never runs again, so after
+/// `asShutdown` sets it (`:160`) every later `asInit` takes the first-time
+/// branch and skips `asCaStop`. Here the next `asInit` alone sees it.
+pub(crate) fn as_shutdown() {
+    as_state().lock().unwrap().as_init_ran = false;
+}
+
 /// Register the `as*` command family on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
     super::vars::register_variable(as_check_client_ip_var());

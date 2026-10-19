@@ -293,6 +293,19 @@ impl QueueInner {
     }
 }
 
+/// The `dbCaLink` worker's life, written only by [`LinkPutQueue::start_owner`]
+/// and [`LinkPutQueue::shutdown`].
+mod owner_state {
+    /// No worker: before `dbCaLinkInit`. A put staged now waits for one.
+    pub(super) const INIT: u8 = 0;
+    /// The worker runs.
+    pub(super) const RUN: u8 = 1;
+    /// C `dbCaCtl == ctlExit` (`dbCa.c:329`): the worker drains what is
+    /// ready and returns. A put staged afterwards is queued and never
+    /// serviced, as C's `workList` is, until a rebuild's `dbCaLinkInit`.
+    pub(super) const STOPPED: u8 = 2;
+}
+
 /// The queue itself. Lives in `PvDatabaseInner`; one owner task drains it.
 pub(crate) struct LinkPutQueue {
     inner: parking_lot::Mutex<QueueInner>,
@@ -303,8 +316,10 @@ pub(crate) struct LinkPutQueue {
     /// Wakes [`LinkPutQueue::sync`] waiters when the queue goes idle — the
     /// `dbCaSync` barrier (`dbCa.c:1126-1129`, `CA_SYNC`).
     idle: tokio::sync::Notify,
-    /// Set once the owner task has been spawned.
-    owner_started: std::sync::atomic::AtomicBool,
+    /// The [`owner_state`] of the `dbCaLink` worker.
+    state: std::sync::atomic::AtomicU8,
+    /// The `dbCaLink` thread, joined by [`Self::shutdown`].
+    owner: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The reactor the network half of this queue needs, captured where one is
     /// known to exist — construction time, which for an IOC is inside
     /// `IocApplication::run` and for a test is inside its `#[tokio::test]`.
@@ -329,7 +344,8 @@ impl Default for LinkPutQueue {
             inner: parking_lot::Mutex::new(QueueInner::default()),
             work: Arc::new(tokio::sync::Notify::new()),
             idle: tokio::sync::Notify::new(),
-            owner_started: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(owner_state::INIT),
+            owner: parking_lot::Mutex::new(None),
             reactor: crate::runtime::task::BlockingBridge::try_capture(),
         }
     }
@@ -646,40 +662,70 @@ impl LinkPutQueue {
         }
     }
 
-    /// Start the single owner task, once. `db` is weak so the task cannot
-    /// keep the database alive; it exits when the database is dropped.
-    ///
-    /// Reached from the staging path, which record processing enters on
-    /// whatever thread processed the record, so the loop itself goes to the
-    /// background executor. The network work it dispatches goes to
-    /// [`Self::reactor`] instead — see that field.
+    /// Start the single owner task on its own `dbCaLink` thread at
+    /// `epicsThreadPriorityMedium`, as C `dbCaLinkInitImpl` does
+    /// (`dbCa.c:339-355`): from `INIT`, or from `STOPPED` for a rebuild, which
+    /// gets a fresh worker as C's does. `db` is weak so the task cannot keep the database
+    /// alive; it exits when the database is dropped. The network work it
+    /// dispatches goes to [`Self::reactor`] — see that field.
     ///
     /// The call that starts it gets a latch that opens once the loop has
     /// registered with the watchdog — C `dbCaLinkInit` waits for exactly
-    /// that (`dbCa.c:355-357`). Only `ca_link_init` waits. The lazy callers
-    /// (`stage_external_link_open`, `write_external_pv`) must not: they run in
-    /// record processing under the record hold, and they can run on the
-    /// Medium band, where the loop itself would have to start.
-    pub(crate) fn ensure_owner(
+    /// that (`dbCa.c:355-357`). `None` when the worker already runs.
+    pub(crate) fn start_owner(
         self: &Arc<Self>,
         db: Weak<super::PvDatabaseInner>,
     ) -> Option<crate::runtime::sync::StartWait> {
-        if self
-            .owner_started
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        use std::sync::atomic::Ordering;
+        let start = |from| {
+            self.state
+                .compare_exchange(from, owner_state::RUN, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if !start(owner_state::INIT) && !start(owner_state::STOPPED) {
             return None;
         }
         let queue = Arc::downgrade(self);
         let work = self.work.clone();
         let (started, wait) = crate::runtime::sync::start_latch();
-        // Middle band: one owner loop drains the queued link puts of every
-        // record, so there is no single record whose PRIO it could take.
-        crate::runtime::task::spawn_background(
-            crate::runtime::task::CallbackPriority::Medium,
-            owner_loop(queue, work, db, started),
-        );
+        let thread = crate::runtime::task::MandatoryThread::new(
+            "dbCaLink",
+            crate::runtime::task::ThreadPriority::Medium,
+            crate::runtime::task::StackSizeClass::Big,
+        )
+        .spawn(move || {
+            if let Err(e) =
+                crate::runtime::task::block_on_sync(owner_loop(queue, work, db, started))
+            {
+                unreachable!("a fresh dbCaLink thread can always block: {e:?}");
+            }
+        });
+        *self.owner.lock() = Some(thread);
         Some(wait)
+    }
+
+    /// C `dbCaShutdown` (`dbCa.c:324-333`): tell the owner to exit once it
+    /// has drained what is ready, and join it. Nothing to stop when no owner
+    /// runs.
+    pub(crate) fn shutdown(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(
+                owner_state::RUN,
+                owner_state::STOPPED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.work.notify_one();
+        let thread = self.owner.lock().take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -761,6 +807,11 @@ async fn owner_loop(
                         q.finish(key);
                     }
                 }
+            }
+            // C `dbCaTask` leaves once its `workList` is empty and `dbCaCtl`
+            // is `ctlExit` (`dbCa.c:1187`).
+            if q.state.load(std::sync::atomic::Ordering::Acquire) != owner_state::RUN {
+                return;
             }
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.

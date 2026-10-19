@@ -205,6 +205,8 @@ async fn drive_silent(db: &PvDatabase, val: f64) {
 #[epics_macros_rs::epics_test]
 async fn unchanged_source_cycle_does_not_process_the_cp_holder() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CP", 0.0, ScanType::Passive).await;
     let settled = settle(&db, &pair).await;
 
@@ -224,6 +226,8 @@ async fn unchanged_source_cycle_does_not_process_the_cp_holder() {
 #[epics_macros_rs::epics_test]
 async fn a_value_post_processes_the_cp_holder_once() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CP", 0.0, ScanType::Passive).await;
     let settled = settle(&db, &pair).await;
 
@@ -243,6 +247,8 @@ async fn a_value_post_processes_the_cp_holder_once() {
 #[epics_macros_rs::epics_test]
 async fn a_move_inside_mdel_does_not_process_the_cp_holder() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CP", 10.0, ScanType::Passive).await;
     let settled = settle(&db, &pair).await;
 
@@ -263,6 +269,8 @@ async fn a_move_inside_mdel_does_not_process_the_cp_holder() {
 #[epics_macros_rs::epics_test]
 async fn an_alarm_only_transition_processes_the_cp_holder() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CP", 10.0, ScanType::Passive).await;
     let connected = pair.hold();
 
@@ -283,6 +291,8 @@ async fn an_alarm_only_transition_processes_the_cp_holder() {
 #[epics_macros_rs::epics_test]
 async fn a_cpp_holder_that_is_not_passive_is_still_skipped_on_a_post() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CPP", 0.0, ScanType::SEC1).await;
     let settled = settle(&db, &pair).await;
 
@@ -301,6 +311,8 @@ async fn a_cpp_holder_that_is_not_passive_is_still_skipped_on_a_post() {
 #[epics_macros_rs::epics_test]
 async fn a_passive_cpp_holder_dispatches_on_a_post() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let pair = cp_pair(&db, "CPP", 0.0, ScanType::Passive).await;
     let settled = settle(&db, &pair).await;
 

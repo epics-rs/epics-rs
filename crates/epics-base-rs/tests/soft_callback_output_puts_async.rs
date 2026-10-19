@@ -75,6 +75,10 @@ async fn rig_on(scheme: &str, admission: PutAdmission) -> Rig {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.register_link_set(
         scheme,
         Arc::new(Lset {

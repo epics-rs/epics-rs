@@ -289,6 +289,8 @@ fn a_record_thread_s_first_contended_queue_allocates_nothing() {
 /// hold on a blocking port — allocates nothing after one round of each arm.
 #[test]
 fn a_special_put_on_a_blocking_port_queues_without_allocating() {
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     test_ioc_thread(|| {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;

@@ -93,6 +93,8 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     add_ao_with_out(&db, "AO_BADOUT", "NO_SUCH_TARGET").await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -115,6 +117,8 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_external_out_put_raises_link_invalid() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
 
     add_ao_with_out(&db, "AO_BADCA", "ca://REMOTE:OUT").await;
@@ -140,6 +144,8 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("SIM_ON", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
@@ -170,6 +176,8 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
 async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
     db.process_cp_links_on_connect().await;
 
@@ -224,6 +232,8 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
 #[epics_macros_rs::epics_test]
 async fn r14_62_successful_local_out_put_raises_no_alarm() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.add_record("AO_GOOD_DEST", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

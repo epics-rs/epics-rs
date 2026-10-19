@@ -172,6 +172,8 @@ async fn process(db: &PvDatabase, name: &str) {
 #[epics_macros_rs::epics_test]
 async fn ivov_reaches_a_scalar_target_under_use_ocal() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("PROBE", Box::new(ScalarProbe { last: last.clone() }))
         .await
@@ -194,6 +196,8 @@ async fn ivov_reaches_a_scalar_target_under_use_ocal() {
 #[epics_macros_rs::epics_test]
 async fn ivov_bypasses_an_array_target_under_use_ocal() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("APROBE", Box::new(ArrayProbe { last: last.clone() }))
         .await
@@ -216,6 +220,8 @@ async fn ivov_bypasses_an_array_target_under_use_ocal() {
 #[epics_macros_rs::epics_test]
 async fn ivov_is_a_no_op_under_use_val() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("PROBE", Box::new(ScalarProbe { last: last.clone() }))
         .await
@@ -239,6 +245,8 @@ async fn ivov_is_a_no_op_under_use_val() {
 #[epics_macros_rs::epics_test]
 async fn a_single_element_source_picks_the_scalar_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("APROBE", Box::new(ArrayProbe { last: last.clone() }))
         .await
@@ -267,6 +275,8 @@ async fn a_single_element_source_picks_the_scalar_buffer() {
 #[epics_macros_rs::epics_test]
 async fn an_external_array_target_gets_the_array_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -295,6 +305,8 @@ async fn an_external_array_target_gets_the_array_buffer() {
 #[epics_macros_rs::epics_test]
 async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",

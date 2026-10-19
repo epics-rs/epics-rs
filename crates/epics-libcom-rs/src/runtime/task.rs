@@ -529,12 +529,39 @@ fn background() -> &'static crate::runtime::background::BackgroundExecutor {
     BACKGROUND.get_or_init(crate::runtime::background::BackgroundExecutor::new)
 }
 
-/// Eagerly start the process-global background executor — C `callbackInit`
-/// parity (callback.c:286), called once from `IocApplication::run`. Idempotent:
-/// a second call (or a prior lazy init) is a no-op, matching `callbackInit`'s
-/// own re-entry guard (callback.c:292-295).
+/// C `callbackInit` (callback.c:286-337): start the process-global
+/// background executor if nothing has yet, and arm its callback bands. A
+/// second call before [`background_callback_cleanup`] prints C's warning and
+/// changes nothing (callback.c:292-295). The executor a lazy first use
+/// builds leaves the bands unarmed, refusing requests as C's do before
+/// `callbackInit`.
 pub fn background_init() {
-    let _ = background();
+    background().callbacks().init();
+}
+
+/// Arm the callback bands if they are in `cbInit`, silently otherwise —
+/// [`background_init`] without C's second-call warning, for a build that has
+/// no `iocBuild` to call `callbackInit`.
+pub fn background_arm() {
+    background().callbacks().arm();
+}
+
+/// C `callbackStop` (callback.c:237-260), from `iocShutdown`: the queued
+/// callback work runs, then the bands take requests without running them.
+/// A process that never built the executor has nothing to stop.
+pub fn background_callback_stop() {
+    if let Some(exec) = BACKGROUND.get() {
+        exec.callbacks().stop();
+    }
+}
+
+/// C `callbackCleanup` (callback.c:262-284), from an isolated build's
+/// `iocShutdown`: stopped bands go back to unarmed, so the next
+/// [`background_init`] arms them.
+pub fn background_callback_cleanup() {
+    if let Some(exec) = BACKGROUND.get() {
+        exec.callbacks().cleanup();
+    }
 }
 
 /// Has the process-global background executor been built yet?

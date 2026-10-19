@@ -1,0 +1,14 @@
+record(calc, "CL:ca") {
+    field(INPA, "CL:nowhere CA")
+}
+record(calc, "CL:json") {
+    field(INPA, {const:1})
+}
+record(calc, "CL:db") {
+    field(INPA, "CL:plain")
+}
+record(ai, "CL:soft") {
+    field(INP, "1.5")
+}
+record(calc, "CL:plain") {
+}

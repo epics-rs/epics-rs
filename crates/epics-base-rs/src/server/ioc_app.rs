@@ -58,13 +58,9 @@ pub mod init_hooks {
     /// The pause block and the reachable half of the shutdown block are
     /// here because [`super::ioc_pause`] and [`super::ioc_shutdown`] make
     /// those transitions real. Still absent, because the port has no such
-    /// transition to announce them from: `initHookAfterCloseLinks`,
-    /// `initHookAfterStopCallback` and `initHookAfterStopLinks` (no
-    /// `doCloseLinks`, `callbackStop` or `dbCaShutdown` analogue — the
-    /// callback facility has no stop and the link sets have no lifecycle
-    /// methods), `initHookBeforeFree` (C announces it only from
-    /// `iocBuildIsolated`'s shutdown), the two `dbUnitTest` states, and the
-    /// two states C itself marks deprecated.
+    /// transition to announce them from: the two `dbUnitTest` states. The
+    /// two states C marks deprecated are modelled: C's first `iocRun` still
+    /// announces them (`iocInit.c:262-263`, `:270-271`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum InitHookState {
         /// Start of iocBuild() / iocInit().
@@ -113,10 +109,23 @@ pub mod init_hooks {
 
         /// Start of iocShutdown().
         AtShutdown,
+        /// Links disabled/deleted.
+        AfterCloseLinks,
         /// Scan tasks stopped.
         AfterStopScan,
+        /// Callback tasks stopped.
+        AfterStopCallback,
+        /// CA links stopped.
+        AfterStopLinks,
+        /// Resource cleanup about to happen.
+        BeforeFree,
         /// End of iocShutdown().
         AfterShutdown,
+
+        /// Only announced once. Deprecated in favor of AfterDatabaseRunning.
+        AfterInterruptAccept,
+        /// Only announced once. Deprecated in favor of AfterIocRunning.
+        AtEnd,
     }
 
     impl InitHookState {
@@ -145,8 +154,14 @@ pub mod init_hooks {
                 InitHookState::AfterDatabasePaused => "initHookAfterDatabasePaused",
                 InitHookState::AfterIocPaused => "initHookAfterIocPaused",
                 InitHookState::AtShutdown => "initHookAtShutdown",
+                InitHookState::AfterCloseLinks => "initHookAfterCloseLinks",
                 InitHookState::AfterStopScan => "initHookAfterStopScan",
+                InitHookState::AfterStopCallback => "initHookAfterStopCallback",
+                InitHookState::AfterStopLinks => "initHookAfterStopLinks",
+                InitHookState::BeforeFree => "initHookBeforeFree",
                 InitHookState::AfterShutdown => "initHookAfterShutdown",
+                InitHookState::AfterInterruptAccept => "initHookAfterInterruptAccept",
+                InitHookState::AtEnd => "initHookAtEnd",
             }
         }
     }
@@ -222,6 +237,22 @@ pub enum IocState {
     Paused,
 }
 
+/// C `iocBuildMode` (`iocInit.c:77-79`): whether `iocRun`, `iocPause` and
+/// `iocShutdown` drive the protocol servers, and whether `iocShutdown` frees
+/// what the build made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BuildMode {
+    /// C `buildServers`: `iocBuild`'s mode, and the one every `iocShutdown`
+    /// leaves behind (`iocInit.c:761`).
+    #[default]
+    Servers,
+    /// C `buildIsolated` (`iocBuildIsolated`, `iocInit.c:232-247`), the build
+    /// C's `testdb` boots: no server is initialised or run, a CA link reaches
+    /// only this database (`dbCaLinkInitIsolated`), and `iocShutdown` also
+    /// removes DB links and frees the build, so the process can build again.
+    Isolated,
+}
+
 /// The IOC lifecycle's single owner.
 ///
 /// C keeps `iocState` in one file-static and lets only `iocBuild`,
@@ -241,12 +272,16 @@ struct Lifecycle {
     /// The database `iocBuild` built, from [`initial_process`] until
     /// `iocShutdown` — C's `pdbbase` as `piniProcess` walks it.
     db: Option<Arc<PvDatabase>>,
+    /// C `iocBuildMode`: written by a build that succeeds and reset by
+    /// `iocShutdown`.
+    mode: BuildMode,
 }
 
 static LIFECYCLE: Mutex<Lifecycle> = Mutex::new(Lifecycle {
     state: IocState::Void,
     scan: None,
     db: None,
+    mode: BuildMode::Servers,
 });
 
 fn lifecycle() -> std::sync::MutexGuard<'static, Lifecycle> {
@@ -332,9 +367,18 @@ struct IocRunStarted {
 impl IocRunStarted {
     fn finish(self) {
         init_hook_announce(InitHookState::AfterDatabaseRunning);
+        if self.from == IocState::Built {
+            init_hook_announce(InitHookState::AfterInterruptAccept);
+        }
 
-        crate::server::db_server::db_run_servers();
-        init_hook_announce(InitHookState::AfterCaServerRunning);
+        if lifecycle().mode == BuildMode::Servers {
+            crate::server::db_server::db_run_servers();
+            init_hook_announce(InitHookState::AfterCaServerRunning);
+        }
+
+        if self.from == IocState::Built {
+            init_hook_announce(InitHookState::AtEnd);
+        }
 
         crate::runtime::log::errlog_printf(if self.from == IocState::Built {
             "iocRun: All initialization complete\n"
@@ -364,8 +408,10 @@ pub fn ioc_pause() -> i32 {
     }
     init_hook_announce(InitHookState::AtIocPause);
 
-    crate::server::db_server::db_pause_servers();
-    init_hook_announce(InitHookState::AfterCaServerPaused);
+    if lifecycle().mode == BuildMode::Servers {
+        crate::server::db_server::db_pause_servers();
+        init_hook_announce(InitHookState::AfterCaServerPaused);
+    }
 
     if let Some(ctl) = ioc_scan_control() {
         ctl.pause();
@@ -382,19 +428,27 @@ pub fn ioc_pause() -> i32 {
 /// [`IocState::Void`]. Idempotent — C returns 0 immediately when already
 /// void, which is what makes it safe on every exit path.
 ///
-/// C reaches this from `epicsAtExit(exitDatabase)` (`iocInit.c:579`), and
-/// so does the port: [`IocApplication::run`] registers it there, so the
-/// scan threads stop when the IOC's `run` returns however it returns.
+/// C reaches this from `epicsAtExit(exitDatabase)` (`iocInit.c:580`), and
+/// so does the port: every build registers it there through
+/// [`BuildSequence`], so the scan threads stop at the exit callbacks
+/// however the IOC was built.
 ///
-/// C's `doCloseLinks`, `callbackStop` and `dbCaShutdown` steps have no
-/// port analogue and are not faked — the callback facility has no stop and
-/// the link sets have no lifecycle methods, so their init-hook states are
-/// not announced either.
+/// Of an isolated build's free branch (`:745-757`) only
+/// `initHookBeforeFree`, `scanCleanup` and `callbackCleanup` are here; the
+/// records, lock sets, access security and iocsh are not freed.
 pub fn ioc_shutdown() -> i32 {
     if get_ioc_state() == IocState::Void {
         return 0;
     }
     init_hook_announce(InitHookState::AtShutdown);
+    let mode = lifecycle().mode;
+
+    let db = lifecycle().db.clone();
+    if let Some(db) = &db {
+        db.close_links(mode == BuildMode::Isolated);
+    }
+    drop(db);
+    init_hook_announce(InitHookState::AfterCloseLinks);
 
     // Dropping the owner is C's `scanStop`: it trips the facility to
     // `ctlExit` and joins the owner thread, which joins the scan threads. Taken out from under the lock
@@ -410,12 +464,37 @@ pub fn ioc_shutdown() -> i32 {
     if let Some(db) = &db {
         db.scan_control().stop();
     }
-    drop(db);
     init_hook_announce(InitHookState::AfterStopScan);
+    crate::runtime::task::background_callback_stop();
+    init_hook_announce(InitHookState::AfterStopCallback);
 
-    crate::server::db_server::db_stop_servers();
+    if mode != BuildMode::Isolated {
+        crate::server::db_server::db_stop_servers();
+    }
 
-    set_ioc_state(IocState::Void);
+    // Held to here so the `dbCaLink` worker, which exits once its database
+    // drops, is stopped by `dbCaShutdown` and not by the scan stop.
+    if let Some(db) = &db {
+        db.ca_link_shutdown();
+    }
+    drop(db);
+    init_hook_announce(InitHookState::AfterStopLinks);
+
+    if mode == BuildMode::Isolated {
+        init_hook_announce(InitHookState::BeforeFree);
+        // `scanCleanup` frees nothing here: the `scanOnce` ring was reset by
+        // `scanStop`'s join above, and the periodic and I/O Intr lists are
+        // the database's, freed when it drops.
+        crate::runtime::task::background_callback_cleanup();
+        crate::server::iocsh::as_shutdown();
+        crate::server::iocsh::iocsh_free();
+    }
+
+    {
+        let mut life = lifecycle();
+        life.state = IocState::Void;
+        life.mode = BuildMode::Servers;
+    }
     init_hook_announce(InitHookState::AfterShutdown);
     0
 }
@@ -548,8 +627,9 @@ pub type DynamicDeviceSupportFactory =
 
 /// An async external link-set installer, registered on an
 /// [`IocApplication`] via [`IocApplication::register_link_type`]
-/// and invoked by [`IocApplication::run`] at the C `initHookAfterCaLinkInit`
-/// point — BEFORE [`PvDatabase::setup_cp_links`] warms Passive CP holders.
+/// and invoked by [`IocApplication::run`] at C `dbCaLinkInit`, just before
+/// `initHookAfterCaLinkInit` — BEFORE [`PvDatabase::setup_cp_links`] warms
+/// Passive CP holders.
 ///
 /// The installer receives the live database, registers its external
 /// [`crate::server::database::LinkSet`] (e.g. the `ca` set from
@@ -1354,6 +1434,11 @@ pub(crate) const BUILD_HOOK_STATES: [InitHookState; 13] = [
 /// construction.
 pub(crate) struct BuildSequence {
     next: usize,
+    /// [`Self::ca_link_init`] has run, so `initHookAfterCaLinkInit` may be
+    /// announced.
+    links: bool,
+    /// What [`Self::finish`] records as C `iocBuildMode`.
+    mode: BuildMode,
 }
 
 impl BuildSequence {
@@ -1364,11 +1449,20 @@ impl BuildSequence {
     /// write (`:147`), then `iocBuilding` — after both announces, so their
     /// observers read the state the IOC came from.
     pub(crate) fn begin(out: impl Fn(&str)) -> Option<Self> {
+        Self::begin_mode(BuildMode::Servers, out)
+    }
+
+    /// [`Self::begin`] for C `iocBuild` (`Servers`) or `iocBuildIsolated`.
+    pub(crate) fn begin_mode(mode: BuildMode, out: impl Fn(&str)) -> Option<Self> {
         if get_ioc_state() != IocState::Void {
             crate::runtime::log::errlog_printf(&build_refusal());
             return None;
         }
-        let mut build = Self { next: 0 };
+        let mut build = Self {
+            next: 0,
+            links: false,
+            mode,
+        };
         build.reach(InitHookState::AtIocBuild);
         // C raises the caller to ok-to-block here (`iocInit.c:125-127`).
         crate::runtime::task::set_thread_ok_to_block(true);
@@ -1378,6 +1472,12 @@ impl BuildSequence {
             out(&line);
         }
         set_ioc_state(IocState::Building);
+        // `taskwdInit(); callbackInit();` (`iocInit.c:150-151`), the one
+        // place every build constructs and arms the callback bands. The
+        // position is `callbackSetQueueSize`'s and `callbackParallelThreads`'s
+        // contract: both refuse once the pool exists (`callback.c:106-109`,
+        // `:162-165`), since the pool reads their knobs when it is built.
+        crate::runtime::task::background_init();
         Some(build)
     }
 
@@ -1394,10 +1494,22 @@ impl BuildSequence {
             .position(|s| *s == state)
             .map(|i| self.next + i + 1)
             .unwrap_or_else(|| panic!("{} announced out of iocBuild order", state.name()));
+        assert!(
+            self.links
+                || !BUILD_HOOK_STATES[self.next..end].contains(&InitHookState::AfterCaLinkInit),
+            "initHookAfterCaLinkInit announced before dbCaLinkInit"
+        );
         std::iter::from_fn(move || {
             (self.next < end).then(|| {
                 let state = BUILD_HOOK_STATES[self.next];
                 self.next += 1;
+                if state == InitHookState::AfterInitDatabase {
+                    // C `initDatabase` ends with `epicsAtExit(exitDatabase,
+                    // NULL)` (`iocInit.c:580`), whose body is `iocShutdown`.
+                    crate::runtime::exit::at_exit("iocShutdown", || {
+                        ioc_shutdown();
+                    });
+                }
                 init_hook_announce(state);
                 state
             })
@@ -1407,6 +1519,30 @@ impl BuildSequence {
     /// [`Self::until`] for a caller with nothing of its own to run.
     pub(crate) fn reach(&mut self, state: InitHookState) {
         self.until(state).for_each(drop);
+    }
+
+    /// C `dbCaLinkInit` (`iocInit.c:217`): after `iocBuild_1`'s
+    /// `initHookAfterCallbackInit` and before `iocBuild_2` announces
+    /// `initHookAfterCaLinkInit` (`:165`), whose observers find the
+    /// `dbCaLink` worker up and every link set installed. Panics when
+    /// `initHookAfterCallbackInit` is not the last state announced.
+    pub(crate) async fn ca_link_init(
+        &mut self,
+        db: &Arc<PvDatabase>,
+        installers: Vec<LinkSetInstaller>,
+    ) {
+        assert_eq!(
+            BUILD_HOOK_STATES.get(self.next),
+            Some(&InitHookState::AfterCaLinkInit),
+            "dbCaLinkInit out of iocBuild order"
+        );
+        if self.mode == BuildMode::Isolated {
+            // `dbCaLinkInitIsolated` (`dbCa.c:357-360`).
+            db.ca_link_isolate();
+        }
+        db.ca_link_init();
+        install_link_sets(db, installers).await;
+        self.links = true;
     }
 
     /// C `iocBuild_3` (`iocInit.c:201-207`): the states left through
@@ -1419,14 +1555,17 @@ impl BuildSequence {
         }
         set_ioc_state(IocState::Built);
         self.reach(InitHookState::AfterIocBuilt);
+        // Last, as C sets it after `iocBuild_3` returns (`iocInit.c:229`,
+        // `:246`).
+        lifecycle().mode = self.mode;
     }
 }
 
-/// C `dbCaLinkInit` (`iocInit.c:217`, between `iocBuild_1` and
-/// `iocBuild_2`): every external link set is registered before any record
-/// initialises, and each installer's iocsh commands go onto the process's
-/// command table.
-pub(crate) async fn ca_link_init(db: &Arc<PvDatabase>, installers: Vec<LinkSetInstaller>) {
+/// The link-set half of C `dbCaLinkInit`: every external link set is
+/// registered before any record initialises, and each installer's iocsh
+/// commands go onto the process's command table. An `iocBuild` runs it
+/// through [`BuildSequence::ca_link_init`].
+pub(crate) async fn install_link_sets(db: &Arc<PvDatabase>, installers: Vec<LinkSetInstaller>) {
     for installer in installers {
         for cmd in installer(db.clone()).await {
             iocsh::register_command(cmd);
@@ -1571,6 +1710,8 @@ pub(crate) async fn build_without_application(db: &Arc<PvDatabase>, out: impl Fn
     let Some(mut build) = BuildSequence::begin(out) else {
         return false;
     };
+    build.reach(InitHookState::AfterCallbackInit);
+    build.ca_link_init(db, Vec::new()).await;
     build.reach(InitHookState::AfterInitDevSup);
     init_database(db, true, &|line| eprintln!("{line}")).await;
     build.reach(InitHookState::AfterInitDatabase);
@@ -1749,35 +1890,17 @@ impl IocBuild {
         // — can process a record before `initHookAfterInterruptAccept`.
         // A database's scan control is created paused, so the build has
         // nothing to close.
-        // C `initDatabase` registers the shutdown on the process exit list
-        // (`epicsAtExit(exitDatabase, NULL)`, iocInit.c:579), and
-        // `exitDatabase` is a one-line call to `iocShutdown`. Registered
-        // here so `run`'s `call_at_exits()` stops the scan threads however
-        // this IOC ends.
-        crate::runtime::exit::at_exit("iocShutdown", || {
-            ioc_shutdown();
-        });
-        // C `iocBuild_1` builds the callback facilities here and nowhere else
-        // — `iocState = iocBuilding` then `taskwdInit(); callbackInit();`
-        // immediately before this announce (`iocInit.c:148-153`). That
-        // position is the whole of `callbackSetQueueSize`'s and
-        // `callbackParallelThreads`'s contract: both refuse once the pool
-        // exists (`callback.c:106-109`, `:162-165`) because the pool reads
-        // their knobs when it is constructed, so a startup script's
-        // `callbackSetQueueSize 5000` on the line before `iocInit` is only
-        // honoured while nothing has constructed it earlier.
-        crate::runtime::task::background_init();
-        // Both of this IOC's access-security watchers spawn on the pool that
-        // line just built (C `asCaStart`, reached from `asInitCommon`,
-        // `asDbLib.c:147`). They are the reason moving `background_init`
-        // alone changed nothing: the cell used to be created watching, and
-        // that spawn built the pool before the script ran.
+        // Both of this IOC's access-security watchers spawn on the pool
+        // `BuildSequence::begin`'s `callbackInit` just built (C `asCaStart`,
+        // reached from `asInitCommon`, `asDbLib.c:147`). They are the reason
+        // moving `background_init` alone changed nothing: the cell used to be
+        // created watching, and that spawn built the pool before the script
+        // ran.
         access_security::start_acf_watchers(&db, &acf);
         announce!(InitHookState::AfterCallbackInit);
-        announce!(InitHookState::AfterCaLinkInit);
 
-        // External link-set installers fire at `AfterCaLinkInit` — the C
-        // `initHookAfterCaLinkInit` point — so every external link set is
+        // External link-set installers run at C `dbCaLinkInit`, before
+        // `initHookAfterCaLinkInit` is announced — so every external link set is
         // registered on the database BEFORE `setup_cp_links` (Phase 2b,
         // below) warms Passive CP/CPP holders. A link set registered later
         // (e.g. inside the Phase-3 protocol runner) is too late: the warm's
@@ -1791,7 +1914,8 @@ impl IocBuild {
         // shell was constructed before this line, so a per-shell table could
         // never carry these names into the script, however they were handed
         // around afterwards.
-        ca_link_init(&db, link_set_installers).await;
+        build.ca_link_init(&db, link_set_installers).await;
+        announce!(InitHookState::AfterCaLinkInit);
 
         announce!(InitHookState::AfterInitDrvSup);
         announce!(InitHookState::AfterInitRecSup);
@@ -2073,8 +2197,8 @@ pub struct IocApplication {
     /// Callbacks invoked after iocInit completes (e.g., start pollers).
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
     /// Async external link-set installers (CA links via `epics-ca-rs`'s
-    /// `calink`, PVA links via the bridge's `pvalink`). Fired at the
-    /// `AfterCaLinkInit` hook in [`Self::run`] — before `setup_cp_links`
+    /// `calink`, PVA links via the bridge's `pvalink`). Fired at C
+    /// `dbCaLinkInit` in [`Self::run`] — before `setup_cp_links`
     /// — so a Passive holder of an external CP link warms at iocInit.
     link_set_installers: Vec<LinkSetInstaller>,
     /// The link types those installers serve ([`Self::register_link_type`]),
@@ -2251,8 +2375,8 @@ impl IocApplication {
     /// loads; one call for both means no binary can accept a link it has no
     /// set to service.
     ///
-    /// The installer is invoked by [`Self::run`] at the C
-    /// `initHookAfterCaLinkInit` point — BEFORE
+    /// The installer is invoked by [`Self::run`] at C `dbCaLinkInit`, just
+    /// before `initHookAfterCaLinkInit` — BEFORE
     /// [`PvDatabase::setup_cp_links`] warms Passive CP holders. It
     /// registers its external [`crate::server::database::LinkSet`] on the
     /// live database and returns any iocsh commands it owns, which [`Self::run`]
@@ -4384,8 +4508,10 @@ mod lifecycle_tests {
     /// leftovers and the old one's records are freed.
     #[epics_macros_rs::epics_test]
     async fn shutdown_releases_the_published_database() {
-        let build = BuildSequence::begin(|line| println!("{line}")).expect("void");
+        let mut build = BuildSequence::begin(|line| println!("{line}")).expect("void");
         let db = Arc::new(PvDatabase::new());
+        build.reach(InitHookState::AfterCallbackInit);
+        build.ca_link_init(&db, Vec::new()).await;
         initial_process(&db);
         build.finish();
         assert_eq!(ioc_run(), 0);
@@ -4397,6 +4523,160 @@ mod lifecycle_tests {
         // No wait: the `scan-%g` threads holding it are joined, as C's
         // `scanStop` joins them (`dbScan.c:173-176`).
         assert_eq!(published.strong_count(), 0);
+    }
+
+    /// C `initDatabase` puts `iocShutdown` on the exit callbacks
+    /// (`iocInit.c:580`) whatever ran `iocBuild`: the bare shell's build
+    /// too.
+    #[epics_macros_rs::epics_test]
+    async fn a_bare_build_is_shut_down_by_the_exit_callbacks() {
+        build_and_run().await;
+        crate::runtime::exit::call_at_exits();
+        assert_eq!(get_ioc_state(), IocState::Void);
+    }
+
+    /// A bare build in `mode`, run, then shut down.
+    async fn build_run_and_shut_down(mode: BuildMode) {
+        let mut build = BuildSequence::begin_mode(mode, |line| println!("{line}")).expect("void");
+        let db = Arc::new(PvDatabase::new());
+        build.reach(InitHookState::AfterCallbackInit);
+        build.ca_link_init(&db, Vec::new()).await;
+        initial_process(&db);
+        build.finish();
+        assert_eq!(ioc_run(), 0);
+        assert_eq!(ioc_shutdown(), 0);
+    }
+
+    /// `asInit`'s `firstTime` across a shutdown, for `mode`.
+    async fn as_init_after_a_shutdown(mode: BuildMode) -> crate::server::iocsh::AsInitOutcome {
+        use crate::server::iocsh::{AsInitOutcome, as_init};
+        let acf = crate::server::access_security::new_acf_cell(None);
+        assert_eq!(as_init(&acf, &|_| {}), AsInitOutcome::NeverEnabled);
+        assert_eq!(as_init(&acf, &|_| {}), AsInitOutcome::NotActive);
+        build_run_and_shut_down(mode).await;
+        as_init(&acf, &|_| {})
+    }
+
+    /// C `asShutdown` (`iocInit.c:754`, `asDbLib.c:157-164`): an isolated
+    /// shutdown puts `firstTime` back, so the next IOC's bare `asInit` is the
+    /// first one again.
+    #[epics_macros_rs::epics_test]
+    async fn an_isolated_shutdown_resets_as_init_s_first_time() {
+        assert_eq!(
+            as_init_after_a_shutdown(BuildMode::Isolated).await,
+            crate::server::iocsh::AsInitOutcome::NeverEnabled
+        );
+    }
+
+    /// `asShutdown` is on the isolated branch only (`iocInit.c:745`).
+    #[epics_macros_rs::epics_test]
+    async fn a_servers_shutdown_keeps_as_init_s_first_time() {
+        assert_eq!(
+            as_init_after_a_shutdown(BuildMode::Servers).await,
+            crate::server::iocsh::AsInitOutcome::NotActive
+        );
+    }
+
+    /// C resets `iocBuildMode` at the end of `iocShutdown` (`iocInit.c:761`)
+    /// because only a build that succeeds sets it (`:229`): a Servers build
+    /// that fails after an isolated IOC shut down is shut down as Servers.
+    #[epics_macros_rs::epics_test]
+    async fn a_failed_build_after_an_isolated_ioc_shuts_down_as_servers() {
+        build_run_and_shut_down(BuildMode::Isolated).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            log.lock().unwrap().push(state);
+        }));
+        // A build that fails before `iocBuild_3` never finishes.
+        BuildSequence::begin(|line| println!("{line}")).expect("void");
+        assert_eq!(get_ioc_state(), IocState::Building);
+        assert_eq!(ioc_shutdown(), 0);
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&InitHookState::AfterShutdown));
+        assert!(!seen.contains(&InitHookState::BeforeFree), "{seen:?}");
+    }
+
+    /// Did a shutdown in `mode` leave a command and a variable this IOC
+    /// registered?
+    async fn iocsh_tables_after_a_shutdown(mode: BuildMode) -> (bool, bool) {
+        use crate::server::iocsh::registry::{CommandDef, CommandOutcome};
+        use crate::server::iocsh::vars::{VarAccess, VarDef, register_variable, variable_names};
+        crate::server::iocsh::register_command(CommandDef::new(
+            "tstFreeCmd",
+            Vec::new(),
+            "",
+            |_: &[crate::server::iocsh::registry::ArgValue],
+             _: &crate::server::iocsh::registry::CommandContext| {
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+        register_variable(VarDef {
+            name: "tstFreeVar",
+            access: VarAccess::Int {
+                get: || 0,
+                set: |_| {},
+            },
+        });
+        build_run_and_shut_down(mode).await;
+        let registry = crate::server::iocsh::command_registry().read().unwrap();
+        assert!(registry.get("dbl").is_some(), "the base set is born in");
+        assert!(
+            variable_names().contains(&"seqDLYlimit"),
+            "and the seeded knobs"
+        );
+        (
+            registry.get("tstFreeCmd").is_some(),
+            variable_names().contains(&"tstFreeVar"),
+        )
+    }
+
+    /// C `iocshFree` (`iocInit.c:757`): an isolated shutdown leaves the next
+    /// IOC no command or variable a registrar of this one added.
+    #[epics_macros_rs::epics_test]
+    async fn an_isolated_shutdown_frees_the_iocsh_tables() {
+        assert_eq!(
+            iocsh_tables_after_a_shutdown(BuildMode::Isolated).await,
+            (false, false)
+        );
+    }
+
+    /// `iocshFree` is on the isolated branch only.
+    #[epics_macros_rs::epics_test]
+    async fn a_servers_shutdown_keeps_the_iocsh_tables() {
+        assert_eq!(
+            iocsh_tables_after_a_shutdown(BuildMode::Servers).await,
+            (true, true)
+        );
+    }
+
+    /// An exit callback armed before `initDatabase` ends runs after the
+    /// `iocShutdown` it arms (`iocInit.c:580`), one armed after it runs
+    /// before: softIoc's `AfterInitDevSup` `epicsAtExit` sees `iocVoid`.
+    #[epics_macros_rs::epics_test]
+    async fn exit_callbacks_armed_inside_the_build_run_around_ioc_shutdown() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            if matches!(
+                state,
+                InitHookState::AfterInitDevSup | InitHookState::AfterFinishDevSup
+            ) {
+                let log = Arc::clone(&log);
+                crate::runtime::exit::at_exit("probe", move || {
+                    log.lock().unwrap().push((state.name(), get_ioc_state()));
+                });
+            }
+        }));
+        build_and_run().await;
+        crate::runtime::exit::call_at_exits();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("initHookAfterFinishDevSup", IocState::Running),
+                ("initHookAfterInitDevSup", IocState::Void),
+            ]
+        );
     }
 
     /// BOUNDARY: `iocShutdown` from `iocPaused`. C shuts down from any

@@ -72,6 +72,8 @@ impl DeviceSupport for Sink {
 
 async fn completes_on(prio: i16) -> Vec<String> {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("AI", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
@@ -210,6 +212,8 @@ async fn complete(db: &PvDatabase, pending: &Pending) {
 #[epics_macros_rs::epics_test]
 async fn a_cancel_before_the_completion_stops_the_reentry() {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     let pending = Pending::default();
     let reads = queueing_ai(&db, &pending).await;
     db.process_record("AI").await.unwrap();
@@ -224,6 +228,8 @@ async fn a_cancel_before_the_completion_stops_the_reentry() {
 #[epics_macros_rs::epics_test]
 async fn a_completion_leaves_the_record_s_token_current() {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     let pending = Pending::default();
     let reads = queueing_ai(&db, &pending).await;
     let token = db.mint_async_token("AI").unwrap();
@@ -239,6 +245,8 @@ async fn a_completion_leaves_the_record_s_token_current() {
 #[epics_macros_rs::epics_test]
 async fn a_completion_after_the_scan_stopped_processes_nothing() {
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     let pending = Pending::default();
     let reads = queueing_ai(&db, &pending).await;
     db.process_record("AI").await.unwrap();

@@ -143,6 +143,8 @@ async fn settle() {
 #[epics_macros_rs::epics_test]
 async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_NUM", Box::new(AiRecord::new(1.23456789)))
         .await
@@ -181,6 +183,8 @@ async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
 #[epics_macros_rs::epics_test]
 async fn string_source_numeric_destination_puts_atof_of_the_string() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_STR", Box::new(StringinRecord::new("")))
         .await
@@ -217,6 +221,8 @@ async fn string_source_numeric_destination_puts_atof_of_the_string() {
 #[epics_macros_rs::epics_test]
 async fn char_array_destination_puts_the_string_bytes() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_C", Box::new(AiRecord::new(7.0)))
         .await
@@ -256,6 +262,8 @@ async fn char_array_destination_puts_the_string_bytes() {
 #[epics_macros_rs::epics_test]
 async fn scalar_char_destination_puts_the_double() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last = Arc::new(Mutex::new(None));
     db.add_record("SRC_C1", Box::new(AiRecord::new(7.0)))
         .await
@@ -293,6 +301,8 @@ async fn scalar_char_destination_puts_the_double() {
 #[epics_macros_rs::epics_test]
 async fn unresolved_destination_is_not_written_at_all() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",
@@ -341,6 +351,8 @@ async fn unresolved_destination_is_not_written_at_all() {
 #[epics_macros_rs::epics_test]
 async fn resolved_external_string_destination_takes_the_string_view() {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     let last_put = Arc::new(Mutex::new(None));
     db.register_link_set(
         "ca",

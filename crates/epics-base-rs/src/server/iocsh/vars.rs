@@ -217,6 +217,16 @@ fn seeded_knobs() -> Vec<VarDef> {
     ]
 }
 
+/// The variable half of C `iocshFree` (`iocsh.cpp:796-802`): the table goes
+/// back to what it is born holding, the knobs C's next
+/// `registerRecordDeviceDriver` registers again.
+pub(super) fn free() {
+    *VARIABLES.lock().unwrap_or_else(|e| e.into_inner()) = seeded_knobs()
+        .into_iter()
+        .map(|def| (def.name, def))
+        .collect();
+}
+
 /// C `iocshRegisterVariable`. Re-registering the same name is a no-op,
 /// which is what C's `found` branch amounts to for a table whose entries
 /// all point at their own global.

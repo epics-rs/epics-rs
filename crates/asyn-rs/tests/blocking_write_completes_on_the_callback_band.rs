@@ -121,6 +121,8 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
     ads.init(&mut rec).unwrap();
 
     let db = PvDatabase::new();
+    // C `callbackInit`: no build arms the bands for a bare database.
+    epics_base_rs::runtime::task::background_init();
     db.add_record("BLK:AO", Box::new(rec)).await.unwrap();
     db.add_record("BLK:SINK", Box::new(AoRecord::new(0.0)))
         .await

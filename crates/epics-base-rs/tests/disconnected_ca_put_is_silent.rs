@@ -67,6 +67,8 @@ fn console_of(name: &str) -> Vec<String> {
 /// errlog, and return the record's alarm.
 async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(lset)).await;
     db.process_cp_links_on_connect().await;
     db.add_record("R1", Box::new(AoRecord::new(1.0)))

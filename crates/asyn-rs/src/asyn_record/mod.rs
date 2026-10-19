@@ -11062,6 +11062,8 @@ mod tests {
     /// grows by one for it and reuses both once they are released.
     #[test]
     fn a_special_put_queues_while_an_earlier_one_is_outstanding() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_base_rs::runtime::task::background_init();
         use crate::interrupt::InterruptManager;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -11625,6 +11627,8 @@ A.TMSK 1
     /// `asyn_special_posts_in_c_order`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn special_callbacks_post_after_the_put_as_the_oracle_does() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_base_rs::runtime::task::background_init();
         use crate::interfaces::Capability;
         use crate::interpose::eos::EosInterpose;
         use crate::port::InterfaceMask;
@@ -11918,6 +11922,8 @@ A.OEOS
     /// runs after the readback, and IEOS shows the record's own terminator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn special_readback_runs_in_the_same_port_callback() {
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_base_rs::runtime::task::background_init();
         use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};

@@ -195,6 +195,8 @@ async fn plain_put_returns_before_the_wire_write_completes() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
@@ -243,6 +245,8 @@ async fn plain_put_returns_before_the_wire_write_completes() {
 async fn disconnected_link_stages_nothing_and_alarms() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(RecordingLset {
@@ -290,6 +294,8 @@ async fn pending_put_is_overwritten_latest_wins() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
@@ -341,6 +347,8 @@ async fn pending_put_is_overwritten_latest_wins() {
 async fn per_link_put_ordering_is_preserved() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set("ca", Arc::new(RecordingLset::connected(&writes)))
         .await;
     db.process_cp_links_on_connect().await;
@@ -384,6 +392,8 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {
@@ -449,6 +459,8 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
 async fn async_put_wire_failure_settles_the_chain_without_alarming() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(RecordingLset {
@@ -493,6 +505,8 @@ async fn a_blocked_link_does_not_stall_other_links() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
     let db = PvDatabase::new();
+    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+    db.ca_link_init();
     db.register_link_set(
         "ca",
         Arc::new(GateLset {

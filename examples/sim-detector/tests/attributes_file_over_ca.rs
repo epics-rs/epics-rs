@@ -5,7 +5,6 @@
 
 #![cfg(all(feature = "ioc", tokio_backend))]
 
-use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -24,17 +23,6 @@ fn base_bin(name: &str) -> PathBuf {
     use epics_base_rs::reference::{ReferenceTree, reference_path};
     let arch = std::env::var("EPICS_HOST_ARCH").unwrap_or_else(|_| "linux-x86_64".into());
     reference_path(ReferenceTree::Base, &format!("bin/{arch}/{name}"))
-}
-
-/// A port free for both TCP and UDP, as a CA or PVA server binds both.
-fn free_port() -> u16 {
-    loop {
-        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
 }
 
 struct Clients {
@@ -86,9 +74,14 @@ iocInit()
 "#,
     )
     .unwrap();
+    // The UDP numbers are the ones the clients search on and the IOC must get
+    // (a taken TCP number only moves a server to a dynamic port, which the
+    // search reply carries), so they are held for the child, whose fanout
+    // binds join the holds.
+    let (ca, pva) = (named_port::HeldPort::udp(), named_port::HeldPort::udp());
     let clients = Clients {
-        ca: free_port(),
-        pva: free_port(),
+        ca: ca.port,
+        pva: pva.port,
     };
     let _ioc = Reaped(
         Command::new(env!("CARGO_BIN_EXE_sim-ioc"))

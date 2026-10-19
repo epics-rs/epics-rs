@@ -487,6 +487,14 @@ fn render_queues(state: &IntrospectionState) -> String {
 mod tests {
     use super::*;
 
+    /// A loopback address for `run_introspection` to bind, its number held
+    /// from first bind to last ([`named_port::HeldPort::tcp`]).
+    fn held_addr() -> (named_port::HeldPort, SocketAddr) {
+        let held = named_port::HeldPort::tcp();
+        let addr = SocketAddr::from(([127, 0, 0, 1], held.port));
+        (held, addr)
+    }
+
     #[test]
     fn parse_request_line_basic() {
         let (m, p) = parse_request_line("GET /healthz HTTP/1.1\r\n");
@@ -515,9 +523,7 @@ mod tests {
         // Bind ephemeral port, fire a real GET /healthz, parse the
         // response. Catches issues with the request reader/writer
         // that the unit-level tests don't exercise.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // re-bind inside run_introspection
+        let (_held, addr) = held_addr();
         let state = IntrospectionState::new(5064);
         let st = state.clone();
         let server = tokio::spawn(async move {
@@ -545,9 +551,7 @@ mod tests {
     /// security's blocking work runs.
     #[tokio::test]
     async fn reload_acf_runs_on_the_access_security_offload() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (_held, addr) = held_addr();
         let ran_on = Arc::new(std::sync::Mutex::new(None));
         let seen = ran_on.clone();
         let state = IntrospectionState::new(5064).with_reload_acf(Arc::new(move || {

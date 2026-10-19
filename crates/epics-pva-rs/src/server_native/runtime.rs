@@ -882,11 +882,8 @@ mod tcp_fallback_tests {
     async fn unrecovered_bind_logs_pvxs_err_line() {
         // TEST-NET-1 (RFC 5737) is never a local address.
         let unassigned = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let held = named_port::HeldPort::tcp();
+        let port = held.port;
         let errno = std::net::TcpListener::bind((unassigned, port))
             .unwrap_err()
             .raw_os_error()
@@ -933,11 +930,8 @@ mod tcp_fallback_tests {
     #[tokio::test]
     #[serial_test::serial(epics_env)]
     async fn interface_list_binds_in_pvxs_sorted_order() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let held = named_port::HeldPort::tcp();
+        let port = held.port;
         let errno = std::net::TcpListener::bind(("192.0.2.1", port))
             .unwrap_err()
             .raw_os_error()
@@ -1052,18 +1046,10 @@ mod tcp_fallback_tests {
     #[tokio::test]
     #[serial_test::serial(epics_env)]
     async fn wildcard_entry_binds_after_a_specific_one() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let in_use = {
-            let _held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-            std::net::TcpListener::bind(("::", port))
-                .unwrap_err()
-                .raw_os_error()
-                .unwrap()
-        };
+        let held = named_port::HeldPort::tcp();
+        let port = held.port;
+        // The server's own 127.0.0.1 listener refuses its wildcard.
+        let in_use = libc::EADDRINUSE;
         // SAFETY: `serial(epics_env)` holds every env-touching test off.
         unsafe {
             std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1 0.0.0.0:7000");
@@ -1518,17 +1504,8 @@ mod tcp_fallback_tests {
     /// triggered and the server gets exactly what it asked for.
     #[tokio::test]
     async fn requested_port_used_when_available() {
-        // Reserve a port, drop the reservation so the kernel almost
-        // certainly hands it back, then ask the server for it. The
-        // window is small enough that this is reliable in practice;
-        // if a sibling test happens to grab the port between our
-        // drop and the server's bind, the fallback path catches it
-        // and the test still passes (just doesn't exercise the
-        // happy path). That's an acceptable trade for not having
-        // to manage a shared port pool.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        let target = probe.local_addr().expect("probe addr").port();
-        drop(probe);
+        let held = named_port::HeldPort::tcp();
+        let target = held.port;
 
         let source = Arc::new(SharedSource::new());
         let config = PvaServerConfig {
@@ -1542,10 +1519,7 @@ mod tcp_fallback_tests {
 
         let server = PvaServer::start(source, config).expect("server must start");
         let report = server.report();
-        // Either we got the requested port (happy path) or fallback
-        // kicked in (sibling test grabbed it). Both are valid; only
-        // a panic would be a regression.
-        assert!(report.tcp_port != 0, "must bind a real port");
+        assert_eq!(report.tcp_port, target);
         drop(server);
     }
 

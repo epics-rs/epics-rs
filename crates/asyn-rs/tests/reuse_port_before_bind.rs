@@ -10,9 +10,6 @@
 //! second `udp&` port on the same local port failed `EADDRINUSE` — the one
 //! configuration the `&` suffix is for.
 
-use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr};
-
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::port::PortDriver;
 use asyn_rs::user::AsynUser;
@@ -26,33 +23,6 @@ fn free_udp_port() -> u16 {
     s.local_addr().unwrap().port()
 }
 
-/// Hold a UDP port alive for the whole test so no neighbour's probe can steal
-/// the number in the drop→rebind window (the probe-then-rebind flake).
-///
-/// The driver binds its `udp&` local endpoint on `0.0.0.0:<port>` with
-/// `SO_REUSEPORT` set before the bind (`ip_port.rs::new_socket` /
-/// `connect_udp`). Holding a `SO_REUSEPORT` socket on the *same* `0.0.0.0:<port>`
-/// therefore (a) reserves the number — a plain-bind neighbour is refused
-/// `EADDRINUSE`, and the ephemeral allocator will not hand it out — while
-/// (b) still letting the driver's two `udp&` ports join the same REUSEPORT group.
-/// Returns `(held socket, port)`; keep the socket alive for as long as the number
-/// must stay ours.
-fn hold_reuseport_udp() -> (Socket, u16) {
-    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-    // Same split as the driver's own bind (ip_port.rs `new_socket`, C
-    // drvAsynIPPort.c:468-472 USE_SO_REUSEADDR): SO_REUSEPORT where it
-    // exists, SO_REUSEADDR on Windows — socket2 exposes `set_reuse_port`
-    // only on unix, and Windows SO_REUSEADDR is what grants the co-bind.
-    #[cfg(unix)]
-    s.set_reuse_port(true).unwrap();
-    #[cfg(not(unix))]
-    s.set_reuse_address(true).unwrap();
-    let bind: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
-    s.bind(&bind.into()).unwrap();
-    let port = s.local_addr().unwrap().as_socket().unwrap().port();
-    (s, port)
-}
-
 /// ```text
 /// drvAsynIPPortConfigure("A", "127.0.0.1:9000:5000 udp&", ...)
 /// drvAsynIPPortConfigure("B", "127.0.0.1:9000:5000 udp&", ...)
@@ -62,15 +32,13 @@ fn hold_reuseport_udp() -> (Socket, u16) {
 /// only works if the option precedes the bind.
 #[test]
 fn two_udp_reuseport_ports_share_one_local_port() {
-    // `local` is what both ports re-bind, so hold it race-proof with a REUSEPORT
-    // socket the driver's own REUSEPORT binds can share. `peer` is only a
-    // destination address (the driver never binds it, C :533 does not connect a
-    // datagram socket), so a plain held socket keeps its number ours too. Holding
-    // both across the whole test closes the probe-then-rebind window without
-    // changing the honest path — the ports still bind `local`, now alongside our
-    // held member of the same REUSEPORT group.
-    let (_hold_local, local) = hold_reuseport_udp();
-    let (_hold_peer, peer) = hold_reuseport_udp();
+    // `local` is what both ports re-bind, so it is held by a member of the
+    // REUSEPORT group the driver's binds join. `peer` is only a destination
+    // address (the driver never binds it, C :533 does not connect a datagram
+    // socket), so a closed hold keeps its number ours.
+    let hold_local = named_port::HeldPort::reuse_port_udp();
+    let hold_peer = named_port::HeldPort::closed_udp();
+    let (local, peer) = (hold_local.port, hold_peer.port);
     let spec = format!("127.0.0.1:{peer}:{local} udp&");
 
     let mut first = DrvAsynIPPort::new("R1862A", &spec).unwrap();

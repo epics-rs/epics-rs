@@ -13,11 +13,10 @@ use asyn_rs::trace::{TraceFile, TraceMask};
 
 #[test]
 fn every_listener_line_is_c_s_text() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Held for the test, so no other socket takes the number before the
+    // listener binds it.
+    let held = named_port::HeldPort::tcp();
+    let port = held.port;
     let info = format!("127.0.0.1:{port}");
 
     let services = PortServices::new();

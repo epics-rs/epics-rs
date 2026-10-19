@@ -4034,11 +4034,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_refused_tcp_connect_reports_connect_s_errno_in_c_s_words() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let held = named_port::HeldPort::closed_tcp();
+        let port = held.port;
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let err = drv.connect(&AsynUser::default()).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);

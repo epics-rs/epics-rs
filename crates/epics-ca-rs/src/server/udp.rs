@@ -1397,20 +1397,6 @@ mod responder_bind_tests {
     use super::*;
     use socket2::{Domain, Protocol, Socket, Type};
 
-    /// `bind` until it stops answering EADDRINUSE, at most eight times. The
-    /// port these tests take is chosen on one socket and then bound on
-    /// another, so any other process on the box can hold it in between; that
-    /// is a lost race of the rig, retried on a fresh number.
-    fn bind_retrying_addr_in_use(mut bind: impl FnMut() -> CaResult<BoundUdp>) -> BoundUdp {
-        for _ in 0..8 {
-            match bind() {
-                Err(epics_base_rs::error::CaError::Io(e)) if bind_was_held(&e) => {}
-                r => return r.expect("bind responders"),
-            }
-        }
-        panic!("eight chosen ports in a row were already in use");
-    }
-
     /// The bundle-bind error path itself: a port another socket holds
     /// exclusively fails the bind, naming the address. Windows answers a
     /// `SO_REUSEADDR` bind on a held specific address with WSAEACCES, never
@@ -1760,15 +1746,12 @@ mod responder_bind_tests {
     /// helper's Windows carve-out.
     #[test]
     fn fixed_responder_port_still_allows_datagram_fanout() {
-        // Take an ephemeral port first, then re-bind that same number as
-        // a *fixed* port so the test never guesses at a free one.
-        let mut port = 0;
-        let bound = bind_retrying_addr_in_use(|| {
-            let probe = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("probe bind");
-            port = probe.port();
-            drop(probe);
-            bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[])
-        });
+        // A number held for the test, re-bound as a *fixed* port beside the
+        // hold, so the test never guesses at a free one.
+        let held = named_port::HeldPort::udp();
+        let port = held.port;
+        let bound =
+            bind_udp_responders(port, vec![Ipv4Addr::LOCALHOST], &[]).expect("bind responders");
         assert_eq!(bound.port(), port);
 
         let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");

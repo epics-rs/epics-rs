@@ -3837,10 +3837,9 @@ pub(crate) mod tests {
         /// refusal into a slow one.
         #[test]
         fn dial_to_closed_target_fails_fast() {
-            // Bind, take the addr, drop: nothing listens → RST.
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = l.local_addr().expect("addr");
-            drop(l);
+            // Held and never listening → RST.
+            let held = named_port::HeldPort::closed_tcp();
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], held.port));
 
             let started = std::time::Instant::now();
             let (tx, rx) = std::sync::mpsc::channel();

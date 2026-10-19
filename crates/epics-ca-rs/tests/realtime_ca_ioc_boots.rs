@@ -171,11 +171,10 @@ mod exec_model {
     /// A port with nothing listening on it, for the name server the IOC is
     /// pointed at. The client is expected to fail to reach it — what is under
     /// test is that it fails by refusing a connection rather than by panicking.
+    /// Held for the whole run, so no stranger can take the number and answer.
     fn closed_port() -> u16 {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
-        let port = tcp.local_addr().unwrap().port();
-        drop(tcp);
-        port
+        static HOLD: std::sync::OnceLock<named_port::HeldPort> = std::sync::OnceLock::new();
+        HOLD.get_or_init(named_port::HeldPort::closed_tcp).port
     }
 
     /// What the IOC reports about the server it started, or `None` while that

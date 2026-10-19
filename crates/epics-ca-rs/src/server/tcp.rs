@@ -14318,18 +14318,16 @@ mod bind_tcp_set_tests {
     /// OS-picked number, not the requested one (`caservertask.c:266`).
     #[tokio::test]
     async fn skipping_an_address_that_is_not_an_interface_restarts_on_port_zero() {
-        for _ in 0..5 {
-            let probe = std::net::TcpListener::bind((LO, 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let (_, bound) = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1), LO], port)
-                .await
-                .expect("bind");
-            if bound != port {
-                return;
-            }
-        }
-        panic!("the set stayed on the requested number after the skip");
+        // Held, so the number is the test's own and an OS pick never repeats it.
+        let held = named_port::HeldPort::tcp();
+        // Without the skip the set takes the number, so a move below is the skip's.
+        let (listeners, bound) = bind_tcp_set(vec![LO], held.port).await.expect("bind");
+        assert_eq!(bound, held.port);
+        drop(listeners);
+        let (_, bound) = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1), LO], held.port)
+            .await
+            .expect("bind");
+        assert_ne!(bound, held.port);
     }
 
     /// An address that is no interface of this host is skipped; the rest

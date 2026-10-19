@@ -20,11 +20,11 @@ impl Drop for Reaped {
 
 #[test]
 fn no_simulator_leaves_demo_ai_at_its_database_value() {
-    let ca_port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // CA's UDP responder must get this number or the IOC exits (a taken TCP
+    // number only moves CA to a dynamic one), so it is held for the child,
+    // whose fanout bind joins the hold.
+    let ca_held = named_port::HeldPort::udp();
+    let ca_port = ca_held.port;
     let pva_port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

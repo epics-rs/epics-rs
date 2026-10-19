@@ -51,15 +51,12 @@ fn a_refused_fanout_option_is_logged_and_the_udp_server_still_binds() {
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
     errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    // Held for the server, which has no ephemeral-port getter: its
+    // SO_REUSEADDR bind on 127.0.0.1 joins the hold and outranks it for
+    // unicast.
+    let held = named_port::HeldPort::udp();
+    let port = held.port;
     refuse_reuse_port();
-
-    // A free port, released for the server: the UDP server has no
-    // ephemeral-port getter.
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let mut srv =
         DrvAsynIPServerPort::new("fanout_refused", &format!("127.0.0.1:{port} UDP")).unwrap();
     srv.connect(&AsynUser::default())

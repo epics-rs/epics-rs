@@ -3000,6 +3000,7 @@ dependencies = [
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+ "named-port",
  "tempfile",
 ]
 
@@ -3730,6 +3731,7 @@ dependencies = [
  "ad-plugins-rs",
  "asyn-rs",
  "epics-base-rs",
+ "named-port",
  "parking_lot",
  "rand 0.9.3",
  "tempfile",

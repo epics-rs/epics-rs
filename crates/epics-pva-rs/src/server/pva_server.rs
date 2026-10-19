@@ -641,11 +641,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(epics_env)]
     async fn env_server_port_zero_leaves_the_search_port() {
-        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let udp_held = named_port::HeldPort::udp();
+        let udp = udp_held.port;
         // SAFETY: `serial(epics_env)` holds every env-touching test off.
         unsafe {
             std::env::set_var("EPICS_PVAS_SERVER_PORT", "0");
@@ -704,28 +701,20 @@ mod tests {
                 None,
             )
         };
-        let free = || {
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
-        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let udp_held = named_port::HeldPort::udp();
+        let udp = udp_held.port;
         // SAFETY: `serial(epics_env)` holds every env-touching test off.
         unsafe {
             std::env::remove_var("EPICS_PVAS_SERVER_PORT");
             std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1");
             std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string());
         }
-        let explicit = free();
+        let explicit_held = named_port::HeldPort::tcp();
+        let explicit = explicit_held.port;
         let got_explicit = bound_tcp(from_parts(explicit)).await;
         let got_zero = bound_tcp(from_parts(0)).await;
-        let built = free();
+        let built_held = named_port::HeldPort::tcp();
+        let built = built_held.port;
         let got_built = bound_tcp(PvaServer::builder().port(built).build().await.unwrap()).await;
         unsafe {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");

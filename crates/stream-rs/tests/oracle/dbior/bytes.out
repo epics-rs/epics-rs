@@ -1,0 +1,92 @@
+==L1
+Driver: stream
+  StreamDevice 2.8.26-dirty 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+    %é HighConverter
+  connected records:
+    R3: h.proto hi dummy
+==L2
+Driver: stream
+  StreamDevice 2.8.26-dirty 2026-08-10 17:18:59 +0200
+  commit: 562dd5ad36e07989a8bbb231dcb5bd165537c7f6
+  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)
+  Use interest level 100 for license information
+  registered bus interfaces:
+    DebugInterface
+    DummyInterface
+    AsynDriverInterface
+  registered converters:
+    %/ RegexpConverter
+    %< ChecksumConverter
+    %B BinaryConverter
+    %D BCDConverter
+    %E StdDoubleConverter
+    %G StdDoubleConverter
+    %R RawFloatConverter
+    %T TimestampConverter
+    %X StdLongConverter
+    %[ StdCharsetConverter
+    %b BinaryConverter
+    %c StdCharsConverter
+    %d StdLongConverter
+    %e StdDoubleConverter
+    %f StdDoubleConverter
+    %g StdDoubleConverter
+    %i StdLongConverter
+    %m MantissaExponentConverter
+    %o StdLongConverter
+    %r RawConverter
+    %s StdStringConverter
+    %u StdLongConverter
+    %x StdLongConverter
+    %{ EnumConverter
+    %é HighConverter
+  connected records:
+
+R3: h.proto hi dummy
+hi {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "café \xe9";
+}
+==END

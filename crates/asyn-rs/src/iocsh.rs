@@ -417,8 +417,8 @@ fn ports_report(mgr: &PortManager, level: i32, port: Option<&str>) -> String {
 struct DrvAsyn(Arc<PortManager>);
 
 impl epics_base_rs::server::driver_support::DriverSupport for DrvAsyn {
-    fn report(&self, level: i32) -> Option<String> {
-        Some(ports_report(&self.0, level, None))
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
+        Some(ports_report(&self.0, level, None).into_bytes())
     }
 }
 
@@ -3622,7 +3622,7 @@ mod tests {
     fn dbior_reports_asyn_ports_through_drv_asyn() {
         use epics_base_rs::server::driver_support::DriverSupport as _;
         let mgr = fresh_mgr_with_port("dbior_rep");
-        let text = DrvAsyn(mgr).report(0).unwrap();
+        let text = String::from_utf8(DrvAsyn(mgr).report(0).unwrap()).unwrap();
         assert!(text.contains("dbior_rep multiDevice:No"), "{text}");
         assert!(text.contains("Port: dbior_rep"), "{text}");
     }

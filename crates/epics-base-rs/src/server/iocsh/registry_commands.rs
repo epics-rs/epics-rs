@@ -465,7 +465,7 @@ mod tests {
         let ctx = make_ctx();
         struct Probe;
         impl crate::server::driver_support::DriverSupport for Probe {
-            fn report(&self, _level: i32) -> Option<String> {
+            fn report(&self, _level: i32) -> Option<Vec<u8>> {
                 None
             }
         }

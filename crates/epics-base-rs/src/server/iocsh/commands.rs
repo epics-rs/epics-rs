@@ -4116,16 +4116,11 @@ fn cmd_dbior() -> CommandDef {
                 match drvet.report(level) {
                     // C `pdrvet->report == NULL` (`dbTest.c:738-739`).
                     None => ctx.println(&format!("Driver: {name} No report available")),
-                    Some(text) => {
+                    // C's header is a separate `printf` from whatever
+                    // `report()` writes, which goes out byte for byte.
+                    Some(bytes) => {
                         ctx.println(&format!("Driver: {name}"));
-                        // C's header is a separate `printf` from whatever
-                        // `report()` writes, so a report that printed nothing
-                        // leaves the header alone on its line.
-                        if !text.is_empty() {
-                            for line in text.trim_end_matches('\n').split('\n') {
-                                ctx.println(line);
-                            }
-                        }
+                        ctx.print_bytes(&bytes);
                     }
                 }
             }
@@ -8457,13 +8452,13 @@ mod tests {
 
         struct Chatty;
         impl DriverSupport for Chatty {
-            fn report(&self, level: i32) -> Option<String> {
-                Some(format!("  chatty state, level {level}"))
+            fn report(&self, level: i32) -> Option<Vec<u8>> {
+                Some(format!("  chatty state, level {level}\n").into_bytes())
             }
         }
         struct NoReport;
         impl DriverSupport for NoReport {
-            fn report(&self, _level: i32) -> Option<String> {
+            fn report(&self, _level: i32) -> Option<Vec<u8>> {
                 None
             }
         }

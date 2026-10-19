@@ -1,0 +1,3 @@
+Terminator = CR LF;
+get { out "VAL?"; in "%f"; }
+put { out "SET %s"; }

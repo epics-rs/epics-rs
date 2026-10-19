@@ -1503,6 +1503,10 @@ impl BuildSequence {
             (self.next < end).then(|| {
                 let state = BUILD_HOOK_STATES[self.next];
                 self.next += 1;
+                // C `iocBuild_2` runs `initDrvSup` just before this announce.
+                if state == InitHookState::AfterInitDrvSup {
+                    crate::server::driver_support::init_drv_sup();
+                }
                 if state == InitHookState::AfterInitDatabase {
                     // C `initDatabase` ends with `epicsAtExit(exitDatabase,
                     // NULL)` (`iocInit.c:580`), whose body is `iocShutdown`.

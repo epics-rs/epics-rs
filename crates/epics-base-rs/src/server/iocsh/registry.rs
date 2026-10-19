@@ -431,6 +431,11 @@ impl CommandContext {
         let _ = out.write_all(b"\n");
     }
 
+    /// Print raw BYTES to the current output, as C's `printf("%s")` does.
+    pub fn print_bytes(&self, bytes: &[u8]) {
+        let _ = self.output.borrow_mut().write_all(bytes);
+    }
+
     /// Print a formatted string to the current output.
     pub fn print_fmt(&self, args: std::fmt::Arguments<'_>) {
         let mut out = self.output.borrow_mut();

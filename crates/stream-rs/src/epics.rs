@@ -40,6 +40,7 @@ use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
     WriteStart,
 };
+use epics_base_rs::server::driver_support::{DriverSupport, register_driver_support};
 use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
 use epics_base_rs::server::recgbl::alarm_status::{
     CALC_ALARM, COMM_ALARM, NO_ALARM, READ_ALARM, TIMEOUT_ALARM, UDF_ALARM, WRITE_ALARM,
@@ -1021,19 +1022,83 @@ static TERMINATING: AtomicBool = AtomicBool::new(false);
 /// stream.dbd's `driver(stream)` and the stream dsets' `init`: iocInit runs
 /// them whether or not a record uses them, `drvStreamInit` in `initDrvSup`
 /// (iocInit.c:167), `streamInit(0)` in `initDevSup` (:173) and
-/// `streamInit(1)` in `finishDevSup` (:183). Base has no driver or dset
-/// init pass, so they run from the hook each of those is announced
-/// before.
+/// `streamInit(1)` in `finishDevSup` (:183). The driver is the `stream`
+/// drvet (StreamEpics.cc:276-280); base has no dset init pass, so the dset
+/// `init` runs from the hook each of those is announced before.
 pub fn register_driver() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        register_driver_support("stream", Arc::new(Drvet));
         init_hook_register(Arc::new(|state| match state {
-            InitHookState::AfterInitDrvSup => drv_init(),
             InitHookState::AfterInitRecSup => stream_init(false),
             InitHookState::AfterFinishDevSup => stream_init(true),
             _ => {}
         }))
     });
+}
+
+/// `StreamVersion` (StreamVersion.c) as a build without git or `.VERSION`
+/// metadata spells it: the StreamDevice release this crate ports, with no
+/// commit date or hash, those of a C build naming its StreamDevice
+/// checkout.
+pub const STREAM_VERSION: &str = "StreamDevice 2.8.26";
+
+/// `struct drvet stream`
+struct Drvet;
+
+impl DriverSupport for Drvet {
+    fn report(&self, interest: i32) -> Option<Vec<u8>> {
+        Some(report(interest))
+    }
+
+    fn init(&self) {
+        drv_init();
+    }
+}
+
+/// `Stream::report(interest)`, its `printf`s' bytes.
+fn report(interest: i32) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut out = Vec::new();
+    let _ = writeln!(out, "  {STREAM_VERSION}");
+    out.extend_from_slice(b"  (C) 1999 Dirk Zimoch (dirk.zimoch@psi.ch)\n");
+    if interest == 100 {
+        let _ = write!(out, "\n{}", crate::core::license());
+        return out;
+    }
+    out.extend_from_slice(b"  Use interest level 100 for license information\n");
+    out.extend_from_slice(b"  registered bus interfaces:\n");
+    for name in crate::bus::stream_bus_interface_names() {
+        let _ = writeln!(out, "    {name}");
+    }
+    if interest < 1 {
+        return out;
+    }
+    out.extend_from_slice(b"  registered converters:\n");
+    for c in 0..=255u8 {
+        if let Some(converter) = crate::converter::find(c) {
+            out.extend_from_slice(b"    %");
+            out.push(c);
+            let _ = writeln!(out, " {}", converter.name);
+        }
+    }
+    out.extend_from_slice(b"  connected records:\n");
+    for stream in all_streams() {
+        if interest == 2 {
+            let _ = writeln!(out, "\n{}: {}", stream.name(), stream.link());
+            let _ = stream.lock.lock().print_protocol(&mut out);
+        } else {
+            let _ = writeln!(out, "    {}: {}", stream.name(), stream.link());
+            if interest == 3 {
+                let mut buffer = StreamBuffer::new();
+                stream.lock.lock().print_status(&mut buffer);
+                out.extend_from_slice(b"      ");
+                out.extend_from_slice(buffer.bytes());
+                out.push(b'\n');
+            }
+        }
+    }
+    out
 }
 
 /// `Stream::drvInit`, the driver's `init`.

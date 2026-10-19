@@ -1799,7 +1799,7 @@ variable(seqDLYprecision,int)
 
         struct Probe;
         impl DriverSupport for Probe {
-            fn report(&self, _level: i32) -> Option<String> {
+            fn report(&self, _level: i32) -> Option<Vec<u8>> {
                 Some("probe".into())
             }
         }

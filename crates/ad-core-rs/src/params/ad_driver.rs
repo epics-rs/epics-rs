@@ -77,43 +77,31 @@ impl ADDriverParams {
             base,
             first_ad_param,
 
-            // Image size
-            max_size_x: port_base.create_param("MAX_SIZE_X", ParamType::Int32)?,
-            max_size_y: port_base.create_param("MAX_SIZE_Y", ParamType::Int32)?,
-            size_x: port_base.create_param("SIZE_X", ParamType::Int32)?,
-            size_y: port_base.create_param("SIZE_Y", ParamType::Int32)?,
-            min_x: port_base.create_param("MIN_X", ParamType::Int32)?,
-            min_y: port_base.create_param("MIN_Y", ParamType::Int32)?,
+            // C createParam order (ADDriver.cpp:139-172), which asynReport
+            // prints as each parameter's index.
+            gain: port_base.create_param("GAIN", ParamType::Float64)?,
             bin_x: port_base.create_param("BIN_X", ParamType::Int32)?,
             bin_y: port_base.create_param("BIN_Y", ParamType::Int32)?,
+            min_x: port_base.create_param("MIN_X", ParamType::Int32)?,
+            min_y: port_base.create_param("MIN_Y", ParamType::Int32)?,
+            size_x: port_base.create_param("SIZE_X", ParamType::Int32)?,
+            size_y: port_base.create_param("SIZE_Y", ParamType::Int32)?,
+            max_size_x: port_base.create_param("MAX_SIZE_X", ParamType::Int32)?,
+            max_size_y: port_base.create_param("MAX_SIZE_Y", ParamType::Int32)?,
             reverse_x: port_base.create_param("REVERSE_X", ParamType::Int32)?,
             reverse_y: port_base.create_param("REVERSE_Y", ParamType::Int32)?,
-
-            // Acquire
+            frame_type: port_base.create_param("FRAME_TYPE", ParamType::Int32)?,
             image_mode: port_base.create_param("IMAGE_MODE", ParamType::Int32)?,
-            num_images: port_base.create_param("NIMAGES", ParamType::Int32)?,
-            num_images_counter: port_base.create_param("NIMAGES_COUNTER", ParamType::Int32)?,
             num_exposures: port_base.create_param("NEXPOSURES", ParamType::Int32)?,
             num_exposures_counter: port_base
                 .create_param("NEXPOSURES_COUNTER", ParamType::Int32)?,
+            num_images: port_base.create_param("NIMAGES", ParamType::Int32)?,
+            num_images_counter: port_base.create_param("NIMAGES_COUNTER", ParamType::Int32)?,
             acquire_time: port_base.create_param("ACQ_TIME", ParamType::Float64)?,
             acquire_period: port_base.create_param("ACQ_PERIOD", ParamType::Float64)?,
             time_remaining: port_base.create_param("TIME_REMAINING", ParamType::Float64)?,
             status: port_base.create_param("STATUS", ParamType::Int32)?,
-            status_message: port_base.create_param("STATUS_MESSAGE", ParamType::Octet)?,
-            string_to_server: port_base.create_param("STRING_TO_SERVER", ParamType::Octet)?,
-            string_from_server: port_base.create_param("STRING_FROM_SERVER", ParamType::Octet)?,
-            acquire,
-            acquire_busy,
-            wait_for_plugins,
-            read_status: port_base.create_param("READ_STATUS", ParamType::Int32)?,
-
-            // Detector
-            gain: port_base.create_param("GAIN", ParamType::Float64)?,
-            frame_type: port_base.create_param("FRAME_TYPE", ParamType::Int32)?,
             trigger_mode: port_base.create_param("TRIGGER_MODE", ParamType::Int32)?,
-
-            // Shutter
             shutter_control: port_base.create_param("SHUTTER_CONTROL", ParamType::Int32)?,
             shutter_control_epics: port_base
                 .create_param("SHUTTER_CONTROL_EPICS", ParamType::Int32)?,
@@ -122,10 +110,15 @@ impl ADDriverParams {
             shutter_open_delay: port_base.create_param("SHUTTER_OPEN_DELAY", ParamType::Float64)?,
             shutter_close_delay: port_base
                 .create_param("SHUTTER_CLOSE_DELAY", ParamType::Float64)?,
-
-            // Temperature
             temperature: port_base.create_param("TEMPERATURE", ParamType::Float64)?,
             temperature_actual: port_base.create_param("TEMPERATURE_ACTUAL", ParamType::Float64)?,
+            read_status: port_base.create_param("READ_STATUS", ParamType::Int32)?,
+            status_message: port_base.create_param("STATUS_MESSAGE", ParamType::Octet)?,
+            string_to_server: port_base.create_param("STRING_TO_SERVER", ParamType::Octet)?,
+            string_from_server: port_base.create_param("STRING_FROM_SERVER", ParamType::Octet)?,
+            acquire,
+            acquire_busy,
+            wait_for_plugins,
         };
         Ok((params, owner))
     }
@@ -202,5 +195,62 @@ mod tests {
             params.base.array_counter,
             base.find_param("ARRAY_COUNTER").unwrap()
         );
+    }
+
+    /// C's createParam order (ADDriver.cpp:139-172): the index asynReport
+    /// prints for each.
+    #[test]
+    fn params_are_created_in_c_order() {
+        let mut base = PortDriverBase::new(
+            "order",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let (params, _) = ADDriverParams::create(&mut base).unwrap();
+        let c = [
+            "GAIN",
+            "BIN_X",
+            "BIN_Y",
+            "MIN_X",
+            "MIN_Y",
+            "SIZE_X",
+            "SIZE_Y",
+            "MAX_SIZE_X",
+            "MAX_SIZE_Y",
+            "REVERSE_X",
+            "REVERSE_Y",
+            "FRAME_TYPE",
+            "IMAGE_MODE",
+            "NEXPOSURES",
+            "NEXPOSURES_COUNTER",
+            "NIMAGES",
+            "NIMAGES_COUNTER",
+            "ACQ_TIME",
+            "ACQ_PERIOD",
+            "TIME_REMAINING",
+            "STATUS",
+            "TRIGGER_MODE",
+            "SHUTTER_CONTROL",
+            "SHUTTER_CONTROL_EPICS",
+            "SHUTTER_STATUS",
+            "SHUTTER_MODE",
+            "SHUTTER_OPEN_DELAY",
+            "SHUTTER_CLOSE_DELAY",
+            "TEMPERATURE",
+            "TEMPERATURE_ACTUAL",
+            "READ_STATUS",
+            "STATUS_MESSAGE",
+            "STRING_TO_SERVER",
+            "STRING_FROM_SERVER",
+        ];
+        for (i, name) in c.iter().enumerate() {
+            assert_eq!(
+                base.find_param(name),
+                Some(params.first_ad_param + i),
+                "{name}"
+            );
+        }
     }
 }

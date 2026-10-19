@@ -1826,23 +1826,25 @@ impl PortActor {
         // is the single owner of the linkage: an interpose has no other handle on
         // the port, and a user that never reached a port traces nothing.
         self.link_user(&mut user);
+        let callback = Self::c_dispatch(&op) != CDispatch::Direct;
         // C `portThread` announces the callback it is about to run
-        // (asynManager.c:904) — the FLOW line an operator watches to see a
-        // request reach the driver.
-        user.print(
-            crate::trace::TraceMask::FLOW,
-            file!(),
-            line!(),
-            format_args!(
-                "asynManager::portThread port={} callback\n",
-                self.driver.base().port_name
-            ),
-        );
+        // (asynManager.c:904). A direct manager call never reaches it, and a
+        // port without ASYN_CANBLOCK has no thread: its line is the gate's.
+        if callback && self.driver.base().flags.can_block {
+            user.print(
+                crate::trace::TraceMask::FLOW,
+                file!(),
+                line!(),
+                format_args!(
+                    "asynManager::portThread port={} callback\n",
+                    self.driver.base().port_name
+                ),
+            );
+        }
 
         // C runs a callback and a `lockPort` span under `synchronousLock`
         // (asynManager.c:830, :909, :1581, :1800); a direct manager call
         // takes no port lock.
-        let callback = Self::c_dispatch(&op) != CDispatch::Direct;
         let held =
             (callback || matches!(op, RequestOp::LockPort(_))).then(|| self.sync_lock.hold());
         let result = self.dispatch_io(&mut user, &op);
@@ -1974,7 +1976,26 @@ impl PortActor {
     /// a Connect-priority request is how such a device comes up.
     fn synchronous_gate(&mut self, msg: &ActorMessage, connect: ConnectCheck) -> AsynResult<()> {
         let addr = msg.user.addr;
-        self.driver.base().check_queue(addr, connect)?;
+        let base = self.driver.base();
+        base.queue_gate()
+            .check(connect)
+            .map_err(|r| AsynError::from(r).into_queue_refusal())?;
+        if connect != ConnectCheck::SynchronousLock {
+            // :1561 sits between the port-level refusals and the device-level
+            // ones, so a request the device refuses still prints it.
+            if let Some(trace) = self.user_trace() {
+                trace.print(
+                    crate::port::dp_common_key(base.flags.multi_device, addr).unwrap_or(-1),
+                    msg.user.reason as i32,
+                    crate::trace::TraceMask::FLOW,
+                    file!(),
+                    line!(),
+                    format_args!("{} queueRequest synchronous\n", base.port_name),
+                );
+            }
+            base.check_device_enabled(addr)
+                .map_err(AsynError::into_queue_refusal)?;
+        }
         if connect != ConnectCheck::SynchronousLock
             && msg.priority < QueuePriority::Connect
             && msg.user.reason != crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED

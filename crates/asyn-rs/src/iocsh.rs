@@ -3228,6 +3228,9 @@ mod tests {
         let manager = at("asynManager:waitConnect port=wc2_never exit, isConnected=0\n");
         let shell = at(" waitConnect: port=wc2_never exit, isConnected=0\n");
         assert!(waiting < manager && manager < shell, "{port:?}");
+        // waitConnect reads dpc.connected under asynManagerLock: nothing
+        // passes through portThread (asynManager.c:3339-3341).
+        assert!(!port.contains("portThread"), "{port:?}");
     }
 
     /// R19-117: `asynSetAutoConnectTimeout` rewrites the value a newly

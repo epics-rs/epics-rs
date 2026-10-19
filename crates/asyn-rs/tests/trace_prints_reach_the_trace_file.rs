@@ -192,7 +192,7 @@ fn a_record_write_and_read_print_at_every_layer() {
 
     let log = fx.log();
     for expected in [
-        "asynManager::portThread port=TRPRINT callback",
+        "TRPRINT queueRequest synchronous",
         "asynPortDriver:writeFloat64: function=0, name=VAL, value=2.500000",
         "TR:AO devAsynFloat64::processCallbackOutput process value 2.500000",
         "TR:AI devAsynFloat64::processCallbackInput process value=2.500000",
@@ -290,6 +290,66 @@ fn a_repeated_queue_refusal_prints_once() {
         assert_eq!(log.matches(&needle).count(), 1, "{needle:?} in:\n{log}");
     }
     assert!(!log.contains("process read error"), "{log}");
+}
+
+/// C's `queueRequest` runs a request for a port without `ASYN_CANBLOCK` inline
+/// and says so (asynManager.c:1561) ahead of its device checks, so a request
+/// the device refuses prints it too. Only `portThread` prints the callback
+/// line (:904).
+#[test]
+fn only_the_port_thread_prints_the_callback_line() {
+    use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource, PvDatabase};
+    let sync = fixture_with(
+        "TRSYNCLINE",
+        PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        },
+    );
+    let blk = fixture_with(
+        "TRBLKLINE",
+        PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        },
+    );
+    let mut ao = sync.device("TR:SLAO", "asynFloat64");
+    let mut rec = AoRecord::new(0.0);
+    ao.init(&mut rec).unwrap();
+    ao.write(&mut rec).unwrap();
+    sync.handle.set_enable(0, false).unwrap();
+    let _ = ao.write(&mut rec);
+
+    let mut bao = blk.device("TR:BLAO", "asynFloat64");
+    let mut brec = AoRecord::new(0.0);
+    bao.init(&mut brec).unwrap();
+    let db = PvDatabase::new();
+    let done = DeviceDone::new(
+        &db,
+        &epics_base_rs::server::record::RecordInstance::new("TR:BLAO", AoRecord::new(0.0)),
+    );
+    bao.write_begin(&mut brec, &DeviceDoneSource::new(&done))
+        .unwrap();
+    // Back once the queued write has run.
+    let _ = blk.handle.submit_blocking(
+        asyn_rs::request::RequestOp::Float64Read,
+        asyn_rs::user::AsynUser::new(0).with_priority(asyn_rs::port::QueuePriority::Low),
+    );
+
+    let log = sync.log();
+    assert_eq!(
+        log.matches("TRSYNCLINE queueRequest synchronous\n").count(),
+        2,
+        "{log}"
+    );
+    assert!(log.contains("or device 0 not enabled"), "{log}");
+    assert!(!log.contains("portThread"), "{log}");
+    let log = blk.log();
+    assert!(
+        log.contains("asynManager::portThread port=TRBLKLINE callback\n"),
+        "{log}"
+    );
+    assert!(!log.contains("queueRequest synchronous"), "{log}");
 }
 
 /// On a synchronous port C reports every `queueRequest`, so the first one

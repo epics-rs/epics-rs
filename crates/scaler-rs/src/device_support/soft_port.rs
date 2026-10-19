@@ -311,7 +311,7 @@ impl Delivery {
         for pv in &self.inputs.names {
             let put = self
                 .db
-                .put_record_field_from_ca(&pv.record, &pv.field, EpicsValue::Long(0))
+                .put_record_field_from_ca_no_notify(&pv.record, &pv.field, EpicsValue::Long(0))
                 .await;
             if let Err(e) = put {
                 errlog_printf(&format!("drvScalerSoft: dbPutField {} 0: {e}\n", pv.name));

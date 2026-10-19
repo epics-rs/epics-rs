@@ -124,3 +124,47 @@ async fn an_arm_whose_zero_posts_nothing_counts_zero() {
     .unwrap();
     assert_eq!(read(), 0, "IN4's count after the arm");
 }
+
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the exec
+// backend, as the four above. No CA server; `#[tokio::test]` gives the reactor.
+/// C's arm zeroes each input with `dbPutField` (drvScalerSoft.c:321), which
+/// writes the zero into a busy input and raises RPRO (dbAccess.c:1263-1273);
+/// only a put-notify waits out the busy cycle unwritten. A calcout held in its
+/// ODLY cycle, its VAL 7 unposted until the cycle ends, therefore counts 0 at
+/// the arm's read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_arm_writes_the_zero_into_a_busy_input() {
+    let ports = Arc::new(SoftScalerPorts::default());
+    ports.configure("B", 1, "BUSY%d").unwrap();
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(calcout, "BUSY1") { field(CALC, "A") field(ODLY, "5") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    ports.connect(&db);
+    let driver = ports.device_support("B").unwrap().driver();
+    let mut delivered = ports.deliveries("B").unwrap();
+    let read = || {
+        let mut counts = [0u32; MAX_SCALER_CHANNELS];
+        driver.lock().unwrap().read(&mut counts).unwrap();
+        counts[0]
+    };
+
+    db.put_record_field_from_ca_no_notify("BUSY1", "A", EpicsValue::Long(7))
+        .await
+        .unwrap();
+    let rec = db.get_record(b"BUSY1").unwrap();
+    assert!(rec.read().is_processing(), "ODLY holds the calcout busy");
+    let before = *delivered.borrow_and_update();
+    driver.lock().unwrap().arm(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(4), delivered.wait_for(|n| *n > before))
+        .await
+        .expect("the arm's zeros were never written")
+        .unwrap();
+    assert!(rec.read().is_processing(), "still inside the ODLY cycle");
+    assert_eq!(read(), 0, "BUSY1's count after the arm");
+}

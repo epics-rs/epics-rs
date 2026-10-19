@@ -1307,32 +1307,102 @@ mod tests {
     /// token: later failures print nothing and the first ConnAck is
     /// `Reconnected.`. An error on a live session is a loss, a failed retry
     /// after it prints nothing, and the ConnAck after it is `Reconnected.`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_edges_print_c_s_trace_lines() {
+    /// A loopback port the test's broker owns from first bind to last: a
+    /// socket bound and never listening holds it, so a connect is refused,
+    /// and each [`Self::listen`] binds a listener beside it. A port released
+    /// between phases is free for any socket on the box to take — under load,
+    /// an outgoing connect's source port — and the next bind then fails.
+    struct BrokerPort {
+        _hold: socket2::Socket,
+        addr: SocketAddr,
+    }
+
+    impl BrokerPort {
+        fn new() -> Self {
+            let hold = Self::socket();
+            // Unix shares a bound port only among `SO_REUSEPORT` sockets, so
+            // the hold sets it; Windows lets an `SO_REUSEADDR` bind join any
+            // non-exclusive one, so the hold sets nothing.
+            #[cfg(unix)]
+            hold.set_reuse_port(true).unwrap();
+            hold.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+                .unwrap();
+            let addr = hold.local_addr().unwrap().as_socket().unwrap();
+            Self { _hold: hold, addr }
+        }
+
+        fn socket() -> socket2::Socket {
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap()
+        }
+
+        /// The broker, up until the listener drops.
+        fn listen(&self) -> tokio::net::TcpListener {
+            let l = Self::socket();
+            // REUSEADDR also takes the port past the last session's TIME_WAIT.
+            l.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            l.set_reuse_port(true).unwrap();
+            l.bind(&self.addr.into()).unwrap();
+            l.listen(128).unwrap();
+            l.set_nonblocking(true).unwrap();
+            tokio::net::TcpListener::from_std(l.into()).unwrap()
+        }
+    }
+
+    /// The release-and-rebind this replaces lost the number to a socket that
+    /// took it in between; held, no plain bind can take it, and the broker
+    /// still comes up on it (refused, up, refused, up).
+    #[tokio::test]
+    async fn a_held_broker_port_keeps_its_number_between_sessions() {
+        let port = BrokerPort::new();
+        let refused = || std::net::TcpStream::connect(port.addr).unwrap_err().kind();
+        assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            std::net::TcpListener::bind(port.addr).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        for _ in 0..2 {
+            let listener = port.listen();
+            let client = tokio::net::TcpStream::connect(port.addr).await.unwrap();
+            let (served, _) = listener.accept().await.unwrap();
+            drop((listener, served, client));
+            assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
+            assert_eq!(
+                std::net::TcpListener::bind(port.addr).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
+    }
+
+    /// The ConnAck arm's last line. A reader that waits for an earlier one,
+    /// `Reconnected.`, can look between the arm's two prints.
+    const CONNACK_ARM_DONE: &str = "onConnectCb: Connected to broker";
+
+    /// An event loop for a broker at `addr`, its port tracing ERROR and
+    /// IO_DRIVER into `file`, started.
+    fn spawn_traced_loop(
+        port: &str,
+        addr: SocketAddr,
+        file: std::fs::File,
+    ) -> (
+        asyn_rs::runtime::port::PortRuntimeHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
         use asyn_rs::runtime::config::RuntimeConfig;
         use asyn_rs::services::PortServices;
         use asyn_rs::trace::TraceFile;
-        use tokio::io::AsyncWriteExt;
-
-        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
-        // No broker at boot.
-        let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
 
         let config = MqttConfig {
             broker_host: "127.0.0.1".into(),
             broker_port: addr.port(),
-            client_id: "edges-test".into(),
+            client_id: format!("{port}-test"),
             keep_alive_secs: 3600,
             ..MqttConfig::default()
         };
         let (publish_tx, publish_rx) = mpsc::unbounded_channel();
         let connected = Arc::new(AtomicBool::new(false));
         let mut driver = crate::driver::MqttDriver::new(
-            "MQEDGE",
+            port,
             &config,
             Vec::new(),
             publish_tx,
@@ -1352,33 +1422,11 @@ mod tests {
             },
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!("mqedge-{}.log", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
         trace.set_trace_file(
-            Some("MQEDGE"),
+            Some(port),
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
-        trace.set_trace_mask(Some("MQEDGE"), TraceMask::ERROR | TraceMask::IO_DRIVER);
-        async fn wait_for(path: &std::path::Path, needle: &str) {
-            wait_for_n(path, needle, 1).await;
-        }
-        async fn wait_for_n(path: &std::path::Path, needle: &str, n: usize) {
-            for _ in 0..100 {
-                if std::fs::read_to_string(path)
-                    .unwrap()
-                    .matches(needle)
-                    .count()
-                    >= n
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            panic!(
-                "no '{needle}' in:\n{}",
-                std::fs::read_to_string(path).unwrap()
-            );
-        }
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
 
         let port_handle = runtime.port_handle().clone();
         let start = Arc::new(Notify::new());
@@ -1400,6 +1448,41 @@ mod tests {
             .await;
         });
         start.notify_one();
+        (runtime, ev)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_edges_print_c_s_trace_lines() {
+        use tokio::io::AsyncWriteExt;
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        // No broker at boot.
+        let port = BrokerPort::new();
+        let addr = port.addr;
+
+        let path = std::env::temp_dir().join(format!("mqedge-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        async fn wait_for(path: &std::path::Path, needle: &str) {
+            wait_for_n(path, needle, 1).await;
+        }
+        async fn wait_for_n(path: &std::path::Path, needle: &str, n: usize) {
+            for _ in 0..100 {
+                if std::fs::read_to_string(path)
+                    .unwrap()
+                    .matches(needle)
+                    .count()
+                    >= n
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "no '{needle}' in:\n{}",
+                std::fs::read_to_string(path).unwrap()
+            );
+        }
+        let (runtime, ev) = spawn_traced_loop("MQEDGE", addr, file);
 
         // The first failed attempt is reported, the retries are not.
         wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
@@ -1407,13 +1490,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(3500)).await;
 
         // First session, then the broker goes away entirely.
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let listener = port.listen();
         let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
-        wait_for(&path, "onConnectCb: Connected to broker").await;
+        wait_for(&path, CONNACK_ARM_DONE).await;
+        // `onConnectCb`'s lines, in C's order (drvMqtt.cpp:202-206).
+        let connect_cb = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.split_once("MqttDriver::onConnectCb: "))
+                .map(|(_, m)| m.to_owned())
+                .collect()
+        };
         let booted = std::fs::read_to_string(&path).unwrap();
         assert_eq!(booted.matches("Operation error").count(), 1, "{booted}");
-        assert_eq!(booted.matches("Reconnected.").count(), 1, "{booted}");
+        assert_eq!(
+            connect_cb(&booted),
+            ["Reconnected.", "Connected to broker"],
+            "{booted}"
+        );
         drop(listener);
         drop(sock);
         wait_for(&path, "onDisconnectCb: Connection lost. Reconnecting...").await;
@@ -1421,15 +1515,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(3500)).await;
 
         // The broker is back.
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let listener = port.listen();
         let mut sock = accept_connect(&listener).await;
         sock.write_all(&CONNACK).await.unwrap();
-        wait_for_n(&path, "onConnectCb: Reconnected.", 2).await;
+        wait_for_n(&path, CONNACK_ARM_DONE, 2).await;
 
         let text = std::fs::read_to_string(&path).unwrap();
         let n = |needle: &str| text.matches(needle).count();
-        assert_eq!(n("Connected to broker"), 2, "{text}");
-        assert_eq!(n("Reconnected."), 2, "{text}");
+        assert_eq!(
+            connect_cb(&text),
+            [
+                "Reconnected.",
+                "Connected to broker",
+                "Reconnected.",
+                "Connected to broker"
+            ],
+            "{text}"
+        );
         assert_eq!(n("Connection lost"), 1, "{text}");
         assert_eq!(n("Operation error"), 1, "{text}");
 
@@ -1440,6 +1542,99 @@ mod tests {
             .expect("event loop did not exit")
             .unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Holds the event loop between the ConnAck arm's two prints: the trace
+    /// sink is a pipe filled so that `Reconnected.` takes its last byte and
+    /// `Connected to broker` blocks. A reader there has seen the first line,
+    /// so only the arm's last one may end a wait.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_between_the_connack_prints_has_not_seen_the_arm() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncWriteExt;
+
+        // Blocking reads, off the runtime: `n` bytes, or up to `needle`.
+        async fn read_exact(r: std::io::PipeReader, n: usize) -> (std::io::PipeReader, String) {
+            tokio::task::spawn_blocking(move || {
+                let mut r = r;
+                let mut buf = vec![0; n];
+                r.read_exact(&mut buf).unwrap();
+                (r, String::from_utf8(buf).unwrap())
+            })
+            .await
+            .unwrap()
+        }
+        async fn read_through(
+            r: std::io::PipeReader,
+            needle: &'static str,
+        ) -> (std::io::PipeReader, String) {
+            tokio::task::spawn_blocking(move || {
+                let mut r = r;
+                let mut text = Vec::new();
+                while !String::from_utf8_lossy(&text).contains(needle)
+                    || text.last() != Some(&b'\n')
+                {
+                    let mut buf = [0; 512];
+                    let n = r.read(&mut buf).unwrap();
+                    assert_ne!(n, 0, "the sink closed");
+                    text.extend_from_slice(&buf[..n]);
+                }
+                (r, String::from_utf8(text).unwrap())
+            })
+            .await
+            .unwrap()
+        }
+        let unread = |r: &std::io::PipeReader| {
+            let mut n: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(r.as_raw_fd(), libc::FIONREAD, &mut n) },
+                0
+            );
+            n
+        };
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        let port = BrokerPort::new();
+        let addr = port.addr;
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut filler = writer.try_clone().unwrap();
+        let (runtime, ev) =
+            spawn_traced_loop("MQHOLD", addr, std::os::fd::OwnedFd::from(writer).into());
+
+        // The refused boot connect spends the token, so the ConnAck after the
+        // retry prints both lines.
+        let (reader, boot) = read_through(reader, "Operation error").await;
+        let listener = port.listen();
+        let mut sock = accept_connect(&listener).await;
+        assert_eq!(unread(&reader), 0, "a line after {boot:?}");
+
+        // Every line carries a prefix of the same width.
+        const FIRST: &str = "MqttDriver::onConnectCb: Reconnected.\n";
+        let first = boot.find("MqttDriver::").unwrap() + FIRST.len();
+        let capacity =
+            usize::try_from(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETPIPE_SZ) })
+                .unwrap();
+        filler.write_all(&vec![b'.'; capacity - first]).unwrap();
+        sock.write_all(&CONNACK).await.unwrap();
+
+        // Everything the pipe held: the event loop is between its prints.
+        let (reader, held) = read_exact(reader, capacity).await;
+        let held = &held[capacity - first..];
+        assert!(held.ends_with(FIRST), "{held:?}");
+        assert!(!held.contains(CONNACK_ARM_DONE), "{held:?}");
+
+        let (reader, rest) = read_through(reader, CONNACK_ARM_DONE).await;
+        assert!(rest.contains(CONNACK_ARM_DONE), "{rest:?}");
+        drop(reader);
+
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
     }
 
     /// A connect that fails while paho dispatches it keeps the token's

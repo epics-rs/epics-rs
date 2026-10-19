@@ -2,9 +2,9 @@
 //! build. Every `#ifdef SUPPORT_UTF` / `SUPPORT_UCP` branch is the
 //! compiled-out one, so `utf` is always false and XCLASS is never emitted.
 //!
-//! Pointers become indices: `ptr` indexes [`Cd::pat`], `code` indexes
-//! [`Cd::code`] (C's `cd->start_code` is index 0) and `hwm` indexes
-//! [`Cd::work`]. The C gotos inside `compile_branch` are a label enum.
+//! Pointers become indices: `ptr` indexes `Cd::pat`, `code` indexes
+//! `Cd::code` (C's `cd->start_code` is index 0) and `hwm` indexes
+//! `Cd::work`. The C gotos inside `compile_branch` are a label enum.
 
 use super::chartables::DEFAULT_TABLES;
 use super::internal::*;

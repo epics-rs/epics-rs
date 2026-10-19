@@ -7,7 +7,7 @@
 //! NULL in StreamDevice, so OP_CALLOUT is only skipped.
 //!
 //! C's match() recurses natively through RMATCH. Here each incarnation is a
-//! [`Frame`] on a heap stack and the function body is a state machine:
+//! `Frame` on a heap stack and the function body is a state machine:
 //! RMATCH pushes a child and records the label (C's RM number) to resume
 //! at, RRETURN pops back to that label with the child's result. Pointers
 //! into the subject, the code and other frames become indices.

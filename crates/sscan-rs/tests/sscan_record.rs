@@ -519,25 +519,20 @@ async fn a_pv_name_written_during_a_connect_waits_for_it_to_land() {
     let lines = errlog_lines("S:special:connect");
     put(&db, "S.P1PV", EpicsValue::String("M".into())).await;
     let db2 = db.clone();
-    let rename = std::thread::spawn(move || {
+    let (done, renamed) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
         epics_base_rs::runtime::task::test_block_on(async move {
             db2.put_pv("S.P1PV", EpicsValue::String("M2".into()))
                 .await
                 .unwrap()
         });
-        t0.elapsed()
+        let _ = done.send(t0.elapsed());
     });
-    // Keep this runtime from running M's connect until the rename waits.
-    std::thread::sleep(Duration::from_millis(100));
-    wait_until("rename", || rename.is_finished()).await;
-    let waited = rename.join().unwrap();
-    // C checks once a second: the connect lands inside the first one.
-    // (The exec backend may finish the connect before the rename.)
+    let waited = renamed.await.unwrap();
+    // The connect lands before the rename, between C's "Waiting..." and its
+    // first check (no sleep: links.rs pins it), or inside the first second.
     assert!(waited < Duration::from_millis(1900), "{waited:?}");
-    if logged(&lines, "Waiting...") {
-        assert!(waited >= Duration::from_millis(900), "{waited:?}");
-    }
     assert!(!logged(&lines, "Trying new PV name."));
     connected(&db, "S", &["P1NV"]).await;
     db.put_pv_and_post("M2", EpicsValue::Double(4.0))

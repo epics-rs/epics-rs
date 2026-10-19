@@ -398,7 +398,7 @@ impl SscanRecord {
     }
 
     /// The PV-name case of `special`.
-    fn pv_written(&mut self, i: usize) {
+    pub(super) fn pv_written(&mut self, i: usize) {
         let old = self.nv[i];
         if is_blank(&self.pvn[i]) {
             self.pvn[i] = PvString::default();

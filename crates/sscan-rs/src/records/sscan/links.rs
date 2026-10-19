@@ -628,3 +628,77 @@ impl SscanRecord {
         self.bad_input = bad_in;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+
+    use super::super::{PvString, SscanRecord, T1_OUT, with_sscan};
+    use crate::rec_dyn_link::LinkEvent;
+
+    /// C's `special` logs "Waiting..." and only then tests
+    /// `connectInProgress` before its first sleep (`sscanRecord.c:1316-1328`):
+    /// a connect that lands in between ends the wait without sleeping. Forced
+    /// here by holding the record's lock, which keeps the queued connect from
+    /// being applied, until the link's whole connect is queued.
+    #[epics_base_rs::epics_test]
+    async fn a_connect_queued_before_the_first_check_ends_the_wait_unslept() {
+        let (name, factory) = crate::sscan_record_factory();
+        let (db, _) = IocBuilder::new()
+            .register_record_type(name, factory)
+            .db_string(
+                "record(ao, \"M\") {}\nrecord(sscan, \"S\") {}\n",
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if m.contains("S:special:connect") {
+                sink.lock().unwrap().push(m.to_owned());
+            }
+        });
+        let h = db.async_handle();
+        let (done, waited) = tokio::sync::oneshot::channel();
+        // Off this runtime, which may be the one the link's task runs on.
+        std::thread::spawn(move || {
+            with_sscan(&h, "S", |s: &mut SscanRecord| {
+                s.pvn[T1_OUT] = PvString::from_bytes(b"M");
+                s.pv_written(T1_OUT);
+                {
+                    let queued = |events: &std::collections::VecDeque<(usize, u64, LinkEvent)>| {
+                        events
+                            .iter()
+                            .any(|(li, _, e)| *li == T1_OUT && matches!(e, LinkEvent::Ctrl(_)))
+                    };
+                    let inbox = &s.inbox;
+                    let events = inbox.events.lock().unwrap();
+                    drop(inbox.arrived.wait_while(events, |e| !queued(e)).unwrap());
+                }
+                assert!(s.lpvt[T1_OUT].connect_in_progress);
+                let t0 = std::time::Instant::now();
+                s.wait_for_connect(T1_OUT);
+                let _ = done.send((t0.elapsed(), s.lpvt[T1_OUT].connect_in_progress));
+            });
+        });
+        let (waited, in_progress) = waited.await.unwrap();
+        assert!(!in_progress);
+        assert!(waited < Duration::from_millis(900), "{waited:?}");
+        epics_base_rs::runtime::log::errlog_flush();
+        let lines = lines.lock().unwrap();
+        assert!(lines.iter().any(|l| l.contains("Waiting...")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("Trying new PV name.")),
+            "{lines:?}"
+        );
+        drop(lines);
+        assert_eq!(db.get_pv("S.T1NV").unwrap().to_f64(), Some(0.0));
+    }
+}

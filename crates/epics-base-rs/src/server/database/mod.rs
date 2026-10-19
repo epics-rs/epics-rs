@@ -2261,7 +2261,7 @@ impl PvDatabase {
     ///
     /// Returns false, having started nothing, when this database captured no
     /// reactor: the owner's network work has nowhere to run, which is the same
-    /// condition [`Self::stage_external_link_open`] already refuses on.
+    /// condition an external link open already refuses on.
     pub fn ca_link_init(&self) -> bool {
         if self.inner.link_puts.network().is_none() {
             return false;

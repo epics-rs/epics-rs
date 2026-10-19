@@ -429,8 +429,8 @@ pub fn ioc_pause() -> i32 {
 /// void, which is what makes it safe on every exit path.
 ///
 /// C reaches this from `epicsAtExit(exitDatabase)` (`iocInit.c:580`), and
-/// so does the port: every build registers it there through
-/// [`BuildSequence`], so the scan threads stop at the exit callbacks
+/// so does the port: every `iocBuild` registers it there, so the scan
+/// threads stop at the exit callbacks
 /// however the IOC was built.
 ///
 /// Of an isolated build's free branch (`:745-757`) only

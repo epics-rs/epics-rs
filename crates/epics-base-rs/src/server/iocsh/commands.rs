@@ -4056,8 +4056,14 @@ fn cmd_dbjlr() -> CommandDef {
                     ctx.console_println(&format!("    Link field '{field}':"));
                     let live = rec.read().live_link(&field);
                     let link = live.as_deref().unwrap_or(&parsed);
-                    for line in link.jlink_report(level, 6) {
-                        ctx.console_println(&line);
+                    let class = crate::types::dbf_link_class(record_type, &field);
+                    for line in link.jlink_report(ctx.db(), class, level, 6) {
+                        match line {
+                            crate::server::record::ReportLine::Console(text) => {
+                                ctx.console_println(&text)
+                            }
+                            crate::server::record::ReportLine::Stdout(text) => ctx.println(&text),
+                        }
                     }
                 }
                 if target.is_some() {
@@ -13539,6 +13545,85 @@ record(ai, "SIM:C") { field(VAL, "1") }
         assert_eq!(
             run_cmd(&ctx, "dbjlr", &["R:NOPE"]),
             "JSON links in record 'R:NOPE'\n\n"
+        );
+    }
+
+    /// A `pva` link reports through its lset (`dbJLink.c:468-471` calling
+    /// pvxs `pva_report`), with the holding field's class, on the shell's
+    /// stdout: pvxs prints through `epicsStdio.h`, so `dbjlr P > f` puts its
+    /// line in `f` while dbJLink.c's headers and lnkCalc.c's lines stay on
+    /// the console (softIocPVX 1.5.3). A `calc` argument reports as an input
+    /// one level down and four spaces in.
+    #[test]
+    fn dbjlr_hands_a_pva_link_to_its_lset_report() {
+        use crate::server::database::{LinkRef, LinkSet};
+        use crate::types::DbfLinkClass;
+        struct Reporter;
+        #[async_trait::async_trait]
+        impl LinkSet for Reporter {
+            fn is_connected(&self, _: LinkRef<'_>) -> bool {
+                false
+            }
+            async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+                None
+            }
+            fn report(
+                &self,
+                link: LinkRef<'_>,
+                class: Option<DbfLinkClass>,
+                level: i32,
+                indent: usize,
+            ) -> Vec<String> {
+                let name = String::from_utf8_lossy(link.name);
+                vec![format!("{:indent$}'pva': {name} {class:?} {level}", "")]
+            }
+        }
+        let (db, ctx) = make_ctx();
+        db.declare_link_type("pva");
+        ctx.block_on(db.register_link_set("pva", std::sync::Arc::new(Reporter)));
+        load_records(
+            &ctx,
+            "record(ai, \"P\") { field(INP, {pva:\"SRC\"}) } \
+             record(ao, \"Q\") { field(OUT, {pva:{pv:\"SRC\", proc:true}}) } \
+             record(ai, \"K\") { field(INP, {calc:{expr:\"A\", args:[{pva:\"SRC\"}]}}) }",
+        )
+        .unwrap();
+        ctx.block_on(db.ioc_init());
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let dbjlr = registry.get("dbjlr").unwrap();
+        // (stdout, console) of `dbjlr rec level`.
+        let report = |rec: &str, level: &str| -> (String, String) {
+            let tokens = [IocshString::from(rec), IocshString::from(level)];
+            let args = parse_args(&tokens, &dbjlr.args).unwrap();
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let console = tempfile::NamedTempFile::new().unwrap();
+            ctx.with_console(console.reopen().unwrap(), std::io::stderr(), || {
+                ctx.with_output(out.reopen().unwrap(), || {
+                    dbjlr.handler.call(&args, &ctx).unwrap();
+                })
+            });
+            let read = |f: &tempfile::NamedTempFile| std::fs::read_to_string(f.path()).unwrap();
+            (read(&out), read(&console))
+        };
+        assert_eq!(
+            report("P", "1"),
+            (
+                "      'pva': SRC Some(InLink) 1\n".to_string(),
+                "JSON links in record 'P'\n\n  ai record 'P':\n    Link field 'INP':\n".to_string()
+            )
+        );
+        let (out, _) = report("Q", "0");
+        assert!(out.ends_with(" Some(OutLink) 0\n"), "{out}");
+        assert_eq!(
+            report("K", "2"),
+            (
+                "          'pva': SRC Some(InLink) 1\n".to_string(),
+                "JSON links in record 'K'\n\n  ai record 'K':\n    Link field 'INP':\n      \
+                 'calc': \"A\" = 0 \n        Input A: 0\n"
+                    .to_string()
+            )
         );
     }
 

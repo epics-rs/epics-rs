@@ -403,7 +403,8 @@ impl PvaLinkResolver {
         if let Some(old) = holders.remove(holder) {
             self.unregister(holder, &old);
         }
-        self.registry.attach_record(cfg, holder.record.as_bytes());
+        self.registry
+            .attach_link(cfg, &holder.record, &holder.field);
         // B3: keyed by the monitor variant identity, NOT bare PV name, so
         // a `Q=1` record's scan targets are not merged with a `Q=64`
         // sibling's (pvxs keys links onto their channel by
@@ -452,8 +453,9 @@ impl PvaLinkResolver {
     /// under the `holders` lock.
     fn unregister(&self, holder: &Holder, attached: &Attached) {
         let cfg = &*attached.cfg;
-        if self.registry.detach_record(cfg, holder.record.as_bytes())
-            && cfg.direction == LinkDirection::Inp
+        if self
+            .registry
+            .detach_link(cfg, &holder.record, &holder.field)
         {
             // The forwarder ends with the channel; a reopen spawns its own.
             self.forwarders.lock().remove(&MonitorKey::from_config(cfg));
@@ -520,7 +522,7 @@ impl PvaLinkResolver {
             started.insert(key.clone());
         }
         let Some(rx) = link.take_notify_rx() else {
-            // OUT / non-monitor links never created a channel.
+            // A test link built without a monitor, or a receiver taken.
             self.forwarders.lock().remove(&key);
             return;
         };
@@ -682,7 +684,7 @@ impl PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         self.registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?
             .link_alarm_severity_with(&cfg.field, sevr)
     }
 
@@ -823,7 +825,7 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // "there are no options to pre-register" conflated *carrying
                 // options* with *needing a channel*, and the missing channel
                 // is load-bearing on the OUT side: `PvaLink::open` starts the
-                // OUT connection-tracking monitor, and the non-retry write
+                // channel monitor, and the non-retry write
                 // gate refuses a put while `is_connected()` is false
                 // (`valid() == connected && root`, `pvxs/ioc/pvalink_link.cpp:69`).
                 // Opening lazily on the first put therefore DROPPED that put.
@@ -1094,7 +1096,7 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         match self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
         {
             Some(link) => link.is_connected(),
             None => false,
@@ -1112,9 +1114,9 @@ impl LinkSet for PvaLinkResolver {
         // Fast path: cached monitor value, no async runtime touch.
         // resolve THIS caller's monitor variant, then apply the per-link
         // field selector.
-        if let Some(link) = self
-            .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
+        if let Some(link) =
+            self.registry
+                .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
             && let Some(value) = link.with_cached_value(&cfg.field, pvfield_to_epics_value)
         {
             self.reads
@@ -1151,7 +1153,7 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         let value = link.with_cached_value(&cfg.field, pvfield_to_epics_value)?;
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1170,7 +1172,7 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         !self
             .registry
-            .try_get_inp(link_pv_name(full), cfg.pipeline, cfg.queue_size)
+            .try_get_channel(link_pv_name(full), cfg.pipeline, cfg.queue_size)
             .is_some_and(|link| link.is_valid())
     }
 
@@ -1201,6 +1203,59 @@ impl LinkSet for PvaLinkResolver {
                 .spawn(async move { this.open_attached(holder, cfg, id).await });
         }
         LinkOpen::Lset
+    }
+
+    /// pvxs `pva_report` (`pvxs/ioc/pvalink_jlif.cpp:228-282`): the link's
+    /// config, then its channel's connection, in-flight put and disconnect
+    /// count, or `No Channel` before one is open.
+    fn report(
+        &self,
+        link: LinkRef<'_>,
+        class: Option<DbfLinkClass>,
+        level: i32,
+        indent: usize,
+    ) -> Vec<String> {
+        use super::iocsh::{proc_label, sevr_label};
+        use std::fmt::Write;
+        let Some(full) = strip_scheme(link.name) else {
+            return Vec::new();
+        };
+        let cfg = match holder_direction(class) {
+            LinkDirection::Inp => self.inp_cfg_for(full),
+            LinkDirection::Out => self.out_cfg_for(full),
+        };
+        let tf = |b: bool| if b { 'T' } else { 'F' };
+        let mut line = format!("{:indent$}'pva': {}", "", cfg.pv_name);
+        if !cfg.field.is_empty() {
+            let _ = write!(line, "|.{}", cfg.field);
+        }
+        let _ = write!(line, " {} {}", proc_label(cfg.proc), sevr_label(cfg.sevr));
+        if level > 0 {
+            let _ = write!(
+                line,
+                " Q={} pipe={} defer={} time={} retry={} atomic={} morder={}",
+                cfg.queue_size,
+                tf(cfg.pipeline),
+                tf(cfg.defer),
+                tf(cfg.time),
+                tf(cfg.retry),
+                tf(cfg.atomic),
+                cfg.monorder,
+            );
+        }
+        match self.registry.try_get(&cfg) {
+            Some(chan) => {
+                let _ = write!(line, " conn={}", tf(chan.is_connected()));
+                if chan.put_in_flight() {
+                    line.push_str(" Put");
+                }
+                if level > 0 {
+                    let _ = write!(line, " #disconn={}", chan.num_disconnect());
+                }
+            }
+            None => line.push_str(" No Channel"),
+        }
+        vec![line]
     }
 
     /// pvxs `pvaRemoveLink` (`pvxs/ioc/pvalink_lset.cpp:176-185`).
@@ -1238,14 +1293,9 @@ impl LinkSet for PvaLinkResolver {
     /// database asks this on the record-processing thread, inside the
     /// record's advisory write gate.
     ///
-    /// Looks up the **OUT** registry variant, not the INP one
-    /// [`LinkSet::is_connected`] uses: the registry keys on direction, so an
-    /// OUT-only channel is invisible to `try_get_inp` and the trait's default
-    /// gate (derived from `is_connected`) would refuse every OUT write to a
-    /// healthy channel. An OUT `PvaLink` tracks its connection through its
-    /// own liveness monitor — pvxs runs a monitor on every channel, INP and
-    /// OUT alike, to maintain `lchan->connected`
-    /// (`pvxs/ioc/pvalink_channel.cpp:342-363`), and gates the write on
+    /// Reads the OUT link's own config for `retry`, and its channel's
+    /// connection, which the channel monitor keeps
+    /// (`pvxs/ioc/pvalink_channel.cpp:342-363`): pvxs gates the write on
     /// `valid() = connected && root` (`pvxs/ioc/pvalink_lset.cpp:609`).
     ///
     /// A link never opened reports `Unopened` so the write is still staged
@@ -1264,15 +1314,15 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.out_cfg_for(full);
         // pvxs gates the write on `if(!self->retry && !self->valid())`
         // (`pvxs/ioc/pvalink_lset.cpp:609`): a `retry` link deliberately skips the
-        // connection gate and queues for replay on reconnect. Refusing it
+        // connection gate, and its put waits for the connection. Refusing it
         // here would delete that whole mechanism, so a retry link is always
-        // admitted and `flush_scratch` owns its disconnect handling.
+        // admitted and `PvaLink::put` holds it.
         if cfg.retry {
             return PutAdmission::Connected;
         }
         match self
             .registry
-            .try_get_out(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
         {
             None => PutAdmission::Unopened,
             Some(link) if link.is_connected() => PutAdmission::Connected,
@@ -1376,28 +1426,6 @@ impl LinkSet for PvaLinkResolver {
         Box::new(PvaForward(shared))
     }
 
-    async fn flush_puts(&self) {
-        if !self.is_enabled() {
-            return;
-        }
-        // Production drain of any retry-queued OUT writes: re-attempt
-        // every shared channel owner that a prior disconnect left with
-        // a `retry` write staged, now that some OUT activity has reached
-        // the lset (the upstream may have reconnected). `flush_retry_pending`
-        // is a no-op on channels with nothing stuck, so a freshly-`defer`red
-        // write awaiting its sibling is never flushed early.
-        let links = self.registry.out_links();
-        if links.is_empty() {
-            return;
-        }
-        async {
-            for link in links {
-                let _ = link.flush_retry_pending().await;
-            }
-        }
-        .await;
-    }
-
     fn alarm_message(&self, link: LinkRef<'_>) -> Option<Arc<str>> {
         // parse the caller's full link config and apply the
         // caller's own `sevr` mode — `get_or_open` may return a
@@ -1417,7 +1445,7 @@ impl LinkSet for PvaLinkResolver {
         // advisory write gate.
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         link.alarm_message_with(field, sevr)
     }
 
@@ -1441,7 +1469,7 @@ impl LinkSet for PvaLinkResolver {
         // advisory write gate.
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         link.link_alarm_severity_with(field, sevr)
     }
 
@@ -1467,7 +1495,7 @@ impl LinkSet for PvaLinkResolver {
         // advisory write gate.
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         link.remote_alarm_snapshot(field)
     }
 
@@ -1482,7 +1510,7 @@ impl LinkSet for PvaLinkResolver {
         // advisory write gate.
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         link.time_stamp(&cfg.field)
     }
 
@@ -1500,7 +1528,7 @@ impl LinkSet for PvaLinkResolver {
         }
         Some(
             self.registry
-                .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
+                .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)
                 .map_or(
                     (super::link::NO_TIME.0, super::link::NO_TIME.1, 0),
                     |link| link.snap_stamp(&cfg.field),
@@ -1539,13 +1567,13 @@ impl LinkSet for PvaLinkResolver {
         // advisory write gate.
         let link = self
             .registry
-            .try_get_inp(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
+            .try_get_channel(&cfg.pv_name, cfg.pipeline, cfg.queue_size)?;
         link.link_metadata_with(field)
     }
 
     fn link_names(&self) -> Vec<epics_base_rs::types::RecordName> {
         // The [`LinkSet::link_names`] enumeration contract: surface one
-        // identity per opened INP monitor variant, for link introspection.
+        // identity per open channel, for link introspection.
         // NOT consumed by `dbCaRun`'s wait, which is CA-facility only;
         // pvalink never blocks iocInit (pvxs parity). A `pva://` monitor
         // connects in the background.
@@ -1556,11 +1584,10 @@ impl LinkSet for PvaLinkResolver {
         // `PV?pipeline=…&Q=…` for a non-default one. Two records on the
         // same PV with different `Q` / `pipeline` therefore each get their
         // own identity, and the per-name `is_connected` query lands on
-        // that record's own monitor. OUT links are excluded: they install
-        // no monitor and have no connection signal to report.
+        // that record's own monitor.
         let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
         self.registry
-            .inp_identities()
+            .identities()
             .into_iter()
             .map(|(pv, pipeline, qsize)| {
                 if !pipeline && qsize == default_q {
@@ -2720,7 +2747,7 @@ mod tests {
             ..PvaLinkConfig::defaults_for("SRC", LinkDirection::Inp)
         };
         let (link, connected) = PvaLink::for_test_with_monitor_flag(cfg.clone(), None);
-        connected.store(true, std::sync::atomic::Ordering::Release);
+        connected.up();
         resolver.registry.insert_for_test(&cfg, Arc::new(link));
         // Mark the forwarder already started → reuse path (no fresh
         // first-event scan is wired for the newly attached record).
@@ -3129,10 +3156,10 @@ mod tests {
         assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
     }
 
-    /// `LinkSet::link_names()` must surface the opened INP upstream PV
-    /// names (the lset enumeration contract), each landing on the right
-    /// link when fed back through its `is_connected` companion query; OUT
-    /// links are excluded (no monitor connection signal). These names are
+    /// `LinkSet::link_names()` must surface the opened channels' PV names
+    /// (the lset enumeration contract), each landing on the right link
+    /// when fed back through its `is_connected` companion query; an OUT
+    /// link's channel is one of them. These names are
     /// NOT consumed by the iocInit wait — that is CA-facility only and
     /// pvalink never blocks init (pvxs parity) — but the round-trip
     /// `link_names → is_connected` identity contract still holds.
@@ -3142,7 +3169,7 @@ mod tests {
 
         // A connected INP link (for_test seeds a cached value, so
         // is_connected() reads true), a pending INP link (no value yet),
-        // and an OUT link (must be excluded).
+        // and an OUT link.
         let connected_cfg = resolver.inp_cfg_for("FR15:CONNECTED");
         let pending_cfg = resolver.inp_cfg_for("FR15:PENDING");
         let out_cfg = resolver.out_cfg_for("FR15:OUT");
@@ -3166,8 +3193,11 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["FR15:CONNECTED".to_string(), "FR15:PENDING".to_string()],
-            "opened INP PV names; OUT excluded"
+            vec![
+                "FR15:CONNECTED".to_string(),
+                "FR15:OUT".to_string(),
+                "FR15:PENDING".to_string()
+            ],
         );
 
         // Each returned name is queryable via is_connected — the
@@ -3367,7 +3397,7 @@ mod tests {
     /// there were no options to pre-register — which left the channel
     /// unopened. On the OUT side that is a dropped write, not just a
     /// missing diagnostic: `PvaLink::open` is what starts the
-    /// connection-tracking monitor, and the non-retry write gate refuses a
+    /// channel monitor, and the non-retry write gate refuses a
     /// put while `is_connected()` is false, so the first put through a
     /// lazily-opened OUT link was always discarded.
     ///
@@ -3400,15 +3430,25 @@ mod tests {
         let inp = diags
             .iter()
             .find(|d| d.pv_name == "UP:AI")
-            .unwrap_or_else(|| panic!("INP channel missing, got {diags:?}"));
-        assert!(matches!(inp.direction, LinkDirection::Inp));
-        assert_eq!(inp.records, [RecordName::from("DOWN")]);
+            .unwrap_or_else(|| panic!("UP:AI channel missing, got {diags:?}"));
+        let holders = |d: &crate::pvalink::registry::ChannelDiag| -> Vec<(RecordName, String)> {
+            d.links
+                .iter()
+                .map(|l| (l.record.clone(), l.field.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            holders(inp),
+            [(RecordName::from("DOWN"), "INP".to_string())]
+        );
         let out = diags
             .iter()
             .find(|d| d.pv_name == "UP:AO")
-            .unwrap_or_else(|| panic!("OUT channel missing, got {diags:?}"));
-        assert!(matches!(out.direction, LinkDirection::Out));
-        assert_eq!(out.records, [RecordName::from("UPLNK")]);
+            .unwrap_or_else(|| panic!("UP:AO channel missing, got {diags:?}"));
+        assert_eq!(
+            holders(out),
+            [(RecordName::from("UPLNK"), "OUT".to_string())]
+        );
     }
 
     /// `local:true` asks `dbChannelTest` alone (`pvxs/ioc/pvalink_lset.cpp:70`),
@@ -4172,11 +4212,11 @@ mod tests {
         // Each variant opened its OWN cached link (own monitor receiver).
         let link_def = resolver
             .registry
-            .try_get_inp("PIPE:PV", false, default_q)
+            .try_get_channel("PIPE:PV", false, default_q)
             .expect("default variant link must exist");
         let link_pipe = resolver
             .registry
-            .try_get_inp("PIPE:PV", true, 1)
+            .try_get_channel("PIPE:PV", true, 1)
             .expect("pipelined Q=1 variant link must exist");
         assert!(
             !Arc::ptr_eq(&link_def, &link_pipe),
@@ -4795,7 +4835,7 @@ mod tests {
         let c = channel_of_a_runtime_json_link("ai", "INP", "ZZ:ABSENT:I")
             .await
             .expect("the INP link opened a channel");
-        assert_eq!((c.direction, c.queue_size), (LinkDirection::Inp, 7));
+        assert_eq!(c.queue_size, 7);
     }
 
     #[epics_base_rs::epics_test]
@@ -4803,7 +4843,7 @@ mod tests {
         let c = channel_of_a_runtime_json_link("ao", "OUT", "ZZ:ABSENT:O")
             .await
             .expect("the OUT link opened a channel");
-        assert_eq!((c.direction, c.queue_size), (LinkDirection::Out, 7));
+        assert_eq!(c.queue_size, 7);
     }
 
     /// A JSON string can carry the identity key's separator in any field: a

@@ -392,12 +392,6 @@ impl LinkSet for CaLinks {
         }
     }
 
-    async fn flush_puts(&self) {
-        if let Some(net) = self.network() {
-            net.flush_puts().await;
-        }
-    }
-
     fn alarm_message(&self, link: LinkRef<'_>) -> Option<Arc<str>> {
         self.answer(link, |_| None, |n| Some(n.alarm_message(link)))
             .flatten()

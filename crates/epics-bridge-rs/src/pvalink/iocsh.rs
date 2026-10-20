@@ -21,7 +21,7 @@ use epics_base_rs::server::iocsh::registry::{
 };
 use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
 
-use super::config::{LinkDirection, ProcMode, SevrMode};
+use super::config::{ProcMode, SevrMode};
 use super::integration::PvaLinkResolver;
 use super::registry::ChannelDiag;
 
@@ -98,7 +98,7 @@ pub fn pvalinkrefdiff_command(resolver: PvaLinkResolver) -> CommandDef {
 
 /// pvxs `proc`-mode label as printed by `dbpvxr`
 /// (`pvxs/ioc/pvalink.cpp:284-290`).
-fn proc_label(p: ProcMode) -> &'static str {
+pub(super) fn proc_label(p: ProcMode) -> &'static str {
     match p {
         ProcMode::Default => "Def",
         ProcMode::Pp => "PP",
@@ -110,7 +110,7 @@ fn proc_label(p: ProcMode) -> &'static str {
 
 /// pvxs `sevr`-mode label as printed by `dbpvxr`
 /// (`pvxs/ioc/pvalink.cpp:291-295`).
-fn sevr_label(s: SevrMode) -> &'static str {
+pub(super) fn sevr_label(s: SevrMode) -> &'static str {
     match s {
         SevrMode::Nms => "NMS",
         SevrMode::Ms => "MS",
@@ -161,61 +161,55 @@ fn glob_match(text: &[u8], pat: &[u8]) -> bool {
     p >= pat.len()
 }
 
-/// Print one channel row + (at `level >= 5`) its per-link config detail,
-/// mirroring pvxs `dbpvxr`'s per-channel block
-/// (`pvxs/ioc/pvalink.cpp:243-306`). When `glob` is set, only attached
-/// records whose name matches it are printed (`pvxs/ioc/pvalink.cpp:269`).
-fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&[u8]>) {
-    // pvxs right-justifies the channel name in a 28-wide column.
-    ctx.println(&format!(
-        "{:>28} conn={} dir={} Q={} pipe={}",
-        d.pv_name,
-        if d.connected { 'T' } else { 'F' },
-        match d.direction {
-            LinkDirection::Inp => "INP",
-            LinkDirection::Out => "OUT",
-        },
-        d.queue_size,
-        if d.pipeline { 'T' } else { 'F' },
-    ));
-    if level >= 5 {
-        // pvxs prints one `precord->name.fldname` row per attached
-        // `pvaLink`, glob-filtered by record name. The Rust registry
-        // folds field/sevr-only variants onto one channel, so it cannot
-        // recover each link's record-field name or per-link proc/sevr;
-        // it prints one row per owning record carrying the channel's
-        // folded config. (pvxs num_disconnect / num_type_change / Put
-        // are not instrumented by the Rust link and are omitted rather
-        // than fabricated.)
-        let detail = format!(
-            "{} {} Q={} pipe={} defer={} time={} retry={} morder={} field={:?}",
-            proc_label(d.proc),
-            sevr_label(d.sevr),
-            d.queue_size,
-            if d.pipeline { 'T' } else { 'F' },
-            if d.defer { 'T' } else { 'F' },
-            if d.time { 'T' } else { 'F' },
-            if d.retry { 'T' } else { 'F' },
-            d.monorder,
-            d.field,
-        );
-        let mut printed_any = false;
-        for rec in &d.records {
-            if glob.map(|g| glob_match(rec, g)).unwrap_or(true) {
-                // The record name as C prints it: its bytes.
-                let mut row = vec![b' '; 30];
-                row.extend_from_slice(rec);
-                row.extend_from_slice(format!(" {detail}").as_bytes());
-                ctx.println_bytes(&row);
-                printed_any = true;
-            }
-        }
-        if !printed_any {
-            // Channel with no owning record (e.g. a `pvxr`-opened link):
-            // still surface the folded config.
-            ctx.println(&format!("{:30}{detail}", ""));
-        }
+/// One channel of pvxs `dbpvxr` (`pvxs/ioc/pvalink.cpp:243-303`): its row
+/// and, at `level >= 5`, a line per link whose record `glob` matches.
+fn print_channel(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&[u8]>) {
+    use std::fmt::Write;
+    let tf = |b: bool| if b { 'T' } else { 'F' };
+    // `%28s ` pads bytes, as `key.first.size()` counts them.
+    let mut row = match 28usize.checked_sub(d.pv_name.len()) {
+        Some(pad) => format!("{:pad$}{} ", "", d.pv_name),
+        None => format!("{}\t", d.pv_name),
+    };
+    let _ = write!(
+        row,
+        "conn={} {} disconnects, {} type changes",
+        tf(d.connected),
+        d.num_disconnect,
+        d.num_type_change
+    );
+    if d.put {
+        row.push_str(" Put");
     }
+    ctx.println(&row);
+    if level < 5 {
+        return;
+    }
+    for l in &d.links {
+        if !glob.is_none_or(|g| glob_match(&l.record, g)) {
+            continue;
+        }
+        let c = &l.config;
+        let mut line = vec![b' '; 30];
+        line.extend_from_slice(&l.record);
+        line.extend_from_slice(
+            format!(
+                ".{} {} {} Q={} pipe={} defer={} time={} retry={} morder={}",
+                l.field,
+                proc_label(c.proc),
+                sevr_label(c.sevr),
+                c.queue_size,
+                tf(c.pipeline),
+                tf(c.defer),
+                tf(c.time),
+                tf(c.retry),
+                c.monorder,
+            )
+            .as_bytes(),
+        );
+        ctx.println_bytes(&line);
+    }
+    ctx.println("");
 }
 
 /// `dbpvar [<recordNameGlob>] [<level>]` — print pvalink diagnostics.
@@ -284,56 +278,36 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
             match &glob {
                 None => ctx.println("PVA links in all records\n"),
                 Some(g) => {
-                    let mut line = b"PVA links in records matching '".to_vec();
+                    let mut line = b"PVA links in record named '".to_vec();
                     line.extend_from_slice(g);
                     line.extend_from_slice(b"'\n");
                     ctx.println_bytes(&line);
                 }
             }
 
-            // Channel-centric listing for BOTH all-records and
-            // record-filtered calls, mirroring pvxs `dbpvxr`: snapshot
-            // the channel map, filter each channel by glob-matching the
-            // names of the records whose links attached to it, then apply
-            // the level gates (`pvxs/ioc/pvalink.cpp:208-311`).
-            let diags = resolver.channel_diagnostics();
-            let mut nchans = 0usize;
-            let mut nconn = 0usize;
-            let mut nlinks = 0usize;
-            for d in &diags {
-                let nmatched = match &glob {
-                    Some(g) => d.records.iter().filter(|r| glob_match(r, g)).count(),
-                    None => d.records.len(),
-                };
-                // A glob-filtered call skips channels no matching record
-                // uses (`pvxs/ioc/pvalink.cpp:229-231`).
-                if glob.is_some() && nmatched == 0 {
-                    continue;
+            let (mut nchans, mut nlinks, mut nconn) = (0usize, 0usize, 0usize);
+            for d in &resolver.channel_diagnostics() {
+                match &glob {
+                    // A channel shows when one of its links' records matches.
+                    Some(g) => {
+                        let n = d.links.iter().filter(|l| glob_match(&l.record, g)).count();
+                        if n == 0 {
+                            continue;
+                        }
+                        nlinks += n;
+                    }
+                    None => nlinks += d.links.len(),
                 }
                 nchans += 1;
                 if d.connected {
                     nconn += 1;
                 }
-                nlinks += nmatched;
-                if level <= 0 {
-                    continue;
-                }
-                // level 1 lists only disconnected channels; level >= 2
-                // lists every matching channel (`pvxs/ioc/pvalink.cpp:243`).
-                if level >= 2 || !d.connected {
-                    print_channel_row(ctx, d, level, glob.as_deref());
+                if level >= 2 || (level == 1 && !d.connected) {
+                    print_channel(ctx, d, level, glob.as_deref());
                 }
             }
             ctx.println(&format!(
-                "  {nconn}/{nchans} channels connected used by {nlinks} link(s)"
-            ));
-            // Rust-specific resolver counters, clearly separated from the
-            // pvxs-shaped summary above.
-            ctx.println(&format!(
-                "  ({} cached link(s), {} total reads, enabled={})",
-                resolver.link_count(),
-                resolver.read_count(),
-                resolver.is_enabled()
+                "  {nconn}/{nchans} channels connected used by {nlinks} links"
             ));
             Ok(CommandOutcome::Continue)
         },

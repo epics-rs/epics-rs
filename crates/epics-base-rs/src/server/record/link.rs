@@ -1198,22 +1198,36 @@ pub struct CalcLink {
     pub units: Option<String>,
 }
 
+/// One `dbjlr` line and where C prints it: base's lnk*.c and dbJLink.c
+/// print with plain `printf`, on the console; pvxs's `pva_report` with
+/// `epicsStdio.h`'s `printf`, which `cmd > f` redirects.
+pub(crate) enum ReportLine {
+    Console(String),
+    Stdout(String),
+}
+
 impl CalcLink {
     /// C `lnkCalc_report` (`lnkCalc.c:377-425`): the expression and the last
     /// result; from level 1 the alarm the last evaluation raised, the alarm
     /// expressions, the timestamp input, each argument with its child link's
     /// report, and the output link's.
-    pub(crate) fn report(&self, level: i32, indent: usize) -> Vec<String> {
+    pub(crate) fn report(
+        &self,
+        db: &crate::server::database::PvDatabase,
+        level: i32,
+        indent: usize,
+    ) -> Vec<ReportLine> {
+        use crate::types::DbfLinkClass;
         use epics_libcom_rs::cfmt::CFloat;
         let pad = " ".repeat(indent);
         // `%.*g` takes a negative precision as omitted.
         let prec = usize::try_from(self.prec).unwrap_or(6);
-        let mut out = vec![format!(
+        let mut out = vec![ReportLine::Console(format!(
             "{pad}'calc': \"{}\" = {:.prec$} {}",
             self.expr.as_deref().unwrap_or("(null)"),
             CFloat(self.val.get()).g(),
             self.units.as_deref().unwrap_or(""),
-        )];
+        ))];
         if level <= 0 {
             return out;
         }
@@ -1226,19 +1240,23 @@ impl CalcLink {
             } else {
                 "post_minor error"
             };
-            out.push(format!(
+            out.push(ReportLine::Console(format!(
                 "{pad}  Alarm: {}, {}, \"{amsg}\"",
                 crate::server::record::dbd_generated::MENU_ALARM_SEVR[sevr as usize],
                 crate::server::recgbl::alarm_condition_string(
                     crate::server::recgbl::alarm_status::LINK_ALARM
                 ),
-            ));
+            )));
         }
         if let Some(major) = &self.major {
-            out.push(format!("{pad}  Major expression: \"{major}\""));
+            out.push(ReportLine::Console(format!(
+                "{pad}  Major expression: \"{major}\""
+            )));
         }
         if let Some(minor) = &self.minor {
-            out.push(format!("{pad}  Minor expression: \"{minor}\""));
+            out.push(ReportLine::Console(format!(
+                "{pad}  Minor expression: \"{minor}\""
+            )));
         }
         if let Some(letter) = self.time_source {
             let time = crate::server::builtin_devices::timestamp::epics_time_to_strftime_in(
@@ -1246,7 +1264,9 @@ impl CalcLink {
                 "%Y-%m-%d %H:%M:%S.%09f",
                 self.val.stamp().0,
             );
-            out.push(format!("{pad}  Timestamp input {letter}: {time}"));
+            out.push(ReportLine::Console(format!(
+                "{pad}  Timestamp input {letter}: {time}"
+            )));
         }
         for (i, arg) in self.args.iter().enumerate() {
             let (value, child) = match arg {
@@ -1254,14 +1274,22 @@ impl CalcLink {
                 CalcArg::Link(link) => (self.val.arg(i), Some(link)),
             };
             let letter = char::from(b'A' + i as u8);
-            out.push(format!("{pad}  Input {letter}: {}", CFloat(value).g()));
+            out.push(ReportLine::Console(format!(
+                "{pad}  Input {letter}: {}",
+                CFloat(value).g()
+            )));
             if let Some(child) = child {
-                out.extend(child.jlink_report(level - 1, indent + 4));
+                out.extend(child.jlink_report(
+                    db,
+                    Some(DbfLinkClass::InLink),
+                    level - 1,
+                    indent + 4,
+                ));
             }
         }
         if let Some(link) = &self.out {
-            out.push(format!("{pad}  Output:"));
-            out.extend(link.jlink_report(level - 1, indent + 4));
+            out.push(ReportLine::Console(format!("{pad}  Output:")));
+            out.extend(link.jlink_report(db, Some(DbfLinkClass::OutLink), level - 1, indent + 4));
         }
         out
     }
@@ -2453,12 +2481,26 @@ impl ParsedLink {
     }
 
     /// C `dbJLinkReport` (`dbJLink.c:468-471`): the link type's own
-    /// `report`, for a type whose jlif has one, and nothing otherwise.
-    pub(crate) fn jlink_report(&self, level: i32, indent: usize) -> Vec<String> {
+    /// `report`, for a type whose jlif has one, and nothing otherwise. A
+    /// `pva` link's is its lset's; `class` is the holding field's.
+    pub(crate) fn jlink_report(
+        &self,
+        db: &crate::server::database::PvDatabase,
+        class: Option<crate::types::DbfLinkClass>,
+        level: i32,
+        indent: usize,
+    ) -> Vec<ReportLine> {
+        let console = |lines: Vec<String>| lines.into_iter().map(ReportLine::Console).collect();
         match self {
-            ParsedLink::Constant(c) => c.report(level, indent),
-            ParsedLink::Calc(c) => c.report(level, indent),
-            ParsedLink::State(st) => st.report(indent),
+            ParsedLink::Constant(c) => console(c.report(level, indent)),
+            ParsedLink::Calc(c) => c.report(db, level, indent),
+            ParsedLink::State(st) => console(st.report(indent)),
+            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => self
+                .external()
+                .into_iter()
+                .flat_map(|link| db.external_link_report(link, class, level, indent))
+                .map(ReportLine::Stdout)
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -4737,7 +4779,17 @@ mod json_link_tests {
     /// from level 2 (`lnkConst.c:286-347`).
     #[test]
     fn const_link_report_names_the_json_type_it_parsed() {
-        let report = |value: &str, level| ParsedLink::json_constant(value).jlink_report(level, 6);
+        let db = crate::server::database::PvDatabase::new();
+        let report = |value: &str, level| -> Vec<String> {
+            ParsedLink::json_constant(value)
+                .jlink_report(&db, None, level, 6)
+                .into_iter()
+                .map(|line| match line {
+                    ReportLine::Console(text) => text,
+                    ReportLine::Stdout(text) => panic!("{text} on stdout"),
+                })
+                .collect()
+        };
         assert_eq!(report("4.25", 0), ["      'const': double 4.25"]);
         assert_eq!(report("4", 0), ["      'const': integer 4"]);
         assert_eq!(report("\"hi\"", 0), ["      'const': string \"hi\""]);

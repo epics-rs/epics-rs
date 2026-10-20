@@ -22,8 +22,8 @@
 //!   the wire (`dbCa.c:419-506`). Their signature is what enforces
 //!   that: a `fn` cannot await, so it cannot suspend the record thread.
 //! * **Async methods** ([`LinkSet::get_value`],
-//!   [`LinkSet::connect_link`], [`LinkSet::put_value`],
-//!   [`LinkSet::flush_puts`]) are the `dbCaTask` half. They run on the
+//!   [`LinkSet::connect_link`], [`LinkSet::put_value`]) are the
+//!   `dbCaTask` half. They run on the
 //!   database's link work owner, never on a record-processing thread,
 //!   and MAY block on the network.
 //!
@@ -799,22 +799,6 @@ pub trait LinkSet: Send + Sync {
         Box::new(NoForward)
     }
 
-    /// Flush any OUT-link writes the lset has queued but not yet sent —
-    /// the production drain trigger for an async OUT channel owner.
-    ///
-    /// Two queued states this drains: a write deferred for sibling
-    /// coalescing, and a write that failed mid-disconnect and is held
-    /// for replay once the upstream reconnects (`retry`). The database
-    /// calls this after every external OUT-link write so the
-    /// "retry on connect" path has a production caller from record
-    /// processing — not only test code. Default no-op: a synchronous
-    /// lset (DB links, a read-only lset) queues nothing.
-    ///
-    /// Mirrors the role of pvxs's shared `pvaLinkChannel::put()` being
-    /// driven from record processing rather than left to manual calls
-    /// (`pvxs/ioc/pvalink_lset.cpp:653`, `pvxs/ioc/pvalink_channel.cpp:220-280`).
-    async fn flush_puts(&self) {}
-
     /// Most recent alarm message string from the upstream PV, when
     /// available. None means no alarm or no cache.
     ///
@@ -947,6 +931,19 @@ pub trait LinkSet: Send + Sync {
     /// `dbcar` walks `plink->type == CA_LINK` and no other link flavour.
     async fn link_diagnostics(&self, _link: LinkRef<'_>) -> Option<LinkDiagnostics> {
         None
+    }
+
+    /// The lines `dbjlr` prints for `link`, held in a field of `class`, at
+    /// `indent` spaces: C `dbJLinkReport` calling the link's jlif `report`
+    /// (`dbJLink.c:468-471`). Default: none, as for a jlif with no `report`.
+    fn report(
+        &self,
+        _link: LinkRef<'_>,
+        _class: Option<crate::types::DbfLinkClass>,
+        _level: i32,
+        _indent: usize,
+    ) -> Vec<String> {
+        Vec::new()
     }
 }
 

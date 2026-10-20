@@ -51,8 +51,8 @@
 //!
 //! One [`LinkPutQueue`] per [`super::PvDatabase`]. A record-processing
 //! thread stages a write and returns; a single owner task drains the queue
-//! and performs the actual `LinkSet::put_value` / `LinkSet::flush_puts`
-//! away from the record's advisory write gate.
+//! and performs the actual `LinkSet::put_value` away from the record's
+//! advisory write gate.
 //!
 //! **Invariant.** *Every staged completion is resolved exactly once* —
 //! by the owner (with the lset's result), by a superseding put, by the
@@ -1196,18 +1196,7 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey) -> Written {
 async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> Written {
     let WireWrite { value, op } = write;
     let (done, result) = match lset {
-        Some(lset) => {
-            let (done, result) = lset.put_value_done(key.channel.link_ref(), value, op).await;
-            if result.is_ok() {
-                // Production drain of any retry-queued OUT writes
-                // on this lset now that a write has reached it (the
-                // channel may have just reconnected). pvxs replays
-                // the queued put from record processing, not
-                // test code (`ioc/pvalink_channel.cpp:220-280`).
-                lset.flush_puts().await;
-            }
-            (done, result)
-        }
+        Some(lset) => lset.put_value_done(key.channel.link_ref(), value, op).await,
         None => (
             LinkPutDone::Callback,
             Err(format!(
@@ -1238,7 +1227,7 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> 
     Written {
         inline: done == LinkPutDone::Inline,
         result,
-        // `newOutNative` is dbCa's: pvalink replays its own (`flush_puts`).
+        // `newOutNative` is dbCa's; pvxs keeps no put a disconnect cancelled.
         unsent: unsent && key.channel.scheme == "ca",
     }
 }

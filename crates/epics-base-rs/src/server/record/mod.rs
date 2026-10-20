@@ -53,8 +53,8 @@ pub use link::{
     pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{
-    DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif, trim_link_text,
-    warn_discarded_cp,
+    DbLinkAnswer, LinkList, LinkLookup, ReportLine, check_json_link_text_in, implemented_jlif,
+    trim_link_text, warn_discarded_cp,
 };
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,

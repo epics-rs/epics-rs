@@ -553,8 +553,10 @@ mod ioc {
         }
         for d in resolver.channel_diagnostics() {
             println!(
-                "STAGE5 seq={seq} link pv={} dir={:?} connected={} records={:?}",
-                d.pv_name, d.direction, d.connected, d.records,
+                "STAGE5 seq={seq} link pv={} connected={} records={:?}",
+                d.pv_name,
+                d.connected,
+                d.links.iter().map(|l| &l.record).collect::<Vec<_>>(),
             );
         }
         // The §9.11 dial-pool bound, and the heap it was said to stop eating.

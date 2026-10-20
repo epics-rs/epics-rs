@@ -2406,6 +2406,22 @@ impl PvDatabase {
         })
     }
 
+    /// The `report` of `link`'s lset ([`LinkSet::report`](super::LinkSet::report));
+    /// nothing when no lset takes its scheme.
+    pub(crate) fn external_link_report(
+        &self,
+        link: crate::server::record::ExternalRef<'_>,
+        class: Option<crate::types::DbfLinkClass>,
+        level: i32,
+        indent: usize,
+    ) -> Vec<String> {
+        let (scheme, lref) = Self::external_link_ref(link);
+        super::link_put_queue::find_lset(&self.inner, scheme, |lset| {
+            Some(lset.report(lref, class, level, indent))
+        })
+        .unwrap_or_default()
+    }
+
     /// What an open of `field`'s stored link answered, bound into the record:
     /// no lset is [`RecordInstance::bind_no_lset`](crate::server::record::RecordInstance::bind_no_lset),
     /// an lset gives a forward link its handle.

@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -14,23 +14,18 @@ use tokio::sync::mpsc;
 
 use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::CacheAction;
 use epics_pva_rs::client_native::ops_v2::{
     MonitorEvent, MonitorEventMask, PutLeaf, effective_typed_put_path,
 };
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
-use super::config::{LinkDirection, ProcMode, PvaLinkConfig};
+use super::config::{ProcMode, PvaLinkConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PvaLinkError {
     #[error("PVA error: {0}")]
     Pva(#[from] epics_pva_rs::error::PvaError),
-    #[error("link is INP-only, write requested")]
-    NotWritable,
-    #[error("link is OUT-only, read requested")]
-    NotReadable,
     #[error("pvalink monitor for {0:?} is disconnected (cached value is stale)")]
     Disconnected(String),
     #[error("field {0:?} not found in remote NT structure")]
@@ -140,6 +135,201 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
     }
 }
 
+/// pvxs `pvaLinkChannel::connected`, `num_disconnect`, `num_type_change` and
+/// `op_put`, with its links' `put_scratch` (`pvxs/ioc/pvalink.h:150-170`):
+/// what pvxs moves under `pvaLinkChannel::lock`. The connection changes only under
+/// [`Outbox`]'s lock, where a put tests it, so a put is either held before a
+/// connect releases it or sees the connection after.
+#[derive(Default)]
+pub(crate) struct Connection {
+    connected: AtomicBool,
+    /// [`Self::down`] is the one place the count moves.
+    disconnects: AtomicUsize,
+    /// [`Self::up`] is the one place the count moves.
+    type_changes: AtomicUsize,
+    /// Upstream puts on the wire ([`PutInFlight`]).
+    puts_in_flight: AtomicUsize,
+    outbox: Mutex<Outbox>,
+}
+
+impl Connection {
+    /// A value arrived. The first one since the channel was down connects it
+    /// and counts a type change, as pvxs's `run()` re-creates its cache
+    /// (`pvxs/ioc/pvalink_channel.cpp:342-353`). A put held for the
+    /// connection comes back to be sent.
+    pub(crate) fn up(&self) -> Option<PutOp> {
+        let mut out = self.outbox.lock();
+        if self.connected.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        self.type_changes.fetch_add(1, Ordering::Relaxed);
+        out.held.take()
+    }
+
+    /// The connection is lost; true when it was up, which counts one
+    /// disconnect and, as `pvaLink::onDisconnect` does, drops every staged
+    /// write (`pvxs/ioc/pvalink_channel.cpp:362-373`, `pvalink_link.cpp:75-81`).
+    /// Nothing is held while up; a put on the wire fails with the
+    /// disconnect and keeps nothing ([`send_put`]), pvxs's `op_put.reset()`.
+    pub(crate) fn down(&self) -> bool {
+        let mut out = self.outbox.lock();
+        let was_up = self.connected.swap(false, Ordering::AcqRel);
+        if was_up {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+            out.staged.clear();
+        }
+        was_up
+    }
+
+    /// A put succeeded: pvxs `linkPutDone` restarts the channel's put
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`), which takes every write
+    /// staged behind it.
+    fn restart(&self) -> Option<PutOp> {
+        let mut out = self.outbox.lock();
+        out.start(false, self.is_up())
+    }
+
+    fn is_up(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+}
+
+/// The channel's writes not yet sent.
+#[derive(Default)]
+pub(crate) struct Outbox {
+    /// Each field's latest write not yet taken by a put: pvxs's per-link
+    /// `put_scratch`, keyed by the link's `field`.
+    staged: HashMap<String, StagedPut>,
+    /// A put started while the channel was down, with the writes it took:
+    /// pvxs's `op_put` before its build, and the links' `put_queue`.
+    held: Option<PutOp>,
+}
+
+impl Outbox {
+    /// pvxs `pvaLinkChannel::put(force)` (`pvxs/ioc/pvalink_channel.cpp:220-280`):
+    /// take every staged write into a put that replaces the held one and
+    /// carries its writes too, as `linkBuildPut` sends every queued value
+    /// (`:127-184`). It comes back to send when `connected`, and is held
+    /// otherwise.
+    fn start(&mut self, force: bool, connected: bool) -> Option<PutOp> {
+        if self.staged.is_empty() && !force {
+            return None;
+        }
+        // `if((reqProcess&2) || force) proc = "true"` over the links this put
+        // takes: a forced put outranks even a staged NPP (`:258-260`).
+        let proc = if force {
+            ProcMode::Pp
+        } else {
+            combine_proc(self.staged.values().map(|s| s.proc))
+        };
+        let mut fields = self.held.take().map(|op| op.fields).unwrap_or_default();
+        fields.extend(self.staged.drain());
+        let op = PutOp { fields, proc };
+        if connected {
+            return Some(op);
+        }
+        self.held = Some(op);
+        None
+    }
+}
+
+/// One channel put: the writes it carries and its process option.
+pub(crate) struct PutOp {
+    fields: HashMap<String, StagedPut>,
+    proc: ProcMode,
+}
+
+/// Send one channel put: pvxs's op once built, `linkBuildPut` assigning each
+/// write into the `GetOPut` readback (`_doGet`, `src/clientget.cpp:678-692`;
+/// `pvxs/ioc/pvalink_channel.cpp:127-184`), so every leaf the readback marked
+/// goes back with them and a group target's other members are rewritten too.
+/// A forced put with nothing staged sends the readback untouched.
+async fn send_put(
+    client: &PvaClient,
+    pv_name: &str,
+    channel: &Arc<Connection>,
+    op: PutOp,
+) -> PvaLinkResult<usize> {
+    let block = op.fields.values().any(|s| s.block);
+    let req = build_put_request(op.proc, block);
+    let on_wire = PutInFlight::start(&channel.puts_in_flight);
+    let put_result = match client.pvput_begin(pv_name, Some(&req), true).await {
+        Ok(put) => {
+            let intro = put.introspection().clone();
+            let assignments: Vec<(String, PutLeaf)> = op
+                .fields
+                .iter()
+                .map(|(field, sp)| {
+                    let leaf = match &sp.value {
+                        QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
+                        QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
+                    };
+                    (effective_typed_put_path(&intro, field), leaf)
+                })
+                .collect();
+            put.commit_fields_onto_present(&assignments).await
+        }
+        Err(e) => Err(e),
+    };
+    drop(on_wire);
+    match put_result {
+        Ok(()) => {
+            if let Some(next) = channel.restart() {
+                let reactor = epics_base_rs::runtime::task::Reactor::current()
+                    .expect("a channel put completes on the IOC's reactor");
+                spawn_put(&reactor, client, pv_name, channel, next);
+            }
+            Ok(1)
+        }
+        // A disconnect cancels the put and its writes go with it, as pvxs's
+        // `op_put.reset()` keeps none (`pvxs/ioc/pvalink_channel.cpp:362-370`).
+        // Only a non-retry write's record alarms for it.
+        Err(e)
+            if is_disconnect(&e)
+                && !op.fields.is_empty()
+                && op.fields.values().all(|s| s.retry) =>
+        {
+            Ok(0)
+        }
+        Err(e) => Err(PvaLinkError::Pva(e)),
+    }
+}
+
+/// Send a put no record waits on: one held for the connect, or one a
+/// completed put restarted.
+fn spawn_put(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+    client: &PvaClient,
+    pv_name: &str,
+    channel: &Arc<Connection>,
+    op: PutOp,
+) {
+    let (client, pv_name, channel) = (client.clone(), pv_name.to_owned(), channel.clone());
+    reactor.spawn(async move {
+        if let Err(e) = send_put(&client, &pv_name, &channel, op).await {
+            // pvxs `linkPutDone` (`pvxs/ioc/pvalink_channel.cpp:192`).
+            epics_base_rs::stderr_println!("{pv_name} PVA link put ERROR: {e}");
+        }
+    });
+}
+
+/// One put on the wire for [`PvaLink::put_in_flight`], counted from its
+/// start until it is dropped on any exit — pvxs's `op_put` lifetime.
+struct PutInFlight<'a>(&'a AtomicUsize);
+
+impl<'a> PutInFlight<'a> {
+    fn start(puts: &'a AtomicUsize) -> Self {
+        puts.fetch_add(1, Ordering::Relaxed);
+        Self(puts)
+    }
+}
+
+impl Drop for PutInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Take an INP link from connected to disconnected: stamp the
 /// disconnect time and enqueue the payload-less scan trigger that makes
 /// CP / passive-CPP targets process and expose LINK_ALARM/INVALID.
@@ -147,21 +337,22 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
 /// **The single owner of that transition**, called from the two places
 /// that can observe it — the monitor's `Disconnected`/`Finished` event and
 /// the subscription future returning — so neither can implement half of it.
-/// Idempotent by construction: the `swap` gate means the second observer of
-/// one outage is a no-op, and a subscription that never delivered an event
-/// synthesizes no scan at all. The gate is ours, not pvxs parity: pvxs has
+/// Idempotent by construction: the [`Connection::down`] gate means the
+/// second observer of one outage is a no-op, and a subscription that never
+/// delivered an event synthesizes no scan at all. The gate is ours, not
+/// pvxs parity: pvxs has
 /// one observer, so its `catch(client::Disconnect&)` arm clears `connected`
 /// and runs every link's `onDisconnect()` unconditionally
 /// (`pvxs/ioc/pvalink_channel.cpp:360-373`, `pvxs/ioc/pvalink_link.cpp:75-81`); its
 /// `if(!connected)` at `pvalink_channel.cpp:342` is the value-update path's
 /// reconnect arm, not a disconnect gate.
 fn inp_disconnect_scan(
-    connected: &AtomicBool,
+    connected: &Connection,
     snaps: &Mutex<Snaps>,
     tx: &mpsc::Sender<ScanEvent>,
     overrun: &ScanOverrun,
 ) {
-    if !connected.swap(false, Ordering::AcqRel) {
+    if !connected.down() {
         return;
     }
     // pvxs `snap_time = e.time` (`pvxs/ioc/pvalink_channel.cpp:372`). We have
@@ -242,11 +433,9 @@ impl Snaps {
     }
 }
 
-/// A live PVA link.
-///
-/// Constructed once per record-link instance. For INP links the optional
-/// monitor task spawns automatically; for OUT links the link just owns the
-/// PvaClient and writes synchronously.
+/// A live PVA link channel: pvxs `pvaLinkChannel`, one per
+/// `(channelName, pvRequest)` whichever input and output links attach to
+/// it. Its monitor task spawns at open.
 pub struct PvaLink {
     /// Field declaration order matters: Rust drops fields in
     /// declaration order, so `_monitor_abort` MUST come BEFORE
@@ -261,16 +450,16 @@ pub struct PvaLink {
     /// Latest received value (INP only — None until first event), one
     /// shared snapshot per update so a read borrows it.
     latest: Arc<Mutex<Option<Arc<PvField>>>>,
-    /// Live-connection flag for INP+monitor links (B-pvalink-restart).
+    /// The channel's connection, kept by the monitor (B-pvalink-restart),
+    /// and its puts.
     ///
-    /// The INP monitor task is a re-subscribe loop: it sets this
-    /// `true` while a subscription is live and `false` the moment
-    /// `pvmonitor` returns (IOC restart / transient I/O), then
-    /// re-subscribes with exponential backoff. `is_connected()`
-    /// reads this flag so a downstream IOC restart is reflected as
-    /// a disconnect instead of serving the stale cached value
-    /// forever. `None` for OUT / non-monitor links.
-    monitor_connected: Option<Arc<AtomicBool>>,
+    /// The monitor task is a re-subscribe loop: it marks the channel up
+    /// while a subscription is live and down the moment `pvmonitor`
+    /// returns (IOC restart / transient I/O), then re-subscribes with
+    /// exponential backoff. `is_connected()` reads it so a downstream IOC
+    /// restart is reflected as a disconnect instead of serving the stale
+    /// cached value forever.
+    channel: Arc<Connection>,
     /// Receiver half of the INP-monitor record-notification channel.
     ///
     /// B3: every monitor event for an INP+monitor link pushes the new
@@ -286,41 +475,6 @@ pub struct PvaLink {
     /// subscription ends, so the forwarder can scan CP/CPP targets on
     /// the disconnect even though no value accompanies it.
     notify_rx: Mutex<Option<mpsc::Receiver<ScanEvent>>>,
-    /// Per-field staged OUT writes — this link's role as the shared
-    /// `pvaLinkChannel` PUT owner (pvxs `put_scratch` / `put_queue`,
-    /// `pvxs/ioc/pvalink_channel.cpp:127-263`).
-    ///
-    /// Sibling OUT links to the same `(pv, pipeline, queue_size)` now
-    /// resolve to THIS one `PvaLink` (the registry no longer keys on
-    /// per-link OUT options), and each stages its value here keyed by
-    /// its own `field` selector (`""` = root). A non-deferred write
-    /// flushes the whole map into ONE combined upstream PUT, with the
-    /// process option resolved across every participating field
-    /// (PP/CP/CPP beats NPP, `pvxs/ioc/pvalink_channel.cpp:257-263`). A
-    /// `defer=true` write stays staged until a non-deferred sibling —
-    /// or the production drain — flushes it, so several fields combine
-    /// into one PUT (`documentation/pvalink.rst:111-113`).
-    ///
-    /// Keyed per field with most-recent-wins overwrite: pvxs keeps one
-    /// `put_scratch` per link and a later write to the same field
-    /// supersedes the earlier one before the channel PUT starts
-    /// (`pvxs/ioc/pvalink_lset.cpp:645-653`), so `retry` replays only the most
-    /// recent incomplete value, never a stale FIFO log.
-    ///
-    /// Stores [`QueuedPut`] (via [`StagedPut`]), not a bare `PvField`:
-    /// a string-form write must replay through the string `pvput` path
-    /// (which coerces the text against the channel's introspected
-    /// type), not as a `PvField::Scalar(String)` that would mismatch a
-    /// numeric record.
-    out_scratch: Mutex<HashMap<String, StagedPut>>,
-    /// Set when a disconnected flush left `retry=true` writes staged for
-    /// replay. The `LinkSet::flush_puts` production drain re-attempts the
-    /// staged writes only while this is set, so a freshly-`defer`red
-    /// write awaiting its sibling is never flushed early — only a
-    /// genuinely stuck retry write is replayed on the next OUT activity
-    /// (pvxs replays the queued put on the client reconnect event,
-    /// `pvalink.rst:99-100`).
-    retry_pending: AtomicBool,
     /// Coalescing overrun accounting for the scan-trigger queue. Shared
     /// with the monitor task (producer, marks on a full queue) and the
     /// scan forwarder (consumer, drains the owed scan), so a full local
@@ -414,239 +568,154 @@ impl PvaLink {
         let latest = Arc::new(Mutex::new(None));
         let snaps: Arc<Mutex<Snaps>> = Arc::default();
         let scan_overrun = Arc::new(ScanOverrun::default());
-        let mut notify_rx = None;
-        let mut monitor_abort = None;
-        let mut monitor_connected = None;
+        // pvxs `pvaLinkChannel::open` (`pvxs/ioc/pvalink_channel.cpp:101-122`):
+        // every channel runs this one monitor, whichever links attach to it.
+        // Its connection is what an output link's put waits for and what
+        // gates a non-retry write (`valid()`), so an output link needs it as
+        // much as an input link needs the value.
+        //
+        // B3 / B4-Q: the channel buffer is sized to the link's
+        // `Q` (monitor queue depth). When it fills, the monitor
+        // task does NOT silently drop the event — it coalesces to
+        // the `latest` cache and arms an overrun marker via
+        // `enqueue_scan_trigger`, so the forwarder still runs one
+        // CP/CPP scan with the newest value (EPICS
+        // `db_queue_event_log` replace-last-on-full,
+        // `dbEvent.c:812-827`).
+        let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
 
-        if matches!(config.direction, LinkDirection::Inp) && config.monitor {
-            // B3 / B4-Q: the channel buffer is sized to the link's
-            // `Q` (monitor queue depth). When it fills, the monitor
-            // task does NOT silently drop the event — it coalesces to
-            // the `latest` cache and arms an overrun marker via
-            // `enqueue_scan_trigger`, so the forwarder still runs one
-            // CP/CPP scan with the newest value (EPICS
-            // `db_queue_event_log` replace-last-on-full,
-            // `dbEvent.c:812-827`).
-            let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
-            notify_rx = Some(rx);
-
-            let pv_name = config.pv_name.clone();
-            let latest_clone = latest.clone();
-            let client_clone = client.clone();
-            let connected = Arc::new(AtomicBool::new(false));
-            let connected_for_task = connected.clone();
-            monitor_connected = Some(connected);
-            let snaps_task = snaps.clone();
-            let scan_overrun_task = scan_overrun.clone();
-            // B4-pipeline / B4-Q: when the link asks for pipeline
-            // flow-control or a non-default queue depth, build a
-            // pvRequest carrying `record[pipeline=...,queueSize=N]`
-            // so the negotiation reaches the server. Otherwise use
-            // the plain monitor (lower overhead, matches prior
-            // behaviour).
-            let request = monitor_request(&config);
-            // B-pvalink-restart: the INP monitor is a re-subscribe
-            // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
-            // The subscription runs on the TYPED EVENT STREAM
-            // (`pvmonitor_events`), not on the value-only `pvmonitor`,
-            // because the disconnect must arrive as an EVENT — see
-            // `inp_disconnect_scan` below.
-            let join = reactor.spawn(async move {
-                let mut backoff = Duration::from_millis(250);
-                let max_backoff = Duration::from_secs(30);
-                loop {
-                    let tx_inner = tx.clone();
-                    let tx_disc = tx.clone();
-                    let latest_inner = latest_clone.clone();
-                    let connected_inner = connected_for_task.clone();
-                    let connected_disc = connected_for_task.clone();
-                    let overrun_inner = scan_overrun_task.clone();
-                    let overrun_disc = scan_overrun_task.clone();
-                    let snaps_ev = snaps_task.clone();
-                    // pvxs's pvalink channel is driven by the monitor's
-                    // event stream: `Connected` / value updates / the
-                    // `catch(client::Disconnect&)` branch
-                    // (`pvxs/ioc/pvalink_channel.cpp:335-373`). Ours must be too.
-                    //
-                    // `mask_disconnected: false` is the load-bearing half.
-                    // `op_monitor_events` RE-SUBSCRIBES INTERNALLY on
-                    // connection loss (`ops_v2.rs`, `MonitorEnd::ConnectionLost`
-                    // → deliver `Disconnected`, sleep, loop), so the
-                    // subscription future does NOT return when the upstream
-                    // IOC dies. Inferring the disconnect from that future
-                    // returning — what this loop did before — therefore
-                    // never fired: measured on the RTEMS stage-5 target —
-                    // killing the upstream left both downstream records at
-                    // their stale value with `SEVR=0 STAT=0` and
-                    // `is_connected() == true`, while the
-                    // client itself correctly reported the peer gone
-                    // (`conn alive=false channels=[]`, `active=0 searching=2`).
-                    let on_event = move |ev: MonitorEvent| match ev {
-                        MonitorEvent::Connected { .. } => {
-                            connected_inner.store(true, Ordering::Release);
+        let pv_name = config.pv_name.clone();
+        let latest_clone = latest.clone();
+        let client_clone = client.clone();
+        let connected = Arc::new(Connection::default());
+        let connected_for_task = connected.clone();
+        let snaps_task = snaps.clone();
+        let scan_overrun_task = scan_overrun.clone();
+        // B4-pipeline / B4-Q: when the link asks for pipeline
+        // flow-control or a non-default queue depth, build a
+        // pvRequest carrying `record[pipeline=...,queueSize=N]`
+        // so the negotiation reaches the server. Otherwise use
+        // the plain monitor (lower overhead, matches prior
+        // behaviour).
+        let request = monitor_request(&config);
+        // The connect sends a put held for it.
+        let release = {
+            let (reactor, client, pv_name, channel) = (
+                reactor.clone(),
+                client.clone(),
+                pv_name.clone(),
+                connected.clone(),
+            );
+            move |op: PutOp| spawn_put(&reactor, &client, &pv_name, &channel, op)
+        };
+        // B-pvalink-restart: the INP monitor is a re-subscribe
+        // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
+        // The subscription runs on the TYPED EVENT STREAM
+        // (`pvmonitor_events`), not on the value-only `pvmonitor`,
+        // because the disconnect must arrive as an EVENT — see
+        // `inp_disconnect_scan` below.
+        let join = reactor.spawn(async move {
+            let mut backoff = Duration::from_millis(250);
+            let max_backoff = Duration::from_secs(30);
+            loop {
+                let tx_inner = tx.clone();
+                let tx_disc = tx.clone();
+                let latest_inner = latest_clone.clone();
+                let connected_inner = connected_for_task.clone();
+                let connected_disc = connected_for_task.clone();
+                let overrun_inner = scan_overrun_task.clone();
+                let overrun_disc = scan_overrun_task.clone();
+                let snaps_ev = snaps_task.clone();
+                let release = release.clone();
+                // pvxs's pvalink channel is driven by the monitor's
+                // event stream: value updates and the
+                // `catch(client::Disconnect&)` branch
+                // (`pvxs/ioc/pvalink_channel.cpp:335-373`). Ours must be too.
+                // `Connected` is masked there (`:110-112`): the channel is
+                // connected by its first value, not by the circuit.
+                //
+                // `mask_disconnected: false` is the load-bearing half.
+                // `op_monitor_events` RE-SUBSCRIBES INTERNALLY on
+                // connection loss (`ops_v2.rs`, `MonitorEnd::ConnectionLost`
+                // → deliver `Disconnected`, sleep, loop), so the
+                // subscription future does NOT return when the upstream
+                // IOC dies. Inferring the disconnect from that future
+                // returning — what this loop did before — therefore
+                // never fired: measured on the RTEMS stage-5 target —
+                // killing the upstream left both downstream records at
+                // their stale value with `SEVR=0 STAT=0` and
+                // `is_connected() == true`, while the
+                // client itself correctly reported the peer gone
+                // (`conn alive=false channels=[]`, `active=0 searching=2`).
+                let on_event = move |ev: MonitorEvent| match ev {
+                    MonitorEvent::Connected { .. } => {}
+                    MonitorEvent::Data { value, .. } => {
+                        if let Some(op) = connected_inner.up() {
+                            release(op);
                         }
-                        MonitorEvent::Data { value, .. } => {
-                            connected_inner.store(true, Ordering::Release);
-                            *latest_inner.lock() = Some(Arc::new(value.clone()));
-                            // The value is now cached in `latest`; enqueue a
-                            // scan trigger, coalescing to the cache + overrun
-                            // marker if the queue is full rather than dropping
-                            // the CP/CPP scan (EPICS `db_queue_event_log`,
-                            // `dbEvent.c:812-827`).
-                            enqueue_scan_trigger(
-                                &tx_inner,
-                                &overrun_inner,
-                                ScanEvent::Value(value),
-                            );
-                        }
-                        // A clean end-of-stream is as much a loss of the
-                        // live value as a dropped circuit: pvxs pushes
-                        // `Finished()` into the same stream the
-                        // `Disconnect` lands in, and `pvaLinkChannel`
-                        // stops being `connected` either way.
-                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
-                            inp_disconnect_scan(
-                                &connected_disc,
-                                &snaps_ev,
-                                &tx_disc,
-                                &overrun_disc,
-                            );
-                        }
-                    };
-                    let result = client_clone
-                        .pvmonitor_events(
-                            &pv_name,
-                            request.as_ref(),
-                            MonitorEventMask {
-                                mask_connected: false,
-                                mask_disconnected: false,
-                            },
-                            on_event,
-                        )
-                        .await;
-                    // The subscription future returned — the stream ended
-                    // for good (`Fatal`/`Remote`, or the channel closed),
-                    // rather than dropping a circuit it re-subscribes to
-                    // itself. Same transition, same owner: idempotent
-                    // because it is gated on the prior `connected` state,
-                    // so a `Disconnected` event already handled above does
-                    // not scan twice here.
-                    inp_disconnect_scan(&connected_for_task, &snaps_task, &tx, &scan_overrun_task);
-                    match &result {
-                        Ok(()) => tracing::debug!(
-                            pv = %pv_name,
-                            "pvalink: INP monitor ended, re-subscribing"
-                        ),
-                        Err(e) => tracing::warn!(
-                            pv = %pv_name,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "pvalink: INP monitor failed, will retry"
-                        ),
+                        *latest_inner.lock() = Some(Arc::new(value.clone()));
+                        // The value is now cached in `latest`; enqueue a
+                        // scan trigger, coalescing to the cache + overrun
+                        // marker if the queue is full rather than dropping
+                        // the CP/CPP scan (EPICS `db_queue_event_log`,
+                        // `dbEvent.c:812-827`).
+                        enqueue_scan_trigger(&tx_inner, &overrun_inner, ScanEvent::Value(value));
                     }
-                    task::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
-                }
-            });
-            monitor_abort = Some(MonitorAbort(join.abort_handle()));
-        } else if matches!(config.direction, LinkDirection::Out) {
-            // pvxs pvalink runs a monitor on EVERY channel — INP *and*
-            // OUT — to maintain `lchan->connected`
-            // (`pvxs/ioc/pvalink_channel.cpp:342-363`); the OUT-write gate
-            // `valid()` is `connected && root` (`pvxs/ioc/pvalink_link.cpp:69`,
-            // applied at `pvxs/ioc/pvalink_lset.cpp:609`). An OUT link must
-            // therefore track connection too, even though it never reads
-            // the cached value: without it `is_connected()` (the
-            // `latest.is_some()` fallback) is permanently false for OUT
-            // links, so the non-retry write gate below would drop every
-            // OUT write. This is the same re-subscribe-with-backoff loop
-            // as the INP monitor, stripped to connection-tracking only —
-            // no value cache, no scan triggers, no disconnect-time
-            // capture (those are INP-read concerns).
-            let pv_name = config.pv_name.clone();
-            let client_clone = client.clone();
-            let connected = Arc::new(AtomicBool::new(false));
-            let connected_for_task = connected.clone();
-            monitor_connected = Some(connected);
-            // pvxs keeps one `pvaLinkChannel` per `(channelName,
-            // pvRequest)` and calls `chan.monitor(this, pvRequest)` for
-            // BOTH INP and OUT channels, with `pvRequest` coming from
-            // `pvaLink::makeRequest()` (`pvxs/ioc/pvalink_link.cpp:49-65`,
-            // installed at `pvxs/ioc/pvalink_channel.cpp` channel open). That
-            // request always carries `record._options.atomic=true`,
-            // `pipeline=<cfg>`, and `queueSize=<Q/4>`. The OUT
-            // connection-tracking monitor must therefore open with the
-            // same request as the INP monitor — not a plain
-            // option-less subscription — so the server sees the pvalink
-            // atomic/pipeline/queue negotiation on the OUT liveness path.
-            let request = monitor_request(&config);
-            let join = reactor.spawn(async move {
-                let mut backoff = Duration::from_millis(250);
-                let max_backoff = Duration::from_secs(30);
-                loop {
-                    let connected_inner = connected_for_task.clone();
-                    // Same event stream as the INP monitor, for the same
-                    // reason: `op_monitor_events` re-subscribes internally
-                    // on connection loss, so the future returning is NOT
-                    // the disconnect signal. Without the `Disconnected`
-                    // event the OUT-write gate would keep reporting a dead
-                    // upstream as writable and every put would be swallowed
-                    // by the peer's absence instead of deferring/retrying.
-                    // Liveness is proven by a delivered event, never by
-                    // entering the subscription; the value itself is ignored.
-                    let on_event = move |ev: MonitorEvent| match ev {
-                        MonitorEvent::Connected { .. } | MonitorEvent::Data { .. } => {
-                            connected_inner.store(true, Ordering::Release);
-                        }
-                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
-                            connected_inner.store(false, Ordering::Release);
-                        }
-                    };
-                    let result = client_clone
-                        .pvmonitor_events(
-                            &pv_name,
-                            request.as_ref(),
-                            MonitorEventMask {
-                                mask_connected: false,
-                                mask_disconnected: false,
-                            },
-                            on_event,
-                        )
-                        .await;
-                    // The subscription future returned — the stream ended
-                    // for good. Reflect the disconnect so the OUT-write gate
-                    // sees `is_connected() == false` until re-subscribed.
-                    connected_for_task.store(false, Ordering::Release);
-                    match &result {
-                        Ok(()) => tracing::debug!(
-                            pv = %pv_name,
-                            "pvalink: OUT connection monitor ended, re-subscribing"
-                        ),
-                        Err(e) => tracing::warn!(
-                            pv = %pv_name,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "pvalink: OUT connection monitor failed, will retry"
-                        ),
+                    // A clean end-of-stream is as much a loss of the
+                    // live value as a dropped circuit: pvxs pushes
+                    // `Finished()` into the same stream the
+                    // `Disconnect` lands in, and `pvaLinkChannel`
+                    // stops being `connected` either way.
+                    MonitorEvent::Disconnected | MonitorEvent::Finished => {
+                        inp_disconnect_scan(&connected_disc, &snaps_ev, &tx_disc, &overrun_disc);
                     }
-                    task::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                };
+                let result = client_clone
+                    .pvmonitor_events(
+                        &pv_name,
+                        request.as_ref(),
+                        MonitorEventMask {
+                            mask_connected: true,
+                            mask_disconnected: false,
+                        },
+                        on_event,
+                    )
+                    .await;
+                // The subscription future returned — the stream ended
+                // for good (`Fatal`/`Remote`, or the channel closed),
+                // rather than dropping a circuit it re-subscribes to
+                // itself. Same transition, same owner: idempotent
+                // because it is gated on the prior `connected` state,
+                // so a `Disconnected` event already handled above does
+                // not scan twice here.
+                inp_disconnect_scan(&connected_for_task, &snaps_task, &tx, &scan_overrun_task);
+                match &result {
+                    Ok(()) => tracing::debug!(
+                        pv = %pv_name,
+                        "pvalink: INP monitor ended, re-subscribing"
+                    ),
+                    Err(e) => tracing::warn!(
+                        pv = %pv_name,
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "pvalink: INP monitor failed, will retry"
+                    ),
                 }
-            });
-            monitor_abort = Some(MonitorAbort(join.abort_handle()));
-        }
+                task::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        });
+        let monitor_abort = MonitorAbort(join.abort_handle());
 
         Ok(Self {
             config,
             client,
             latest,
-            monitor_connected,
-            notify_rx: Mutex::new(notify_rx),
-            out_scratch: Mutex::new(HashMap::new()),
+            channel: connected,
+            notify_rx: Mutex::new(Some(rx)),
             snaps,
-            retry_pending: AtomicBool::new(false),
             scan_overrun,
-            _monitor_abort: monitor_abort,
+            _monitor_abort: Some(monitor_abort),
         })
     }
 
@@ -670,9 +739,8 @@ impl PvaLink {
     /// Take the INP-monitor notification receiver (B3). Returns the
     /// channel exactly once; subsequent calls return `None`. The
     /// resolver calls this right after `open` to spawn the
-    /// scan-on-update forwarder. `None` for OUT / non-monitor links
-    /// (they never created a channel) or after the receiver has
-    /// already been claimed.
+    /// scan-on-update forwarder. `None` for a test link built without a
+    /// monitor, or after the receiver has already been claimed.
     pub fn take_notify_rx(&self) -> Option<mpsc::Receiver<ScanEvent>> {
         self.notify_rx.lock().take()
     }
@@ -695,10 +763,7 @@ impl PvaLink {
     /// but differ in which sub-field they target (pvxs
     /// `pvxs/ioc/pvalink_link.cpp:91` — `root = lchan->root[fieldName]`).
     pub async fn read_with_field(&self, field: &str) -> PvaLinkResult<PvField> {
-        if matches!(self.config.direction, LinkDirection::Out) {
-            return Err(PvaLinkError::NotReadable);
-        }
-        // a monitor link serves its cached value ONLY
+        // the channel serves its cached value ONLY
         // while the subscription is live. When the upstream monitor is
         // down — an IOC restart / transient I/O, or before the first
         // event has ever arrived — the cache is not a valid current
@@ -710,35 +775,29 @@ impl PvaLink {
         // pvxs `pvaGetValue`'s `!self->valid()` gate
         // (pvxs/ioc/pvalink_lset.cpp:259-272), which returns failure while
         // disconnected and does NOT fall back to a one-shot GET.
-        // Non-monitor INP links keep the fresh-GET path: each read
-        // proves connectivity by itself, so there is no stale window.
-        if self.config.monitor {
-            if !self.is_connected() {
-                return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-            }
-            let cached = self.latest.lock();
-            return match cached.as_ref() {
-                Some(v) => {
-                    // value-read latch: pvxs `pvaGetValue` copies the live
-                    // `fld_severity` / `fld_message` into the snapshot on
-                    // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
-                    self.latch_snapshot(field, v);
-                    Ok(select_link_value(v, field).clone())
-                }
-                // Connected flag set but the first event has not yet
-                // written `latest` (the callback stores the flag before
-                // the value): not-yet-valid, surface a failed read.
-                None => Err(PvaLinkError::Disconnected(self.config.pv_name.clone())),
-            };
+        if !self.is_connected() {
+            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
         }
-        let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(select_link_value(&result.value, field).clone())
+        let cached = self.latest.lock();
+        match cached.as_ref() {
+            Some(v) => {
+                // value-read latch: pvxs `pvaGetValue` copies the live
+                // `fld_severity` / `fld_message` into the snapshot on
+                // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
+                self.latch_snapshot(field, v);
+                Ok(select_link_value(v, field).clone())
+            }
+            // Connected flag set but the first event has not yet
+            // written `latest` (the callback stores the flag before
+            // the value): not-yet-valid, surface a failed read.
+            None => Err(PvaLinkError::Disconnected(self.config.pv_name.clone())),
+        }
     }
 
     /// Synchronous fast-path read: return the cached field if the
     /// monitor has delivered at least one event, without ever
-    /// awaiting. Returns `None` for OUT links, non-monitor INPs,
-    /// or pre-first-event INPs.
+    /// awaiting. Returns `None` while disconnected or before the first
+    /// event.
     ///
     /// Lets the record-link resolver path skip `block_on` on every
     /// process — the typical hot case where a monitor has already
@@ -759,9 +818,6 @@ impl PvaLink {
     /// value in place, so a record-thread read copies nothing it does not
     /// convert.
     pub fn with_cached_value<R>(&self, field: &str, read: impl FnOnce(&PvField) -> R) -> Option<R> {
-        if matches!(self.config.direction, LinkDirection::Out) || !self.config.monitor {
-            return None;
-        }
         // same disconnect gate as `read_with_field` — the
         // sync fast path must never serve a stale cached value while the
         // monitor subscription is down. Returning `None` makes the lset
@@ -893,8 +949,8 @@ impl PvaLink {
     }
 
     /// Core OUT-write path: stage `value` under `field` on the shared
-    /// channel scratch, then — unless `defer` — flush the whole scratch
-    /// into one combined upstream PUT. Mirrors pvxs `pvaPutValue`
+    /// channel, then — unless `defer` — put every staged write in one
+    /// upstream PUT. Mirrors pvxs `pvaPutValue`
     /// (`pvxs/ioc/pvalink_lset.cpp:645-653`): `put_scratch = value; if(!defer)
     /// lchan->put()`.
     async fn stage_and_flush(
@@ -906,202 +962,65 @@ impl PvaLink {
         block: bool,
         value: QueuedPut,
     ) -> PvaLinkResult<()> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        // pvxs `pvaPutValueX` gates EVERY put — deferred or not — on
-        // `if(!self->retry && !self->valid()) return -1`
-        // (`pvxs/ioc/pvalink_lset.cpp:609`), BEFORE staging into `put_scratch`.
-        // A non-retry write to a disconnected channel would fail
-        // identically on every replay, so it must not occupy the
-        // scratch (nor return Ok on the deferred path). `retry` links
-        // skip this gate and queue for replay instead — the disconnect
-        // is handled in `flush_scratch`, which restores the staged
-        // value and arms the production drain. This `retry` is the
-        // PER-CALL link's option (combine-PUT siblings carry their own),
-        // and `is_connected()` is the shared channel's connection truth.
-        if !retry && !self.is_connected() {
-            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-        }
-        self.stage_put(
-            field,
-            StagedPut {
-                value,
-                proc,
-                retry,
-                block,
-            },
-        );
-        if defer {
-            // Cached for sibling coalescing; a non-deferred sibling — or
-            // the `flush_puts` production drain — flushes it later.
-            return Ok(());
-        }
-        self.flush_scratch().await.map(|_| ())
+        let staged = StagedPut {
+            value,
+            proc,
+            retry,
+            block,
+        };
+        self.put(Some((field, staged)), retry, defer, false)
+            .await
+            .map(|_| ())
     }
 
-    /// Stage one field's write into the shared scratch, overwriting any
-    /// earlier staged write for the same field (most-recent-wins, pvxs
-    /// single `put_scratch` per link, `pvxs/ioc/pvalink_lset.cpp:645-653`).
-    fn stage_put(&self, field: &str, staged: StagedPut) {
-        self.out_scratch.lock().insert(field.to_string(), staged);
+    /// The channel put every OUT write and forward link takes, as pvxs
+    /// `pvaPutValueX` / `pvaScanForward` under `lchan->lock`. Returns the
+    /// number of upstream PUTs sent (0 or 1).
+    ///
+    /// `if(!self->retry && !self->valid()) return -1` comes first, before
+    /// staging (`pvxs/ioc/pvalink_lset.cpp:609,677`): a non-retry write to a
+    /// down channel occupies nothing. `retry` is the calling link's own
+    /// option; the channel is shared and its `config` is the first opener's.
+    /// A retry put on a down channel is held, and the connect sends it.
+    async fn put(
+        &self,
+        write: Option<(&str, StagedPut)>,
+        retry: bool,
+        defer: bool,
+        force: bool,
+    ) -> PvaLinkResult<usize> {
+        let op = {
+            let mut out = self.channel.outbox.lock();
+            let connected = self.channel.is_up();
+            if !retry && !connected {
+                return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
+            }
+            if let Some((field, staged)) = write {
+                // Most-recent-wins: one `put_scratch` per link.
+                out.staged.insert(field.to_string(), staged);
+            }
+            if defer {
+                return Ok(0);
+            }
+            match out.start(force, connected) {
+                Some(op) => op,
+                None => return Ok(0),
+            }
+        };
+        send_put(&self.client, &self.config.pv_name, &self.channel, op).await
     }
 
     /// Number of distinct fields currently staged on this channel — the
     /// shared `put_scratch` size (0 when nothing is queued).
     pub fn staged_count(&self) -> usize {
-        self.out_scratch.lock().len()
-    }
-
-    /// Flush every staged field into ONE combined upstream PUT. Mirrors
-    /// pvxs `pvaLinkChannel::put` (`pvxs/ioc/pvalink_channel.cpp:220-263`).
-    ///
-    /// Every staged field is assigned into the readback so siblings land
-    /// in one PUT (`linkBuildPut`, `pvxs/ioc/pvalink_channel.cpp:127-184`).
-    /// The process option is resolved across all participating links — PP/CP/CPP
-    /// forces processing over NPP (`pvxs/ioc/pvalink_channel.cpp:257-263`).
-    ///
-    /// On a disconnect, `retry=true` fields are restored to the scratch
-    /// (most-recent-wins) and `retry_pending` is set so the production
-    /// drain replays them on reconnect; `retry=false` fields are
-    /// dropped and surfaced as an error so the owning record alarms.
-    /// Returns the number of upstream PUTs issued (0 or 1).
-    pub async fn flush_scratch(&self) -> PvaLinkResult<usize> {
-        if matches!(self.config.direction, LinkDirection::Inp) {
-            return Err(PvaLinkError::NotWritable);
-        }
-        self.issue_put(false).await
-    }
-
-    /// Single owner of "this channel issues one upstream PUT", the port
-    /// of pvxs `pvaLinkChannel::put(bool force)`
-    /// (`pvxs/ioc/pvalink_channel.cpp:220-280`). `force` is the forward-link
-    /// entry: it makes the PUT happen even with nothing staged and
-    /// pins `record._options.process` to `"true"` (`:258-260`).
-    ///
-    /// No direction gate here — pvxs has none on the channel put, and
-    /// the scratch is the only way a value enters, so `stage_and_flush`
-    /// is where an INP link is refused.
-    async fn issue_put(&self, force: bool) -> PvaLinkResult<usize> {
-        // Snapshot + clear (pvxs moves used_scratch into put_queue).
-        let staged: Vec<(String, StagedPut)> = {
-            let mut scratch = self.out_scratch.lock();
-            if scratch.is_empty() && !force {
-                return Ok(0);
-            }
-            scratch.drain().collect()
-        };
-        // `if((reqProcess&2) || force) proc = "true"` — a forced put outranks even
-        // a staged NPP sibling (`pvxs/ioc/pvalink_channel.cpp:258-260`).
-        let combined_proc = if force {
-            ProcMode::Pp
-        } else {
-            combine_proc(staged.iter().map(|(_, s)| s.proc))
-        };
-        let block = staged.iter().any(|(_, s)| s.block);
-        let req = build_put_request(combined_proc, block);
-
-        // pvxs `build()` put: the `GetOPut` readback is the prototype
-        // (`_doGet`, `src/clientget.cpp:678-692`) and `linkBuildPut` assigns
-        // each staged leaf into it (`pvxs/ioc/pvalink_channel.cpp:127-184`),
-        // so every leaf the readback marked goes back with the staged ones —
-        // on a group target the other members are rewritten too. A forced
-        // put with nothing staged sends the readback untouched.
-        let put_result = match self
-            .client
-            .pvput_begin(&self.config.pv_name, Some(&req), true)
-            .await
-        {
-            Ok(op) => {
-                let intro = op.introspection().clone();
-                let assignments: Vec<(String, PutLeaf)> = staged
-                    .iter()
-                    .map(|(field, sp)| {
-                        let leaf = match &sp.value {
-                            QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
-                            QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
-                        };
-                        (effective_typed_put_path(&intro, field), leaf)
-                    })
-                    .collect();
-                op.commit_fields_onto_present(&assignments).await
-            }
-            Err(e) => Err(e),
-        };
-
-        match put_result {
-            Ok(()) => {
-                self.retry_pending.store(false, Ordering::Release);
-                Ok(1)
-            }
-            Err(e) if is_disconnect(&e) => {
-                if staged.is_empty() {
-                    // A forced put stages nothing, so there is no
-                    // retry-eligible field to requeue and the caller owns
-                    // reporting the disconnect.
-                    return Err(PvaLinkError::Pva(e));
-                }
-                // Requeue retry-eligible fields for replay; drop the
-                // rest. Most-recent-wins: only restore a field a newer
-                // write has not already re-staged.
-                let mut any_retry = false;
-                let mut any_dropped = false;
-                {
-                    let mut scratch = self.out_scratch.lock();
-                    for (field, sp) in staged {
-                        if sp.retry {
-                            scratch.entry(field).or_insert(sp);
-                            any_retry = true;
-                        } else {
-                            any_dropped = true;
-                        }
-                    }
-                }
-                if any_retry {
-                    self.retry_pending.store(true, Ordering::Release);
-                    // Discard the dead channel so the replay re-resolves a
-                    // fresh one. pvxs's channel auto-recovers on reconnect;
-                    // our cached channel does not re-create after a failed
-                    // `create_channel` (a pinned `EPICS_PVA_ADDR_LIST`
-                    // retry link would otherwise NEVER replay — the dead
-                    // channel stays cached forever). `Drop` removes it
-                    // unconditionally so the next `flush_retry_pending`
-                    // opens a new channel against the now-present PV.
-                    self.client
-                        .cache_clear_action(&self.config.pv_name, CacheAction::Drop)
-                        .await;
-                }
-                if any_dropped {
-                    // A non-retry link saw a real disconnect — its
-                    // record must alarm. Retry links stay queued.
-                    Err(PvaLinkError::Pva(e))
-                } else {
-                    Ok(0)
-                }
-            }
-            Err(e) => Err(PvaLinkError::Pva(e)),
-        }
-    }
-
-    /// Replay any retry-queued writes if a prior disconnect left them
-    /// staged — the per-channel half of the `LinkSet::flush_puts`
-    /// production drain. No-op unless `retry_pending` is set, so a
-    /// freshly-`defer`red write awaiting its sibling is never flushed
-    /// early; only a genuinely stuck retry write is replayed. Mirrors
-    /// pvxs replaying the queued put on the client reconnect event
-    /// (`pvalink.rst:99-100`).
-    pub async fn flush_retry_pending(&self) -> PvaLinkResult<usize> {
-        if !self.retry_pending.load(Ordering::Acquire) {
-            return Ok(0);
-        }
-        self.flush_scratch().await
+        self.channel.outbox.lock().staged.len()
     }
 
     /// Fire this link's forward link (FLNK): trigger the remote target to
     /// process, transferring no value. Mirrors pvxs `pvaScanForward`
     /// (`pvxs/ioc/pvalink_lset.cpp:672-688`), which is `lchan->put(true)`
     /// at `:691` — the forced arm of the same channel put every OUT write
-    /// takes, so it goes through `Self::issue_put` here too.
+    /// takes, so it goes through `Self::put` here too.
     ///
     /// It must NOT be a PVA `PROCESS` (cmd 16): pvxs implements no handler
     /// for that command anywhere. `CMD_PROCESS` occurs once in its tree, as
@@ -1117,36 +1036,46 @@ impl PvaLink {
     /// with no trigger sent and no blocking connect attempted. A `retry`
     /// link skips the gate and issues the put anyway: pvxs reaches
     /// `lchan->put(true)`, whose `doit = force` is unconditionally true
-    /// (`pvxs/ioc/pvalink_channel.cpp:226,266`), so the operation is started and the
-    /// client holds it until the channel connects. `retry` is the
+    /// (`pvxs/ioc/pvalink_channel.cpp:226,266`), so the operation is started and
+    /// held until the channel connects. `retry` is the
     /// forwarding link's own option, `self->retry`: this channel is shared by
     /// every link to the PV and its `config` is only the first opener's.
     pub async fn scan_forward(&self, retry: bool) -> PvaLinkResult<()> {
-        if !retry && !self.is_connected() {
-            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
-        }
         // "FWD_LINK is never deferred, and always results in a Put"
         // (`pvxs/ioc/pvalink_lset.cpp:682`).
-        self.issue_put(true).await.map(|_| ())
+        self.put(None, retry, false, true).await.map(|_| ())
     }
 
     /// True when the link currently has a live upstream connection.
     /// Mirrors pvxs `pvaIsConnected` (pvxs/ioc/pvalink_lset.cpp:186).
     ///
-    /// B-pvalink-restart: for INP+monitor links this reads the
+    /// B-pvalink-restart: this reads the
     /// monitor task's live-connection flag — it goes `false` the
     /// moment the upstream subscription ends (IOC restart / transient
     /// I/O) and back `true` once the re-subscribe loop delivers a
-    /// fresh event. Pre-fix this returned `latest.is_some()`, which
+    /// fresh value. Pre-fix this returned `latest.is_some()`, which
     /// stayed `true` forever once any value had been cached, so an
-    /// IOC restart was never reflected. For non-monitor links (which
-    /// never run the monitor task) it falls back to "a value has been
-    /// cached".
+    /// IOC restart was never reflected. A test link built without a
+    /// monitor falls back to "a value has been cached".
     pub fn is_connected(&self) -> bool {
-        match &self.monitor_connected {
-            Some(flag) => flag.load(Ordering::Acquire),
-            None => self.latest.lock().is_some(),
-        }
+        self.channel.is_up()
+    }
+
+    /// pvxs `num_disconnect`: how many times the monitor lost its connection.
+    pub fn num_disconnect(&self) -> usize {
+        self.channel.disconnects.load(Ordering::Relaxed)
+    }
+
+    /// pvxs `num_type_change`: how many times the monitor connected.
+    pub fn num_type_change(&self) -> usize {
+        self.channel.type_changes.load(Ordering::Relaxed)
+    }
+
+    /// pvxs `op_put` set: an upstream put is on the wire, or a `retry` put
+    /// is held for the connection, as pvxs's op waits for it.
+    pub fn put_in_flight(&self) -> bool {
+        self.channel.puts_in_flight.load(Ordering::Relaxed) > 0
+            || self.channel.outbox.lock().held.is_some()
     }
 
     /// pvxs `pvaLink::valid`: connected, and a value has arrived
@@ -1313,7 +1242,7 @@ impl PvaLink {
     /// (`pvxs/ioc/pvalink_channel.cpp:370-373`; the retention is pvxs's own comment
     /// at `:375-376`).
     fn monitor_disconnected_stale(&self) -> bool {
-        self.config.monitor && !self.is_connected() && self.latest.lock().is_some()
+        !self.is_connected() && self.latest.lock().is_some()
     }
 
     /// Severity to fold into the owning record's `LINK_ALARM`, after
@@ -1628,26 +1557,18 @@ impl PvaLink {
         })
     }
 
-    /// Test-only constructor: build a [`PvaLink`] with a pre-seeded
-    /// cached value and no live connection. Lets the unit tests
+    /// Test-only constructor: build a [`PvaLink`] with no monitor, up when
+    /// `cached` stands in for the monitor's first value. Lets the unit tests
     /// exercise the cache-reading accessors (`link_alarm_severity`,
     /// `alarm_message`, `try_read_cached`) and the defer queue
     /// without standing up a PVA server.
     #[cfg(test)]
     pub(crate) fn for_test(config: PvaLinkConfig, cached: Option<PvField>) -> Self {
-        let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
-        Self {
-            _monitor_abort: None,
-            config,
-            client,
-            latest: Arc::new(Mutex::new(cached.map(Arc::new))),
-            monitor_connected: None,
-            notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
-            snaps: Arc::default(),
-            retry_pending: AtomicBool::new(false),
-            scan_overrun: Arc::new(ScanOverrun::default()),
+        let (link, channel) = Self::for_test_with_monitor_flag(config, cached);
+        if link.latest.lock().is_some() {
+            channel.up();
         }
+        link
     }
 
     /// Test-only constructor: build a [`PvaLink`] around a
@@ -1656,7 +1577,7 @@ impl PvaLink {
     /// real `write` / `write_pv_field` wire paths without UDP
     /// discovery.
     ///
-    /// The link is marked CONNECTED (`monitor_connected = Some(true)`):
+    /// The link is marked CONNECTED:
     /// a link built around a live, server-pinned client stands in for
     /// one whose channel monitor has already delivered its first event,
     /// so the OUT-write disconnect gate (`stage_and_flush`) lets non-retry
@@ -1665,23 +1586,15 @@ impl PvaLink {
     /// [`Self::for_test_with_monitor_flag`] with the flag left false.
     #[cfg(test)]
     pub(crate) fn for_test_with_client(config: PvaLinkConfig, client: PvaClient) -> Self {
-        Self {
-            _monitor_abort: None,
-            config,
-            client,
-            latest: Arc::new(Mutex::new(None)),
-            monitor_connected: Some(Arc::new(AtomicBool::new(true))),
-            notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
-            snaps: Arc::default(),
-            retry_pending: AtomicBool::new(false),
-            scan_overrun: Arc::new(ScanOverrun::default()),
-        }
+        let (mut link, channel) = Self::for_test_with_monitor_flag(config, None);
+        link.client = client;
+        channel.up();
+        link
     }
 
     /// Test-only constructor for a link whose live-connection flag is
     /// externally controllable (INP+monitor or OUT). Returns the link
-    /// plus the shared `AtomicBool` so a test can simulate the
+    /// plus the shared [`Connection`] so a test can simulate the
     /// re-subscribe loop's connect / event / disconnect transitions
     /// (B-pvalink-restart) without standing up a PVA server. For an OUT
     /// link, setting the flag `true` stands in for the channel monitor
@@ -1691,19 +1604,17 @@ impl PvaLink {
     pub(crate) fn for_test_with_monitor_flag(
         config: PvaLinkConfig,
         cached: Option<PvField>,
-    ) -> (Self, Arc<AtomicBool>) {
+    ) -> (Self, Arc<Connection>) {
         let client = PvaClient::builder().timeout(Duration::from_secs(1)).build();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(Connection::default());
         let link = Self {
             _monitor_abort: None,
             config,
             client,
             latest: Arc::new(Mutex::new(cached.map(Arc::new))),
-            monitor_connected: Some(flag.clone()),
+            channel: flag.clone(),
             notify_rx: Mutex::new(None),
-            out_scratch: Mutex::new(HashMap::new()),
             snaps: Arc::default(),
-            retry_pending: AtomicBool::new(false),
             scan_overrun: Arc::new(ScanOverrun::default()),
         };
         (link, flag)
@@ -1840,9 +1751,8 @@ fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
     }
 }
 
-/// build the pvRequest for a pvalink monitor channel (INP value monitor
-/// or OUT connection-tracking monitor — pvxs uses the same
-/// `makeRequest()` output for both).
+/// build the pvRequest for a pvalink channel's monitor (pvxs
+/// `makeRequest()`, whichever links attach to the channel).
 ///
 /// pvxs `pvaLink::makeRequest` (`pvxs/ioc/pvalink_link.cpp:49-65`) ALWAYS
 /// emits three fields on every pvalink monitor request:
@@ -2703,7 +2613,7 @@ mod tests {
             inp_cfg(SevrMode::Nms),
             Some(nt_with_alarm(2, Some("was-major"))),
         );
-        flag.store(true, Ordering::Release);
+        flag.up();
         // latch a real snapshot so the disconnect-refusal below is not
         // merely refusing the initial INVALID default.
         assert!(link.try_read_cached_with_field("").is_some());
@@ -2711,7 +2621,7 @@ mod tests {
             .remote_alarm_snapshot("")
             .expect("connected monitor serves the snapshot");
         assert_eq!(snap.severity, 2);
-        flag.store(false, Ordering::Release);
+        flag.down();
         assert!(
             link.remote_alarm_snapshot("").is_none(),
             "disconnected-stale monitor refuses the snapshot (CHECK_VALID)"
@@ -2782,13 +2692,11 @@ mod tests {
         assert!(req.record_options.iter().any(|(k, _)| k == "queueSize"));
     }
 
-    /// An OUT link's connection-tracking monitor must open with the same pvalink
-    /// pvRequest as an INP monitor — pvxs uses one `makeRequest()` output for both
-    /// directions (`pvxs/ioc/pvalink_link.cpp:49-65`,
-    /// `pvxs/ioc/pvalink_channel.cpp` channel open).
-    /// Regression for the OUT path opening a plain option-less
-    /// `pvmonitor` so the server saw no atomic/pipeline/queue
-    /// negotiation on the liveness monitor that gates OUT writes.
+    /// A channel opened by an OUT link monitors with the pvxs `makeRequest()`
+    /// pvRequest (`pvxs/ioc/pvalink_link.cpp:49-65`), as one opened by an
+    /// INP link does. Regression for an OUT-only option-less `pvmonitor`
+    /// that negotiated no atomic/pipeline/queue on the monitor that gates
+    /// OUT writes.
     #[test]
     fn out_connection_monitor_request_matches_pvxs_make_request() {
         let cfg = PvaLinkConfig {
@@ -3265,14 +3173,16 @@ mod tests {
     /// live server. The disconnected case uses [`PvaLink::for_test`].
     fn connected_out(defer: bool, retry: bool) -> PvaLink {
         let (link, flag) = PvaLink::for_test_with_monitor_flag(out_cfg(defer, retry), None);
-        flag.store(true, Ordering::Release);
+        flag.up();
         link
     }
 
     /// Read the single staged value (tests stage exactly one field).
     fn sole_staged(link: &PvaLink) -> Option<QueuedPut> {
-        link.out_scratch
+        link.channel
+            .outbox
             .lock()
+            .staged
             .values()
             .next()
             .map(|s| s.value.clone())
@@ -3329,18 +3239,14 @@ mod tests {
         }
     }
 
+    /// A retry put on a down channel is held, not sent: pvxs's op waits
+    /// for the connection.
     #[tokio::test]
-    async fn b4_retry_queues_on_disconnect() {
-        // retry=true, no server reachable → write should queue rather
-        // than error, and arm the retry-pending flag for the drain.
+    async fn a_retry_put_on_a_down_channel_is_held() {
         let link = PvaLink::for_test(out_cfg(false, true), None);
-        let r = link.write("7").await;
-        assert!(r.is_ok(), "retry write should queue, got {r:?}");
-        assert_eq!(link.staged_count(), 1);
-        assert!(
-            link.retry_pending.load(Ordering::Acquire),
-            "a queued retry write must arm the production drain"
-        );
+        link.write("7").await.expect("a held put is not refused");
+        assert_eq!(link.staged_count(), 0);
+        assert!(link.put_in_flight(), "the held put is pvxs's op_put");
     }
 
     #[tokio::test]
@@ -3355,7 +3261,7 @@ mod tests {
             "non-retry write must surface a disconnect error, got {r:?}"
         );
         assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert!(!link.put_in_flight());
     }
 
     /// BRPVALINK-2 regression: a DEFERRED non-retry write to a
@@ -3384,83 +3290,81 @@ mod tests {
             0,
             "the undeliverable value must NOT occupy the scratch"
         );
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert!(!link.put_in_flight());
     }
 
+    /// A put that fails on a disconnect keeps nothing: pvxs's
+    /// `op_put.reset()` cancels it after `linkBuildPut` took the values
+    /// (`pvxs/ioc/pvalink_channel.cpp:362-370`). Only the non-retry write
+    /// reports it. Connected so the staging gate passes; the failure is the
+    /// real put, with no server behind the test client.
     #[tokio::test]
-    async fn b4_flush_drops_value_when_no_retry() {
-        // defer link, retry=false; staged while connected, then flushed
-        // against no server. The staged value's Put fails on disconnect
-        // → with retry=false it is dropped (it would fail identically on
-        // every replay), leaving the scratch empty and an error for the
-        // record to alarm on. Connected so the staging gate passes; the
-        // failure is the real PUT (no server behind the test client),
-        // i.e. this exercises the flush-time drop, not the stage gate.
-        let link = connected_out(true, false);
+    async fn a_disconnect_drops_a_sent_put() {
+        for retry in [false, true] {
+            let link = connected_out(true, retry);
+            link.write("1").await.unwrap();
+            link.write("2").await.unwrap();
+            assert_eq!(link.staged_count(), 1, "coalesced to the newest");
+            let r = link.put(None, retry, false, false).await;
+            assert_eq!(r.is_err(), !retry, "retry={retry}: {r:?}");
+            assert_eq!(link.staged_count(), 0, "retry={retry}");
+            assert!(!link.put_in_flight(), "retry={retry}");
+        }
+    }
+
+    /// The disconnect drops staged writes too (`pvaLink::onDisconnect`,
+    /// `pvxs/ioc/pvalink_link.cpp:75-81`); a channel never up has no
+    /// disconnect and keeps them.
+    #[tokio::test]
+    async fn a_disconnect_drops_staged_writes() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(true, true), None);
         link.write("1").await.unwrap();
-        link.write("2").await.unwrap();
-        // Coalesced to one staged value ("2").
+        assert!(!channel.down(), "never up: no disconnect");
         assert_eq!(link.staged_count(), 1);
-        let r = link.flush_scratch().await;
-        assert!(r.is_err(), "no-retry disconnect surfaces an error");
+        assert!(channel.up().is_none(), "a deferred write is not a put");
+        assert!(channel.down());
         assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
+        assert_eq!(link.num_disconnect(), 1);
     }
 
+    /// A put while one is held replaces it and carries its writes, the
+    /// newest per field (`linkBuildPut` sends every queued value); the
+    /// connect hands back that one put.
     #[tokio::test]
-    async fn b4_flush_retry_restores_staged() {
-        // defer + retry: flush against no server → the staged value is
-        // restored for a later retry and the drain is armed. A queued
-        // retry is NOT an error (0 PUTs issued, queued), matching the
-        // immediate-write path.
-        let link = PvaLink::for_test(out_cfg(true, true), None);
+    async fn the_connect_releases_one_held_put() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(false, true), None);
+        let other = PvaLinkConfig {
+            field: "b".into(),
+            ..out_cfg(false, true)
+        };
         link.write("1").await.unwrap();
+        link.put_out_str(&other, "9", false).await.unwrap();
         link.write("2").await.unwrap();
-        assert_eq!(link.staged_count(), 1);
-        let r = link.flush_scratch().await;
-        assert!(matches!(r, Ok(0)), "retry disconnect queues, got {r:?}");
-        // retry restores the most-recent staged value ("2").
-        assert_eq!(link.staged_count(), 1);
-        assert!(link.retry_pending.load(Ordering::Acquire));
-        match sole_staged(&link) {
-            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
-            other => panic!("most-recent value must be restored, got {other:?}"),
-        }
+        assert!(link.put_in_flight());
+        let op = channel.up().expect("the held put");
+        assert_eq!(op.fields.len(), 2);
+        assert!(matches!(&op.fields[""].value, QueuedPut::Str(s) if s == "2"));
+        assert!(matches!(&op.fields["b"].value, QueuedPut::Str(s) if s == "9"));
+        assert!(!link.put_in_flight());
+        assert!(channel.up().is_none(), "released once");
     }
 
+    /// A forced put (a retry forward link) is held as one too, and keeps
+    /// its process override.
     #[tokio::test]
-    async fn b4_flush_retry_keeps_newer_write() {
-        // defer + retry: most-recent-PUT wins across a failing flush.
-        let link = PvaLink::for_test(out_cfg(true, true), None);
-        link.write("1").await.unwrap();
-        let r = link.flush_scratch().await;
-        assert!(matches!(r, Ok(0)));
-        // A newer write supersedes the restored "1".
-        link.write("2").await.unwrap();
-        // A second flush restores "2" (not the older "1").
-        let r2 = link.flush_scratch().await;
-        assert!(matches!(r2, Ok(0)));
-        match sole_staged(&link) {
-            Some(QueuedPut::Str(s)) => assert_eq!(s, "2"),
-            other => panic!("newer write must survive, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn b4_flush_on_inp_link_rejected() {
-        let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
-        assert!(matches!(
-            link.flush_scratch().await,
-            Err(PvaLinkError::NotWritable)
-        ));
+    async fn a_held_forward_link_put_keeps_its_force() {
+        let (link, channel) = PvaLink::for_test_with_monitor_flag(out_cfg(false, true), None);
+        link.scan_forward(true).await.unwrap();
+        let op = channel.up().expect("the held forward put");
+        assert!(op.fields.is_empty());
+        assert_eq!(op.proc, ProcMode::Pp);
     }
 
     #[test]
     fn b3_take_notify_rx_only_once() {
-        // INP+monitor link built via for_test has no channel (no live
-        // monitor), so take_notify_rx is None — exercised here for
-        // the OUT / non-monitor branch. The live-channel path is
-        // covered by the integration-side forwarder test.
+        // A link built via for_test has no monitor, so take_notify_rx
+        // is None. The live-channel path is covered by the
+        // integration-side forwarder test.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Nms), None);
         assert!(link.take_notify_rx().is_none());
     }
@@ -3487,12 +3391,12 @@ mod tests {
         );
 
         // Monitor delivers an event → flag flips true.
-        flag.store(true, Ordering::Release);
+        flag.up();
         assert!(link.is_connected(), "live subscription reports connected");
 
         // Upstream subscription ends (IOC restart) → flag false, even
         // though `latest` still holds the stale cached value.
-        flag.store(false, Ordering::Release);
+        flag.down();
         assert!(
             link.latest_value().is_some(),
             "stale value is still cached after disconnect"
@@ -3503,7 +3407,7 @@ mod tests {
         );
 
         // Re-subscribe loop delivers a fresh event → connected again.
-        flag.store(true, Ordering::Release);
+        flag.up();
         assert!(link.is_connected(), "re-subscribe restores connected");
     }
 
@@ -3524,8 +3428,8 @@ mod tests {
             Some(nt_with_alarm(0, None)),
         );
         // Connected once, then dropped.
-        flag.store(true, Ordering::Release);
-        flag.store(false, Ordering::Release);
+        flag.up();
+        flag.down();
 
         // Value reads refuse the stale cache.
         assert!(
@@ -3567,7 +3471,7 @@ mod tests {
             inp_cfg(SevrMode::Ms),
             Some(nt_with_alarm(2, Some("hot"))),
         );
-        flag.store(true, Ordering::Release);
+        flag.up();
 
         assert!(link.read().await.is_ok(), "live monitor read succeeds");
         assert!(
@@ -3642,7 +3546,7 @@ mod tests {
 
         // Connected: both getters serve the cached metadata/timestamp
         // (the FR-13 gate is inert while connected).
-        flag.store(true, Ordering::Release);
+        flag.up();
         link.try_read_cached_with_field("");
         assert_eq!(
             link.time_stamp(""),
@@ -3657,7 +3561,7 @@ mod tests {
 
         // Disconnected: both getters refuse the stale snapshot through
         // CHECK_VALID.
-        flag.store(false, Ordering::Release);
+        flag.down();
         assert!(
             link.time_stamp("").is_none(),
             "disconnected monitor must not serve the stale latched timestamp"
@@ -3715,13 +3619,13 @@ mod tests {
         );
 
         // Connected: the full remote timestamp+tag.
-        flag.store(true, Ordering::Release);
+        flag.up();
         link.try_read_cached_with_field("");
         assert_eq!(link.time_stamp(""), Some((1_700_000_000, 42, 0x55)));
 
         // Disconnected with a recorded drop time: adopt the drop time
         // (seconds/nanos), but keep the last value's userTag 0x55.
-        flag.store(false, Ordering::Release);
+        flag.down();
         link.record_disconnect_time_for_test(1_800_000_500, 7);
         assert_eq!(
             link.snap_stamp(""),
@@ -3762,7 +3666,7 @@ mod tests {
                 inp_cfg(SevrMode::Nms),
                 Some(PvField::Structure(root)),
             );
-            flag.store(true, Ordering::Release);
+            flag.up();
             link.try_read_cached_with_field("");
             link.time_stamp("").map(|(_, _, utag)| utag)
         };
@@ -3799,8 +3703,7 @@ mod tests {
         );
     }
 
-    /// BUG 2: a live INP+monitor link spawns the re-subscribe loop and
-    /// installs the `monitor_connected` flag. Before the first event
+    /// BUG 2: a live INP+monitor link spawns the re-subscribe loop. Before the first event
     /// the link reports disconnected (no liveness proven yet); the
     /// monitor task is present so a later disconnect is observable.
     #[tokio::test]
@@ -3819,10 +3722,6 @@ mod tests {
         )
         .await
         .expect("open INP monitor link");
-        assert!(
-            link.monitor_connected.is_some(),
-            "INP+monitor link must install the live-connection flag"
-        );
         assert!(
             !link.is_connected(),
             "no event delivered yet → not connected"
@@ -4162,7 +4061,7 @@ mod tests {
         // Connected so the disconnect gate lets the deferred write
         // stage (we're checking the defer path enqueues, not the gate).
         let (link, flag) = PvaLink::for_test_with_monitor_flag(cfg, None);
-        flag.store(true, Ordering::Release);
+        flag.up();
         // Deferred write queues without hitting the network.
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -4507,8 +4406,7 @@ mod tests {
 
     #[cfg(tokio_backend)]
     /// BRIDGE-RS defer drain: two `defer=true` writes to different fields
-    /// are held until an explicit drain (the `LinkSet::flush_puts`
-    /// production path / `flush_scratch`), then sent as ONE combined PUT
+    /// stay staged until a non-deferred put, then go as ONE combined PUT
     /// (pvxs `documentation/pvalink.rst:111-113`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn deferred_fields_drain_in_one_put() {
@@ -4557,8 +4455,11 @@ mod tests {
         assert_eq!(struct_double(&pre, "value"), 0.0, "nothing sent yet");
         assert_eq!(struct_double(&pre, "setpoint"), 0.0, "nothing sent yet");
 
-        // Explicit drain → one combined PUT carrying both fields.
-        let n = link.flush_scratch().await.expect("drain succeeds");
+        // A non-deferred put → one combined PUT carrying both fields.
+        let n = link
+            .put(None, false, false, false)
+            .await
+            .expect("drain succeeds");
         assert_eq!(n, 1, "two deferred fields drain as ONE upstream PUT");
         assert_eq!(link.staged_count(), 0);
 
@@ -4569,43 +4470,207 @@ mod tests {
     }
 
     #[cfg(tokio_backend)]
-    /// BRIDGE-RS retry replay: a `retry=true` write issued while the
-    /// target channel does not exist is queued (not errored), and the
-    /// `flush_puts` production drain (`flush_retry_pending`) replays it
-    /// automatically once the PV appears (pvxs `pvalink.rst:99-100`).
+    /// pvxs `linkPutDone` restarts the channel's put when one succeeds
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`), so a deferred write staged
+    /// while a put is in flight goes out as that put completes, with no
+    /// further write (softIocPVX: `PUT 2` 2.00 s after a 2 s `PUT 1`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_replays_after_target_pv_appears() {
+    async fn a_deferred_write_goes_out_when_the_put_ahead_of_it_completes() {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::new();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(Some(gate));
+        pv.on_put({
+            let seen = seen.clone();
+            move |_, v| {
+                seen.lock().unwrap().push(struct_double(&v, "value"));
+                // The first put stays in flight until the gate opens, its
+                // worker handed off so the runtime's timers still run.
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    let _ = tokio::task::block_in_place(|| gate.recv());
+                }
+                Ok(())
+            }
+        });
+        let source = SharedSource::new();
+        source.add("SLOW:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(3))
+            .build();
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred = PvaLinkConfig {
+            defer: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let wait_for = |n: usize| {
+            let seen = seen.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while seen.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        wait_for(1).await;
+        link.put_out_str(&deferred, "2", false).await.unwrap();
+        assert_eq!(link.staged_count(), 1, "the deferred write is staged");
+        open_gate.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        wait_for(2).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [1.0, 2.0],
+            "the deferred write goes out when the put ahead of it completes"
+        );
+        assert_eq!(link.staged_count(), 0);
+    }
+
+    /// `SLOW:PV` on an isolated server whose first put stays in flight until
+    /// the returned gate opens, then succeeds or (`refuse_first`) is refused.
+    #[cfg(tokio_backend)]
+    fn gated_put_server(
+        refuse_first: bool,
+    ) -> (
+        epics_pva_rs::server_native::PvaServer,
+        PvaClient,
+        Arc<std::sync::Mutex<Vec<f64>>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::new();
+        pv.open(double_struct_desc(), double_struct_initial())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(Some(gate));
+        pv.on_put({
+            let seen = seen.clone();
+            move |_, v| {
+                seen.lock().unwrap().push(struct_double(&v, "value"));
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    let _ = tokio::task::block_in_place(|| gate.recv());
+                    if refuse_first {
+                        return Err("refused".into());
+                    }
+                }
+                Ok(())
+            }
+        });
+        let source = SharedSource::new();
+        source.add("SLOW:PV", pv);
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(3))
+            .build();
+        (server, client, seen, open_gate)
+    }
+
+    #[cfg(tokio_backend)]
+    /// pvxs `linkPutDone` restarts the put only when one succeeds
+    /// (`pvxs/ioc/pvalink_channel.cpp:205-208`): a deferred write staged
+    /// behind a refused put stays staged (softIocPVX: no `PUT 2`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deferred_write_stays_staged_when_the_put_ahead_of_it_fails() {
+        let (_server, client, seen, open_gate) = gated_put_server(true);
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred = PvaLinkConfig {
+            defer: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        link.put_out_str(&deferred, "2", false).await.unwrap();
+        open_gate.send(()).unwrap();
+        assert!(first.await.unwrap().is_err(), "the server refuses put 1");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), [1.0]);
+        assert_eq!(link.staged_count(), 1, "the deferred write waits");
+    }
+
+    #[cfg(tokio_backend)]
+    /// A put that succeeds after its channel went down restarts into a held
+    /// put, as pvxs's restarted op waits for the channel, and the connect
+    /// sends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_put_restarted_while_down_is_held_for_the_connect() {
+        let (_server, client, seen, open_gate) = gated_put_server(false);
+        let out = PvaLinkConfig::defaults_for("SLOW:PV", LinkDirection::Out);
+        let deferred_retry = PvaLinkConfig {
+            defer: true,
+            retry: true,
+            ..out.clone()
+        };
+        let link = Arc::new(PvaLink::for_test_with_client(out.clone(), client));
+        let first = tokio::spawn({
+            let link = link.clone();
+            async move { link.put_out_str(&out, "1", false).await }
+        });
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(link.channel.down());
+        link.put_out_str(&deferred_retry, "2", false).await.unwrap();
+        open_gate.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), [1.0], "nothing goes out while down");
+        assert_eq!(link.staged_count(), 0);
+        let held = link
+            .channel
+            .up()
+            .expect("the connect releases the restarted put");
+        send_put(&link.client, "SLOW:PV", &link.channel, held)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), [1.0, 2.0]);
+    }
+
+    #[cfg(tokio_backend)]
+    /// BRIDGE-RS retry replay: a `retry=true` write issued while the
+    /// target channel does not exist is held, and goes out when the
+    /// channel's monitor connects, with no further write (pvxs's op waits
+    /// for the connection, `pvalink.rst:99-100`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_retry_put_goes_out_on_connect() {
         use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-        #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::{SharedPV, SharedSource};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 
         // Server is up the whole time; the channel is absent at first.
         let source = Arc::new(SharedSource::new());
         let server = PvaServer::isolated(source.clone()).expect("test PVA server must start");
-        let addr = server.tcp_addr();
-
         let client = PvaClient::builder()
-            .server_addr(addr)
+            .server_addr(server.tcp_addr())
             .timeout(Duration::from_secs(2))
             .build();
         let cfg = PvaLinkConfig {
             retry: true,
             ..PvaLinkConfig::defaults_for("RETRY:PV", LinkDirection::Out)
         };
-        let link = PvaLink::for_test_with_client(cfg, client);
+        let link = PvaLink::open(cfg, client).await.expect("open");
 
-        // Channel does not exist yet → disconnect → queued, not errored.
-        link.write("42")
-            .await
-            .expect("retry write queues, not errors");
-        assert_eq!(link.staged_count(), 1, "value queued for retry");
-        assert!(
-            link.retry_pending.load(Ordering::Acquire),
-            "queued retry arms the production drain"
-        );
+        link.write("42").await.expect("a held put is not refused");
+        assert!(link.put_in_flight(), "held for the connection");
 
-        // The target PV appears.
         let pv = SharedPV::build_mailbox();
         pv.open(
             FieldDesc::Scalar(ScalarType::Double),
@@ -4614,17 +4679,60 @@ mod tests {
         .unwrap();
         source.add("RETRY:PV", pv.clone());
 
-        // Production drain replays the queued write now that it resolves.
-        let n = link.flush_retry_pending().await.expect("replay");
-        assert_eq!(n, 1, "the queued retry write replays as one PUT");
-        assert_eq!(link.staged_count(), 0);
-        assert!(!link.retry_pending.load(Ordering::Acquire));
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        match pv.current().expect("PV value") {
-            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 42.0),
-            other => panic!("expected Double 42, got {other:?}"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while pv.current() != Some(PvField::Scalar(ScalarValue::Double(42.0))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held put never went out: {:?}",
+                pv.current()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(link.is_connected());
+    }
+
+    #[cfg(tokio_backend)]
+    /// pvxs masks the monitor's `Connected` (`pvalink_channel.cpp:110-112`):
+    /// a channel to a PV with no value yet is not connected, and the first
+    /// value connects it and counts one type change (`:342-353`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_value_connects_the_channel() {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let source = Arc::new(SharedSource::new());
+        let pv = SharedPV::new();
+        source.add("TYPE:PV", pv.clone());
+        let server = PvaServer::isolated(source).expect("test PVA server must start");
+        let client = PvaClient::builder()
+            .server_addr(server.tcp_addr())
+            .timeout(Duration::from_secs(2))
+            .build();
+        let cfg = PvaLinkConfig::defaults_for("TYPE:PV", LinkDirection::Inp);
+        let link = PvaLink::open(cfg, client.clone()).await.expect("open");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while client.report().channels_active == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!link.is_connected(), "a circuit is not a value");
+        assert_eq!(link.num_type_change(), 0);
+
+        pv.open(
+            FieldDesc::Scalar(ScalarType::Double),
+            PvField::Scalar(ScalarValue::Double(1.0)),
+        )
+        .unwrap();
+        while !link.is_connected() {
+            assert!(std::time::Instant::now() < deadline, "the value never came");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(link.num_type_change(), 1);
     }
 
     /// softIocPVX writes an unmarked `value` as its type default, so a

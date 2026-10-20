@@ -183,14 +183,13 @@ pub struct PvaLinkConfig {
     /// INP+monitor only.
     pub pipeline: bool,
     /// Defer the actual Put: when true a `write` only stages the value
-    /// on the shared OUT channel and a non-deferred sibling — or the
-    /// `LinkSet::flush_puts` production drain — flushes it, so several
-    /// fields combine into one PUT. Mirrors pvxs `pvaLinkConfig::defer`.
+    /// on the shared OUT channel and a non-deferred sibling flushes it,
+    /// so several fields combine into one PUT. Mirrors pvxs `pvaLinkConfig::defer`.
     /// OUT only.
     pub defer: bool,
-    /// Retry queued Puts across disconnects: when true a `write` issued
-    /// while the upstream is unreachable is queued and replayed once
-    /// the link reconnects. Mirrors pvxs `pvaLinkConfig::retry`.
+    /// When true a `write` issued while the channel is down is held and
+    /// sent once it connects; a disconnect still cancels a put already
+    /// sent. Mirrors pvxs `pvaLinkConfig::retry`.
     /// Without it, a Put on a disconnected link fails immediately.
     /// OUT only.
     pub retry: bool,

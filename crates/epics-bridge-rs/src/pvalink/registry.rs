@@ -1,4 +1,4 @@
-//! Process-wide registry of open [`PvaLink`]s, keyed by PV name + direction.
+//! Process-wide registry of open [`PvaLink`]s, keyed by PV name + pvRequest.
 //!
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
@@ -8,7 +8,7 @@
 // §4.2, stage 3.)
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use epics_pva_rs::client::PvaClient;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use super::config::{LinkDirection, ProcMode, PvaLinkConfig, SevrMode};
+use super::config::PvaLinkConfig;
 use super::link::{PvaLink, PvaLinkResult};
 
 mod opener;
@@ -36,12 +36,13 @@ const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Registry cache key.
 ///
-/// All four members — `(pv_name, pipeline, queue_size, direction)` —
-/// mirror pvxs's `channels_key_t = (channelName, pvRequest)` where
-/// pvRequest encodes `pipeline` and `queueSize`
-/// (`pvxs/ioc/pvalink_lset.cpp:99-100`, `pvxs/ioc/pvalink.h:116`). The
-/// key deliberately does NOT include the per-link OUT options
-/// (`field`, `process`, `defer`, `retry`): pvxs caches one shared
+/// `(pv_name, pipeline, queue_size)` is pvxs's `channels_key_t =
+/// (channelName, pvRequest)`, the pvRequest encoding `pipeline` and
+/// `queueSize` (`pvxs/ioc/pvalink_lset.cpp:99-100`, `pvxs/ioc/pvalink.h:116`).
+/// No direction: pvxs opens the same channel for an input and an output
+/// link, so they share its monitor, its put and its counters. The key
+/// deliberately does NOT include the per-link options (`field`,
+/// `process`, `defer`, `retry`): pvxs caches one shared
 /// `pvaLinkChannel` per `(channelName, pvRequest)` and keeps the
 /// per-link `field`/`proc`/`defer`/`retry` on the child `pvaLink`
 /// objects, not in the channel key (`pvxs/ioc/pvalink_lset.cpp:99-131`,
@@ -55,28 +56,28 @@ const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`pvxs/ioc/pvalink_channel.cpp:220-263`). The per-link options
 /// travel with each write via [`PvaLink::put_out_str`] /
 /// [`PvaLink::put_out_field`] rather than being baked into the channel
-/// identity (see `link.rs`'s `out_scratch`).
+/// identity (see `link.rs`'s `Outbox`).
 ///
 /// INP per-link `field` / `sevr` / `time` divergence is likewise
 /// handled at the getter level (see `integration.rs`), so INP links
 /// that differ only in those collapse onto one monitor subscription.
-type RegistryKey = (String, bool, usize, LinkDirection);
+type RegistryKey = (String, bool, usize);
 
 /// A `RegistryKey` a lookup can borrow, so the lset's per-cycle lookups
 /// build no `String`. Hashes as the owned tuple does: a `String` hashes
 /// as its `str`, and a tuple hashes field by field.
 trait KeyView {
-    fn view(&self) -> (&str, bool, usize, LinkDirection);
+    fn view(&self) -> (&str, bool, usize);
 }
 
 impl KeyView for RegistryKey {
-    fn view(&self) -> (&str, bool, usize, LinkDirection) {
-        (&self.0, self.1, self.2, self.3)
+    fn view(&self) -> (&str, bool, usize) {
+        (&self.0, self.1, self.2)
     }
 }
 
-impl KeyView for (&str, bool, usize, LinkDirection) {
-    fn view(&self) -> (&str, bool, usize, LinkDirection) {
+impl KeyView for (&str, bool, usize) {
+    fn view(&self) -> (&str, bool, usize) {
         *self
     }
 }
@@ -101,42 +102,34 @@ impl Hash for dyn KeyView + '_ {
     }
 }
 
-/// One row of pvalink channel diagnostics — the per-channel state the
-/// `dbpvar` IOC shell command prints. Mirrors the fields pvxs `dbpvxr`
-/// dumps per channel (`pvxs/ioc/pvalink.cpp:243-303`): the connection
-/// state plus the link's `proc`/`sevr` mode and its
-/// queue/pipeline/defer/time/retry/monorder configuration.
-///
-/// NOTE the pvxs `num_disconnect` / `num_type_change` counters and the
-/// active-`Put` marker are not represented: the Rust [`PvaLink`] does
-/// not instrument those transitions, so they are intentionally absent
-/// rather than reported as a fabricated zero.
+/// One link on a channel: a record field's `pvaLink` on
+/// `pvaLinkChannel::links` (`pvxs/ioc/pvalink.h:175-179`), with the
+/// options it was opened with.
+#[derive(Debug, Clone)]
+pub struct ChannelLink {
+    pub record: RecordName,
+    pub field: Box<str>,
+    pub config: Arc<PvaLinkConfig>,
+}
+
+/// One channel as pvxs `dbpvxr` prints it (`pvxs/ioc/pvalink.cpp:243-303`).
 #[derive(Debug, Clone)]
 pub struct ChannelDiag {
     pub pv_name: String,
-    pub direction: LinkDirection,
     pub connected: bool,
     pub pipeline: bool,
     pub queue_size: usize,
-    pub proc: ProcMode,
-    pub sevr: SevrMode,
-    pub field: String,
-    pub defer: bool,
-    pub time: bool,
-    pub retry: bool,
-    pub monorder: i32,
-    /// Sorted set of record names whose links attached to this channel.
-    /// pvxs's `pvaLinkChannel` keeps a `links` list of `pvaLink*`, each
-    /// with `plink->precord->name`; the registry folds field/sevr-only
-    /// variants onto one channel entry, so this is the de-duplicated set
-    /// of owning records. Backs `dbpvar`'s record-name glob filter
-    /// (`pvxs/ioc/pvalink.cpp:216-231`). Empty for channels opened
-    /// manually (e.g. `pvxr`) with no owning record.
-    pub records: Vec<RecordName>,
+    pub num_disconnect: usize,
+    pub num_type_change: usize,
+    /// pvxs `op_put` is set.
+    pub put: bool,
+    /// In pvxs `LinkSort` order: `monorder`, then attach order. Empty for
+    /// a channel opened with no record (`pvxr`).
+    pub links: Vec<ChannelLink>,
 }
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
-/// `(pv_name, pipeline, queue_size, direction)` tuples.
+/// `(pv_name, pipeline, queue_size)` tuples.
 pub struct PvaLinkRegistry {
     /// The ONE [`PvaClient`] every link opened through this registry
     /// runs on — the single owner pvxs calls
@@ -162,25 +155,15 @@ pub struct PvaLinkRegistry {
     /// This map carries an `Arc<Notify>` per in-flight open; the
     /// second caller awaits and then reads the cached entry.
     pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
-    /// Channel → owning record-name back-index. Mirrors pvxs's
-    /// `pvaLinkChannel::links` (a list of `pvaLink*` each with
-    /// `plink->precord->name`): the records whose links attached to each
-    /// cached channel, each with its count of attached links. Populated
-    /// via [`Self::attach_record`], drained by [`Self::detach_record`];
-    /// backs the `dbpvar` record-name glob filter
-    /// (`pvxs/ioc/pvalink.cpp:216-231`).
-    channel_records: RwLock<HashMap<RegistryKey, BTreeMap<RecordName, usize>>>,
+    /// pvxs `pvaLinkChannel::links` of each channel, in attach order.
+    /// [`Self::attach_link`] adds, [`Self::detach_link`] removes.
+    channel_links: RwLock<HashMap<RegistryKey, Vec<ChannelLink>>>,
 }
 
 /// Build the `RegistryKey` for a config — the shared
 /// `(channelName, pvRequest)` identity pvxs caches by.
 fn key_of(config: &PvaLinkConfig) -> RegistryKey {
-    (
-        config.pv_name.clone(),
-        config.pipeline,
-        config.queue_size,
-        config.direction,
-    )
+    (config.pv_name.clone(), config.pipeline, config.queue_size)
 }
 
 impl Default for PvaLinkRegistry {
@@ -206,7 +189,7 @@ impl PvaLinkRegistry {
             client,
             map: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
-            channel_records: RwLock::new(HashMap::new()),
+            channel_links: RwLock::new(HashMap::new()),
         }
     }
 
@@ -218,42 +201,38 @@ impl PvaLinkRegistry {
         &self.client
     }
 
-    /// Record that `record`'s link attached to the channel identified by
-    /// `config`. The channel may not be open yet (or may be shared by
-    /// several records); the back-index keys by the same
-    /// `(channelName, pvRequest)` identity the registry caches by, so a
-    /// fold of field/sevr-only variants still accumulates every owning
-    /// record. Mirrors pvxs appending a `pvaLink` to
-    /// `pvaLinkChannel::links` (`pvxs/ioc/pvalink_channel.cpp` link attach).
-    pub fn attach_record(&self, config: &PvaLinkConfig, record: &[u8]) {
-        *self
-            .channel_records
+    /// `record.field`'s link joins the channel `config` names, which may not
+    /// be open yet: pvxs's `pvaLink` entering `pvaLinkChannel::links`.
+    pub fn attach_link(&self, config: &Arc<PvaLinkConfig>, record: &RecordName, field: &str) {
+        self.channel_links
             .write()
             .entry(key_of(config))
             .or_default()
-            .entry(RecordName::from(record))
-            .or_default() += 1;
+            .push(ChannelLink {
+                record: record.clone(),
+                field: field.into(),
+                config: config.clone(),
+            });
     }
 
-    /// Undo one [`Self::attach_record`]: pvxs `~pvaLink` erasing itself
-    /// from `pvaLinkChannel::links` (`pvxs/ioc/pvalink_link.cpp:27-35`). The
-    /// last record leaving closes the channel, as `~pvaLinkChannel` erases
+    /// Undo [`Self::attach_link`]: pvxs `~pvaLink` erasing itself from
+    /// `pvaLinkChannel::links` (`pvxs/ioc/pvalink_link.cpp:27-35`). The
+    /// last link leaving closes the channel, as `~pvaLinkChannel` erases
     /// it from `linkGlobal->channels` (`pvxs/ioc/pvalink_channel.cpp:95-99`);
     /// `true` then.
-    pub fn detach_record(&self, config: &PvaLinkConfig, record: &[u8]) -> bool {
-        let mut channels = self.channel_records.write();
+    pub fn detach_link(&self, config: &PvaLinkConfig, record: &RecordName, field: &str) -> bool {
+        let mut channels = self.channel_links.write();
         let key = key_of(config);
-        let Some(records) = channels.get_mut(&key) else {
+        let Some(links) = channels.get_mut(&key) else {
             return false;
         };
-        let record = RecordName::from(record);
-        if let Some(n) = records.get_mut(&record) {
-            *n -= 1;
-            if *n == 0 {
-                records.remove(&record);
-            }
+        if let Some(at) = links
+            .iter()
+            .position(|l| l.record == *record && *l.field == *field)
+        {
+            links.remove(at);
         }
-        if !records.is_empty() {
+        if !links.is_empty() {
             return false;
         }
         channels.remove(&key);
@@ -264,52 +243,25 @@ impl PvaLinkRegistry {
     /// Exact lookup for the full config's `RegistryKey`. Returns
     /// `None` when no link with that exact key has been opened.
     pub fn try_get(&self, config: &PvaLinkConfig) -> Option<Arc<PvaLink>> {
-        self.lookup((
-            &config.pv_name,
-            config.pipeline,
-            config.queue_size,
-            config.direction,
-        ))
+        self.try_get_channel(&config.pv_name, config.pipeline, config.queue_size)
     }
 
-    /// Exact INP lookup by monitor-variant identity `(pv_name,
-    /// pipeline, queue_size)`. Returns the cached INP link for that
-    /// exact variant, or `None`.
-    ///
-    /// The monitor variant is fully described by these three fields —
-    /// matching pvxs's `channels_key_t = (channelName, pvRequest)` where
-    /// the pvRequest encodes `pipeline` / `queueSize`
+    /// Exact lookup by channel identity `(pv_name, pipeline,
+    /// queue_size)`, pvxs's `channels_key_t = (channelName, pvRequest)`
     /// (`pvxs/ioc/pvalink.h:116-120`). Resolver hot paths use this
     /// instead of a bare-PV-name match so a `Q=1` record reads from its
     /// own monitor, never from a `Q=64` sibling that merely shares the
     /// upstream PV name.
-    pub fn try_get_inp(
+    pub fn try_get_channel(
         &self,
         pv_name: &str,
         pipeline: bool,
         queue_size: usize,
     ) -> Option<Arc<PvaLink>> {
-        self.lookup((pv_name, pipeline, queue_size, LinkDirection::Inp))
+        self.lookup((pv_name, pipeline, queue_size))
     }
 
-    /// Exact OUT lookup — the write-direction twin of [`Self::try_get_inp`].
-    ///
-    /// The registry keys on direction, so an OUT link's shared channel owner
-    /// is a *different* entry from the INP one for the same PV. A caller
-    /// asking "is the write path up?" must therefore look here: the INP
-    /// lookup answers `None` for a perfectly healthy OUT-only channel.
-    /// An OUT channel tracks its connection through its own liveness monitor
-    /// (`PvaLink::open`'s OUT arm), which is what `is_connected()` reads.
-    pub fn try_get_out(
-        &self,
-        pv_name: &str,
-        pipeline: bool,
-        queue_size: usize,
-    ) -> Option<Arc<PvaLink>> {
-        self.lookup((pv_name, pipeline, queue_size, LinkDirection::Out))
-    }
-
-    fn lookup(&self, key: (&str, bool, usize, LinkDirection)) -> Option<Arc<PvaLink>> {
+    fn lookup(&self, key: (&str, bool, usize)) -> Option<Arc<PvaLink>> {
         self.map.read().get(&key as &dyn KeyView).cloned()
     }
 
@@ -319,12 +271,7 @@ impl PvaLinkRegistry {
     /// the second caller awaits via `pending` and reads the
     /// winner's cached entry.
     async fn get_or_open(&self, config: PvaLinkConfig) -> PvaLinkResult<Arc<PvaLink>> {
-        let key: RegistryKey = (
-            config.pv_name.clone(),
-            config.pipeline,
-            config.queue_size,
-            config.direction,
-        );
+        let key = key_of(&config);
 
         // Fast path: already cached.
         if let Some(existing) = self.map.read().get(&key).cloned() {
@@ -441,7 +388,7 @@ impl PvaLinkRegistry {
     pub fn close_all(&self) {
         self.map.write().clear();
         self.pending.write().clear();
-        self.channel_records.write().clear();
+        self.channel_links.write().clear();
     }
 
     /// Test-only: insert a pre-built [`PvaLink`] under its config's
@@ -451,13 +398,7 @@ impl PvaLinkRegistry {
     /// a known cache state.
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, config: &PvaLinkConfig, link: Arc<PvaLink>) {
-        let key: RegistryKey = (
-            config.pv_name.clone(),
-            config.pipeline,
-            config.queue_size,
-            config.direction,
-        );
-        self.map.write().insert(key, link);
+        self.map.write().insert(key_of(config), link);
     }
 
     pub fn len(&self) -> usize {
@@ -468,106 +409,63 @@ impl PvaLinkRegistry {
         self.len() == 0
     }
 
-    /// Distinct monitor-variant identities `(pv_name, pipeline,
-    /// queue_size)` of every opened INP link, sorted for a stable order.
+    /// The identities `(pv_name, pipeline, queue_size)` of every open
+    /// channel, sorted for a stable order.
     ///
     /// Backs [`epics_base_rs::server::database::LinkSet::link_names`] (the `LinkSet` enumeration
     /// contract): each identity round-trips to an `is_connected(name)`
-    /// query that lands on that variant's own monitor. Only INP links
-    /// carry a monitor connection signal — OUT links install no monitor —
-    /// so OUT keys are excluded here. (This enumeration is not consumed by
-    /// the iocInit wait: that is CA-facility only and pvalink never blocks
-    /// init — pvxs parity.)
+    /// query that lands on that channel's own monitor. (This enumeration is
+    /// not consumed by the iocInit wait: that is CA-facility only and
+    /// pvalink never blocks init — pvxs parity.)
     ///
-    /// Two INP links to the same upstream PV with different `pipeline` /
-    /// `queue_size` are DISTINCT monitor variants (distinct subscriptions
-    /// in pvxs, `pvxs/ioc/pvalink.h:116-120`), so each is reported
-    /// separately: a per-variant `is_connected` must land on that
-    /// variant's own monitor, not just the first to share the PV name.
-    /// Links that share the exact `(pv_name, pipeline, queue_size)`
-    /// variant (differing only in `field` / `sevr`, which the registry
-    /// folds onto one entry) collapse to a single identity, matching the
-    /// one shared subscription that actually backs them.
-    pub fn inp_identities(&self) -> Vec<(String, bool, usize)> {
-        let mut ids: Vec<(String, bool, usize)> = self
-            .map
-            .read()
-            .keys()
-            .filter(|(_, _, _, dir)| *dir == LinkDirection::Inp)
-            .map(|(name, pipeline, qsize, _)| (name.clone(), *pipeline, *qsize))
-            .collect();
+    /// Two links to the same upstream PV with different `pipeline` /
+    /// `queue_size` are DISTINCT channels (distinct subscriptions in pvxs,
+    /// `pvxs/ioc/pvalink.h:116-120`), so each is reported separately.
+    pub fn identities(&self) -> Vec<(String, bool, usize)> {
+        let mut ids: Vec<(String, bool, usize)> = self.map.read().keys().cloned().collect();
         ids.sort();
-        ids.dedup();
         ids
     }
 
-    /// Every cached OUT-direction [`PvaLink`] — the shared channel
-    /// owners that may hold staged or retry-queued writes. Backs the
-    /// `LinkSet::flush_puts` production drain: the resolver re-attempts
-    /// any channel holding a retry-queued write after a reconnect.
-    pub fn out_links(&self) -> Vec<Arc<PvaLink>> {
-        self.map
-            .read()
-            .iter()
-            .filter(|((_, _, _, dir), _)| *dir == LinkDirection::Out)
-            .map(|(_, link)| link.clone())
-            .collect()
-    }
-
-    /// Per-channel diagnostics snapshot for every cached link, sorted by
-    /// `(pv_name, direction)` for stable output. Backs the `dbpvar` IOC
-    /// shell command, the Rust counterpart of pvxs `dbpvxr`
+    /// Per-channel diagnostics snapshot for every open channel. Backs the
+    /// `dbpvar` IOC shell command, the Rust counterpart of pvxs `dbpvxr`
     /// (`pvxs/ioc/pvalink.cpp:184-316`), which iterates
-    /// `linkGlobal->channels`. Each cached registry entry is one channel
-    /// (the registry already folds links that differ only in
-    /// `field`/`sevr` onto one entry, matching pvxs's one-subscription
-    /// fold).
+    /// `linkGlobal->channels` in its `std::map` order: by name, then by
+    /// the formatted pvRequest, whose `pipeline` precedes its decimal
+    /// `queueSize` (`pvxs/ioc/pvalink_link.cpp:49-66`).
     pub fn channel_diagnostics(&self) -> Vec<ChannelDiag> {
-        fn dir_rank(d: LinkDirection) -> u8 {
-            match d {
-                LinkDirection::Inp => 0,
-                LinkDirection::Out => 1,
-            }
-        }
-        let records = self.channel_records.read();
-        let mut rows: Vec<ChannelDiag> = self
+        let links = self.channel_links.read();
+        let mut rows: Vec<(String, ChannelDiag)> = self
             .map
             .read()
             .iter()
             .map(|(key, link)| {
-                let (pv, pipeline, qsize, dir) = key;
-                let c = link.config();
-                ChannelDiag {
+                let (pv, pipeline, qsize) = key;
+                let mut links = links.get(key).cloned().unwrap_or_default();
+                links.sort_by_key(|l| l.config.monorder);
+                let diag = ChannelDiag {
                     pv_name: pv.clone(),
-                    direction: *dir,
                     connected: link.is_connected(),
                     pipeline: *pipeline,
                     queue_size: *qsize,
-                    proc: c.proc,
-                    sevr: c.sevr,
-                    field: c.field.clone(),
-                    defer: c.defer,
-                    time: c.time,
-                    retry: c.retry,
-                    monorder: c.monorder,
-                    records: records
-                        .get(key)
-                        .map(|s| s.keys().cloned().collect())
-                        .unwrap_or_default(),
-                }
+                    num_disconnect: link.num_disconnect(),
+                    num_type_change: link.num_type_change(),
+                    put: link.put_in_flight(),
+                    links,
+                };
+                (qsize.to_string(), diag)
             })
             .collect();
-        rows.sort_by(|a, b| {
-            a.pv_name
-                .cmp(&b.pv_name)
-                .then(dir_rank(a.direction).cmp(&dir_rank(b.direction)))
+        rows.sort_by(|(qa, a), (qb, b)| {
+            (&a.pv_name, a.pipeline, qa).cmp(&(&b.pv_name, b.pipeline, qb))
         });
-        rows
+        rows.into_iter().map(|(_, diag)| diag).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::{LinkDirection, ProcMode};
     use super::*;
 
     #[tokio::test]
@@ -580,147 +478,127 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
-    /// `inp_identities` backs `link_names` (the lset enumeration
-    /// contract). It must (a) report each DISTINCT INP monitor variant —
-    /// two links to the same upstream PV with different `queue_size` /
-    /// `pipeline` are distinct subscriptions and each must surface its own
-    /// identity so a per-variant `is_connected` lands correctly;
-    /// (b) collapse links that share the exact `(pv, pipeline, Q)` variant
-    /// (the registry already folds `field`/`sevr` differences onto one
-    /// entry); and (c) exclude OUT links (no monitor signal).
-    /// `insert_for_test` seeds links without a PVA server.
-    ///
-    /// Pre-fix this deduped by bare PV name, collapsing the `Q=1` and
-    /// `Q=8` variants of `A:PV` into one identity — so an `is_connected`
-    /// query could land on the wrong variant's monitor.
+    /// `identities` backs `link_names` (the lset enumeration contract):
+    /// one identity per channel, so two links to one PV with different
+    /// `queue_size` each surface, while links folded onto one channel —
+    /// a `field`-only variant, or an output link with the same options —
+    /// surface once.
     #[tokio::test]
-    async fn fr15_inp_identities_separate_variants_and_exclude_out() {
+    async fn identities_are_one_per_channel() {
         let reg = PvaLinkRegistry::new();
-
-        // Two INP monitor-variants of the same upstream PV.
         let a1 = PvaLinkConfig {
             queue_size: 1,
             ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
         };
-        let a2 = PvaLinkConfig {
+        let a8 = PvaLinkConfig {
             queue_size: 8,
             ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
         };
-        // Same variant as a1 but a different sub-field — registry folds
-        // it onto a1's entry, so it must NOT add a second identity.
         let a1_field = PvaLinkConfig {
-            queue_size: 1,
             field: "alarm.severity".to_string(),
-            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+            ..a1.clone()
         };
-        let b = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Inp);
-        let c_out = PvaLinkConfig::defaults_for("C:OUT", LinkDirection::Out);
-
-        reg.insert_for_test(&a1, Arc::new(PvaLink::for_test(a1.clone(), None)));
-        reg.insert_for_test(&a2, Arc::new(PvaLink::for_test(a2.clone(), None)));
-        reg.insert_for_test(
-            &a1_field,
-            Arc::new(PvaLink::for_test(a1_field.clone(), None)),
-        );
-        reg.insert_for_test(&b, Arc::new(PvaLink::for_test(b.clone(), None)));
-        reg.insert_for_test(&c_out, Arc::new(PvaLink::for_test(c_out.clone(), None)));
-
-        let default_q = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Inp).queue_size;
+        let a1_out = PvaLinkConfig {
+            direction: LinkDirection::Out,
+            ..a1.clone()
+        };
+        let b = PvaLinkConfig::defaults_for("B:PV", LinkDirection::Out);
+        for cfg in [&a1, &a8, &a1_field, &a1_out, &b] {
+            reg.insert_for_test(cfg, Arc::new(PvaLink::for_test(cfg.clone(), None)));
+        }
+        let default_q = b.queue_size;
         assert_eq!(
-            reg.inp_identities(),
+            reg.identities(),
             vec![
                 ("A:PV".to_string(), false, 1),
                 ("A:PV".to_string(), false, 8),
                 ("B:PV".to_string(), false, default_q),
-            ],
-            "distinct Q variants of A:PV reported separately; field-only \
-             variant folded; OUT (C:OUT) excluded"
+            ]
         );
     }
 
-    /// `channel_diagnostics` backs the `dbpvar` IOC shell command: it
-    /// snapshots every cached channel (INP and OUT) with its connection
-    /// state and per-link config, sorted by `(pv_name, direction)`.
+    /// `channel_diagnostics` lists channels in pvxs's `channels` map
+    /// order: by name, then by the formatted pvRequest, where `pipeline`
+    /// comes first and `queueSize` compares as decimal text, so `Q=10`
+    /// sorts before `Q=4`.
     #[tokio::test]
-    async fn channel_diagnostics_reports_all_channels_with_config() {
+    async fn channel_diagnostics_follow_the_pvxs_channel_order() {
         let reg = PvaLinkRegistry::new();
-
-        let inp = PvaLinkConfig {
-            queue_size: 8,
-            time: true,
-            sevr: SevrMode::Ms,
-            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Inp)
+        let at = |pv: &str, pipeline: bool, queue_size: usize| PvaLinkConfig {
+            pipeline,
+            queue_size,
+            ..PvaLinkConfig::defaults_for(pv, LinkDirection::Inp)
         };
-        let out = PvaLinkConfig {
-            field: "VAL".to_string(),
-            proc: ProcMode::Pp,
-            defer: true,
-            ..PvaLinkConfig::defaults_for("A:PV", LinkDirection::Out)
-        };
-        reg.insert_for_test(&inp, Arc::new(PvaLink::for_test(inp.clone(), None)));
-        reg.insert_for_test(&out, Arc::new(PvaLink::for_test(out.clone(), None)));
-
-        let diags = reg.channel_diagnostics();
-        assert_eq!(diags.len(), 2, "both INP and OUT channels reported");
-
-        // Sorted: same pv_name, INP before OUT.
-        assert_eq!(diags[0].direction, LinkDirection::Inp);
-        assert_eq!(diags[0].queue_size, 8);
-        assert_eq!(diags[0].sevr, SevrMode::Ms);
-        assert!(diags[0].time, "INP link config (time=true) surfaced");
-
-        assert_eq!(diags[1].direction, LinkDirection::Out);
-        assert_eq!(diags[1].proc, ProcMode::Pp);
-        assert!(diags[1].defer, "OUT link config (defer=true) surfaced");
-        assert_eq!(diags[1].field, "VAL");
-
-        // `for_test` links are not connected (no live monitor).
-        assert!(diags.iter().all(|d| !d.connected));
-    }
-
-    /// The channel → record back-index that backs `dbpvar`'s record-name
-    /// glob filter: `attach_record` accumulates every owning record on a
-    /// channel (folding field/sevr-only variants onto one entry), and
-    /// `channel_diagnostics` surfaces the de-duplicated, sorted set.
-    /// pvxs equivalent: `pvaLinkChannel::links` filtered by
-    /// `epicsStrGlobMatch(precord->name, ...)` (`pvxs/ioc/pvalink.cpp:216-231`).
-    #[tokio::test]
-    async fn channel_diagnostics_carries_attached_record_names() {
-        let reg = PvaLinkRegistry::new();
-
-        let inp = PvaLinkConfig::defaults_for("SRC:PV", LinkDirection::Inp);
-        // A field-only variant folds onto the same channel key.
-        let inp_field = PvaLinkConfig {
-            field: "alarm.severity".to_string(),
-            ..PvaLinkConfig::defaults_for("SRC:PV", LinkDirection::Inp)
-        };
-        reg.insert_for_test(&inp, Arc::new(PvaLink::for_test(inp.clone(), None)));
-        reg.insert_for_test(
-            &inp_field,
-            Arc::new(PvaLink::for_test(inp_field.clone(), None)),
-        );
-
-        // Two records share the folded channel; one of them registers
-        // twice (idempotent set insert).
-        reg.attach_record(&inp, b"REC:A");
-        reg.attach_record(&inp_field, b"REC:B");
-        reg.attach_record(&inp, b"REC:A");
-        // Two names that are not UTF-8 stay two records.
-        reg.attach_record(&inp, b"caf\xe9");
-        reg.attach_record(&inp, b"caf\xe8");
-
-        let diags = reg.channel_diagnostics();
-        let row = diags
-            .iter()
-            .find(|d| d.pv_name == "SRC:PV" && d.direction == LinkDirection::Inp)
-            .expect("INP channel present");
+        for cfg in [
+            at("B", false, 4),
+            at("A", true, 2),
+            at("A", false, 4),
+            at("A", false, 10),
+            at("A", false, 5),
+        ] {
+            reg.insert_for_test(&cfg, Arc::new(PvaLink::for_test(cfg.clone(), None)));
+        }
+        let order: Vec<(String, bool, usize)> = reg
+            .channel_diagnostics()
+            .into_iter()
+            .map(|d| (d.pv_name, d.pipeline, d.queue_size))
+            .collect();
         assert_eq!(
-            row.records,
-            [&b"REC:A"[..], b"REC:B", b"caf\xe8", b"caf\xe9"].map(RecordName::from),
-            "every owning record surfaces, de-duplicated and sorted"
+            order,
+            [
+                ("A", false, 10),
+                ("A", false, 4),
+                ("A", false, 5),
+                ("A", true, 2),
+                ("B", false, 4),
+            ]
+            .map(|(pv, pipe, q)| (pv.to_string(), pipe, q))
+        );
+    }
+
+    /// A channel's links as pvxs `pvaLinkChannel::links` holds them: one per
+    /// record field, whatever options fold onto the channel, in `LinkSort`
+    /// order (`monorder`, then attach order; `pvxs/ioc/pvalink_channel.cpp:82-86`).
+    #[tokio::test]
+    async fn channel_diagnostics_lists_each_link() {
+        let reg = PvaLinkRegistry::new();
+        let inp = Arc::new(PvaLinkConfig::defaults_for("SRC:PV", LinkDirection::Inp));
+        let inp_field = Arc::new(PvaLinkConfig {
+            field: "alarm.severity".to_string(),
+            ..(*inp).clone()
+        });
+        let early = Arc::new(PvaLinkConfig {
+            monorder: -1,
+            ..(*inp).clone()
+        });
+        reg.insert_for_test(&inp, Arc::new(PvaLink::for_test((*inp).clone(), None)));
+
+        let rec = |name: &[u8]| RecordName::from(name);
+        reg.attach_link(&inp, &rec(b"REC:B"), "INPA");
+        reg.attach_link(&inp_field, &rec(b"REC:A"), "INP");
+        reg.attach_link(&inp, &rec(b"REC:B"), "INPB");
+        reg.attach_link(&inp, &rec(b"caf\xe9"), "INP");
+        reg.attach_link(&early, &rec(b"REC:Z"), "INP");
+        assert!(!reg.detach_link(&inp, &rec(b"REC:B"), "INPB"));
+
+        let links = |reg: &PvaLinkRegistry| -> Vec<(RecordName, String, String)> {
+            reg.channel_diagnostics()
+                .into_iter()
+                .flat_map(|d| d.links)
+                .map(|l| (l.record, l.field.to_string(), l.config.field.clone()))
+                .collect()
+        };
+        assert_eq!(
+            links(&reg),
+            [
+                (rec(b"REC:Z"), "INP", ""),
+                (rec(b"REC:B"), "INPA", ""),
+                (rec(b"REC:A"), "INP", "alarm.severity"),
+                (rec(b"caf\xe9"), "INP", ""),
+            ]
+            .map(|(r, f, c)| (r, f.to_string(), c.to_string()))
         );
 
-        // close_all clears the back-index too.
         reg.close_all();
         assert!(reg.channel_diagnostics().is_empty());
     }
@@ -774,6 +652,12 @@ mod tests {
             1,
             "differing OUT options must NOT spawn distinct cache entries"
         );
+        // An input link with the same pvRequest is the same channel too
+        // (`pvxs/ioc/pvalink_lset.cpp:99-131` keys no direction).
+        let cfg_inp = PvaLinkConfig::defaults_for("MR_R14:PV", LinkDirection::Inp);
+        let link_inp = reg.get_or_open(cfg_inp).await.expect("open INP link");
+        assert!(Arc::ptr_eq(&link_a, &link_inp));
+        assert_eq!(reg.len(), 1);
         // A differing `pipeline` / `queue_size` IS a distinct channel
         // (distinct upstream pvRequest, pvxs `channels_key_t`), so
         // those still key separately.

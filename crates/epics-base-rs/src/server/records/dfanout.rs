@@ -243,6 +243,17 @@ impl Record for DfanoutRecord {
         true
     }
 
+    /// DOL is read at `DBR_DOUBLE` (`dfanoutRecord.c:119`) and SELL at
+    /// `DBR_USHORT` (`:126`), so a source those requests cannot convert is a
+    /// failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Double,
+            "SELL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SELM" => Some(DFANOUT_SELM_CHOICES),

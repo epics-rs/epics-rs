@@ -494,6 +494,16 @@ impl Record for SwaitRecord {
             SIMM, SIMS;
         spill: VERS, HOPR, LOPR, CBST, OUTN);
 
+    /// `swaitRecord.c:416` reads SIOL at `DBR_DOUBLE` and `:402` SIML at
+    /// `DBR_ENUM`, so a source that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "SIOL" => crate::server::record::LinkReadAs::Double,
+            "SIML" => crate::server::record::LinkReadAs::Enum,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// What `put_field` stores for `A`..`L`, without the by-name lookups
     /// that precede it on the default path.
     fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {

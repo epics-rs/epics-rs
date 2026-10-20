@@ -186,6 +186,15 @@ impl Record for BoRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_USHORT` (`boRecord.c:197`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
     /// rset are its: `get_units` (`:294-299`) answers `"s"` and `get_precision`
     /// (`:301-308`) answers `boHIGHprecision`; every other field falls to

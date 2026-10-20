@@ -990,8 +990,8 @@ impl OutTarget {
 pub enum LinkReadAs {
     /// The source's NATIVE value, coerced (or preserved) by the target field's
     /// own `put_field_internal`. The framework default: every record whose C
-    /// `dbGetLink` request does not switch on the source class (compress `INP`,
-    /// waveform `INP`, sseq `SELL`, epid, motor, table) reads this way.
+    /// `dbGetLink` request does not switch on the source class (epid, motor,
+    /// table) reads this way.
     Native,
     /// C `dbGetLink(..., DBR_STRING, ...)`. An `ENUM`/`MENU` source delivers its
     /// state LABEL (`dbConvert.c` `getEnumString` → the record's

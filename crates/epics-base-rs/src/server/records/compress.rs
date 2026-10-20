@@ -616,6 +616,19 @@ impl Record for CompressRecord {
         "compress"
     }
 
+    /// `compressRecord.c:342` reads INP at `DBF_DOUBLE` for all the source's
+    /// elements, so a source that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::LinkReadAs;
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "INP" => LinkReadAs::Array {
+                dbr: crate::types::DbFieldType::Double,
+                n_request: usize::MAX,
+            },
+            _ => LinkReadAs::Native,
+        })
+    }
+
     /// `compressRecord.c:342-366`: a failed `dbGetLink` on INP raises
     /// LINK/INVALID and then FOLDS the failure away — `status = 0` — so the
     /// tail's `if (status != 1) prec->udf = FALSE;` clears UDF on the broken

@@ -795,6 +795,15 @@ impl Record for SelRecord {
         seeds
     }
 
+    /// NVL is read at `DBR_USHORT` (`selRecord.c:423`), so a source that
+    /// request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "NVL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// The 12 `INPA..INPL` texts read straight off the record's own fields, not
     /// through the default body's 12 name matches on `link_text_ref`.
     /// See [`Record::set_input_link_slots`].

@@ -171,6 +171,15 @@ impl Record for MbboDirectRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_ULONG` (`mbboDirectRecord.c:184`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::ULong,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
         if soft == crate::server::device_support::SoftDtyp::Raw {

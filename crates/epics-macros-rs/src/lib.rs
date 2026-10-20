@@ -320,6 +320,9 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     val: i32,
 /// }
 /// ```
+/// - `#[record(type = "fanout", link_read_as(SELL = UShort))]` — emit
+///   `Record::input_link_request` answering each named link's `LinkReadAs`
+///   variant (C's `dbGetLink` `dbrType` for it) and `Native` for the rest
 /// - `#[record(type = "seq", take_cycle_posted_fields = seq_take_posts,
 ///   fields_posted_only_when_marked = SEQ_CLAIMED)]` — the record's C
 ///   `monitor()` posts: `Record::take_cycle_posted_fields` delegates to the
@@ -400,6 +403,10 @@ struct RecordAttrs {
     /// `Record` impl is hand-written declares the same table by overriding that
     /// method directly.
     constant_init: Vec<(String, String)>,
+    /// `#[record(link_read_as(SELL = UShort))]` — the `dbrType` the record's C
+    /// `dbGetLink` asks for each named link. Emitted as
+    /// `Record::input_link_request`; the variant path is resolved by rustc.
+    link_read_as: Vec<(String, syn::Ident)>,
     /// `#[record(init = some_fn)]` — the record's C `init_record`. The derive
     /// emits no `init_record` by default (the trait's no-op applies); a record
     /// type whose C `init_record` does real work (e.g. `seq`'s
@@ -743,6 +750,27 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     };
 
+    // `#[record(link_read_as(LINK = Variant, ...))]` — emit
+    // `Record::input_link_request`. Omitted when none is declared, so the
+    // trait default (`Native` for every link) applies.
+    let link_request_method = if attrs.link_read_as.is_empty() {
+        quote! {}
+    } else {
+        let links = attrs.link_read_as.iter().map(|(link, _)| link);
+        let variants = attrs.link_read_as.iter().map(|(_, variant)| variant);
+        quote! {
+            fn input_link_request(
+                &self,
+                link_field: &str,
+            ) -> #krate::server::record::InputLinkRequest {
+                #krate::server::record::InputLinkRequest::As(match link_field {
+                    #(#links => #krate::server::record::LinkReadAs::#variants,)*
+                    _ => #krate::server::record::LinkReadAs::Native,
+                })
+            }
+        }
+    };
+
     // `#[record(init = some_fn)]` — emit `Record::init_record` delegating to
     // the named free function. Omitted entirely when the record declares no
     // init, so the trait default (no-op) applies.
@@ -1015,6 +1043,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         impl #krate::server::record::Record for #name {
             #soft_input_entry_method
             #constant_init_method
+            #link_request_method
             #init_method
             #value_monitor_method
             #computed_udf_method
@@ -1086,6 +1115,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut record_type = None;
     let mut crate_path = None;
     let mut constant_init: Vec<(String, String)> = Vec::new();
+    let mut link_read_as: Vec<(String, syn::Ident)> = Vec::new();
     let mut init: Option<syn::Path> = None;
     let mut metadata_override: Option<syn::Path> = None;
     let mut link_metadata_field: Option<syn::Path> = None;
@@ -1129,6 +1159,18 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                         }
                     }
                     Ok(())
+                } else if meta.path.is_ident("link_read_as") {
+                    meta.parse_nested_meta(|entry| {
+                        let link = entry
+                            .path
+                            .get_ident()
+                            .ok_or_else(|| {
+                                entry.error("link_read_as entries are `LINK = Variant`")
+                            })?
+                            .to_string();
+                        link_read_as.push((link, entry.value()?.parse()?));
+                        Ok(())
+                    })
                 } else if meta.path.is_ident("init") {
                     init = Some(meta.value()?.parse()?);
                     Ok(())
@@ -1175,7 +1217,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                     Ok(())
                 } else {
                     Err(meta.error(
-                        "expected `type`, `crate_path`, `constant_init`, `init`, \
+                        "expected `type`, `crate_path`, `constant_init`, `link_read_as`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
                          `no_value_monitor`, `take_cycle_posted_fields`, \
                          `fields_posted_only_when_marked`, `process_posted_fields`, \
@@ -1194,6 +1236,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         record_type,
         crate_path,
         constant_init,
+        link_read_as,
         init,
         metadata_override,
         link_metadata_field,

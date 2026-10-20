@@ -1291,6 +1291,16 @@ impl EpicsValue {
                 _ => {}
             }
         }
+        // The DBR_ENUM column of that row is `getStringUshort` too
+        // (`dbConvert.c:1710-1712`); one string the record's `cvt_st_e` reads
+        // is the callers' (`cvt_st_e_input`).
+        if target == DbFieldType::Enum && matches!(self, Self::String(_) | Self::StringArray(_)) {
+            return Ok(match self.get_convert(DbFieldType::UShort)? {
+                Self::UShortArray(a) => Self::EnumArray(a),
+                Self::UShort(v) => Self::Enum(v),
+                other => other,
+            });
+        }
         Ok(self.convert_to(target))
     }
 

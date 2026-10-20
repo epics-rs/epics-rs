@@ -240,6 +240,16 @@ impl Record for BusyRecord {
         true
     }
 
+    /// The closed-loop DOL (`busyRecord.c:200`) and SIML (`:399`, busy's own
+    /// read, not `recGblGetSimm`'s) are read at `DBR_USHORT`, so a source that
+    /// request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" | "SIML" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if(status==0){ prec->val = val;
     /// prec->udf = FALSE; }`, `:202-204`); a bare (no-DOL) record reads the

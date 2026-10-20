@@ -439,6 +439,15 @@ impl Record for AoRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_DOUBLE` (`aoRecord.c:444`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Double,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// `aoRecord.c:329-350` `get_control_double` lists `OVAL` and `PVAL`
     /// alongside `VAL` and the alarm bands, all answering the record's
     /// `DRVH`/`DRVL` (not `HOPR`/`LOPR` — `ao` is the output record). The

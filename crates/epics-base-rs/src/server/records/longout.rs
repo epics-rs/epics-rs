@@ -235,6 +235,15 @@ impl Record for LongoutRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_LONG` (`longoutRecord.c:148`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Long,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if (!dbLinkIsConstant(&prec->dol) &&
     /// !status) prec->udf=FALSE;`); the no-DOL arm reads the current VAL and

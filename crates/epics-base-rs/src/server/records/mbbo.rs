@@ -480,6 +480,15 @@ impl Record for MbboRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_USHORT` (`mbboRecord.c:204`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::UShort,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// C `mbboRecord.c:286-291` — the `db_post_events` inside `special()`
     /// after a `SPC_MOD` write:
     ///

@@ -29,9 +29,12 @@ static FANOUT_POSTED: [crate::server::record::FieldIx; 2] = crate::server::recor
 // `caput VAL` posts no per-put value monitor (only the connect-time snapshot).
 // `process_posted_fields`: `process()` posts VAL and SELN alone
 // (`fanoutRecord.c:147-152`; fanout has no `monitor()`).
+// `link_read_as`: SELL is read at `DBR_USHORT` (`fanoutRecord.c:103`), so a
+// source that request cannot convert is a failed read.
 #[record(
     type = "fanout",
     constant_init = "SELL:SELN",
+    link_read_as(SELL = UShort),
     no_value_monitor,
     process_posted_fields = FANOUT_POSTED,
     spill()

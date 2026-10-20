@@ -4983,14 +4983,12 @@ impl PvDatabase {
         // (`aSubRecord.c:126`) loaded at init — which is also what a `caput
         // REC.SNAM other` leaves in place.
         use crate::server::recgbl::simm::LinkFetch;
-        let (fetch, render) = self.db_get_link_rendered_in(rec, "SUBL", &subl, true, visited);
-        let name: Option<String> =
-            match self.convert_link_fetch(rec, "SUBL", &subl, fetch, render).0 {
-                LinkFetch::Value(EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
-                LinkFetch::Value(other) => unreachable!("a DBR_STRING read delivered {other:?}"),
-                LinkFetch::NoData => Some(snam),
-                LinkFetch::Failed => None,
-            };
+        let name: Option<String> = match self.db_get_link_in(rec, "SUBL", &subl, visited) {
+            LinkFetch::Value(EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
+            LinkFetch::Value(other) => unreachable!("a DBR_STRING read delivered {other:?}"),
+            LinkFetch::NoData => Some(snam),
+            LinkFetch::Failed => None,
+        };
 
         let Some(name) = name else {
             // Link read failed — C `if (status) return status` skips do_sub.
@@ -5520,10 +5518,13 @@ impl PvDatabase {
             use crate::server::recgbl::simm::LinkFetch;
             // Non-`.TIME` TSEL: C `dbGetLink(&tsel, DBR_SHORT, &prec->tse)`
             // loads TSE from the link regardless of its type; a CONSTANT TSEL
-            // never reaches here (`tsel_link`). The coercion is C's, chosen by
-            // the SOURCE type. A failed read is `TselStamp::Failed`, whose
-            // LINK alarm the stamp raises where C's read sits.
-            match self.db_try_get_link(rec, &tsel_link, visited) {
+            // never reaches here (`tsel_link`). A failed read, conversion
+            // included, is `TselStamp::Failed`, whose LINK alarm the stamp
+            // raises where C's read sits.
+            let short = crate::server::record::InputLinkRequest::As(
+                crate::server::record::LinkReadAs::Short,
+            );
+            match self.db_try_get_link_requested(rec, "TSEL", &tsel_link, short, visited) {
                 LinkFetch::Value(val) => super::TselStamp::Tse(val.to_dbf_i16().unwrap_or(0)),
                 LinkFetch::Failed => super::TselStamp::Failed,
                 LinkFetch::NoData => super::TselStamp::None,
@@ -6116,15 +6117,7 @@ impl PvDatabase {
                 // DOL with `DBR_STRING` (`stringoutRecord.c:141`), lso via
                 // `dbGetLinkLS` (`lsoRecord.c:114`) — an ENUM/MENU DOL source
                 // delivers its label, not the index.
-                let render = rec
-                    .read()
-                    .record
-                    .input_link_request("DOL")
-                    .renders_at_source();
-                let (fetch, render) =
-                    self.db_get_link_rendered_in(rec, "DOL", dol_parsed, render, visited);
-                self.convert_link_fetch(rec, "DOL", dol_parsed, fetch, render)
-                    .0
+                self.db_get_link_in(rec, "DOL", dol_parsed, visited)
             });
         // C's `if (status)` on the closed-loop DOL read, read twice below: once
         // by the record's own failure arm at the DOL-apply site, once by the
@@ -6152,24 +6145,11 @@ impl PvDatabase {
         } else {
             match sel_nvl_link {
                 Some(parsed) => {
-                    let (fetch, _) =
-                        self.db_get_link_rendered_in(rec, "NVL", &parsed, false, visited);
-                    // C `dbGetLink(&nvl, DBR_USHORT, &seln, 0, 0)`: the source
-                    // is converted at DBR_USHORT (an array contributes element
-                    // 0), so a value outside 0..65535 wraps as C's GET table
-                    // does and one it cannot convert is a failed read.
-                    match fetch {
-                        crate::server::recgbl::simm::LinkFetch::Value(v) => {
-                            let converted = self.apply_link_read_as(
-                                Some(rec.set()),
-                                &parsed,
-                                crate::server::record::LinkReadAs::UShort,
-                                v,
-                                None,
-                            );
-                            sel_nvl_read_failed = converted.is_none();
-                            converted
-                        }
+                    // sel asks for NVL at DBR_USHORT (`selRecord.c:423`), so
+                    // the read delivers SELN's own type or fails with
+                    // `dbGetLink`'s LINK alarm.
+                    match self.db_get_link_in(rec, "NVL", &parsed, visited) {
+                        crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
                         crate::server::recgbl::simm::LinkFetch::NoData => None,
                         crate::server::recgbl::simm::LinkFetch::Failed => {
                             sel_nvl_read_failed = true;
@@ -6679,16 +6659,21 @@ impl PvDatabase {
             let disa = match sdis_link {
                 Some(sdis_link) => {
                     guard.release();
-                    let fetch = self.db_get_link_in(rec, "SDIS", &sdis_link, visited);
+                    // C `dbGetLink(&prec->sdis, DBR_SHORT, &prec->disa)`, the
+                    // value converted in the read.
+                    let fetch = self.db_get_link_requested(
+                        rec,
+                        "SDIS",
+                        &sdis_link,
+                        crate::server::record::InputLinkRequest::As(
+                            crate::server::record::LinkReadAs::Short,
+                        ),
+                        visited,
+                    );
                     if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
                         sdis_status = Err(DbStatus::FAILED);
                     }
                     if let Some(val) = fetch.value() {
-                        // C `dbGetLink(&prec->sdis, DBR_SHORT, &prec->disa)` — the
-                        // routine is picked by the SOURCE type, so this goes through
-                        // the coercion owner, not `c_cast` direct (an integer SDIS
-                        // source takes C's defined modular conversion; only a float
-                        // source takes the UB cast).
                         let disa_val = val.to_dbf_i16().unwrap_or(0);
                         guard.hold().common.disa = disa_val;
                     }
@@ -10653,10 +10638,10 @@ impl PvDatabase {
     /// can carry (see [`crate::server::recgbl::simm::LinkFetch`]) and carrying
     /// the source-alarm tail, but WITHOUT `setLinkAlarm`.
     ///
-    /// Only the two readers whose C really is `dbTryGetLink`-shaped call this
-    /// directly ([`Self::rec_gbl_get_simm`] and swait's `recDynLinkGet` DOL);
-    /// every other process-time read is a C `dbGetLink` and goes through
-    /// [`Self::db_get_link_in`], which owns the failure alarm.
+    /// It reads the source's own type; [`Self::db_try_get_link_requested`]
+    /// is the conversion at C's `dbrType` on top, and every process-time read
+    /// goes through it or through [`Self::db_get_link_in`], which owns the
+    /// failure alarm.
     ///
     /// A raw value read collapses two of them: it hands back the CONSTANT
     /// link's parsed text as if the link had delivered it this cycle, and
@@ -10688,18 +10673,8 @@ impl PvDatabase {
     /// A `PP` DB link processes its source first, as `dbDbGetValue` does for
     /// every caller (`dbDbLink.c:174-179`), and a failed process is the read's
     /// failure.
-    pub(crate) fn db_try_get_link(
-        &self,
-        reader: InFrame<'_>,
-        link: &crate::server::record::ParsedLink,
-        visited: &mut ProcStack,
-    ) -> crate::server::recgbl::simm::LinkFetch {
-        self.db_try_get_link_rendered(reader, link, false, visited)
-            .0
-    }
-
-    /// [`Self::db_try_get_link`] with the source's `DBR_STRING` part when
-    /// `render` asks for it.
+    ///
+    /// The source's `DBR_STRING` part comes back too when `render` asks for it.
     fn db_try_get_link_rendered(
         &self,
         reader: InFrame<'_>,
@@ -10746,7 +10721,7 @@ impl PvDatabase {
         (fetch, render)
     }
 
-    /// **C `dbGetLink`** (`dbLink.c:324-340`) — [`Self::db_try_get_link`] plus the
+    /// **C `dbGetLink`** (`dbLink.c:324-340`) — [`Self::db_try_get_link_rendered`] plus the
     /// failure effect C attaches to it, because in C the two are ONE function:
     ///
     /// ```c
@@ -10772,9 +10747,14 @@ impl PvDatabase {
     /// field name, a [`ParsedLink`](crate::server::record::ParsedLink) does not, so
     /// the caller spells it.
     ///
-    /// Use [`Self::db_try_get_link`] for `recGblGetSimm`'s SIML read
+    /// Use [`Self::db_try_get_link_requested`] for `recGblGetSimm`'s SIML read
     /// (`dbTryGetLink`, which bypasses `setLinkAlarm` and writes `nsta` itself,
     /// `recGbl.c:453-454`).
+    ///
+    /// The value is converted here, at the reader's own request for
+    /// `link_field` (C's `dbrType` argument), so a source the request cannot
+    /// convert is a failed read with the same alarm: converting after the
+    /// read is what left `ao` `DOL` and `longin` `SIOL` at `"abc"` silent.
     pub(crate) fn db_get_link_in(
         &self,
         reader: InFrame<'_>,
@@ -10782,28 +10762,54 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         visited: &mut ProcStack,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        self.db_get_link_rendered_in(reader, link_field, link, false, visited)
-            .0
+        let request = reader.read().record.input_link_request(link_field);
+        self.db_get_link_requested(reader, link_field, link, request, visited)
     }
 
-    /// [`Self::db_get_link_in`] with the source's `DBR_STRING` part when
-    /// `render` asks for it.
-    pub(crate) fn db_get_link_rendered_in(
+    /// [`Self::db_get_link_in`] at a `dbrType` the caller fixes, for the links
+    /// `dbAccess.c` and `recGbl.c` read at one type whatever the record: the
+    /// record is not asked, because its answer is for its own links (table
+    /// answers `DBR_DOUBLE` for all of them).
+    pub(crate) fn db_get_link_requested(
         &self,
         reader: InFrame<'_>,
         link_field: &'static str,
         link: &crate::server::record::ParsedLink,
-        render: bool,
+        request: crate::server::record::InputLinkRequest,
         visited: &mut ProcStack,
-    ) -> (
-        crate::server::recgbl::simm::LinkFetch,
-        Option<crate::server::record::record_instance::SourceRender>,
-    ) {
-        let (fetch, render) = self.db_try_get_link_rendered(reader, link, render, visited);
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        let fetch = self.db_try_get_link_requested(reader, link_field, link, request, visited);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
             self.db_get_link_failed(reader, link_field, link);
         }
-        (fetch, render)
+        fetch
+    }
+
+    /// C `dbTryGetLink`: [`Self::db_get_link_requested`] without its
+    /// `setLinkAlarm`.
+    pub(crate) fn db_try_get_link_requested(
+        &self,
+        reader: InFrame<'_>,
+        link_field: &'static str,
+        link: &crate::server::record::ParsedLink,
+        request: crate::server::record::InputLinkRequest,
+        visited: &mut ProcStack,
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        let (mut fetch, render) =
+            self.db_try_get_link_rendered(reader, link, request.renders_at_source(), visited);
+        let instance = reader.read();
+        self.convert_link_fetch_as(
+            Reader {
+                record: &*instance.record,
+                held: reader.set(),
+            },
+            link_field,
+            link,
+            request,
+            &mut fetch,
+            render,
+        );
+        fetch
     }
 
     /// [`Self::get_link_failed`] on `rec`'s own pending alarm.
@@ -10856,40 +10862,14 @@ impl PvDatabase {
     /// `default: break` — no read — mapped to `NoData`; a conversion the
     /// source cannot satisfy is a FAILED read (C's non-zero status).
     ///
-    /// The second return is whether the reader asked for a STRING class: such a
-    /// value bypasses the store's `to_f64` funnel, because that funnel IS the
+    /// Returns whether the reader asked for a STRING class: such a value
+    /// bypasses the store's `to_f64` funnel, because that funnel IS the
     /// `DBR_DOUBLE` request of the calc-class records (`calcRecord.c:434`), not
     /// a rule of the store.
-    fn convert_link_fetch(
-        &self,
-        rec: InFrame<'_>,
-        link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
-        fetch: crate::server::recgbl::simm::LinkFetch,
-        render: Option<crate::server::record::record_instance::SourceRender>,
-    ) -> (crate::server::recgbl::simm::LinkFetch, bool) {
-        let instance = rec.read();
-        let request = instance.record.input_link_request(link_field);
-        let mut fetch = fetch;
-        let store_raw = self.convert_link_fetch_as(
-            Reader {
-                record: &*instance.record,
-                held: rec.set(),
-            },
-            link_field,
-            link,
-            request,
-            &mut fetch,
-            render,
-        );
-        (fetch, store_raw)
-    }
-
-    /// [`Self::convert_link_fetch`] for a caller that already holds the
-    /// record's request for the link — the multi-input fetch reads it for
-    /// every set link under the cycle's entry guard, where C's
-    /// `fetch_values` has it for free, instead of taking the record's lock
-    /// once per link to ask.
+    ///
+    /// `request` is the caller's: the multi-input fetch reads it for every set
+    /// link under the cycle's entry guard, where C's `fetch_values` has it for
+    /// free, instead of taking the record's lock once per link to ask.
     #[inline]
     fn convert_link_fetch_as(
         &self,
@@ -11042,7 +11022,7 @@ impl PvDatabase {
         (fetch, alarm, store_raw)
     }
 
-    /// The `Option`-shaped twin of [`Self::convert_link_fetch`] for the
+    /// The `Option`-shaped twin of [`Self::convert_link_fetch_as`] for the
     /// single-INP soft path, whose reader deals in `Option<EpicsValue>`:
     /// a conversion (or declaration) miss is `None`, which that path
     /// already classifies as a failed read of a real link (LINK alarm,
@@ -11182,12 +11162,19 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour)
         // would stomp the operator's put back to the constant on the very
         // next process.
-        let fetch = self.db_try_get_link(rec, siml, visited);
+        //
+        // `recGblGetSimm` reads at `DBR_USHORT` for every record that uses it;
+        // the records that read SIML themselves pick their own request.
+        let recgbl_simm = rec.read().record.uses_recgbl_simm_helpers();
+        let request = if recgbl_simm {
+            crate::server::record::InputLinkRequest::As(crate::server::record::LinkReadAs::UShort)
+        } else {
+            rec.read().record.input_link_request("SIML")
+        };
+        let fetch = self.db_try_get_link_requested(rec, "SIML", siml, request, visited);
         let failed = matches!(fetch, LinkFetch::Failed);
         match fetch {
             LinkFetch::Value(v) => {
-                // `dbGetLink(&prec->siml, DBR_USHORT, &prec->simm)` — through the
-                // coercion owner, source-type-chosen (see the DISA read above);
                 // SIMM's storage here is the i16 carrier.
                 let simm = v.to_dbf_i16().unwrap_or(0);
                 let mut instance = rec.write();
@@ -11201,7 +11188,7 @@ impl PvDatabase {
             // record's support uses (`Record::uses_recgbl_simm_helpers`):
             LinkFetch::Failed => {
                 let mut instance = rec.write();
-                if !instance.record.uses_recgbl_simm_helpers() {
+                if !recgbl_simm {
                     // `busyRecord.c:399`, `swaitRecord.c:402` and
                     // `mcaRecord.c:1106` read SIML with a plain `dbGetLink`.
                     drop(instance);
@@ -12166,14 +12153,7 @@ impl PvDatabase {
             // failure. Converted to the record's declared request: stringin
             // reads SIOL with `DBR_STRING` (`stringinRecord.c:208`), lsi via
             // `dbGetLinkLS` (`lsiRecord.c:244`).
-            let render = rec
-                .read()
-                .record
-                .input_link_request("SIOL")
-                .renders_at_source();
-            let (fetch, render) =
-                self.db_get_link_rendered_in(rec, "SIOL", &siol_link, render, visited);
-            let (fetch, _raw) = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch, render);
+            let fetch = self.db_get_link_in(rec, "SIOL", &siol_link, visited);
             // The read itself raised C's `setLinkAlarm` (dbLink.c:321 ->
             // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field SIOL")`) on a
             // FAILED fetch. For a base record that is AFTER the SIMM_ALARM
@@ -12186,13 +12166,6 @@ impl PvDatabase {
             // guard the store runs under.
             let (tsel, siol_stamp) = self.read_sim_stamp(rec, &siol_link, visited);
             let mut instance = rec.write();
-
-            // The other order (`mcaRecord.c:1118` then `:1129`): the read has
-            // happened, so its LINK_ALARM is already pending and the
-            // equal-severity SIMM_ALARM now loses the tie instead.
-            if simm_after_read {
-                raise_simm(&mut instance.common);
-            }
 
             // C's SIOL read buffer is `&prec->sval` on every scalar SIML/SIOL
             // record (`longinRecord.c:416` `dbGetLink(&prec->siol, DBR_LONG,
@@ -12207,7 +12180,7 @@ impl PvDatabase {
             // data (status 0), and C's `val = sval` then publishes the SVAL
             // the operator wrote.
             let has_sval = instance.record.has_sval();
-            let fetch_ok = fetch.is_ok();
+            let mut fetch_ok = fetch.is_ok();
             // `Some(v)` is a value that goes straight to the landing (no SVAL);
             // `Sval` is one already in SVAL, copied to the landing below.
             enum Fetched {
@@ -12217,19 +12190,30 @@ impl PvDatabase {
             }
             let landed = match fetch {
                 crate::server::recgbl::simm::LinkFetch::Value(v) => {
-                    if has_sval {
-                        // `put_field_internal` is the DBR-coercion owner
-                        // (C `dbGetLink(DBF_<sval>)`).
-                        let _ = instance.record.put_field_internal("SVAL", v);
+                    if !has_sval {
+                        Fetched::Direct(v)
+                    } else if instance.record.put_field_internal("SVAL", v).is_ok() {
                         Fetched::Sval
                     } else {
-                        Fetched::Direct(v)
+                        // SVAL's type is C's `dbrType` (mbbiDirect declares its
+                        // own), so a value SVAL refuses is the conversion
+                        // `dbGetLink` fails inside the read.
+                        crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "SIOL");
+                        fetch_ok = false;
+                        Fetched::None
                     }
                 }
                 crate::server::recgbl::simm::LinkFetch::NoData if has_sval => Fetched::Sval,
                 crate::server::recgbl::simm::LinkFetch::NoData
                 | crate::server::recgbl::simm::LinkFetch::Failed => Fetched::None,
             };
+
+            // The other order (`mcaRecord.c:1118` then `:1129`): the read has
+            // happened, so its LINK_ALARM is already pending and the
+            // equal-severity SIMM_ALARM now loses the tie instead.
+            if simm_after_read {
+                raise_simm(&mut instance.common);
+            }
 
             let target_supports_raw = !matches!(landed, Fetched::None)
                 && raw_mode

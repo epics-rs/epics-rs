@@ -11,7 +11,7 @@ use super::filters::ChannelName;
 use super::link_set::LinkDbfType;
 use super::processing::ProcStack;
 use super::record_lock::InFrame;
-use super::{PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
+use super::{PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
 
 /// The `record[.FIELD]` name a link target is addressed by in the local
 /// database — the name with the channel filter already removed.
@@ -76,29 +76,29 @@ fn filter_read(suffix: &str, v: EpicsValue) -> EpicsValue {
         .unwrap_or(v)
 }
 
-/// C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes its
-/// element 0 (C asks for one element, so `dbGet` converts offset 0), the same
-/// rule the multi-input fetch applies.
+/// What a one-element request converts of `value`: an array's element 0, as
+/// `dbGet` and `dbCaGetLink` convert from offset 0, and of an empty array
+/// nothing, a failed read.
 #[inline]
-fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
-    let scalar = if value.is_array() {
+fn element_0(value: EpicsValue) -> Option<EpicsValue> {
+    if value.is_array() {
         value.first_element()
     } else {
         Some(value)
-    };
-    scalar.and_then(|s| s.get_convert_f64())
+    }
+}
+
+/// C `dbGetLink(..., DBR_DOUBLE, ...)` of one element.
+#[inline]
+fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
+    element_0(value).and_then(|s| s.get_convert_f64())
 }
 
 /// [`link_value_as_f64`] for the integer requests: element 0 through C's GET
 /// table, so a string source parses (`cvt_st_l` and siblings) and an integer
 /// source narrows by cast.
 fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValue> {
-    let scalar = if value.is_array() {
-        value.first_element()?
-    } else {
-        value
-    };
-    scalar.get_convert(target).ok()
+    element_0(value)?.get_convert(target).ok()
 }
 
 fn empty_read_fetch(
@@ -1560,21 +1560,7 @@ impl PvDatabase {
                 }
             };
         }
-        let scalar = if value.is_array() {
-            value.first_element()?
-        } else {
-            value
-        };
-        let EpicsValue::String(s) = scalar else {
-            return scalar.get_convert(DbFieldType::Enum).ok();
-        };
-        let EpicsValue::UShort(v) = EpicsValue::String(s)
-            .get_convert(DbFieldType::UShort)
-            .ok()?
-        else {
-            return None;
-        };
-        Some(EpicsValue::Enum(v))
+        element_0(value)?.get_convert(DbFieldType::Enum).ok()
     }
 
     /// The `DBR_STRING` form of a value just read from `link`: rendered by the
@@ -1632,11 +1618,12 @@ impl PvDatabase {
         if let crate::server::record::ParsedLink::Db(db) = link
             && db.target().string_view
         {
-            return crate::server::record::value_as_dbr_string(&value.first_element()?);
+            return crate::server::record::value_as_dbr_string(&element_0(value)?);
         }
         if let Some(render) = render {
             return render.dbr_string(value);
         }
+        let value = element_0(value)?;
         // An external ENUM value crosses the wire as a bare index; the label
         // table lives in the lset's cached metadata (CA: the one-shot
         // `DBR_CTRL_ENUM` attribute fetch — C `dbCa` instead keeps a second
@@ -1788,7 +1775,7 @@ impl PvDatabase {
             return (None, None);
         }
         let (value, alarm, _) = self.read_link_value_and_alarm(link, reader, false);
-        let Some(value) = value.and_then(|value| value.get_convert_f64()) else {
+        let Some(value) = value.and_then(link_value_as_f64) else {
             return (None, self.get_link_failure(link, CHILD_LINK_FIELD));
         };
         let alarm = alarm
@@ -4486,9 +4473,8 @@ impl PvDatabase {
             inputs.prev_val = val;
             crate::calc::eval(&compiled, &mut inputs).ok()
         };
-        let val = value
-            .into_value()
-            .get_convert_f64()
+        // C converts `pbuffer[0]` (`lnkCalc.c:672`).
+        let val = link_value_as_f64(value.into_value())
             .and_then(|val| match &calc.expr {
                 Some(expr) => perform(expr, val),
                 None => Some(val),
@@ -4660,15 +4646,11 @@ impl PvDatabase {
         // (`fanoutRecord.c:88`, `dfanoutRecord.c:102`, `seqRecord.c:121`
         // `recGblInitConstantLink(&sell, DBF_USHORT, &seln)`), so a
         // `caput REC.SELN` STAYS put.
-        if let Some(val) = self.db_get_link_in(rec, "SELL", &parsed, visited).value() {
-            // The conversion routine is chosen by the SOURCE type — an integer
-            // source wraps mod 2^16, a float source is UB. `dbr_ushort_cast`
-            // owns that split. SELN is a `DBF_USHORT` (u16) field either way,
-            // and `select_link_indices_ex` consumes it as `u16` — never as a
-            // signed value that could clamp to 0.
-            let seln = dbr_ushort_cast(&val);
+        // fanout, dfanout and seq all read SELL at `DBR_USHORT`, so the read
+        // delivers SELN's own type, converted as C's GET table converts it.
+        if let Some(seln) = self.db_get_link_in(rec, "SELL", &parsed, visited).value() {
             let mut instance = rec.write();
-            let _ = instance.record.put_field("SELN", EpicsValue::UShort(seln));
+            let _ = instance.record.put_field("SELN", seln);
         }
     }
 
@@ -5077,8 +5059,7 @@ impl PvDatabase {
         // DOLn raises `setLinkAlarm` (LINK/INVALID, AMSG `field DOL0`) on the
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
-            self.db_get_link_rendered_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, false, visited)
-                .0
+            self.db_get_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, visited)
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)

@@ -48,7 +48,7 @@ use std::any::Any;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
-    ProcessAction, ProcessOutcome, Record, uniform_post_table,
+    InputLinkRequest, LinkReadAs, ProcessAction, ProcessOutcome, Record, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
@@ -618,6 +618,15 @@ fn as_string(name: &str, v: &EpicsValue) -> CaResult<PvString> {
 impl Record for McaRecord {
     fn record_type(&self) -> &'static str {
         "mca"
+    }
+
+    /// `readValue` reads SIML at `DBR_ENUM` (`mcaRecord.c:1106`), so a
+    /// source that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
+        InputLinkRequest::As(match link_field {
+            "SIML" => LinkReadAs::Enum,
+            _ => LinkReadAs::Native,
+        })
     }
 
     /// The `mca` declaration: the table generated from the vendored

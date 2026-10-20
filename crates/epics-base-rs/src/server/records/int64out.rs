@@ -164,6 +164,15 @@ impl Record for Int64outRecord {
         true
     }
 
+    /// The closed-loop DOL is read at `DBR_INT64` (`int64outRecord.c:138`), so a source
+    /// that request cannot convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        crate::server::record::InputLinkRequest::As(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::Int64,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// C `int64outRecord.c:135-143`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if (prec->dol.type!=CONSTANT &&
     /// RTN_SUCCESS(status)) prec->udf=FALSE;`); the no-DOL arm reads the current

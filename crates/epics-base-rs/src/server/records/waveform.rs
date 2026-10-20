@@ -1261,6 +1261,29 @@ impl Record for WaveformRecord {
         Some((self.ftvl_element_type(), nreq.max(0) as usize))
     }
 
+    /// The soft dsets read INP, and SIOL under SIMM (`devAaiSoft.c:87`,
+    /// `waveformRecord.c:351`), and aao's `fetchValue` reads DOL
+    /// (`aaoRecord.c:366`), at `(FTVL, nRequest)`, so a source FTVL cannot
+    /// convert is a failed read.
+    fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
+        use crate::server::record::LinkReadAs;
+        crate::server::record::InputLinkRequest::As(
+            match (link_field, self.kind, self.soft_input_array_request()) {
+                ("INP" | "SIOL", _, Some((dbr, n_request))) => LinkReadAs::Array { dbr, n_request },
+                ("DOL", ArrayKind::Aao, _) => LinkReadAs::Array {
+                    dbr: self.ftvl_element_type(),
+                    n_request: self.nelm.max(0) as usize,
+                },
+                _ => LinkReadAs::Native,
+            },
+        )
+    }
+
+    /// `FTVL` and `NELM` are fields, so the request above is the instance's.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
     fn soft_input_dset_init(&mut self, loaded: bool) {
         // `prebuilt_nord`: the elements a caller loaded are not C's calloc'd
         // buffer, and the dset's zeroing arm exists because C's buffer IS empty.

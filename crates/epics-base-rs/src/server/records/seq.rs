@@ -106,6 +106,16 @@ pub(crate) fn set_seq_dly_limit(value: f64) {
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
+    // DOLn is read at `DBR_DOUBLE` (`seqRecord.c:259`) and SELL at
+    // `DBR_USHORT` (`:152`), so a source those requests cannot convert is a
+    // failed read.
+    link_read_as(
+        DOL0 = Double, DOL1 = Double, DOL2 = Double, DOL3 = Double,
+        DOL4 = Double, DOL5 = Double, DOL6 = Double, DOL7 = Double,
+        DOL8 = Double, DOL9 = Double, DOLA = Double, DOLB = Double,
+        DOLC = Double, DOLD = Double, DOLE = Double, DOLF = Double,
+        SELL = UShort,
+    ),
     init = seq_init_record,
     take_cycle_posted_fields = seq_monitor_posts,
     fields_posted_only_when_marked = SEQ_CLAIMED,

@@ -22,6 +22,8 @@ const LINE: &str = "AUTOSAVE_AS_VERIFY_LINE";
 const TASK: &str = "AUTOSAVE_AS_VERIFY_TASK";
 /// What the child prints once the shell line has returned.
 const RETURNED: &str = "-- shell line returned --";
+/// Set: the child has no save task, so C's `opMsgQueue` is NULL.
+const NO_TASK: &str = "AUTOSAVE_AS_VERIFY_NO_TASK";
 
 const SAV: &str =
     "# h\nA 1.5\nB 3\nA.DESC d\nA.PREC 2\nA.SCAN 0\nX 1\n#C.VAL Search Issued\n<END>\n";
@@ -29,17 +31,18 @@ const SAV: &str =
 /// The child's stdout for the shell line `line` run on `dir`, with `dir`
 /// written `DIR` and the test harness's own lines dropped.
 fn output_of(dir: &Path, line: &str) -> Vec<String> {
-    run_child(dir, line, false)
+    run_child(dir, line, None)
 }
 
-fn run_child(dir: &Path, line: &str, task: bool) -> Vec<String> {
+/// [`output_of`] with the child's `flag` set.
+fn run_child(dir: &Path, line: &str, flag: Option<&str>) -> Vec<String> {
     let name = "child_as_verify";
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD, dir)
         .env(LINE, line.replace("DIR", &dir.display().to_string()));
-    if task {
-        cmd.env(TASK, "1");
+    if let Some(flag) = flag {
+        cmd.env(flag, "1");
     }
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -81,9 +84,13 @@ fn child_as_verify() {
             .unwrap();
     });
     let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
-    let mgr = Arc::new(rt.block_on(AutosaveBuilder::new().build()));
-    holder.lock().unwrap().manager = Some(mgr.clone());
-    let _task = mgr.clone().start(db.clone());
+    // A built manager has C's task and queue, so NO_TASK attaches none.
+    let task = std::env::var_os(NO_TASK).is_none().then(|| {
+        let mgr = Arc::new(rt.block_on(AutosaveBuilder::new().build()));
+        holder.lock().unwrap().manager = Some(mgr.clone());
+        let handle = mgr.clone().start(db.clone());
+        (mgr, handle)
+    });
     holder.lock().unwrap().save_file_path = Some(dir);
     let bridge = {
         let _guard = rt.enter();
@@ -104,21 +111,21 @@ fn child_as_verify() {
     })
     .join()
     .unwrap();
-    rt.block_on(mgr.ops_served());
+    if let Some((mgr, _)) = task {
+        rt.block_on(mgr.ops_served());
+    }
 }
 
-/// With a save task, asVerify is its op (save_restore.c:2874, :1239-1248):
-/// the shell line returns first, as C's prompt comes back before the
-/// task's lines.
+/// With a save task, asVerify is its op (save_restore.c:2874, :1239-1248).
+/// C orders the task's lines against neither the shell's return nor its
+/// prompt, so the child waits for the task before they are read.
 #[test]
-fn the_save_task_verifies_after_the_shell_returns() {
+fn the_save_task_lists_what_differed_at_verbose_0() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("s.sav"), SAV).unwrap();
-    let lines = run_child(dir.path(), "asVerify(\"s.sav\", 0, \"\")", true);
     assert_eq!(
-        lines,
+        output_of(dir.path(), "asVerify(\"s.sav\", 0, \"\")"),
         [
-            RETURNED,
             "    PVname saved_value live_value",
             "    =============================",
             "*** B                         3.000000                  2.000000",
@@ -127,6 +134,17 @@ fn the_save_task_verifies_after_the_shell_returns() {
             "2 PVs differed.  (5 PVs checked; 2 PVs not connected)",
         ]
     );
+}
+
+/// With no save task C's `opMsgQueue` is NULL and asVerify's send crashes
+/// (:2874), a defect not copied: the op is dropped, and the shell does not
+/// verify in the task's place.
+#[test]
+fn without_a_save_task_nothing_is_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("s.sav"), SAV).unwrap();
+    let lines = run_child(dir.path(), "asVerify(\"s.sav\", 0, \"\")", Some(NO_TASK));
+    assert!(lines.is_empty(), "{lines:?}");
 }
 
 /// Every op is the task's, in the order sent (save_restore.c:1131): the
@@ -139,7 +157,7 @@ fn a_verify_sent_before_a_restore_is_served_first() {
         let lines = run_child(
             dir.path(),
             "asVerify(\"v.sav\", 0, \"\");fdbrestore(\"v.sav\")",
-            true,
+            Some(TASK),
         );
         assert_eq!(
             lines.iter().rev().find(|l| l.contains("differed")).unwrap(),

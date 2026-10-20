@@ -211,6 +211,27 @@ fn softioc_version_echoes() -> Vec<Option<Vec<u8>>> {
     vec![echo(0), echo(7), echo(7), echo(7), None]
 }
 
+/// The datagram's last VERSION decides the reply header, an unsupported one
+/// included: `udp_version_action` stores its minor before refusing it
+/// (`camessage.c:2150-2153`).
+fn last_version_echoes(udp: SocketAddr) -> Vec<Option<Vec<u8>>> {
+    let v = |minor, cid| hdr(CA_PROTO_VERSION, 0, 0, minor, cid, 0);
+    [
+        [v(13, 7), search(0x70), v(10, 9)].concat(),
+        [v(10, 9), search(0x72), v(13, 7)].concat(),
+        [v(13, 7), search(0x74), v(2, 9)].concat(),
+        [v(13, 7), search(0x76), v(12, 0)].concat(),
+    ]
+    .into_iter()
+    .map(|prefix| reply_version(udp, prefix))
+    .collect()
+}
+
+fn softioc_last_version_echoes() -> Vec<Option<Vec<u8>>> {
+    let echo = |cid| Some(hdr(CA_PROTO_VERSION, 0, 1, 13, cid, 0));
+    vec![None, echo(7), None, echo(0)]
+}
+
 /// `f` against the blocking front end's UDP responder.
 fn with_blocking_responder<T>(f: impl FnOnce(SocketAddr) -> T) -> T {
     use epics_base_rs::types::EpicsValue;
@@ -328,6 +349,26 @@ async fn the_async_responder_echoes_any_v411_version_s_sequence() {
         .await
         .unwrap();
     assert_eq!(got, softioc_version_echoes());
+}
+
+#[test]
+#[serial]
+fn the_blocking_responder_echoes_the_last_version() {
+    assert_eq!(
+        with_blocking_responder(last_version_echoes),
+        softioc_last_version_echoes()
+    );
+}
+
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_async_responder_echoes_the_last_version() {
+    let udp = async_responder().await;
+    let got = tokio::task::spawn_blocking(move || last_version_echoes(udp))
+        .await
+        .unwrap();
+    assert_eq!(got, softioc_last_version_echoes());
 }
 
 #[cfg(tokio_backend)]

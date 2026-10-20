@@ -772,21 +772,17 @@ pub(crate) struct ClientState {
     /// diffed for access-rights transition frames. Mirrors C
     /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
     channel_trap: HashMap<u32, bool>,
-    next_sid: AtomicU32,
-    /// Recycled SIDs from channels destroyed via CLEAR_CHANNEL —
-    /// without recycling, `next_sid` would wrap after 2³² channel
-    /// creations and start handing out SIDs that collide with live
-    /// channels. epics-base `rsrv/camessage.c` uses
-    /// `freeListItemPvt` for the same reason. We use a Vec stack
-    /// (LIFO) so the most-recently-freed SID is reused first —
-    /// keeps the active set's SIDs clustered near the low end.
-    free_sids: Vec<u32>,
     /// Monitor ids [`destroy_channel`] retired but could not finish tearing
     /// down, because the delivery machinery lives in the driver's own
     /// registry. Drained by the driver after each dispatch — see
     /// [`ClientState::take_retired_subscriptions`]. Empty for the async
     /// server, which owns `subscriptions` and finishes in place.
     retired_subscriptions: Vec<epics_base_rs::server::event_queue::AttachId>,
+    /// Each sid `sweep_destroyed_channels` retired with
+    /// `CA_PROTO_SERVER_DISCONN`, and its channel's element count. A request
+    /// still naming one crossed that frame, and gets [`answer_retired`];
+    /// every other unknown sid keeps rsrv's answer. Freed with the circuit.
+    retired: HashMap<u32, u32>,
     /// This circuit's access-security host identity. See [`HostIdentity`]
     /// — the variant, not a runtime check at the write site, decides
     /// whether `CA_PROTO_HOST_NAME` may replace it.
@@ -983,9 +979,8 @@ impl ClientState {
             subscriptions: HashMap::new(),
             channel_access: HashMap::new(),
             channel_trap: HashMap::new(),
-            next_sid: AtomicU32::new(1),
-            free_sids: Vec::new(),
             retired_subscriptions: Vec::new(),
+            retired: HashMap::new(),
             hostname: HostIdentity::Claimed(Vec::new()),
             username: Vec::new(),
             auth_method: String::new(),
@@ -1147,21 +1142,17 @@ impl ClientState {
         }
     }
 
-    fn alloc_sid(&mut self) -> u32 {
-        // prefer recycled SIDs from CLEAR_CHANNEL'd channels.
-        // Falls back to monotonic counter only when the free list is
-        // empty, which prevents wraparound collisions on long-uptime
-        // high-churn servers (epics-base rsrv `freeListItemPvt`
-        // parity).
-        if let Some(sid) = self.free_sids.pop() {
-            return sid;
+    /// C `claim_ciu_action` (`camessage.c:1027-1042`): one process-wide
+    /// `bucketID++` from 0, skipping an id still in use — here also one this
+    /// circuit retired, which a request in flight can still name.
+    fn alloc_sid(&self) -> u32 {
+        static BUCKET_ID: AtomicU32 = AtomicU32::new(0);
+        loop {
+            let sid = BUCKET_ID.fetch_add(1, Ordering::Relaxed);
+            if !self.channels.contains_key(&sid) && !self.retired.contains_key(&sid) {
+                return sid;
+            }
         }
-        self.next_sid.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Return a SID to the free list when its channel is destroyed.
-    fn release_sid(&mut self, sid: u32) {
-        self.free_sids.push(sid);
     }
 
     /// Return the type-state-wrapped access token for a
@@ -2512,7 +2503,7 @@ where
 
 /// The single owner of "this channel is gone".
 ///
-/// Index cleanup (channel table, access token, trap mask), SID recycle,
+/// Index cleanup (channel table, access token, trap mask),
 /// pending put-callback drain (C `rsrvFreePutNotify`, `camessage.c:1889`)
 /// and subscription cancel all live here, so the two events that retire a
 /// channel — the client asking with `CA_PROTO_CLEAR_CHANNEL`, and the
@@ -2531,10 +2522,7 @@ fn destroy_channel(
 ) -> Option<ChannelEntry> {
     let entry = state.channels.remove(&sid)?;
     state.channel_access.remove(&sid);
-    // drop the parallel trap-mask entry so a recycled SID never inherits a
-    // stale trap flag.
     state.channel_trap.remove(&sid);
-    state.release_sid(sid);
     if let Some(tx) = conn_events {
         let _ = tx.send(ServerConnectionEvent::ChannelCleared {
             peer,
@@ -2629,6 +2617,7 @@ fn sweep_destroyed_channels(
     for sid in gone {
         if let Some(entry) = destroy_channel(state, sid, peer, conn_events) {
             writer.push(server_disconn_frame(entry.cid));
+            state.retired.insert(sid, entry.final_element_count);
             retired += 1;
         }
     }
@@ -3173,6 +3162,9 @@ pub(crate) async fn dispatch_message(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
+                    if let Some(&elements) = state.retired.get(&sid) {
+                        return answer_retired(writer, hdr, state, elements);
+                    }
                     // C `read_action` (camessage.c:608-611) and
                     // `read_notify_action` (707-711) bad-SID:
                     // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
@@ -3621,6 +3613,8 @@ pub(crate) async fn dispatch_message(
                          dispatch_message; it has no event thread here to multiplex on"
                     )
                 }
+                // The destruction's wake-up runs the sweep that retires it.
+                SubscriptionOutcome::Retired | SubscriptionOutcome::ChannelGone { .. } => {}
                 SubscriptionOutcome::Circuit(s) => {
                     // C `event_add_action` links the new `event_ext` onto
                     // `pciu->eventq` (`camessage.c:1846`): the channel is what
@@ -3907,6 +3901,9 @@ pub(crate) async fn dispatch_message(
             // so a probing peer could send CLEAR_CHANNEL on random
             // SIDs indefinitely.
             if !state.channels.contains_key(&sid) {
+                if let Some(&elements) = state.retired.get(&sid) {
+                    return answer_retired(writer, hdr, state, elements);
+                }
                 send_bad_resource_id(writer, hdr, LogBadId::ClearChannel, state)?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
@@ -4110,6 +4107,10 @@ pub(crate) async fn serve_write_head(
         let entry = match state.channels.get(&sid) {
             Some(e) => e,
             None => {
+                if let Some(&elements) = state.retired.get(&sid) {
+                    return answer_retired(writer, hdr, state, elements)
+                        .map(|()| WriteHeadOutcome::Done);
+                }
                 // C `write_action` (camessage.c:735-739) +
                 // `write_notify_action` (camessage.c:1641-1645):
                 // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
@@ -4327,6 +4328,10 @@ pub(crate) async fn serve_write_head(
     let entry = match state.channels.get(&sid) {
         Some(e) => e,
         None => {
+            if let Some(&elements) = state.retired.get(&sid) {
+                return answer_retired(writer, hdr, state, elements)
+                    .map(|()| WriteHeadOutcome::Done);
+            }
             // Same C logBadId + RSRV_ERROR family as the
             // ACKT/ACKS branch above and the READ branch: an
             // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
@@ -5078,6 +5083,15 @@ pub(crate) enum SubscriptionOutcome {
     /// [`SubscriptionDelivery::HandOff`]: the live reader plus the metadata the
     /// caller needs to frame deliveries; no task was spawned.
     HandedOff(RegisteredSubscription),
+    /// The sid names a channel this circuit retired; [`answer_retired`] has
+    /// answered and the circuit stays.
+    Retired,
+    /// The channel's PV is destroyed and the channel not yet retired. Nothing
+    /// is sent: as PCAS queues its `channelDestroyEvent` behind a request it
+    /// has accepted, the retirement's own `CA_PROTO_SERVER_DISCONN` is the
+    /// answer — the async server's sweep, or the blocking driver's event
+    /// thread told with [`EventTaskControl::Retire`] the client's `cid`.
+    ChannelGone { cid: u32 },
 }
 
 /// Everything the async caller needs to record a spawned subscription and emit
@@ -5192,6 +5206,10 @@ pub(crate) async fn register_subscription(
     let entry = match state.channels.get(&sid) {
         Some(e) => e,
         None => {
+            if let Some(&elements) = state.retired.get(&sid) {
+                return answer_retired(writer, hdr, state, elements)
+                    .map(|()| SubscriptionOutcome::Retired);
+            }
             // C `event_add_action` (camessage.c:1773-1777):
             // `logBadId` + RSRV_ERROR on missing channel.
             // `logBadId` emits an ECA_INTERNAL "Bad Resource ID"
@@ -5335,6 +5353,9 @@ pub(crate) async fn register_subscription(
         &context,
         pre_chain,
     ) else {
+        if target.is_destroyed() {
+            return Ok(SubscriptionOutcome::ChannelGone { cid: entry_cid });
+        }
         return Err(refuse_install(
             writer,
             hdr,
@@ -5387,6 +5408,15 @@ pub(crate) fn cancel_subscription_reply(
     // channel id draws `logBadId` (ECA_INTERNAL "Bad Resource ID") + RSRV_ERROR.
     let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
         Some(entry) => (entry.cid, entry.target.rsrv_record_name()),
+        None if state.retired.contains_key(&req_channel_sid) => {
+            // PCAS `eventCancelAction` (`casStrmClient.cc:2252-2258`): unlike
+            // the other requests, `logBadId` and the end of the circuit.
+            pcas_log_bad_id(writer, hdr, state, 2257)?;
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "EVENT_CANCEL on retired SID {req_channel_sid} (PCAS eventCancelAction \
+                 S_cas_badResourceId)"
+            )));
+        }
         None => {
             send_bad_resource_id(writer, hdr, LogBadId::EventCancel, state)?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -5477,6 +5507,10 @@ pub(crate) enum EventTaskControl {
     /// put-callback (C `camsgtask`) and there is ONE owner of async socket
     /// writes (the event thread), never a third writer.
     WriteComplete(Box<PendingWriteNotify>),
+    /// The client `cid` of a channel whose PV a request found destroyed
+    /// ([`SubscriptionOutcome::ChannelGone`]), owed its
+    /// `CA_PROTO_SERVER_DISCONN` if no end of stream has sent it.
+    Retire(u32),
 }
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
@@ -5770,6 +5804,11 @@ pub(crate) async fn run_event_task(
                 subs.retain(|s| s.reader.id() != id)
             }
             EventStep::Control(Some(EventTaskControl::WriteComplete(p))) => pending_writes.push(*p),
+            EventStep::Control(Some(EventTaskControl::Retire(cid))) => {
+                if retired.insert(cid) && sink.0.stage(&server_disconn_frame(cid)).is_err() {
+                    break;
+                }
+            }
             // End of stream, which has two causes needing opposite answers.
             //
             // The subscription went away — EVENT_CANCEL, CLEAR_CHANNEL — and
@@ -7584,6 +7623,138 @@ pub(crate) fn send_bad_resource_id(
     )
 }
 
+/// PCAS's answer to a request naming a channel this circuit retired: the
+/// `chanTable` lookup fails with ECA_BADCHID, which each `casStrmClient.cc`
+/// (v4.13.3) handler reports with the circuit kept. EVENT_CANCEL, which ends
+/// it, is [`cancel_subscription_reply`]'s. `elements` is the channel's count.
+fn answer_retired(
+    writer: &Outbox,
+    hdr: &CaHeader,
+    state: &ClientState,
+    elements: u32,
+) -> CaResult<()> {
+    let minor = state.client_minor_version;
+    let reply = |frame: Result<Vec<u8>, ExtendedHeaderUnsupported>| {
+        writer.push(frame.map_err(|_| {
+            epics_base_rs::error::CaError::Protocol(format!(
+                "retired SID {}: reply needs the extended header",
+                hdr.cid
+            ))
+        })?);
+        Ok(())
+    };
+    match hdr.cmmd {
+        // `readAction`, `writeAction` (`:463`, `:1048`); the write's says get.
+        CA_PROTO_READ | CA_PROTO_WRITE => {
+            send_ca_error(writer, hdr, ECA_BADCHID, 0xFFFF_FFFF, "get request", minor)
+        }
+        // `eventAddAction` (`:2023`): no context string at all.
+        CA_PROTO_EVENT_ADD => {
+            writer.push(error_frame(
+                hdr,
+                ECA_BADCHID,
+                0xFFFF_FFFF,
+                Vec::new(),
+                minor,
+            ));
+            Ok(())
+        }
+        // `readNotifyFailureResponse` (`:749-762`): `dbr_size_n` zeros, the
+        // status in `m_cid`. The count stops at the channel's, as a live
+        // read's does, so the zeros are bounded.
+        CA_PROTO_READ_NOTIFY => {
+            let count = hdr.actual_count().min(elements);
+            let zeros = vec![0; align8(dbr_size_n(hdr.data_type, count))];
+            reply(copy_in_header(
+                CA_PROTO_READ_NOTIFY,
+                hdr.data_type,
+                count,
+                ECA_BADCHID,
+                hdr.available,
+                &zeros,
+                minor,
+            ))
+        }
+        // `writeNotifyResponseECA_XXX` (`:1240-1251`).
+        CA_PROTO_WRITE_NOTIFY => reply(copy_in_header(
+            CA_PROTO_WRITE_NOTIFY,
+            hdr.data_type,
+            hdr.actual_count(),
+            ECA_BADCHID,
+            hdr.available,
+            &[],
+            minor,
+        )),
+        // `clearChannelAction` (`:2127-2152`): the confirmation, then `logBadId`.
+        CA_PROTO_CLEAR_CHANNEL => {
+            reply(copy_in_header(
+                CA_PROTO_CLEAR_CHANNEL,
+                hdr.data_type,
+                hdr.actual_count(),
+                hdr.cid,
+                hdr.available,
+                &[],
+                minor,
+            ))?;
+            pcas_log_bad_id(writer, hdr, state, 2151)
+        }
+        cmmd => unreachable!("command {cmmd} names no channel"),
+    }
+}
+
+/// PCAS `logBadIdWithFileAndLineno` (`casStrmClient.cc:2925-2950`) for the
+/// `logBadId` at `line`, with `__FILE__` as the pcas module build spells it.
+fn pcas_log_bad_id(
+    writer: &Outbox,
+    hdr: &CaHeader,
+    state: &ClientState,
+    line: u32,
+) -> CaResult<()> {
+    use std::io::Write;
+    const FILE: &str = "../../../../src/pcas/generic/casStrmClient.cc";
+    epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+        "CAS: bad resource id in \"{FILE}\" at line {line}\n"
+    ));
+    // `caServerI::dumpMsg` (`caServerI.cc:312-321`) puts this one on stderr.
+    let mut request = b"CAS Request: ".to_vec();
+    request.extend_from_slice(&state.username);
+    request.extend_from_slice(b" on ");
+    request.extend_from_slice(state.hostname.as_bytes());
+    let _ = writeln!(
+        request,
+        ": cmd={} cid={} typ={} cnt={} psz={} avail={:x}",
+        hdr.cmmd,
+        hdr.cid,
+        hdr.data_type,
+        hdr.actual_count(),
+        hdr.actual_postsize(),
+        hdr.available
+    );
+    let _ = std::io::stderr().write_all(&request);
+    send_ca_error(
+        writer,
+        hdr,
+        ECA_BADCHID,
+        0xFFFF_FFFF,
+        format_args!("Bad Resource ID={} detected at {FILE}.{line}", hdr.cid),
+        state.client_minor_version,
+    )
+}
+
+/// C `dbr_size_n` (`db_access.h:533-534`), whose unsigned arithmetic makes a
+/// count of 0 `dbr_size - dbr_value_size`. `data_type` is at most 38.
+fn dbr_size_n(data_type: u16, count: u32) -> usize {
+    let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) else {
+        return 0;
+    };
+    let size = epics_base_rs::types::dbr_buffer_size(data_type, native, 1);
+    let value_size = native.element_size();
+    match count {
+        0 => size - value_size,
+        n => size + (n as usize - 1) * value_size,
+    }
+}
+
 /// The two `event_add_action` install failures, each `log_header`, an
 /// `ECA_ALLOCMEM` frame and `RSRV_ERROR`; this port's subscription caps
 /// fail at the same stages.
@@ -7667,6 +7838,24 @@ pub(crate) fn build_ca_error_frame(
     message.write_to(&mut error_msg_bytes);
     error_msg_bytes.truncate(CA_PROTO_ERROR_MAX_DIAG_LEN);
     error_msg_bytes.push(0);
+    error_frame(
+        original_hdr,
+        eca_status,
+        chan_cid,
+        error_msg_bytes,
+        client_minor,
+    )
+}
+
+/// [`build_ca_error_frame`] from the diagnostic's bytes, NUL included: PCAS
+/// `sendErr` (`casStrmClient.cc:2807-2829`) sends none for a NULL format.
+fn error_frame(
+    original_hdr: &CaHeader,
+    eca_status: u32,
+    chan_cid: u32,
+    mut error_msg_bytes: Vec<u8>,
+    client_minor: u16,
+) -> Vec<u8> {
     error_msg_bytes.resize(align8(error_msg_bytes.len()), 0);
     // C `vsend_err` (`rsrv/camessage.c:201-223`) picks the echo's form from
     // the request's ACTUAL size and count — `(m_postsize >= 0xffff ||
@@ -12721,6 +12910,47 @@ mod destroyed_channel_teardown_tests {
         handle.abort();
     }
 
+    /// C `claim_ciu_action` takes each sid from `bucketID++`
+    /// (`camessage.c:1027-1042`), so a retired channel's sid does not come
+    /// back for the next channel, and a request already in flight when
+    /// `CA_PROTO_SERVER_DISCONN` left cannot land on it.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retired_sid_is_not_handed_to_the_next_channel() {
+        const GONE: u32 = 0x2222_2222;
+        const NEXT: u32 = 0x3333_3333;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BR3:gone", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        db.add_pv("BR3:next", EpicsValue::Double(2.0))
+            .await
+            .expect("add pv");
+        let peer: SocketAddr = "127.0.0.1:55304".parse().unwrap();
+        let (mut client, _conn_rx, _acf_tx, handle) = spawn_server(db.clone(), peer);
+
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(GONE, "BR3:gone"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush");
+        let retired = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        db.remove_simple_pv("BR3:gone").await.expect("was there");
+        read_until_cmmd(&mut client, CA_PROTO_SERVER_DISCONN, Duration::from_secs(3)).await;
+
+        client
+            .write_all(&create_chan_frame(NEXT, "BR3:next"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush");
+        let next = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        assert_ne!(next, retired, "the retired sid names the next channel");
+
+        drop(client);
+        handle.abort();
+    }
+
     /// A channel on a PV that was NOT destroyed survives the sweep — the
     /// wake-up carries no name, so the sweep has to be the thing that
     /// discriminates, and it must discriminate by target identity.
@@ -13005,6 +13235,302 @@ mod destroyed_channel_teardown_tests {
             ops.push(op);
         }
         assert_eq!(ops, [Op::Stage(CA_PROTO_SERVER_DISCONN), Op::Send]);
+    }
+
+    /// One CA header as the wire carries it.
+    fn wire_hdr(
+        cmmd: u16,
+        postsize: u16,
+        data_type: u16,
+        count: u16,
+        cid: u32,
+        available: u32,
+    ) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.postsize = postsize;
+        h.data_type = data_type;
+        h.count = count;
+        h.cid = cid;
+        h.available = available;
+        h.to_bytes().to_vec()
+    }
+
+    /// The `CA_PROTO_ERROR` echoing `request`'s header, with `diag` if any.
+    fn error_reply(request: &[u8], status: u32, diag: Option<&str>) -> Vec<u8> {
+        let mut body = request[..CaHeader::SIZE].to_vec();
+        if let Some(diag) = diag {
+            body.extend_from_slice(diag.as_bytes());
+            body.push(0);
+        }
+        body.resize(align8(body.len()), 0);
+        let mut frame = wire_hdr(CA_PROTO_ERROR, body.len() as u16, 0, 0, u32::MAX, status);
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    /// The next whole frame, or `None` once the server has closed.
+    #[cfg(tokio_backend)]
+    async fn next_frame<R: tokio::io::AsyncRead + Unpin>(client: &mut R) -> Option<Vec<u8>> {
+        let mut frame = vec![0u8; CaHeader::SIZE];
+        let read = tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut frame))
+            .await
+            .expect("a frame or the close within 3 s");
+        read.ok()?;
+        let postsize = usize::from(u16::from_be_bytes([frame[2], frame[3]]));
+        frame.resize(CaHeader::SIZE + postsize, 0);
+        client
+            .read_exact(&mut frame[CaHeader::SIZE..])
+            .await
+            .expect("frame body");
+        Some(frame)
+    }
+
+    /// A circuit whose channel on `name` the server has retired, and its
+    /// sid. The ACF sender is held: its drop ends the circuit.
+    #[cfg(tokio_backend)]
+    async fn retired_circuit(
+        db: &Arc<PvDatabase>,
+        name: &str,
+        peer: SocketAddr,
+    ) -> (
+        tokio::io::DuplexStream,
+        (tokio::task::JoinHandle<CaResult<()>>, broadcast::Sender<()>),
+        u32,
+    ) {
+        db.add_pv(name, EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let (mut client, _conn_rx, acf_tx, handle) = spawn_server(db.clone(), peer);
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0x4444_4444, name))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        db.remove_simple_pv(name).await.expect("was there");
+        read_until_cmmd(&mut client, CA_PROTO_SERVER_DISCONN, Duration::from_secs(3)).await;
+        (client, (handle, acf_tx), sid)
+    }
+
+    /// The br3 race: the gateway's EVENT_ADD crosses the
+    /// `CA_PROTO_SERVER_DISCONN` retiring its channel. PCAS `eventAddAction`
+    /// answers ECA_BADCHID and keeps the circuit (`casStrmClient.cc:2023`);
+    /// rsrv's bad-resource-id disconnect cost the gateway ~10 s to reconnect.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_add_crossing_server_disconn_keeps_the_circuit() {
+        let db = Arc::new(PvDatabase::new());
+        let peer: SocketAddr = "127.0.0.1:55305".parse().unwrap();
+        let (mut client, handle, sid) = retired_circuit(&db, "BR3:race", peer).await;
+
+        let add = event_add_frame(sid, 1);
+        client.write_all(&add).await.expect("event_add");
+        assert_eq!(
+            next_frame(&mut client).await,
+            Some(error_reply(&add, ECA_BADCHID, None))
+        );
+        client
+            .write_all(&wire_hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0))
+            .await
+            .expect("echo");
+        let echo = next_frame(&mut client).await.expect("the circuit is kept");
+        assert_eq!(u16::from_be_bytes([echo[0], echo[1]]), CA_PROTO_ECHO);
+
+        drop(client);
+        handle.0.abort();
+    }
+
+    /// Each request on a retired sid, answered as PCAS v4.13.3 `excas`
+    /// answers a sid its `chanTable` does not hold (captured on the wire).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_request_on_a_retired_sid_gets_the_pcas_answer() {
+        const FILE: &str = "../../../../src/pcas/generic/casStrmClient.cc";
+        let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = logged.clone();
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+            if line.contains(FILE) {
+                sink.lock().unwrap().push(line.to_string());
+            }
+        });
+        let db = Arc::new(PvDatabase::new());
+        let peer: SocketAddr = "127.0.0.1:55306".parse().unwrap();
+        let (mut client, handle, sid) = retired_circuit(&db, "BR3:pcas", peer).await;
+        let double = 1.0f64.to_be_bytes();
+        let mut mon_info = vec![0u8; 16];
+        mon_info[12..14].copy_from_slice(&5u16.to_be_bytes());
+        let with = |hdr: Vec<u8>, payload: &[u8]| [hdr, payload.to_vec()].concat();
+        let get = Some("get request");
+        let bad_id = |line| format!("Bad Resource ID={sid} detected at {FILE}.{line}");
+
+        let read = wire_hdr(CA_PROTO_READ, 0, 6, 1, sid, 7);
+        let write = with(wire_hdr(CA_PROTO_WRITE, 8, 6, 1, sid, 7), &double);
+        let add = with(wire_hdr(CA_PROTO_EVENT_ADD, 16, 6, 1, sid, 9), &mon_info);
+        let clear = wire_hdr(CA_PROTO_CLEAR_CHANNEL, 0, 0, 0, sid, 0x55);
+        let cases: [(Vec<u8>, Vec<Vec<u8>>); 7] = [
+            (read.clone(), vec![error_reply(&read, ECA_BADCHID, get)]),
+            (
+                wire_hdr(CA_PROTO_READ_NOTIFY, 0, 6, 1, sid, 7),
+                vec![with(
+                    wire_hdr(CA_PROTO_READ_NOTIFY, 8, 6, 1, ECA_BADCHID, 7),
+                    &[0; 8],
+                )],
+            ),
+            (
+                wire_hdr(CA_PROTO_READ_NOTIFY, 0, 0, 1, sid, 7),
+                vec![with(
+                    wire_hdr(CA_PROTO_READ_NOTIFY, 40, 0, 1, ECA_BADCHID, 7),
+                    &[0; 40],
+                )],
+            ),
+            (write.clone(), vec![error_reply(&write, ECA_BADCHID, get)]),
+            (
+                with(wire_hdr(CA_PROTO_WRITE_NOTIFY, 8, 6, 1, sid, 7), &double),
+                vec![wire_hdr(CA_PROTO_WRITE_NOTIFY, 0, 6, 1, ECA_BADCHID, 7)],
+            ),
+            (add.clone(), vec![error_reply(&add, ECA_BADCHID, None)]),
+            (
+                clear.clone(),
+                vec![
+                    clear.clone(),
+                    error_reply(&clear, ECA_BADCHID, Some(&bad_id(2151))),
+                ],
+            ),
+        ];
+        for (request, want) in cases {
+            client.write_all(&request).await.expect("request");
+            for frame in want {
+                assert_eq!(next_frame(&mut client).await, Some(frame), "{request:02x?}");
+            }
+        }
+        // `eventCancelAction` alone ends the circuit.
+        let cancel = wire_hdr(CA_PROTO_EVENT_CANCEL, 0, 6, 1, sid, 9);
+        client.write_all(&cancel).await.expect("event_cancel");
+        assert_eq!(
+            next_frame(&mut client).await,
+            Some(error_reply(&cancel, ECA_BADCHID, Some(&bad_id(2257))))
+        );
+        assert_eq!(
+            next_frame(&mut client).await,
+            None,
+            "closed after EVENT_CANCEL"
+        );
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        assert_eq!(
+            *logged.lock().unwrap(),
+            [2151, 2257].map(|line| format!("CAS: bad resource id in \"{FILE}\" at line {line}\n"))
+        );
+        handle.0.abort();
+    }
+
+    /// A sid this circuit never issued still gets softIoc's answer beside a
+    /// retired one: ECA_INTERNAL "Bad Resource ID" and the disconnect.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_garbage_sid_beside_a_retired_one_gets_the_softioc_answer() {
+        let db = Arc::new(PvDatabase::new());
+        let peer: SocketAddr = "127.0.0.1:55307".parse().unwrap();
+        let (mut client, handle, _retired) = retired_circuit(&db, "BR3:garbage", peer).await;
+
+        let add = event_add_frame(0xFFFF_FFF0, 1);
+        client.write_all(&add).await.expect("event_add");
+        assert_eq!(
+            next_frame(&mut client).await,
+            Some(error_reply(
+                &add,
+                ECA_INTERNAL,
+                Some("Bad Resource ID at ../rsrv/camessage.c.1825")
+            ))
+        );
+        assert_eq!(
+            next_frame(&mut client).await,
+            None,
+            "softIoc ends the circuit"
+        );
+        handle.0.abort();
+    }
+
+    /// An EVENT_ADD on a channel whose PV is destroyed but not yet swept
+    /// sends nothing: the sweep's `CA_PROTO_SERVER_DISCONN` answers it, as
+    /// PCAS's queued `channelDestroyEvent` follows a request it accepted.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn an_event_add_on_an_unswept_destroyed_channel_is_left_to_the_retirement() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BR3:unswept", EpicsValue::Double(1.0))
+            .await
+            .expect("add pv");
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let peer: SocketAddr = "127.0.0.1:55308".parse().unwrap();
+        let version = CaHeader::from_bytes(&version_frame()).expect("header");
+        let create = create_chan_frame(0x1234, "BR3:unswept");
+        let create_hdr = CaHeader::from_bytes(&create).expect("header");
+        for (hdr, payload) in [(version, &[][..]), (create_hdr, &create[CaHeader::SIZE..])] {
+            dispatch_message(
+                &hdr,
+                payload,
+                &mut state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
+            )
+            .await
+            .expect("dispatch");
+        }
+        let sid = *state.channels.keys().next().expect("the channel");
+        while drain.try_next().is_some() {}
+        db.remove_simple_pv("BR3:unswept").await.expect("was there");
+
+        let add = event_add_frame(sid, 1);
+        let outcome = register_subscription(
+            &CaHeader::from_bytes(&add).expect("header"),
+            &add[CaHeader::SIZE..],
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Ok(SubscriptionOutcome::ChannelGone { cid: 0x1234 })
+        ));
+        assert!(drain.try_next().is_none(), "nothing on the wire");
+    }
+
+    /// [`EventTaskControl::Retire`] owes the channel one frame, shared with
+    /// the end of stream that may already have sent it.
+    // RTEMS-EXEC-MODEL-ALLOW(1): drives `run_event_task` on the test runtime
+    // with a recording sink, no socket.
+    #[tokio::test]
+    async fn retire_sends_one_server_disconn_per_channel() {
+        use epics_base_rs::server::event_queue::EventUser;
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        for cid in [7, 7, 8] {
+            ctl_tx
+                .send(EventTaskControl::Retire(cid))
+                .expect("receiver is held");
+        }
+        drop(ctl_tx);
+        let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
+        run_event_task(Arc::new(EventUser::new()), ctl_rx, Record(op_tx)).await;
+        let mut ops = Vec::new();
+        while let Ok(op) = op_rx.try_recv() {
+            ops.push(op);
+        }
+        assert_eq!(
+            ops,
+            [
+                Op::Stage(CA_PROTO_SERVER_DISCONN),
+                Op::Stage(CA_PROTO_SERVER_DISCONN),
+                Op::Send
+            ]
+        );
     }
 }
 

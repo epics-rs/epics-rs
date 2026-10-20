@@ -678,16 +678,15 @@ pub(crate) struct SearchReplyBatch {
     /// One outbound datagram in progress. Byte 0 holds the seeded VERSION
     /// placeholder; SEARCH replies are appended after it.
     send_buf: Vec<u8>,
-    /// C `seqNoOfReq`: the last VERSION's `m_cid` if it is CA_V411, else 0
-    /// (`camessage.c:2157-2161`); echoed in the reply VERSION.
-    client_seq: u32,
-    /// Largest VERSION minor seen this batch; drives the CA_V411
-    /// keep/strip decision at flush time. C flushes with whatever the last
-    /// datagram left, and resets it for a new peer before flushing the old
-    /// peer's batch (`cast_server.c:197-212`), so a batch ending in a
-    /// VERSION-less datagram or flushed by another peer's loses its VERSION
-    /// header. That ordering is a C defect and is not copied.
-    client_minor: Option<u16>,
+    /// The minor and `m_cid` of this batch's last VERSION, unsupported ones
+    /// included: C `udp_version_action` stores both before refusing
+    /// (`camessage.c:2150-2161`), and the flush keeps the header, echoing
+    /// the `m_cid`, only for a CA_V411 minor. C also resets them per
+    /// datagram, before flushing the old peer's batch (`cast_server.c:197-212`),
+    /// so a batch ending in a VERSION-less datagram or flushed by another
+    /// peer's loses its VERSION header. That ordering is a C defect and is
+    /// not copied.
+    last_version: Option<(u16, u32)>,
 }
 
 impl SearchReplyBatch {
@@ -698,7 +697,7 @@ impl SearchReplyBatch {
     /// equivalent through `flush_send_buf`. Encapsulates the private batch
     /// fields so the shaping stays in one place.
     pub(crate) fn shape_trailing(&self) -> Option<Vec<u8>> {
-        shape_search_reply_dg(&self.send_buf, self.client_minor, self.client_seq)
+        shape_search_reply_dg(&self.send_buf, self.last_version)
     }
 
     /// Shape the current batch into its on-wire datagram (or `None` when
@@ -707,7 +706,7 @@ impl SearchReplyBatch {
     /// boundary — a recv-queue drain (FIONREAD == 0), a peer change, or
     /// shutdown — which is byte-equivalent to the async responder's
     /// `flush_send_buf` (shape + `send_buf.clear()`) followed by the
-    /// peer-change `client_seq`/`client_minor` reset (`recv_loop`,
+    /// peer-change `last_version` reset (`recv_loop`,
     /// udp.rs:846-849). Resetting the whole batch keeps the invariant "a
     /// non-empty batch's `client_*` echo state belongs to its own replies"
     /// true by construction for the next group.
@@ -780,8 +779,7 @@ pub(crate) async fn parse_search_datagram(
     const UDP_FLUSH_THRESHOLD: usize = 1024;
     let SearchReplyBatch {
         send_buf,
-        client_seq,
-        client_minor,
+        last_version,
     } = batch;
     // C `cast_server.c:197` resets it for every datagram.
     let mut minor = 0;
@@ -845,6 +843,7 @@ pub(crate) async fn parse_search_datagram(
         }
         if hdr.cmmd == CA_PROTO_VERSION {
             minor = crate::protocol::declared_minor(&hdr);
+            *last_version = Some((minor, hdr.cid));
             // C `udp_version_action` returns RSRV_ERROR on
             // `!CA_VSUPPORTED(m_count)` and the UDP dispatcher
             // breaks out of the current datagram on any non-OK
@@ -857,13 +856,6 @@ pub(crate) async fn parse_search_datagram(
             if !crate::protocol::declares_supported_version(&hdr) {
                 break;
             }
-            // track the largest VERSION minor seen so the
-            // flush-time placeholder strip/keep decision matches
-            // `CA_V411(minor_version_number)` regardless of
-            // whether the inbound's leading frame is VERSION,
-            // SEARCH, or chained.
-            *client_minor = Some(client_minor.unwrap_or(0).max(minor));
-            *client_seq = if minor >= 11 { hdr.cid } else { 0 };
         }
         if hdr.cmmd == CA_PROTO_SEARCH {
             // C `search_reply_udp` (rsrv/camessage.c:2151-2153)
@@ -984,9 +976,7 @@ pub(crate) async fn parse_search_datagram(
                         // to the caller to send, and begin a fresh batch. C
                         // `cas_copy_in_header` flushes mid-build the same way
                         // (`caserverio.c:280-294`).
-                        if let Some(dg) =
-                            shape_search_reply_dg(&send_buf[..], *client_minor, *client_seq)
-                        {
+                        if let Some(dg) = shape_search_reply_dg(&send_buf[..], *last_version) {
                             ready.push(dg);
                         }
                         send_buf.clear();
@@ -1187,8 +1177,7 @@ async fn recv_loop(
                         // src, then reset batch state for the new src.
                         flush_send_buf(&socket, current_src, &mut batch, &bind_ip).await;
                         current_src = peek_src;
-                        batch.client_seq = 0;
-                        batch.client_minor = None;
+                        batch.last_version = None;
                     }
                     // Replace `current_buf` with the accepted
                     // datagram's bytes BEFORE re-entering `'parse` so
@@ -1216,21 +1205,20 @@ async fn recv_loop(
 /// thread-per-client responder (`crate::server::blocking`), so a reply is
 /// byte-identical on either front-end.
 ///
-/// If `client_minor >= 11` (CA_V411 peer), the seeded VERSION placeholder
-/// at bytes 0..16 is patched with the final header (cid = client seq,
+/// If the last VERSION's minor is CA_V411, the seeded VERSION placeholder
+/// at bytes 0..16 is patched with the final header (cid = its `m_cid`,
 /// data_type = `sequenceNoIsValid`). Otherwise the 16-byte placeholder
 /// is stripped — pre-V4.11 peers must not see the VERSION header. Returns
 /// `None` when there is nothing to send. Does not mutate `send_buf`; the
 /// caller clears it after a flush.
 pub(crate) fn shape_search_reply_dg(
     send_buf: &[u8],
-    client_minor: Option<u16>,
-    client_seq: u32,
+    last_version: Option<(u16, u32)>,
 ) -> Option<Vec<u8>> {
     if send_buf.is_empty() {
         return None;
     }
-    if client_minor.is_some_and(|m| m >= 11) {
+    if let Some((11.., client_seq)) = last_version {
         // Patch placeholder at bytes 0..16 with final seq/data_type.
         // The placeholder was seeded with cid=0, data_type=0.
         let mut out = send_buf.to_vec();
@@ -1278,9 +1266,7 @@ async fn flush_send_buf(
     batch: &mut SearchReplyBatch,
     bind_ip: &Ipv4Addr,
 ) {
-    if let Some(payload) =
-        shape_search_reply_dg(&batch.send_buf, batch.client_minor, batch.client_seq)
-    {
+    if let Some(payload) = shape_search_reply_dg(&batch.send_buf, batch.last_version) {
         send_reply_dg(socket, src, &payload, bind_ip).await;
     }
     batch.send_buf.clear();

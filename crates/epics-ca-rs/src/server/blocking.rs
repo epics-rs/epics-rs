@@ -1643,6 +1643,12 @@ fn handle_client_blocking(
                         Ok(Ok(SubscriptionOutcome::Circuit(_))) => {
                             unreachable!("HandOff mode never spawns a task")
                         }
+                        Ok(Ok(SubscriptionOutcome::Retired)) => {}
+                        // No broadcast wakes this driver, so the request that
+                        // found the PV gone hands the retirement over.
+                        Ok(Ok(SubscriptionOutcome::ChannelGone { cid })) => {
+                            let _ = ev_tx.send(EventTaskControl::Retire(cid));
+                        }
                         Ok(Err(e)) => {
                             let _ = drain_outbox_locked(&send_lock, &mut drain);
                             print_forcing_disconnect(peer);
@@ -2705,7 +2711,8 @@ mod tests {
         };
         run(&mut state, version_frame());
         run(&mut state, create_chan_frame(cid, pv));
-        run(&mut state, read_notify_frame(1, ioid, dbr_type));
+        let sid = created_sid(&mut drain);
+        run(&mut state, read_notify_frame(sid, ioid, dbr_type));
 
         let mut reply = None;
         while let Some(f) = drain.try_next() {
@@ -2831,7 +2838,6 @@ mod tests {
         c.write_all(&create_chan_frame(0x1234, "BLK:PV")).unwrap();
         let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
         let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]); // m_available = sid
-        assert_eq!(sid, 1, "first channel gets sid 1 (next_sid starts at 1)");
 
         // Read it.
         let ioid = 0x7777;
@@ -4287,7 +4293,13 @@ mod tests {
     fn write_test_session(
         pv: &str,
         seed: EpicsValue,
-    ) -> (Arc<PvDatabase>, ClientState, outbox::Outbox, OutboxDrain) {
+    ) -> (
+        Arc<PvDatabase>,
+        ClientState,
+        outbox::Outbox,
+        OutboxDrain,
+        u32,
+    ) {
         let db = seed_db(&[(pv, seed)]);
         let acf = new_acf();
         let mut state = ClientState::new(acf, 5064, db.clone());
@@ -4311,8 +4323,19 @@ mod tests {
             .unwrap()
             .unwrap();
         }
+        let sid = created_sid(&mut drain);
         while drain.try_next().is_some() {}
-        (db, state, outbox, drain)
+        (db, state, outbox, drain, sid)
+    }
+
+    /// The sid the queued CREATE_CHAN reply carries in `m_available`.
+    fn created_sid(drain: &mut OutboxDrain) -> u32 {
+        while let Some(f) = drain.try_next() {
+            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_CREATE_CHAN {
+                return u32::from_be_bytes([f[12], f[13], f[14], f[15]]);
+            }
+        }
+        panic!("no CREATE_CHAN reply")
     }
 
     /// epics-base #934 (4128a7c07): `write_notify_action` cross-checks
@@ -4322,7 +4345,7 @@ mod tests {
     /// silently truncated by `from_bytes_array` and the put proceeded.
     #[test]
     fn write_notify_payload_shorter_than_declared_count_drops_silently() {
-        let (db, mut state, outbox, mut drain) =
+        let (db, mut state, outbox, mut drain, sid) =
             write_test_session("WR:ARR", EpicsValue::DoubleArray(vec![1.0, 2.0].into()));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
@@ -4331,7 +4354,7 @@ mod tests {
             CA_PROTO_WRITE_NOTIFY,
             DBR_DOUBLE_MON,
             2,
-            1,
+            sid,
             0x51,
             &9.0f64.to_be_bytes(),
         );
@@ -4371,7 +4394,7 @@ mod tests {
     /// (an array landed in a scalar channel) and echoed back.
     #[test]
     fn write_notify_count_above_capacity_clamps_to_channel_elements() {
-        let (db, mut state, outbox, mut drain) =
+        let (db, mut state, outbox, mut drain, sid) =
             write_test_session("WR:CLAMP", EpicsValue::Double(1.0));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
@@ -4380,7 +4403,14 @@ mod tests {
         for v in [9.0f64, 8.0, 7.0, 6.0] {
             payload.extend_from_slice(&v.to_be_bytes());
         }
-        let f = put_frame(CA_PROTO_WRITE_NOTIFY, DBR_DOUBLE_MON, 4, 1, 0x52, &payload);
+        let f = put_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            DBR_DOUBLE_MON,
+            4,
+            sid,
+            0x52,
+            &payload,
+        );
         let (hdr, hdr_size) =
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
         let payload = f[hdr_size..].to_vec();
@@ -4419,7 +4449,7 @@ mod tests {
     /// and the alarm-ack path ran with a value the peer never sent.
     #[test]
     fn write_put_ackt_with_empty_payload_drops_silently() {
-        let (db, mut state, outbox, mut drain) =
+        let (db, mut state, outbox, mut drain, sid) =
             write_test_session("WR:ACK", EpicsValue::Double(1.0));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
@@ -4427,7 +4457,7 @@ mod tests {
             CA_PROTO_WRITE,
             epics_base_rs::types::DBR_PUT_ACKT,
             1,
-            1,
+            sid,
             0x53,
             &[],
         );
@@ -4458,14 +4488,14 @@ mod tests {
     /// Dispatch a scalar DBR_STRING WRITE of `body` to `WR:STR`, seeded
     /// with `"seed"`; the dispatch result and the stored value.
     fn write_scalar_string(body: &[u8]) -> (CaResult<()>, EpicsValue) {
-        let (db, mut state, outbox, _drain) =
+        let (db, mut state, outbox, _drain, sid) =
             write_test_session("WR:STR", EpicsValue::String("seed".into()));
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let f = put_frame(
             CA_PROTO_WRITE,
             epics_base_rs::types::DBR_STRING,
             1,
-            1,
+            sid,
             0x54,
             body,
         );
@@ -4517,10 +4547,10 @@ mod tests {
     fn a_scalar_string_put_without_a_nul_drops_the_circuit() {
         for body in [&b"AAAAAAAA"[..], b"", &[b'a'; 40]] {
             for cmmd in [CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY] {
-                let (db, mut state, outbox, mut drain) =
+                let (db, mut state, outbox, mut drain, sid) =
                     write_test_session("WR:STR", EpicsValue::String("x".into()));
                 let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-                let f = put_frame(cmmd, epics_base_rs::types::DBR_STRING, 1, 1, 0x54, body);
+                let f = put_frame(cmmd, epics_base_rs::types::DBR_STRING, 1, sid, 0x54, body);
                 let (hdr, hdr_size) =
                     CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
                 let payload = f[hdr_size..].to_vec();
@@ -4693,7 +4723,6 @@ mod tests {
         c.write_all(&create_chan_frame(0x1234, "BLK:MON")).unwrap();
         let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
         let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
-        assert_eq!(sid, 1, "first channel gets sid 1");
 
         // Subscribe → initial value.
         let sub_id = 0xAB;

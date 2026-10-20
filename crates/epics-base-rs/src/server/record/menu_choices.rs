@@ -564,7 +564,7 @@ pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
 /// C routes it through the record's `put_enum_str` rset slot
 /// ([`Record::enum_str_state`](crate::server::record::Record::enum_str_state))
 /// and, when no state matched, falls back to `epicsParseUInt16` + the
-/// `get_enum_strs` bound (`val < no_str`) — see [`cvt_st_e`].
+/// `get_enum_strs` bound (`val < no_str`) — see `cvt_st_e`.
 ///
 /// A record whose `enum_state_strings` is `None` leaves both rset slots NULL in
 /// C (`mbbiDirect`/`mbboDirect`), and `putStringEnum` fails the put with

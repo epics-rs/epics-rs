@@ -988,7 +988,7 @@ pub enum LinkReadAs {
     UInt64,
     /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer. Numeric
     /// sources convert as [`Self::UShort`] does. A one-element `DBF_STRING`
-    /// source is [`cvt_st_e`](super::cvt_st_e) against the SOURCE record; a
+    /// source is `cvt_st_e` against the SOURCE record; a
     /// longer one parses element 0 (`getStringUshort`). Where C writes nothing
     /// (NORD=0) the read delivers an empty `EnumArray`, so the buffer stays the
     /// reader's and this request can be cached in the plan.

@@ -101,7 +101,7 @@ pub struct MotorDeviceState {
 ///
 /// devMotorAsyn's `statusCallback` and `asynCallback`, and motordevCom's
 /// `motor_callback`, `dbProcess` under `dbScanLock` on the driver's thread
-/// ([`call_back`]). The settle delay and a devMotorSim callback leave
+/// (`call_back`). The settle delay and a devMotorSim callback leave
 /// their state for the next pass and ask for one on the record's io_intr
 /// task (`scanOnce`).
 #[derive(Debug, Default)]
@@ -195,7 +195,7 @@ pub(crate) fn async_callback(
 
 impl MotorDeviceState {
     /// C `statusCallback` (devMotorAsyn.c:755-762) under the record's lock
-    /// ([`call_back`]): copy the post, and unless a move is pending process
+    /// (`call_back`): copy the post, and unless a move is pending process
     /// with `needUpdate`.
     pub fn status_callback(&mut self, status: StampedStatus) -> IoIntrAction {
         self.callbacks.status = status.status.clone();
@@ -232,7 +232,7 @@ impl MotorDeviceState {
 
     /// C `asynCallback`'s tail for a move-class command, whatever the write
     /// returned, under the record's lock (devMotorAsyn.c:717-726,
-    /// [`async_callback`]): the last move to finish processes the record
+    /// `async_callback`): the last move to finish processes the record
     /// with the last status posted.
     pub fn move_done(&mut self) -> IoIntrAction {
         let callbacks = &mut self.callbacks;
@@ -574,7 +574,7 @@ impl AxisSubscribers {
     }
 
     /// `record`'s move-class command finished: its `asynCallback`
-    /// ([`async_callback`]).
+    /// (`async_callback`).
     pub fn move_done(&self, record: RecordId, command: &crate::flags::MotorCommand) {
         let Some((state, trace)) = self
             .lock()

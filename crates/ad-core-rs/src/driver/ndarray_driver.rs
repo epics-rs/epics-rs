@@ -15,7 +15,7 @@ use crate::attributes::{
 };
 use crate::color::NDColorMode;
 use crate::ndarray::NDArray;
-use crate::ndarray_pool::{DriverArray, DriverPool, NDArrayPool, PublishedArray};
+use crate::ndarray_pool::{DriverArray, DriverPool, NDArrayPool, PersistentArray, PublishedArray};
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
 
@@ -1272,7 +1272,26 @@ pub struct ArrayOwner {
     queued: Arc<QueuedArrayCounter>,
     port: std::sync::OnceLock<asyn_rs::port_handle::WeakPortHandle>,
     attributes: Arc<parking_lot::Mutex<DriverAttributes>>,
-    arrays: parking_lot::Mutex<Vec<Option<Arc<NDArray>>>>,
+    arrays: parking_lot::Mutex<Vec<Option<Held>>>,
+}
+
+/// What C's `pArrays[addr]` points at.
+enum Held {
+    /// An array handed over whole, which nothing changes after.
+    Shared(Arc<NDArray>),
+    /// An array the driver goes on writing into, as NDDriverStdArrays does
+    /// its `pArrays[0]` (NDDriverStdArrays.cpp:220-250).
+    Persistent(Box<PersistentArray>),
+}
+
+impl Held {
+    /// The array a reader gets: a persistent one's current publish.
+    fn array(&mut self) -> Arc<NDArray> {
+        match self {
+            Self::Shared(array) => array.clone(),
+            Self::Persistent(array) => array.published().array().clone(),
+        }
+    }
 }
 
 impl ArrayOwner {
@@ -1315,19 +1334,25 @@ impl ArrayOwner {
     /// `preAllocateBuffers` template (asynNDArrayDriver.cpp:717-726).
     /// Returns what the slot held.
     pub fn store_array(&self, addr: usize, array: Arc<NDArray>) -> Option<Arc<NDArray>> {
-        Self::slot(&mut self.arrays.lock(), addr).replace(array)
+        Self::slot(&mut self.arrays.lock(), addr)
+            .replace(Held::Shared(array))
+            .map(|mut held| held.array())
     }
 
     /// The array [`ArrayOwner::store_array`] last left at `addr`.
     pub fn array(&self, addr: usize) -> Option<Arc<NDArray>> {
-        self.arrays.lock().get(addr).cloned().flatten()
+        self.arrays.lock().get_mut(addr)?.as_mut().map(Held::array)
     }
 
     /// C's driver releasing `pArrays[addr]` and leaving it NULL, as Timepix3
     /// does to a band it no longer fills (serval_stream.cpp:476-479).
     /// Returns what the slot held.
     pub fn release_array(&self, addr: usize) -> Option<Arc<NDArray>> {
-        self.arrays.lock().get_mut(addr)?.take()
+        self.arrays
+            .lock()
+            .get_mut(addr)?
+            .take()
+            .map(|mut held| held.array())
     }
 
     /// C's driver releasing `pArrays[addr]` and allocating the next array
@@ -1345,8 +1370,36 @@ impl ArrayOwner {
         // Released first, so `make` can reuse its buffer.
         drop(slot.take());
         let array = make()?.share();
-        *slot = Some(array.array().clone());
+        *slot = Some(Held::Shared(array.array().clone()));
         Some(array)
+    }
+
+    /// [`ArrayOwner::replace_array`] for an array the driver then writes into
+    /// in place, as NDDriverStdArrays allocates its `pArrays[0]`
+    /// (NDDriverStdArrays.cpp:153-158). `false` is a refused `make`.
+    pub fn replace_persistent(
+        &self,
+        addr: usize,
+        make: impl FnOnce() -> Option<DriverArray>,
+    ) -> bool {
+        let mut arrays = self.arrays.lock();
+        let slot = Self::slot(&mut arrays, addr);
+        drop(slot.take());
+        *slot = make().map(|array| Held::Persistent(Box::new(PersistentArray::new(array))));
+        slot.is_some()
+    }
+
+    /// The array [`ArrayOwner::replace_persistent`] left at `addr`, under the
+    /// lock, so a reader waits through `f`; `None` when the slot holds none.
+    pub fn persistent<R>(
+        &self,
+        addr: usize,
+        f: impl FnOnce(&mut PersistentArray) -> R,
+    ) -> Option<R> {
+        match self.arrays.lock().get_mut(addr)? {
+            Some(Held::Persistent(array)) => Some(f(array)),
+            _ => None,
+        }
     }
 
     /// C's driver changing its `pArrays[addr]` in place under the driver
@@ -1369,20 +1422,20 @@ impl ArrayOwner {
             Err(shared) => match shared.pool().alloc_copy(&shared) {
                 Ok(copy) => copy,
                 Err(e) => {
-                    *slot = Some(shared.array().clone());
+                    *slot = Some(Held::Shared(shared.array().clone()));
                     return Err(e);
                 }
             },
         };
         change(&mut array);
         let array = array.share();
-        *slot = Some(array.array().clone());
+        *slot = Some(Held::Shared(array.array().clone()));
         Ok(array)
     }
 
-    fn slot(arrays: &mut Vec<Option<Arc<NDArray>>>, addr: usize) -> &mut Option<Arc<NDArray>> {
+    fn slot(arrays: &mut Vec<Option<Held>>, addr: usize) -> &mut Option<Held> {
         if arrays.len() <= addr {
-            arrays.resize(addr + 1, None);
+            arrays.resize_with(addr + 1, || None);
         }
         &mut arrays[addr]
     }
@@ -2003,6 +2056,34 @@ pub(crate) mod tests {
         assert!(owner.array(2).is_none());
         assert_eq!(pool.num_free_buffers(), 1);
         assert!(owner.release_array(5).is_none());
+    }
+
+    /// NDDriverStdArrays's `pArrays[0]`: written in place whoever holds its
+    /// publish, read as its current publish, on its one pool charge.
+    #[test]
+    fn a_persistent_slot_is_written_in_place_and_read_as_its_publish() {
+        use crate::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+        let pool = crate::ndarray_pool::DriverPool::standalone(1_000_000);
+        let owner = pool.owner().clone();
+        let f64s = |a: &NDArray| match &a.data {
+            NDDataBuffer::F64(v) => v.clone(),
+            other => panic!("{:?}", other.data_type()),
+        };
+        assert!(owner.replace_persistent(0, || {
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Float64)
+                .ok()
+        }));
+        let held = owner.persistent(0, |a| a.published()).unwrap();
+        owner.persistent(0, |a| a.refill().data = NDDataBuffer::F64(vec![1.0, 2.0]));
+        assert_eq!(f64s(&owner.array(0).unwrap()), [1.0, 2.0]);
+        assert_eq!(f64s(held.array()), [0.0, 0.0]);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        drop(held);
+
+        assert!(!owner.replace_persistent(0, || None));
+        assert!(owner.array(0).is_none());
+        assert!(owner.persistent(0, |_| ()).is_none());
+        assert_eq!(pool.num_free_buffers(), 1);
     }
 
     /// C changes `pArrays[0]` under the driver lock (simDetector.cpp:824-828),

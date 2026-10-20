@@ -2610,7 +2610,7 @@ impl PortDriverBase {
 
     /// C `callParamCallbacks(addr)` (asynPortDriver.cpp:833-873): every
     /// changed flag is walked and cleared at the end; only a bad index returns
-    /// early, with the flags kept. Only scalars post (see [`scalar_callback`]):
+    /// early, with the flags kept. Only scalars post (see `scalar_callback`):
     /// an array or generic pointer reaches a record only through its own
     /// [`Self::do_callbacks_array`].
     pub fn call_param_callbacks(&mut self, addr: i32) -> AsynResult<()> {

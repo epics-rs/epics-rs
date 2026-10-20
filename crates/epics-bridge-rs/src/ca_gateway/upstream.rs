@@ -3757,7 +3757,7 @@ ASG(NewGroup) {
             .await
             .expect("CA server");
         let port = server.udp_port();
-        let upstream_pv = server.database().find_pv(name).await.expect("upstream PV");
+        let upstream_pv = server.database().find_pv(name).expect("upstream PV");
         let _upstream = tokio::spawn(async move { server.run().await });
         let monitors = |want: usize, what: &'static str| {
             let pv = upstream_pv.clone();
@@ -3860,7 +3860,7 @@ ASG(NewGroup) {
         to_owner.send(late).unwrap();
         to_owner.send((2, snapshot)).unwrap();
         reach(ShadowLife::Alive(2)).await;
-        let pv = db.find_pv(name).await.expect("the next life registers");
+        let pv = db.find_pv(name).expect("the next life registers");
         assert_eq!(pv.snapshot().value, EpicsValue::Double(9.0));
         monitors(1, "the next life's monitor").await;
 

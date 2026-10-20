@@ -1795,7 +1795,7 @@ impl NDPluginProcess for CodecProcessor {
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C reads the codec selection under the port lock and releases it
-        // around every codec call (`NDPluginCodec.cpp:556`, `:596`), so the
+        // around every codec call (`NDPluginCodec.cpp:689-756`), so the
         // compression itself never holds it. `mode`, `jpeg_quality` and
         // `blosc_config` are the selection; `compression_ratio` is this
         // frame's result and goes back under the lock at the end.

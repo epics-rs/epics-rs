@@ -931,10 +931,12 @@ struct ProcParamIndices {
 /// ProcessProcessor wraps existing ProcessState.
 pub struct ProcessProcessor {
     state: Mutex<ProcessState>,
-    /// The frame's f64 working copy, kept between frames: C works in a
-    /// pool-recycled NDFloat64 array, and a fresh frame-sized Vec per frame
-    /// spends more on faulting its pages in than on the conversion.
-    scratch: Mutex<Vec<f64>>,
+    /// Free f64 working copies. A frame takes one for itself and gives it
+    /// back, as C converts each frame into its own pool-recycled NDFloat64
+    /// array (NDPluginProcess.cpp:147): one shared copy would serialise the
+    /// NumThreads workers, and a fresh frame-sized Vec per frame spends more
+    /// on faulting its pages in than on the conversion.
+    scratch: Mutex<Vec<Vec<f64>>>,
     params: ProcParamIndices,
 }
 
@@ -1028,7 +1030,7 @@ impl NDPluginProcess for ProcessProcessor {
                 }
             }
         } else {
-            let mut values = self.scratch.lock();
+            let mut values = self.scratch.lock().pop().unwrap_or_default();
             array.data.copy_to_f64(&mut values);
             frame.apply_element_ops(&mut values);
 
@@ -1038,20 +1040,19 @@ impl NDPluginProcess for ProcessProcessor {
                 (emitted, state.num_filtered)
             };
 
-            let out = if emitted {
-                match frame.build_output(pool, array, &values) {
-                    Ok(arr) => {
-                        let arr = Arc::new(arr);
-                        self.state.lock().end_frame(&frame, array, &arr);
-                        Some(arr)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "process output allocation failed; dropping frame");
-                        return ProcessResult::empty();
-                    }
+            let built = emitted.then(|| frame.build_output(pool, array, &values));
+            self.scratch.lock().push(values);
+            let out = match built {
+                Some(Ok(arr)) => {
+                    let arr = Arc::new(arr);
+                    self.state.lock().end_frame(&frame, array, &arr);
+                    Some(arr)
                 }
-            } else {
-                None
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "process output allocation failed; dropping frame");
+                    return ProcessResult::empty();
+                }
+                None => None,
             };
             (out, num_filtered)
         };

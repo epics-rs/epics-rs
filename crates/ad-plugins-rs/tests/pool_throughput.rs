@@ -356,7 +356,7 @@ fn measure_shipped_plugin_throughput() {
         drive(&roi_stat, &frames, 4),
     ));
 
-    // C releases around every codec call (NDPluginCodec.cpp:556, :596).
+    // C releases around every codec call (NDPluginCodec.cpp:689-756).
     let (codec, _j) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_CODEC").unwrap(),
         // Zlib rather than LZ4: LZ4 finishes a frame this size in well under
@@ -366,8 +366,8 @@ fn measure_shipped_plugin_throughput() {
             quality: 85,
         }),
         pool.max_memory(),
-        0,
         QUEUE,
+        0,
         "",
         wiring.clone(),
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

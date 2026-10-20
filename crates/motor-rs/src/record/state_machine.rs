@@ -18,10 +18,19 @@ impl MotorRecord {
         // C enter_do_work gate (1487-1492): a stop flagged on this callback
         // (RDBL 3687-3697, LVIO 1475-1484) is consumed by do_work's top
         // block after the stopped block, or stays latent past process_exit.
+        // A put that rode the pass and no exit took runs do_work there, or
+        // waits past process_exit or a closed gate for the callback's own
+        // NOTHING_DONE pass.
         if self.callback_pass(&mut effects) == BlockExit::ProcessExit {
             effects.process_exit = true;
-        } else {
+        } else if !self.put_rides() {
             self.take_latent_stop(&mut effects);
+        } else if self.ctrl.stop != 0
+            || matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause)
+            || self.stat.dmov != 0
+            || self.stat.mip.contains(MipFlags::RETRY)
+        {
+            self.callback_do_work(&mut effects);
         }
         effects
     }
@@ -343,7 +352,7 @@ impl MotorRecord {
                 // clears. CALLBACK_DATA pass — the implicit GET_INFO
                 // (C 2546) stays off; the pp completion return above
                 // skips one pass and the next poll lands here.
-                self.dispatch_latent_collection(effects, false);
+                self.callback_do_work(effects);
                 BlockExit::DoWork
             }
         }
@@ -371,10 +380,9 @@ impl MotorRecord {
         // home completion (postProcess 893-906), and limit/LVIO handling.
         // A jog button latched through SPMG=Pause must survive its stop
         // completion so Go can resume the jog (C 1916-1918).
-        // Sync last values
-        self.internal.lval = self.pos.val;
-        self.internal.ldvl = self.pos.dval;
-        self.internal.lrvl = self.pos.rval;
+        // The lasts are left alone, as C's maybeRetry close-enough branch
+        // does (1083-1102): a write parked during the motion, or one a put
+        // riding this pass has not collected yet, is still new to do_work.
         // No SPMG Move->Pause restore here: C performs it only in
         // maybeRetry's close-enough branch (1096-1101) — see
         // restore_spmg_move_to_pause(). A completion that reached this
@@ -618,6 +626,10 @@ impl MotorRecord {
                 self.retry.miss = 1;
                 self.mark(m::MISS);
                 self.finalize_motion(effects);
+                // C 1067-1069.
+                self.internal.lval = self.pos.val;
+                self.internal.ldvl = self.pos.dval;
+                self.internal.lrvl = self.pos.rval;
                 // C maybeRetry give-up (motorRecord.cc:1063-1065):
                 // `mip = MIP_DONE` then re-arm `MIP_JOG_REQ` from the held
                 // jogf/jogr field — unlike the close-enough/rtry==0 branches
@@ -631,11 +643,10 @@ impl MotorRecord {
                 );
                 // dmov stays TRUE through give-up, so do_work re-fires the
                 // armed jog/home in the SAME process pass (1489 `pmr->dmov`).
-                // dispatch_latent_collection is the Rust same-pass do_work
-                // re-fire: finalize_motion above set dmov=true and cleared
-                // mip, so the gate passes and the re-armed jog or a held
-                // home replays now instead of waiting for the next idle poll.
-                self.dispatch_latent_collection(effects, false);
+                // finalize_motion above set dmov=true and cleared mip, so
+                // the gate passes and the re-armed jog or a held home
+                // replays now instead of waiting for the next idle poll.
+                self.callback_do_work(effects);
                 return;
             }
             if self.retry.rmod == RetryMode::InPosition {
@@ -694,16 +705,10 @@ impl MotorRecord {
             // maybeRetry leaves the lasts alone and the same pass enters
             // do_work (1489), whose move block dispatches a target parked
             // during the motion; under Pause it stays parked for Go.
-            if self.pos.dval != self.internal.ldvl {
-                if self.can_accept_command() {
-                    self.stat.mip = MipFlags::empty();
-                    self.set_phase(MotionPhase::Idle);
-                    self.plan_absolute_move(effects);
-                    return;
-                }
-                let lasts = (self.internal.lval, self.internal.ldvl, self.internal.lrvl);
-                self.finalize_motion(effects);
-                (self.internal.lval, self.internal.ldvl, self.internal.lrvl) = lasts;
+            if self.pos.dval != self.internal.ldvl && self.can_accept_command() {
+                self.stat.mip = MipFlags::empty();
+                self.set_phase(MotionPhase::Idle);
+                self.plan_absolute_move(effects);
                 return;
             }
             self.finalize_motion(effects);

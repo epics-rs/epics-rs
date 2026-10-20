@@ -17,49 +17,27 @@ impl MotorRecord {
         );
     }
 
-    /// Determine the event for this process cycle by reading shared device state.
+    /// C `update_values` (motorRecord.cc:1276): every pass, a put's
+    /// included, takes what the device left for the record — a status
+    /// with `needUpdate`, the settle delay's expiry, a model-1 driver's
+    /// `mr->cdir` — so the callback's own later pass reads nothing new.
     pub(crate) fn determine_event(&mut self) -> Option<MotorEvent> {
-        // C dbScanLock serializes one pass per signal: a dbPutField pass
-        // never consumes the device callback's payload — the callback's
-        // own dbProcess (devMotorAsyn.c statusCallback 757-766, delay
-        // callbackFunc) follows with a CALLBACK_DATA pass. When a
-        // put-side signal owns this pass (last_write, or the resolution
-        // re-anchor mark a pp(TRUE) MRES-family put parked), leave the
-        // mailbox untouched — no status consume, no STUP ack, no delay
-        // take. The io_intr pulse that announced a pending status or
-        // delay expiry is already queued and triggers its own pass.
-        // A model-1 driver's `mr->cdir` write is no callback payload: it is
-        // the record's own field, seen by any pass.
-        let put_pass = self.last_write.is_some() || self.internal.res_reanchor;
-        let mailbox = self.device_state.as_ref().and_then(|state| {
+        let (cdir, delay_id, new_status) = self.device_state.as_ref().and_then(|state| {
             let mut ds = state.lock().ok()?;
-            let cdir = ds.driver_cdir.take();
-            Some(if put_pass {
-                (cdir, None, None)
-            } else {
-                (cdir, ds.expired_delay_id.take(), ds.update_values())
-            })
-        });
-        if let Some((Some(cdir), ..)) = mailbox {
+            Some((
+                ds.driver_cdir.take(),
+                ds.expired_delay_id.take(),
+                ds.update_values(),
+            ))
+        })?;
+        if let Some(cdir) = cdir {
             self.stat.cdir = i16::from(cdir);
         }
-        if put_pass {
-            self.trace_update_values(false);
-            return None;
-        }
-        let (_, delay_id, new_status) = mailbox?;
         self.trace_update_values(new_status.is_some());
+        // A stale delay (its wait rescinded by a later dispatch) is ignored.
+        let delay = delay_id.is_some_and(|id| id == self.next_delay_id.wrapping_sub(1));
 
-        // Check delay expiry first (higher priority)
-        if let Some(delay_id) = delay_id {
-            if delay_id == self.next_delay_id.wrapping_sub(1) {
-                return Some(MotorEvent::DelayExpired);
-            }
-            // Stale delay -- ignore
-        }
-
-        // Check for new motor status
-        if let Some(status) = new_status {
+        if let Some(status) = &new_status {
             // C process_exit (1498-1502): a CALLBACK_DATA pass returns a
             // BUSY STUP to OFF — the GET_INFO response has arrived. The
             // pre-clear value is latched one pass so the done branch can
@@ -69,21 +47,28 @@ impl MotorRecord {
                 self.mark(m::STUP);
                 self.internal.stup_ack = true;
             }
-            // Always apply readback even in Idle
-            if self.stat.phase == MotionPhase::Idle {
-                self.process_motor_info(&status);
-                // C process_reason: this pass IS a CALLBACK_DATA pass
-                // even though no event is reported — mark it so
-                // do_process_inner routes it through the idle completion
-                // pipeline (LOAD_P collapse, pp sync, C 1396-1409) and
-                // keeps the put-pass-only implicit GET_INFO (C 2546)
-                // off, which is C's status-refresh loop prevention.
-                self.internal.idle_status_pass = true;
-                return None;
+            // The callback block reads the status before the delay's ACK
+            // (C 1300, 1416).
+            if delay || self.stat.phase == MotionPhase::Idle {
+                self.process_motor_info(status);
             }
-            return Some(MotorEvent::DeviceUpdate(status));
         }
-        None
+        if delay {
+            return Some(MotorEvent::DelayExpired);
+        }
+
+        let status = new_status?;
+        if self.stat.phase == MotionPhase::Idle {
+            // C process_reason: this pass IS a CALLBACK_DATA pass even
+            // though no event is reported — mark it so do_process_inner
+            // routes it through the idle completion pipeline (LOAD_P
+            // collapse, pp sync, C 1396-1409) and keeps the implicit
+            // GET_INFO (C 2546) off, which is C's status-refresh loop
+            // prevention.
+            self.internal.idle_status_pass = true;
+            return None;
+        }
+        Some(MotorEvent::DeviceUpdate(status))
     }
 
     /// Convert ProcessEffects to DeviceActions for the shared mailbox.

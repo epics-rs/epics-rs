@@ -10,11 +10,13 @@ use std::time::Duration;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, StatusWrite};
 use asyn_rs::user::AsynUser;
-use motor_rs::device_state::{AxisSubscribers, SharedDeviceState, new_shared_state};
+use motor_rs::device_state::{AxisSubscribers, MotorDset, SharedDeviceState, new_shared_state};
 use motor_rs::flags::MotorCommand;
 use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
 use motor_rs::trace::{MotorTrace, TraceUser};
 use tokio::sync::mpsc;
+
+mod passes;
 
 /// A done axis at 1.0 whose encoder-ratio write sets the encoder position
 /// to `encoder`, as phytron's `setEncoderRatio` does, and whose move sets
@@ -116,23 +118,16 @@ struct Rig {
 }
 
 struct Bound {
-    io_intr: mpsc::Receiver<()>,
+    reads: passes::Reads,
     state: SharedDeviceState,
 }
 
 impl Bound {
-    /// The statuses the processes queued so far read, one per pulse.
+    /// The statuses the processes so far read.
     fn passes(&mut self) -> Vec<MotorStatus> {
-        let mut read = Vec::new();
-        while self.io_intr.try_recv().is_ok() {
-            let mut ds = self.state.lock().unwrap();
-            let seq = ds.latest_status.as_ref().unwrap().seq;
-            ds.begin_callback_pass();
-            let latest = ds.latest_status.clone().unwrap();
-            assert_ne!(latest.seq, seq, "every pulse reads a status");
-            read.push(latest.status);
-        }
-        read
+        (self.reads.take().into_iter())
+            .map(|status| status.expect("every process reads a status"))
+            .collect()
     }
 }
 
@@ -148,15 +143,16 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
     let subscribers = AxisSubscribers::new();
     let trace = Arc::new(MotorTrace::with_user(user));
     let bind = || {
-        let (io_intr_tx, io_intr) = mpsc::channel(8);
+        let (io_intr_tx, _) = mpsc::channel(8);
         let state = new_shared_state();
-        state.lock().unwrap().accept();
+        let own = Arc::<MotorTrace>::default();
+        let reads = passes::bind(&state, &own);
         // As MotorAxis::attach binds a model-1 record.
         if trace.is_model1() {
-            state.lock().unwrap().set_motordevcom();
+            state.lock().unwrap().set_dset(MotorDset::MotordevCom);
         }
-        subscribers.attach(state.clone(), io_intr_tx, Default::default());
-        Bound { io_intr, state }
+        subscribers.attach(state.clone(), io_intr_tx, own);
+        Bound { reads, state }
     };
     let mut poll_loop = MotorPollLoop::new(
         PollerInbox {

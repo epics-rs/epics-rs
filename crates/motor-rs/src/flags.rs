@@ -734,6 +734,16 @@ pub struct ProcessEffects {
     pub suppress_forward_link: bool,
 }
 
+impl ProcessEffects {
+    /// Append the effects of a later step of the same pass.
+    pub(crate) fn absorb(&mut self, later: ProcessEffects) {
+        self.commands.extend(later.commands);
+        self.schedule_delay = later.schedule_delay.or(self.schedule_delay);
+        self.request_poll |= later.request_poll;
+        self.process_exit |= later.process_exit;
+    }
+}
+
 /// Motor record errors.
 #[derive(Debug)]
 pub enum MotorError {

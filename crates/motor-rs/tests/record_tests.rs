@@ -2570,7 +2570,10 @@ fn test_model1_stup_in_comm_alarm_still_sends_get_info() {
     // motordevCom's build_trans has no COMM_ALARM check.
     let mut rec = MotorRecord::new();
     let state = motor_rs::device_state::new_shared_state();
-    state.lock().unwrap().set_motordevcom();
+    state
+        .lock()
+        .unwrap()
+        .set_dset(motor_rs::device_state::MotorDset::MotordevCom);
     rec.set_device_state(state);
     rec.internal.comm_alarm = true;
     rec.stat.stup = 1;
@@ -2839,12 +2842,11 @@ fn test_go_resume_dispatch_consumes_pass_no_get_info() {
 }
 
 #[test]
-fn test_put_pass_leaves_injected_device_update_pending() {
+fn test_put_pass_reads_an_injected_device_update() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    // One signal, one pass (C dbScanLock): a put-owned pass must not
-    // consume a coalesced DeviceUpdate — the update keeps its
-    // completion pipeline on the following pass instead of being
-    // reduced to a readback apply.
+    // C update_values (motorRecord.cc:1276): the put's pass reads a
+    // pending callback and runs its completion pipeline; the callback's
+    // own later pass reads nothing.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
@@ -2861,12 +2863,8 @@ fn test_put_pass_leaves_injected_device_update_pending() {
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     rec.set_event(MotorEvent::DeviceUpdate(done));
     rec.do_process(); // the put's pass
-    assert_eq!(
-        rec.stat.phase,
-        MotionPhase::MainMove,
-        "completion not consumed by the put pass"
-    );
-    assert!(rec.stat.dmov == 0);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov != 0);
 
     rec.do_process(); // the update's own pass
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
@@ -2874,11 +2872,11 @@ fn test_put_pass_leaves_injected_device_update_pending() {
 }
 
 #[test]
-fn test_put_pass_leaves_delay_expiry_pending() {
+fn test_put_pass_reads_a_delay_expiry() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    // A DelayExpired coalesced with a put must survive the put pass:
-    // the settle watchdog timer is one-shot, so consuming it without
-    // acting would leave DELAY_REQ armed forever.
+    // C callbackFunc (motorRecord.cc:470-477) sets MIP_DELAY_ACK for
+    // whatever pass comes next: a put's pass takes the ACK and its
+    // GET_INFO (1416-1426), and the pass after it ends the wait.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
@@ -2899,16 +2897,20 @@ fn test_put_pass_leaves_delay_expiry_pending() {
 
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     rec.set_event(MotorEvent::DelayExpired);
-    rec.do_process(); // the put's pass
-    assert!(
-        rec.stat.mip.contains(MipFlags::DELAY_REQ),
-        "watchdog survives the put pass"
-    );
-    assert!(!rec.stat.mip.contains(MipFlags::DELAY_ACK));
-
-    let effects = rec.do_process(); // the expiry's own pass
+    let effects = rec.do_process(); // the put's pass
     assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
+    assert!(!rec.stat.mip.contains(MipFlags::DELAY_REQ));
     assert!(sends_get_info(&effects));
+
+    rec.process_motor_info(&done);
+    rec.do_process(); // the GET_INFO answer's pass
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov != 0);
+    assert!(
+        !rec.stat
+            .mip
+            .intersects(MipFlags::DELAY_REQ | MipFlags::DELAY_ACK)
+    );
 }
 
 #[test]

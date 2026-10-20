@@ -1,5 +1,7 @@
 use asyn_rs::interfaces::motor::MotorStatus;
 use asyn_rs::trace::TraceMask;
+use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::device_support::{IoIntrAction, IoIntrRun};
 use epics_libcom_rs::cfmt::CFloat;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,8 +66,9 @@ impl DeviceActions {
 /// Shared mailbox between MotorRecord, MotorDeviceSupport, and PollLoop.
 ///
 /// Data flow:
-///   PollLoop → [`Callbacks`] → latest_status, expired_delay_id on the pass
-///   io_intr runs → Record.process() reads
+///   PollLoop → [`Callbacks`] → latest_status, expired_delay_id → the
+///   record's next pass, whatever processed it, reads
+///   (motorRecord.cc:1276)
 ///   Record.process() → pending_actions → DeviceSupport.write() consumes
 #[derive(Debug, Default)]
 pub struct MotorDeviceState {
@@ -92,24 +95,15 @@ pub struct MotorDeviceState {
     pub callbacks: Callbacks,
 }
 
-/// One process a callback asked for, with what that pass reads.
-#[derive(Debug, Clone)]
-enum Callback {
-    /// `statusCallback` or a finished move: `needUpdate` with this status.
-    Status(StampedStatus),
-    /// The settle delay's `callbackFunc` (motorRecord.cc:460-480).
-    Delay(u64),
-}
-
 /// devMotorAsyn's per-record callback state (`motorAsynPvt`): the single
 /// owner that turns a driver post, a finished move or the settle delay into
 /// a record process.
 ///
-/// C calls `dbProcess` from the callback itself, so that pass reads the
-/// status the callback copied. Here the pass runs later on the record's
-/// io_intr task, so each asked-for process is queued with what it reads and
-/// paired with exactly one io_intr pulse; [`MotorDeviceState::begin_callback_pass`]
-/// takes one per pass.
+/// devMotorAsyn's `statusCallback` and `asynCallback`, and motordevCom's
+/// `motor_callback`, `dbProcess` under `dbScanLock` on the driver's thread
+/// ([`call_back`]). The settle delay and a devMotorSim callback leave
+/// their state for the next pass and ask for one on the record's io_intr
+/// task (`scanOnce`).
 #[derive(Debug, Default)]
 pub struct Callbacks {
     /// `pPvt->status`: the last status posted.
@@ -120,62 +114,142 @@ pub struct Callbacks {
     accepting: bool,
     /// `pmr->stat == COMM_ALARM` as the record's last pass committed it.
     comm_alarm: bool,
-    /// The record's device support is model-1 motordevCom, or devMotorSim,
-    /// whose `build_trans` has no COMM_ALARM check and no pending-move
-    /// count either: only the driver's callback processes the record.
-    motordevcom: bool,
-    queued: std::collections::VecDeque<Callback>,
+    dset: MotorDset,
+    /// The record's database, which [`call_back`] locks it in.
+    db: Option<RecordDb>,
+}
+
+/// The C device support a record's callbacks run as.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MotorDset {
+    #[default]
+    DevMotorAsyn,
+    /// Model-1 motordevCom.
+    MotordevCom,
+    DevMotorSim,
+}
+
+impl MotorDset {
+    /// motordevCom and devMotorSim: `build_trans` has no COMM_ALARM check
+    /// and no pending-move count, and only the driver's callback processes
+    /// the record.
+    fn is_drvset(self) -> bool {
+        self != Self::DevMotorAsyn
+    }
+}
+
+/// The database a record's callbacks take `dbScanLock(pmr)` in.
+#[derive(Clone)]
+struct RecordDb(AsyncDbHandle);
+
+impl std::fmt::Debug for RecordDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecordDb")
+    }
+}
+
+/// Run a driver callback on `record`'s mailbox as C runs it: once
+/// `dbScanLockOK`, `locked` under `dbScanLock(pmr)` on the calling thread, a
+/// [`IoIntrAction::Process`] answer `dbProcess` inside the hold
+/// (devMotorAsyn.c:717-726, :755-762, motordevCom.cc:555-557); before it,
+/// or with no record to hold, `before_init` with no lock.
+pub(crate) fn call_back(
+    state: &SharedDeviceState,
+    record: &str,
+    locked: impl FnOnce(&mut MotorDeviceState) -> IoIntrAction + Send + 'static,
+    before_init: impl FnOnce(&mut MotorDeviceState),
+) {
+    let db = state.lock().ok().and_then(|ds| ds.callbacks.db.clone());
+    let held = state.clone();
+    let run = db.map_or(IoIntrRun::Refused, |db| {
+        db.0.run_io_intr_callback_with(record, move |_| {
+            held.lock()
+                .map_or(IoIntrAction::Skip, |mut ds| locked(&mut ds))
+        })
+    });
+    if matches!(run, IoIntrRun::Refused)
+        && let Ok(mut ds) = state.lock()
+    {
+        before_init(&mut ds);
+    }
+}
+
+/// C `asynCallback`'s tail for a finished move-class command
+/// (devMotorAsyn.c:717-729). motordevCom has none: only the driver's
+/// `motor_callback` processes its record (motordevCom.cc:534-556).
+pub(crate) fn async_callback(
+    state: &SharedDeviceState,
+    record: &str,
+    command: &crate::flags::MotorCommand,
+) {
+    if state
+        .lock()
+        .map_or(true, |ds| ds.callbacks.dset.is_drvset())
+    {
+        return;
+    }
+    call_back(state, record, MotorDeviceState::move_done, |ds| {
+        ds.move_done_before_init(command)
+    });
 }
 
 impl MotorDeviceState {
-    /// C `statusCallback` (devMotorAsyn.c:743-770): copy the post, and ask
-    /// for a process unless a move is pending. Before the gate opens it only
-    /// copies, with `needUpdate`. True when the caller must pulse io_intr.
-    pub fn status_callback(&mut self, status: &StampedStatus) -> bool {
+    /// C `statusCallback` (devMotorAsyn.c:755-762) under the record's lock
+    /// ([`call_back`]): copy the post, and unless a move is pending process
+    /// with `needUpdate`.
+    pub fn status_callback(&mut self, status: StampedStatus) -> IoIntrAction {
         self.callbacks.status = status.status.clone();
-        if !self.callbacks.accepting {
-            self.latest_status = Some(status.clone());
-            return false;
-        }
         if self.callbacks.move_request_pending > 0 {
-            return false;
+            return IoIntrAction::Skip;
         }
-        self.queue(Callback::Status(status.clone()));
-        true
+        self.latest_status = Some(status);
+        IoIntrAction::Process
+    }
+
+    /// Copy a post with `needUpdate`: `statusCallback` before
+    /// `dbScanLockOK` (devMotorAsyn.c:763-766), motordevCom's
+    /// `motor_callback` under `ptrans->lock` (motordevCom.cc:541-548).
+    pub fn copy_post(&mut self, status: &StampedStatus) {
+        self.callbacks.status = status.status.clone();
+        self.latest_status = Some(status.clone());
+    }
+
+    /// A devMotorSim callback (devMotorSim.c:126-129): copy the post with
+    /// `needUpdate`, and past the gate ask for its `scanOnce`. True when the
+    /// caller must pulse io_intr.
+    fn motor_sim_callback(&mut self, status: &StampedStatus) -> bool {
+        self.copy_post(status);
+        self.callbacks.accepting
     }
 
     /// C `build_trans` queuing a move-class command (devMotorAsyn.c:547,
     /// :565, :582). motordevCom's `motor_end_trans_com` counts nothing.
     pub fn move_queued(&mut self) {
-        if !self.callbacks.motordevcom {
+        if !self.callbacks.dset.is_drvset() {
             self.callbacks.move_request_pending += 1;
         }
     }
 
     /// C `asynCallback`'s tail for a move-class command, whatever the write
-    /// returned (devMotorAsyn.c:717-728): the last move to finish processes
-    /// the record with the last status posted. Before the gate a
-    /// SET_POSITION clears the count instead. True when the caller must
-    /// pulse io_intr. motordevCom has no `asynCallback`: only the driver's
-    /// `motor_callback` processes its record (motordevCom.cc:534-556).
-    pub fn move_done(&mut self, command: &crate::flags::MotorCommand) -> bool {
+    /// returned, under the record's lock (devMotorAsyn.c:717-726,
+    /// [`async_callback`]): the last move to finish processes the record
+    /// with the last status posted.
+    pub fn move_done(&mut self) -> IoIntrAction {
         let callbacks = &mut self.callbacks;
-        if callbacks.motordevcom {
-            return false;
-        }
-        if !callbacks.accepting {
-            if matches!(command, crate::flags::MotorCommand::SetPosition { .. }) {
-                callbacks.move_request_pending = 0;
-            }
-            return false;
-        }
         callbacks.move_request_pending = callbacks.move_request_pending.saturating_sub(1);
         if callbacks.move_request_pending > 0 {
-            return false;
+            return IoIntrAction::Skip;
         }
-        let status = self.stamp(self.callbacks.status.clone());
-        self.queue(Callback::Status(status));
-        true
+        self.latest_status = Some(self.stamp(self.callbacks.status.clone()));
+        IoIntrAction::Process
+    }
+
+    /// `asynCallback` before `dbScanLockOK` (devMotorAsyn.c:728-729): a
+    /// SET_POSITION clears the pending count.
+    pub fn move_done_before_init(&mut self, command: &crate::flags::MotorCommand) {
+        if matches!(command, crate::flags::MotorCommand::SetPosition { .. }) {
+            self.callbacks.move_request_pending = 0;
+        }
     }
 
     /// devMotorSim's GET_INFO (devMotorSim.c build_trans): `needUpdate` on
@@ -185,21 +259,17 @@ impl MotorDeviceState {
     /// for this, so C's next put (after a no-op pass armed motorRecord's
     /// implicit GET_INFO, e.g. SPMG Go) reads it as CALLBACK_DATA with STUP
     /// BUSY, skips do_work (motorRecord.cc:1345, 1487) and the move is
-    /// lost with DMOV 0. A put pass here never consumes the mailbox
-    /// (`determine_event`), so the move dispatches.
+    /// lost with DMOV 0. The record runs do_work on that pass.
     pub fn get_info(&mut self) {
         self.latest_status = Some(self.stamp(self.callbacks.status.clone()));
     }
 
-    /// The settle delay expired. True when the caller must pulse io_intr;
-    /// before the gate the expiry only waits for the next pass.
+    /// The settle delay expired, for the next pass to read. True when the
+    /// caller must pulse io_intr; before the gate the expiry only waits for
+    /// the next pass.
     pub fn delay_expired(&mut self, id: u64) -> bool {
-        if !self.callbacks.accepting {
-            self.expired_delay_id = Some(id);
-            return false;
-        }
-        self.queue(Callback::Delay(id));
-        true
+        self.expired_delay_id = Some(id);
+        self.callbacks.accepting
     }
 
     /// The record's `stat` as its passes before this batch committed it;
@@ -208,15 +278,15 @@ impl MotorDeviceState {
         self.callbacks.comm_alarm = comm_alarm;
     }
 
-    /// The record's device support is model-1 motordevCom.
-    pub fn set_motordevcom(&mut self) {
-        self.callbacks.motordevcom = true;
+    /// The C device support the record's callbacks run as.
+    pub fn set_dset(&mut self, dset: MotorDset) {
+        self.callbacks.dset = dset;
     }
 
     /// Whether `build_trans` refuses a record whose stat is COMM_ALARM
     /// (devMotorAsyn.c:529-532); motordevCom queues regardless.
     pub(crate) fn refuses_in_comm_alarm(&self) -> bool {
-        !self.callbacks.motordevcom
+        !self.callbacks.dset.is_drvset()
     }
 
     /// C `build_trans` refusing a record in COMM_ALARM: it queues nothing,
@@ -230,14 +300,9 @@ impl MotorDeviceState {
         self.callbacks.accepting = true;
     }
 
-    /// The pass one io_intr pulse runs: hand it the oldest asked-for
-    /// process.
-    pub fn begin_callback_pass(&mut self) {
-        match self.callbacks.queued.pop_front() {
-            Some(Callback::Status(status)) => self.latest_status = Some(status),
-            Some(Callback::Delay(id)) => self.expired_delay_id = Some(id),
-            None => {}
-        }
+    /// The record's database, which its callbacks lock it in.
+    pub fn bind_database(&mut self, db: AsyncDbHandle) {
+        self.callbacks.db = Some(RecordDb(db));
     }
 
     /// The axis' cached status, as `readGenericPointer` returns it at bind.
@@ -281,10 +346,6 @@ impl MotorDeviceState {
         let seen = self.latest_status.as_ref().map_or(0, |s| s.seq);
         let seq = self.stamps.after(seen);
         StampedStatus { seq, status }
-    }
-
-    fn queue(&mut self, callback: Callback) {
-        self.callbacks.queued.push_back(callback);
     }
 }
 
@@ -374,7 +435,8 @@ struct Bound {
     trace: Arc<MotorTrace>,
 }
 
-/// The io_intr pulses a post or a finished move owes, one per process.
+/// The io_intr pulses a devMotorSim post owes, one per
+/// process.
 pub type Pulses = Vec<tokio::sync::mpsc::Sender<()>>;
 
 impl AxisSubscribers {
@@ -439,18 +501,41 @@ impl AxisSubscribers {
         subscribed.latest = Some(StampedStatus { seq, status });
     }
 
-    /// Fill the cache and run every bound record's `statusCallback`; the
-    /// pulses the processes it asked for are owed.
+    /// Fill the cache and run every bound record's `statusCallback` or
+    /// `motor_callback`; the pulses of the devMotorSim passes it asked for
+    /// are owed.
     pub fn post(&self, status: MotorStatus) -> Pulses {
         let mut subscribed = self.lock();
         let seq = subscribed.stamps.after(0);
         let status = StampedStatus { seq, status };
         let mut pulses = Pulses::new();
         for bound in &subscribed.records {
-            if let Ok(mut ds) = bound.device_state.lock() {
-                print_status_callback(&bound.trace, &ds, &status.status);
-                if ds.status_callback(&status) {
-                    pulses.push(bound.io_intr.clone());
+            let Ok(mut ds) = bound.device_state.lock() else {
+                continue;
+            };
+            print_status_callback(&bound.trace, &ds, &status.status);
+            let record = bound.trace.record();
+            match ds.callbacks.dset {
+                MotorDset::DevMotorAsyn => {
+                    drop(ds);
+                    let locked = status.clone();
+                    call_back(
+                        &bound.device_state,
+                        record,
+                        move |ds| ds.status_callback(locked),
+                        |ds| ds.copy_post(&status),
+                    );
+                }
+                MotorDset::MotordevCom => {
+                    ds.copy_post(&status);
+                    drop(ds);
+                    let process = |_: &mut MotorDeviceState| IoIntrAction::Process;
+                    call_back(&bound.device_state, record, process, |_| {});
+                }
+                MotorDset::DevMotorSim => {
+                    if ds.motor_sim_callback(&status) {
+                        pulses.push(bound.io_intr.clone());
+                    }
                 }
             }
         }
@@ -488,16 +573,18 @@ impl AxisSubscribers {
         }
     }
 
-    /// `record`'s move-class command finished ([`MotorDeviceState::move_done`]).
-    pub fn move_done(
-        &self,
-        record: RecordId,
-        command: &crate::flags::MotorCommand,
-    ) -> Option<tokio::sync::mpsc::Sender<()>> {
-        let subscribed = self.lock();
-        let bound = subscribed.records.get(record)?;
-        let mut ds = bound.device_state.lock().ok()?;
-        ds.move_done(command).then(|| bound.io_intr.clone())
+    /// `record`'s move-class command finished: its `asynCallback`
+    /// ([`async_callback`]).
+    pub fn move_done(&self, record: RecordId, command: &crate::flags::MotorCommand) {
+        let Some((state, trace)) = self
+            .lock()
+            .records
+            .get(record)
+            .map(|bound| (bound.device_state.clone(), bound.trace.clone()))
+        else {
+            return;
+        };
+        async_callback(&state, trace.record(), command);
     }
 }
 
@@ -523,6 +610,109 @@ fn print_status_callback(trace: &MotorTrace, ds: &MotorDeviceState, status: &Mot
     );
 }
 
+/// A record in a database past `finishDevSup` for each state a harness
+/// binds, to see each `dbProcess` a callback runs and what it read.
+#[cfg(test)]
+pub(crate) mod passes {
+    use super::*;
+    use epics_base_rs::error::CaResult;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
+    use epics_base_rs::server::record::{Record, ScanType};
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    type Read = Arc<Mutex<Vec<Option<MotorStatus>>>>;
+
+    /// One record's processes, each with its mailbox's new status, if it
+    /// read one. Holds the record's database.
+    pub(crate) struct Reads(Read, Arc<PvDatabase>);
+
+    impl Reads {
+        pub(crate) fn take(&self) -> Vec<Option<MotorStatus>> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+
+    /// Takes the mailbox as the motor record's callback pass does.
+    struct ReadsMailbox(Option<SharedDeviceState>, Read);
+
+    impl DeviceSupport for ReadsMailbox {
+        fn dtyp(&self) -> &str {
+            "readsMailbox"
+        }
+        fn read(&mut self, _: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+            let read = self
+                .0
+                .as_ref()
+                .and_then(|state| state.lock().unwrap().update_values());
+            self.1.lock().unwrap().push(read);
+            Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+        }
+        fn write(&mut self, _: &mut dyn Record) -> CaResult<()> {
+            Ok(())
+        }
+    }
+
+    const NAME: &str = "R";
+
+    /// Record [`NAME`] reading `mailbox`, past the gate if `finished`.
+    fn record(mailbox: Option<SharedDeviceState>, finished: bool) -> Reads {
+        let db = Arc::new(PvDatabase::new());
+        // A thread of its own, which may block whatever runtime the test runs.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                epics_base_rs::runtime::task::block_on_sync(
+                    db.add_record(NAME, Box::new(AiRecord::new(0.0))),
+                )
+            })
+            .join()
+        })
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let read = Read::default();
+        {
+            let rec = db.get_record(NAME).unwrap();
+            let mut inst = rec.write();
+            inst.common.dtyp = "readsMailbox".into();
+            inst.device = Some(Box::new(ReadsMailbox(mailbox, read.clone())));
+        }
+        if finished {
+            db.scan_control().finish_dev_sup();
+        }
+        Reads(read, db)
+    }
+
+    /// `state` past the gate, its callbacks processing a record named into
+    /// `trace`.
+    pub(crate) fn bind(state: &SharedDeviceState, trace: &MotorTrace) -> Reads {
+        let reads = bind_before_init(state, trace);
+        reads.1.scan_control().finish_dev_sup();
+        state.lock().unwrap().accept();
+        reads
+    }
+
+    /// [`bind`], before `finishDevSup`.
+    pub(crate) fn bind_before_init(state: &SharedDeviceState, trace: &MotorTrace) -> Reads {
+        let reads = record(Some(state.clone()), false);
+        trace.set_record(NAME);
+        assert_eq!(trace.record(), NAME, "one record per trace");
+        state.lock().unwrap().bind_database(reads.1.async_handle());
+        reads
+    }
+
+    /// `support`'s callbacks processing a record that reads `mailbox`.
+    pub(crate) fn bind_support(
+        support: &mut dyn DeviceSupport,
+        mailbox: Option<SharedDeviceState>,
+    ) -> Reads {
+        let reads = record(mailbox, true);
+        support.set_record_info(NAME, ScanType::Passive);
+        support.bind_database(reads.1.async_handle());
+        reads
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,23 +735,29 @@ mod tests {
         }
     }
 
-    /// `statusCallback` with a post of `position` from the list `ds` draws
-    /// its stamps from.
-    fn call_back(ds: &mut MotorDeviceState, position: f64) -> bool {
-        let posted = StampedStatus {
+    /// A post of `position` from the list `ds` draws its stamps from.
+    fn posted(ds: &MotorDeviceState, position: f64) -> StampedStatus {
+        StampedStatus {
             seq: ds.stamps.after(0),
             status: at(position),
-        };
-        ds.status_callback(&posted)
+        }
     }
 
-    /// The position the next io_intr pass reads, if it reads a status.
-    fn pass(state: &SharedDeviceState) -> Option<f64> {
-        let mut ds = state.lock().unwrap();
-        let before = ds.latest_status.as_ref().map(|s| s.seq);
-        ds.begin_callback_pass();
-        let after = ds.latest_status.as_ref().unwrap();
-        (Some(after.seq) != before).then_some(after.status.position)
+    /// devMotorAsyn's `statusCallback` with a post of `position`.
+    fn post_to(ds: &mut MotorDeviceState, position: f64) -> IoIntrAction {
+        let posted = posted(ds, position);
+        ds.status_callback(posted)
+    }
+
+    /// devMotorSim's `motor_callback` with a post of `position`.
+    fn sim_post(ds: &mut MotorDeviceState, position: f64) -> bool {
+        let posted = posted(ds, position);
+        ds.motor_sim_callback(&posted)
+    }
+
+    /// The position the next pass reads, taking it.
+    fn read(ds: &mut MotorDeviceState) -> Option<f64> {
+        ds.update_values().map(|status| status.position)
     }
 
     fn move_to() -> MotorCommand {
@@ -604,19 +800,23 @@ mod tests {
     }
 
     #[test]
-    fn every_record_on_the_axis_gets_one_process_per_post() {
+    fn every_queued_record_on_the_axis_gets_one_pass_per_post() {
         let axis = AxisSubscribers::new();
         let (a, b) = (accepting(), accepting());
+        a.lock().unwrap().set_dset(MotorDset::DevMotorSim);
+        b.lock().unwrap().set_dset(MotorDset::DevMotorSim);
         let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
         assert_eq!(axis.attach(a.clone(), tx_a, Arc::default()), 0);
         assert_eq!(axis.attach(b.clone(), tx_b, Arc::default()), 1);
         assert_eq!(axis.post(at(1.0)).len(), 2);
         assert_eq!(axis.post(at(2.0)).len(), 2);
+        // devMotorSim.c:126-129 updates the status in place: the first
+        // pass reads the last post, the second nothing.
         for state in [&a, &b] {
-            assert_eq!(pass(state), Some(1.0));
-            assert_eq!(pass(state), Some(2.0));
-            assert_eq!(pass(state), None);
+            let mut ds = state.lock().unwrap();
+            assert_eq!(read(&mut ds), Some(2.0));
+            assert_eq!(read(&mut ds), None);
         }
     }
 
@@ -628,17 +828,13 @@ mod tests {
         let state = accepting();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         axis.attach(state.clone(), tx, Arc::default());
-        let read = |state: &SharedDeviceState| {
-            let mut ds = state.lock().unwrap();
-            ds.begin_callback_pass();
-            ds.update_values().map(|status| status.position)
-        };
+        let read = |state: &SharedDeviceState| read(&mut state.lock().unwrap());
         axis.post(at(1.0));
         assert_eq!(read(&state), Some(1.0));
         {
             let mut ds = state.lock().unwrap();
             ds.move_queued();
-            assert!(ds.move_done(&move_to()));
+            assert_eq!(ds.move_done(), IoIntrAction::Process);
         }
         assert_eq!(read(&state), Some(1.0));
         axis.post(at(3.0));
@@ -647,22 +843,38 @@ mod tests {
 
     #[test]
     fn a_post_before_the_gate_copies_with_need_update_and_asks_no_process() {
+        let axis = AxisSubscribers::new();
         let state = new_shared_state();
+        let trace = Arc::<MotorTrace>::default();
+        let reads = passes::bind_before_init(&state, &trace);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        axis.attach(state.clone(), tx, trace);
         let mut ds = state.lock().unwrap();
-        assert!(!call_back(&mut ds, 3.0));
-        assert_eq!(ds.latest_status.as_ref().unwrap().status.position, 3.0);
-        assert!(ds.callbacks.queued.is_empty());
+        ds.move_queued();
+        drop(ds);
+        assert!(axis.post(at(3.0)).is_empty());
+        assert!(reads.take().is_empty(), "a post before the gate processed");
+        assert_eq!(read(&mut state.lock().unwrap()), Some(3.0));
     }
 
     #[test]
-    fn each_pass_reads_its_own_post_in_order() {
+    fn a_post_past_the_gate_processes_with_it_and_queues_nothing() {
         let state = accepting();
         let mut ds = state.lock().unwrap();
-        assert!(call_back(&mut ds, 1.0));
-        assert!(call_back(&mut ds, 2.0));
-        drop(ds);
-        assert_eq!(pass(&state), Some(1.0));
-        assert_eq!(pass(&state), Some(2.0));
+        assert_eq!(post_to(&mut ds, 1.0), IoIntrAction::Process);
+        assert_eq!(read(&mut ds), Some(1.0));
+    }
+
+    /// devMotorSim.c:126-129, :215-223: the first pass reads the last post,
+    /// whatever processed the record.
+    #[test]
+    fn a_motor_sim_pass_reads_the_last_post() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        assert!(sim_post(&mut ds, 1.0));
+        assert!(sim_post(&mut ds, 2.0));
+        assert_eq!(read(&mut ds), Some(2.0));
+        assert_eq!(read(&mut ds), None);
     }
 
     #[test]
@@ -670,12 +882,11 @@ mod tests {
         let state = accepting();
         let mut ds = state.lock().unwrap();
         ds.move_queued();
-        assert!(!call_back(&mut ds, 1.0));
-        assert!(!call_back(&mut ds, 2.0));
-        assert!(ds.move_done(&move_to()));
-        drop(ds);
-        assert_eq!(pass(&state), Some(2.0));
-        assert_eq!(pass(&state), None);
+        assert_eq!(post_to(&mut ds, 1.0), IoIntrAction::Skip);
+        assert_eq!(post_to(&mut ds, 2.0), IoIntrAction::Skip);
+        assert_eq!(read(&mut ds), None, "a copy alone is no needUpdate");
+        assert_eq!(ds.move_done(), IoIntrAction::Process);
+        assert_eq!(read(&mut ds), Some(2.0));
     }
 
     #[test]
@@ -684,53 +895,75 @@ mod tests {
         let mut ds = state.lock().unwrap();
         ds.move_queued();
         ds.move_queued();
-        assert!(!ds.move_done(&move_to()));
-        assert!(!call_back(&mut ds, 5.0));
-        assert!(ds.move_done(&move_to()));
-        assert!(call_back(&mut ds, 6.0), "nothing pending");
-        drop(ds);
-        assert_eq!(pass(&state), Some(5.0));
-        assert_eq!(pass(&state), Some(6.0));
+        assert_eq!(ds.move_done(), IoIntrAction::Skip);
+        assert_eq!(post_to(&mut ds, 5.0), IoIntrAction::Skip);
+        assert_eq!(ds.move_done(), IoIntrAction::Process);
+        assert_eq!(read(&mut ds), Some(5.0));
+        assert_eq!(
+            post_to(&mut ds, 6.0),
+            IoIntrAction::Process,
+            "nothing pending"
+        );
+        assert_eq!(read(&mut ds), Some(6.0));
     }
 
     // motordevCom: a move processes nothing itself, and every driver
     // callback processes the record (motordevCom.cc:534-556).
     #[test]
     fn a_motordevcom_move_waits_for_the_driver_callback() {
-        let state = accepting();
+        let axis = AxisSubscribers::new();
+        let state = new_shared_state();
+        let trace = Arc::<MotorTrace>::default();
+        let reads = passes::bind(&state, &trace);
         let mut ds = state.lock().unwrap();
-        ds.set_motordevcom();
+        ds.set_dset(MotorDset::MotordevCom);
         ds.move_queued();
-        assert!(!ds.move_done(&move_to()));
-        assert!(call_back(&mut ds, 1.0));
         drop(ds);
-        assert_eq!(pass(&state), Some(1.0));
-        assert_eq!(pass(&state), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let record = axis.attach(state.clone(), tx, trace);
+        axis.move_done(record, &move_to());
+        assert!(reads.take().is_empty(), "a motordevCom move processed");
+        assert!(axis.post(at(1.0)).is_empty());
+        let read: Vec<_> = reads
+            .take()
+            .into_iter()
+            .map(|s| s.map(|s| s.position))
+            .collect();
+        assert_eq!(read, [Some(1.0)]);
+        assert!(rx.try_recv().is_err(), "a motordevCom callback queued");
     }
 
     #[test]
     fn before_the_gate_only_a_set_position_clears_the_pending_count() {
         let state = new_shared_state();
+        let trace = MotorTrace::default();
+        let reads = passes::bind_before_init(&state, &trace);
         let mut ds = state.lock().unwrap();
         ds.move_queued();
         ds.move_queued();
-        assert!(!ds.move_done(&move_to()));
-        assert_eq!(ds.callbacks.move_request_pending, 2);
-        assert!(!ds.move_done(&MotorCommand::SetPosition { position: 0.0 }));
-        assert_eq!(ds.callbacks.move_request_pending, 0);
+        drop(ds);
+        let pending = || state.lock().unwrap().callbacks.move_request_pending;
+        async_callback(&state, trace.record(), &move_to());
+        assert_eq!(pending(), 2);
+        async_callback(
+            &state,
+            trace.record(),
+            &MotorCommand::SetPosition { position: 0.0 },
+        );
+        assert_eq!(pending(), 0);
+        assert!(reads.take().is_empty());
     }
 
+    /// C sets MIP_DELAY_ACK beside a pending `needUpdate`
+    /// (motorRecord.cc:470-477): the next pass reads both (1276, 1280).
     #[test]
-    fn a_delay_expiry_takes_its_turn_behind_the_posts_before_it() {
+    fn a_delay_expiry_and_a_post_before_it_reach_the_next_pass() {
         let state = accepting();
         let mut ds = state.lock().unwrap();
-        assert!(call_back(&mut ds, 1.0));
-        ds.delay_expired(7);
-        drop(ds);
-        assert_eq!(pass(&state), Some(1.0));
-        assert_eq!(state.lock().unwrap().expired_delay_id, None);
-        assert_eq!(pass(&state), None);
-        assert_eq!(state.lock().unwrap().expired_delay_id, Some(7));
+        assert!(sim_post(&mut ds, 1.0));
+        assert!(ds.delay_expired(7));
+        assert_eq!(read(&mut ds), Some(1.0));
+        assert_eq!(ds.expired_delay_id, Some(7));
     }
 
     #[test]

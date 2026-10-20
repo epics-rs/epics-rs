@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
-use epics_base_rs::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+use epics_base_rs::runtime::task::{
+    CallbackPriority, sleep_background, spawn_background, spawn_blocking_background,
 };
+use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::PvString;
 use tokio::sync::mpsc;
@@ -153,10 +153,15 @@ impl AxisSlot {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
         let trace = Arc::new(MotorTrace::with_user(user));
-        if (trace.is_model1() || trace.is_motor_interface())
-            && let Ok(mut ds) = device_state.lock()
-        {
-            ds.set_motordevcom();
+        let dset = if trace.is_model1() {
+            MotorDset::MotordevCom
+        } else if trace.is_motor_interface() {
+            MotorDset::DevMotorSim
+        } else {
+            MotorDset::DevMotorAsyn
+        };
+        if let Ok(mut ds) = device_state.lock() {
+            ds.set_dset(dset);
         }
         let record =
             self.subscribers
@@ -642,16 +647,18 @@ impl CommandPort {
             Err(missing) => missing,
         };
         crate::poll_loop::refuse_commands(&self.trace, missing, &commands);
-        // asynCallback runs for a refused write as for any other.
-        for command in commands.iter().filter(|c| c.is_move()) {
-            let done = self
-                .device_state
-                .lock()
-                .is_ok_and(|mut ds| ds.move_done(command));
-            if done {
-                self.pulse();
-            }
+        // asynCallback runs for a refused write as for any other, on the
+        // port's thread, which waits for the record this pass holds.
+        let moves: Vec<_> = commands.into_iter().filter(|c| c.is_move()).collect();
+        if moves.is_empty() {
+            return;
         }
+        let (state, trace) = (self.device_state.clone(), self.trace.clone());
+        spawn_blocking_background(self.prio, move |_| {
+            for command in &moves {
+                async_callback(&state, trace.record(), command);
+            }
+        });
     }
 
     /// The axis that takes the record's requests now, or why none does.
@@ -663,17 +670,6 @@ impl CommandPort {
                 .map(|axis| (axis, *record))
                 .ok_or(MissingAxis::Controller),
             AxisLink::Missing(missing) => Err(*missing),
-        }
-    }
-
-    /// Pulse io_intr for a process the record's callbacks queued, waiting
-    /// for room rather than dropping it.
-    fn pulse(&self) {
-        let io_intr_tx = self.io_intr_tx.clone();
-        if let Err(mpsc::error::TrySendError::Full(())) = io_intr_tx.try_send(()) {
-            spawn_background(self.prio, async move {
-                let _ = io_intr_tx.send(()).await;
-            });
         }
     }
 
@@ -834,6 +830,13 @@ impl DeviceSupport for MotorDeviceSupport {
         self.port.prio = prio;
     }
 
+    /// The database devMotorAsyn's callbacks lock the record in.
+    fn bind_database(&mut self, db: epics_base_rs::server::database::AsyncDbHandle) {
+        if let Ok(mut ds) = self.port.device_state.lock() {
+            ds.bind_database(db);
+        }
+    }
+
     /// devMotorAsyn's `dbScanLockOK`, set by its dset `init(after)` at
     /// `finishDevSup` (devMotorAsyn.c:159-162): from then on, PINI and any
     /// put before `scanRun` included, the record's callbacks process it.
@@ -855,15 +858,6 @@ impl DeviceSupport for MotorDeviceSupport {
                 epics_base_rs::runtime::interrupt_accept::EdgeDone::Inline
             });
         }
-    }
-
-    /// The pass one io_intr pulse runs reads the process its callback
-    /// queued.
-    fn arm_readback_callback(&mut self) -> DeviceUdf {
-        if let Ok(mut ds) = self.port.device_state.lock() {
-            ds.begin_callback_pass();
-        }
-        DeviceUdf::Untouched
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {

@@ -3,6 +3,11 @@ use super::*;
 impl MotorRecord {
     /// Plan and start a motion from a user write.
     pub fn plan_motion(&mut self, src: CommandSource) -> ProcessEffects {
+        self.put_do_work(src, ProcReason::NothingDone)
+    }
+
+    /// C do_work (1804-2557) for the put that wrote `src`.
+    fn put_do_work(&mut self, src: CommandSource, reason: ProcReason) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
 
         // C mmap marks live exactly one process pass (monitor() clears
@@ -57,7 +62,7 @@ impl MotorRecord {
             match src {
                 CommandSource::Sync | CommandSource::Set | CommandSource::Cnen => {}
                 _ => {
-                    self.handle_spmg_change(&mut effects);
+                    self.handle_spmg_change(&mut effects, reason);
                     match self.ctrl.spmg {
                         SpmgMode::Stop | SpmgMode::Pause => return effects,
                         SpmgMode::Go | SpmgMode::Move => {
@@ -132,7 +137,7 @@ impl MotorRecord {
                     // dispatched nothing fires the implicit GET_INFO
                     // (2546). The collection skips its sections under
                     // closed loop on its own.
-                    self.dispatch_latent_collection(&mut effects, true);
+                    self.dispatch_latent_collection(&mut effects, reason);
                     return effects;
                 }
                 if !self.can_accept_command() {
@@ -332,7 +337,7 @@ impl MotorRecord {
                 if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(&mut effects);
                 } else {
-                    self.dispatch_latent_collection(&mut effects, true);
+                    self.dispatch_latent_collection(&mut effects, reason);
                 }
             }
             // Returned from the top block before the sections.
@@ -349,7 +354,7 @@ impl MotorRecord {
                 // GET_INFO, 2546). A pass during motion is consumed by
                 // the move block instead (!dmov) — the collection's dmov
                 // gate reproduces that.
-                self.dispatch_latent_collection(&mut effects, true);
+                self.dispatch_latent_collection(&mut effects, reason);
             }
             CommandSource::Twf | CommandSource::Twr => {
                 // The fold already ran in the collection above (SET-mode
@@ -363,7 +368,7 @@ impl MotorRecord {
                     if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
                         self.plan_absolute_move(&mut effects);
                     } else {
-                        self.dispatch_latent_collection(&mut effects, true);
+                        self.dispatch_latent_collection(&mut effects, reason);
                     }
                 }
             }
@@ -385,7 +390,7 @@ impl MotorRecord {
                 if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(&mut effects);
                 } else {
-                    self.dispatch_latent_collection(&mut effects, true);
+                    self.dispatch_latent_collection(&mut effects, reason);
                 }
             }
         }
@@ -755,9 +760,12 @@ impl MotorRecord {
                 // C drops only MIP here: the next callback marks the still
                 // moving axis EXTERNAL with pp (1314-1320) and a VAL parked
                 // during the retry replays (1384-1397), overriding the
-                // STOP. That C defect is not copied: finalize_motion adopts
-                // the parked target into the lasts, so nothing replays.
+                // STOP. That C defect is not copied: the parked target is
+                // adopted into the lasts, so nothing replays.
                 self.finalize_motion(effects);
+                self.internal.lval = self.pos.val;
+                self.internal.ldvl = self.pos.dval;
+                self.internal.lrvl = self.pos.rval;
             }
         } else {
             if self.stat.movn != 0 {
@@ -1049,14 +1057,14 @@ impl MotorRecord {
     /// After the sections, the C else-if chain end runs: the move block
     /// (2241) whose set test replays a parked SET redefinition, the
     /// latent SYNC arm (2540-2544), and the implicit GET_INFO arm
-    /// (2546-2557). `put_pass` is C's `proc_ind == NOTHING_DONE`: only
-    /// a put/scan pass may fire the implicit GET_INFO — a CALLBACK_DATA
-    /// pass firing it would request a fresh status from every status,
-    /// an unbounded poll feedback loop C prevents with the same test.
+    /// (2546-2557), which only a NOTHING_DONE pass fires — a
+    /// CALLBACK_DATA pass firing it would request a fresh status from
+    /// every status, an unbounded poll feedback loop C prevents with the
+    /// same test.
     pub(super) fn dispatch_latent_collection(
         &mut self,
         effects: &mut ProcessEffects,
-        put_pass: bool,
+        reason: ProcReason,
     ) {
         if self.stat.dmov == 0 || !self.can_accept_command() {
             return;
@@ -1099,7 +1107,7 @@ impl MotorRecord {
         // returns STUP to OFF (here: never enters BUSY, like the
         // explicit driverless STUP put). determine_event's stup==2
         // clear + ack on the next fresh status closes the cycle.
-        if put_pass && self.stat.stup == 0 && self.can_get_info() {
+        if reason == ProcReason::NothingDone && self.stat.stup == 0 && self.can_get_info() {
             self.stat.stup = 2;
             self.mark(m::STUP);
             effects.commands.push(MotorCommand::Poll);
@@ -1219,7 +1227,7 @@ impl MotorRecord {
     }
 
     /// Handle SPMG mode change.
-    fn handle_spmg_change(&mut self, effects: &mut ProcessEffects) {
+    fn handle_spmg_change(&mut self, effects: &mut ProcessEffects, reason: ProcReason) {
         let new = self.ctrl.spmg;
         self.internal.lspg = new;
 
@@ -1314,7 +1322,7 @@ impl MotorRecord {
                         // C chain end (2540/2546): a Go pass the move
                         // block did not consume applies a latched SYNC
                         // or fires the implicit GET_INFO.
-                        self.dispatch_latent_collection(effects, true);
+                        self.dispatch_latent_collection(effects, reason);
                     }
                 }
             }
@@ -1342,7 +1350,7 @@ impl MotorRecord {
                     self.plan_absolute_move(effects);
                 } else {
                     // C chain end (2540/2546), as in the Go branch.
-                    self.dispatch_latent_collection(effects, true);
+                    self.dispatch_latent_collection(effects, reason);
                 }
             }
         }
@@ -1845,36 +1853,8 @@ impl MotorRecord {
         // the pass that carried the callback.
         let stup_ack = std::mem::take(&mut self.internal.stup_ack);
         // One-pass CALLBACK_DATA mark from determine_event's Idle
-        // consume — the C process_reason discriminator. Taken here so
-        // it never outlives this pass: when a coalesced user write owns
-        // the pass below, the mark drops unconsumed (the readback was
-        // already applied; C would have run two passes).
+        // consume — the C process_reason discriminator.
         let idle_status_pass = std::mem::take(&mut self.internal.idle_status_pass);
-
-        // C do_work resolution block (1936-1991) on the pass a
-        // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
-        // dispatcher that pass carries no command source. The mark
-        // lives exactly one pass: when the pass would take a C
-        // top-block stop return (LVIO rising, latent stop pulse, SPMG
-        // transition to Stop/Pause), it is dropped unconsumed and the
-        // existing latent handling owns the pass.
-        if self.internal.res_reanchor && self.last_write.is_none() {
-            self.internal.res_reanchor = false;
-            // C enter_do_work LVIO (1463-1484) precedes do_work.
-            if self.recompute_lvio_during_motion() {
-                let mut effects = ProcessEffects::default();
-                self.take_latent_stop(&mut effects);
-                return effects;
-            }
-            let top_block_returns = self.ctrl.stop != 0
-                || (self.ctrl.spmg != self.internal.lspg
-                    && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause));
-            if !top_block_returns {
-                let mut effects = ProcessEffects::default();
-                self.dispatch_res_reanchor(&mut effects);
-                return effects;
-            }
-        }
 
         // Sub-step pulse recovery: if DMOV is false but phase is Idle
         // (no real motion started), finalize to restore DMOV=1. This is
@@ -1895,8 +1875,8 @@ impl MotorRecord {
         //   pending).
         // - The LS-error update (1367-1378) of a load on a limit: pp is
         //   armed and the GET_INFO pass must run postProcess.
-        let put_owned = self.last_write.is_some()
-            || matches!(self.pending_event, Some(MotorEvent::UserWrite(_)));
+        let put_owned =
+            self.put_rides() || matches!(self.pending_event, Some(MotorEvent::UserWrite(_)));
         if !put_owned
             && self.internal.pp == 0
             && self.stat.dmov == 0
@@ -1909,20 +1889,10 @@ impl MotorRecord {
             return effects;
         }
 
-        // C dbScanLock: one signal owns one pass. A put-owned pass
-        // consumes only last_write — pending_event stays untouched for
-        // the pass its io_intr pulse triggers, so a coalesced device
-        // update keeps its completion pipeline and a coalesced
-        // DelayExpired keeps the settle watchdog (a dropped expiry has
-        // no second timer; with the poll loop idled by the delay it
-        // wedged DMOV low for good). determine_event defers the mailbox
-        // consume while a put is pending, so the two cannot co-occur on
-        // the live path; not taking the event here keeps the invariant
-        // for directly injected events too.
-        if let Some(src) = self.last_write.take() {
-            return self.plan_motion(src);
-        }
-
+        // C process() 1276-1293: what update_values read, or a settle
+        // delay's ACK, makes this a CALLBACK_DATA pass whether or not a
+        // put processed the record; a put that rode it gets do_work at the
+        // callback block's exit (callback_do_work).
         match self.pending_event.take() {
             Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {
@@ -1940,9 +1910,13 @@ impl MotorRecord {
                     // button/tweak latched while the STUP was in flight
                     // dispatches here even though completion is skipped.
                     // CALLBACK_DATA pass — no implicit GET_INFO (C 2546).
+                    //
+                    // A put riding the ack pass runs do_work too: C's 1345
+                    // skip leaves the put's DMOV blink unrestored, so its
+                    // 1489 gate drops the move (C defect, not copied).
                     let mut effects = ProcessEffects::default();
-                    if !self.take_latent_stop(&mut effects) {
-                        self.dispatch_latent_collection(&mut effects, false);
+                    if self.put_rides() || !self.take_latent_stop(&mut effects) {
+                        self.callback_do_work(&mut effects);
                     }
                     return effects;
                 }
@@ -1964,43 +1938,92 @@ impl MotorRecord {
                     self.stat.mip.remove(MipFlags::DELAY_REQ);
                     self.stat.mip.insert(MipFlags::DELAY_ACK);
                     effects.commands.push(MotorCommand::Poll);
-                    // C 1416-1426: the ACK pass leaves through process_exit.
+                    // C 1416-1426: the ACK pass leaves through process_exit;
+                    // a put that rode it waits for the next pass.
                     effects.process_exit = true;
+                } else if self.put_rides() {
+                    // The orphan's pass is the put's.
+                    return self.do_work(ProcReason::NothingDone);
                 }
                 effects
             }
-            None => {
-                // A pass with no command source and no device event — in
-                // the live IOC this is the process cycle a put to a field
-                // that sets no last_write triggers (HLM/LLM/DHLM/DLLM are
-                // pp(TRUE) in C). C still runs the enter_do_work LVIO
-                // re-evaluation (1463-1484) on it: a limit lowered onto a
-                // running jog must stop the axis on the write pass.
+            None if idle_status_pass || self.stat.mip.contains(MipFlags::DELAY_ACK) => {
+                // C enter_do_work's LVIO (1463-1484) runs on every pass.
                 self.recompute_lvio_during_motion();
                 // C process (1301-1409): a CALLBACK_DATA pass on an idle
                 // record runs the stopped branch — LOAD_P collapse
                 // (1405-1409), the pp pass (1382-1402) — before falling
-                // into do_work. determine_event consumed the status in
-                // place and left the one-pass mark; route it through
-                // check_completion so the live idle poll reaches that
-                // pipeline (its Idle arm). Any other pass runs do_work
-                // only, as in C.
-                if idle_status_pass {
-                    self.check_completion()
-                } else {
-                    // C do_work gate (1487-1492): the put pass continues
-                    // into do_work, whose home/jog/tweak sections act on
-                    // latched button state and whose chain end may fire
-                    // the implicit GET_INFO (2546-2557, NOTHING_DONE
-                    // passes only — put_pass carries that discriminator).
-                    let mut effects = ProcessEffects::default();
-                    if !self.take_latent_stop(&mut effects) && !self.jog_stop_section(&mut effects)
-                    {
-                        self.dispatch_latent_collection(&mut effects, true);
-                    }
-                    effects
-                }
+                // into do_work; determine_event consumed the status in
+                // place and left the one-pass mark. A DELAY_ACK enters
+                // the block on any pass (1280), so the pass after the ACK
+                // pass ends the wait whatever processed the record.
+                self.check_completion()
+            }
+            None => self.do_work(ProcReason::NothingDone),
+        }
+    }
+
+    /// Whether a put left do_work to this pass: the src a field put
+    /// wrote, or the resolution re-anchor a pp(TRUE) MRES-family put
+    /// marked.
+    pub(super) fn put_rides(&self) -> bool {
+        self.last_write.is_some() || self.internal.res_reanchor
+    }
+
+    /// do_work at a callback-block exit whose gate (C 1487-1492) holds: a
+    /// put that rode the pass owns it, otherwise the latent field state
+    /// does.
+    pub(super) fn callback_do_work(&mut self, effects: &mut ProcessEffects) {
+        if self.put_rides() {
+            effects.absorb(self.do_work(ProcReason::CallbackData));
+        } else {
+            self.dispatch_latent_collection(effects, ProcReason::CallbackData);
+        }
+    }
+
+    /// C do_work (1804-2557) on a pass that reaches it.
+    fn do_work(&mut self, reason: ProcReason) -> ProcessEffects {
+        if let Some(src) = self.last_write.take() {
+            return self.put_do_work(src, reason);
+        }
+
+        // C do_work resolution block (1936-1991) on the pass a
+        // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
+        // dispatcher that pass carries no command source. The mark
+        // lives exactly one pass: when the pass would take a C
+        // top-block stop return (LVIO rising, latent stop pulse, SPMG
+        // transition to Stop/Pause), it is dropped unconsumed and the
+        // existing latent handling owns the pass.
+        if std::mem::take(&mut self.internal.res_reanchor) {
+            // C enter_do_work LVIO (1463-1484) precedes do_work.
+            if self.recompute_lvio_during_motion() {
+                let mut effects = ProcessEffects::default();
+                self.take_latent_stop(&mut effects);
+                return effects;
+            }
+            let top_block_returns = self.ctrl.stop != 0
+                || (self.ctrl.spmg != self.internal.lspg
+                    && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause));
+            if !top_block_returns {
+                let mut effects = ProcessEffects::default();
+                self.dispatch_res_reanchor(&mut effects);
+                return effects;
             }
         }
+
+        // A pass with no command source — in the live IOC the process
+        // cycle a put to a field that sets no last_write triggers
+        // (HLM/LLM/DHLM/DLLM are pp(TRUE) in C). C still runs the
+        // enter_do_work LVIO re-evaluation (1463-1484) on it: a limit
+        // lowered onto a running jog must stop the axis on the write
+        // pass. do_work's home/jog/tweak sections then act on latched
+        // button state and its chain end may fire the implicit GET_INFO
+        // (2546-2557, NOTHING_DONE passes only).
+        self.recompute_lvio_during_motion();
+        let mut effects = ProcessEffects::default();
+        if !self.take_latent_stop(&mut effects) && !self.jog_stop_section(&mut effects) {
+            self.dispatch_latent_collection(&mut effects, reason);
+        }
+        effects
     }
 }

@@ -56,6 +56,15 @@ pub struct MotorRecord {
     next_delay_id: u64,
 }
 
+/// C `CALLBACK_VALUE`: why a pass reaches do_work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcReason {
+    /// A put or scan with no device callback to read.
+    NothingDone,
+    /// A device callback, or the settle delay's ACK (C 1280-1293).
+    CallbackData,
+}
+
 /// One row per [`m`] bit: C `monitor()`'s `monitor_mask | DBE_VAL_LOG`
 /// posts, then the literal `DBE_VAL_LOG` ones.
 static MONITOR_POSTS: [(FieldIx, CyclePostMask); 57] =
@@ -595,10 +604,8 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // If wired to device state, determine event from shared mailbox.
-        // An event that survived a put-owned pass is a still-pending
-        // signal: this pass consumes it before pulling a new one from
-        // the mailbox (one signal, one pass — never overwrite).
+        // If wired to device state, determine event from shared mailbox;
+        // an injected event is not overwritten.
         if self.pending_event.is_none() && self.device_state.is_some() {
             if let Some(event) = self.determine_event() {
                 self.pending_event = Some(event);

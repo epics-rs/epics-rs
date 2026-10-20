@@ -12,6 +12,8 @@ use motor_rs::builder::{ControllerAxes, ControllerAxis, ControllerBuilder};
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::trace::TraceUser;
 
+mod passes;
+
 type Log = Arc<Mutex<Vec<(&'static str, Instant)>>>;
 
 const SLOW: Duration = Duration::from_millis(40);
@@ -212,11 +214,11 @@ impl AsynMotor for Creeping {
     }
 }
 
-/// At each poll, the pulses axis 0's record had received and the polls
+/// At each poll, the processes axis 0's record had run and the polls
 /// axis 0 had made.
 struct Watching {
-    io_intr: tokio::sync::mpsc::Receiver<()>,
-    pulses: u32,
+    reads: passes::Reads,
+    processes: u32,
     polls: Arc<std::sync::atomic::AtomicU32>,
     seen: Arc<Mutex<Vec<(u32, u32)>>>,
 }
@@ -241,11 +243,9 @@ impl AsynMotor for Watching {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        while self.io_intr.try_recv().is_ok() {
-            self.pulses += 1;
-        }
+        self.processes += self.reads.take().len() as u32;
         let polls = self.polls.load(std::sync::atomic::Ordering::SeqCst);
-        self.seen.lock().unwrap().push((polls, self.pulses));
+        self.seen.lock().unwrap().push((polls, self.processes));
         *status = MotorStatus::default();
         Ok(())
     }
@@ -270,8 +270,8 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
     let mut record = a0.axis.attach();
     record.bind_dev_sup_gate(&InterruptGate::opened());
     let watching = Watching {
-        io_intr: record.io_intr_receiver().unwrap(),
-        pulses: 0,
+        reads: passes::bind_support(&mut record, None),
+        processes: 0,
         polls: polls.clone(),
         seen: seen.clone(),
     };
@@ -286,8 +286,8 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
     // Every poll of axis 0 posts, the startup pass's too: its record is
     // bound before the poller starts, as ANF2StartPoller's after iocInit
     // (asynMotorController.cpp:630, :658; asynMotorAxis.cpp:318-320).
-    for &(polls, pulses) in &seen {
-        assert_eq!(pulses, polls, "{seen:?}");
+    for &(polls, processes) in &seen {
+        assert_eq!(processes, polls, "{seen:?}");
     }
 }
 
@@ -406,17 +406,17 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
     };
     let mover = Arc::new(Mutex::new(Mover::default()));
     let m0 = {
-        let watched = Arc::new(Mutex::new(None::<tokio::sync::mpsc::Receiver<()>>));
+        let watched = Arc::new(Mutex::new(None::<passes::Reads>));
         let watcher = MoveWatcher {
-            io_intr: watched.clone(),
-            pulses: 0,
+            reads: watched.clone(),
+            processes: 0,
             seen: seen.clone(),
         };
         let m0 = controller.axis(Arc::new(Mutex::new(watcher)), user(0));
         let m1 = controller.axis(mover, user(1));
         let mut record = m1.axis.attach();
         record.bind_dev_sup_gate(&InterruptGate::opened());
-        *watched.lock().unwrap() = record.io_intr_receiver();
+        *watched.lock().unwrap() = Some(passes::bind_support(&mut record, None));
         motor_rs::devices::register_axis(m0.axis.clone()).unwrap();
         motor_rs::devices::register_axis(m1.axis.clone()).unwrap();
         (m0, record)
@@ -443,10 +443,10 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
     assert_eq!(seen, [0, 2, 3]);
 }
 
-/// At each poll, the pulses another axis's record had received.
+/// At each poll, the processes another axis's record had run.
 struct MoveWatcher {
-    io_intr: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
-    pulses: u32,
+    reads: Arc<Mutex<Option<passes::Reads>>>,
+    processes: u32,
     seen: Arc<Mutex<Vec<u32>>>,
 }
 
@@ -470,12 +470,10 @@ impl AsynMotor for MoveWatcher {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        if let Some(rx) = self.io_intr.lock().unwrap().as_mut() {
-            while rx.try_recv().is_ok() {
-                self.pulses += 1;
-            }
+        if let Some(reads) = self.reads.lock().unwrap().as_ref() {
+            self.processes += reads.take().len() as u32;
         }
-        self.seen.lock().unwrap().push(self.pulses);
+        self.seen.lock().unwrap().push(self.processes);
         *status = MotorStatus::default();
         Ok(())
     }
@@ -994,19 +992,13 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
     );
     let mut record = m.axis.attach();
     record.bind_dev_sup_gate(&InterruptGate::opened());
-    let mut io_intr = record.io_intr_receiver().unwrap();
+    let reads = passes::bind_support(&mut record, None);
     motor_rs::devices::register_axis(m.axis.clone()).unwrap();
     let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
-    let mut pulses = move || {
-        let mut n = 0;
-        while io_intr.try_recv().is_ok() {
-            n += 1;
-        }
-        n
-    };
+    let processes = || reads.take().len();
     tokio::time::sleep(PERIOD * 8).await;
     assert_eq!(
-        pulses(),
+        processes(),
         1,
         "only the startup poll, which the constructor raised, posts"
     );
@@ -1015,7 +1007,7 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         .unwrap()
         .unwrap();
     tokio::time::sleep(PERIOD * 8).await;
-    assert_eq!(pulses(), 1);
+    assert_eq!(processes(), 1);
     m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
 }
@@ -1084,17 +1076,14 @@ async fn the_first_poll_to_call_back_posts_unless_the_constructor_did() {
         );
         let mut record = m.axis.attach();
         record.bind_dev_sup_gate(&InterruptGate::opened());
-        let mut io_intr = record.io_intr_receiver().unwrap();
+        let reads = passes::bind_support(&mut record, None);
         let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
         tokio::time::sleep(PERIOD * 12).await;
         m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
         poller.await.unwrap();
-        let mut pulses = 0;
-        while io_intr.try_recv().is_ok() {
-            pulses += 1;
-        }
+        let processes = reads.take().len();
         assert_eq!(
-            pulses, posts,
+            processes, posts,
             "constructor called back: {constructor_calls_back}"
         );
     }

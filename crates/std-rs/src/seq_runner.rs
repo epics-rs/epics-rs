@@ -7,10 +7,10 @@
 //! `seqStart` startup command, the same shape
 //! `optics_rs::seq_runner::seq_start` is registered with.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
-// --all-features`, 222/222). The reactor its test obtains comes from the
+// --all-features`, 223/223). The reactor each test obtains comes from the
 // test's own `Runtime::new`, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;

@@ -1937,7 +1937,7 @@ impl Hdf5Writer {
         // C defect, not copied: C's SWMR Single file closes with its frame
         // unwritten, so `data` reads all fill (C oracle: storage 0). The
         // frame is written here as in a standard Single file.
-        let (grid_shape_usize, mut grid_chunk_usize, mut grid_leading) =
+        let (grid_shape_usize, grid_chunk_usize, mut grid_leading) =
             self.standard_layout(&usize_frame_dims);
         let max_shape: Vec<Option<u64>> = self
             .detector_max_shape(&grid_shape_usize, grid_leading.is_none())
@@ -1945,11 +1945,8 @@ impl Hdf5Writer {
             .map(|m| m.map(|v| v as u64))
             .collect();
         // rust-hdf5 appends to a SWMR frame axis in order only; positioned
-        // frames are placed in a grid over their positions, one frame per
-        // chunk, since a chunk shared by frames arriving in any order would
-        // be read back and patched.
+        // frames are placed in a grid over their positions.
         if grid_leading.is_none() && self.cfg.pos_running {
-            grid_chunk_usize[0] = 1;
             grid_leading = Some(self.virtual_dims());
         }
         let use_grid = grid_leading.is_some();
@@ -3345,9 +3342,10 @@ impl Hdf5Writer {
 
     /// C `verifyChunking` (NDFileHDF5Dataset.cpp:191-230) and the chunk C's
     /// `H5Dwrite_chunk` stores (:291-329): a compressed frame is
-    /// direct-chunk-written only when its codec equals the dataset's and one
-    /// chunk is exactly one frame; any other compressed frame is refused
-    /// (:343-348). `None` for an uncompressed frame, which goes through the
+    /// direct-chunk-written only when its codec equals the dataset's, one
+    /// chunk is exactly one frame and no extraDimChunk param is over 1, even
+    /// one its axis clamps to 1 (:224-229); any other compressed frame is
+    /// refused (:343-348). `None` for an uncompressed frame, which goes through the
     /// dataset's filter as C's H5Dwrite does.
     fn direct_chunk(
         &self,
@@ -3363,7 +3361,11 @@ impl Hdf5Writer {
             && chunk[lead_n..]
                 .iter()
                 .zip(frame_dims)
-                .all(|(&c, &d)| c == d.max(1));
+                .all(|(&c, &d)| c == d.max(1))
+            && !(self.multi_frame
+                && self.cfg.extra_dims[..=self.cfg.n_extra_dims]
+                    .iter()
+                    .any(|d| d.chunk > 1));
         if !(one_frame && codecs_match(self.dataset_codec.as_ref(), Some(codec))) {
             return Err(FrameError::Dataset(ADError::Reported {
                 lines: vec![
@@ -8285,7 +8287,8 @@ mod tests {
     /// With no extra dimensions the position is the frame index, bounded by
     /// `extraDimSizeN`, and frames sharing an `nFramesChunks`-deep chunk land
     /// in any order (C oracle: N = 2, 0, 1 on N=3 give (3,4,4)). The frame
-    /// axis is NumCapture deep, unlimited when that is 0.
+    /// axis is NumCapture deep, unlimited when that is 0, and chunked at
+    /// nFramesChunks on both paths (C oracle: (2,4,4) in a SWMR file).
     fn assert_positions_place_frames_on_the_frame_axis(swmr: bool, frames_chunks: usize) {
         for (num_capture, max) in [(3, Some(3)), (0, None)] {
             for (positions, want) in [
@@ -8312,6 +8315,7 @@ mod tests {
                 let h5 = H5File::open(&path).unwrap();
                 let ds = h5.dataset("entry/data").unwrap();
                 assert_eq!(ds.max_shape().unwrap(), [max, Some(4), Some(4)], "{at}");
+                assert_eq!(ds.chunk_dims().unwrap(), [frames_chunks, 4, 4], "{at}");
                 std::fs::remove_file(&path).ok();
             }
         }
@@ -8326,6 +8330,7 @@ mod tests {
     #[test]
     fn swmr_positions_place_frames_on_the_frame_axis() {
         assert_positions_place_frames_on_the_frame_axis(true, 1);
+        assert_positions_place_frames_on_the_frame_axis(true, 2);
     }
 
     /// A position past its extra dimension, or a missing position attribute,
@@ -12821,6 +12826,40 @@ mod tests {
         assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
         writer.close_file().ok();
         std::fs::remove_file(&path).ok();
+    }
+
+    /// `verifyChunking` refuses on the extraDimChunk params as written, so on
+    /// N's, which nFramesChunks replaces, and on one an axis of size 1 clamps
+    /// to 1 (C oracle: ExtraDimChunkX 2 on X=1 refuses the first LZ4 frame).
+    #[test]
+    fn a_compressed_frame_is_refused_on_any_extra_dim_chunk_over_one() {
+        for swmr in [false, true] {
+            for (extra_dims, axis) in [(0, 0), (1, 1)] {
+                let path = temp_path(&format!("hdf5_comp_ed_chunk_{swmr}_{axis}"));
+                let mut writer = Hdf5Writer::new();
+                writer.set_swmr_mode(swmr);
+                writer.set_n_extra_dims(extra_dims);
+                writer.set_extra_dim_size(0, 2);
+                writer.set_extra_dim_chunk(axis, 2);
+                writer.set_num_capture(2);
+                let comp = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
+                writer
+                    .open_file(
+                        &path,
+                        NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                        &comp,
+                    )
+                    .unwrap();
+                let err = writer.write_file(&Arc::new(comp)).unwrap_err();
+                assert_eq!(
+                    err.lines(),
+                    [MISMATCHED, ABORTING],
+                    "swmr={swmr} axis={axis}"
+                );
+                writer.close_file().ok();
+                std::fs::remove_file(&path).ok();
+            }
+        }
     }
 
     /// C's line for a compressed frame `verifyChunking` refuses

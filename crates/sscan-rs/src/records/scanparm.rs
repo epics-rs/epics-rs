@@ -362,6 +362,16 @@ impl Record for ScanparmRecord {
         ProcessStatusRule::ZERO.with_status_links(&["OGO", "OLOAD"])
     }
 
+    /// `scanparmRecord.c` names `udf` nowhere: process neither clears it nor
+    /// raises UDF_ALARM on it.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn cycle_hooks(&self) -> CycleHooks {
         CycleHooks::CYCLE_POSTED
             .union(CycleHooks::PROCESS_POSTED)

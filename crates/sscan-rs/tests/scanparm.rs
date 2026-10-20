@@ -553,3 +553,25 @@ async fn go_clears_and_posts_before_the_load_put() {
         ["LOAD 1", "GO 0", "VAL 0", "LOAD 0"]
     );
 }
+
+/// `scanparmRecord.c` names `udf` nowhere: process neither clears it nor
+/// raises UDF_ALARM on it, so a step move resets the born alarm and leaves
+/// UDF at 1.
+#[epics_base_rs::epics_test]
+async fn process_neither_clears_udf_nor_alarms_on_it() {
+    // oracle (oracleSscanIoc, bare record): UDF 1 UDF/INVALID; EP 1: STEP 1,
+    // UDF 1 NO_ALARM; UDF 1: UDF 1 NO_ALARM; EP 2: UDF 1 NO_ALARM.
+    sscan_rs::register_sscan_dbd();
+    let db = ioc("record(scanparm, \"P\") {}\n").await;
+    let udf = |db: &PvDatabase| db.get_record("P").unwrap().read().common.udf;
+    assert_eq!((udf(&db), alarm(&db)), (1, (17, 3)), "born UDF/INVALID");
+    put(&db, "EP", 1.0).await;
+    assert_eq!(f(&db, "P.STEP"), 1.0);
+    assert_eq!((udf(&db), alarm(&db)), (1, (0, 0)));
+    db.put_record_field_from_ca("P", "UDF", EpicsValue::UChar(1))
+        .await
+        .unwrap();
+    assert_eq!((udf(&db), alarm(&db)), (1, (0, 0)));
+    put(&db, "EP", 2.0).await;
+    assert_eq!((udf(&db), alarm(&db)), (1, (0, 0)));
+}

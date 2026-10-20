@@ -119,11 +119,14 @@ impl Default for ChunkConfig {
     }
 }
 
-/// One extra-dimension entry (C `HDF5_extraDimSizeN` / `HDF5_extraDimNameN`).
+/// One extra-dimension entry (C `HDF5_extraDimSizeN` / `HDF5_extraDimNameN` /
+/// `HDF5_extraDimChunkN`).
 #[derive(Clone, Default)]
 struct ExtraDim {
     size: usize,
     name: String,
+    /// As written: C's `verifyChunking` reads it unclamped.
+    chunk: i32,
 }
 
 /// State for a single open attribute time-series dataset (one per NDAttribute).
@@ -636,7 +639,8 @@ struct SwmrGridLayout {
     leading: Vec<usize>,
     /// HDF5-order frame dims `[Y, X]` (fastest-varying last).
     frame_dims: Vec<usize>,
-    /// Full per-chunk shape `[1, …, 1, rc, cc]` (same rank as the dataset).
+    /// Full per-chunk shape `[leading chunk…, rc, cc]` (same rank as the
+    /// dataset).
     chunk: Vec<usize>,
     /// Element size in bytes.
     elem_size: usize,
@@ -1062,6 +1066,12 @@ impl Hdf5Settings {
         }
     }
 
+    pub fn set_extra_dim_chunk(&mut self, idx: usize, chunk: i32) {
+        if idx < MAX_EXTRA_DIMS {
+            self.extra_dims[idx].chunk = chunk;
+        }
+    }
+
     pub fn set_fill_value(&mut self, v: f64) {
         self.fill_value = v;
     }
@@ -1371,6 +1381,12 @@ impl Hdf5Writer {
         self.cfg.store().update(|s| s.set_extra_dim_name(idx, name));
     }
 
+    pub fn set_extra_dim_chunk(&mut self, idx: usize, chunk: i32) {
+        self.cfg
+            .store()
+            .update(|s| s.set_extra_dim_chunk(idx, chunk));
+    }
+
     pub fn set_fill_value(&mut self, v: f64) {
         self.cfg.store().update(|s| s.set_fill_value(v));
     }
@@ -1526,6 +1542,19 @@ impl Hdf5Writer {
             .collect()
     }
 
+    /// C's chunk on each extra axis, outermost first: `extraDimChunk`
+    /// clamped to `1..=size` (NDFileHDF5.cpp:3184-3200), the innermost then
+    /// replaced by nFramesChunks (:3266-3274).
+    fn extra_dim_chunks(&self) -> Vec<usize> {
+        (0..=self.cfg.n_extra_dims)
+            .rev()
+            .map(|i| match &self.cfg.extra_dims[i] {
+                _ if i == 0 => self.cfg.chunk.n_frames_chunks.max(1),
+                d => (d.chunk.max(1) as usize).min(d.size.max(1)),
+            })
+            .collect()
+    }
+
     /// C `writeFile`'s positional placement (NDFileHDF5.cpp:1480-1494,
     /// `findPositionIndex` :3974-3987): the frame's offset on each extra
     /// dimension, outermost first, read as Int32 from the NDAttribute its
@@ -1587,9 +1616,9 @@ impl Hdf5Writer {
     /// is `[frame, Y, X]` and the single leading axis is extensible. With
     /// `HDF5_nExtraDims = N`
     /// it is `[eds[N], …, eds[1], eds[0], Y, X]` — `N+1` fixed leading axes
-    /// created at full configured size, each chunked at 1 (the frame data is
-    /// row-major identical to the collapsed form, only the dataspace rank
-    /// differs). `close_file` calls `set_extent` to the extent C's
+    /// created at full configured size, chunked as `extra_dim_chunks` (the
+    /// frame data is row-major identical to the collapsed form, only the
+    /// dataspace rank differs). `close_file` calls `set_extent` to the extent C's
     /// `extendDataSet` reaches for the frames written.
     ///
     /// Returns `(shape, chunk, leading)` where `leading` is `Some([eds…])`
@@ -1608,9 +1637,7 @@ impl Hdf5Writer {
             Some(leading) => {
                 let mut shape = leading.clone();
                 shape.extend_from_slice(frame_dims);
-                // Each leading axis is chunked at 1 (extraDimChunk defaults to
-                // 1; per-axis chunking is not plumbed in this port).
-                let mut chunk = vec![1usize; leading.len()];
+                let mut chunk = self.extra_dim_chunks();
                 chunk.extend_from_slice(&frame_chunk);
                 (shape, chunk, Some(leading))
             }
@@ -1671,10 +1698,9 @@ impl Hdf5Writer {
     /// leading axes, outermost-first).
     ///
     /// For the extensible single-axis layout `leading_coords` is `[band_idx]`
-    /// and up to `fc = chunk[0]` frames stack along that axis. For the fixed
-    /// multi-extra-dimension layout `leading_coords` is the full
-    /// `[eds[N], …, eds[0]]` odometer position (each leading chunk is 1, so
-    /// `fc == 1` and one frame is written per call); a Single file has none.
+    /// and up to `fc = chunk[0]` frames stack along that axis. Otherwise
+    /// `leading_coords` is the frame's full position and every leading chunk
+    /// is 1, so one frame is written per call; a Single file has none.
     ///
     /// The frame is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
     /// written with `write_chunk_at(leading_coords ++ [row_tile, col_tile], ..)`.
@@ -1699,8 +1725,6 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Frames one chunk holds: the innermost leading axis's chunk, or one
-    /// frame when the dataset is the frame alone (a Single file).
     /// Write one frame at its leading `coords` by read-modify-write of the
     /// chunks it shares. The LE frame bytes go in as unsigned words of the
     /// stored element size; the dataset keeps its own datatype.
@@ -1744,6 +1768,8 @@ impl Hdf5Writer {
         written.map_err(|e| ADError::UnsupportedConversion(format!("HDF5 write_slice error: {e}")))
     }
 
+    /// Frames one chunk holds: the innermost leading axis's chunk, or one
+    /// frame when the dataset is the frame alone (a Single file).
     fn frames_per_chunk(chunk: &[usize], lead: usize) -> usize {
         lead.checked_sub(1).map_or(1, |i| chunk[i])
     }
@@ -2660,7 +2686,9 @@ impl Hdf5Writer {
             // per-dataset odometer, which a fixed extra-dim layout bounds by
             // the product of the extra-dim sizes.
             let frame_idx = det.frame_count;
-            let positioned = positions.is_some();
+            // Frames in order along the one extensible axis go out a whole
+            // `fc`-deep chunk at a time.
+            let banded = leading.is_none() && positions.is_none();
             let coords = match (positions, &leading) {
                 (Some(offsets), _) => offsets,
                 (None, Some(lead)) => {
@@ -2693,10 +2721,13 @@ impl Hdf5Writer {
                         e
                     )))
                 })?;
-            } else if positioned && fc > 1 {
-                // The frame shares its `nFramesChunks`-deep chunk with frames
-                // that come in any order, so it is patched in, as C's
-                // hyperslab write does.
+            } else if !banded
+                && chunk[..chunk.len() - frame_dims.len()]
+                    .iter()
+                    .any(|&c| c > 1)
+            {
+                // The frame shares its chunk with frames that come in any
+                // order, so it is patched in, as C's hyperslab write does.
                 let mut dims = det.extent.clone();
                 dims.extend_from_slice(&frame_dims);
                 det.ds.set_extent(&dims).map_err(|e| {
@@ -2711,17 +2742,13 @@ impl Hdf5Writer {
             } else {
                 // Uncompressed: frames accumulate in this dataset's band and a
                 // full `fc`-deep band is flushed as a grid of write_chunk_at
-                // tiles; close_file flushes the partial final band. With a fixed
-                // multi-extra-dim layout every leading chunk is 1, so `fc == 1`
-                // and each frame is placed at its coordinates.
+                // tiles; close_file flushes the partial final band. Unbanded,
+                // every leading chunk is 1, so `fc == 1` and each frame is
+                // placed at its coordinates.
                 let fle = frame_le.expect("frame_le is set whenever chunk_bytes is None");
                 det.frame_band.push(fle);
                 if det.frame_band.len() >= fc {
-                    let leading_coords = if fc == 1 {
-                        coords
-                    } else {
-                        vec![frame_idx / fc]
-                    };
+                    let leading_coords = if banded { vec![frame_idx / fc] } else { coords };
                     Self::flush_band(
                         &det.ds,
                         &leading_coords,
@@ -3440,9 +3467,32 @@ impl Hdf5Writer {
                 stored_elem_size,
             );
             match (grid, leading_coords) {
-                // Fixed multi-extra-dimension grid: place this frame at its
-                // chunk position(s) via `write_chunk_at`, mirroring the standard
-                // path's `flush_band` (one frame per leading position, `fc == 1`).
+                // A chunk shared with other frames is patched, as on the
+                // standard path.
+                (Some(g), Some(leading_coords))
+                    if g.chunk[..g.leading.len()].iter().any(|&c| c > 1) =>
+                {
+                    let starts: Vec<u64> = leading_coords
+                        .iter()
+                        .map(|&c| c as u64)
+                        .chain(g.frame_dims.iter().map(|_| 0))
+                        .collect();
+                    let counts: Vec<u64> = leading_coords
+                        .iter()
+                        .map(|_| 1)
+                        .chain(g.frame_dims.iter().map(|&d| d as u64))
+                        .collect();
+                    writer
+                        .write_slice(ds_index, &starts, &counts, &frame_bytes)
+                        .map_err(|e| {
+                            FrameError::Dataset(ADError::UnsupportedConversion(format!(
+                                "SWMR write_slice error: {}",
+                                e
+                            )))
+                        })?;
+                }
+                // Otherwise each frame is its own chunk(s), placed via
+                // `write_chunk_at` as the standard path's `flush_band` does.
                 (Some(g), Some(leading_coords)) => {
                     for (coords, tile) in Self::band_chunk_writes(
                         &leading_coords,
@@ -4645,6 +4695,7 @@ struct Hdf5ParamIndices {
     pos_index_name: [Option<usize>; MAX_EXTRA_DIMS],
     extra_dim_size: [Option<usize>; MAX_EXTRA_DIMS],
     extra_dim_name: [Option<usize>; MAX_EXTRA_DIMS],
+    extra_dim_chunk: [Option<usize>; MAX_EXTRA_DIMS],
     fill_value: Option<usize>,
     dim_att_datasets: Option<usize>,
     layout_filename: Option<usize>,
@@ -5056,6 +5107,11 @@ impl Hdf5FileProcessor {
                     .update(|s| s.set_extra_dim_name(i, value.as_string().unwrap_or("")));
                 return;
             }
+            if Some(reason) == self.hdf5_params.extra_dim_chunk[i] {
+                self.settings
+                    .update(|s| s.set_extra_dim_chunk(i, value.as_i32()));
+                return;
+            }
             if Some(reason) == self.hdf5_params.pos_name[i] {
                 self.settings
                     .update(|s| s.set_pos_name(i, value.as_string().unwrap_or("")));
@@ -5423,6 +5479,7 @@ impl NDPluginProcess for Hdf5FileProcessor {
         for i in 0..MAX_EXTRA_DIMS {
             self.hdf5_params.extra_dim_size[i] = base.find_param(EXTRA_DIM_SIZE_PARAMS[i]);
             self.hdf5_params.extra_dim_name[i] = base.find_param(EXTRA_DIM_NAME_PARAMS[i]);
+            self.hdf5_params.extra_dim_chunk[i] = base.find_param(EXTRA_DIM_CHUNK_PARAMS[i]);
             self.hdf5_params.pos_name[i] = base.find_param(POS_NAME_PARAMS[i]);
             self.hdf5_params.pos_index_name[i] = base.find_param(POS_INDEX_PARAMS[i]);
         }
@@ -8141,6 +8198,90 @@ mod tests {
         assert_positions_place_frames_on_the_extra_dimensions(true);
     }
 
+    /// Each extra axis chunks at its `extraDimChunk` clamped to its size, the
+    /// innermost at nFramesChunks (NDFileHDF5.cpp:3184-3274), and frames
+    /// sharing a chunk land in any order. C oracle: X chunk 2 on X=3 gives
+    /// (2,1,4,4); Y chunk 2, X chunk 5, nFramesChunks 2 on (2,3,2) give
+    /// (2,3,2,4,4).
+    fn assert_extra_dim_chunks_follow_c(swmr: bool) {
+        let x_chunk = |w: &mut Hdf5Writer| {
+            w.set_n_extra_dims(1);
+            w.set_extra_dim_size(0, 2);
+            w.set_extra_dim_size(1, 3);
+            w.set_extra_dim_chunk(1, 2);
+            w.set_num_capture(6);
+        };
+        let cases: [(
+            &str,
+            Box<dyn FnOnce(&mut Hdf5Writer)>,
+            &[(i32, i32)],
+            &[usize],
+            &[u8],
+        ); 3] = [
+            (
+                "seq",
+                Box::new(move |w: &mut Hdf5Writer| {
+                    x_chunk(w);
+                    w.set_pos_running(false);
+                }),
+                &[(0, 0); 6],
+                &[2, 1, 4, 4],
+                &[1, 2, 3, 4, 5, 6],
+            ),
+            (
+                "pos",
+                Box::new(move |w: &mut Hdf5Writer| {
+                    x_chunk(w);
+                    w.set_n_frames_chunks(2);
+                }),
+                &[(2, 1), (0, 0), (1, 1), (0, 1)],
+                &[2, 2, 4, 4],
+                &[2, 4, 0, 3, 0, 1],
+            ),
+            (
+                "yx",
+                Box::new(|w: &mut Hdf5Writer| {
+                    w.set_pos_running(false);
+                    w.set_n_extra_dims(2);
+                    w.set_extra_dim_size(0, 2);
+                    w.set_extra_dim_size(1, 3);
+                    w.set_extra_dim_size(2, 2);
+                    w.set_extra_dim_chunk(1, 5);
+                    w.set_extra_dim_chunk(2, 2);
+                    w.set_n_frames_chunks(2);
+                    w.set_num_capture(12);
+                }),
+                &[(0, 0); 7],
+                &[2, 3, 2, 4, 4],
+                &[1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0],
+            ),
+        ];
+        for (name, configure, positions, chunk, cells) in cases {
+            let (path, results) = write_positioned(
+                &format!("hdf5_ed_chunk_{name}_{swmr}"),
+                swmr,
+                configure,
+                positions,
+            );
+            assert!(results.iter().all(Result::is_ok), "{name} swmr={swmr}");
+            let h5 = H5File::open(&path).unwrap();
+            let ds = h5.dataset("entry/data").unwrap();
+            assert_eq!(ds.chunk_dims().unwrap(), chunk, "{name} swmr={swmr}");
+            assert_eq!(positioned_cells(&path).1, cells, "{name} swmr={swmr}");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn extra_dim_chunks_follow_c() {
+        assert_extra_dim_chunks_follow_c(false);
+    }
+
+    #[test]
+    fn swmr_extra_dim_chunks_follow_c() {
+        assert_extra_dim_chunks_follow_c(true);
+    }
+
     /// With no extra dimensions the position is the frame index, bounded by
     /// `extraDimSizeN`, and frames sharing an `nFramesChunks`-deep chunk land
     /// in any order (C oracle: N = 2, 0, 1 on N=3 give (3,4,4)). The frame
@@ -8363,6 +8504,19 @@ mod tests {
         assert!(proc.settings.get(|s| s.pos_running));
         assert_eq!(proc.settings.get(|s| s.pos_names[1].clone()), "PosX");
         assert_eq!(proc.settings.get(|s| s.pos_index_names[2].clone()), "PosY");
+    }
+
+    #[test]
+    fn extra_dim_chunk_reaches_the_settings() {
+        let (proc, mut base) = hdf5_port();
+        proc.validate_int32(
+            idx(&base, "HDF5_extraDimChunkX"),
+            0,
+            2,
+            WriteVerdict::Accept(2),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
+        assert_eq!(proc.settings.get(|s| s.extra_dims[1].chunk), 2);
     }
 
     /// An extra-dimension grid starts at C's `dims_`, 1 on each leading

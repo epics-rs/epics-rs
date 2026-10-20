@@ -1731,7 +1731,6 @@ impl SharedProcessorInner {
     }
 
     /// Process array and return a `ProcessOutput`. Does NOT send to actor.
-    /// Direct interrupts (std_array_data_param) happen here (sync).
     /// The returned output must be published and flushed by the caller in async context.
     fn process_and_publish<P: NDPluginProcess>(
         &mut self,
@@ -1996,67 +1995,25 @@ impl SharedProcessorInner {
             sets.extend(self.dimensions(input));
         }
 
-        // Fire the StdArray waveform interrupt directly (C EPICS pattern).
-        // This is NDPluginStdArrays' typed-array callback
-        // (NDPluginStdArrays.cpp:71-73 `arrayInterruptCallback`), NOT the
-        // `doCallbacksGenericPointer` downstream path: C fires it whether or
-        // not NDArrayCallbacks is set (StdArrays defaults NDArrayCallbacks=0),
-        // so it must NOT be gated by `deliver`. It fires only with the
-        // routed/served output (`output_arrays.first()`), never the
-        // input: C skips the interface callback on throttle
-        // (NDPluginStdArrays.cpp:58), so a throttled frame leaves
-        // `output_arrays` empty and serves nothing.
-        if let (Some(param), Some(served)) = (
-            self.std_array_data_param,
-            output_arrays.first().map(|a| &**a),
-        ) {
-            use crate::ndarray::NDDataBuffer;
-            use asyn_rs::param::ParamValue;
-            let value = match &served.data {
-                NDDataBuffer::I8(v) => {
-                    Some(ParamValue::Int8Array(std::sync::Arc::from(v.as_slice())))
-                }
-                NDDataBuffer::U8(v) => Some(ParamValue::Int8Array(std::sync::Arc::from(
-                    v.iter().map(|&x| x as i8).collect::<Vec<_>>().as_slice(),
-                ))),
-                NDDataBuffer::I16(v) => {
-                    Some(ParamValue::Int16Array(std::sync::Arc::from(v.as_slice())))
-                }
-                NDDataBuffer::U16(v) => Some(ParamValue::Int16Array(std::sync::Arc::from(
-                    v.iter().map(|&x| x as i16).collect::<Vec<_>>().as_slice(),
-                ))),
-                NDDataBuffer::I32(v) => {
-                    Some(ParamValue::Int32Array(std::sync::Arc::from(v.as_slice())))
-                }
-                NDDataBuffer::U32(v) => Some(ParamValue::Int32Array(std::sync::Arc::from(
-                    v.iter().map(|&x| x as i32).collect::<Vec<_>>().as_slice(),
-                ))),
-                NDDataBuffer::I64(v) => {
-                    Some(ParamValue::Int64Array(std::sync::Arc::from(v.as_slice())))
-                }
-                NDDataBuffer::U64(v) => Some(ParamValue::Int64Array(std::sync::Arc::from(
-                    v.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
-                ))),
-                NDDataBuffer::F32(v) => {
-                    Some(ParamValue::Float32Array(std::sync::Arc::from(v.as_slice())))
-                }
-                NDDataBuffer::F64(v) => {
-                    Some(ParamValue::Float64Array(std::sync::Arc::from(v.as_slice())))
-                }
-            };
-            if let Some(value) = value {
-                let ts = served.timestamp.to_system_time();
-                self.port_handle
-                    .interrupts()
-                    .notify(asyn_rs::interrupt::InterruptValue {
-                        reason: param,
-                        addr: 0,
-                        value,
-                        timestamp: ts,
-                        uint32_changed_mask: 0,
-                        ..Default::default()
-                    });
-            }
+        // NDPluginStdArrays' `arrayInterruptCallback`s (NDPluginStdArrays.cpp:
+        // 170-197), between the dims post and the frame's params. Not gated by
+        // `deliver`: C posts at NDArrayCallbacks 0, StdArrays' default. Only
+        // the served output posts, so a throttled frame posts nothing (:58).
+        if let (Some(param), Some(served)) = (self.std_array_data_param, output_arrays.first()) {
+            let interrupts = self.port_handle.interrupts();
+            let data = &served.data;
+            sets.extend(
+                [
+                    std_array_post::<i8>(interrupts, param, data),
+                    std_array_post::<i16>(interrupts, param, data),
+                    std_array_post::<i32>(interrupts, param, data),
+                    std_array_post::<i64>(interrupts, param, data),
+                    std_array_post::<f32>(interrupts, param, data),
+                    std_array_post::<f64>(interrupts, param, data),
+                ]
+                .into_iter()
+                .flatten(),
+            );
         }
 
         // ArrayRate_RBV is computed by a calc record in the DB template
@@ -2367,6 +2324,14 @@ pub struct PluginPortDriver {
 }
 
 impl PluginPortDriver {
+    /// The served frame converted into `buf`, or 0 elements with none.
+    fn read_served<T: StdArrayElement>(&self, buf: &mut [T]) -> usize {
+        self.array_data
+            .as_ref()
+            .and_then(|handle| handle.lock().as_ref().map(|a| T::convert(&a.data, buf)))
+            .unwrap_or(0)
+    }
+
     fn new<P: NDPluginProcess>(
         port_name: &str,
         plugin_type_name: &str,
@@ -2822,31 +2787,91 @@ impl CastFromF64 for f64 {
     }
 }
 
-/// Copy NDArray data into the output buffer with type conversion.
-/// Returns the number of elements copied, or 0 if no data is available.
-macro_rules! impl_read_array {
+/// The element of one asyn array interface, and C `NDArrayPool::convert` of
+/// a frame into it. The polled `readXxxArray` and the StdArrays post both
+/// convert through it, so a waveform reads one value either way.
+trait StdArrayElement: Copy + Default {
+    const IFACE: asyn_rs::interfaces::InterfaceType;
+    /// Converts `data` into `buf`, returning the elements copied.
+    fn convert(data: &crate::ndarray::NDDataBuffer, buf: &mut [Self]) -> usize;
+    fn param(elements: Vec<Self>) -> ParamValue;
+}
+
+macro_rules! impl_std_array_element {
     (
-        $self:expr, $buf:expr, $direct_variant:ident,
+        $t:ty, $array:ident, $direct_variant:ident,
         ccast: [ $( $ccast_variant:ident ),* ],
         convert: [ $( $variant:ident ),* ]
-    ) => {{
-        use crate::ndarray::NDDataBuffer;
-        let handle = match &$self.array_data {
-            Some(h) => h,
-            None => return Ok(0),
-        };
-        let guard = handle.lock();
-        let array = match &*guard {
-            Some(a) => a,
-            None => return Ok(0),
-        };
-        let n = match &array.data {
-            NDDataBuffer::$direct_variant(v) => copy_direct(v, $buf),
-            $( NDDataBuffer::$ccast_variant(v) => copy_ccast(v, $buf), )*
-            $( NDDataBuffer::$variant(v) => copy_convert(v, $buf), )*
-        };
-        Ok(n)
-    }};
+    ) => {
+        impl StdArrayElement for $t {
+            const IFACE: asyn_rs::interfaces::InterfaceType =
+                asyn_rs::interfaces::InterfaceType::$array;
+            fn convert(data: &crate::ndarray::NDDataBuffer, buf: &mut [Self]) -> usize {
+                use crate::ndarray::NDDataBuffer;
+                match data {
+                    NDDataBuffer::$direct_variant(v) => copy_direct(v, buf),
+                    $( NDDataBuffer::$ccast_variant(v) => copy_ccast(v, buf), )*
+                    $( NDDataBuffer::$variant(v) => copy_convert(v, buf), )*
+                }
+            }
+            fn param(elements: Vec<Self>) -> ParamValue {
+                ParamValue::$array(elements.into())
+            }
+        }
+    };
+}
+
+// Every integer source -> integer is a C cast (truncating, per C++
+// NDArrayPool.cpp:387); float sources keep the numeric f64 conversion.
+impl_std_array_element!(
+    i8, Int8Array, I8,
+    ccast: [U8, I16, U16, I32, U32, I64, U64],
+    convert: [F32, F64]
+);
+impl_std_array_element!(
+    i16, Int16Array, I16,
+    ccast: [I8, U8, U16, I32, U32, I64, U64],
+    convert: [F32, F64]
+);
+impl_std_array_element!(
+    i32, Int32Array, I32,
+    ccast: [I8, U8, I16, U16, U32, I64, U64],
+    convert: [F32, F64]
+);
+impl_std_array_element!(
+    i64, Int64Array, I64,
+    ccast: [I8, U8, I16, U16, I32, U32, U64],
+    convert: [F32, F64]
+);
+impl_std_array_element!(
+    f32, Float32Array, F32,
+    ccast: [],
+    convert: [I8, U8, I16, U16, I32, U32, I64, U64, F64]
+);
+impl_std_array_element!(
+    f64, Float64Array, F64,
+    ccast: [],
+    convert: [I8, U8, I16, U16, I32, U32, I64, U64, F32]
+);
+
+/// One `arrayInterruptCallback` (NDPluginStdArrays.cpp:22-80): `data`
+/// converted into `T`'s interface and posted there, only when a client is
+/// bound to it — C converts for the first node on the list.
+fn std_array_post<T: StdArrayElement>(
+    interrupts: &asyn_rs::interrupt::InterruptManager,
+    param: usize,
+    data: &crate::ndarray::NDDataBuffer,
+) -> Option<asyn_rs::request::ParamSetValue> {
+    if !interrupts.has_subscriber(param, 0, T::IFACE) {
+        return None;
+    }
+    let mut elements = vec![T::default(); data.len()];
+    T::convert(data, &mut elements);
+    Some(asyn_rs::request::ParamSetValue::array(
+        param,
+        0,
+        T::param(elements),
+    ))
 }
 
 impl PortDriver for PluginPortDriver {
@@ -3080,53 +3105,27 @@ impl PortDriver for PluginPortDriver {
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
-        // Every integer source -> i8 is a C cast (truncating, per C++
-        // NDArrayPool.cpp:387); float sources keep the numeric f64 conversion.
-        impl_read_array!(
-            self, buf, I8,
-            ccast: [U8, I16, U16, I32, U32, I64, U64],
-            convert: [F32, F64]
-        )
+        Ok(self.read_served(buf))
     }
 
     fn read_int16_array(&mut self, _user: &AsynUser, buf: &mut [i16]) -> AsynResult<usize> {
-        impl_read_array!(
-            self, buf, I16,
-            ccast: [I8, U8, U16, I32, U32, I64, U64],
-            convert: [F32, F64]
-        )
+        Ok(self.read_served(buf))
     }
 
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
-        impl_read_array!(
-            self, buf, I32,
-            ccast: [I8, U8, I16, U16, U32, I64, U64],
-            convert: [F32, F64]
-        )
+        Ok(self.read_served(buf))
     }
 
     fn read_int64_array(&mut self, _user: &AsynUser, buf: &mut [i64]) -> AsynResult<usize> {
-        impl_read_array!(
-            self, buf, I64,
-            ccast: [I8, U8, I16, U16, I32, U32, U64],
-            convert: [F32, F64]
-        )
+        Ok(self.read_served(buf))
     }
 
     fn read_float32_array(&mut self, _user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
-        impl_read_array!(
-            self, buf, F32,
-            ccast: [],
-            convert: [I8, U8, I16, U16, I32, U32, I64, U64, F64]
-        )
+        Ok(self.read_served(buf))
     }
 
     fn read_float64_array(&mut self, _user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
-        impl_read_array!(
-            self, buf, F64,
-            ccast: [],
-            convert: [I8, U8, I16, U16, I32, U32, I64, U64, F32]
-        )
+        Ok(self.read_served(buf))
     }
 }
 
@@ -5232,6 +5231,151 @@ mod tests {
         wait_until("the waveform to be served", || served.lock().is_some());
         assert!(Arc::ptr_eq(served.lock().as_ref().unwrap(), frame.array()));
         assert_eq!(detector.num_alloc_buffers(), 1);
+    }
+
+    type StdArrayPosts = (
+        Vec<(Option<asyn_rs::interfaces::InterfaceType>, String)>,
+        Vec<String>,
+    );
+
+    /// What one frame of `data` through a StdArrays plugin posts on
+    /// STD_ARRAY_DATA: each binding on `bound` records its post's interface
+    /// and value, and an observer, which binds nothing, every post's
+    /// interface in order, NDDimensions' as `dims`.
+    fn std_array_posts(
+        port: &str,
+        data: crate::ndarray::NDDataBuffer,
+        bound: &[asyn_rs::interfaces::InterfaceType],
+    ) -> StdArrayPosts {
+        fn shown(v: &ParamValue) -> String {
+            match v {
+                ParamValue::Int8Array(a) => format!("Int8 {a:?}"),
+                ParamValue::Int16Array(a) => format!("Int16 {a:?}"),
+                ParamValue::Int32Array(a) => format!("Int32 {a:?}"),
+                ParamValue::Int64Array(a) => format!("Int64 {a:?}"),
+                ParamValue::Float32Array(a) => format!("Float32 {a:?}"),
+                ParamValue::Float64Array(a) => format!("Float64 {a:?}"),
+                other => other.type_name().to_string(),
+            }
+        }
+        let claim = asyn_rs::asyn_record::claim_port(port).unwrap();
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &claim,
+            ServingProcessor {
+                served: Arc::default(),
+            },
+            1_000_000,
+            10,
+            0,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle().clone();
+        claim
+            .publish(
+                port.clone(),
+                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+            )
+            .unwrap();
+        enable_callbacks(&handle);
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let dims = handle.ndarray_params.array_dimensions;
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _bindings: Vec<_> = bound
+            .iter()
+            .map(|&iface| {
+                let log = seen.clone();
+                port.interrupts()
+                    .register_sync_callback(
+                        asyn_rs::interrupt::InterruptFilter {
+                            reason: Some(std),
+                            addr: Some(0),
+                            iface: Some(iface),
+                            ..Default::default()
+                        },
+                        move |iv| log.lock().push((iv.iface, shown(&iv.value))),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let mut observer = port.interrupts().subscribe_async(256, 4096);
+        let mut array = NDArray::new(vec![NDDimension::new(data.len())], data.data_type());
+        array.data = data;
+        send_array(handle.array_sender(), published(Arc::new(array)));
+        let counter = handle.ndarray_params.array_counter;
+        wait_until("the frame to be counted", || {
+            port.read_int32_blocking(counter, 0).is_ok_and(|v| v == 1)
+        });
+        params_applied(&handle);
+        // The flush is enqueued, not run: a round trip runs behind it.
+        port.read_int32_blocking(counter, 0).unwrap();
+        let mut observed = Vec::new();
+        loop {
+            match observer.try_recv() {
+                Ok(v) if v.reason == std => observed.push(format!("{:?}", v.iface)),
+                Ok(v) if v.reason == dims => observed.push("dims".to_string()),
+                Ok(_) | Err(asyn_rs::interrupt::AsyncTryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let posts = seen.lock().clone();
+        (posts, observed)
+    }
+
+    /// NDPluginStdArrays converts the frame from its own type into each
+    /// interface a client is bound to, and posts it on that interface after
+    /// beginProcessCallbacks' dims post (NDPluginStdArrays.cpp:38-52,
+    /// :167-197): an unsigned frame's top value reaches an Int32 and a
+    /// Float64 waveform as `convert` gives it.
+    #[test]
+    fn a_std_arrays_frame_converts_from_its_own_type_per_bound_interface() {
+        use crate::ndarray::NDDataBuffer;
+        use asyn_rs::interfaces::InterfaceType::{Float64Array, Int32Array};
+        for (port, data, int32, float64) in [
+            ("STDU8", NDDataBuffer::U8(vec![255]), "[255]", "[255.0]"),
+            (
+                "STDU16",
+                NDDataBuffer::U16(vec![65535]),
+                "[65535]",
+                "[65535.0]",
+            ),
+            (
+                "STDU32",
+                NDDataBuffer::U32(vec![u32::MAX]),
+                "[-1]",
+                "[4294967295.0]",
+            ),
+        ] {
+            let (posts, observed) = std_array_posts(port, data, &[Int32Array, Float64Array]);
+            assert_eq!(
+                posts,
+                [
+                    (Some(Int32Array), format!("Int32 {int32}")),
+                    (Some(Float64Array), format!("Float64 {float64}")),
+                ],
+                "{port}"
+            );
+            assert_eq!(
+                observed,
+                ["dims", "Some(Int32Array)", "Some(Float64Array)"],
+                "{port}"
+            );
+        }
+    }
+
+    /// An interface with no client takes no conversion and no post: C's
+    /// `arrayInterruptCallback` converts only for a node on its list.
+    #[test]
+    fn a_std_arrays_frame_with_no_bound_interface_posts_nothing() {
+        let (posts, observed) =
+            std_array_posts("STDNONE", crate::ndarray::NDDataBuffer::U8(vec![255]), &[]);
+        assert!(posts.is_empty());
+        assert_eq!(observed, ["dims"]);
     }
 
     /// Sets its own STAMP to ten times the frame's id and forwards the frame.

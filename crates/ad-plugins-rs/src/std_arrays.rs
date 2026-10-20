@@ -376,7 +376,29 @@ mod tests {
             .unwrap();
         params_applied(&handle);
 
-        let mut rx = port.interrupts().subscribe_async(256, 4096);
+        // The ArrayData waveform's binding, an asynInt8ArrayIn I/O Intr.
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = served.clone();
+        let _binding = port
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(std),
+                    addr: Some(0),
+                    iface: Some(asyn_rs::interfaces::InterfaceType::Int8Array),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if matches!(iv.value, ParamValue::Int8Array(_)) {
+                        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -396,24 +418,8 @@ mod tests {
                 .is_ok_and(|v| v == 1)
         });
 
-        // make_array(7) is a 4-element UInt8 array → the STD_ARRAY_DATA
-        // interrupt carries it as an Int8Array; the dimensions interrupt carries
-        // an Int32Array. Finding an Int8Array interrupt proves the waveform was
-        // served despite NDArrayCallbacks=0.
-        let mut served = false;
-        loop {
-            match rx.try_recv() {
-                Ok(v) => {
-                    if matches!(v.value, ParamValue::Int8Array(_)) {
-                        served = true;
-                    }
-                }
-                Err(asyn_rs::interrupt::AsyncTryRecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            }
-        }
         assert!(
-            served,
+            served.load(std::sync::atomic::Ordering::Relaxed),
             "StdArrays must serve STD_ARRAY_DATA with NDArrayCallbacks=0"
         );
     }

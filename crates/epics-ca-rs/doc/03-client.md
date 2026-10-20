@@ -152,10 +152,11 @@ The search engine combines several layered policies:
    address is in penalty for `PENALTY_DURATION` (30 s). Search
    responses from penalised servers are ignored so the channel can
    find another server.
-5. **Datagram sequence validation** — outgoing VERSION header carries
-   `data_type = 0x8000` (sequenceNoIsValid) plus `cid = seq_no`. We
-   only accept SEARCH responses preceded by a VERSION whose seq_no
-   matches (or by an unflagged VERSION, for legacy servers).
+5. **Datagram sequence number** — outgoing VERSION header carries
+   `data_type = 1` (sequenceNoIsValid) plus `cid = seq_no`, which the
+   server echoes. libca scores search RTT with the echo; this client
+   does not model that timer and resolves every SEARCH response, as
+   libca `searchRespAction` does.
 
 ### Send loop
 

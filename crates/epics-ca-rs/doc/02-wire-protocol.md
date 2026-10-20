@@ -116,13 +116,13 @@ SEARCH headers each with the PV name as payload.
 Fields:
 
 ```
-VERSION:   cmmd=0, count=CA_MINOR_VERSION (13), data_type=0x8000 (sequenceNoIsValid), cid=seq_no
-SEARCH:    cmmd=6, postsize=padded_len, data_type=CA_DO_REPLY (10), count=CA_MINOR_VERSION,
+VERSION:   cmmd=0, count=CA_MINOR_VERSION (13), data_type=1 (sequenceNoIsValid), cid=seq_no
+SEARCH:    cmmd=6, postsize=padded_len, data_type=CA_DONT_REPLY (5), count=CA_MINOR_VERSION,
            cid=client_cid, available=client_cid
 ```
 
-We always set `data_type = CA_DO_REPLY` so we get an explicit
-NOT_FOUND on miss when the server supports it.
+`data_type = CA_DONT_REPLY` as libca `searchMsg` sets it: a server answers
+only a name it has, and sends no NOT_FOUND.
 
 ### SEARCH response (UDP unicast or TCP)
 

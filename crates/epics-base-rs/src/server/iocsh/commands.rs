@@ -932,14 +932,9 @@ fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Ve
 /// both are C. `dbpf` ends by calling `dbgf` (`:433`) whatever the put
 /// returned, so its read-back is this printer and not a second rendering.
 ///
-/// A name with no `dbFldDes` behind it is C's record ATTRIBUTE, for which
-/// `dbGetAttributePart` synthesises a `DBF_STRING` descriptor
-/// (`dbStaticLib.c:1265-1272`); `RTYP` is the only such name this port serves.
 fn dbgf_lines(addr: &DbAddr, val: &EpicsValue) -> Vec<String> {
     let inst = addr.rec.read();
-    let Some((_, dbr)) = addr.fld_des.map(|fd| field_addr_types(fd, Some(val))) else {
-        return native_readback_lines(DbfCode::String, val);
-    };
+    let (_, dbr) = addr.types(Some(val));
     if dbr == DbfCode::String {
         return native_readback_lines(dbr, &long_string_value(&inst, val));
     }
@@ -1081,7 +1076,17 @@ fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
             )
         });
     let addr = resolved.and_then(|rec| {
-        let fld_des = rec.read().field_desc(field);
+        let fld_des = {
+            let inst = rec.read();
+            match inst.field_desc(field) {
+                Some(fd) => FldDes::Declared(fd),
+                None if rec.declares_name(field) => FldDes::NameOnly,
+                None => FldDes::Attribute(
+                    ctx.db()
+                        .record_type_attribute(inst.record.record_type(), field)?,
+                ),
+            }
+        };
         let addr = DbAddr {
             rec,
             record: parts.record.to_vec(),
@@ -1119,17 +1124,7 @@ struct DbAddr {
     /// C's `pfldDes->name`: `VAL` when the name carried no field part.
     field: String,
     /// C's `paddr->pfldDes`, which is never null after `dbNameToAddr`.
-    ///
-    /// `None` here is the one shape C has no counterpart for: the `dbCommon`
-    /// `DBF_NOACCESS` internals this port carries by NAME only
-    /// (`RecordInstance::resolves_noaccess_name`). C has a `dbFldDes` for
-    /// every one of them; the generator carries a descriptor only for the
-    /// rows whose `extra(...)` names a plain scalar, so `RSET`, `MLOK`,
-    /// `MLIS`, `DSET`, `DPVT`, `RDES`, `LSET`, `ASP`, `PPN`, `PPNR`, `SPVT`
-    /// and `BKLNK` arrive with the name and nothing else. They are still
-    /// RESOLVED — the declaration is what C resolves against — so this is a
-    /// missing width, not a missing field.
-    fld_des: Option<&'static FieldDesc>,
+    fld_des: FldDes,
     /// The name carried the `$` modifier, so the address is C's `DBR_CHAR`
     /// view of the field ([`DbAddr::char_view`]).
     char_view: bool,
@@ -1139,16 +1134,38 @@ struct DbAddr {
     find_field_ok: bool,
 }
 
+/// [`DbAddr::fld_des`], by which of `dbNameToAddr`'s two lookups found the
+/// name (`dbAccess.c:672-675`).
+enum FldDes {
+    /// `dbFindFieldPart`: the record type's declaration.
+    Declared(&'static FieldDesc),
+    /// `dbFindFieldPart` too, for the `dbCommon` `DBF_NOACCESS` internals this
+    /// port carries by NAME only (`RecordInstance::resolves_noaccess_name`).
+    /// C has a `dbFldDes` for every one of them; the generator carries a
+    /// descriptor only for the rows whose `extra(...)` names a plain scalar,
+    /// so `RSET`, `MLOK`, `MLIS`, `DSET`, `DPVT`, `RDES`, `LSET`, `ASP`,
+    /// `PPN`, `PPNR`, `SPVT` and `BKLNK` arrive with the name and nothing
+    /// else. They are still RESOLVED — the declaration is what C resolves
+    /// against — so this is a missing width, not a missing field.
+    NameOnly,
+    /// `dbGetAttributePart`: a record-type attribute (`RTYP`, `VERS`, a
+    /// `dbPutAttribute` name), whose descriptor `dbPutRecordAttribute`
+    /// synthesises as `DBF_STRING`, `SPC_ATTRIBUTE`, `MAX_STRING_SIZE`
+    /// (`dbStaticLib.c:1265-1271`). Carries the attribute's text, C's `pfield`.
+    Attribute(String),
+}
+
 impl DbAddr {
     /// C's `paddr->field_type` and `paddr->dbr_field_type`.
     ///
-    /// Every name-only row above is declared `DBF_NOACCESS` in `dbCommon.dbd`,
-    /// and `mapDBFToDBR` is the identity on it, so both words are
-    /// `DBF_NOACCESS` with no descriptor to consult.
+    /// Every name-only row is declared `DBF_NOACCESS` in `dbCommon.dbd`, and
+    /// `mapDBFToDBR` is the identity on it, so both words are `DBF_NOACCESS`
+    /// with no descriptor to consult.
     fn types(&self, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
         match self.fld_des {
-            Some(fd) => field_addr_types(fd, value),
-            None => (DbfCode::NoAccess, DbfCode::NoAccess),
+            FldDes::Declared(fd) => field_addr_types(fd, value),
+            FldDes::NameOnly => (DbfCode::NoAccess, DbfCode::NoAccess),
+            FldDes::Attribute(_) => (DbfCode::String, DbfCode::String),
         }
     }
 
@@ -1209,12 +1226,10 @@ fn char_view_put(ctx: &CommandContext, addr: &DbAddr, value: EpicsValue) -> bool
 /// end and R7.0.10 prints the adjacent `dbf[1]`, `DBF_CHAR`. The string C
 /// meant is in that table already, stranded at index 12. This prints it.
 fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
-    let (field_type, dbr, field_name) = match addr.fld_des {
-        Some(fd) => {
-            let (ft, dbr) = field_addr_types(fd, None);
-            (ft, dbr, fd.name)
-        }
-        None => (DbfCode::NoAccess, DbfCode::NoAccess, addr.field.as_str()),
+    let (field_type, dbr) = addr.types(None);
+    let field_name = match addr.fld_des {
+        FldDes::Declared(fd) => fd.name,
+        FldDes::NameOnly | FldDes::Attribute(_) => addr.field.as_str(),
     };
     let rec_name = String::from_utf8_lossy(&addr.record);
     crate::server::recgbl::rec_gbl_bad_dbrtype("dbGet", dbr, field_type, &rec_name, field_name);
@@ -1243,11 +1258,8 @@ fn dbgf_failed(ctx: &CommandContext, addr: &DbAddr) {
 /// The `????` C prints for an out-of-range type (`:807-808`, `:815-816`) is
 /// unreachable here: [`DbfCode`] has no invalid value.
 ///
-/// C's `dba` also resolves record ATTRIBUTES (`dbNameToAddr` falls back to
-/// `dbGetAttributePart`, `dbAccess.c:670-672`), so `dba("rec.RTYP")` prints a
-/// synthesised `DBF_STRING`/`SPC_ATTRIBUTE` descriptor (`dbStaticLib.c:1265-1272`).
-/// This port has no attribute table — that is the subject `dbPutAttribute` is
-/// still waiting on — so an attribute name reports not-found here.
+/// An attribute's Field Description is C's `dbCalloc`'d descriptor
+/// (`dbStaticLib.c:1265`); the port synthesises none, so it prints `(none)`.
 fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
     let view = addr.char_view.then(|| addr.char_view()).flatten();
     let inst = addr.rec.read();
@@ -1265,12 +1277,14 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
         .field_native_count(field)
         .or_else(|| inst.record.get_field(field).map(|v| v.count()))
         .unwrap_or(1);
-    let mut field_size = addr.fld_des.and_then(|fd| {
-        c_field_size(
+    let mut field_size = match addr.fld_des {
+        FldDes::Declared(fd) => c_field_size(
             field_type,
             served_element_size(&*inst.record, fd, field_type),
-        )
-    });
+        ),
+        FldDes::NameOnly => None,
+        FldDes::Attribute(_) => Some(char_view::MAX_STRING_SIZE as u16),
+    };
     // The `$` modifier's re-typing (`dbAccess.c:682-701`).
     if let Some(view) = view {
         field_type = view.field_type;
@@ -1280,12 +1294,12 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
     }
 
     match addr.fld_des {
-        Some(fd) => ctx.println(&format!(
+        FldDes::Declared(fd) => ctx.println(&format!(
             "Record Address: {:p} Field Address: (none) Field Description: {:p}",
             Arc::as_ptr(&addr.rec),
             fd as *const FieldDesc,
         )),
-        None => ctx.println(&format!(
+        FldDes::NameOnly | FldDes::Attribute(_) => ctx.println(&format!(
             "Record Address: {:p} Field Address: (none) Field Description: (none)",
             Arc::as_ptr(&addr.rec),
         )),
@@ -1306,9 +1320,11 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
     // `ASP` :192, `SPVT` :210, `RSET` :218, `DSET` :225, `RDES` :237,
     // `LSET` :243, and so on), which is why C prints `Special: 1` for all of
     // them. It is read off the `.dbd`, not inferred.
-    let special = addr
-        .fld_des
-        .map_or(Special::NoMod.code(), |fd| fd.special.code());
+    let special = match addr.fld_des {
+        FldDes::Declared(fd) => fd.special.code(),
+        FldDes::NameOnly => Special::NoMod.code(),
+        FldDes::Attribute(_) => Special::Attribute.code(),
+    };
     ctx.println(&format!("       Special: {special}"));
     ctx.println(&format!(
         "DBR Field Type: {} = DBR_{}",
@@ -2720,24 +2736,15 @@ fn cmd_dbtgf() -> CommandDef {
             for line in printbuffer_lines(native.name(), 0, Some(&native_body)) {
                 ctx.println(&line);
             }
-            // C `long precision = 6` before it asks the record
-            // (`dbConvert.c:778-784`).
-            let Some(snap) = snap else {
-                // Nothing to convert FROM: C's twelve `dbGetField` calls all
-                // land in `dbGet`'s validity gate and `printBuffer` prints the
-                // header and `failed.` for each (`dbTest.c:994-997`).
-                for (dbr, _) in DBTGF_REQUEST_TYPES {
-                    for line in printbuffer_lines(dbr, 1, None) {
-                        ctx.println(&line);
-                    }
-                }
-                return Ok(CommandOutcome::Continue);
-            };
             // A link or an attribute is read as text, `no_elements` 1.
-            if let Some(route) =
-                char_view::read_route(&inst, &addr.field).and_then(|source| source.text_route())
-            {
-                let text = char_view::text_of(&snap.value);
+            let text_read = match &addr.fld_des {
+                FldDes::Attribute(text) => Some((char_view::TextRoute::Attribute, text.as_bytes())),
+                FldDes::Declared(_) | FldDes::NameOnly => snap.as_ref().and_then(|snap| {
+                    let route = char_view::read_route(&inst, &addr.field)?.text_route()?;
+                    Some((route, char_view::text_of(&snap.value)))
+                }),
+            };
+            if let Some((route, text)) = text_read {
                 for (dbr, target) in DBTGF_REQUEST_TYPES {
                     let lines = match route.read(target) {
                         Some(read) => printbuffer_block(dbr, target.dbf_code(), &read.get(text, 1)),
@@ -2749,6 +2756,19 @@ fn cmd_dbtgf() -> CommandDef {
                 }
                 return Ok(CommandOutcome::Continue);
             }
+            let Some(snap) = snap else {
+                // Nothing to convert FROM: C's twelve `dbGetField` calls all
+                // land in `dbGet`'s validity gate and `printBuffer` prints the
+                // header and `failed.` for each (`dbTest.c:994-997`).
+                for (dbr, _) in DBTGF_REQUEST_TYPES {
+                    for line in printbuffer_lines(dbr, 1, None) {
+                        ctx.println(&line);
+                    }
+                }
+                return Ok(CommandOutcome::Continue);
+            };
+            // C `long precision = 6` before it asks the record
+            // (`dbConvert.c:778-784`).
             let precision = snap.precision().unwrap_or(6);
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 let float_string = (target == crate::types::DbFieldType::String)
@@ -15649,23 +15669,22 @@ Total 3 records, 2 aliases
             "dbDumpPath must reject a first argument that is not pdbbase"
         );
     }
-    /// `REC.FIELD$` through all seven `dbTest.c` commands against softIoc
-    /// R7.0.10-146 stdout, `testdata/dollar_view/softioc.out`, which
+    /// `testdata/<case>/cmds.txt` on `t.db` against softIoc R7.0.10-146
+    /// stdout, `testdata/<case>/softioc.out`, which
     /// `softIoc -d t.db < cmds.txt 2>/dev/null` printed. Two columns are
     /// masked, each a deliberate non-match documented at its printer:
     /// `Field Address` ([`print_db_addr`]) and `time =`
-    /// ([`dbtgf_option_lines`]). dbpr/dbtr's `Record Not Found` is errlog.
-    #[test]
-    fn dollar_view_commands_match_softioc_r7_0_10_146() {
+    /// ([`dbtgf_option_lines`]). Errlog lines went to stderr.
+    fn assert_matches_softioc(case: &str) {
         let (db, ctx) = make_ctx();
-        let dir = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/server/iocsh/testdata/dollar_view"
+        let dir = format!(
+            "{}/src/server/iocsh/testdata/{case}",
+            env!("CARGO_MANIFEST_DIR")
         );
         run_cmd(&ctx, "dbLoadRecords", &[&format!("{dir}/t.db")]);
         ctx.block_on(db.ioc_init());
-        let cmds = include_str!("testdata/dollar_view/cmds.txt");
-        let want = include_str!("testdata/dollar_view/softioc.out");
+        let cmds = std::fs::read_to_string(format!("{dir}/cmds.txt")).unwrap();
+        let want = std::fs::read_to_string(format!("{dir}/softioc.out")).unwrap();
         // Zipping two empty files would compare nothing.
         assert!(cmds.lines().count() > 0, "cmds.txt is empty");
         assert!(want.lines().count() > 0, "softioc.out is empty");
@@ -15700,10 +15719,23 @@ Total 3 records, 2 aliases
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        for (n, (got, want)) in mask(&out).lines().zip(mask(want).lines()).enumerate() {
-            assert_eq!(got, want, "line {}", n + 1);
+        for (n, (got, want)) in mask(&out).lines().zip(mask(&want).lines()).enumerate() {
+            assert_eq!(got, want, "{case} line {}", n + 1);
         }
-        assert_eq!(mask(&out).lines().count(), mask(want).lines().count());
+        assert_eq!(mask(&out).lines().count(), mask(&want).lines().count());
+    }
+
+    /// `REC.FIELD$` through all seven `dbTest.c` commands.
+    #[test]
+    fn dollar_view_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("dollar_view");
+    }
+
+    /// `RTYP`, `VERS` and a `dbPutAttribute` name through the `dbTest.c`
+    /// commands: `dbGetAttributePart`'s `DBF_STRING` address, read as text.
+    #[test]
+    fn attribute_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("attribute");
     }
 
     /// The bare shell's `iocInit` — every `CaServerBuilder` binary and a

@@ -1,0 +1,109 @@
+epics> epics> status = 17, severity = 3
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+alLong: 0 < 0 .. 0 < 0
+alDouble: 0 < 0 .. 0 < 0
+DBF_STRING[0]: (empty)        
+DBF_STRING:         "ai"      
+DBF_CHAR:           0 = 0x0   
+DBF_UCHAR:          0 = 0x0   
+DBF_SHORT:          failed.   
+DBF_USHORT:         failed.   
+DBF_LONG:           failed.   
+DBF_ULONG:          failed.   
+DBF_INT64:          failed.   
+DBF_UINT64:         failed.   
+DBF_FLOAT:          failed.   
+DBF_DOUBLE:         failed.   
+DBF_ENUM:           failed.   
+epics> Record Address: 0x5e7af2b44b30 Field Address: 0x5e7af2a97cf0 Field Description: 0x5e7af2a97d40
+   No Elements: 1
+   Record Type: ai
+    Field Type: 0 = DBF_STRING
+    Field Size: 40
+       Special: 7
+DBR Field Type: 0 = DBR_STRING
+epics> DBF_STRING:         "ai"      
+epics> Put as DBR_STRING Failed.
+Cvt to DBR_CHAR failed.
+Cvt to DBR_UCHAR failed.
+Cvt to DBR_SHORT failed.
+Cvt to DBR_USHORT failed.
+Cvt to DBR_LONG failed.
+Cvt to DBR_ULONG failed.
+Cvt to DBR_INT64 failed.
+Cvt to DBR_UINT64 failed.
+Cvt to DBR_FLOAT failed.
+Cvt to DBR_DOUBLE failed.
+Cvt to DBR_ENUM failed.
+epics> DBF_STRING:         "ai"      
+epics> status = 17, severity = 3
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+alLong: 0 < 0 .. 0 < 0
+alDouble: 0 < 0 .. 0 < 0
+DBF_STRING[0]: (empty)        
+DBF_STRING:         "none specified"    
+DBF_CHAR:           0 = 0x0   
+DBF_UCHAR:          0 = 0x0   
+DBF_SHORT:          failed.   
+DBF_USHORT:         failed.   
+DBF_LONG:           failed.   
+DBF_ULONG:          failed.   
+DBF_INT64:          failed.   
+DBF_UINT64:         failed.   
+DBF_FLOAT:          failed.   
+DBF_DOUBLE:         failed.   
+DBF_ENUM:           failed.   
+epics> Record Address: 0x5e7af2b44b30 Field Address: 0x5e7af2a97dc0 Field Description: 0x5e7af2a97e10
+   No Elements: 1
+   Record Type: ai
+    Field Type: 0 = DBF_STRING
+    Field Size: 40
+       Special: 7
+DBR Field Type: 0 = DBR_STRING
+epics> DBF_STRING:         "none specified"    
+epics> status = 17, severity = 3
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+alLong: 0 < 0 .. 0 < 0
+alDouble: 0 < 0 .. 0 < 0
+DBF_STRING[0]: (empty)        
+DBF_STRING:         "bar"     
+DBF_CHAR:           0 = 0x0   
+DBF_UCHAR:          0 = 0x0   
+DBF_SHORT:          failed.   
+DBF_USHORT:         failed.   
+DBF_LONG:           failed.   
+DBF_ULONG:          failed.   
+DBF_INT64:          failed.   
+DBF_UINT64:         failed.   
+DBF_FLOAT:          failed.   
+DBF_DOUBLE:         failed.   
+DBF_ENUM:           failed.   
+epics> Record Address: 0x5e7af2b44b30 Field Address: 0x5e7af2b5f9b0 Field Description: 0x5e7af2b5fa00
+   No Elements: 1
+   Record Type: ai
+    Field Type: 0 = DBF_STRING
+    Field Size: 40
+       Special: 7
+DBR Field Type: 0 = DBR_STRING
+epics> DBF_STRING:         "bar"     

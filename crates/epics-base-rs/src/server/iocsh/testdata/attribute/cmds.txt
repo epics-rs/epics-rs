@@ -1,0 +1,12 @@
+dbPutAttribute ai FOO bar
+dbtgf AI.RTYP
+dba AI.RTYP
+dbgf AI.RTYP
+dbtpf AI.RTYP x
+dbpf AI.RTYP x
+dbtgf AI.VERS
+dba AI.VERS
+dbgf AI.VERS
+dbtgf AI.FOO
+dba AI.FOO
+dbgf AI.FOO

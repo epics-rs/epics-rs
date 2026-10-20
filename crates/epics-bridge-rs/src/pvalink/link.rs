@@ -282,16 +282,32 @@ async fn send_put(
             Ok(1)
         }
         // A disconnect cancels the put and its writes go with it, as pvxs's
-        // `op_put.reset()` keeps none (`pvxs/ioc/pvalink_channel.cpp:362-370`).
-        // Only a non-retry write's record alarms for it.
-        Err(e)
-            if is_disconnect(&e)
-                && !op.fields.is_empty()
-                && op.fields.values().all(|s| s.retry) =>
-        {
-            Ok(0)
+        // `op_put.reset()` keeps none (`pvxs/ioc/pvalink_channel.cpp:362-370`),
+        // and prints nothing. Only a non-retry write's record alarms for it.
+        Err(e) if is_disconnect(&e) => {
+            if !op.fields.is_empty() && op.fields.values().all(|s| s.retry) {
+                Ok(0)
+            } else {
+                Err(PvaLinkError::Pva(e))
+            }
         }
-        Err(e) => Err(PvaLinkError::Pva(e)),
+        Err(e) => {
+            // pvxs `linkPutDone` (`pvxs/ioc/pvalink_channel.cpp:192`), for
+            // every put the channel sends.
+            epics_base_rs::stderr_println!("{pv_name} PVA link put ERROR: {}", put_what(&e));
+            Err(PvaLinkError::Pva(e))
+        }
+    }
+}
+
+/// pvxs's `e.what()` for a failed put: a server's refusal is its message
+/// alone (`RemoteError(msg)`, `src/client.cpp:83-85`).
+fn put_what(e: &epics_pva_rs::error::PvaError) -> Cow<'_, str> {
+    match e {
+        epics_pva_rs::error::PvaError::RemoteError(status) => {
+            Cow::Borrowed(status.message().unwrap_or_default())
+        }
+        e => Cow::Owned(e.to_string()),
     }
 }
 
@@ -306,10 +322,8 @@ fn spawn_put(
 ) {
     let (client, pv_name, channel) = (client.clone(), pv_name.to_owned(), channel.clone());
     reactor.spawn(async move {
-        if let Err(e) = send_put(&client, &pv_name, &channel, op).await {
-            // pvxs `linkPutDone` (`pvxs/ioc/pvalink_channel.cpp:192`).
-            epics_base_rs::stderr_println!("{pv_name} PVA link put ERROR: {e}");
-        }
+        // A failure is printed by `send_put`.
+        let _ = send_put(&client, &pv_name, &channel, op).await;
     });
 }
 
@@ -3030,9 +3044,7 @@ mod tests {
     /// never as a silent `Ok`. pvxs raises no record alarm on this path —
     /// `linkPutDone` reports the failed put with `errlogPrintf` and carries
     /// an explicit `// TODO: signal INVALID_ALARM ?`
-    /// (`pvxs/ioc/pvalink_channel.cpp:192-195`) — so the resolver's spawned task
-    /// logs it to the console and the record stays unalarmed. The `Err`
-    /// is what gives it something to log.
+    /// (`pvxs/ioc/pvalink_channel.cpp:192-195`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_forward_link_put_is_not_reported_as_success() {
         let obs = Arc::new(std::sync::Mutex::new(ConnSwitchObs::default()));

@@ -1713,14 +1713,9 @@ async fn run_forward(shared: Arc<ForwardShared>, opener: ChannelOpener, cfg: Pva
             },
         };
         while shared.pending.swap(false, Ordering::AcqRel) {
-            if let Err(e) = link.scan_forward(cfg.retry).await {
-                // pvxs `linkPutDone`: `errlogPrintf("%s PVA link put ERROR:
-                // %s\n", key.first, e.what())` — named channel, console
-                // only. `eprintln!` is this crate's errlog equivalent (see
-                // `report_open_failure`): the RTEMS target installs no
-                // `tracing` subscriber.
-                epics_base_rs::stderr_println!("{} PVA forward link put ERROR: {e}", cfg.pv_name);
-            }
+            // A failed put is printed by the channel's put, as pvxs
+            // `linkPutDone` prints it; a link that went down prints nothing.
+            let _ = link.scan_forward(cfg.retry).await;
         }
         shared.wake.notified().await;
     }

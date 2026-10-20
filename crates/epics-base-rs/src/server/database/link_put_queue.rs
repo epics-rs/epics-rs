@@ -1218,7 +1218,9 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> 
     // from the staging gate, exactly as `dbCaPutLink`'s `-1` does. A link
     // that went down after staging says nothing: the task skips it with
     // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
+    // A pva link prints its own failure, as pvxs `linkPutDone` does.
     if let Err(e) = &result
+        && key.channel.scheme == "ca"
         && lset.is_some_and(|lset| lset.is_connected(key.channel.link_ref()))
     {
         crate::runtime::log::errlog_vprintf(format_args!(

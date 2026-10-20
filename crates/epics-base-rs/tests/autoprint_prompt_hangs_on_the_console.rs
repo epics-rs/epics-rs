@@ -4,6 +4,10 @@
 //! `-> ` hangs: the next output follows it on the same line. C oracle
 //! (`oracleStdIoc`, the same script): `f` holds only `dbpf`'s line.
 
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use epics_base_rs::server::ioc_app::IocApplication;
 
 const CHILD: &str = "AUTOPRINT_PROMPT_HANGS_ON_THE_CONSOLE_SCRIPT";
@@ -13,13 +17,21 @@ async fn child_script() {
     let Some(script) = std::env::var_os(CHILD) else {
         return;
     };
+    // The stdin shell after the script, as C's softIoc runs one.
     IocApplication::new()
         .port(0)
         .startup_script(script.to_str().unwrap())
-        .run(|_| async { Ok(()) })
+        .run(|config| async move {
+            epics_base_rs::server::db_server::announce_serving("probe");
+            config.run_shell(Vec::new()).await
+        })
         .await
         .unwrap();
 }
+
+/// The stdin shell's prompt, which races the print; nothing else the
+/// shell prints is concurrent with it.
+const PROMPT: &str = "epics> ";
 
 #[test]
 fn the_autoprint_prompt_hangs_on_the_console() {
@@ -37,33 +49,57 @@ fn the_autoprint_prompt_hangs_on_the_console() {
              iocInit\n\
              dbb A\n\
              dbap B\n\
-             dbpf B.PROC 1 > {d}/f.txt\n\
-             epicsThreadSleep 1\n\
-             echo MARK\n"
+             dbpf B.PROC 1 > {d}/f.txt\n"
         ),
     )
     .unwrap();
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child_script", "--nocapture", "--test-threads=1"])
         .env(CHILD, format!("{d}/st.cmd"))
-        .output()
+        .env("IOCSH_PS1", PROMPT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(out.status.success(), "{out:?}");
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        while let Ok(n @ 1..) = stdout.read(&mut buf) {
+            let _ = tx.send(buf[..n].to_vec());
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut console = Vec::new();
+    let mut read_until = |done: &dyn Fn(&str) -> bool| loop {
+        let text = String::from_utf8_lossy(&console).replace(PROMPT, "");
+        if done(&text) {
+            return text;
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(chunk) => console.extend(chunk),
+            Err(e) => panic!("{e}: {text}"),
+        }
+    };
+    // `echo MARK` goes in once the print's `-> ` is out, so its output is
+    // the next thing printed.
+    read_until(&|text| {
+        text.find("NAME: B ")
+            .is_some_and(|at| text[at..].contains("\n-> "))
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"echo MARK\n").unwrap();
+    drop(stdin);
+    let console = read_until(&|text| text.contains("MARK\n"));
+    assert!(child.wait().unwrap().success(), "{console}");
     assert_eq!(
         std::fs::read_to_string(format!("{d}/f.txt")).unwrap(),
         "DBF_UCHAR:          1 = 0x1   \n"
     );
-    let console = String::from_utf8_lossy(&out.stdout);
-    // The script echoes each line it runs, so the next line's echo is what
-    // follows the `-> `, as C's `epics> ` prompt does.
     let at = console
         .find("\n\nACKS: ")
         .unwrap_or_else(|| panic!("{console}"));
     let print = &console[at..];
     assert!(print.contains("NAME: B "), "{print}");
-    // The print races the shell, so the echo after it is either the sleep's
-    // or the next line's; either one starts in bold.
-    let prompt = print.find("\n-> ").unwrap_or_else(|| panic!("{print:?}"));
-    let rest = print[prompt + 4..].lines().next().unwrap();
-    assert!(rest.starts_with("\x1b[1m"), "{print:?}");
+    assert!(print.contains("\n-> MARK\n"), "{print:?}");
 }

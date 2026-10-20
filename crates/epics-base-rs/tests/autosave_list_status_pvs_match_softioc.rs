@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
@@ -103,6 +103,28 @@ fn posts(db: &PvDatabase, name: &str, rx: &mut EventReader) -> Vec<(String, u16)
     out
 }
 
+/// Add each reader's posts to its `seen` until `done` holds of them, or 30 s
+/// pass: the save task reports on its own one-second passes, later under
+/// load. The caller's assertion names what was missing.
+async fn until(
+    db: &PvDatabase,
+    names: &[&str],
+    rx: &mut [EventReader],
+    seen: &mut [Vec<(String, u16)>],
+    done: impl Fn(&[Vec<(String, u16)>]) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for ((name, rx), seen) in names.iter().zip(rx.iter_mut()).zip(seen.iter_mut()) {
+            seen.extend(posts(db, name, rx));
+        }
+        if done(seen) || Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn build() -> Arc<PvDatabase> {
     IocBuilder::new()
         .db_string(DB, &HashMap::new())
@@ -140,44 +162,36 @@ async fn a_clean_save_fills_its_list_records_in_creation_order() {
             .await,
     );
     let handle = mgr.clone().start(db.clone()).unwrap();
-    sleep(Duration::from_millis(500)).await;
-    let before: Vec<_> = names
-        .iter()
-        .zip(rx.iter_mut())
-        .map(|(n, r)| posts(&db, n, r))
-        .collect();
-    mgr.manual_save("first", &db).await.unwrap();
-    sleep(Duration::from_millis(1500)).await;
-    let after: Vec<_> = names
-        .iter()
-        .zip(rx.iter_mut())
-        .map(|(n, r)| posts(&db, n, r))
-        .collect();
-    mgr.shutdown();
-    let _ = handle.await;
-
     let one = |t: &str| vec![(t.to_string(), 0u16)];
+    let want = [
+        one("s"),
+        one("0"),
+        one("Enabling list..."),
+        vec![],
+        one("t"),
+    ];
+    let mut before = vec![Vec::new(); names.len()];
+    until(&db, &names, &mut rx, &mut before, |seen| seen == want).await;
     assert_eq!(
-        before,
-        [
-            one("s"),
-            one("0"),
-            one("Enabling list..."),
-            vec![],
-            one("t")
-        ],
+        before, want,
         "INIT is below SR_STATUS_WARN, so Time keeps its db value"
     );
+    // The list is enabled, so the save's status is not overwritten by it,
+    // as C's task saves only after `enable_list`.
+    mgr.manual_save("first", &db).await.unwrap();
     let saved = mgr.sets()[0]
         .0
         .save_time()
         .format("%a %b %d %H:%M:%S")
         .to_string();
-    assert_eq!(
-        after,
-        [vec![], vec![], one("Ok"), one(&saved), vec![]],
-        "a stringout posts only a changed value"
-    );
+    let want = [vec![], vec![], one("Ok"), one(&saved), vec![]];
+    let mut after = vec![Vec::new(); names.len()];
+    until(&db, &names, &mut rx, &mut after, |seen| seen == want).await;
+    // Whatever a later pass posts is read once the task has stopped.
+    mgr.shutdown();
+    let _ = handle.await;
+    until(&db, &names, &mut rx, &mut after, |_| true).await;
+    assert_eq!(after, want, "a stringout posts only a changed value");
 }
 
 #[epics_macros_rs::epics_test]
@@ -196,12 +210,24 @@ async fn a_value_it_could_not_fetch_is_counted_in_statusstr() {
             .await,
     );
     let handle = mgr.clone().start(db.clone()).unwrap();
+    let names = ["T:SR_0_StatusStr"];
+    let rx = std::slice::from_mut(&mut rx);
+    let mut seen = vec![Vec::new()];
+    let last_is = |text: &str| {
+        let want = (text.to_string(), 0);
+        move |seen: &[Vec<(String, u16)>]| seen[0].last() == Some(&want)
+    };
+    // As C's task saves only after `enable_list`, which would overwrite an
+    // earlier save's status.
+    until(&db, &names, rx, &mut seen, last_is("Enabling list...")).await;
     let _ = mgr.manual_save("first", &db).await;
-    sleep(Duration::from_millis(1500)).await;
+    until(&db, &names, rx, &mut seen, last_is("1 value not saved")).await;
     mgr.shutdown();
     let _ = handle.await;
+    until(&db, &names, rx, &mut seen, |_| true).await;
     assert_eq!(
-        posts(&db, "T:SR_0_StatusStr", &mut rx).last(),
-        Some(&("1 value not saved".to_string(), 0))
+        seen[0].last(),
+        Some(&("1 value not saved".to_string(), 0)),
+        "{seen:?}"
     );
 }

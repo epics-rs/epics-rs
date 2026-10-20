@@ -617,13 +617,16 @@ impl LocalLink {
     }
 
     /// `dbCaGetLink` (`dbCa.c:419-506`), which marks a connected link a
-    /// native input before the empty-cache bail.
+    /// native input before the empty-cache bail. The cache is read first:
+    /// C queues `CA_MONITOR_NATIVE` only after this read's unlock, so the
+    /// read that asks for the monitor never sees its first event.
     fn read(&self) -> Option<EpicsValue> {
         if !self.is_connected() {
             return None;
         }
+        let value = self.with_value(|s| s.value.clone());
         self.state.note_read();
-        self.with_value(|s| s.value.clone())
+        value
     }
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and

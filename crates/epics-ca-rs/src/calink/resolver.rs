@@ -510,6 +510,15 @@ impl CaLink {
         }
     }
 
+    /// `dbCaGetLink`: the cache as it was, then the mark. C queues
+    /// `CA_MONITOR_NATIVE` only after the read's unlock, so the read that
+    /// asks for the monitor never sees its first event.
+    fn read(&self) -> Option<EpicsValue> {
+        let value = self.value();
+        self.note_read();
+        value
+    }
+
     /// C `pvlOptInpNative` with its `CA_MONITOR_NATIVE` (`dbCa.c:1218-1235`):
     /// subscribe once.
     fn monitor_native(&self) {
@@ -1110,8 +1119,7 @@ impl LinkSet for CaLinkResolver {
 
     async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let link = self.open_link(link).await?;
-        link.note_read();
-        link.value()
+        link.read()
     }
 
     /// C `dbCaGetLink` (`dbCa.c:419-506`): copy out of the buffer the CA
@@ -1125,8 +1133,7 @@ impl LinkSet for CaLinkResolver {
     /// database's link work owner via [`Self::connect_link`].
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let link = self.cached_link(link)?;
-        link.note_read();
-        link.value()
+        link.read()
     }
 
     /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:1140-1159`): create the

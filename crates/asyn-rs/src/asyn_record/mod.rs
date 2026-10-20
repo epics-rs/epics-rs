@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(16): checked, not waived — all 16 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(17): checked, not waived — all 17 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1148/1148). asyn-rs became a census subject when its
+// --all-features`, 1572/1572). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -5390,8 +5390,15 @@ impl Record for AsynRecord {
         Some(self)
     }
 
+    /// asynRecord.c's one `udf` statement is init_record pass 0's `udf = 0`
+    /// (:303), and it has no `checkAlarms`: process neither clears a UDF put
+    /// back to 1 nor alarms on it.
     fn clears_udf(&self) -> bool {
-        true
+        false
+    }
+
+    fn raises_udf_alarm(&self) -> bool {
+        false
     }
 
     /// C `asynRecord.c` init_record pass 0: `pasynRec->udf = 0;` (`:303`) —
@@ -7288,6 +7295,36 @@ mod tests {
             Some(EpicsValue::Short(0)),
             "recGblResetAlarms → SEVR=NO_ALARM"
         );
+    }
+
+    /// C `process()` never writes `udf` — only init_record pass 0 does
+    /// (asynRecord.c:303) — so `caput A.UDF 1` processes and reads back 1.
+    #[tokio::test]
+    async fn process_leaves_udf_as_put() {
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use std::collections::HashMap;
+
+        let macros = HashMap::new();
+        let (name, factory) = crate::asyn_record::asyn_record_factory();
+        let (db, _autosave) = IocBuilder::new()
+            .register_record_type(name, factory)
+            .db_string("record(asyn, \"TEST:ASYN:UDFPUT\") {}\n", &macros)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        db.put_record_field_from_ca("TEST:ASYN:UDFPUT", "UDF", EpicsValue::UChar(1))
+            .await
+            .unwrap();
+        let rec = db.get_record("TEST:ASYN:UDFPUT").unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            inst.get_common_field("STAT"),
+            Some(EpicsValue::Short(alarm_status::STATE_ALARM as i16)),
+            "the put processed: no port is STATE_ALARM (asynRecord.c:356-361)"
+        );
+        assert_eq!(inst.get_common_field("UDF"), Some(EpicsValue::UChar(1)));
     }
 
     /// R9-52: C `monitorStatus` refreshes TSIZ from `getTraceIOTruncateSize`

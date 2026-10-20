@@ -7660,8 +7660,10 @@ fn answer_retired(
             Ok(())
         }
         // `readNotifyFailureResponse` (`:749-762`): `dbr_size_n` zeros, the
-        // status in `m_cid`. The count stops at the channel's, as a live
-        // read's does, so the zeros are bounded.
+        // status in `m_cid`. PCAS sizes them from the request's count alone,
+        // bounded only by `malloc` (`clientBufMemoryManager::allocate`), so
+        // one request asks it for up to 4 GiB; that C defect is not copied,
+        // and the count stops at the channel's, as a live read's does.
         CA_PROTO_READ_NOTIFY => {
             let count = hdr.actual_count().min(elements);
             let zeros = vec![0; align8(dbr_size_n(hdr.data_type, count))];

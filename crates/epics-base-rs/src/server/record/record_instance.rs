@@ -9077,13 +9077,10 @@ impl RecordInstance {
                 FieldRead::Unreadable => return None,
             },
             // C `dbNameToAddr` falls through to `dbGetAttributePart` on
-            // `S_dbLib_fieldNotFound` (`dbAccess.c:672-675`), which is how
-            // `RTYP` — declared by no record type — reads as the type name.
-            // `VERS` and any `dbPutAttribute` name need the database's
-            // attribute map and are answered a level up, in `get_pv`.
+            // `S_dbLib_fieldNotFound` (`dbAccess.c:672-675`).
             None => {
                 Self::count_name_read();
-                self.get_virtual_field(name)?
+                EpicsValue::String(self.attribute(name)?.into())
             }
         };
         Some(value)
@@ -11573,15 +11570,14 @@ impl RecordInstance {
     ///
     /// Two C outcomes, split by whether the name resolves at all:
     ///
-    /// - A record *attribute* (`NAME`, `RTYP`) resolves — `dbGetAttributePart`
-    ///   succeeds — but the write is refused: `NAME` is `special(SPC_NOMOD)`
-    ///   (dbCommon.dbd:13-17) so `dbPutSpecial` pass 0 returns `S_db_noMod`
-    ///   (dbAccess.c:123-124), and an attribute address carries
-    ///   `special == SPC_ATTRIBUTE`, which `dbPutField` rejects with the same
-    ///   `S_db_noMod` (dbAccess.c:1252-1253).
+    /// - `NAME` or a record *attribute* resolves but the write is refused:
+    ///   `NAME` is `special(SPC_NOMOD)` (dbCommon.dbd:13-17) so `dbPutSpecial`
+    ///   pass 0 returns `S_db_noMod` (dbAccess.c:123-124), and an attribute
+    ///   address carries `special == SPC_ATTRIBUTE`, which `dbPutField`
+    ///   rejects with the same `S_db_noMod` (dbAccess.c:1252-1253).
     /// - Anything else does not resolve: `S_dbLib_fieldNotFound`.
     fn unknown_field_error(&self, name: String) -> CaError {
-        if self.get_virtual_field(&name).is_some() {
+        if self.get_virtual_field(&name).is_some() || self.attribute(&name).is_some() {
             CaError::ReadOnlyField(name)
         } else {
             CaError::FieldNotFound(name)
@@ -11672,15 +11668,28 @@ impl RecordInstance {
         Ok(CommonFieldPutResult::NoChange)
     }
 
-    /// Get virtual fields (NAME, RTYP).
+    /// Get virtual fields (NAME).
     pub fn get_virtual_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "NAME" => Some(EpicsValue::String(self.name.as_bytes().into())),
-            "RTYP" => Some(EpicsValue::String(
-                self.record.record_type().to_string().into(),
-            )),
             _ => None,
         }
+    }
+
+    /// C `dbGetAttributePart` (`dbStaticLib.c:1279-1315`) for `name`: the
+    /// database's attribute table, `RTYP` and `VERS` as `dbPutAttribute`
+    /// left them. `None` where the type declares `name` — C asks only after
+    /// `dbFindFieldPart` missed, so `motor.VERS` hides the attribute — and on
+    /// a record no database owns.
+    pub(crate) fn attribute(&self, name: &str) -> Option<String> {
+        let cell = self.cold.cell.upgrade()?;
+        if cell.declares_name(name) {
+            return None;
+        }
+        self.cold
+            .db
+            .upgrade()?
+            .record_type_attribute(self.record.record_type(), name)
     }
 
     /// Evaluate alarms based on record type and current value.
@@ -16587,7 +16596,6 @@ mod declaration_gate_tests {
     /// dbgf C:GOOD.SSCN     PV 'C:GOOD.SSCN' not found
     /// dbgf C:GOOD.OLDSIMM  PV 'C:GOOD.OLDSIMM' not found
     /// dbgf C:GOOD.NOSUCH   PV 'C:GOOD.NOSUCH' not found
-    /// dbgf C:GOOD.RTYP     DBF_STRING: "calc"
     /// dbgf C:GOOD.NAME     DBF_STRING: "C:GOOD"
     /// dbgf B:ONE.INP       DBF_STRING: ""
     /// dbgf B:ONE.OUT       PV 'B:ONE.OUT' not found
@@ -16600,12 +16608,8 @@ mod declaration_gate_tests {
         for undeclared in ["OUT", "INP", "SSCN", "OLDSIMM", "NOSUCH"] {
             assert_eq!(calc.resolve_field(undeclared), None, "calc.{undeclared}");
         }
-        // Undeclared, but C's `dbNameToAddr` falls through to the record
-        // type's attributes for it.
-        assert_eq!(
-            calc.resolve_field("RTYP"),
-            Some(EpicsValue::String("calc".into()))
-        );
+        // `RTYP` is undeclared too, and an attribute of the database this
+        // record is not in (`every_record_type_starts_with_rtyp_and_vers`).
         // Declared by dbCommon, so it stays readable.
         assert_eq!(
             calc.resolve_field("NAME"),

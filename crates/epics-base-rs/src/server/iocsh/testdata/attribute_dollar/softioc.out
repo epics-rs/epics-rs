@@ -1,0 +1,42 @@
+epics> epics> epics> Record Address: 0x61a706336c00 Field Address: 0x61a706289ca0 Field Description: 0x61a706289cf0
+   No Elements: 40
+   Record Type: ai
+    Field Type: 1 = DBF_CHAR
+    Field Size: 1
+       Special: 7
+DBR Field Type: 1 = DBR_CHAR
+epics> DBF_CHAR[3]:        "zz"      
+epics> DBF_STRING:         "zz"      
+epics> Record Address: 0x61a706336c00 Field Address: 0x61a706289d70 Field Description: 0x61a706289dc0
+   No Elements: 40
+   Record Type: ai
+    Field Type: 1 = DBF_CHAR
+    Field Size: 1
+       Special: 7
+DBR Field Type: 1 = DBR_CHAR
+epics> DBF_CHAR[15]:       "none specified"    
+epics> status = 17, severity = 3
+units = ""
+precision not returned
+time = <undefined>
+enum strings not returned
+grLong: 0 .. 0
+grDouble: 0 .. 0
+ctrlLong: 0 .. 0
+ctrlDouble: 0 .. 0
+alLong: 0 < 0 .. 0 < 0
+alDouble: 0 < 0 .. 0 < 0
+DBF_CHAR[0]: (empty)          
+DBF_STRING:         "bar"     
+DBF_CHAR[4]:        "bar"     
+DBF_UCHAR[4]:       98 = 0x62 97 = 0x61 114 = 0x72          0 = 0x0   
+DBF_SHORT[40]:      failed.   
+DBF_USHORT[40]:     failed.   
+DBF_LONG[40]:       failed.   
+DBF_ULONG[40]:      failed.   
+DBF_INT64[40]:      failed.   
+DBF_UINT64[40]:     failed.   
+DBF_FLOAT[40]:      failed.   
+DBF_DOUBLE[40]:     failed.   
+DBF_ENUM[40]:       failed.   
+epics> DBF_CHAR[4]:        "bar"     

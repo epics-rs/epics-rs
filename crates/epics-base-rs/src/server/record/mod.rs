@@ -56,7 +56,6 @@ pub(crate) use link::{
     DbLinkAnswer, LinkList, LinkLookup, check_json_link_text_in, implemented_jlif, trim_link_text,
     warn_discarded_cp,
 };
-pub(crate) use menu_choices::{EnumChoice, enum_state_choice};
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
     MENU_PINI, MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
@@ -65,6 +64,7 @@ pub use menu_choices::{
     resolve_enum_state_string, resolve_menu_field_string, resolve_menu_field_string_db_load,
     resolve_put_string_enum, shared_menu_choices,
 };
+pub(crate) use menu_choices::{cvt_st_e, cvt_st_e_input};
 pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;
 pub use record_instance::{

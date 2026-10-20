@@ -577,11 +577,6 @@ impl Record for MbbiRecord {
         )
     }
 
-    /// `prec->udf = FALSE` (`mbbiRecord.c:284`).
-    fn enum_str_clears_udf(&self) -> bool {
-        true
-    }
-
     /// C `get_enum_str` (mbbiRecord.c:235-255): any `val <= 15` reads its state slot,
     /// defined or not, so an unset state renders EMPTY; past 15 it is
     /// `"Illegal Value"`. `enum_state_strings` above stops at the last

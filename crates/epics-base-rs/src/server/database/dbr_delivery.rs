@@ -80,7 +80,8 @@ pub fn apply_long_string_mode(
 /// What one CA subscription does to each event between its queue and the
 /// wire: the channel's post chain, on a `$` channel's char image, then the
 /// long-string boundary conversion, then for a link or an attribute the text
-/// `dbGet` reads for the request type. Every delivery path reads its events
+/// `dbGet` reads for the request type, and for a string field read as
+/// `DBR_ENUM` its `cvt_st_e`. Every delivery path reads its events
 /// through this one owner, as C's event task runs the post chain for every
 /// `event_read` (`dbEvent.c:984-985`).
 #[derive(Clone)]
@@ -97,6 +98,68 @@ struct StageTransform {
     post: Option<std::sync::Arc<crate::server::database::db_access::PostStage>>,
     long_string_mode: LongStringMode,
     text: Option<TextStep>,
+    st_e: Option<EnumSource>,
+}
+
+/// The record a `DBF_STRING` field's `DBR_ENUM` read converts against:
+/// `cvt_st_e` asks the field's own record (`dbFastLinkConv.c:247-281`).
+#[derive(Clone)]
+struct EnumSource {
+    record: std::sync::Arc<crate::server::record::RecordCell>,
+    field: std::sync::Arc<str>,
+}
+
+impl EnumSource {
+    /// The source of a `data_type` request on `target`, read in `mode`;
+    /// `None` where no read of it reaches `cvt_st_e`. The value decides at
+    /// each read ([`cvt_st_e_input`](crate::server::record::cvt_st_e_input));
+    /// the address type only spares every other field the transform.
+    fn of(target: &ChannelTarget, mode: LongStringMode, data_type: u16) -> Option<Self> {
+        use crate::types::DbFieldType;
+        let ChannelTarget::RecordField { record, field } = target else {
+            return None;
+        };
+        if crate::types::native_type_for_dbr(data_type).ok() != Some(DbFieldType::Enum) {
+            return None;
+        }
+        let string = match mode {
+            LongStringMode::NativeString => true,
+            LongStringMode::Plain => {
+                let inst = record.read();
+                record
+                    .addressed_field_type(field, Some(&*inst.record))
+                    .is_none_or(|t| t == DbFieldType::String)
+            }
+            LongStringMode::DollarChar { .. } | LongStringMode::Text(_) => false,
+        };
+        string.then(|| Self {
+            record: record.clone(),
+            field: field.clone(),
+        })
+    }
+
+    /// `value` as `dbGet` reads it for `DBR_ENUM`: the state index
+    /// [`cvt_st_e`](crate::server::record::cvt_st_e) answers for one string,
+    /// `Err` where it fails, after printing C's line.
+    fn read(&self, value: &mut EpicsValue) -> Result<(), GetFailed> {
+        let Some(s) = crate::server::record::cvt_st_e_input(value) else {
+            return Ok(());
+        };
+        let index = crate::server::record::cvt_st_e(&*self.record.read().record, s);
+        match index {
+            Ok(i) => {
+                *value = EpicsValue::Enum(i);
+                Ok(())
+            }
+            Err(report) => {
+                report.emit(
+                    &self.record.name().to_str_lossy(),
+                    &self.record.put_name(&self.field).0,
+                );
+                Err(GetFailed)
+            }
+        }
+    }
 }
 
 /// `dbGet`'s read of a link or an attribute for the stage's request type.
@@ -109,9 +172,10 @@ enum TextStep {
 }
 
 impl DeliveryStage {
-    /// The stage for a `data_type` request on a channel whose post chain is
-    /// `post`, on a field of `autosize` elements.
+    /// The stage for a `data_type` request on `target`, a channel whose post
+    /// chain is `post`, on a field of `autosize` elements.
     pub fn new(
+        target: &ChannelTarget,
         post: crate::server::database::filters::FilterChain,
         long_string_mode: LongStringMode,
         autosize: u32,
@@ -138,11 +202,16 @@ impl DeliveryStage {
             });
         let post = crate::server::database::db_access::PostStage::new(post, dollar)
             .map(std::sync::Arc::new);
-        let transform = (post.is_some() || long_string_mode != LongStringMode::Plain).then(|| {
+        let st_e = EnumSource::of(target, long_string_mode, data_type);
+        let transform = (post.is_some()
+            || long_string_mode != LongStringMode::Plain
+            || st_e.is_some())
+        .then(|| {
             Box::new(StageTransform {
                 post,
                 long_string_mode,
                 text,
+                st_e,
             })
         });
         Self {
@@ -242,27 +311,31 @@ impl DeliveryStage {
     }
 
     /// [`Self::prepare`] for a snapshot no queue carried: a read, or a single
-    /// event posted under subscriber mask `mask`, rewritten in place; `false`
-    /// where the chain drops it, which leaves `snapshot` without its value.
-    /// The caller has answered [`Self::refuses`].
+    /// event posted under subscriber mask `mask`, rewritten in place, then
+    /// converted as `dbGet` converts the request type; `None` where the chain
+    /// drops it, which leaves `snapshot` without its value, and `Err` where
+    /// `dbGet` fails it. The caller has answered [`Self::refuses`].
     fn prepare_snapshot(
         &self,
         snapshot: &mut crate::server::snapshot::Snapshot,
         requested_count: u32,
         mask: u16,
-    ) -> bool {
-        if self.is_identity() {
-            return true;
-        }
+    ) -> Option<Result<(), GetFailed>> {
+        let Some(transform) = &self.transform else {
+            return Some(Ok(()));
+        };
         let log = crate::server::pv::MonitorEvent::read_log(
             snapshot,
             crate::server::recgbl::EventMask::from_bits(mask),
         );
-        let Some(log) = self.prepare(log, requested_count) else {
-            return false;
-        };
+        let log = self.prepare(log, requested_count)?;
         log.write_log_over(snapshot);
-        true
+        Some(
+            transform
+                .st_e
+                .as_ref()
+                .map_or(Ok(()), |source| source.read(&mut snapshot.value)),
+        )
     }
 }
 
@@ -341,13 +414,15 @@ impl<'a> Update<'a> {
             });
         }
         match body {
+            // A string read as `DBR_ENUM` is always a read: the encode reads
+            // `put_enum_str` ([`reads_options`]), so `cvt_st_e` runs here.
             Body::Read(read) => {
-                if !stage.prepare_snapshot(read, requested_count, posted.mask().bits()) {
-                    return None;
-                }
+                let body = stage
+                    .prepare_snapshot(read, requested_count, posted.mask().bits())?
+                    .map(|()| Body::Read(read));
                 Some(Delivery {
                     log: log.insert(posted),
-                    body: Ok(Body::Read(read)),
+                    body,
                 })
             }
             Body::Log(_) => {
@@ -473,6 +548,7 @@ pub fn prepare_read(
     // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
     // string so plain access ships one DBR_STRING (C cvt_dbaddr).
     let stage = DeliveryStage::new(
+        target,
         post_chain,
         long_string_mode,
         field_element_count,
@@ -485,7 +561,8 @@ pub fn prepare_read(
         // The post chain drops nothing (`arr`, `ts`), so `None` is
         // unreachable; it keeps the value as read.
         let mut read = snapshot.clone();
-        if stage.prepare_snapshot(&mut read, requested_count, 0) {
+        if let Some(prepared) = stage.prepare_snapshot(&mut read, requested_count, 0) {
+            prepared?;
             snapshot = read;
         }
     }

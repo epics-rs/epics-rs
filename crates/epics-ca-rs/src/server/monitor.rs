@@ -315,7 +315,11 @@ mod tests {
         for pass in [true, false] {
             let mut chain = FilterChain::new();
             chain.push(std::sync::Arc::new(Post(pass)));
+            let target = crate::server::tcp::ChannelTarget::SimplePv(std::sync::Arc::new(
+                epics_base_rs::server::pv::ProcessVariable::new("c:pv", EpicsValue::Double(0.0)),
+            ));
             let stage = crate::server::DeliveryStage::new(
+                &target,
                 chain,
                 crate::server::LongStringMode::Plain,
                 1,

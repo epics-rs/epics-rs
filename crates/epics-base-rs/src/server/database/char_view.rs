@@ -61,8 +61,7 @@ fn route_at(inst: &RecordInstance, field: &str, desc: Option<&FieldDesc>) -> Opt
         Some(desc) if crate::types::link_class_of(desc).is_some() => Some(CharSource::Link),
         Some(_) => Some(CharSource::Field),
         // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
-        None => matches!(inst.get_virtual_field(field)?, EpicsValue::String(_))
-            .then_some(CharSource::Attribute),
+        None => inst.attribute(field).map(|_| CharSource::Attribute),
     }
 }
 
@@ -106,7 +105,9 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
         CharSource::Attribute => {
             return Some(CharView {
                 source: CharSource::Attribute,
-                value: inst.get_virtual_field(field),
+                value: inst
+                    .attribute(field)
+                    .map(|text| EpicsValue::String(text.into())),
                 count: MAX_STRING_SIZE,
                 no_elements: MAX_STRING_SIZE,
                 field_type: DbfCode::Char,

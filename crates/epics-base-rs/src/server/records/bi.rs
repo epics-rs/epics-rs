@@ -306,11 +306,6 @@ impl Record for BiRecord {
         crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
     }
 
-    /// `prec->udf = FALSE` (`biRecord.c:227`).
-    fn enum_str_clears_udf(&self) -> bool {
-        true
-    }
-
     /// C `get_enum_str` (biRecord.c:173-192): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`

@@ -98,6 +98,17 @@ fn declared_types() -> &'static Mutex<HashSet<String>> {
     DECLARED_TYPES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Whether this process can see `record_type`'s declarations — C's
+/// `dbFindRecordType` succeeding: the generated table's types and every type a
+/// registration published to [`declared_types`].
+pub(crate) fn record_type_visible(record_type: &str) -> bool {
+    crate::server::record::dbd_generated::record_fields(record_type).is_some()
+        || declared_types()
+            .lock()
+            .expect("declared record type set mutex poisoned")
+            .contains(record_type)
+}
+
 /// C `dbFindField` (`dbStaticLib.c:1847-1859` @`R7.0.10`), asked with a record
 /// type NAME because the parser holds a type string and no instance.
 ///
@@ -128,12 +139,7 @@ fn declared_types() -> &'static Mutex<HashSet<String>> {
 fn record_type_field_exists(record_type: &str, field: &str) -> Option<bool> {
     use crate::server::record::dbd_generated;
 
-    let visible = dbd_generated::record_fields(record_type).is_some()
-        || declared_types()
-            .lock()
-            .expect("declared record type set mutex poisoned")
-            .contains(record_type);
-    if !visible {
+    if !record_type_visible(record_type) {
         return None;
     }
     if crate::server::record::declared_field(record_type, field).is_some_and(|d| d.name == field) {

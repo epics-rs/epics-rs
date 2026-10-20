@@ -669,10 +669,6 @@ fn test_resolve_field_priority() {
         Some(EpicsValue::String(s)) => assert_eq!(s, "TEMP"),
         other => panic!("expected String(TEMP), got {:?}", other),
     }
-    match instance.resolve_field("RTYP") {
-        Some(EpicsValue::String(s)) => assert_eq!(s, "ai"),
-        other => panic!("expected String(ai), got {:?}", other),
-    }
     assert!(instance.resolve_field("HIHI").is_some());
     assert!(instance.resolve_field("NONEXISTENT").is_none());
 }

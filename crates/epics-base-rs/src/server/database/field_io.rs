@@ -2470,35 +2470,6 @@ impl PvDatabase {
             );
             return value;
         }
-        self.read_field_by_name_at(instance, field, addr)
-    }
-
-    /// [`Self::read_field_at`] for a field with no slot.
-    fn read_field_by_name_at(
-        &self,
-        instance: &crate::server::record::RecordInstance,
-        field: &str,
-        addr: crate::server::record::record_instance::FieldAddr,
-    ) -> Option<EpicsValue> {
-        // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
-        // against the record type's DECLARED field list first and falls
-        // through to `dbGetAttributePart` only on
-        // `S_dbLib_fieldNotFound`. So a record type that declares a field
-        // of the attribute's name — `motor.VERS` — shadows the attribute,
-        // and `RTYP`, which no record type declares, never is shadowed.
-        //
-        // Asked in that order, which is also the cheap one: the declared
-        // list is a static slice this process never writes, while the
-        // attribute map is behind a `Mutex` the whole IOC shares — a lock
-        // every link value read and every `get_pv` was taking to miss.
-        // Both operands are pure reads, so the conjunction's answer does not
-        // depend on which is asked first. The same order, for the same C
-        // lines, is already what `PvDatabase::channel_field_exists` uses.
-        if !addr.declared
-            && let Some(value) = self.record_type_attribute(instance.record.record_type(), field)
-        {
-            return Some(EpicsValue::String(value.into()));
-        }
         instance.resolve_field_upper_at(field, addr.desc)
     }
 

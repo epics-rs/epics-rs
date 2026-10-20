@@ -858,6 +858,7 @@ impl LocalChannel {
             _user: user,
             reader,
             stage: DeliveryStage::new(
+                &self.chan.target,
                 post_chain,
                 self.chan.long_string_mode,
                 self.chan.field_element_count,

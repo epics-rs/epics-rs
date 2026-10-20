@@ -1081,10 +1081,7 @@ fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
             match inst.field_desc(field) {
                 Some(fd) => FldDes::Declared(fd),
                 None if rec.declares_name(field) => FldDes::NameOnly,
-                None => FldDes::Attribute(
-                    ctx.db()
-                        .record_type_attribute(inst.record.record_type(), field)?,
-                ),
+                None => FldDes::Attribute(inst.attribute(field)?),
             }
         };
         let addr = DbAddr {
@@ -2774,9 +2771,19 @@ fn cmd_dbtgf() -> CommandDef {
                 let float_string = (target == crate::types::DbFieldType::String)
                     .then(|| dbtgf_string_elements(&snap, precision))
                     .flatten();
-                let lines = match float_string {
-                    Some(elements) => printbuffer_lines(dbr, elements.len(), Some(&elements)),
-                    None => match snap.value.get_convert(target) {
+                let st_e = (target == crate::types::DbFieldType::Enum)
+                    .then(|| crate::server::record::cvt_st_e_input(&snap.value))
+                    .flatten();
+                let lines = match (float_string, st_e) {
+                    (Some(elements), _) => printbuffer_lines(dbr, elements.len(), Some(&elements)),
+                    (None, Some(s)) => match crate::server::record::cvt_st_e(&*inst.record, s) {
+                        Ok(i) => printbuffer_block(dbr, target.dbf_code(), &EpicsValue::Enum(i)),
+                        Err(report) => {
+                            report.emit(&inst.name.to_str_lossy(), &addr.field);
+                            printbuffer_lines(dbr, 1, None)
+                        }
+                    },
+                    (None, None) => match snap.value.get_convert(target) {
                         Ok(v) => printbuffer_block(dbr, target.dbf_code(), &v),
                         Err(_) => printbuffer_lines(dbr, 1, None),
                     },
@@ -7929,6 +7936,35 @@ mod tests {
         assert!(
             run_cmd(&ctx, "dbgf", &["A:ONE.VERS"]).contains("\"none specified\""),
             "the shell path resolves it too"
+        );
+    }
+
+    /// The seed covers every record type the IOC knows, including one
+    /// another crate supplies (`epid`, `sscan`): C seeds each `.dbd` it reads.
+    #[test]
+    fn a_record_type_outside_the_generated_table_starts_with_rtyp_and_vers() {
+        struct Supplied;
+        impl crate::server::record::Record for Supplied {
+            fn record_type(&self) -> &'static str {
+                "suppliedType"
+            }
+            fn get_field(&self, _: &str) -> Option<crate::types::EpicsValue> {
+                None
+            }
+            fn put_field(&mut self, _: &str, _: crate::types::EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
+                crate::server::record::dbd_generated::record_fields("longin").unwrap()
+            }
+        }
+        let (db, ctx) = make_ctx();
+        ctx.block_on(db.add_record("S:ONE", Box::new(Supplied)))
+            .unwrap();
+        assert_eq!(attr_of(&db, "S:ONE.RTYP").as_deref(), Some("suppliedType"));
+        assert_eq!(
+            attr_of(&db, "S:ONE.VERS").as_deref(),
+            Some("none specified")
         );
     }
 
@@ -13223,6 +13259,66 @@ record(ai, "SIM:C") { field(VAL, "1") }
         assert_eq!(strs("E:M"), "enum strings not returned");
     }
 
+    /// `dbtgf`'s `DBR_ENUM` read of a string field is `cvt_st_e` against the
+    /// field's record. softIoc: `"High"` stores VAL 1 into `S:B` and prints
+    /// the unwritten buffer, a defect not copied — here the index is printed
+    /// and VAL stays 0; `"7"` fails with
+    /// `recGblRecordError: 7 Illegal choice PV: S:B7`; stringin fails with
+    /// `recGblRecSupError: … stringin::put_enum_str PV: S:SI.VAL`.
+    #[test]
+    fn dbtgf_reads_a_string_field_as_enum_through_cvt_st_e() {
+        let (db, ctx) = make_ctx();
+        load_records(
+            &ctx,
+            "record(bi, \"S:B\") { field(ZNAM, \"Low\") field(ONAM, \"High\") \
+             field(DESC, \"High\") }\n\
+             record(bi, \"S:B7\") { field(ZNAM, \"Low\") field(ONAM, \"High\") \
+             field(DESC, \"7\") }\n\
+             record(stringin, \"S:SI\") { field(VAL, \"High\") }\n",
+        )
+        .unwrap();
+        ctx.block_on(db.ioc_init());
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&heard);
+        crate::runtime::log::errlog_add_listener(move |m| {
+            sink.lock().unwrap().push(m.trim_end().to_string())
+        });
+        for (pv, want, line) in [
+            ("S:B.DESC", "1", None),
+            (
+                "S:B7.DESC",
+                "failed.",
+                Some("recGblRecordError: 7 Illegal choice PV: S:B7"),
+            ),
+            (
+                "S:SI",
+                "failed.",
+                Some(
+                    "recGblRecSupError: dbPutField missing record support entry table \
+                     stringin::put_enum_str PV: S:SI.VAL",
+                ),
+            ),
+        ] {
+            crate::runtime::log::errlog_flush();
+            heard.lock().unwrap().clear();
+            let out = run_cmd(&ctx, "dbtgf", &[pv]);
+            crate::runtime::log::errlog_flush();
+            let got: Vec<&str> = out
+                .lines()
+                .find(|l| l.starts_with("DBF_ENUM:"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            assert_eq!(got, ["DBF_ENUM:", want], "{pv}:\n{out}");
+            let said = std::mem::take(&mut *heard.lock().unwrap());
+            match line {
+                Some(line) => assert!(said.iter().any(|l| l == line), "{pv}: {said:?}"),
+                None => assert!(said.is_empty(), "{pv}: {said:?}"),
+            }
+        }
+        assert_eq!(db.get_pv_blocking("S:B").unwrap(), EpicsValue::Enum(0));
+    }
+
     /// C prints `<cmd> only works after iocInit` and fails the line
     /// when the record's `lset` is still NULL — `dbgf`
     /// (`dbTest.c:366-368`), `dbpf` (`:408-410`), `dbtr` (`:476-478`),
@@ -15609,6 +15705,13 @@ Total 3 records, 2 aliases
     #[test]
     fn attribute_commands_match_softioc_r7_0_10_146() {
         assert_matches_softioc("attribute");
+    }
+
+    /// An attribute's `$` address, and a `dbPutAttribute` over `RTYP`, which
+    /// both the plain and the `$` read then serve.
+    #[test]
+    fn attribute_dollar_commands_match_softioc_r7_0_10_146() {
+        assert_matches_softioc("attribute_dollar");
     }
 
     /// The bare shell's `iocInit` — every `CaServerBuilder` binary and a

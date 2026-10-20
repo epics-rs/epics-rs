@@ -988,10 +988,9 @@ pub enum LinkReadAs {
     UInt64,
     /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer. Numeric
     /// sources convert as [`Self::UShort`] does. A one-element `DBF_STRING`
-    /// source goes to the SOURCE record's `put_enum_str` (`cvt_st_e`), which on
-    /// a name match stores the source's VAL and leaves the buffer as it was; a
+    /// source is [`cvt_st_e`](super::cvt_st_e) against the SOURCE record; a
     /// longer one parses element 0 (`getStringUshort`). Where C writes nothing
-    /// the read delivers an empty `EnumArray`, so the buffer stays the
+    /// (NORD=0) the read delivers an empty `EnumArray`, so the buffer stays the
     /// reader's and this request can be cached in the plan.
     Enum,
     /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
@@ -2127,7 +2126,6 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         // `get_alarm_double`.
         "bi" | "mbbi" | "mbbo" => P {
             enum_strs: true,
-            put_enum_str: Some(true),
             ..P::NONE
         },
         "bo" => P {
@@ -2135,7 +2133,6 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
             precision: true,
             control_double: true,
             enum_strs: true,
-            put_enum_str: Some(true),
             ..P::NONE
         },
         // busyRecord.c (synApps busy): units/graphic/control/alarm NULL,
@@ -2143,7 +2140,6 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
         "busy" => P {
             precision: true,
             enum_strs: true,
-            put_enum_str: Some(true),
             ..P::NONE
         },
         // mbbiDirectRecord.c:63-81 / mbboDirectRecord.c:63-81 — only
@@ -4137,14 +4133,6 @@ pub trait Record: RecordAny + Send + Sync + 'static {
             .iter()
             .position(|state| state.as_bytes() == name.as_bytes())
             .map(|i| i as u16)
-    }
-
-    /// Whether that slot's store also clears UDF. C's bi and mbbi do
-    /// (`biRecord.c:227`, `mbbiRecord.c:284`); bo, mbbo and busy store VAL
-    /// alone (`boRecord.c:360-368`, `mbboRecord.c:354-371`,
-    /// `busyRecord.c:321-329`).
-    fn enum_str_clears_udf(&self) -> bool {
-        false
     }
 
     /// The record's `get_enum_str` rset slot — how a `DBR_STRING` READ of its

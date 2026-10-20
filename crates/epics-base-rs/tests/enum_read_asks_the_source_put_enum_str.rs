@@ -1,11 +1,14 @@
 //! devBiSoftCallback and devMbbiSoftCallback read INP as `DBR_ENUM`. A
-//! one-element `DBF_STRING` source converts through `cvt_st_e`, which calls
-//! the SOURCE record's `put_enum_str` with the source's `dbAddr`: a state name
-//! stores the source's VAL and leaves the reader's buffer unwritten, a number
-//! below `no_str` is delivered, anything else fails. A longer string array
-//! takes `dbGet`'s `getStringUshort` on element 0. Every expectation is
-//! softIoc's, each reader read through the held (`NPP`) and general (`PP`)
-//! paths.
+//! one-element `DBF_STRING` source converts through `cvt_st_e`, which asks
+//! the SOURCE record's `put_enum_str`: a state name and a number below
+//! `no_str` are delivered as the index, anything else fails. A longer string
+//! array takes `dbGet`'s `getStringUshort` on element 0. Each reader is read
+//! through the held (`NPP`) and general (`PP`) paths.
+//!
+//! Every expectation is softIoc's but one: on a state name C's `put_enum_str`
+//! stores the SOURCE's VAL and leaves the reader's buffer unwritten. That is a
+//! C defect and is not copied — the reader gets the state's index and no
+//! source is written.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,20 +126,21 @@ async fn read_both(db: &PvDatabase, source: &str, val: u16, stat: u16) {
     }
 }
 
-/// softIoc: `R_BONAM` VAL=0 NO_ALARM, and `BSRC` VAL 0 -> 1, UDF 0.
+/// `ONAM` delivers 1 and `BSRC` keeps VAL 0 (softIoc stores 1 into `BSRC`
+/// and leaves the readers at 0).
 #[epics_macros_rs::epics_test]
-async fn a_bi_state_name_stores_the_sources_val() {
+async fn a_bi_state_name_is_delivered_as_its_index() {
     let db = ioc("bi", "BSRC.ONAM").await;
-    read_both(&db, "BSRC.ONAM", 0, NO_ALARM).await;
-    assert_eq!(state(&db, "BSRC"), (EpicsValue::Enum(1), NO_ALARM, 0));
+    read_both(&db, "BSRC.ONAM", 1, NO_ALARM).await;
+    assert_eq!(state(&db, "BSRC").0, EpicsValue::Enum(0));
 }
 
-/// softIoc: `R_MONST` VAL=0 NO_ALARM, and `MSRC` VAL 0 -> 1.
+/// `ONST` delivers 1 and `MSRC` keeps VAL 0 (softIoc stores 1 into `MSRC`).
 #[epics_macros_rs::epics_test]
-async fn an_mbbi_state_name_stores_the_sources_val() {
+async fn an_mbbi_state_name_is_delivered_as_its_index() {
     let db = ioc("mbbi", "MSRC.ONST").await;
-    read_both(&db, "MSRC.ONST", 0, NO_ALARM).await;
-    assert_eq!(state(&db, "MSRC").0, EpicsValue::Enum(1));
+    read_both(&db, "MSRC.ONST", 1, NO_ALARM).await;
+    assert_eq!(state(&db, "MSRC").0, EpicsValue::Enum(0));
 }
 
 /// softIoc: `"1"` on a bi and `"2"` on an mbbi are below `no_str` and are
@@ -284,7 +288,9 @@ record(mbbi, "MNONE") {
 }
 "#;
 
-/// `(source, reader type, reader STAT, source VAL)`, each softIoc's.
+/// `(source, reader type, reader STAT, state index)`: the index is the slot
+/// softIoc's `put_enum_str` stores into the source, here delivered to the
+/// reader instead.
 const SLOT_READS: [(&str, &str, u16, u16); 5] = [
     ("MGAP", "mbbi", NO_ALARM, 2),
     ("M2", "mbbi", NO_ALARM, 2),
@@ -321,12 +327,13 @@ async fn slots_ioc() -> Arc<PvDatabase> {
 #[epics_macros_rs::epics_test]
 async fn put_enum_str_scans_the_slots_c_scans() {
     let db = slots_ioc().await;
-    for (src, _, stat, val) in SLOT_READS {
+    for (src, _, stat, index) in SLOT_READS {
         let reader = format!("R_{src}");
         db.process_record(&reader).await.unwrap();
         settle(&db, &reader).await;
-        assert_eq!(state(&db, &reader).1, stat, "{reader}");
-        assert_eq!(state(&db, src).0, EpicsValue::Enum(val), "{src}");
+        let (val, got, _) = state(&db, &reader);
+        assert_eq!((val, got), (EpicsValue::Enum(index), stat), "{reader}");
+        assert_eq!(state(&db, src).0, EpicsValue::Enum(0), "{src}");
     }
 }
 
@@ -342,10 +349,12 @@ async fn an_empty_name_put_selects_the_first_empty_slot() {
     assert!(db.put_pv("MNONE", empty()).await.is_err());
 }
 
-/// softIoc: a name read from each source's DESC stores VAL 1 in all four,
-/// but only bi's and mbbi's `put_enum_str` clear UDF; bo and mbbo keep 1.
+/// A name read from each source's DESC delivers 1 and leaves each source's
+/// VAL at 0, where softIoc's `put_enum_str` stores 1. UDF is softIoc's: the
+/// read's `dbProcessNotify` processes the source, which clears it on bi and
+/// mbbi and not on bo and mbbo.
 #[epics_macros_rs::epics_test]
-async fn only_bi_and_mbbi_put_enum_str_clear_udf() {
+async fn a_state_name_read_writes_no_source() {
     let sources = [
         (
             "bo",
@@ -394,10 +403,12 @@ record({reader}, "R_{name}") {{
         .unwrap();
     for (_, name, _, udf) in sources {
         assert_eq!(state(&db, name).2, 1, "{name} starts undefined");
-        db.process_record(&format!("R_{name}")).await.unwrap();
-        settle(&db, &format!("R_{name}")).await;
+        let reader = format!("R_{name}");
+        db.process_record(&reader).await.unwrap();
+        settle(&db, &reader).await;
+        assert_eq!(state(&db, &reader).0, EpicsValue::Enum(1), "{reader}");
         let (val, _, got) = state(&db, name);
-        assert_eq!((val, got), (EpicsValue::Enum(1), udf), "{name}");
+        assert_eq!((val, got), (EpicsValue::Enum(0), udf), "{name}");
     }
 }
 

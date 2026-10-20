@@ -1511,24 +1511,42 @@ impl PvDatabase {
     }
 
     /// The `DBR_ENUM` form of a value just read from `link`, or an empty
-    /// `EnumArray` where C writes nothing into the reader's buffer. A
-    /// one-element string is C's `cvt_st_e`, which hands it to the source's
-    /// `put_enum_str` with the SOURCE's `dbAddr`: a state name stores the
-    /// source's VAL (no post) and the buffer is not written. More elements
-    /// take `dbGet`'s table, `getStringUshort` on element 0; none (NORD=0) is
-    /// `dbGet`'s `n <= 0` arm, which converts nothing and succeeds.
+    /// `EnumArray` where C writes nothing into the reader's buffer. One string
+    /// is [`cvt_st_e`](crate::server::record::cvt_st_e) against the SOURCE
+    /// record. More elements take `dbGet`'s table, `getStringUshort` on
+    /// element 0; none (NORD=0) is `dbGet`'s `n <= 0` arm, which converts
+    /// nothing and succeeds.
     fn enum_read_of(
         &self,
         held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
     ) -> Option<EpicsValue> {
-        use crate::server::record::EnumChoice;
-        let unwritten = || Some(EpicsValue::EnumArray(Vec::new().into()));
         if value.is_array() && value.count() == 0 {
-            return unwritten();
+            return Some(EpicsValue::EnumArray(Vec::new().into()));
         }
-        let one = value.count() == 1;
+        if let Some(s) = crate::server::record::cvt_st_e_input(&value) {
+            let crate::server::record::ParsedLink::Db(db) = link else {
+                return None;
+            };
+            let at = self.db_link_addr(db)?;
+            let source = match held {
+                Some(set) => at.rec.read_in(set),
+                None => at.rec.read(),
+            };
+            let index = crate::server::record::cvt_st_e(&*source.record, s);
+            drop(source);
+            // C reports under the reader's lock set (`dbFastLinkConv.c:255-256`,
+            // `:277-280`); printed here once the source's data lock is down.
+            return match index {
+                Ok(i) => Some(EpicsValue::Enum(i)),
+                Err(report) => {
+                    let field = at.put.field().desc.map_or("VAL", |d| d.name);
+                    self.emit_put_report(&at.name, field, *report);
+                    None
+                }
+            };
+        }
         let scalar = if value.is_array() {
             value.first_element()?
         } else {
@@ -1537,59 +1555,13 @@ impl PvDatabase {
         let EpicsValue::String(s) = scalar else {
             return scalar.get_convert(DbFieldType::Enum).ok();
         };
-        if !one {
-            let EpicsValue::UShort(v) = EpicsValue::String(s)
-                .get_convert(DbFieldType::UShort)
-                .ok()?
-            else {
-                return None;
-            };
-            return Some(EpicsValue::Enum(v));
-        }
-        let crate::server::record::ParsedLink::Db(db) = link else {
-            return None;
-        };
-        let at = self.db_link_addr(db)?;
-        let mut source = at.rec.write_under(held);
-        // Named only by a refusal, so a delivered read never looks it up.
-        let field = || at.put.field().desc.map_or("VAL", |d| d.name);
-        // C's `cvt_st_e` reports both refusals under the reader's lock set
-        // (`dbFastLinkConv.c:255-256`, `:277-280`); printed here once the
-        // source's data lock is down.
-        let Some(states) = source.record.enum_state_strings() else {
-            let record_type = source.record.record_type();
-            drop(source);
-            let report = crate::server::recgbl::PutReport::RecSupError {
-                message: "dbPutField",
-                record_type,
-                support: "put_enum_str",
-            };
-            self.emit_put_report(&at.name, field(), report);
-            return None;
-        };
-        let Some(choice) = crate::server::record::enum_state_choice(&*source.record, &states, &s)
+        let EpicsValue::UShort(v) = EpicsValue::String(s)
+            .get_convert(DbFieldType::UShort)
+            .ok()?
         else {
-            drop(source);
-            let mut refusal =
-                crate::error::ChoiceRefusal::enum_state(field(), &s.as_str_lossy(), states.len());
-            if let Some(report) = refusal.take_report() {
-                self.emit_put_report(&at.name, field(), report);
-            }
             return None;
         };
-        match choice {
-            EnumChoice::Named(i) => {
-                source
-                    .record
-                    .put_field_internal("VAL", EpicsValue::Enum(i))
-                    .ok()?;
-                if source.record.enum_str_clears_udf() {
-                    source.common.udf = 0;
-                }
-                unwritten()
-            }
-            EnumChoice::Index(i) => Some(EpicsValue::Enum(i)),
-        }
+        Some(EpicsValue::Enum(v))
     }
 
     /// The `DBR_STRING` form of a value just read from `link`: rendered by the
@@ -7525,12 +7497,13 @@ mod enum_read_held_set_tests {
     use crate::server::records::{ao::AoRecord, bi::BiRecord};
     use crate::types::{DbFieldType, EpicsValue};
 
-    /// `cvt_st_e` stores the source's VAL through `put_enum_str` and posts
-    /// nothing, from a reader whose set holds the source (the borrow) and
-    /// from one whose set does not (the acquire).
+    /// `cvt_st_e` answers the state's index and leaves the source alone (C's
+    /// `put_enum_str` stores its VAL, a defect not copied), from a reader
+    /// whose set holds the source (the borrow) and from one whose set does
+    /// not (the acquire).
     // RTEMS-EXEC-MODEL-ALLOW(1): the runtime only awaits add_record; passes on the exec backend.
     #[tokio::test]
-    async fn a_state_name_read_stores_the_source_val_in_or_out_of_the_held_set() {
+    async fn a_state_name_read_answers_the_index_in_or_out_of_the_held_set() {
         let db = PvDatabase::new();
         let mut bsrc = BiRecord::new(0);
         bsrc.put_field("ZNAM", EpicsValue::String("Low".into()))
@@ -7573,14 +7546,10 @@ mod enum_read_held_set_tests {
             );
             drop(gate);
             assert!(
-                matches!(&fetch, LinkFetch::Value(EpicsValue::EnumArray(v)) if v.is_empty()),
-                "{reader}: the reader's buffer is unwritten, {fetch:?}"
+                matches!(&fetch, LinkFetch::Value(EpicsValue::Enum(i)) if *i == want),
+                "{reader}: {fetch:?}"
             );
-            assert_eq!(
-                db.get_pv("BSRC").unwrap(),
-                EpicsValue::Enum(want),
-                "{reader}"
-            );
+            assert_eq!(db.get_pv("BSRC").unwrap(), EpicsValue::Enum(0), "{reader}");
             assert!(posts.try_recv().is_err(), "{reader}: nothing posted");
         }
     }

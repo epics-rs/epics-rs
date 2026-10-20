@@ -564,7 +564,7 @@ pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
 /// C routes it through the record's `put_enum_str` rset slot
 /// ([`Record::enum_str_state`](crate::server::record::Record::enum_str_state))
 /// and, when no state matched, falls back to `epicsParseUInt16` + the
-/// `get_enum_strs` bound (`val < no_str`) — see `enum_state_choice`.
+/// `get_enum_strs` bound (`val < no_str`) — see [`cvt_st_e`].
 ///
 /// A record whose `enum_state_strings` is `None` leaves both rset slots NULL in
 /// C (`mbbiDirect`/`mbboDirect`), and `putStringEnum` fails the put with
@@ -601,49 +601,68 @@ fn resolve_enum_state<R: crate::server::record::Record + ?Sized>(
              (C put_enum_str == NULL: S_db_noRSET)"
         )));
     };
-    let index = enum_choice_parsed_by(record, &states, s, parse_index)
-        .map(|(EnumChoice::Named(i) | EnumChoice::Index(i))| i)
-        .ok_or_else(|| {
-            CaError::BadChoice(crate::error::ChoiceRefusal::enum_state(
-                field,
-                &s.as_str_lossy(),
-                states.len(),
-            ))
-        })?;
+    let index = enum_state_index(record, &states, s, parse_index).ok_or_else(|| {
+        CaError::BadChoice(crate::error::ChoiceRefusal::enum_state(
+            field,
+            &s.as_str_lossy(),
+            states.len(),
+        ))
+    })?;
     Ok(EpicsValue::Enum(index))
 }
 
-/// How `cvt_st_e` resolved a string against a record's state table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EnumChoice {
-    /// `put_enum_str` matched a state name: the rset itself stored it.
-    Named(u16),
-    /// The `get_enum_strs` fallback: a number below `no_str`.
-    Index(u16),
+/// The string `dbGet` hands [`cvt_st_e`] on a `DBR_ENUM` read of `value`:
+/// one `DBF_STRING` element, the fast path's `no_elements == 1`
+/// (`dbAccess.c:967`). `None` for anything else, which `dbGet`'s conversion
+/// table reads instead.
+pub(crate) fn cvt_st_e_input(value: &EpicsValue) -> Option<&PvString> {
+    match value {
+        EpicsValue::String(s) => Some(s),
+        EpicsValue::StringArray(a) if a.len() == 1 => a.first(),
+        _ => None,
+    }
 }
 
-/// `cvt_st_e` (`dbFastLinkConv.c:247-281`): the record's `put_enum_str`
-/// first, then `epicsParseUInt16` + `val < no_str` over `states`, its
-/// `get_enum_strs` table.
-pub(crate) fn enum_state_choice<R: crate::server::record::Record + ?Sized>(
+/// C `cvt_st_e` (`dbFastLinkConv.c:247-281`) reading `s` from a field of
+/// `record` as `DBR_ENUM`: the record's `put_enum_str`, then `epicsParseUInt16`
+/// below `no_str`, its `get_enum_strs` count. Every read route — a link, a CA
+/// read or monitor, `dbtgf` — converts here; `Err` is the line C prints.
+///
+/// On a state name C's `put_enum_str` stores the state into the record's VAL
+/// and leaves the reader's buffer unwritten (`:252-254`). That is a C defect
+/// and is not copied: the read answers the state's index and stores nothing.
+pub(crate) fn cvt_st_e<R: crate::server::record::Record + ?Sized>(
     record: &R,
-    states: &[PvString],
     s: &PvString,
-) -> Option<EnumChoice> {
-    enum_choice_parsed_by(record, states, s, epics_parse_uint16)
+) -> Result<u16, Box<crate::server::recgbl::PutReport>> {
+    use crate::server::recgbl::{PutReport, ReportString};
+    let Some(states) = record.enum_state_strings() else {
+        return Err(Box::new(PutReport::RecSupError {
+            message: "dbPutField",
+            record_type: record.record_type(),
+            support: "put_enum_str",
+        }));
+    };
+    enum_state_index(record, &states, s, epics_parse_uint16).ok_or_else(|| {
+        Box::new(PutReport::IllegalChoice {
+            from: ReportString::new(&s.as_str_lossy()),
+        })
+    })
 }
 
-fn enum_choice_parsed_by<R: crate::server::record::Record + ?Sized>(
+/// The state `s` selects: the record's `put_enum_str`, else an index
+/// `parse_index` reads below `states.len()`, C's `no_str`.
+fn enum_state_index<R: crate::server::record::Record + ?Sized>(
     record: &R,
     states: &[PvString],
     s: &PvString,
     parse_index: fn(&str) -> Option<u16>,
-) -> Option<EnumChoice> {
+) -> Option<u16> {
     if let Some(i) = record.enum_str_state(s) {
-        return Some(EnumChoice::Named(i));
+        return Some(i);
     }
     let value = parse_index(&s.as_str_lossy())?;
-    (value < states.len() as u16).then_some(EnumChoice::Index(value))
+    (value < states.len() as u16).then_some(value)
 }
 
 /// The one string→menu-index converter. Both public entry points are this

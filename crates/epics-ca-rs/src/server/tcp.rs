@@ -5356,6 +5356,7 @@ pub(crate) async fn register_subscription(
     // `:984-985`).
     let (pre_chain, post_chain) = entry.filter_chain().split();
     let stage = super::DeliveryStage::new(
+        &entry.target,
         post_chain,
         long_string_mode,
         entry.field_element_count,
@@ -7145,6 +7146,7 @@ mod delivery_reads_options {
             chain.push(Arc::new(TimestampFilter::with_mode(mode)));
             let mut m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
             m.stage = super::super::DeliveryStage::new(
+                &m.target,
                 chain,
                 super::super::LongStringMode::Plain,
                 1,
@@ -14276,6 +14278,106 @@ mod string_as_enum_getfail_tests {
                 );
             }
         }
+        handle.abort();
+    }
+
+    /// A bi's DESC read as `DBR_ENUM` answers the state its `put_enum_str`
+    /// names, or a number below `no_str`; anything else is GETFAIL, on a
+    /// READ_NOTIFY and on each monitor update. softIoc stores the state into
+    /// `B.VAL` and replies the unwritten buffer — a defect not copied: the
+    /// reply carries the index and `B.VAL` stays 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_state_name_read_as_dbr_enum_is_its_index() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::bi::BiRecord;
+        use epics_base_rs::types::DBR_TIME_ENUM;
+        let db = Arc::new(PvDatabase::new());
+        let mut bi = BiRecord::new(0);
+        bi.put_field("ZNAM", EpicsValue::String("Low".into()))
+            .unwrap();
+        bi.put_field("ONAM", EpicsValue::String("High".into()))
+            .unwrap();
+        db.add_record("B", Box::new(bi)).await.unwrap();
+        db.put_pv("B.DESC", EpicsValue::String("High".into()))
+            .await
+            .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (mut client, server_io) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:55361".parse().unwrap();
+        let served = db.clone();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                served,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        client.write_all(&version_frame()).await.unwrap();
+        client
+            .write_all(&create_chan_frame(1, "B.DESC"))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        let mut acc = Vec::new();
+
+        for (dt, at) in [(DBR_ENUM, 0), (DBR_TIME_ENUM, 14)] {
+            client
+                .write_all(&request(CA_PROTO_READ_NOTIFY, sid, 3, dt, &[]))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            assert_eq!(
+                (hdr.cid, &payload[at..at + 2]),
+                (ECA_NORMAL, &1u16.to_be_bytes()[..]),
+                "type {dt}"
+            );
+        }
+
+        client
+            .write_all(&request(
+                CA_PROTO_EVENT_ADD,
+                sid,
+                10,
+                DBR_ENUM,
+                &EVENT_ADD_BODY,
+            ))
+            .await
+            .unwrap();
+        let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+        assert_eq!((hdr.cid, &payload[..2]), (ECA_NORMAL, &[0, 1][..]));
+        for (text, want) in [(&b"Low"[..], Some(0u16)), (b"7", None), (b"1", Some(1))] {
+            let mut value = [0u8; 40];
+            value[..text.len()].copy_from_slice(text);
+            client
+                .write_all(&request(CA_PROTO_WRITE, sid, 0, 0, &value))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            match want {
+                Some(i) => assert_eq!(
+                    (hdr.cid, &payload[..2]),
+                    (ECA_NORMAL, &i.to_be_bytes()[..]),
+                    "{text:?}"
+                ),
+                None => assert_eq!((hdr.cid, payload), (ECA_GETFAIL, vec![0; 8]), "{text:?}"),
+            }
+        }
+        assert_eq!(db.get_pv("B").unwrap(), EpicsValue::Enum(0));
         handle.abort();
     }
 }

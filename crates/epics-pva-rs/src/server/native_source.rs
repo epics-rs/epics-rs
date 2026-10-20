@@ -2940,7 +2940,6 @@ mod tests {
                 control_double: bits & 8 != 0,
                 alarm_double: bits & 16 != 0,
                 enum_strs: bits & 32 != 0,
-                put_enum_str: None,
             };
             for vf in [true, false] {
                 let leaves = leaves_for(props, vf);
@@ -3382,7 +3381,6 @@ mod tests {
                 control_double: bits & 8 != 0,
                 alarm_double: bits & 16 != 0,
                 enum_strs: bits & 32 != 0,
-                put_enum_str: None,
             })
             .collect()
     }

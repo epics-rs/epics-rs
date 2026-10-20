@@ -976,7 +976,10 @@ struct PvDatabaseInner {
     /// C materialises the list once the `.dbd` is read: `dbReadCOM`'s tail
     /// (`dbLexRoutines.c:311-331`) gives every record type `RTYP` = its own
     /// name and `VERS` = `"none specified"`, and `dbPutRecordAttribute`
-    /// (`dbStaticLib.c:1232-1277`) adds or overwrites from there. Both maps
+    /// (`dbStaticLib.c:1232-1277`) adds or overwrites from there. A type
+    /// holds an entry here once `dbPutAttribute` first touched it, starting
+    /// from that seed; a type without one answers [`seeded_record_attribute`].
+    /// Both maps
     /// are `BTreeMap`s because C keeps the inner list in `strcmp` order and
     /// walks it in that order in `dbGetAttributePart` and
     /// `dbDumpRecordType`; sorting is the container's job here rather than an
@@ -1502,22 +1505,30 @@ impl RecordAttributeError {
     }
 }
 
-/// C `dbReadCOM`'s tail (`dbLexRoutines.c:311-331`): once the `.dbd` is read,
-/// every record type it declared carries `RTYP` = its own name and `VERS` =
-/// `"none specified"`. The port's `.dbd` is the generated table, which is
-/// complete before the first `dbLoadRecords`, so the seed happens at
-/// construction instead of after a read.
 type RecordAttributes =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
 
-fn seeded_record_attributes() -> RecordAttributes {
-    crate::server::record::dbd_generated::RECORD_TYPES
-        .iter()
-        .map(|t| {
-            let mut attrs = std::collections::BTreeMap::new();
-            attrs.insert("RTYP".to_string(), (*t).to_string());
-            attrs.insert("VERS".to_string(), "none specified".to_string());
-            ((*t).to_string(), attrs)
+/// C `dbReadCOM`'s tail (`dbLexRoutines.c:311-331`): every record type a
+/// `.dbd` declared carries `RTYP` = its own name and `VERS` =
+/// `"none specified"`. The port's types come from the generated table and
+/// from other crates' registrations, so the seed is answered for a type with
+/// no table entry rather than written for a list of types up front.
+fn seeded_record_attribute<'a>(record_type: &'a str, name: &str) -> Option<&'a str> {
+    match name {
+        "RTYP" => Some(record_type),
+        "VERS" => Some("none specified"),
+        _ => None,
+    }
+}
+
+/// [`seeded_record_attribute`]'s whole list, for the entry a first
+/// `dbPutAttribute` on `record_type` creates.
+fn seeded_record_attributes(record_type: &str) -> std::collections::BTreeMap<String, String> {
+    ["RTYP", "VERS"]
+        .into_iter()
+        .filter_map(|name| {
+            let value = seeded_record_attribute(record_type, name)?;
+            Some((name.to_string(), value.to_string()))
         })
         .collect()
 }
@@ -1612,7 +1623,7 @@ impl PvDatabase {
                     pini_done: std::sync::atomic::AtomicBool::new(false),
                     pini_notify: tokio::sync::Notify::new(),
                     record_locks: record_lock::RecordLockRegistry::default(),
-                    record_attributes: ArcSwap::from_pointee(seeded_record_attributes()),
+                    record_attributes: ArcSwap::from_pointee(RecordAttributes::new()),
                     record_attributes_write:
                         crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
                     subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
@@ -1630,7 +1641,7 @@ impl PvDatabase {
     /// set or create one attribute of one record type.
     ///
     /// C's `!pdbbase` arm is unreachable here — the record-type set is the
-    /// generated `dbd_generated::RECORD_TYPES` table, which exists before any
+    /// generated table plus every registered type, which exist before any
     /// database is loaded — so `S_db_notFound` has no site.
     ///
     /// `name` and `value` are `Option` because C's are `const char *` that
@@ -1653,7 +1664,7 @@ impl PvDatabase {
             return Err(RecordAttributeError::BadField);
         };
         let value = value.unwrap_or("");
-        if !crate::server::record::dbd_generated::RECORD_TYPES.contains(&record_type) {
+        if !crate::server::db_loader::record_type_visible(record_type) {
             return Err(RecordAttributeError::RecordTypeNotFound);
         }
         // C truncates by byte (`strncpy` then `[MAX_STRING_SIZE-1] = 0`),
@@ -1664,7 +1675,7 @@ impl PvDatabase {
         let _write = self.inner.record_attributes_write.lock();
         let mut next = RecordAttributes::clone(&self.inner.record_attributes.load());
         next.entry(record_type.to_string())
-            .or_default()
+            .or_insert_with(|| seeded_record_attributes(record_type))
             .insert(name.to_string(), truncated);
         self.inner.record_attributes.store(Arc::new(next));
         Ok(())
@@ -1677,33 +1688,33 @@ impl PvDatabase {
     /// The caller owes the shadowing test: C reaches this only after the
     /// record type's declared field list has missed, so a type that declares
     /// a field of the same name (`motor.VERS`) hides the attribute.
+    ///
+    /// `record_type` is a record's own type, so it is one the IOC knows.
     pub fn record_type_attribute(&self, record_type: &str, name: &str) -> Option<String> {
-        self.inner
-            .record_attributes
-            .load()
-            .get(record_type)?
-            .get(name)
-            .cloned()
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.get(name).cloned(),
+            None => seeded_record_attribute(record_type, name).map(str::to_string),
+        }
     }
 
     /// [`Self::record_type_attribute`]'s existence half, copying nothing.
     pub(crate) fn has_record_type_attribute(&self, record_type: &str, name: &str) -> bool {
-        self.inner
-            .record_attributes
-            .load()
-            .get(record_type)
-            .is_some_and(|attrs| attrs.contains_key(name))
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.contains_key(name),
+            None => seeded_record_attribute(record_type, name).is_some(),
+        }
     }
 
     /// One record type's whole attribute list in C's `strcmp` order — the
     /// order `dbPutRecordAttribute` inserts in and `dbDumpRecordType` prints.
     pub fn record_type_attributes(&self, record_type: &str) -> Vec<(String, String)> {
-        self.inner
-            .record_attributes
-            .load()
-            .get(record_type)
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default()
+        match self.inner.record_attributes.load().get(record_type) {
+            Some(attrs) => attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None if crate::server::db_loader::record_type_visible(record_type) => {
+                seeded_record_attributes(record_type).into_iter().collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Merge `tables` into the shared breakpoint-table registry (C `bptList`

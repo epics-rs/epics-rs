@@ -1496,6 +1496,7 @@ fn handle_client_blocking(
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EventTaskControl>();
     let event_send_lock = send_lock.clone();
     let event_user = state.event_user();
+    let event_minor = state.circuit_minor();
     let event_job = event_worker.run(move || {
         // C `event_task` registers itself (`dbEvent.c:1027`) and removes on the
         // way out (`:1093`). Unbounded: it parks on this client's monitor
@@ -1506,7 +1507,7 @@ fn handle_client_blocking(
             None,
         );
         let sink = EventSendBuf(event_send_lock);
-        if block_on_sync(run_event_task(event_user, ev_rx, sink)).is_err() {
+        if block_on_sync(run_event_task(event_user, ev_rx, sink, event_minor)).is_err() {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -5199,7 +5200,7 @@ mod tests {
             .expect("completion");
         let chain = block_on_sync(&mut p.rx).expect("blockable");
         // Nothing else writes this test's outbox, so the commit is a no-op.
-        p.settle(chain, &outbox, || true)
+        p.settle(chain, &outbox, crate::protocol::CA_MINOR_VERSION, || true)
             .expect("encode completion");
 
         while let Some(f) = drain.try_next() {

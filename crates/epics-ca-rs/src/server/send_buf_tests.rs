@@ -172,14 +172,24 @@ fn updates_built_in_place_are_the_frames_built_apart() {
     let wire = Arc::new(Wire::default());
     run(&mut |user, ctl_rx, pvs| {
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-        let mut task = pin!(run_event_task(user, ctl_rx, sink));
+        let mut task = pin!(run_event_task(
+            user,
+            ctl_rx,
+            sink,
+            crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+        ));
         assert!(poll_once(task.as_mut()).is_pending());
         post(pvs);
         assert!(poll_once(task.as_mut()).is_pending());
     });
     let copies = Copies::default();
     run(&mut |user, ctl_rx, pvs| {
-        let mut task = pin!(run_event_task(user, ctl_rx, copies.clone()));
+        let mut task = pin!(run_event_task(
+            user,
+            ctl_rx,
+            copies.clone(),
+            crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+        ));
         assert!(poll_once(task.as_mut()).is_pending());
         post(pvs);
         assert!(poll_once(task.as_mut()).is_pending());
@@ -254,7 +264,12 @@ fn retirements_handed_over_together_reach_the_wire_in_one_write() {
         }
         let wire = Arc::new(Wire::default());
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-        let mut task = pin!(run_event_task(user, ctl_rx, sink));
+        let mut task = pin!(run_event_task(
+            user,
+            ctl_rx,
+            sink,
+            crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+        ));
         assert!(poll_once(task.as_mut()).is_pending());
         let writes = wire.writes();
         assert_eq!(writes.len(), 1, "{k} ready frames, one write");
@@ -279,7 +294,12 @@ fn streams_ended_together_reach_the_wire_in_one_write() {
         }
         let wire = Arc::new(Wire::default());
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-        let mut task = pin!(run_event_task(user, ctl_rx, sink));
+        let mut task = pin!(run_event_task(
+            user,
+            ctl_rx,
+            sink,
+            crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+        ));
         assert!(poll_once(task.as_mut()).is_pending());
         assert!(wire.writes().is_empty(), "live monitors owe no frame");
         destroy(&db, k);
@@ -344,7 +364,6 @@ fn gated_circuit_monitored_pvs(
                 denied: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 data_type: DBR_DOUBLE,
-                client_minor: CA_MINOR_VERSION,
                 sub_id: cid + 1,
                 data_count: 0,
                 stats: None,
@@ -387,7 +406,12 @@ fn updates_ready_together_reach_the_wire_in_one_write() {
     let pvs = circuit_monitored_pvs(N, &user, &ctl_tx);
     let wire = Arc::new(Wire::default());
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-    let mut task = pin!(run_event_task(user, ctl_rx, sink));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        sink,
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
     for pv in &pvs {
         pv.set(EpicsValue::Double(1.0));
@@ -424,7 +448,12 @@ fn the_last_event_of_a_drained_queue_sends_what_is_staged() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(2, &user, &ctl_tx);
     let calls = Calls::default();
-    let mut task = pin!(run_event_task(user, ctl_rx, calls.clone()));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        calls.clone(),
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
     calls.0.lock().unwrap().clear();
     for pv in &pvs {
@@ -445,7 +474,12 @@ fn a_cancelled_last_event_sends_nothing() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = gated_circuit_monitored_pvs(2, &user, &ctl_tx);
     let calls = Calls::default();
-    let mut task = pin!(run_event_task(user, ctl_rx, calls.clone()));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        calls.clone(),
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
     calls.0.lock().unwrap().clear();
     for (pv, _) in &pvs {
@@ -488,7 +522,12 @@ fn a_failed_send_at_a_drained_queue_ends_the_task() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(1, &user, &ctl_tx);
     let sink = GoneCalls::default();
-    let mut task = pin!(run_event_task(user, ctl_rx, sink.clone()));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        sink.clone(),
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
     assert_eq!(*sink.0.0.lock().unwrap(), ["send"], "the peer was there");
     sink.0.0.lock().unwrap().clear();
@@ -537,7 +576,12 @@ fn a_failed_update_stage_ends_the_task() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(2, &user, &ctl_tx);
     let sink = RefusedStages::default();
-    let mut task = pin!(run_event_task(user, ctl_rx, sink.clone()));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        sink.clone(),
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
     sink.0.0.lock().unwrap().clear();
     for pv in &pvs {
@@ -570,7 +614,12 @@ fn a_failed_send_before_waiting_ends_the_task() {
     let wire = Arc::new(Wire::default());
     wire.broken.store(true, Ordering::Relaxed);
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-    let mut task = pin!(run_event_task(user, ctl_rx, sink));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        sink,
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(
         poll_once(task.as_mut()).is_ready(),
         "the control sender is still held, so only the send error can end it"
@@ -588,7 +637,12 @@ fn delivering_events_through_the_real_sink_allocates_nothing() {
     let pvs = circuit_monitored_pvs(N, &user, &ctl_tx);
     let wire = Arc::new(CountWire::default());
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
-    let mut task = pin!(run_event_task(user, ctl_rx, sink));
+    let mut task = pin!(run_event_task(
+        user,
+        ctl_rx,
+        sink,
+        crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
+    ));
     assert!(poll_once(task.as_mut()).is_pending());
 
     // Prime: the first delivery's one-time growth is not per event.

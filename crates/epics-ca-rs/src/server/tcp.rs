@@ -564,7 +564,13 @@ impl PutNotifySlot {
     /// `peer` and `paddr` are what C's `log_header` prints for a timed-out
     /// predecessor: the client and the address of the channel the saved `msg`
     /// addresses, as an integer so the future stays `Send`.
-    async fn serialize(&self, writer: &Outbox, peer: &str, paddr: usize) -> CaResult<()> {
+    async fn serialize(
+        &self,
+        writer: &Outbox,
+        peer: &str,
+        paddr: usize,
+        client_minor: u16,
+    ) -> CaResult<()> {
         // Taken out for the duration of the wait, not consulted in place: this
         // channel's one receive loop is both the only reader of the slot and
         // the thread that waits, so holding the registration here removes the
@@ -621,7 +627,7 @@ impl PutNotifySlot {
             reg.reply.ioid,
             ReplyContext {
                 req_hdr: reg.reply.req_hdr,
-                client_minor: reg.reply.client_minor,
+                client_minor,
             },
         )
     }
@@ -754,6 +760,26 @@ struct SubscriptionEntry {
     reader: epics_base_rs::server::event_queue::EventReader,
 }
 
+/// The circuit's minor version, C `client->minor_version_number`: VERSION and
+/// CREATE_CHAN write it, and every frame reads it as it is built
+/// (`cas_copy_in_header`, `caserverio.c:266-270`), a deferred one included.
+#[derive(Clone)]
+pub(crate) struct CircuitMinor(Arc<std::sync::atomic::AtomicU16>);
+
+impl CircuitMinor {
+    pub(crate) fn new(minor: u16) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU16::new(minor)))
+    }
+
+    pub(crate) fn get(&self) -> u16 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, minor: u16) {
+        self.0.store(minor, Ordering::Relaxed);
+    }
+}
+
 /// Per-circuit CA server state. `pub(crate)` so the blocking
 /// thread-per-client driver (`crate::server::blocking`, the RTEMS CA
 /// server front-end) can construct one and drive [`dispatch_message`]
@@ -806,7 +832,7 @@ pub(crate) struct ClientState {
     /// values when evaluating CALC-gated rules in `compute_access`.
     db: Arc<PvDatabase>,
     tcp_port: u16,
-    client_minor_version: u16,
+    minor: CircuitMinor,
     /// C `client->evuser` (`rsrv/server.h`): this circuit's event user — the
     /// owner of `flowCtrlMode` (EVENTS_OFF/EVENTS_ON) and of the event queue
     /// every subscription on this circuit posts into (`db_init_events`).
@@ -988,7 +1014,7 @@ impl ClientState {
             acf,
             db,
             tcp_port,
-            client_minor_version: 0,
+            minor: CircuitMinor::new(0),
             event_user: Arc::new(epics_base_rs::server::event_queue::EventUser::new()),
             channel_limit_warned: false,
             peer: String::new(),
@@ -1018,7 +1044,11 @@ impl ClientState {
         self.write_notify_queue.get_or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let task = reactor
-                .spawn(run_write_notify_queue(rx, outbox.clone()))
+                .spawn(run_write_notify_queue(
+                    rx,
+                    outbox.clone(),
+                    self.minor.clone(),
+                ))
                 .abort_handle();
             WriteNotifyQueue { tx, task }
         })
@@ -1036,6 +1066,7 @@ impl ClientState {
                 .spawn(run_circuit_monitors(
                     self.event_user.clone(),
                     outbox.clone(),
+                    self.minor.clone(),
                 ))
                 .abort_handle();
             self.circuit_monitors = Some(CircuitMonitors { task });
@@ -1083,7 +1114,13 @@ impl ClientState {
     /// (`RecvAccumulator::next_message`) and to its error replies
     /// (`send_ca_error`) from outside this module.
     pub(crate) fn client_minor_version(&self) -> u16 {
-        self.client_minor_version
+        self.minor.get()
+    }
+
+    /// The circuit's minor cell, for the owners that frame its deferred
+    /// replies.
+    pub(crate) fn circuit_minor(&self) -> CircuitMinor {
+        self.minor.clone()
     }
 
     /// C `vsend_err`'s `m_cid` (`camessage.c:162-191`): the client's cid of
@@ -2322,7 +2359,7 @@ where
             // two hand-maintained lists that drift.
             let mut parsed_any = false;
             loop {
-                let (hdr, payload) = match accumulated.next_message(state.client_minor_version) {
+                let (hdr, payload) = match accumulated.next_message(state.client_minor_version()) {
                     Gate::NeedMore => break,
                     Gate::Deliver { hdr, payload } => (hdr, payload),
                     Gate::Refuse(err) => {
@@ -2695,7 +2732,7 @@ pub(crate) async fn dispatch_message(
             }
             // No reply: C's one VERSION is `rsrv_version_reply` at connect
             // (`caservertask.c:1525`), which each driver sends before its loop.
-            state.client_minor_version = crate::protocol::declared_minor(hdr);
+            state.minor.set(crate::protocol::declared_minor(hdr));
         }
 
         CA_PROTO_HOST_NAME => {
@@ -2713,7 +2750,7 @@ pub(crate) async fn dispatch_message(
                     0xFFFF_FFFF,
                     "attempts to use protocol to set host name \
                      after creating first channel ignored by server",
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 return Ok(());
             }
@@ -2743,7 +2780,7 @@ pub(crate) async fn dispatch_message(
                     ECA_INTERNAL,
                     0xFFFF_FFFF,
                     "bad (very long) host name",
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 return Err(epics_base_rs::error::CaError::Protocol(
                     "HOST_NAME exceeds 511-byte cap (matches C host_name_action RSRV_ERROR)".into(),
@@ -2793,7 +2830,7 @@ pub(crate) async fn dispatch_message(
                     0xFFFF_FFFF,
                     "attempts to use protocol to set user name \
                      after creating first channel ignored by server",
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 return Ok(());
             }
@@ -2818,7 +2855,7 @@ pub(crate) async fn dispatch_message(
                     ECA_INTERNAL,
                     0xFFFF_FFFF,
                     "a very long user name was specified",
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 return Err(epics_base_rs::error::CaError::Protocol(
                     "CLIENT_NAME exceeds 511-byte cap (matches C client_name_action RSRV_ERROR)"
@@ -2916,8 +2953,8 @@ pub(crate) async fn dispatch_message(
             // then honours; pre-fix Rust ignored `hdr.available` entirely,
             // so a peer using the upgrade pattern saw truncated large arrays.
             let claimed = crate::protocol::minor_from(hdr.available);
-            if claimed > state.client_minor_version {
-                state.client_minor_version = claimed;
+            if claimed > state.client_minor_version() {
+                state.minor.set(claimed);
             }
 
             // C `claim_ciu_action` (`rsrv/camessage.c`) forces
@@ -3022,7 +3059,7 @@ pub(crate) async fn dispatch_message(
                         ECA_ALLOCMEM,
                         u32::MAX,
                         target.rsrv_record_name(),
-                        state.client_minor_version,
+                        state.client_minor_version(),
                     )?;
                     // C `claim_ciu_action` (camessage.c:1256-1271): when
                     // the server's channel-allocation pool is exhausted,
@@ -3084,7 +3121,7 @@ pub(crate) async fn dispatch_message(
             // capped at 0xfffe so the CREATE_CHAN reply stays in
             // normal-form (16-byte) layout; V4.9+ clients receive
             // the true count via the extended header.
-            let nelem = if state.client_minor_version < 9 && element_count >= 0xffff {
+            let nelem = if state.client_minor_version() < 9 && element_count >= 0xffff {
                 0xfffe
             } else {
                 element_count
@@ -3093,7 +3130,7 @@ pub(crate) async fn dispatch_message(
             resp.data_type = dbr_type.ca_wire_type();
             resp.cid = client_cid;
             resp.available = sid;
-            resp.set_payload_size(0, nelem, state.client_minor_version)
+            resp.set_payload_size(0, nelem, state.client_minor_version())
                 .expect("nelem is capped at 0xfffe for pre-V49 clients above");
 
             // Two independent, complete frames (ACCESS_RIGHTS then
@@ -3221,7 +3258,7 @@ pub(crate) async fn dispatch_message(
                     ECA_BADTYPE,
                     entry.cid,
                     record_name,
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
@@ -3241,7 +3278,7 @@ pub(crate) async fn dispatch_message(
             if crate::server::frame::header_refused(
                 requested_type,
                 item_count,
-                state.client_minor_version,
+                state.client_minor_version(),
             ) {
                 return send_16k_array_client_err(
                     writer,
@@ -3253,7 +3290,7 @@ pub(crate) async fn dispatch_message(
                         UnloadedReply::Read
                     },
                     item_count,
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 );
             }
 
@@ -3292,7 +3329,7 @@ pub(crate) async fn dispatch_message(
                             },
                             ReplyContext {
                                 req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
+                                client_minor: state.client_minor_version(),
                             },
                         )?;
                     } else {
@@ -3312,7 +3349,7 @@ pub(crate) async fn dispatch_message(
                             denied.eca_code(),
                             entry.cid,
                             record_name,
-                            state.client_minor_version,
+                            state.client_minor_version(),
                         )?;
                     }
                     return Ok(());
@@ -3365,7 +3402,7 @@ pub(crate) async fn dispatch_message(
                             },
                             ReplyContext {
                                 req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
+                                client_minor: state.client_minor_version(),
                             },
                         )?;
                     } else {
@@ -3376,7 +3413,7 @@ pub(crate) async fn dispatch_message(
                             ECA_GETFAIL,
                             entry.cid,
                             record_name,
-                            state.client_minor_version,
+                            state.client_minor_version(),
                         )?;
                     }
                     return Ok(());
@@ -3401,7 +3438,7 @@ pub(crate) async fn dispatch_message(
                         },
                         ReplyContext {
                             req_hdr: *hdr,
-                            client_minor: state.client_minor_version,
+                            client_minor: state.client_minor_version(),
                         },
                     )?;
                 }
@@ -3444,7 +3481,7 @@ pub(crate) async fn dispatch_message(
                 &snapshot,
                 entry.cid,
                 ioid,
-                state.client_minor_version,
+                state.client_minor_version(),
             ) {
                 Ok(frame) => writer.push(frame),
                 Err(ReadReplyError::BadType) => {
@@ -3480,7 +3517,7 @@ pub(crate) async fn dispatch_message(
                             ECA_BADTYPE,
                             entry.cid,
                             entry.target.rsrv_record_name(),
-                            state.client_minor_version,
+                            state.client_minor_version(),
                         )?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -3506,7 +3543,7 @@ pub(crate) async fn dispatch_message(
                             },
                             ReplyContext {
                                 req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
+                                client_minor: state.client_minor_version(),
                             },
                         );
                     }
@@ -3516,7 +3553,7 @@ pub(crate) async fn dispatch_message(
                         ECA_GETFAIL,
                         entry.cid,
                         entry.target.rsrv_record_name(),
-                        state.client_minor_version,
+                        state.client_minor_version(),
                     );
                 }
                 Err(ReadReplyError::Oversize { count }) => {
@@ -3535,7 +3572,7 @@ pub(crate) async fn dispatch_message(
                             UnloadedReply::Read
                         },
                         count,
-                        state.client_minor_version,
+                        state.client_minor_version(),
                     );
                 }
             }
@@ -3737,7 +3774,7 @@ pub(crate) async fn dispatch_message(
                 hdr.cid,
                 hdr.available,
                 &[],
-                state.client_minor_version,
+                state.client_minor_version(),
             ) else {
                 // `read_sync_reply` (`camessage.c:2111-2116`).
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -3777,7 +3814,7 @@ pub(crate) async fn dispatch_message(
                 hdr.cid,
                 hdr.available,
                 payload,
-                state.client_minor_version,
+                state.client_minor_version(),
             ) {
                 writer.push(frame);
             }
@@ -3846,7 +3883,7 @@ pub(crate) async fn dispatch_message(
                 // the reply is now byte-equivalent to the C softIoc.
                 let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                 resp.data_type = state.tcp_port;
-                resp.set_payload_size(0, 0, state.client_minor_version)
+                resp.set_payload_size(0, 0, state.client_minor_version())
                     .expect("a zero-payload, zero-count reply is never extended");
                 resp.cid = u32::MAX; // ~0U — "use TCP peer addr"
                 resp.available = hdr.available;
@@ -3872,7 +3909,7 @@ pub(crate) async fn dispatch_message(
                     hdr.cid,
                     hdr.available,
                     &[],
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 ) {
                     Ok(frame) => writer.push(frame),
                     // `camessage.c:2133-2139`, `__FILE__`/`__LINE__` as softIoc
@@ -3918,7 +3955,7 @@ pub(crate) async fn dispatch_message(
                     sid,
                     cid,
                     &[],
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 ) else {
                     // `clear_channel_reply` (`camessage.c:1966-1971`); the
                     // teardown takes the rest of the circuit's channels.
@@ -3942,7 +3979,7 @@ pub(crate) async fn dispatch_message(
                 hdr,
                 peer,
                 state.channel_addr(hdr.cid),
-                state.client_minor_version,
+                state.client_minor_version(),
             ));
         }
     }
@@ -4195,7 +4232,7 @@ pub(crate) async fn serve_write_head(
                         ioid,
                         ReplyContext {
                             req_hdr: *hdr,
-                            client_minor: state.client_minor_version,
+                            client_minor: state.client_minor_version(),
                         },
                     )?;
                 } else {
@@ -4213,7 +4250,7 @@ pub(crate) async fn serve_write_head(
                         denied.eca_code(),
                         entry_cid,
                         record_name,
-                        state.client_minor_version,
+                        state.client_minor_version(),
                     )?;
                 }
                 return Ok(WriteHeadOutcome::Done);
@@ -4260,7 +4297,12 @@ pub(crate) async fn serve_write_head(
         if is_notify {
             entry
                 .put_notify_slot
-                .serialize(writer, &state.peer, std::ptr::from_ref(entry).addr())
+                .serialize(
+                    writer,
+                    &state.peer,
+                    std::ptr::from_ref(entry).addr(),
+                    state.client_minor_version(),
+                )
                 .await?;
         }
         let result = match &entry.target {
@@ -4291,7 +4333,7 @@ pub(crate) async fn serve_write_head(
                 ioid,
                 ReplyContext {
                     req_hdr: *hdr,
-                    client_minor: state.client_minor_version,
+                    client_minor: state.client_minor_version(),
                 },
             )?;
         } else if let Err(e) = &result {
@@ -4310,7 +4352,7 @@ pub(crate) async fn serve_write_head(
                 eca.eca(),
                 entry_cid,
                 record_name,
-                state.client_minor_version,
+                state.client_minor_version(),
             )?;
         }
         return Ok(WriteHeadOutcome::Done);
@@ -4429,7 +4471,7 @@ pub(crate) async fn serve_write_head(
                     ioid,
                     ReplyContext {
                         req_hdr: *hdr,
-                        client_minor: state.client_minor_version,
+                        client_minor: state.client_minor_version(),
                     },
                 )?;
             }
@@ -4509,7 +4551,7 @@ pub(crate) async fn serve_write_head(
                     ioid,
                     ReplyContext {
                         req_hdr: *hdr,
-                        client_minor: state.client_minor_version,
+                        client_minor: state.client_minor_version(),
                     },
                 )?;
                 state.audit_channel("caput", sid, "", "denied");
@@ -4535,7 +4577,7 @@ pub(crate) async fn serve_write_head(
                     denied.eca_code(),
                     entry_cid,
                     rsrv_name,
-                    state.client_minor_version,
+                    state.client_minor_version(),
                 )?;
                 state.audit_channel("caput", sid, "", "denied");
                 return Ok(WriteHeadOutcome::Done);
@@ -4565,7 +4607,12 @@ pub(crate) async fn serve_write_head(
     // CA_PROTO_WRITE path is not serialised in C, so it is left untouched.
     if is_notify {
         put_notify_slot
-            .serialize(writer, &state.peer, entry_addr)
+            .serialize(
+                writer,
+                &state.peer,
+                entry_addr,
+                state.client_minor_version(),
+            )
             .await?;
     }
 
@@ -4622,7 +4669,7 @@ pub(crate) async fn serve_write_head(
                 ioid,
                 ReplyContext {
                     req_hdr: *hdr,
-                    client_minor: state.client_minor_version,
+                    client_minor: state.client_minor_version(),
                 },
             )?;
         } else {
@@ -4632,7 +4679,7 @@ pub(crate) async fn serve_write_head(
                 ECA_BADTYPE,
                 entry_cid,
                 rsrv_name,
-                state.client_minor_version,
+                state.client_minor_version(),
             )?;
         }
         Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -4806,7 +4853,7 @@ pub(crate) async fn serve_write_head(
                 eca.eca(),
                 entry_cid,
                 rsrv_name,
-                state.client_minor_version,
+                state.client_minor_version(),
             )?;
         }
     }
@@ -4838,7 +4885,6 @@ pub(crate) async fn serve_write_head(
                 write_count,
                 ioid,
                 req_hdr: *hdr,
-                client_minor: state.client_minor_version,
             };
             // The trap-write bracket moves into the completion token rather
             // than travelling with the receiver, so that whichever path
@@ -4875,7 +4921,7 @@ pub(crate) async fn serve_write_head(
             ioid,
             ReplyContext {
                 req_hdr: *hdr,
-                client_minor: state.client_minor_version,
+                client_minor: state.client_minor_version(),
             },
         )?;
     }
@@ -4883,19 +4929,18 @@ pub(crate) async fn serve_write_head(
 }
 
 /// Everything the deferred WRITE_NOTIFY completion reply echoes: the framed
-/// type/count, the request ioid, and the request header + negotiated version
-/// (for extended-form promotion). One value so the shared completion tail and
-/// the in-flight-slot install pass a single descriptor rather than five loose
-/// scalars. `Copy` (like the loose scalars it replaces) so it can be captured
-/// by an `async move` completion task and still be read by the in-flight-slot
-/// install afterwards.
+/// type/count, the request ioid, and the request header. Not the minor: C
+/// frames the reply at the circuit's as it stands then (`write_notify_reply`,
+/// `camessage.c:1438`). One value so the shared completion tail and the
+/// in-flight-slot install pass a single descriptor rather than four loose
+/// scalars. `Copy` so it can be captured by an `async move` completion task
+/// and still be read by the in-flight-slot install afterwards.
 #[derive(Clone, Copy)]
 pub(crate) struct WriteNotifyReply {
     pub write_type: u16,
     pub write_count: u32,
     pub ioid: u32,
     pub req_hdr: CaHeader,
-    pub client_minor: u16,
 }
 
 /// Send a WRITE_NOTIFY completion reply and fire the deferred trap-write
@@ -4910,6 +4955,7 @@ pub(crate) fn finish_write_notify(
     final_status: u32,
     reply: &WriteNotifyReply,
     writer: &impl FrameSink,
+    client_minor: u16,
 ) -> CaResult<()> {
     // AfterWrite at real device-side completion. `status` carries "ok" for
     // ECA_NORMAL or the ECA-code form otherwise so listeners can filter
@@ -4931,7 +4977,7 @@ pub(crate) fn finish_write_notify(
         reply.ioid,
         ReplyContext {
             req_hdr: reply.req_hdr,
-            client_minor: reply.client_minor,
+            client_minor,
         },
     )
 }
@@ -5017,6 +5063,7 @@ impl PendingWriteNotify {
         &mut self,
         chain: Result<(), tokio::sync::oneshot::error::RecvError>,
         writer: &impl FrameSink,
+        client_minor: u16,
         commit: impl FnOnce() -> bool,
     ) -> CaResult<bool> {
         // Losing the claim means a predecessor-timeout supersede already
@@ -5029,7 +5076,13 @@ impl PendingWriteNotify {
             Ok(()) => self.eca_status,
             Err(_) => ECA_PUTFAIL,
         };
-        finish_write_notify(&mut owned.trap_guard, final_status, &self.reply, writer)?;
+        finish_write_notify(
+            &mut owned.trap_guard,
+            final_status,
+            &self.reply,
+            writer,
+            client_minor,
+        )?;
         // `owned` — and with it the successor's release — dies at the end of
         // this scope, after the commit.
         Ok(commit())
@@ -5327,7 +5380,6 @@ pub(crate) async fn register_subscription(
         denied: AtomicBool::new(access_denied),
         ended: AtomicBool::new(false),
         data_type: requested_type,
-        client_minor: state.client_minor_version,
         sub_id,
         data_count: requested_count,
         stats: state.stats.clone(),
@@ -5441,7 +5493,7 @@ pub(crate) fn cancel_subscription_reply(
             ECA_BADMONID,
             entry_cid,
             entry_pv_name,
-            state.client_minor_version,
+            state.client_minor_version(),
         )?;
         return Err(epics_base_rs::error::CaError::Protocol(format!(
             "EVENT_CANCEL sub-id {} not on sid {} (matches C event_cancel_reply \
@@ -5469,7 +5521,7 @@ pub(crate) fn cancel_subscription_reply(
         info.channel_sid,
         sub_id,
         &[],
-        state.client_minor_version,
+        state.client_minor_version(),
     ) else {
         return Err(epics_base_rs::error::CaError::Protocol(format!(
             "EVENT_CANCEL count {} needs an extended header (C event_cancel_reply RSRV_ERROR)",
@@ -5734,6 +5786,7 @@ pub(crate) async fn run_event_task(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
     mut control: tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     sink: impl EventSink,
+    minor: CircuitMinor,
 ) {
     let mut subs: Vec<MonitorDelivery> = Vec::new();
     // The cids this circuit has already retired. The async driver needs no
@@ -5862,9 +5915,12 @@ pub(crate) async fn run_event_task(
                     unreachable!("a delivered step leaves its event in the slot")
                 };
                 let step = match context.downcast_ref::<CircuitMonitor>() {
-                    Some(m) if m.stage.is_identity() => {
-                        Some(deliver_update(m, Cow::Borrowed(event), &mut sink.0))
-                    }
+                    Some(m) if m.stage.is_identity() => Some(deliver_update(
+                        m,
+                        Cow::Borrowed(event),
+                        &mut sink.0,
+                        minor.get(),
+                    )),
                     Some(_) => {
                         let Some(CircuitEvent::Event { context, event, .. }) = slot.take() else {
                             unreachable!()
@@ -5872,7 +5928,12 @@ pub(crate) async fn run_event_task(
                         let m = context
                             .downcast_ref::<CircuitMonitor>()
                             .expect("downcast above");
-                        Some(deliver_update(m, Cow::Owned(event), &mut sink.0))
+                        Some(deliver_update(
+                            m,
+                            Cow::Owned(event),
+                            &mut sink.0,
+                            minor.get(),
+                        ))
                     }
                     None => None,
                 };
@@ -5906,7 +5967,7 @@ pub(crate) async fn run_event_task(
                 // otherwise be free to stage its own put-callback's reply
                 // ahead of it.
                 let to = StageNow::new(&mut sink.0);
-                let committed = p.settle(res, &to, || !to.gone.get());
+                let committed = p.settle(res, &to, minor.get(), || !to.gone.get());
                 match committed {
                     // Encoding the reply failed (16k-array boundary): the reply
                     // is unshippable, drop this completion and keep serving.
@@ -6162,7 +6223,7 @@ pub(crate) fn report_gate_error(
         err.status,
         state.send_err_cid(&err.hdr),
         &err.diagnostic,
-        state.client_minor_version,
+        state.client_minor_version(),
     );
     print_log_header(
         peer,
@@ -6251,14 +6312,14 @@ pub(crate) fn print_forcing_disconnect(peer: SocketAddr) {
 /// subscription's own count, so an autosize request is denied with count 0
 /// (`event_add_action` `camessage.c:1853-1858`, `no_read_access_event`
 /// `:473-475`), not read_reply's `no_elements`.
-pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &impl FrameSink) {
+pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &impl FrameSink, minor: u16) {
     if refuse_unframeable_update(
         outbox,
         m.refusal_channel(),
         m.data_type,
         m.data_count,
         &m.stage,
-        m.client_minor,
+        minor,
         &m.req_hdr,
     ) {
         return;
@@ -6273,7 +6334,7 @@ pub(crate) fn send_denied_event(m: &CircuitMonitor, outbox: &impl FrameSink) {
             available: m.sub_id,
             eca_status: ECA_NORDACCESS,
         },
-        m.reply(),
+        m.reply(minor),
     );
 }
 
@@ -6636,8 +6697,6 @@ pub(crate) struct CircuitMonitor {
     /// Only the event task touches it.
     pub(crate) ended: AtomicBool,
     pub(crate) data_type: u16,
-    /// The client's negotiated minor version, which frames every update.
-    pub(crate) client_minor: u16,
     pub(crate) sub_id: u32,
     pub(crate) data_count: u32,
     pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
@@ -6679,11 +6738,12 @@ impl CircuitMonitor {
         RefusalChannel::new(&self.cid, &self.target)
     }
 
-    /// The reply context a refusal frames, assembled only on that path.
-    pub(crate) fn reply(&self) -> ReplyContext {
+    /// The reply context a refusal frames, assembled only on that path, at
+    /// the minor its delivery read.
+    pub(crate) fn reply(&self, client_minor: u16) -> ReplyContext {
         ReplyContext {
             req_hdr: self.req_hdr,
-            client_minor: self.client_minor,
+            client_minor,
         }
     }
 }
@@ -6704,7 +6764,6 @@ mod circuit_monitor_layout {
             ("denied", offset_of!(CircuitMonitor, denied) + 1),
             ("ended", offset_of!(CircuitMonitor, ended) + 1),
             ("data_type", offset_of!(CircuitMonitor, data_type) + 2),
-            ("client_minor", offset_of!(CircuitMonitor, client_minor) + 2),
             ("sub_id", offset_of!(CircuitMonitor, sub_id) + 4),
             ("data_count", offset_of!(CircuitMonitor, data_count) + 4),
             (
@@ -6734,6 +6793,7 @@ mod circuit_monitor_layout {
 pub(crate) async fn run_circuit_monitors(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
     outbox: Outbox,
+    minor: CircuitMinor,
 ) {
     use epics_base_rs::server::event_queue::CircuitEvent;
     loop {
@@ -6752,10 +6812,10 @@ pub(crate) async fn run_circuit_monitors(
         }
         match &m.target {
             ChannelTarget::SimplePv(_) => {
-                super::monitor::deliver_monitor_event(m, event, &outbox).await
+                super::monitor::deliver_monitor_event(m, event, &outbox, minor.get()).await
             }
             ChannelTarget::RecordField { .. } => {
-                deliver_record_field_event(m, event, &outbox).await
+                deliver_record_field_event(m, event, &outbox, minor.get()).await
             }
         }
     }
@@ -6766,6 +6826,7 @@ async fn deliver_record_field_event(
     m: &CircuitMonitor,
     event: epics_base_rs::server::pv::MonitorEvent,
     outbox: &Outbox,
+    minor: u16,
 ) {
     // One subscription update committed for delivery this cycle
     // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
@@ -6777,7 +6838,7 @@ async fn deliver_record_field_event(
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
     if m.denied.load(Ordering::Acquire) {
-        m.gate.deliver(|| send_denied_event(m, outbox));
+        m.gate.deliver(|| send_denied_event(m, outbox, minor));
         return;
     }
     if refuse_unframeable_update(
@@ -6786,7 +6847,7 @@ async fn deliver_record_field_event(
         m.data_type,
         m.data_count,
         &m.stage,
-        m.client_minor,
+        minor,
         &m.req_hdr,
     ) {
         return;
@@ -6804,7 +6865,7 @@ async fn deliver_record_field_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply(),
+            m.reply(minor),
         );
         return;
     };
@@ -6827,7 +6888,7 @@ async fn deliver_record_field_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply(),
+            m.reply(minor),
         );
         return;
     }
@@ -6843,7 +6904,7 @@ async fn deliver_record_field_event(
     // cannot parse the extended header gets ECA_16KARRAYCLIENT
     // instead of a de-syncing frame.
     if ev
-        .set_payload_size(frame.payload_len(), element_count, m.client_minor)
+        .set_payload_size(frame.payload_len(), element_count, minor)
         .is_err()
     {
         let _ = send_16k_array_client_err(
@@ -6852,7 +6913,7 @@ async fn deliver_record_field_event(
             m.refusal_channel(),
             UnloadedReply::ReadReply,
             element_count,
-            m.client_minor,
+            minor,
         );
         return;
     }
@@ -6924,7 +6985,7 @@ record(waveform, "W") { field(FTVL, "DOUBLE") field(NELM, "4") }"#,
                 };
                 let m = super::delivery_reads_options::monitor(&db, target, data_type);
                 let (outbox, mut drain) = crate::server::outbox::channel();
-                send_denied_event(&m, &outbox);
+                send_denied_event(&m, &outbox, crate::protocol::CA_MINOR_VERSION);
                 let frame = drain.try_next().expect("one frame");
                 let word = |i: usize| u16::from_be_bytes([frame[i], frame[i + 1]]);
                 assert_eq!(
@@ -6984,7 +7045,6 @@ mod delivery_reads_options {
             denied: AtomicBool::new(false),
             gate: crate::server::outbox::MonitorGate::open(),
             stage: super::super::DeliveryStage::plain(),
-            client_minor: CA_MINOR_VERSION,
             req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
             stats: None,
             ended: AtomicBool::new(false),
@@ -7017,10 +7077,17 @@ mod delivery_reads_options {
         let (outbox, mut drain) = crate::server::outbox::channel();
         match &m.target {
             ChannelTarget::SimplePv(_) => {
-                crate::server::monitor::deliver_monitor_event(m, event, &outbox).await
+                crate::server::monitor::deliver_monitor_event(
+                    m,
+                    event,
+                    &outbox,
+                    crate::protocol::CA_MINOR_VERSION,
+                )
+                .await
             }
             ChannelTarget::RecordField { .. } => {
-                deliver_record_field_event(m, event, &outbox).await
+                deliver_record_field_event(m, event, &outbox, crate::protocol::CA_MINOR_VERSION)
+                    .await
             }
         }
         let frame = drain.try_next().expect("one frame");
@@ -7116,7 +7183,13 @@ mod delivery_reads_options {
         let m = monitor(&db, ChannelTarget::SimplePv(pv.clone()), DBR_CLASS_NAME);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let event = MonitorEvent::read_log(&mut pv.snapshot(), EventMask::VALUE);
-        crate::server::monitor::deliver_monitor_event(&m, event, &outbox).await;
+        crate::server::monitor::deliver_monitor_event(
+            &m,
+            event,
+            &outbox,
+            crate::protocol::CA_MINOR_VERSION,
+        )
+        .await;
         let frame = drain.try_next().expect("one frame");
         assert_eq!(&frame[16..56], &[0u8; 40][..]);
     }
@@ -7156,7 +7229,7 @@ record(stringin, "SI") { field(SIMM, "YES") field(SIOL, "abc") field(SIMS, "MAJO
             let event = MonitorEvent::read_log(&mut snap, EventMask::ALARM);
             let m = monitor(&db, target, epics_base_rs::types::DBR_STSACK_STRING);
             let (outbox, mut drain) = crate::server::outbox::channel();
-            deliver_record_field_event(&m, event, &outbox).await;
+            deliver_record_field_event(&m, event, &outbox, crate::protocol::CA_MINOR_VERSION).await;
             let frame = drain.try_next().expect("one frame");
             let word = |i: usize| u16::from_be_bytes([frame[16 + i], frame[17 + i]]);
             assert_eq!((word(4), word(6)), want, "{name} ackt/acks");
@@ -7273,6 +7346,7 @@ fn deliver_update(
     m: &CircuitMonitor,
     event: std::borrow::Cow<'_, epics_base_rs::server::pv::MonitorEvent>,
     sink: &mut impl EventSink,
+    client_minor: u16,
 ) -> Option<DeliverStep> {
     // Read before the gate, which a cancel can hold this thread
     // in; `None` is a failed get, framed inside it.
@@ -7304,7 +7378,7 @@ fn deliver_update(
         let to = StageNow::new(sink);
         let denied = m.denied.load(Ordering::Acquire);
         if denied {
-            send_denied_event(m, &to);
+            send_denied_event(m, &to, client_minor);
         } else if let Some(update) = source {
             super::monitor::send_event(
                 m.refusal_channel(),
@@ -7315,7 +7389,7 @@ fn deliver_update(
                 &to,
                 crate::server::outbox::Credit::none(),
                 &m.stage,
-                m.client_minor,
+                client_minor,
                 &m.req_hdr,
             );
         } else {
@@ -7325,7 +7399,7 @@ fn deliver_update(
                 m.data_type,
                 m.data_count,
                 m.sub_id,
-                m.reply(),
+                m.reply(client_minor),
             );
         }
         if to.gone.get() {
@@ -7407,6 +7481,7 @@ async fn next_write_notify_step(
 async fn run_write_notify_queue(
     mut control: tokio::sync::mpsc::UnboundedReceiver<WriteNotifyQueueMsg>,
     outbox: Outbox,
+    minor: CircuitMinor,
 ) {
     let mut pending: Vec<PendingWriteNotify> = Vec::new();
     loop {
@@ -7424,7 +7499,7 @@ async fn run_write_notify_queue(
                 // is on the blocking driver's owner; the circuit keeps serving.
                 // The commit is a no-op: `outbox` is the one writer task's
                 // queue, so the push `settle` made is already the wire order.
-                let _ = p.settle(res, &outbox, || true);
+                let _ = p.settle(res, &outbox, minor.get(), || true);
             }
         }
     }
@@ -7619,7 +7694,7 @@ pub(crate) fn send_bad_resource_id(
         ECA_INTERNAL,
         0xFFFF_FFFF,
         ctx,
-        state.client_minor_version,
+        state.client_minor_version(),
     )
 }
 
@@ -7633,7 +7708,7 @@ fn answer_retired(
     state: &ClientState,
     elements: u32,
 ) -> CaResult<()> {
-    let minor = state.client_minor_version;
+    let minor = state.client_minor_version();
     let reply = |frame: Result<Vec<u8>, ExtendedHeaderUnsupported>| {
         writer.push(frame.map_err(|_| {
             epics_base_rs::error::CaError::Protocol(format!(
@@ -7739,7 +7814,7 @@ fn pcas_log_bad_id(
         ECA_BADCHID,
         0xFFFF_FFFF,
         format_args!("Bad Resource ID={} detected at {FILE}.{line}", hdr.cid),
-        state.client_minor_version,
+        state.client_minor_version(),
     )
 }
 
@@ -7792,7 +7867,7 @@ fn refuse_install(
         ECA_ALLOCMEM,
         entry.cid,
         (before, pv, after),
-        state.client_minor_version,
+        state.client_minor_version(),
     );
     epics_base_rs::error::CaError::Protocol(format!(
         "EVENT_ADD on {}: {context}",
@@ -7948,7 +8023,6 @@ mod write_notify_queue_tests {
                 write_count: 1,
                 ioid,
                 req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
-                client_minor: crate::protocol::CA_MINOR_VERSION,
             },
             completion: PutNotifyCompletion::new(None).0,
             sid,
@@ -7976,13 +8050,12 @@ mod write_notify_queue_tests {
                 write_count: 1,
                 ioid: 0x1111,
                 req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
-                client_minor: crate::protocol::CA_MINOR_VERSION,
             },
             completion,
             sid: 1,
             cancel: None,
         };
-        let committed = p.settle(Ok(()), &outbox, || {
+        let committed = p.settle(Ok(()), &outbox, crate::protocol::CA_MINOR_VERSION, || {
             assert!(
                 matches!(
                     settled.try_recv(),
@@ -8086,7 +8159,11 @@ mod write_notify_queue_tests {
     async fn clearing_a_channel_drops_only_that_channels_put_callbacks() {
         let (outbox, mut drain) = crate::server::outbox::channel();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let owner = tokio::spawn(run_write_notify_queue(rx, outbox));
+        let owner = tokio::spawn(run_write_notify_queue(
+            rx,
+            outbox,
+            super::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+        ));
 
         // Straight down the control channel rather than through a
         // `WriteNotifyQueue`: the wrapper aborts its owner when it drops, and
@@ -8121,7 +8198,11 @@ mod write_notify_queue_tests {
     async fn the_owner_ends_when_the_connection_drops_its_sender() {
         let (outbox, mut drain) = crate::server::outbox::channel();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let owner = tokio::spawn(run_write_notify_queue(rx, outbox));
+        let owner = tokio::spawn(run_write_notify_queue(
+            rx,
+            outbox,
+            super::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+        ));
         let (p, _tx_never_fires) = pending(1, 0xD00D);
         tx.send(WriteNotifyQueueMsg::Queue(Box::new(p)))
             .expect("owner alive");
@@ -8171,7 +8252,12 @@ mod write_notify_queue_tests {
             .send(super::EventTaskControl::WriteComplete(Box::new(p)))
             .unwrap();
         let user = std::sync::Arc::new(epics_base_rs::server::event_queue::EventUser::new());
-        let mut task = std::pin::pin!(super::run_event_task(user, ctl_rx, sink));
+        let mut task = std::pin::pin!(super::run_event_task(
+            user,
+            ctl_rx,
+            sink,
+            crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION)
+        ));
         let ended = task
             .as_mut()
             .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
@@ -8217,7 +8303,6 @@ mod write_notify_queue_tests {
                 write_count: 1,
                 ioid: 0x1111,
                 req_hdr: CaHeader::new(CA_PROTO_WRITE_NOTIFY),
-                client_minor: crate::protocol::CA_MINOR_VERSION,
             },
             completion,
             sid: 1,
@@ -8264,7 +8349,7 @@ mod put_notify_serialize_tests {
     /// Drive the gate to completion on this test thread. `park_on`, since no
     /// runtime is entered here — the same way the blocking driver runs it.
     fn serialize(slot: &PutNotifySlot, outbox: &Outbox) {
-        block_on_sync(slot.serialize(outbox, "", 0))
+        block_on_sync(slot.serialize(outbox, "", 0, crate::protocol::CA_MINOR_VERSION))
             .expect("no async runtime on this thread")
             .expect("serialize");
     }
@@ -8289,7 +8374,6 @@ mod put_notify_serialize_tests {
             write_count: 1,
             ioid,
             req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
-            client_minor: crate::protocol::CA_MINOR_VERSION,
         }
     }
 
@@ -8334,7 +8418,7 @@ mod put_notify_serialize_tests {
         let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
         let proceeded = block_on_sync(timeout(
             Duration::from_millis(200),
-            slot.serialize(&outbox, "", 0),
+            slot.serialize(&outbox, "", 0, crate::protocol::CA_MINOR_VERSION),
         ))
         .expect("no async runtime on this thread");
         assert!(
@@ -13066,7 +13150,12 @@ mod destroyed_channel_teardown_tests {
                 Ok(())
             }
         }
-        let task = tokio::spawn(run_event_task(user.clone(), ctl_rx, Frames(frame_tx)));
+        let task = tokio::spawn(run_event_task(
+            user.clone(),
+            ctl_rx,
+            Frames(frame_tx),
+            crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+        ));
 
         let mut readers = readers.into_iter();
         ctl_tx
@@ -13166,7 +13255,12 @@ mod destroyed_channel_teardown_tests {
             }
 
             let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
-            let task = tokio::spawn(run_event_task(user.clone(), ctl_rx, Record(op_tx)));
+            let task = tokio::spawn(run_event_task(
+                user.clone(),
+                ctl_rx,
+                Record(op_tx),
+                crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+            ));
             let mut ops = Vec::new();
             loop {
                 let op = tokio::time::timeout(Duration::from_secs(5), op_rx.recv())
@@ -13231,7 +13325,13 @@ mod destroyed_channel_teardown_tests {
         drop(ctl_tx);
 
         let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_event_task(user, ctl_rx, Record(op_tx)).await;
+        run_event_task(
+            user,
+            ctl_rx,
+            Record(op_tx),
+            crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+        )
+        .await;
         let mut ops = Vec::new();
         while let Ok(op) = op_rx.try_recv() {
             ops.push(op);
@@ -13240,6 +13340,7 @@ mod destroyed_channel_teardown_tests {
     }
 
     /// One CA header as the wire carries it.
+    #[cfg(tokio_backend)]
     fn wire_hdr(
         cmmd: u16,
         postsize: u16,
@@ -13258,6 +13359,7 @@ mod destroyed_channel_teardown_tests {
     }
 
     /// The `CA_PROTO_ERROR` echoing `request`'s header, with `diag` if any.
+    #[cfg(tokio_backend)]
     fn error_reply(request: &[u8], status: u32, diag: Option<&str>) -> Vec<u8> {
         let mut body = request[..CaHeader::SIZE].to_vec();
         if let Some(diag) = diag {
@@ -13520,7 +13622,13 @@ mod destroyed_channel_teardown_tests {
         }
         drop(ctl_tx);
         let (op_tx, mut op_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_event_task(Arc::new(EventUser::new()), ctl_rx, Record(op_tx)).await;
+        run_event_task(
+            Arc::new(EventUser::new()),
+            ctl_rx,
+            Record(op_tx),
+            crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+        )
+        .await;
         let mut ops = Vec::new();
         while let Ok(op) = op_rx.try_recv() {
             ops.push(op);
@@ -14747,7 +14855,7 @@ mod unrouted_command_tests {
             5064,
             db.clone(),
         );
-        state.client_minor_version = 13;
+        state.minor.set(13);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let mut hdr = CaHeader::new(5);
         hdr.cid = 7;

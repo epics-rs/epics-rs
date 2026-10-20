@@ -1408,3 +1408,75 @@ async fn a_read_denied_monitor_gets_nordaccess_not_the_value() {
         "initial update of a read-denied monitor: {first:02x?}"
     );
 }
+
+/// `cas_copy_in_header` frames with the client's minor as it stands when the
+/// frame is built (`caserverio.c:266-270`), and a VERSION rewrites it
+/// (`camessage.c:369`): softIoc sends a CA_V413 subscriber an extended update,
+/// and refuses the next post once a VERSION 8 has arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_subscription_update_is_framed_at_the_minor_of_its_post() {
+    // SAFETY: before the server reads it, in a test of its own.
+    unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "1000000") };
+    let port = server().await;
+    let (initial, add, refused) = blocking(move || {
+        let mut c = Client::connect(port, 13);
+        let add = event_add(c.create(1, "WF"), 9, 10000);
+        c.send(&add);
+        let first = |c: &mut Client, cmmd: u16| {
+            std::iter::from_fn(|| c.next()).find(|f| f[..2] == cmmd.to_be_bytes())
+        };
+        let initial = first(&mut c, CA_PROTO_EVENT_ADD).map(|f| f[2..4].to_vec());
+        c.send(&hdr(CA_PROTO_VERSION, 0, 0, 8, 0, 0));
+        c.send(&hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0));
+        first(&mut c, CA_PROTO_ECHO).expect("the VERSION is dispatched");
+        let mut w = Client::connect(port, 13);
+        let mut put = hdr(CA_PROTO_WRITE, 8, DBR_DOUBLE, 1, w.create(1, "WF"), 0);
+        put.extend(5f64.to_be_bytes());
+        w.send(&put);
+        (initial, add, c.try_error())
+    })
+    .await;
+    assert_eq!(initial, Some(vec![0xff, 0xff]), "extended at minor 13");
+    let ctx = "server unable to load read (or subscription update) response into protocol \
+               buffer PV=\"WF\" dbf=6 count=10000 avail=9 max bytes=1000024";
+    assert_eq!(refused, Ok(error_frame(1, ECA_16KARRAYCLIENT, &add, ctx)));
+}
+
+/// `write_notify_reply` frames the completion at the minor of its completion
+/// (`camessage.c:1438-1449`): softIoc logs a put callback whose chain was
+/// still running when a VERSION 8 arrived, and sends nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_put_callback_completion_is_framed_at_the_minor_of_its_completion() {
+    const WN_DB: &str =
+        "record(waveform,\"WC\"){ field(FTVL,\"CHAR\") field(NELM,\"70000\") field(FLNK,\"CO\") }
+record(calcout,\"CO\"){ field(CALC,\"1\") field(ODLY,\"0.5\") }
+";
+    // SAFETY: before the server reads it, in a test of its own.
+    unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "1000000") };
+    let port = serve_db(CaServer::builder(), WN_DB).await;
+    let (after, lines) = blocking(move || {
+        let mut c = Client::connect(port, 13);
+        let sid = c.create(1, "WC");
+        let mut put = hdr(CA_PROTO_WRITE_NOTIFY, 0xffff, 4, 0, sid, 7);
+        put.extend(70000u32.to_be_bytes());
+        put.extend(70000u32.to_be_bytes());
+        put.extend([1u8; 70000]);
+        let mut after = Vec::new();
+        let lines = errlog_lines(|| {
+            c.send(&put);
+            c.send(&hdr(CA_PROTO_VERSION, 0, 0, 8, 0, 0));
+            std::thread::sleep(Duration::from_secs(1));
+            c.send(&hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0));
+            after.push(c.next().map(|f| f[..16].to_vec()));
+        });
+        (after, lines)
+    })
+    .await;
+    assert_eq!(after, [Some(hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0))]);
+    assert_eq!(
+        lines,
+        ["CA server corrupted - put call back(s) discarded\n"]
+    );
+}

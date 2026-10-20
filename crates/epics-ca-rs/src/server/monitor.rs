@@ -15,6 +15,8 @@ pub(crate) async fn deliver_monitor_event(
     // The single per-connection wire outbox — the connection loop is the sole
     // writer owner. See `super::outbox`.
     outbox: &Outbox,
+    // The circuit's minor as this delivery read it.
+    client_minor: u16,
 ) {
     // One subscription update committed for delivery this cycle
     // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
@@ -26,7 +28,8 @@ pub(crate) async fn deliver_monitor_event(
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
     if m.denied.load(Ordering::Acquire) {
-        m.gate.deliver(|| super::tcp::send_denied_event(m, outbox));
+        m.gate
+            .deliver(|| super::tcp::send_denied_event(m, outbox, client_minor));
         return;
     }
     // Back-pressure, taken once this event is known to become a frame:
@@ -47,7 +50,7 @@ pub(crate) async fn deliver_monitor_event(
             m.data_type,
             m.data_count,
             m.sub_id,
-            m.reply(),
+            m.reply(client_minor),
         );
         return;
     };
@@ -67,7 +70,7 @@ pub(crate) async fn deliver_monitor_event(
             outbox,
             credit,
             &m.stage,
-            m.client_minor,
+            client_minor,
             &m.req_hdr,
         )
     });
@@ -393,7 +396,6 @@ mod tests {
                     denied: AtomicBool::new(denied),
                     gate: crate::server::outbox::MonitorGate::open(),
                     stage: crate::server::DeliveryStage::plain(),
-                    client_minor: crate::protocol::CA_MINOR_VERSION,
                     req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
                     stats: Some(stats.clone()),
                     ended: AtomicBool::new(false),
@@ -403,7 +405,11 @@ mod tests {
                 .expect("subscriber added");
             let reactor = epics_base_rs::runtime::task::Reactor::current()
                 .expect("the test driver enters an executor");
-            let task = reactor.spawn(crate::server::tcp::run_circuit_monitors(user, outbox));
+            let task = reactor.spawn(crate::server::tcp::run_circuit_monitors(
+                user,
+                outbox,
+                crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
+            ));
             (task, reader)
         }
 

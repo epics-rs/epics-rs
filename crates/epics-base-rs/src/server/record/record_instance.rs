@@ -10780,6 +10780,7 @@ impl RecordInstance {
                 NewDset::Bound(mut dev) => {
                     dev.set_record_info(&self.name.to_str_lossy(), self.common.scan);
                     dev.apply_record_info(self.info());
+                    crate::server::device_support::hand_device_its_record(self, &mut *dev);
                     match dev.add_record(&mut *self.record) {
                         Ok(()) => {
                             prepared.retired = self.device.replace(dev);

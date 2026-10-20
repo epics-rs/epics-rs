@@ -836,6 +836,43 @@ impl<'a> HeldInstance<'a> {
         f(&mut *instance.record, &mut instance.common)
     }
 
+    /// [`Self::with`] with the record's bound device as well; `None` when
+    /// none is bound, as inside a dset call, which has it out.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::with`].
+    pub fn with_device<R>(
+        &self,
+        f: impl FnOnce(
+            &mut dyn crate::server::record::Record,
+            &mut crate::server::record::CommonFields,
+            &mut dyn crate::server::device_support::DeviceSupport,
+        ) -> R,
+    ) -> Option<R> {
+        let mut instance = self.rec.write();
+        let instance = &mut *instance;
+        let dev = instance.device.as_mut()?;
+        Some(f(&mut *instance.record, &mut instance.common, &mut **dev))
+    }
+
+    /// [`PvDatabase::post_property`] on this record, inside the hold: C's
+    /// `setEnums` and its `db_post_events(DBE_PROPERTY)` from an enum
+    /// callback (devAsynInt32.c:712-766). A field written through
+    /// [`Self::with`] does not reach the metadata cache; one written here does.
+    pub fn put_property(
+        &self,
+        post: crate::server::device_support::PropertyPost,
+    ) -> CaResult<Vec<String>> {
+        let mut links = crate::server::record::PreparedLinks::for_puts(
+            self.db,
+            self.rec.unframed(),
+            post.writes.iter().map(|(f, v)| (f.as_str(), v)),
+        );
+        self.db
+            .store_property(&mut self.rec.write(), post, &mut links)
+    }
+
     /// C `dbPut(&addr, ...)`: this record's field or another's, the record
     /// not processed.
     pub fn db_put(&self, addr: &DbAddr, value: EpicsValue) -> DbResult {
@@ -1241,6 +1278,71 @@ impl AsyncDbHandle {
         let r = f(&mut *instance.record, &mut instance.common);
         super::field_io::emit_cycle_posts(instance);
         Some(r)
+    }
+
+    /// C `dbScanLock`, a device's callback, `dbScanUnlock`, on the driver
+    /// thread that calls it, `f` carrying the driver's data in as C's
+    /// callbacks carry theirs: devEtherIP's `check_ao_callback` reads the PLC
+    /// tag (drvEtherIP.c:819-823, devEtherIP.c:331-436), devMotorAsyn's
+    /// `asynCallback` its message (devMotorAsyn.c:717-726). The hold is
+    /// [`with_held`](Self::with_held)'s; the device's posts
+    /// ([`take_device_posts`](crate::server::device_support::DeviceSupport::take_device_posts))
+    /// go out inside it, then `f`'s answer: `dbProcess` inside it
+    /// ([`HeldInstance::db_process`]), or `scanOnce` once it is let go.
+    ///
+    /// Nothing runs before `finishDevSup`: devMotorAsyn locks only once its
+    /// `init(after)` set `dbScanLockOK` (devMotorAsyn.c:159-162,717), and
+    /// drvEtherIP's scan task starts at `initHookAfterScanInit`
+    /// (drvEtherIP.c:1457). A no-op, too, if the record or the database is
+    /// gone.
+    pub fn run_io_intr_callback_with(
+        &self,
+        name: impl AsRef<[u8]>,
+        f: impl FnOnce(&HeldInstance<'_>) -> crate::server::device_support::IoIntrAction,
+    ) {
+        use crate::server::device_support::IoIntrAction;
+        let name = name.as_ref();
+        if !self
+            .db()
+            .is_some_and(|db| db.scan_control().dev_sup_gate().is_open())
+        {
+            return;
+        }
+        let scan_once = self.with_held(name, |held| {
+            let action = f(held);
+            {
+                let mut instance = held.rec.write();
+                let posts = instance
+                    .device
+                    .as_mut()
+                    .map(|dev| dev.take_device_posts())
+                    .unwrap_or_default();
+                instance.post_device_values(posts);
+            }
+            match action {
+                IoIntrAction::Process => {
+                    let _ = held.db_process(name);
+                    false
+                }
+                IoIntrAction::ScanOnce => true,
+                IoIntrAction::Skip => false,
+            }
+        });
+        if scan_once == Some(true)
+            && let Some(db) = self.db()
+        {
+            db.scan_once(name);
+        }
+    }
+
+    /// [`run_io_intr_callback_with`](Self::run_io_intr_callback_with) the
+    /// bound device's own
+    /// [`io_intr_callback`](crate::server::device_support::DeviceSupport::io_intr_callback).
+    pub fn run_io_intr_callback(&self, name: impl AsRef<[u8]>) {
+        self.run_io_intr_callback_with(name, |held| {
+            held.with_device(|record, common, dev| dev.io_intr_callback(record, common))
+                .unwrap_or(crate::server::device_support::IoIntrAction::Skip)
+        });
     }
 
     /// [`with_instance`](Self::with_instance) for device support whose run
@@ -3876,10 +3978,19 @@ impl PvDatabase {
             &rec,
             post.writes.iter().map(|(f, v)| (f.as_str(), v)),
         );
-        let mut inst = rec.write();
+        self.store_property(&mut rec.write(), post, &mut links)
+    }
+
+    /// [`Self::post_property`] on a record the caller holds.
+    fn store_property(
+        &self,
+        inst: &mut crate::server::record::RecordInstance,
+        post: crate::server::device_support::PropertyPost,
+        links: &mut crate::server::record::PreparedLinks,
+    ) -> CaResult<Vec<String>> {
         let mut written = Vec::with_capacity(post.writes.len());
         for (field, value) in post.writes {
-            self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
+            self.put_internal_field_opening(inst, &field, value, links)?;
             // Snapshot-cache contract: a metadata-class write must rebuild
             // the cache before the monitor snapshot below is built, or the
             // property event would carry the pre-change enum choices.

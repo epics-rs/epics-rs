@@ -3527,18 +3527,8 @@ pub(crate) fn spawn_io_intr_pump(
                 return;
             }
             // Process if the device drives SCAN-independently, or the record
-            // is still on I/O Intr scan, and the device's own callback asks
-            // for it. A device out for processing has no callback to run.
-            let process = {
-                let mut guard = rec.write();
-                let inst = &mut *guard;
-                (independent || inst.common.scan == record::ScanType::IoIntr)
-                    && inst.device.as_mut().is_none_or(|d| {
-                        d.io_intr_callback(&mut *inst.record, &mut inst.common)
-                            == crate::server::device_support::IoIntrAction::Process
-                    })
-            };
-            if !process {
+            // is still on I/O Intr scan.
+            if !independent && rec.read().common.scan != record::ScanType::IoIntr {
                 return;
             }
             let mut visited = crate::server::database::ProcStack::new();
@@ -3692,29 +3682,46 @@ mod io_intr_scan_add_tests {
         assert!(db.records_for_scan(ScanType::IoIntr).await.is_empty());
     }
 
-    /// A device's I/O Intr callback runs on every pulse under the record's
-    /// lock, and a pulse it answers [`IoIntrAction::Skip`] processes nothing,
-    /// as devEtherIP's `check_ao_callback` leaves an unchanged value
-    /// without `scanOnce` (devEtherIP.c:432-434).
-    #[epics_macros_rs::epics_test]
-    async fn a_pulse_the_device_callback_skips_does_not_process() {
+    /// A device that hands out a pulse receiver and also has a callback under
+    /// its record's lock, counting both.
+    mod callback_dev {
         use crate::error::CaResult;
         use crate::runtime::sync::mpsc;
         use crate::server::device_support::{
-            DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
+            DevicePost, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
         };
         use crate::server::record::{CommonFields, Record};
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        struct Seen {
-            callbacks: AtomicUsize,
-            reads: AtomicUsize,
-            process: AtomicBool,
+        pub struct Seen {
+            pub callbacks: AtomicUsize,
+            pub answer: Mutex<IoIntrAction>,
+            pub callback_thread: Mutex<Option<std::thread::ThreadId>>,
+            pub read_thread: Mutex<Option<std::thread::ThreadId>>,
+            pub log: Mutex<Vec<&'static str>>,
+            /// Run inside the callback, under the record's lock.
+            pub inside: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+            /// Posted by the callback.
+            pub post: Mutex<Option<DevicePost>>,
         }
-        struct CallbackDev {
-            seen: Arc<Seen>,
-            pulses: Option<mpsc::Receiver<()>>,
+        impl Default for Seen {
+            fn default() -> Self {
+                Seen {
+                    callbacks: AtomicUsize::new(0),
+                    answer: Mutex::new(IoIntrAction::Skip),
+                    callback_thread: Mutex::default(),
+                    read_thread: Mutex::default(),
+                    log: Mutex::default(),
+                    inside: Mutex::default(),
+                    post: Mutex::default(),
+                }
+            }
+        }
+        pub struct CallbackDev {
+            pub seen: Arc<Seen>,
+            pub pulses: Option<mpsc::Receiver<()>>,
+            pub posts: Vec<DevicePost>,
         }
         impl DeviceSupport for CallbackDev {
             fn dtyp(&self) -> &str {
@@ -3732,54 +3739,215 @@ mod io_intr_scan_add_tests {
                 _common: &mut CommonFields,
             ) -> IoIntrAction {
                 self.seen.callbacks.fetch_add(1, Ordering::SeqCst);
-                if self.seen.process.load(Ordering::SeqCst) {
-                    IoIntrAction::Process
-                } else {
-                    IoIntrAction::Skip
+                *self.seen.callback_thread.lock().unwrap() = Some(std::thread::current().id());
+                self.seen.log.lock().unwrap().push("callback");
+                if let Some(inside) = self.seen.inside.lock().unwrap().take() {
+                    inside();
                 }
+                self.posts.extend(self.seen.post.lock().unwrap().take());
+                *self.seen.answer.lock().unwrap()
+            }
+            fn take_device_posts(&mut self) -> Vec<DevicePost> {
+                std::mem::take(&mut self.posts)
             }
             fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-                self.seen.reads.fetch_add(1, Ordering::SeqCst);
+                *self.seen.read_thread.lock().unwrap() = Some(std::thread::current().id());
+                self.seen.log.lock().unwrap().push("read");
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
                 Ok(())
             }
         }
+    }
 
+    async fn callback_db(
+        pulses: Option<crate::runtime::sync::mpsc::Receiver<()>>,
+    ) -> (Arc<PvDatabase>, Arc<callback_dev::Seen>) {
         let db = Arc::new(PvDatabase::new());
         db.add_record("CB", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let seen = Arc::new(Seen::default());
-        let (pulse, pulses) = mpsc::channel(1);
-        {
-            let rec = db.get_record("CB").unwrap();
-            let mut inst = rec.write();
-            inst.common.dtyp = "Callback".into();
-            inst.device = Some(Box::new(CallbackDev {
-                seen: seen.clone(),
-                pulses: Some(pulses),
-            }));
-        }
+        let seen = Arc::new(callback_dev::Seen::default());
+        let rec = db.get_record("CB").unwrap();
+        let mut inst = rec.write();
+        inst.common.dtyp = "Callback".into();
+        inst.device = Some(Box::new(callback_dev::CallbackDev {
+            seen: seen.clone(),
+            pulses,
+            posts: Vec::new(),
+        }));
+        drop(inst);
+        (db, seen)
+    }
+
+    /// A pulse is C's `scanIoRequest`: it processes the record and runs no
+    /// device code under the lock first (dbScan.c:604-627).
+    #[epics_macros_rs::epics_test]
+    async fn a_pulse_processes_without_the_device_callback() {
+        let (pulse, pulses) = crate::runtime::sync::mpsc::channel(1);
+        let (db, seen) = callback_db(Some(pulses)).await;
         assert_eq!(setup_io_intr(db.clone()).await, 1);
         db.scan_control().run();
 
         pulse.send(()).await.unwrap();
-        while seen.callbacks.load(Ordering::SeqCst) < 1 {
+        while seen.log.lock().unwrap().is_empty() {
             crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
         }
-        seen.process.store(true, Ordering::SeqCst);
-        pulse.send(()).await.unwrap();
-        while seen.reads.load(Ordering::SeqCst) < 1 {
-            crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(*seen.log.lock().unwrap(), ["read"]);
+        assert_eq!(seen.callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// devEtherIP's check callbacks and devMotorAsyn's `asynCallback` take
+    /// `dbScanLock` on the driver thread and run there (drvEtherIP.c:819-823,
+    /// devMotorAsyn.c:717-726): the callback waits for the lock, runs on the
+    /// caller's thread, and a `Process` answer is `dbProcess` before the lock
+    /// is let go, so a thread waiting for it sees the pass done; `ScanOnce`
+    /// processes on the `scanOnce` thread instead.
+    #[epics_macros_rs::epics_test]
+    async fn the_device_callback_runs_on_the_driver_thread_inside_one_hold() {
+        use std::sync::atomic::Ordering;
+        let (db, seen) = callback_db(None).await;
+        let handle = db.async_handle();
+        let driver = |handle: crate::server::database::AsyncDbHandle| {
+            let t = std::thread::spawn(move || handle.run_io_intr_callback("CB"));
+            let id = t.thread().id();
+            t.join().unwrap();
+            id
+        };
+
+        // Before finishDevSup nothing runs.
+        driver(handle.clone());
+        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 0);
+        db.scan_control().finish_dev_sup();
+
+        // Skip: the callback ran on the driver thread and nothing processed.
+        let id = driver(handle.clone());
+        assert_eq!(*seen.callback_thread.lock().unwrap(), Some(id));
+        assert_eq!(*seen.log.lock().unwrap(), ["callback"]);
+
+        // Held elsewhere: the driver thread waits for the lock.
+        let held = db.lock_record("CB");
+        let waiting = std::thread::spawn({
+            let handle = handle.clone();
+            move || handle.run_io_intr_callback("CB")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(
-            seen.reads.load(Ordering::SeqCst),
+            seen.callbacks.load(Ordering::SeqCst),
             1,
-            "the skipped pulse read"
+            "ran under a held lock"
         );
+        drop(held);
+        waiting.join().unwrap();
+        assert_eq!(seen.callbacks.load(Ordering::SeqCst), 2);
+
+        // Process: a thread that asks for the lock from inside the callback
+        // gets it only after the pass.
+        seen.log.lock().unwrap().clear();
+        *seen.answer.lock().unwrap() = crate::server::device_support::IoIntrAction::Process;
+        let (asked, asking) = std::sync::mpsc::channel();
+        let (other_tx, other) = std::sync::mpsc::channel();
+        *seen.inside.lock().unwrap() = Some(Box::new({
+            let db = db.clone();
+            let seen = seen.clone();
+            move || {
+                let _ = other_tx.send(std::thread::spawn(move || {
+                    asked.send(()).unwrap();
+                    let _gate = db.lock_record("CB");
+                    seen.log.lock().unwrap().push("other");
+                }));
+                asking.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }));
+        let id = driver(handle.clone());
+        other.recv().unwrap().join().unwrap();
+        assert_eq!(*seen.log.lock().unwrap(), ["callback", "read", "other"]);
+        assert_eq!(*seen.read_thread.lock().unwrap(), Some(id));
+
+        // ScanOnce: the pass runs on the scanOnce thread.
+        seen.log.lock().unwrap().clear();
+        *seen.answer.lock().unwrap() = crate::server::device_support::IoIntrAction::ScanOnce;
+        let id = driver(handle);
+        while seen.log.lock().unwrap().len() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(*seen.log.lock().unwrap(), ["callback", "read"]);
+        assert_ne!(*seen.read_thread.lock().unwrap(), Some(id));
+    }
+
+    /// devAsynInt32's `interruptCallbackEnum*` re-keys the states and posts
+    /// DBE_PROPERTY on VAL under `dbScanLock` (devAsynInt32.c:712-766): what
+    /// the callback posts reaches a monitor before the call returns.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_the_device_callback_makes_goes_out_inside_the_hold() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::recgbl::EventMask;
+        let (db, seen) = callback_db(None).await;
+        db.scan_control().finish_dev_sup();
+        let mut sub = DbSubscription::subscribe_with_mask(&db, "CB", 0, EventMask::PROPERTY.bits())
+            .await
+            .unwrap();
+        while sub.try_recv_event().is_ok() {}
+        *seen.post.lock().unwrap() = Some(crate::server::device_support::DevicePost {
+            field: "VAL",
+            mask: EventMask::PROPERTY,
+            value: crate::types::EpicsValue::Double(0.0),
+        });
+        let handle = db.async_handle();
+        std::thread::spawn(move || handle.run_io_intr_callback("CB"))
+            .join()
+            .unwrap();
+        assert!(sub.try_recv_event().is_ok(), "no PROPERTY event");
+        assert_eq!(*seen.log.lock().unwrap(), ["callback"]);
+    }
+
+    /// `setEnums` from an enum callback re-keys the states under the hold
+    /// (devAsynInt32.c:712-766): the next read of the record's metadata has
+    /// the new labels, and the one PROPERTY post goes out before the call
+    /// returns.
+    #[epics_macros_rs::epics_test]
+    async fn a_property_put_from_the_callback_reaches_the_metadata() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::device_support::{IoIntrAction, PropertyPost};
+        use crate::server::recgbl::EventMask;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "EN",
+            Box::new(crate::server::records::mbbi::MbbiRecord::new(0)),
+        )
+        .await
+        .unwrap();
+        db.scan_control().finish_dev_sup();
+        let mut sub = DbSubscription::subscribe_with_mask(&db, "EN", 0, EventMask::PROPERTY.bits())
+            .await
+            .unwrap();
+        while sub.try_recv_event().is_ok() {}
+        let handle = db.async_handle();
+        std::thread::spawn(move || {
+            handle.run_io_intr_callback_with("EN", |held| {
+                held.put_property(PropertyPost {
+                    writes: vec![(
+                        "ZRST".into(),
+                        crate::types::EpicsValue::String("LABEL".into()),
+                    )],
+                    post_field: "VAL".into(),
+                })
+                .unwrap();
+                IoIntrAction::Skip
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(sub.try_recv_event().is_ok(), "no PROPERTY event");
+        let snap = db
+            .get_record("EN")
+            .unwrap()
+            .read()
+            .snapshot_for_field("VAL")
+            .unwrap();
+        assert_eq!(snap.enums.unwrap().strings[0].as_str_lossy(), "LABEL");
     }
 
     /// The demotion is scoped to the failure exits: a record that was never on

@@ -838,13 +838,17 @@ impl DevicePost {
     }
 }
 
-/// What a device's own I/O Intr callback decided about one pulse
+/// What a device's callback under its record's lock decided
 /// ([`DeviceSupport::io_intr_callback`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoIntrAction {
-    /// Process the record, as `scanIoRequest`/`scanOnce` would.
+    /// `dbProcess` the record before the lock is let go (devMotorAsyn's
+    /// `asynCallback`).
     Process,
-    /// Leave it: the callback returned without requesting a scan.
+    /// `scanOnce` the record once the lock is let go (devEtherIP's
+    /// `check_ao_callback`).
+    ScanOnce,
+    /// Leave it.
     Skip,
 }
 
@@ -1057,7 +1061,8 @@ pub trait DeviceSupport: Send + Sync + 'static {
     }
 
     /// Whether this device posts monitors itself: after `init_common`,
-    /// `get_ioint_info` and `write_begin_common` the record's holder posts
+    /// `get_ioint_info`, `io_intr_callback` and `write_begin_common` the
+    /// record's holder posts
     /// [`Self::take_device_posts`] while it still holds the record, before
     /// the record's own `monitor()`. A process cycle reads it when the
     /// record's cycle plan is resolved, so `false` costs a cycle nothing.
@@ -1089,17 +1094,17 @@ pub trait DeviceSupport: Send + Sync + 'static {
         false
     }
 
-    /// The device's callback for one I/O Intr pulse, run under the record's
-    /// lock before the pulse may process it. devEtherIP's
-    /// `check_ao_callback` copies the PLC's value into the record and calls
-    /// `scanOnce` only when it changed, and not at all when the get failed
-    /// (devEtherIP.c:326-437). Default: [`IoIntrAction::Process`].
+    /// The device's own code under its record's lock, on the driver thread
+    /// that calls [`AsyncDbHandle::run_io_intr_callback`](crate::server::database::AsyncDbHandle::run_io_intr_callback):
+    /// devEtherIP's `check_ao_callback` copies the PLC's value into the record
+    /// and calls `scanOnce` only when it changed, and not at all when the get
+    /// failed (devEtherIP.c:326-437). Default: [`IoIntrAction::Skip`].
     fn io_intr_callback(
         &mut self,
         _record: &mut dyn Record,
         _common: &mut crate::server::record::CommonFields,
     ) -> IoIntrAction {
-        IoIntrAction::Process
+        IoIntrAction::Skip
     }
 
     /// C's dset `get_ioint_info(cmd, precord, &piosh)`. `scanAdd` asks it
@@ -1515,9 +1520,16 @@ fn begin_device_init(
         };
         return None;
     };
+    hand_device_its_record(instance, &mut *dev);
+    Some((dev, saved))
+}
+
+/// What a dset object reads through `prec` in C before its `init_record`, or
+/// a device-link put's `add_record` (`dbAccess.c:1192-1196`): its database
+/// and the PRIO band.
+pub(crate) fn hand_device_its_record(instance: &RecordInstance, dev: &mut dyn DeviceSupport) {
     dev.bind_database(instance.device_done.database());
     dev.set_callback_priority(instance.common.callback_priority());
-    Some((dev, saved))
 }
 
 /// [`init_device_support`] after the dset call.

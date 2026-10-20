@@ -2,7 +2,6 @@
 # as written in `path`, whose text is not C's, and the C reason it may stay.
 [raw_float_format]
 allow = [
-    { path = "crates/asyn-rs/src/param.rs", arg = "v", reason = "ParamValue's Debug, a Rust value dump; paramVal::report's %g (paramVal.cpp:322) is ParamList::report" },
     { path = "crates/epics-base-rs/src/server/database/filters/parser.rs", arg = "val", reason = "C's arm is %.*g at the option's size - 7 (chfPlugin.c:211-218), but no shipped String option converts (sync.c:60-66 pass Conv 0), so no filter reaches it" },
     { path = "tools/dbd-codegen/src/breaktable.rs", arg = "raw", reason = "emits Rust source: {:?} is the f64 literal that round-trips, which a C breakpoint table never prints" },
     { path = "tools/dbd-codegen/src/breaktable.rs", arg = "eng", reason = "emits Rust source: {:?} is the f64 literal that round-trips, which a C breakpoint table never prints" },

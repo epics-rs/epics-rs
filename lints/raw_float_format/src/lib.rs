@@ -4,35 +4,49 @@
 //! `NaN` with its sign dropped, shortest round-trip digits, `1e5` — where C
 //! `printf` prints `nan` / `-nan`, `%g` digits and `1e+05`. A call is flagged
 //! when its callee's bounds, instantiated with the call's arguments, ask
-//! `Display`, `Debug`, `LowerExp`, `UpperExp` or `ToString` of a float (through
-//! references and std's delegating wrappers such as `Box`). That one rule sees
+//! `Display`, `Debug`, `LowerExp`, `UpperExp` or `ToString` of a float, or of
+//! a std type whose impl of that trait asks it of a float: `Vec<T>: Debug`
+//! needs `T: Debug`, `Box<T>: Display` needs `T: Display`. That one rule sees
 //! `format_args!`'s argument constructors, `x.to_string()`, a `fmt` delegated
-//! to a float and a generic `T: Display` instantiated with one. A site that is
-//! not C text names its argument in `dylint.toml` with a reason; an entry that
-//! matches nothing in a checked file fails too.
+//! to a float, a generic `T: Display` instantiated with one and `{:?}` of a
+//! `Vec<f64>`, an `Option<f32>` or a `(u8, f64)`; such a value coerced to a
+//! `dyn` formatting trait is flagged too. A type's own `Debug`, derived or
+//! written, is developer output and is not looked into.
+//!
+//! C-comparable text goes through the C formatter, never `{:?}`.
+//!
+//! A site that is not C text names its argument in `dylint.toml` with a
+//! reason; an entry that matches nothing in a checked file fails too.
 
 #![feature(rustc_private)]
 
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_infer;
 extern crate rustc_middle;
 extern crate rustc_span;
+extern crate rustc_trait_selection;
 
 use std::path::Path;
 
 use rustc_errors::DiagDecorator;
-use rustc_hir::def::DefKind;
-use rustc_hir::{Expr, ExprKind, Node};
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::{Expr, ExprKind, LetStmt, Node, QPath};
+use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::ty;
+use rustc_middle::traits::ObligationCause;
+use rustc_middle::ty::adjustment::{Adjust, PointerCoercion};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use rustc_span::{FileName, Span, SyntaxContext};
+use rustc_trait_selection::traits::{ImplSource, Obligation, SelectionContext};
 use serde::Deserialize;
 
 dylint_linting::impl_late_lint! {
     /// ### What it does
     /// Flags a call that needs `Display`, `Debug`, `LowerExp`, `UpperExp` or
-    /// `ToString` of an `f32` / `f64` (or a reference or `Box` of one).
+    /// `ToString` of an `f32` / `f64`, or of a type that formats one (a
+    /// reference, `Box`, `Vec`, `Option`, tuple or derived struct of one).
     ///
     /// ### Why is this bad?
     /// The text differs from the C IOC's `printf` for NaN, infinities,
@@ -90,37 +104,34 @@ impl RawFloatFormat {
 /// The traits whose `fmt` / `to_string` spell a float Rust's way.
 const FORMAT_TRAITS: &[&str] = &["Display", "Debug", "LowerExp", "UpperExp", "ToString"];
 
-/// std types whose formatting impls hand the value straight to the inner
-/// type's, so `Box<f64>` spells its float as `f64` does.
-const DELEGATING: &[&str] = &[
-    "Box",
-    "Rc",
-    "Arc",
-    "Cow",
-    "Ref",
-    "RefMut",
-    "MutexGuard",
-    "RwLockReadGuard",
-    "RwLockWriteGuard",
-    "Wrapping",
-    "Saturating",
-    "Pin",
-];
-
 impl<'tcx> LateLintPass<'tcx> for RawFloatFormat {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        let Some(formatted) = float_bound(cx, expr) else {
+        if in_debug_impl(cx, expr) {
+            return;
+        }
+        let (formatted, (mut span, text)) = if let Some(formatted) = float_bound(cx, expr) {
+            (formatted, named(cx, expr, formatted))
+        } else if let Some(formatted) = float_coercion(cx, expr) {
+            (formatted, (expr.span, None))
+        } else {
             return;
         };
-        let (span, text) = named(cx, expr);
+        let sm = cx.sess().source_map();
+        // An argument another crate's macro builds (`vec![x]`) spans that
+        // macro's source; report its call here.
+        let file = loop {
+            let file = sm.lookup_source_file(span.lo());
+            if file.cnum == LOCAL_CRATE {
+                break file;
+            }
+            if !span.from_expansion() {
+                return;
+            }
+            span = span.parent_callsite().unwrap_or(span);
+        };
         // `format_args!` lowers the argument at its source range but in the
         // macro's context, where rustc drops lints from an external macro.
         let span = span.with_ctxt(SyntaxContext::root());
-        let sm = cx.sess().source_map();
-        let file = sm.lookup_source_file(span.lo());
-        if file.cnum != LOCAL_CRATE {
-            return;
-        }
         let Some(path) = local_path(&file.name) else {
             return;
         };
@@ -183,12 +194,43 @@ impl<'tcx> LateLintPass<'tcx> for RawFloatFormat {
     }
 }
 
-/// The float a std formatting trait is required of by `expr`, a method call
-/// or a path to a function: the callee's own bounds, instantiated with the
-/// call's arguments. `format_args!`'s `Argument::new_display::<f64>`,
-/// `x.to_string()`, `Display::fmt(&x, f)` and `render::<f64>` for a
-/// `fn render<T: Display>` are all this one bound.
-fn float_bound<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<ty::Ty<'tcx>> {
+/// Whether `expr` is in the body of an `impl Debug`, derived or written.
+fn in_debug_impl(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    let tcx = cx.tcx;
+    let body = tcx.typeck_root_def_id(tcx.hir_enclosing_body_owner(expr.hir_id).to_def_id());
+    tcx.trait_impl_of_assoc(body)
+        .map(|imp| tcx.impl_trait_id(imp))
+        .is_some_and(|tr| is_std(tcx, tr) && tcx.item_name(tr).as_str() == "Debug")
+}
+
+/// The type `expr` holds when it is coerced to a `dyn` std formatting trait that
+/// spells a float in it: `&x as &dyn Display`, formatted where no bound sees it.
+fn float_coercion<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<Ty<'tcx>> {
+    let tcx = cx.tcx;
+    let results = cx.typeck_results();
+    let mut source = results.expr_ty(expr);
+    for adjustment in results.expr_adjustments(expr) {
+        if let Adjust::Pointer(PointerCoercion::Unsize) = adjustment.kind
+            && let Some(target) = adjustment.target.builtin_deref(true)
+            && let ty::Dynamic(predicates, ..) = target.kind()
+            && let Some(format) = predicates.principal_def_id()
+            && is_format_trait(tcx, format)
+            && let Some(held) = source.builtin_deref(true)
+            && spells_float(cx, ty::TraitRef::new(tcx, format, [held]))
+        {
+            return Some(held.peel_refs());
+        }
+        source = adjustment.target;
+    }
+    None
+}
+
+/// The type a std formatting trait is required of by `expr`, a method call or
+/// a path to a function, when that trait spells a float in it: the callee's
+/// own bounds, instantiated with the call's arguments. `format_args!`'s
+/// `Argument::new_display::<f64>`, `x.to_string()`, `Display::fmt(&x, f)` and
+/// `render::<f64>` for a `fn render<T: Display>` are all this one bound.
+fn float_bound<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<Ty<'tcx>> {
     let tcx = cx.tcx;
     let results = cx.typeck_results();
     let def = match expr.kind {
@@ -209,38 +251,63 @@ fn float_bound<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<ty::Ty
         .into_iter()
         .find_map(|clause| {
             let bound = clause.skip_normalization().as_trait_clause()?.skip_binder();
-            let format = bound.def_id();
-            if !is_std(tcx, format) || !FORMAT_TRAITS.contains(&tcx.item_name(format).as_str()) {
-                return None;
-            }
-            let formatted = delegated(tcx, bound.self_ty());
-            matches!(formatted.kind(), ty::Float(_)).then_some(formatted)
+            (is_format_trait(tcx, bound.def_id()) && spells_float(cx, bound.trait_ref))
+                .then(|| bound.self_ty().peel_refs())
         })
 }
 
-/// `ty` with the references and [`DELEGATING`] wrappers around it removed.
-fn delegated<'tcx>(tcx: ty::TyCtxt<'tcx>, mut ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
-    loop {
-        ty = ty.peel_refs();
-        match ty.kind() {
-            ty::Adt(adt, args)
-                if is_std(tcx, adt.did())
-                    && DELEGATING.contains(&tcx.item_name(adt.did()).as_str()) =>
-            {
-                match args.types().next() {
-                    Some(inner) => ty = inner,
-                    None => return ty,
-                }
-            }
-            _ => return ty,
-        }
+fn is_format_trait(tcx: ty::TyCtxt<'_>, def: DefId) -> bool {
+    is_std(tcx, def) && FORMAT_TRAITS.contains(&tcx.item_name(def).as_str())
+}
+
+/// Whether proving `bound` (`T: Debug`, ...) formats a float: `T` is one, or
+/// the std impl it selects asks a formatting trait of one through its own
+/// bounds (`Vec<T>: Debug` needs `T: Debug`). A `PhantomData<f64>` or
+/// `Weak<f64>` asks nothing of its `f64` and prints none. The walk is the
+/// proof of a bound that holds, so it ends.
+fn spells_float<'tcx>(cx: &LateContext<'tcx>, bound: ty::TraitRef<'tcx>) -> bool {
+    let tcx = cx.tcx;
+    let self_ty = bound.self_ty();
+    if matches!(self_ty.kind(), ty::Float(_)) {
+        return true;
     }
+    let infcx = tcx.infer_ctxt().build(cx.typing_mode());
+    let obligation = Obligation::new(tcx, ObligationCause::dummy(), cx.param_env, bound);
+    let Ok(Some(ImplSource::UserDefined(selected))) =
+        SelectionContext::new(&infcx).select(&obligation)
+    else {
+        return false;
+    };
+    if !is_std(tcx, selected.impl_def_id) {
+        return false;
+    }
+    let args =
+        tcx.erase_and_anonymize_regions(infcx.deeply_resolve_ignoring_regions(selected.args));
+    if args.has_non_region_infer() {
+        return false;
+    }
+    tcx.clauses_of(selected.impl_def_id)
+        .instantiate(tcx, args)
+        .clauses
+        .into_iter()
+        .filter_map(|clause| {
+            tcx.try_normalize_erasing_regions(cx.typing_env(), clause)
+                .ok()?
+                .as_trait_clause()
+        })
+        .map(|clause| clause.skip_binder().trait_ref)
+        .filter(|asked| is_format_trait(tcx, asked.def_id))
+        .any(|asked| spells_float(cx, asked))
 }
 
 /// Where to report `expr` and, unless it is the span's own text, what the
-/// allow-list names it by: a method call's receiver; a called path's first
-/// float argument (`format_args!`'s argument), else the path.
-fn named<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> (Span, Option<String>) {
+/// allow-list names it by: a method call's receiver; a called path's argument
+/// that is the `formatted` value (`format_args!`'s argument), else the path.
+fn named<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &Expr<'tcx>,
+    formatted: Ty<'tcx>,
+) -> (Span, Option<String>) {
     if let ExprKind::MethodCall(_, receiver, _, _) = expr.kind {
         return (expr.span, Some(snippet(cx, receiver.span)));
     }
@@ -251,13 +318,36 @@ fn named<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> (Span, Option<Strin
         let results = cx.typeck_results();
         return match args
             .iter()
-            .find(|arg| matches!(delegated(cx.tcx, results.expr_ty(arg)).kind(), ty::Float(_)))
+            .find(|arg| results.expr_ty(arg).peel_refs() == formatted)
         {
-            Some(arg) => (arg.span, None),
+            Some(arg) => (lowered_from(cx, arg).span, None),
             None => (parent.span, Some(snippet(cx, expr.span))),
         };
     }
     (expr.span, None)
+}
+
+/// The expression `format_args!` lowered its argument `arg` (`args.0`) from:
+/// that element of its `super let args = (&arg0, ..)`. Only that one keeps the
+/// context of a macro that built it, `vec![x]`.
+fn lowered_from<'tcx>(cx: &LateContext<'tcx>, arg: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
+    if let ExprKind::Field(base, index) = arg.kind
+        && let ExprKind::Path(QPath::Resolved(None, path)) = base.kind
+        && let Res::Local(local) = path.res
+        && let Node::LetStmt(LetStmt {
+            init: Some(init), ..
+        }) = cx.tcx.parent_hir_node(local)
+        && let ExprKind::Tup(elements) = init.kind
+        && let Ok(index) = index.as_str().parse::<usize>()
+        && let Some(&Expr {
+            kind: ExprKind::AddrOf(_, _, inner),
+            ..
+        }) = elements.get(index)
+    {
+        inner
+    } else {
+        arg
+    }
 }
 
 fn snippet(cx: &LateContext<'_>, span: Span) -> String {

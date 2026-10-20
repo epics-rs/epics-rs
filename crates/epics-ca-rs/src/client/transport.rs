@@ -2944,15 +2944,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
             match hdr.cmmd {
                 CA_PROTO_VERSION => {
-                    server_minor_version = hdr.count;
+                    // `versionRespNotify` keeps `m_count`, an annex's included.
+                    server_minor_version = crate::protocol::declared_minor(&hdr);
                     // Publish to the transport manager: request framing
                     // gates the extended header on the peer's version
                     // (C `insertRequestHeader`'s `v49Ok`).
-                    server_minor.store(hdr.count, std::sync::atomic::Ordering::Relaxed);
+                    server_minor.store(server_minor_version, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(TransportEvent::ServerVersion {
                         server_addr,
                         priority,
-                        minor_version: hdr.count,
+                        minor_version: server_minor_version,
                     });
                 }
                 CA_PROTO_ACCESS_RIGHTS => {
@@ -3723,6 +3724,33 @@ mod read_loop_tests {
             .expect("echo fires once the refreshed deadline expires");
         assert_eq!(frame.len(), CaHeader::SIZE);
 
+        task.abort();
+    }
+
+    /// libca `versionRespNotify` keeps `msg.m_count` (`tcpiiu.cpp:2196-2198`),
+    /// which an extended header carries in its annex.
+    #[tokio::test]
+    async fn an_extended_version_s_minor_is_its_annex_count() {
+        let (mut server_end, mut events, _writes, _beacon_tx, task) = spawn_read_loop();
+        for (annex, minor) in [(13, 13), (0x1_0003, u16::MAX)] {
+            let mut version = CaHeader::new(CA_PROTO_VERSION).to_bytes().to_vec();
+            version[2..4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+            version.extend_from_slice(&0u32.to_be_bytes());
+            version.extend_from_slice(&(annex as u32).to_be_bytes());
+            server_end
+                .write_all(&version)
+                .await
+                .expect("server end write");
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("ServerVersion within 1 s");
+            match event {
+                Some(TransportEvent::ServerVersion { minor_version, .. }) => {
+                    assert_eq!(minor_version, minor, "annex count {annex:#x}");
+                }
+                _ => panic!("expected ServerVersion"),
+            }
+        }
         task.abort();
     }
 }

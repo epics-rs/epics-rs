@@ -805,12 +805,12 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     // capture once they are equal, whatever the flush returns
                     // (NDPluginFile.cpp:756-768), so NumCapture 0 buffers
                     // nothing and ends on the first frame. `>=` rather than C's
-                    // `==`: NumCapture lowered below NumCaptured mid-capture
-                    // leaves C capturing nothing forever.
+                    // `==`: NumCapture lowered below NumCaptured mid-capture, or
+                    // negative, leaves C capturing nothing forever.
                     let target = c.file_base.num_capture_target();
                     // G12: validate frame dims/dtype in Capture mode too.
                     let latest = Arc::clone(&array);
-                    let valid = c.file_base.num_captured() < target
+                    let valid = (c.file_base.num_captured() as i64) < i64::from(target)
                         && c.file_base.frame_valid(&array).map_or_else(
                             |lines| {
                                 let lines = lines.into_iter().map(|l| (TraceMask::ERROR, l));
@@ -824,7 +824,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                         c.file_base.capture_array(array);
                         c.push_num_captured_update(&mut proc_result.param_updates);
                     }
-                    if c.file_base.num_captured() >= target {
+                    if c.file_base.num_captured() as i64 >= i64::from(target) {
                         let saved = if c.auto_save {
                             let array_counter = c.flush_array_counter(post);
                             let mut posted = c.flush_post(
@@ -889,7 +889,10 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                         c.push_num_captured_update(&mut proc_result.param_updates);
                     }
                     let target = c.file_base.num_capture_target();
-                    if r.is_ok() && target > 0 && c.file_base.num_captured() >= target {
+                    if r.is_ok()
+                        && target > 0
+                        && c.file_base.num_captured() as i64 >= i64::from(target)
+                    {
                         if let Err(e) = NDPluginFileBase::close_stream_io(&mut PortIo::new(self)) {
                             self.controller().fail_cycle(&mut proc_result, &e);
                             return proc_result;
@@ -1091,9 +1094,9 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             }
             self.controller().file_base.set_mode(new_mode);
         } else if Some(reason) == p.num_capture {
-            // C keeps 0: in Capture mode it ends the capture on the first
-            // frame, in Stream mode it never ends it (NDPluginFile.cpp:756-781).
-            c.file_base.set_num_capture(value.max(0) as usize);
+            // C keeps the int as written: 0 or less ends a Capture on the first
+            // frame here and never ends a Stream (NDPluginFile.cpp:756-781).
+            c.file_base.set_num_capture(value);
         } else if Some(reason) == p.create_dir {
             c.file_base.create_dir = value;
         } else if Some(reason) == p.lazy_open {
@@ -1336,6 +1339,8 @@ mod tests {
         abort_write: bool,
         /// How long each `write_file` takes.
         write_time: std::time::Duration,
+        /// The last `set_num_capture`.
+        num_capture: Option<i32>,
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
@@ -1351,6 +1356,7 @@ mod tests {
                 fail_open: false,
                 abort_write: false,
                 write_time: std::time::Duration::ZERO,
+                num_capture: None,
             }
         }
     }
@@ -1399,6 +1405,9 @@ mod tests {
         }
         fn supports_multiple_arrays(&self) -> bool {
             self.multi
+        }
+        fn set_num_capture(&mut self, n: i32) {
+            self.num_capture = Some(n);
         }
     }
 
@@ -1728,6 +1737,25 @@ mod tests {
             };
             assert_eq!(lines, want, "autosave {auto_save}");
         }
+    }
+
+    /// C hands the writer NumCapture as the int it is (NDPluginFile.cpp:228,
+    /// NDFileHDF5.cpp:187), and a Stream with a negative one never ends (:780).
+    #[test]
+    fn a_negative_num_capture_reaches_the_writer_signed() {
+        let mut c = write_port(0, NDFileMode::Stream as i32);
+        c.store_int32(
+            c.params.num_capture.unwrap(),
+            WriteVerdict::Accept(-1).into(),
+        );
+        c.latest_array = Some(Arc::new(array(1)));
+        capture_on(&mut c);
+        for id in 1..=3 {
+            c.process_array(&Arc::new(array(id)), &mut ());
+        }
+        assert_eq!(c.writer.lock().num_capture, Some(-1));
+        assert_eq!(c.file_base.num_captured(), 3);
+        assert!(c.capture_active);
     }
 
     /// The controller keeps the frame it was handed, as C's `pArray->reserve()`

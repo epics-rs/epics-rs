@@ -89,10 +89,10 @@ pub trait NDFileWriter: Send + Sync {
         true
     }
     /// Inform the writer of the configured capture count (`NDFileNumCapture`)
-    /// before the next `open_file`. A writer whose on-disk layout depends on
-    /// the capture target (e.g. HDF5 chunk sizing, C `calculateAttributeChunking`)
-    /// uses it; the default ignores it.
-    fn set_num_capture(&mut self, _n: usize) {}
+    /// before the next `open_file`, signed as C's `int`. A writer whose
+    /// on-disk layout depends on the capture target (e.g. HDF5 chunk sizing,
+    /// C `calculateAttributeChunking`) uses it; the default ignores it.
+    fn set_num_capture(&mut self, _n: i32) {}
     /// The plugin's own NDAttributesFile set as C `getAttributes` returns it
     /// to `openFile`/`writeFile`, evaluated by the processor ahead of the
     /// call because the evaluation cannot run under the writer lock. A
@@ -345,7 +345,7 @@ type FrameWritten<'a> = dyn FnMut(Duration, Option<&Arc<NDArray>>, Option<&ADErr
 /// calls; a frame whose write ran is the one C hands to endProcessCallbacks.
 fn write_one_file(
     writer: &mut dyn NDFileWriter,
-    num_capture: usize,
+    num_capture: i32,
     mode: NDFileOpenMode,
     path: &Path,
     final_path: Option<&Path>,
@@ -427,7 +427,7 @@ pub struct NDPluginFileBase {
     pub lazy_open: bool,
     pub delete_driver_file: bool,
     capture_buffer: Vec<Arc<NDArray>>,
-    num_capture: usize,
+    num_capture: i32,
     num_captured: usize,
     is_open: bool,
     mode: NDFileMode,
@@ -727,11 +727,11 @@ impl NDPluginFileBase {
                 // C buffers while NumCaptured < NumCapture and writes once they
                 // are equal (NDPluginFile.cpp:756-765), so NumCapture 0
                 // buffers nothing and finds the buffer empty.
-                if base.num_captured < base.num_capture {
+                if (base.num_captured as i64) < i64::from(base.num_capture) {
                     base.capture_buffer.push(Arc::clone(&array));
                     base.num_captured = base.capture_buffer.len();
                 }
-                if base.num_captured >= base.num_capture {
+                if base.num_captured as i64 >= i64::from(base.num_capture) {
                     Self::flush_capture_io(lock, &array, &mut |step| {
                         if let FlushStep::Frame {
                             handed_on: Some(frame),
@@ -1007,7 +1007,7 @@ impl NDPluginFileBase {
         self.mode = mode;
     }
 
-    pub fn set_num_capture(&mut self, n: usize) {
+    pub fn set_num_capture(&mut self, n: i32) {
         self.num_capture = n;
     }
 
@@ -1035,7 +1035,7 @@ impl NDPluginFileBase {
         self.mode
     }
 
-    pub fn num_capture_target(&self) -> usize {
+    pub fn num_capture_target(&self) -> i32 {
         self.num_capture
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
             .collect()
     }
 
-    fn capture_deleting(tag: &str, num_capture: usize) -> NDPluginFileBase {
+    fn capture_deleting(tag: &str, num_capture: i32) -> NDPluginFileBase {
         let mut fb = NDPluginFileBase::new();
         fb.file_path = format!("{}/", std::env::temp_dir().display());
         fb.file_name = format!("{tag}_");

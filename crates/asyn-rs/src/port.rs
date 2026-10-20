@@ -2521,7 +2521,8 @@ impl PortDriverBase {
         )
     }
 
-    /// The C `setXxxParam` / `setParam*Status` call one update stands for.
+    /// The C `setXxxParam` / `setParam*Status` / `doCallbacksXxxArray` /
+    /// `callParamCallbacks` call one update stands for.
     pub fn set_param(&mut self, update: &crate::request::ParamSetValue) -> AsynResult<()> {
         use crate::request::ParamSetValue as P;
         match *update {
@@ -2552,6 +2553,12 @@ impl PortDriverBase {
                 addr,
                 alarm_severity,
             } => self.set_param_alarm_severity(reason, addr, alarm_severity),
+            P::Array {
+                reason,
+                addr,
+                ref value,
+            } => self.do_callbacks_array(reason, addr, value.clone()),
+            P::Callbacks { addr } => self.call_param_callbacks(addr),
         }
     }
 
@@ -2601,22 +2608,12 @@ impl PortDriverBase {
         self.interpose_octet.install(addr, layer);
     }
 
-    /// Flush changed parameters as interrupt notifications.
-    /// Equivalent to C asyn's callParamCallbacks().
+    /// C `callParamCallbacks(addr)` (asynPortDriver.cpp:833-873): every
+    /// changed flag is walked and cleared at the end; only a bad index returns
+    /// early, with the flags kept. Only scalars post (see [`scalar_callback`]):
+    /// an array or generic pointer reaches a record only through its own
+    /// [`Self::do_callbacks_array`].
     pub fn call_param_callbacks(&mut self, addr: i32) -> AsynResult<()> {
-        self.flush_param_callbacks(addr, true)
-    }
-
-    /// The one-shot flush when interrupts open: C `callbackThread::run`
-    /// (asynPortDriver.cpp:923-937) is a bare `callParamCallbacks`, whose
-    /// switch has no array arm, and a `doCallbacks*Array` issued before
-    /// `iocInit` reached no record. An array changed before then is consumed
-    /// here without firing.
-    pub(crate) fn boot_param_callbacks(&mut self, addr: i32) -> AsynResult<()> {
-        self.flush_param_callbacks(addr, false)
-    }
-
-    fn flush_param_callbacks(&mut self, addr: i32, arrays: bool) -> AsynResult<()> {
         // C asynPortDriver.cpp:838 — `callCallbacks` returns before the loop
         // AND before `flags.clear()` (:871) while `interruptAccept` is false,
         // so every callback fired during IOC build is a no-op that PRESERVES
@@ -2634,55 +2631,13 @@ impl PortDriverBase {
         // A C driver calls back on the list `getAddress` resolved, never on
         // getAddr's -1, and its single-device clients filter on that list.
         let list = param_list(self.flags.multi_device, addr);
-        // C `callCallbacks` (asynPortDriver.cpp:833-873): every changed flag
-        // is walked and cleared at the end; only a bad index returns early,
-        // with the flags kept.
         self.params.flush_changed(addr, |params, reason| {
-            let value = params.get_value(reason, addr)?;
-            if value.is_array() && !arrays {
-                return Ok(false);
+            let post = scalar_callback(params, reason, addr, list, ts)?;
+            let fired = post.is_some();
+            if let Some(iv) = post {
+                interrupts.notify(iv);
             }
-            let value = value.clone();
-            // C asynPortDriver.cpp:845 — callCallbacks skips firing for an
-            // undefined param even though its changed flag is consumed
-            // (flags.clear() at :871). A status/alarm change or bare
-            // mark_changed on a never-set scalar must not emit an I/O Intr.
-            // Array/generic-pointer params have no callCallbacks analog
-            // (:846-865 switch is scalar-only) and Rust fires them as a
-            // read-trigger regardless, so gate scalars only.
-            if !value.is_array() && !params.is_param_defined(reason, addr).unwrap_or(false) {
-                return Ok(false);
-            }
-            // C parity: read the accumulated callback mask and reset it
-            // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
-            // uInt32CallbackMask = 0). The flush is the single owner of
-            // this consume, so accumulated bits never leak to the next.
-            let uint32_mask = params.take_uint32_interrupt_mask(reason, addr).unwrap_or(0);
-            // C parity: asynPortDriver.cpp:633-637 sets
-            // `pInterrupt->pasynUser->auxStatus/alarmStatus/alarmSeverity`
-            // from the param's stored status before invoking each
-            // subscriber callback. Pull those here so subscribers see
-            // the same triplet C consumers do.
-            let (aux_status, alarm_status, alarm_severity) = params
-                .get_param_status(reason, addr)
-                .unwrap_or((AsynStatus::Success, 0, 0));
-            interrupts.notify(InterruptValue {
-                reason,
-                addr: list,
-                value,
-                timestamp: ts,
-                uint32_changed_mask: uint32_mask,
-                aux_status,
-                alarm_status,
-                alarm_severity,
-                // Untyped: a single cached value per (reason,addr) reaches
-                // every subscribing interface (the pre-per-interface path).
-                iface: None,
-                // C `paramList::octetCallback` passes ASYN_EOM_END
-                // (asynPortDriver.cpp:816-818); no other interface reads it.
-                eom_reason: EomReason::END,
-            });
-            Ok(true)
+            Ok(fired)
         })
     }
 
@@ -2697,49 +2652,17 @@ impl PortDriverBase {
             return Ok(());
         }
         if self.params.take_changed_single(reason, addr)? {
-            let value = self.params.get_value(reason, addr)?.clone();
-            // C asynPortDriver.cpp:845 — see `call_param_callbacks`: an
-            // undefined scalar consumes its changed flag but fires no
-            // callback. Array/generic-pointer triggers fire regardless.
-            if !value.is_array() && !self.params.is_param_defined(reason, addr).unwrap_or(false) {
-                return Ok(());
-            }
+            let list = param_list(self.flags.multi_device, addr);
             let ts = self.time_stamp;
-            // C parity: read the accumulated callback mask and reset it
-            // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
-            // uInt32CallbackMask = 0). The flush is the single owner of
-            // this consume, so accumulated bits never leak to the next.
-            let uint32_mask = self
-                .params
-                .take_uint32_interrupt_mask(reason, addr)
-                .unwrap_or(0);
-            // C parity: see `call_param_callbacks` above.
-            let (aux_status, alarm_status, alarm_severity) = self
-                .params
-                .get_param_status(reason, addr)
-                .unwrap_or((AsynStatus::Success, 0, 0));
-            self.interrupts.notify(InterruptValue {
-                reason,
-                // The list, as `call_param_callbacks` fires.
-                addr: param_list(self.flags.multi_device, addr),
-                value,
-                timestamp: ts,
-                uint32_changed_mask: uint32_mask,
-                aux_status,
-                alarm_status,
-                alarm_severity,
-                // Untyped (see `call_param_callbacks`).
-                iface: None,
-                eom_reason: EomReason::END,
-            });
+            if let Some(iv) = scalar_callback(&mut self.params, reason, addr, list, ts)? {
+                self.interrupts.notify(iv);
+            }
         }
         Ok(())
     }
 
-    /// Mark a parameter as changed without modifying its value.
-    ///
-    /// Use this to trigger I/O Intr on params whose data is served via
-    /// `read_*_array()` overrides rather than the param cache (e.g. pixel data).
+    /// Mark a parameter as changed without modifying its value, so the next
+    /// [`Self::call_param_callbacks`] posts it — a scalar only.
     pub fn mark_param_changed(&mut self, index: usize, addr: i32) -> AsynResult<()> {
         self.params.mark_changed(index, addr)
     }
@@ -2821,6 +2744,54 @@ impl PortDriverBase {
             0,
             AsynStatus::Success,
         );
+        Ok(())
+    }
+
+    /// C `doCallbacksXxxArray` (asynPortDriver.cpp:1829-1866) and
+    /// `doCallbacksGenericPointer` (:3340-3375): post `value` to its
+    /// interface's subscribers at `reason`/`addr` with the port's timestamp
+    /// and the param's status and alarm. The value is not stored and no other
+    /// param is flushed, as [`Self::call_param_callbacks`] would; that flush
+    /// posts no such value, so this is its only route.
+    pub fn do_callbacks_array(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
+        let iface = match &value {
+            ParamValue::Int8Array(_) => InterfaceType::Int8Array,
+            ParamValue::Int16Array(_) => InterfaceType::Int16Array,
+            ParamValue::Int32Array(_) => InterfaceType::Int32Array,
+            ParamValue::Int64Array(_) => InterfaceType::Int64Array,
+            ParamValue::Float32Array(_) => InterfaceType::Float32Array,
+            ParamValue::Float64Array(_) => InterfaceType::Float64Array,
+            ParamValue::GenericPointer(_) => InterfaceType::GenericPointer,
+            other => {
+                return Err(AsynError::TypeMismatch {
+                    expected: "an array",
+                    actual: other.type_name(),
+                });
+            }
+        };
+        // C reads all three with its getters, reporting a bad param each time.
+        let status = self
+            .get_param_status(reason, addr)
+            .unwrap_or(AsynStatus::Success);
+        let alarm_status = self.get_param_alarm_status(reason, addr).unwrap_or(0);
+        let alarm_severity = self.get_param_alarm_severity(reason, addr).unwrap_or(0);
+        self.interrupts.notify(InterruptValue {
+            reason,
+            addr: param_list(self.flags.multi_device, addr),
+            value,
+            timestamp: self.time_stamp,
+            uint32_changed_mask: 0,
+            aux_status: status,
+            alarm_status,
+            alarm_severity,
+            iface: Some(iface),
+            eom_reason: EomReason::empty(),
+        });
         Ok(())
     }
 }
@@ -3063,6 +3034,46 @@ fn write_array_not_implemented() -> AsynError {
 }
 
 /// C's `readArray` template default (asynPortDriver.cpp:1812-1818).
+/// What C `paramList::callCallbacks` fires for one changed parameter
+/// (asynPortDriver.cpp:841-866): nothing for an undefined one (:845), and
+/// nothing for an array or generic pointer, which its switch has no arm for.
+fn scalar_callback(
+    params: &mut ParamList,
+    reason: usize,
+    addr: i32,
+    list: i32,
+    timestamp: SystemTime,
+) -> AsynResult<Option<InterruptValue>> {
+    let value = params.get_value(reason, addr)?;
+    if value.is_array() || !params.is_param_defined(reason, addr).unwrap_or(false) {
+        return Ok(None);
+    }
+    let value = value.clone();
+    // asynPortDriver.cpp:854-855 fires uint32Callback, then clears
+    // uInt32CallbackMask; the flush is the only consumer of the mask.
+    let uint32_changed_mask = params.take_uint32_interrupt_mask(reason, addr).unwrap_or(0);
+    // asynPortDriver.cpp:633-637: each subscriber sees the param's status
+    // and alarm in its pasynUser.
+    let (aux_status, alarm_status, alarm_severity) = params
+        .get_param_status(reason, addr)
+        .unwrap_or((AsynStatus::Success, 0, 0));
+    Ok(Some(InterruptValue {
+        reason,
+        addr: list,
+        value,
+        timestamp,
+        uint32_changed_mask,
+        aux_status,
+        alarm_status,
+        alarm_severity,
+        // Untyped: the one stored value reaches every subscribing interface.
+        iface: None,
+        // C `paramList::octetCallback` passes ASYN_EOM_END
+        // (asynPortDriver.cpp:816-818); no other interface reads it.
+        eom_reason: EomReason::END,
+    }))
+}
+
 fn read_array_not_implemented() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -3428,23 +3439,24 @@ pub trait PortDriver: Any + Send + Sync {
         self.base_mut().call_param_callbacks(user.addr)
     }
 
-    // --- GenericPointer I/O (cache-based defaults) ---
+    // --- GenericPointer I/O (default: not implemented, as in C) ---
 
-    fn read_generic_pointer(&mut self, user: &AsynUser) -> AsynResult<Arc<dyn Any + Send + Sync>> {
-        self.base()
-            .params
-            .get_generic_pointer(user.reason, user.addr)
+    fn read_generic_pointer(&mut self, _user: &AsynUser) -> AsynResult<Arc<dyn Any + Send + Sync>> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:readGenericPointer not implemented".into(),
+        })
     }
 
     fn write_generic_pointer(
         &mut self,
-        user: &mut AsynUser,
-        value: Arc<dyn Any + Send + Sync>,
+        _user: &mut AsynUser,
+        _value: Arc<dyn Any + Send + Sync>,
     ) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_generic_pointer(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeGenericPointer not implemented".into(),
+        })
     }
 
     // --- Array I/O (default: not implemented, as in C) ---
@@ -4387,12 +4399,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn flush_skips_undefined_scalar_but_keeps_array_trigger() {
+    fn flush_skips_an_undefined_scalar_and_an_array() {
         // C asynPortDriver.cpp:845 — a status/alarm change (or bare
         // mark_changed) on a never-set scalar consumes the changed flag
-        // but fires no callback. Array/generic-pointer triggers have no
-        // callCallbacks analog (:846-865 switch is scalar-only) and must
-        // still fire even while undefined.
+        // but fires no callback; an array has no arm in the :846-865 switch.
         let mut drv = TestDriver::new();
         let arr = drv
             .base_mut()
@@ -4406,21 +4416,10 @@ pub(crate) mod tests {
             .params
             .set_status(0, 0, AsynStatus::Error)
             .unwrap();
-        // Mark the never-set array param changed: an override-served trigger.
         drv.base_mut().mark_param_changed(arr, 0).unwrap();
 
         drv.base_mut().call_param_callbacks(0).unwrap();
-
-        // Only the array trigger is delivered; the undefined scalar is gated.
-        let iv = rx.try_recv().unwrap();
-        assert_eq!(
-            iv.reason, arr,
-            "array trigger must still fire while undefined"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "undefined scalar must not emit an I/O Intr"
-        );
+        assert!(rx.try_recv().is_err());
 
         // Once the scalar is defined, a subsequent change does fire.
         drv.base_mut().set_int32_param(0, 0, 7).unwrap();
@@ -4717,8 +4716,101 @@ pub(crate) mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// C callParamCallbacks posts scalars only: its switch has no array or
+    /// generic-pointer arm, and their changed flags are cleared with the rest
+    /// (asynPortDriver.cpp:841-871). The single-param flush is the same.
     #[test]
-    fn test_default_read_write_generic_pointer() {
+    fn a_flush_posts_no_array_or_generic_pointer() {
+        use crate::param::ParamValue;
+
+        let mut base = PortDriverBase::new(
+            "test_flush_scalars",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(InterruptGate::opened());
+        let count = base.create_param("COUNT", ParamType::Int32).unwrap();
+        let wave = base.create_param("WAVE", ParamType::Float64Array).unwrap();
+        let ptr = base.create_param("PTR", ParamType::GenericPointer).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        // A sync callback, as a generic pointer reaches no ring (:3340-3375).
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(crate::interrupt::InterruptFilter::default(), move |iv| {
+                log.lock().push(iv.reason)
+            })
+            .unwrap();
+        let posted = || std::mem::take(&mut *seen.lock());
+
+        base.params.set_float64_array(wave, 0, vec![1.0]).unwrap();
+        base.set_int32_param(count, 0, 1).unwrap();
+        base.set_generic_pointer_param(ptr, 0, Arc::new(1u8))
+            .unwrap();
+        base.call_param_callbacks(0).unwrap();
+        assert_eq!(posted(), [count]);
+
+        base.params.set_float64_array(wave, 0, vec![2.0]).unwrap();
+        base.call_param_callback(0, wave).unwrap();
+        base.mark_param_changed(wave, 0).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        assert_eq!(posted(), Vec::<usize>::new());
+        assert_eq!(base.params.get_float64_array(wave, 0).unwrap()[..], [2.0]);
+    }
+
+    /// `do_callbacks_array` posts on the array's interface with the param's
+    /// status and alarm, and neither stores the array nor flushes a param
+    /// set before it (asynPortDriver.cpp:1829-1866).
+    #[test]
+    fn do_callbacks_array_posts_only_the_array() {
+        use crate::param::ParamValue;
+
+        let mut base = PortDriverBase::new(
+            "test_cb_array",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(InterruptGate::opened());
+        let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
+        let count = base.create_param("COUNT", ParamType::Int32).unwrap();
+        base.set_param_status(wave, 0, AsynStatus::Timeout).unwrap();
+        base.set_param_alarm_status(wave, 0, 2).unwrap();
+        base.set_param_alarm_severity(wave, 0, 1).unwrap();
+        base.set_int32_param(count, 0, 1).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        base.set_int32_param(count, 0, 2).unwrap();
+        let mut rx = base.interrupts.subscribe_async(256, 4096);
+
+        base.do_callbacks_array(wave, 0, ParamValue::Int32Array(vec![4, 5].into()))
+            .unwrap();
+        let v = rx.try_recv().unwrap();
+        assert_eq!((v.reason, v.iface), (wave, Some(InterfaceType::Int32Array)));
+        assert!(matches!(&v.value, ParamValue::Int32Array(a) if a[..] == [4, 5]));
+        assert_eq!(
+            (v.aux_status, v.alarm_status, v.alarm_severity),
+            (AsynStatus::Timeout, 2, 1)
+        );
+        assert!(rx.try_recv().is_err(), "COUNT went out with the array");
+        assert!(
+            !matches!(base.params.get_int32_array(wave, 0), Ok(a) if a[..] == [4, 5]),
+            "the array was stored"
+        );
+        assert!(
+            base.do_callbacks_array(wave, 0, ParamValue::Int32(1))
+                .is_err(),
+            "a scalar has no array interface"
+        );
+    }
+
+    /// asynPortDriver's own readGenericPointer and writeGenericPointer
+    /// refuse (asynPortDriver.cpp:3301-3306, :3328-3333).
+    #[test]
+    fn the_default_generic_pointer_io_is_not_implemented() {
         let mut base = PortDriverBase::new(
             "test_gp",
             1,
@@ -4742,14 +4834,28 @@ pub(crate) mod tests {
 
         let mut drv = GpDriver { base };
         let data: Arc<dyn std::any::Any + Send + Sync> = Arc::new(99i32);
-        let mut user = AsynUser::new(0);
-        drv.write_generic_pointer(&mut user, data).unwrap();
-        let val = drv.read_generic_pointer(&AsynUser::new(0)).unwrap();
-        assert_eq!(*val.downcast_ref::<i32>().unwrap(), 99);
+        let e = drv
+            .write_generic_pointer(&mut AsynUser::new(0), data)
+            .unwrap_err();
+        assert_eq!(
+            (e.status(), e.message()),
+            (
+                AsynStatus::Error,
+                "asynPortDriver:writeGenericPointer not implemented".into()
+            )
+        );
+        let e = drv.read_generic_pointer(&AsynUser::new(0)).unwrap_err();
+        assert_eq!(
+            (e.status(), e.message()),
+            (
+                AsynStatus::Error,
+                "asynPortDriver:readGenericPointer not implemented".into()
+            )
+        );
     }
 
     #[test]
-    fn test_generic_pointer_callback() {
+    fn do_callbacks_array_posts_a_generic_pointer() {
         use crate::param::ParamValue;
 
         // Post-`iocInit` precondition — see `TestDriver::new`.
@@ -4768,35 +4874,23 @@ pub(crate) mod tests {
         let _sync = base
             .interrupts
             .register_sync_callback(crate::interrupt::InterruptFilter::default(), move |iv| {
-                log.lock().push((iv.reason, iv.value.clone()))
+                log.lock().push((iv.reason, iv.iface, iv.value.clone()))
             })
             .unwrap();
 
-        struct GpDriver {
-            base: PortDriverBase,
-        }
-        impl PortDriver for GpDriver {
-            fn base(&self) -> &PortDriverBase {
-                &self.base
-            }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.base
-            }
-        }
-
-        let mut drv = GpDriver { base };
         let data: Arc<dyn std::any::Any + Send + Sync> = Arc::new(vec![1, 2, 3]);
-        drv.base_mut()
-            .set_generic_pointer_param(0, 0, data)
+        base.do_callbacks_array(0, 0, ParamValue::GenericPointer(data))
             .unwrap();
-        drv.base_mut().call_param_callbacks(0).unwrap();
 
         // C: doCallbacksGenericPointer reaches the registered callbacks
         // inline and nothing queues it (asynPortDriver.cpp:3340-3375).
         let seen = seen.lock();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].0, 0);
-        assert!(matches!(seen[0].1, ParamValue::GenericPointer(_)));
+        assert_eq!(
+            (seen[0].0, seen[0].1),
+            (0, Some(InterfaceType::GenericPointer))
+        );
+        assert!(matches!(seen[0].2, ParamValue::GenericPointer(_)));
         assert!(rx.try_recv().is_err());
     }
 

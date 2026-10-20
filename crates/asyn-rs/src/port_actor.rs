@@ -3027,8 +3027,10 @@ impl PortActor {
                 // the order the batch first wrote it.
                 let mut lists = vec![*addr];
                 for u in updates {
-                    if !lists.contains(&u.addr()) {
-                        lists.push(u.addr());
+                    if let Some(list) = u.list()
+                        && !lists.contains(&list)
+                    {
+                        lists.push(list);
                     }
                 }
                 // One list that cannot be flushed must not strand the rest, for
@@ -5923,6 +5925,114 @@ mod tests {
         );
     }
 
+    /// A batch's array is C `doCallbacksXxxArray` where it stands
+    /// (asynPortDriver.cpp:1829-1866): posted ahead of the flush and typed,
+    /// and its address list is not flushed for it.
+    #[test]
+    fn a_batch_array_posts_where_it_stands_and_flushes_no_list() {
+        let mut base = PortDriverBase::new(
+            "array_pub",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let wave = base.create_param("WAVE", ParamType::Float64Array).unwrap();
+        base.set_int32_param(val, 1, 7).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                recorder.lock().push((iv.reason, iv.addr, iv.iface))
+            })
+            .unwrap();
+        let tx = spawn_actor(TestDriverBase(base));
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(
+            &tx,
+            RequestOp::CallParamCallbacks {
+                addr: 0,
+                time_stamp: None,
+                updates: vec![
+                    crate::request::ParamSetValue::new(val, 0, ParamValue::Int32(1)),
+                    crate::request::ParamSetValue::array(
+                        wave,
+                        1,
+                        ParamValue::Float64Array(vec![4.0, 5.0].into()),
+                    ),
+                ],
+            },
+            user,
+        )
+        .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (
+                    wave,
+                    1,
+                    Some(crate::interfaces::InterfaceType::Float64Array)
+                ),
+                (val, 0, None),
+            ]
+        );
+    }
+
+    /// A batch's `callParamCallbacks(addr)` flushes that list where it
+    /// stands, as NDPluginROIStat.cpp:311 flushes each ROI before its time
+    /// series posts (:319); the rest flush at the end.
+    #[test]
+    fn a_batch_callbacks_entry_flushes_its_list_where_it_stands() {
+        let mut base = PortDriverBase::new(
+            "callbacks_pub",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let wave = base.create_param("WAVE", ParamType::Float64Array).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                recorder.lock().push((iv.reason, iv.addr))
+            })
+            .unwrap();
+        let tx = spawn_actor(TestDriverBase(base));
+
+        use crate::request::ParamSetValue as P;
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(
+            &tx,
+            RequestOp::CallParamCallbacks {
+                addr: 0,
+                time_stamp: None,
+                updates: vec![
+                    P::new(val, 0, ParamValue::Int32(1)),
+                    P::new(val, 1, ParamValue::Int32(2)),
+                    P::callbacks(1),
+                    P::array(wave, 1, ParamValue::Float64Array(vec![3.0].into())),
+                ],
+            },
+            user,
+        )
+        .unwrap();
+        assert_eq!(*seen.lock(), vec![(val, 1), (wave, 1), (val, 0)]);
+    }
+
     /// NDPluginDriver.cpp:232 `setTimeStamp` before the cycle's sets: the
     /// batch's callbacks carry it, and so does a later unstamped flush.
     #[test]
@@ -6047,6 +6157,100 @@ mod tests {
             ],
             "a status transition fires with the prior value intact, and so \
              does the recovery back to Success"
+        );
+    }
+
+    /// A batch's doCallbacksXxxArray posts where the batch reaches it, typed,
+    /// before the flush that posts the batch's sets.
+    #[test]
+    fn a_batch_array_posts_in_place_ahead_of_the_flush() {
+        use crate::interfaces::InterfaceType;
+        use crate::param::ParamValue;
+        use crate::request::ParamSetValue;
+        let mut base = PortDriverBase::new(
+            "batch_array",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let wf = base.create_param("WF", ParamType::Float64Array).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                recorder.lock().push((iv.reason, iv.iface))
+            })
+            .unwrap();
+        let tx = spawn_actor(TestDriverBase(base));
+        let user = || AsynUser::new(wf).with_timeout(Duration::from_secs(1));
+        let batch = RequestOp::CallParamCallbacks {
+            addr: 0,
+            updates: vec![
+                ParamSetValue::new(val, 0, ParamValue::Int32(7)),
+                ParamSetValue::array(wf, 0, ParamValue::Float64Array(vec![1.5].into())),
+            ],
+            time_stamp: None,
+        };
+        send_and_wait(&tx, batch, user()).unwrap();
+        assert_eq!(
+            *seen.lock(),
+            vec![(wf, Some(InterfaceType::Float64Array)), (val, None)]
+        );
+    }
+
+    /// doCallbacksXxxArray flushes no list (asynPortDriver.cpp:1829-1866): a
+    /// batch's array at another address leaves that list's pending sets for
+    /// its own callParamCallbacks.
+    #[test]
+    fn a_batch_array_flushes_no_list_of_its_own() {
+        use crate::interfaces::InterfaceType;
+        use crate::param::ParamValue;
+        use crate::request::ParamSetValue;
+        let mut base = PortDriverBase::new(
+            "batch_array_list",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let wf = base.create_param("WF", ParamType::Float64Array).unwrap();
+        for addr in 0..2 {
+            base.call_param_callbacks(addr).unwrap();
+        }
+        base.set_int32_param(val, 1, 7).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                recorder.lock().push((iv.reason, iv.addr, iv.iface))
+            })
+            .unwrap();
+        let tx = spawn_actor(TestDriverBase(base));
+        let user = AsynUser::new(wf).with_timeout(Duration::from_secs(1));
+        let batch = RequestOp::CallParamCallbacks {
+            addr: 0,
+            updates: vec![ParamSetValue::array(
+                wf,
+                1,
+                ParamValue::Float64Array(vec![1.5].into()),
+            )],
+            time_stamp: None,
+        };
+        send_and_wait(&tx, batch, user).unwrap();
+        assert_eq!(
+            *seen.lock(),
+            vec![(wf, 1, Some(InterfaceType::Float64Array))]
         );
     }
 

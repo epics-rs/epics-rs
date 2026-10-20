@@ -315,7 +315,7 @@ fn format_int_spec(spec: &str, value: i32) -> String {
 /// `ADDriverBase::prepare_array`. It populates the array-info parameters that
 /// C++ drivers set for every frame:
 /// `ARRAY_SIZE_X/Y/Z`, `ARRAY_SIZE`, `UNIQUE_ID`, `ARRAY_NDIMENSIONS`,
-/// `ARRAY_DIMENSIONS`, `DATA_TYPE`, `COLOR_MODE`, `BAYER_PATTERN`,
+/// `DATA_TYPE`, `COLOR_MODE`, `BAYER_PATTERN`,
 /// `TIME_STAMP`, `EPICS_TS_SEC`, `EPICS_TS_NSEC`, `CODEC`, `COMPRESSED_SIZE`.
 pub(crate) fn write_array_params(
     port_base: &mut PortDriverBase,
@@ -329,20 +329,9 @@ pub(crate) fn write_array_params(
     port_base.set_int32_param(params.array_size, 0, info.total_bytes as i32)?;
     port_base.set_int32_param(params.unique_id, 0, array.unique_id)?;
 
-    // G7: dimensions. C++ posts the fixed-length `dimsPrev_[ND_ARRAY_MAX_DIMS]`
-    // (NDPluginDriver.cpp:220-231) — always 10 elements, zero-filled beyond the
-    // array's `ndims` — so `readInt32Array` returns NORD=10, not `ndims`.
+    // G7: dimension count. No C driver writes NDDimensions; only
+    // NDPluginDriver posts it (NDPluginDriver.cpp:246).
     port_base.set_int32_param(params.n_dimensions, 0, array.dims.len() as i32)?;
-    let mut dim_sizes = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
-    for (slot, d) in dim_sizes
-        .iter_mut()
-        .zip(array.dims.iter().take(crate::ndarray::ND_ARRAY_MAX_DIMS))
-    {
-        *slot = d.size as i32;
-    }
-    port_base
-        .params
-        .set_int32_array(params.array_dimensions, 0, dim_sizes)?;
 
     // G7: data type and color mode.
     port_base.set_int32_param(params.data_type, 0, array.data.data_type() as i32)?;
@@ -1529,10 +1518,12 @@ impl NDArrayDriverBase {
             != 0;
 
         let to_publish = if callbacks_enabled {
-            self.port_base.set_generic_pointer_param(
+            // C doCallbacksGenericPointer(pImage, NDArrayData, 0): posted
+            // here, ahead of the flush below, and stored nowhere.
+            self.port_base.do_callbacks_array(
                 self.params.ndarray_data,
                 0,
-                array.array().clone() as Arc<dyn std::any::Any + Send + Sync>,
+                ParamValue::GenericPointer(array.array().clone()),
             )?;
             Some(array)
         } else {
@@ -1804,6 +1795,91 @@ pub(crate) mod tests {
                 .expect("POOL_MAX_MEMORY unset after construction"),
             0.0
         );
+    }
+
+    pub(crate) type Posts = Arc<
+        parking_lot::Mutex<
+            Vec<(
+                usize,
+                Option<asyn_rs::interfaces::InterfaceType>,
+                ParamValue,
+            )>,
+        >,
+    >;
+
+    /// Every post `base` makes from here on: reason, interface, value.
+    pub(crate) fn record_posts(
+        base: &mut PortDriverBase,
+    ) -> (Posts, asyn_rs::interrupt::SyncCallbackSubscription) {
+        use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        base.own_interrupts(InterruptGate::opened());
+        let posts = Posts::default();
+        let recorder = posts.clone();
+        let sub = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
+                recorder
+                    .lock()
+                    .push((iv.reason, iv.iface, iv.value.clone()))
+            })
+            .unwrap();
+        (posts, sub)
+    }
+
+    /// A driver's `doCallbacksGenericPointer(pImage, NDArrayData, 0)`
+    /// (simDetector.cpp:834): the frame `id`, posted typed ahead of the
+    /// frame's callParamCallbacks.
+    pub(crate) fn assert_ndarray_data_ahead_of_params(
+        posts: &Posts,
+        params: &NDArrayDriverParams,
+        id: i32,
+    ) {
+        use asyn_rs::interfaces::InterfaceType;
+        let posts = posts.lock();
+        let at = |reason| posts.iter().position(|(r, ..)| *r == reason);
+        let data = at(params.ndarray_data).map(|i| match &posts[i] {
+            (_, iface, ParamValue::GenericPointer(p)) => {
+                (*iface, p.downcast_ref::<NDArray>().map(|a| a.unique_id))
+            }
+            (_, iface, _) => (*iface, None),
+        });
+        assert_eq!(
+            data,
+            Some((Some(InterfaceType::GenericPointer), Some(id))),
+            "{posts:?}"
+        );
+        assert!(
+            at(params.ndarray_data) < at(params.array_counter),
+            "{posts:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_posts_ndarray_data_ahead_of_its_params() {
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        )
+        .unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.array_callbacks, 0, 1)
+            .unwrap();
+        let (posts, _sub) = record_posts(&mut drv.port_base);
+        let arr = drv
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(8)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        let id = arr.unique_id;
+        drv.prepare_array(arr).unwrap();
+        assert_ndarray_data_ahead_of_params(&posts, &drv.params, id);
     }
 
     #[test]
@@ -2450,9 +2526,37 @@ pub(crate) mod tests {
         assert!(!drv.check_path().unwrap());
     }
 
+    /// No C driver writes NDDimensions; only NDPluginDriver (:246) and
+    /// NDDriverStdArrays (:266) post it.
+    #[test]
+    fn a_driver_frame_writes_no_array_dimensions() {
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        )
+        .unwrap();
+        let dims = drv.params.array_dimensions;
+        let before = drv.port_base.params.get_int32_array(dims, 0).ok();
+        let (posts, _sub) = record_posts(&mut drv.port_base);
+        let arr = drv
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(8)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        drv.prepare_array(arr).unwrap();
+        assert!(posts.lock().iter().all(|(r, ..)| *r != dims));
+        assert_eq!(drv.port_base.params.get_int32_array(dims, 0).ok(), before);
+    }
+
     #[test]
     fn test_prepare_array_publishes_dims_type_timestamps() {
-        // G7: prepare_array must publish N_DIMENSIONS, ARRAY_DIMENSIONS,
+        // G7: prepare_array must publish N_DIMENSIONS,
         // DATA_TYPE, COLOR_MODE, TIME_STAMP, EPICS_TS_SEC/NSEC.
         let mut drv = NDArrayDriverBase::new(
             "TEST",
@@ -2486,14 +2590,6 @@ pub(crate) mod tests {
                 .unwrap(),
             2
         );
-        let dims = drv
-            .port_base
-            .params
-            .get_int32_array(drv.params.array_dimensions, 0)
-            .unwrap();
-        // C++ posts the fixed ND_ARRAY_MAX_DIMS (10) array, zero-filled beyond
-        // the 2 real dims (NDPluginDriver.cpp:220-231).
-        assert_eq!(&dims[..], &[64, 48, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.data_type, 0)

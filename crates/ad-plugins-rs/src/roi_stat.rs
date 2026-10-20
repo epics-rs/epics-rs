@@ -595,6 +595,8 @@ impl NDPluginProcess for ROIStatProcessor {
                     updates.push(ParamUpdate::int32_addr(p.dim1_size, addr, size[1] as i32));
                 }
             }
+            // NDPluginROIStat.cpp:311, ahead of the series posts.
+            updates.push(ParamUpdate::callbacks(addr));
         }
         // NDPluginROIStat.cpp:290-321: each used ROI stores this frame's
         // point; a full series stops and posts.
@@ -1302,6 +1304,48 @@ mod tests {
         assert_eq!(ts.len(), 5);
         assert!((ts[0] - 1.0).abs() < 1e-10);
         assert!((ts[4] - 5.0).abs() < 1e-10);
+    }
+
+    /// C flushes each used ROI's list (NDPluginROIStat.cpp:311) before a
+    /// full series posts its arrays (:319).
+    #[test]
+    fn each_roi_flushes_before_the_time_series_posts() {
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [2, 2],
+            bgd_width: 0,
+        };
+        let proc = ROIStatProcessor::new(vec![roi.clone(), roi], 1);
+        proc.set_ts_mode(TSMode::Acquiring);
+        let r = proc.process_array(
+            &Arc::new(make_2d_array(2, 2, |_, _| 1.0)),
+            &NDArrayPool::new(1_000_000),
+        );
+        let mut seq: Vec<(&str, i32)> = r
+            .param_updates
+            .iter()
+            .map(|u| match u {
+                ParamUpdate::Int32 { addr, .. }
+                | ParamUpdate::Float64 { addr, .. }
+                | ParamUpdate::Octet { addr, .. } => ("set", *addr),
+                ParamUpdate::Float64Array { addr, .. } => ("array", *addr),
+                ParamUpdate::Callbacks { addr } => ("flush", *addr),
+            })
+            .collect();
+        seq.dedup();
+        assert_eq!(
+            seq,
+            [
+                ("set", 0),
+                ("flush", 0),
+                ("set", 1),
+                ("flush", 1),
+                ("set", 0),
+                ("array", 0),
+                ("array", 1),
+            ]
+        );
     }
 
     #[test]

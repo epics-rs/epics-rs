@@ -793,7 +793,7 @@ impl PortHandle {
     /// `op` run on this thread with the actor lent to it ([`Lend`]): the
     /// actor reaches it in its queue, parks, and the caller runs it, holding
     /// the port until the returned [`Holding`] drops. A thread that already
-    /// holds the port runs it in place and gets no `Holding`, as C's
+    /// holds the port runs it in place under one more count of it, as C's
     /// recursive `synchronousLock` and `queueLockPort` count do
     /// (asynManager.c:1579-1581, :1872-1876). The outer error is a request
     /// that never ran; the inner one is the request's own.
@@ -1302,11 +1302,11 @@ impl PortHandle {
         Ok(())
     }
 
-    /// The flush when interrupts open, on the actor; see
-    /// [`PortDriverBase::boot_param_callbacks`](crate::port::PortDriverBase::boot_param_callbacks).
+    /// The flush when interrupts open, on the actor: C `callbackThread::run`
+    /// (asynPortDriver.cpp:923-937) is a bare `callParamCallbacks`.
     pub(crate) fn boot_param_callbacks_blocking(&self, addr: i32) -> AsynResult<()> {
         let call = DriverCall::new(move |driver| {
-            let _ = driver.base_mut().boot_param_callbacks(addr);
+            let _ = driver.base_mut().call_param_callbacks(addr);
         });
         self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
         Ok(())
@@ -1518,6 +1518,43 @@ impl PortHandle {
         stamp.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("port {}: the timestamp update did not run", self.port_name),
+        })
+    }
+
+    /// C `doCallbacks*Array` from a driver's own task: post `value` on its
+    /// array interface, on the actor, storing nothing and flushing no other
+    /// param ([`crate::port::PortDriverBase::do_callbacks_array`]).
+    pub async fn do_callbacks_array(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
+        let (call, result) = array_call(reason, addr, value);
+        self.submit_async(RequestOp::WithDriver(call), AsynUser::default())
+            .await?;
+        self.array_result(result)
+    }
+
+    /// [`Self::do_callbacks_array`] for sync callers.
+    pub fn do_callbacks_array_blocking(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
+        let (call, result) = array_call(reason, addr, value);
+        self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
+        self.array_result(result)
+    }
+
+    fn array_result(&self, result: ArraySlot) -> AsynResult<()> {
+        let posted = result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        posted.unwrap_or_else(|| {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("port {}: the array callback did not run", self.port_name),
+            })
         })
     }
 
@@ -2098,6 +2135,18 @@ fn string_param_result(result: &StringParamSlot) -> AsynResult<Vec<u8>> {
                 message: "getStringParam did not run".into(),
             })
         })
+}
+
+type ArraySlot = Arc<Mutex<Option<AsynResult<()>>>>;
+
+fn array_call(reason: usize, addr: i32, value: ParamValue) -> (DriverCall, ArraySlot) {
+    let result = Arc::new(Mutex::new(None));
+    let slot = result.clone();
+    let call = DriverCall::new(move |driver| {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(driver.base().do_callbacks_array(reason, addr, value));
+    });
+    (call, result)
 }
 
 #[cfg(test)]
@@ -3410,6 +3459,44 @@ mod tests {
             .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
             .unwrap();
         assert_eq!(read.timestamp, Some(fixed));
+    }
+
+    /// A task's array post goes out typed, alone and unstored, as C
+    /// `doCallbacksArray` (asynPortDriver.cpp:1829-1866).
+    #[test]
+    fn do_callbacks_array_posts_the_array_alone() {
+        let mut drv = TestDriver::new();
+        let wave = drv
+            .base
+            .create_param("WAVE", ParamType::Float64Array)
+            .unwrap();
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        drv.base.set_int32_param(0, 0, 3).unwrap();
+        let mut rx = drv.base.interrupts.subscribe_async(16, 64);
+        let handle = make_handle(drv);
+
+        handle
+            .do_callbacks_array_blocking(wave, 0, ParamValue::Float64Array(vec![1.5].into()))
+            .unwrap();
+        let v = rx.try_recv().unwrap();
+        assert_eq!(
+            (v.reason, v.iface),
+            (wave, Some(InterfaceType::Float64Array))
+        );
+        assert!(rx.try_recv().is_err(), "VAL went out with the array");
+        let stored = handle
+            .with_driver_blocking(move |d: &mut TestDriver| {
+                d.base.params.get_float64_array(wave, 0)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(stored.is_empty(), "the array was stored");
+        assert!(
+            handle
+                .do_callbacks_array_blocking(0, 0, ParamValue::Int32(1))
+                .is_err()
+        );
     }
 
     /// `with_driver` hands the closure the driver's concrete type, runs it on

@@ -85,7 +85,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// Record `sets`, made but not posted yet, into the view.
     fn record(&self, sets: &[ParamUpdate]) {
         if let Some(view) = &self.view {
-            view.record(sets.iter().map(ParamUpdate::stored));
+            view.record(sets.iter().filter_map(ParamUpdate::stored));
         }
     }
 
@@ -473,7 +473,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             } => {
                 if let Some(frame) = frame {
                     if let Some(view) = &view {
-                        view.record(write_ok.iter().map(ParamUpdate::stored));
+                        view.record(write_ok.iter().filter_map(ParamUpdate::stored));
                     }
                     post.hand_on(frame);
                 }

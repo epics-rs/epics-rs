@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::param::ParamValue;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
@@ -180,10 +181,12 @@ impl ADDriverBase {
             != 0;
 
         let to_publish = if callbacks_enabled {
-            self.port_base.set_generic_pointer_param(
+            // C doCallbacksGenericPointer(pImage, NDArrayData, 0): posted
+            // here, ahead of the flush below, and stored nowhere.
+            self.port_base.do_callbacks_array(
                 self.params.base.ndarray_data,
                 0,
-                array.array().clone() as Arc<dyn std::any::Any + Send + Sync>,
+                ParamValue::GenericPointer(array.array().clone()),
             )?;
             Some(array)
         } else {
@@ -349,7 +352,10 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::ndarray_driver::tests::{assert_c_read_only_block, assert_fresh_pool_stats};
+    use crate::driver::ndarray_driver::tests::{
+        assert_c_read_only_block, assert_fresh_pool_stats, assert_ndarray_data_ahead_of_params,
+        record_posts,
+    };
     use crate::plugin::runtime::ASYN_CANBLOCK;
     use asyn_rs::param::ParamType;
     use asyn_rs::param::ParamValue;
@@ -936,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_sets_generic_pointer() {
+    fn a_frame_posts_ndarray_data_ahead_of_its_params() {
         let mut ad = ADDriverBase::new(
             "TEST",
             1,
@@ -950,6 +956,7 @@ mod tests {
         ad.port_base
             .set_int32_param(ad.params.base.array_callbacks, 0, 1)
             .unwrap();
+        let (posts, _sub) = record_posts(&mut ad.port_base);
         let arr = ad
             .pool
             .alloc(
@@ -962,13 +969,7 @@ mod tests {
             .unwrap();
         let id = arr.unique_id;
         ad.prepare_array(arr).unwrap();
-
-        let gp = ad
-            .port_base
-            .get_generic_pointer_param(ad.params.base.ndarray_data, 0)
-            .unwrap();
-        let recovered = gp.downcast_ref::<NDArray>().unwrap();
-        assert_eq!(recovered.unique_id, id);
+        assert_ndarray_data_ahead_of_params(&posts, &ad.params.base, id);
     }
 
     #[test]

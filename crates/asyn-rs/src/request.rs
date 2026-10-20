@@ -775,7 +775,7 @@ impl QueueTimer {
 #[derive(Debug, Clone)]
 pub enum ParamSetValue {
     /// Set a parameter of any type (C `setIntegerParam` / `setDoubleParam` /
-    /// `setStringParam` / `doCallbacksXxxArray` …).
+    /// `setStringParam` …).
     Value {
         reason: usize,
         addr: i32,
@@ -818,6 +818,17 @@ pub enum ParamSetValue {
         addr: i32,
         alarm_severity: u16,
     },
+    /// C `doCallbacksXxxArray` ([`PortDriverBase::do_callbacks_array`]),
+    /// posted where it stands in the batch and stored in no list.
+    ///
+    /// [`PortDriverBase::do_callbacks_array`]: crate::port::PortDriverBase::do_callbacks_array
+    Array {
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    },
+    /// C `callParamCallbacks(addr)` where it stands in the batch.
+    Callbacks { addr: i32 },
 }
 
 impl ParamSetValue {
@@ -876,15 +887,45 @@ impl ParamSetValue {
         }
     }
 
-    /// The address list this update lands in — the list whose changed flags a
-    /// later `callParamCallbacks` has to consume for it to reach a record.
+    /// C `doCallbacksXxxArray(value, reason, addr)`.
+    pub fn array(reason: usize, addr: i32, value: ParamValue) -> Self {
+        Self::Array {
+            reason,
+            addr,
+            value,
+        }
+    }
+
+    /// C `callParamCallbacks(addr)`.
+    pub fn callbacks(addr: i32) -> Self {
+        Self::Callbacks { addr }
+    }
+
+    /// The address this entry names.
     pub fn addr(&self) -> i32 {
         match self {
             Self::Value { addr, .. }
             | Self::UInt32Digital { addr, .. }
             | Self::Status { addr, .. }
             | Self::AlarmStatus { addr, .. }
-            | Self::AlarmSeverity { addr, .. } => *addr,
+            | Self::AlarmSeverity { addr, .. }
+            | Self::Array { addr, .. }
+            | Self::Callbacks { addr } => *addr,
+        }
+    }
+
+    /// The address list this entry marks changed — the list a later
+    /// `callParamCallbacks` has to consume for it to reach a record. An
+    /// [`Self::Array`] or [`Self::Callbacks`] posts where it stands and marks
+    /// none.
+    pub fn list(&self) -> Option<i32> {
+        match self {
+            Self::Value { addr, .. }
+            | Self::UInt32Digital { addr, .. }
+            | Self::Status { addr, .. }
+            | Self::AlarmStatus { addr, .. }
+            | Self::AlarmSeverity { addr, .. } => Some(*addr),
+            Self::Array { .. } | Self::Callbacks { .. } => None,
         }
     }
 }

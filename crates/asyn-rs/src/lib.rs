@@ -83,6 +83,9 @@
     clippy::single_match,
     clippy::unnecessary_map_or
 )]
+// A merge of two branches that each add the same variant leaves a doubled
+// match arm, which is otherwise only a warning.
+#![deny(unreachable_patterns)]
 
 pub mod drivers;
 pub mod error;

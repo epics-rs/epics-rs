@@ -386,6 +386,9 @@ struct FFTState {
     /// Seconds per input time point (C++ `timePerPoint_`); scales the time
     /// and frequency axis waveforms.
     time_per_point: f64,
+    /// C `nTimeXIn_`, `nTimeYIn_` and `timePerPoint_` as the axes were last
+    /// posted for.
+    axes_for: Option<(usize, usize, f64)>,
 }
 
 pub struct FFTProcessor {
@@ -416,6 +419,7 @@ impl FFTProcessor {
                 avg_count: 0,
                 cached_dims: Vec::new(),
                 time_per_point: 1.0,
+                axes_for: None,
             }),
             unique_id: AtomicI32::new(0),
             array_callbacks: ArrayCallbacks::new(true),
@@ -426,6 +430,22 @@ impl FFTProcessor {
 }
 
 impl FFTState {
+    /// Whether this frame posts the axes: C `createAxisArrays` runs when the
+    /// input size (NDPluginFFT.cpp:317-322, :118) or TimePerPoint (:328-331)
+    /// changed. A frame changing both posts twice in C, the first time with
+    /// the old timePerPoint_ (0 on the first frame, a NaN frequency axis);
+    /// rs posts once, with the current one.
+    fn axes_changed(&mut self, dims: &[NDDimension]) -> bool {
+        let key = (
+            dims[0].size,
+            dims.get(1).map_or(1, |d| d.size),
+            self.time_per_point,
+        );
+        let changed = self.axes_for != Some(key);
+        self.axes_for = Some(key);
+        changed
+    }
+
     /// Check if dimensions changed and reset averaging state if so.
     fn check_dims_changed(&mut self, dims: &[NDDimension]) {
         let current: Vec<usize> = dims.iter().map(|d| d.size).collect();
@@ -716,9 +736,10 @@ impl NDPluginProcess for FFTProcessor {
         // drop the state lock: everything from `compute_fft` to the axis
         // waveforms below reads only the snapshot, so a param write lands
         // while the transform runs instead of queueing behind it.
-        let (frame, avg_count) = {
+        let (frame, avg_count, post_axes) = {
             let mut state = self.state.lock();
             state.check_dims_changed(&array.dims);
+            let post_axes = state.axes_changed(&array.dims);
             (
                 FFTFrame {
                     config: state.config,
@@ -726,6 +747,7 @@ impl NDPluginProcess for FFTProcessor {
                     planner: &self.planner,
                 },
                 state.avg_count,
+                post_axes,
             )
         };
 
@@ -751,6 +773,14 @@ impl NDPluginProcess for FFTProcessor {
             {
                 let n_time = time_series.len();
                 let n_freq = real.len();
+                if post_axes {
+                    if let Some(idx) = self.params.time_axis {
+                        updates.push(ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
+                    }
+                    if let Some(idx) = self.params.freq_axis {
+                        updates.push(ParamUpdate::float64_array(idx, frame.freq_axis(n_freq)));
+                    }
+                }
                 if let Some(idx) = self.params.time_series {
                     updates.push(ParamUpdate::float64_array(idx, time_series));
                 }
@@ -759,12 +789,6 @@ impl NDPluginProcess for FFTProcessor {
                 }
                 if let Some(idx) = self.params.imaginary {
                     updates.push(ParamUpdate::float64_array(idx, imag));
-                }
-                if let Some(idx) = self.params.time_axis {
-                    updates.push(ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
-                }
-                if let Some(idx) = self.params.freq_axis {
-                    updates.push(ParamUpdate::float64_array(idx, frame.freq_axis(n_freq)));
                 }
             }
         }
@@ -1669,6 +1693,51 @@ mod tests {
         let step = 0.5 / 0.5 / 3.0;
         assert!((freq_axis[1] - step).abs() < 1e-12);
         assert!((freq_axis[3] - 3.0 * step).abs() < 1e-12);
+    }
+
+    /// C posts the axes from `createAxisArrays` ahead of the spectrum
+    /// (NDPluginFFT.cpp:324-331 before :224-227), and only on a frame whose
+    /// input size or TimePerPoint changed.
+    #[test]
+    fn the_axes_post_first_and_only_when_the_size_or_time_per_point_changes() {
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+        let proc = fft_proc_with_params(FFTConfig::default());
+        let p = &proc.params;
+        let (time_axis, freq_axis) = (p.time_axis.unwrap(), p.freq_axis.unwrap());
+        let spectrum = [
+            p.time_series.unwrap(),
+            p.real.unwrap(),
+            p.imaginary.unwrap(),
+            p.abs_value.unwrap(),
+        ];
+        let pool = NDArrayPool::new(0);
+        let posted = |n: usize| -> Vec<usize> {
+            let arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+            proc.process_array(&Arc::new(arr), &pool)
+                .param_updates
+                .iter()
+                .filter_map(|u| match u {
+                    ParamUpdate::Float64Array { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect()
+        };
+        let with_axes: Vec<usize> = [time_axis, freq_axis].into_iter().chain(spectrum).collect();
+        assert_eq!(posted(8), with_axes, "first frame");
+        assert_eq!(posted(8), spectrum, "nothing changed");
+        let tpp = p.time_per_point.unwrap();
+        proc.on_param_change(
+            tpp,
+            &PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: tpp,
+                addr: 0,
+                value: ParamChangeValue::Float64(0.5),
+            },
+        );
+        assert_eq!(posted(8), with_axes, "TimePerPoint changed");
+        assert_eq!(posted(16), with_axes, "size changed");
+        assert_eq!(posted(16), spectrum, "nothing changed again");
     }
 
     #[test]

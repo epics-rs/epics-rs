@@ -137,6 +137,8 @@ pub enum ParamUpdate {
         addr: i32,
         value: Vec<f64>,
     },
+    /// C `callParamCallbacks(addr)` where it stands.
+    Callbacks { addr: i32 },
 }
 
 impl ParamUpdate {
@@ -204,34 +206,54 @@ impl ParamUpdate {
             value,
         }
     }
+    /// C `callParamCallbacks(addr)`.
+    pub fn callbacks(addr: i32) -> Self {
+        Self::Callbacks { addr }
+    }
 
-    /// The `(reason, addr, value)` C's `set*Param` stores.
-    pub(crate) fn stored(&self) -> (usize, i32, ParamValue) {
+    /// The batch entry for this update: C's `set*Param`, or
+    /// `doCallbacksFloat64Array` / `callParamCallbacks`, which post where they
+    /// stand and store nothing (asynPortDriver.cpp:1829-1866).
+    fn param_set(&self) -> asyn_rs::request::ParamSetValue {
+        use asyn_rs::request::ParamSetValue;
         match self {
             Self::Int32 {
                 reason,
                 addr,
                 value,
-            } => (*reason, *addr, ParamValue::Int32(*value)),
+            } => ParamSetValue::new(*reason, *addr, ParamValue::Int32(*value)),
             Self::Float64 {
                 reason,
                 addr,
                 value,
-            } => (*reason, *addr, ParamValue::Float64(*value)),
+            } => ParamSetValue::new(*reason, *addr, ParamValue::Float64(*value)),
             Self::Octet {
                 reason,
                 addr,
                 value,
-            } => (*reason, *addr, ParamValue::Octet(value.as_bytes().into())),
+            } => ParamSetValue::new(*reason, *addr, ParamValue::Octet(value.as_bytes().into())),
             Self::Float64Array {
                 reason,
                 addr,
                 value,
-            } => (
+            } => ParamSetValue::array(
                 *reason,
                 *addr,
                 ParamValue::Float64Array(value.clone().into()),
             ),
+            Self::Callbacks { addr } => ParamSetValue::callbacks(*addr),
+        }
+    }
+
+    /// The `(reason, addr, value)` C stores; `None` for a post.
+    pub(crate) fn stored(&self) -> Option<PendingParam> {
+        match self.param_set() {
+            asyn_rs::request::ParamSetValue::Value {
+                reason,
+                addr,
+                value,
+            } => Some((reason, addr, value)),
+            _ => None,
         }
     }
 }
@@ -256,7 +278,7 @@ impl PluginAttributes {
     /// pending ahead of `pending`.
     pub fn evaluate(&self, pending: &[ParamUpdate]) -> Option<NDAttributeList> {
         let mut sets = BEGIN.with(|b| b.borrow().clone());
-        sets.extend(pending.iter().map(ParamUpdate::stored));
+        sets.extend(pending.iter().filter_map(ParamUpdate::stored));
         self.0.evaluate_attributes_blocking(sets)
     }
 
@@ -268,7 +290,7 @@ impl PluginAttributes {
         pending: &[ParamUpdate],
     ) -> Option<NDAttributeList> {
         let mut sets = begin.to_vec();
-        sets.extend(pending.iter().map(ParamUpdate::stored));
+        sets.extend(pending.iter().filter_map(ParamUpdate::stored));
         self.0.evaluate_attributes_blocking(sets)
     }
 
@@ -574,12 +596,14 @@ pub enum SideParam {
         addr: i32,
         value: String,
     },
-    /// C `doCallbacksFloat64Array`: posted at its address when stored.
+    /// C `doCallbacksFloat64Array`: posted at once, stored nowhere.
     Float64Array {
         reason: usize,
         addr: i32,
         value: Vec<f64>,
     },
+    /// C `callParamCallbacks(addr)`, at once.
+    Callbacks { addr: i32 },
 }
 
 impl From<ParamUpdate> for SideParam {
@@ -621,6 +645,7 @@ impl From<ParamUpdate> for SideParam {
                 addr,
                 value,
             },
+            ParamUpdate::Callbacks { addr } => Self::Callbacks { addr },
         }
     }
 }
@@ -793,8 +818,8 @@ impl WriteEpilogue {
     }
 }
 
-/// Store one param a write override set; an array posts at once, as
-/// `doCallbacksFloat64Array` does.
+/// Store one param a write override set; an array posts at once and is
+/// not stored, as `doCallbacksFloat64Array` does.
 fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
     match p {
         SideParam::Int32 {
@@ -816,10 +841,8 @@ fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
             reason,
             addr,
             value,
-        } => {
-            base.params.set_float64_array(reason, addr, value)?;
-            base.call_param_callbacks(addr)
-        }
+        } => base.do_callbacks_array(reason, addr, ParamValue::Float64Array(value.into())),
+        SideParam::Callbacks { addr } => base.call_param_callbacks(addr),
     }
 }
 
@@ -942,21 +965,23 @@ impl PortPost {
 impl ParamPost for PortPost {
     fn post(&mut self, updates: Vec<ParamUpdate>) {
         let Some(port) = &self.port else { return };
-        let stored: Vec<PendingParam> = std::mem::take(&mut self.begin)
+        let updates: Vec<ParamUpdate> = std::mem::take(&mut self.set)
             .into_iter()
-            .chain(
-                std::mem::take(&mut self.set)
-                    .iter()
-                    .map(ParamUpdate::stored),
-            )
-            .chain(updates.iter().map(ParamUpdate::stored))
+            .chain(updates)
             .collect();
+        let begin = std::mem::take(&mut self.begin);
         if let Some(view) = &self.view {
-            view.record(stored.iter().cloned());
+            view.record(
+                begin
+                    .iter()
+                    .cloned()
+                    .chain(updates.iter().filter_map(ParamUpdate::stored)),
+            );
         }
-        let sets = stored
+        let sets = begin
             .into_iter()
             .map(|(reason, addr, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
+            .chain(updates.iter().map(ParamUpdate::param_set))
             .collect();
         if let Err(e) = port.set_params_and_notify_blocking(0, sets) {
             epics_libcom_rs::stderr_println!("plugin param post error: {e}");
@@ -968,7 +993,7 @@ impl ParamPost for PortPost {
         let view = &self.view;
         let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
         if let Some(view) = view {
-            view.record(sets.iter().map(ParamUpdate::stored));
+            view.record(sets.iter().filter_map(ParamUpdate::stored));
         }
         self.set.extend(sets);
     }
@@ -1018,7 +1043,7 @@ impl std::ops::Deref for WritePort<'_> {
 impl ParamPost for WritePort<'_> {
     fn post(&mut self, updates: Vec<ParamUpdate>) {
         if let Some(view) = &self.view {
-            view.record(updates.iter().map(ParamUpdate::stored));
+            view.record(updates.iter().filter_map(ParamUpdate::stored));
         }
         for update in updates {
             let _ = set_side(self.base, update.into());
@@ -1033,7 +1058,7 @@ impl ParamPost for WritePort<'_> {
         let view = self.attribute_view();
         let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
         if let Some(view) = &view {
-            view.record(sets.iter().map(ParamUpdate::stored));
+            view.record(sets.iter().filter_map(ParamUpdate::stored));
         }
         for set in sets {
             let _ = set_side(self.base, set.into());
@@ -1607,9 +1632,10 @@ impl SharedProcessorInner {
         output
     }
 
-    /// The NDDimensions interrupt of `beginProcessCallbacks`, fired when
-    /// `array`'s dims differ from the previous input's.
-    fn post_dimensions(&mut self, array: &NDArray) {
+    /// The NDDimensions `doCallbacksInt32Array` of `beginProcessCallbacks`
+    /// (NDPluginDriver.cpp:246), when `array`'s dims differ from the
+    /// previous input's.
+    fn dimensions(&mut self, array: &NDArray) -> Option<asyn_rs::request::ParamSetValue> {
         // G8: fire an int32-array callback on NDDimensions when the array
         // dimensions change (C++ beginProcessCallbacks dimsPrev_). C++ keeps
         // a fixed `dimsPrev_[ND_ARRAY_MAX_DIMS]` zero-filled beyond `ndims`,
@@ -1623,21 +1649,14 @@ impl SharedProcessorInner {
         {
             *slot = d.size as i32;
         }
-        if cur_dims != self.dims_prev {
+        (cur_dims != self.dims_prev).then(|| {
             self.dims_prev = cur_dims.clone();
-            self.port_handle
-                .interrupts()
-                .notify(asyn_rs::interrupt::InterruptValue {
-                    reason: self.ndarray_params.array_dimensions,
-                    addr: 0,
-                    value: asyn_rs::param::ParamValue::Int32Array(std::sync::Arc::from(
-                        cur_dims.as_slice(),
-                    )),
-                    timestamp: array.timestamp.to_system_time(),
-                    uint32_changed_mask: 0,
-                    ..Default::default()
-                });
-        }
+            asyn_rs::request::ParamSetValue::array(
+                self.ndarray_params.array_dimensions,
+                0,
+                ParamValue::Int32Array(cur_dims.into()),
+            )
+        })
     }
 
     /// C `beginProcessCallbacks`' sets from `array` (NDPluginDriver.cpp:
@@ -1797,10 +1816,6 @@ impl SharedProcessorInner {
             self.array_callbacks.get(),
         );
         output.batch.merge(self.build_status_params_batch());
-        // C `beginProcessCallbacks` `setTimeStamp(&pArray->epicsTS)`
-        // (NDPluginDriver.cpp:232): the input's, for every callback until
-        // the next frame.
-        output.batch.time_stamp = Some(array.timestamp.to_system_time());
         output.addressed = self.delivery.publishable_addressed(result.addressed);
         output
     }
@@ -1855,7 +1870,7 @@ impl SharedProcessorInner {
         let counters = self.delivery.sort_counters();
         let mut batch = ParamBatch {
             time_stamp: None,
-            addr0: vec![
+            sets: vec![
                 ParamSetValue::new(
                     self.plugin_params.disordered_arrays,
                     0,
@@ -1867,10 +1882,9 @@ impl SharedProcessorInner {
                     ParamValue::Int32(counters.dropped_output_arrays),
                 ),
             ],
-            extra: std::collections::HashMap::new(),
         };
         if let Some(free) = counters.sort_free {
-            batch.addr0.push(ParamSetValue::new(
+            batch.sets.push(ParamSetValue::new(
                 self.plugin_params.sort_free,
                 0,
                 ParamValue::Int32(free),
@@ -1921,7 +1935,7 @@ impl SharedProcessorInner {
     fn build_status_params_batch(&self) -> ParamBatch {
         use asyn_rs::request::ParamSetValue;
         let mut batch = self.build_sort_params_batch();
-        batch.addr0.push(ParamSetValue::new(
+        batch.sets.push(ParamSetValue::new(
             self.plugin_params.dropped_arrays,
             0,
             ParamValue::Int32(
@@ -1960,23 +1974,26 @@ impl SharedProcessorInner {
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
-        let mut addr0: Vec<ParamSetValue> = Vec::new();
-        let mut extra: std::collections::HashMap<i32, Vec<ParamSetValue>> =
-            std::collections::HashMap::new();
+        let mut sets: Vec<ParamSetValue> = Vec::new();
+        let mut time_stamp = None;
 
-        if let Some((input, sets)) = begin {
-            self.post_dimensions(input);
+        if let Some((input, begin_sets)) = begin {
             let counter = self.ndarray_params.array_counter;
-            addr0.extend(
-                sets.iter()
+            sets.extend(
+                begin_sets
+                    .iter()
                     .filter(|(reason, ..)| *reason != counter)
                     .map(|(reason, addr, value)| ParamSetValue::new(*reason, *addr, value.clone())),
             );
-            addr0.push(ParamSetValue::new(
+            sets.push(ParamSetValue::new(
                 counter,
                 0,
                 ParamValue::Int32(self.array_counter),
             ));
+            // `setTimeStamp(&pArray->epicsTS)` (:232), which the dimensions
+            // post and every callback until the next frame carry.
+            time_stamp = Some(input.timestamp.to_system_time());
+            sets.extend(self.dimensions(input));
         }
 
         // Fire the StdArray waveform interrupt directly (C EPICS pattern).
@@ -2042,26 +2059,18 @@ impl SharedProcessorInner {
             }
         }
 
+        // ArrayRate_RBV is computed by a calc record in the DB template
+        // (SCAN "1 second", reading ArrayCounter_RBV delta), not in Rust.
+
+        sets.extend(param_updates.iter().map(ParamUpdate::param_set));
+
+        // Set once processCallbacks has returned (NDPluginDriver.cpp:537).
         if let Some(ms) = elapsed_ms {
-            addr0.push(ParamSetValue::new(
+            sets.push(ParamSetValue::new(
                 self.plugin_params.execution_time,
                 0,
                 ParamValue::Float64(ms),
             ));
-        }
-
-        // ArrayRate_RBV is computed by a calc record in the DB template
-        // (SCAN "1 second", reading ArrayCounter_RBV delta), not in Rust.
-
-        // Plugin-specific param updates.
-        for update in &param_updates {
-            let (reason, addr, value) = update.stored();
-            let pv = ParamSetValue::new(reason, addr, value);
-            if addr == 0 {
-                addr0.push(pv);
-            } else {
-                extra.entry(addr).or_default().push(pv);
-            }
         }
 
         ProcessOutput {
@@ -2070,11 +2079,7 @@ impl SharedProcessorInner {
             // still published.
             arrays: if deliver { output_arrays } else { Vec::new() },
             scatter,
-            batch: ParamBatch {
-                addr0,
-                extra,
-                time_stamp: None,
-            },
+            batch: ParamBatch { sets, time_stamp },
             addressed: vec![],
         }
     }
@@ -2181,8 +2186,9 @@ impl ProcessOutput {
 /// Collected param updates ready to be flushed to the actor.
 /// Produced by `build_publish_batch()`, consumed by async `flush()`.
 struct ParamBatch {
-    addr0: Vec<asyn_rs::request::ParamSetValue>,
-    extra: std::collections::HashMap<i32, Vec<asyn_rs::request::ParamSetValue>>,
+    /// In C call order, every address in one request: the actor flushes list
+    /// 0 and then each further list in the order the batch first set it.
+    sets: Vec<asyn_rs::request::ParamSetValue>,
     /// The port timestamp set ahead of the sets; `None` keeps it.
     time_stamp: Option<std::time::SystemTime>,
 }
@@ -2190,37 +2196,28 @@ struct ParamBatch {
 impl ParamBatch {
     fn empty() -> Self {
         Self {
-            addr0: Vec::new(),
-            extra: std::collections::HashMap::new(),
+            sets: Vec::new(),
             time_stamp: None,
         }
     }
 
     fn merge(&mut self, other: ParamBatch) {
         self.time_stamp = other.time_stamp.or(self.time_stamp);
-        self.addr0.extend(other.addr0);
-        for (addr, updates) in other.extra {
-            self.extra.entry(addr).or_default().extend(updates);
-        }
+        self.sets.extend(other.sets);
     }
 
     /// Flush via reliable async enqueue. Call from async context.
     async fn flush(self, port: &asyn_rs::port_handle::PortHandle) {
         let sent = match self.time_stamp {
             Some(ts) => {
-                port.set_time_stamp_params_and_notify(0, ts, self.addr0)
+                port.set_time_stamp_params_and_notify(0, ts, self.sets)
                     .await
             }
-            None if !self.addr0.is_empty() => port.set_params_and_notify(0, self.addr0).await,
+            None if !self.sets.is_empty() => port.set_params_and_notify(0, self.sets).await,
             None => Ok(()),
         };
         if let Err(e) = sent {
-            epics_libcom_rs::stderr_println!("plugin param flush error (addr 0): {e}");
-        }
-        for (addr, updates) in self.extra {
-            if let Err(e) = port.set_params_and_notify(addr, updates).await {
-                epics_libcom_rs::stderr_println!("plugin param flush error (addr {addr}): {e}");
-            }
+            epics_libcom_rs::stderr_println!("plugin param flush error: {e}");
         }
     }
 }
@@ -3540,7 +3537,7 @@ fn queue_status_batch(
     use asyn_rs::request::ParamSetValue;
     ParamBatch {
         time_stamp: None,
-        addr0: vec![
+        sets: vec![
             ParamSetValue::new(
                 plugin_params.queue_size,
                 0,
@@ -3548,7 +3545,6 @@ fn queue_status_batch(
             ),
             ParamSetValue::new(plugin_params.queue_use, 0, ParamValue::Int32(free)),
         ],
-        extra: std::collections::HashMap::new(),
     }
 }
 
@@ -6179,6 +6175,254 @@ mod tests {
             port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
                 .unwrap(),
             2
+        );
+    }
+
+    /// A processor's array update and a param it sets beside it; `flush`
+    /// calls `callParamCallbacks()` between the two.
+    #[derive(Default)]
+    struct ArrayFrame {
+        ids: Arc<parking_lot::Mutex<(usize, usize, usize)>>,
+        flush: bool,
+    }
+
+    impl ArrayFrame {
+        fn updates(&self, other: ParamUpdate, series: ParamUpdate) -> Vec<ParamUpdate> {
+            let flush = self.flush.then(|| ParamUpdate::callbacks(0));
+            [Some(other), flush, Some(series)]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
+    impl NDPluginProcess for ArrayFrame {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            let (_, other, series) = *self.ids.lock();
+            ProcessResult::forward(
+                array,
+                self.updates(
+                    ParamUpdate::int32(other, 5),
+                    ParamUpdate::float64_array(series, vec![1.0, 2.0]),
+                ),
+            )
+        }
+        fn plugin_type(&self) -> &str {
+            "ArrayFrame"
+        }
+        fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+            let go = base.create_param("GO", asyn_rs::param::ParamType::Int32)?;
+            let other = base.create_param("OTHER", asyn_rs::param::ParamType::Int32)?;
+            let series = base.create_param("SERIES", asyn_rs::param::ParamType::Float64Array)?;
+            *self.ids.lock() = (go, other, series);
+            Ok(())
+        }
+        fn validate_int32(
+            &self,
+            reason: usize,
+            _addr: i32,
+            _value: i32,
+            verdict: WriteVerdict<i32>,
+            _params: &mut WritePort<'_>,
+        ) -> WriteOutcome<i32> {
+            let (go, other, series) = *self.ids.lock();
+            if reason != go {
+                return verdict.into();
+            }
+            WriteOutcome::from(verdict).set_updates(self.updates(
+                ParamUpdate::int32(other, 6),
+                ParamUpdate::float64_array(series, vec![3.0]),
+            ))
+        }
+    }
+
+    type Posts = Vec<(usize, Option<asyn_rs::interfaces::InterfaceType>)>;
+
+    /// What a frame through an [`ArrayFrame`] posts of NDDimensions, its
+    /// series, ArrayCounter, its other param and ExecutionTime, in order.
+    fn array_frame_posts(port: &str, flush: bool) -> (Posts, [usize; 5]) {
+        let processor = ArrayFrame {
+            flush,
+            ..ArrayFrame::default()
+        };
+        let ids = processor.ids.clone();
+        let (down, mut down_rx) = ndarray_channel(&format!("{port}_DOWN"), 10);
+        let mut output = NDArrayOutput::new();
+        output.add(down);
+        let claim = asyn_rs::asyn_record::claim_port(port).unwrap();
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &claim,
+            processor,
+            1_000_000,
+            10,
+            0,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        // An IOC past iocInit: the frame's callParamCallbacks posts.
+        claim
+            .publish(
+                handle.port_runtime().port_handle().clone(),
+                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+            )
+            .unwrap();
+        enable_callbacks(&handle);
+        let (_, other, series) = *ids.lock();
+        let reasons = [
+            handle.ndarray_params.array_dimensions,
+            series,
+            handle.ndarray_params.array_counter,
+            other,
+            handle.plugin_params.execution_time,
+        ];
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sync = handle
+            .port_runtime()
+            .port_handle()
+            .interrupts()
+            .register_sync_callback(asyn_rs::interrupt::InterruptFilter::default(), move |iv| {
+                if reasons.contains(&iv.reason) {
+                    log.lock().push((iv.reason, iv.iface))
+                }
+            })
+            .unwrap();
+        send_array(handle.array_sender(), make_test_array(1));
+        down_rx.blocking_recv().unwrap();
+        params_applied(&handle);
+        // The flush is enqueued, not run: a round trip runs behind it.
+        handle
+            .port_runtime()
+            .port_handle()
+            .read_int32_blocking(reasons[2], 0)
+            .unwrap();
+        let posts = seen.lock().clone();
+        (posts, reasons)
+    }
+
+    /// C `beginProcessCallbacks`' `doCallbacksInt32Array(NDDimensions)`
+    /// (NDPluginDriver.cpp:246) and a processor's `doCallbacksFloat64Array`
+    /// post typed where C calls them, ahead of the frame's
+    /// `callParamCallbacks`, and store nothing (asynPortDriver.cpp:1829-1866).
+    /// ExecutionTime is set once processCallbacks has returned (:537), and a
+    /// list posts in the order its params were set (asynPortDriver.cpp:841).
+    #[test]
+    fn a_frame_posts_its_arrays_typed_ahead_of_its_params() {
+        use asyn_rs::interfaces::InterfaceType;
+        let (posts, [dims, series, counter, other, time]) = array_frame_posts("ARRFRAME", false);
+        assert_eq!(
+            posts,
+            [
+                (dims, Some(InterfaceType::Int32Array)),
+                (series, Some(InterfaceType::Float64Array)),
+                (counter, None),
+                (other, None),
+                (time, None),
+            ]
+        );
+    }
+
+    /// A processor's `callParamCallbacks()` posts where it stands, ahead of
+    /// the array it posts next, and ExecutionTime is set only once
+    /// processCallbacks has returned (NDPluginDriver.cpp:534-539).
+    #[test]
+    fn a_frame_flushes_where_its_processor_calls_callbacks() {
+        use asyn_rs::interfaces::InterfaceType;
+        let (posts, [dims, series, counter, other, time]) = array_frame_posts("ARRFLUSH", true);
+        assert_eq!(
+            posts,
+            [
+                (dims, Some(InterfaceType::Int32Array)),
+                (counter, None),
+                (other, None),
+                (series, Some(InterfaceType::Float64Array)),
+                (time, None),
+            ]
+        );
+    }
+
+    /// What a write of an [`ArrayFrame`]'s GO posts of GO, its other param
+    /// and its series, in order.
+    fn array_write_posts(flush: bool) -> (Posts, [usize; 3]) {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = ArrayFrame {
+            flush,
+            ..ArrayFrame::default()
+        };
+        let ids = processor.ids.clone();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            "ARRWRITE",
+            "ArrayFrame",
+            10,
+            0,
+            &"UP".into(),
+            1,
+            tx,
+            processor,
+            None,
+            1_000_000,
+            wiring,
+            PLUGIN_MAX_THREADS,
+        )
+        .unwrap();
+        drv.base
+            .own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let (go, other, series) = *ids.lock();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sync = drv
+            .base
+            .interrupts
+            .register_sync_callback(asyn_rs::interrupt::InterruptFilter::default(), move |iv| {
+                if [go, other, series].contains(&iv.reason) {
+                    log.lock().push((iv.reason, iv.iface))
+                }
+            })
+            .unwrap();
+        drv.io_write_int32(&mut AsynUser::new(go), 1).unwrap();
+        let posts = seen.lock().clone();
+        (posts, [go, other, series])
+    }
+
+    /// A write's `doCallbacksFloat64Array` posts typed where it stands, ahead
+    /// of the write's `callParamCallbacks`.
+    #[test]
+    fn a_write_posts_its_array_typed_ahead_of_its_params() {
+        use asyn_rs::interfaces::InterfaceType;
+        let (posts, [go, other, series]) = array_write_posts(false);
+        assert_eq!(
+            posts,
+            [
+                (series, Some(InterfaceType::Float64Array)),
+                (go, None),
+                (other, None),
+            ]
+        );
+    }
+
+    /// A write's `callParamCallbacks()` in the middle of its work posts where
+    /// it stands, as NDPluginTimeSeries' computeNumAverage does (:112).
+    #[test]
+    fn a_write_flushes_where_it_calls_callbacks() {
+        use asyn_rs::interfaces::InterfaceType;
+        let (posts, [go, other, series]) = array_write_posts(true);
+        assert_eq!(
+            posts,
+            [
+                (go, None),
+                (other, None),
+                (series, Some(InterfaceType::Float64Array)),
+            ]
         );
     }
 

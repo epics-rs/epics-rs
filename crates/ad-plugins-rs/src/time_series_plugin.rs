@@ -159,19 +159,20 @@ fn averaged_value(sum: f64, num_averaged: usize, dt: NDDataType) -> f64 {
 /// then advances it — so coalescing reproduces C's one-callback-per-param
 /// semantics instead of pushing the transient intermediate value.
 fn coalesce_updates(updates: Vec<ParamUpdate>) -> Vec<ParamUpdate> {
-    fn key(u: &ParamUpdate) -> (usize, i32) {
+    fn key(u: &ParamUpdate) -> Option<(usize, i32)> {
         match u {
             ParamUpdate::Int32 { reason, addr, .. }
             | ParamUpdate::Float64 { reason, addr, .. }
             | ParamUpdate::Octet { reason, addr, .. }
-            | ParamUpdate::Float64Array { reason, addr, .. } => (*reason, *addr),
+            | ParamUpdate::Float64Array { reason, addr, .. } => Some((*reason, *addr)),
+            ParamUpdate::Callbacks { .. } => None,
         }
     }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(updates.len());
     // Keep the last occurrence of each key while preserving relative order.
     for u in updates.into_iter().rev() {
-        if seen.insert(key(&u)) {
+        if key(&u).is_none_or(|k| seen.insert(k)) {
             out.push(u);
         }
     }

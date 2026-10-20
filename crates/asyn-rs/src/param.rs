@@ -213,10 +213,8 @@ impl ParamValue {
     /// Whether this is an array or generic-pointer value. C asynPortDriver
     /// fires interrupts for these through the per-type doCallbacks*Array /
     /// doCallbacksGenericPointer paths, NOT `paramList::callCallbacks`
-    /// (whose switch at asynPortDriver.cpp:846-865 handles only scalars).
-    /// The callCallbacks isDefined gate (:845) therefore does not govern
-    /// them, so the Rust flush must keep firing array triggers regardless
-    /// of the `defined` flag.
+    /// (whose switch at asynPortDriver.cpp:846-865 handles only scalars), so
+    /// a flush posts none of them.
     pub fn is_array(&self) -> bool {
         matches!(
             self,

@@ -2003,15 +2003,6 @@ impl NDPluginProcess for StatsProcessor {
             ]);
         }
 
-        // Histogram waveform: the counts (HIST_ARRAY). The bin X axis is
-        // posted by the HistSize/HistMin/HistMax write (`on_param_change`).
-        if cfg.do_compute_histogram {
-            updates.push(ParamUpdate::float64_array(
-                p.hist_array,
-                result.histogram.clone(),
-            ));
-        }
-
         // Profile waveforms: emit the computed X/Y projections to asyn
         // clients (C++ doCallbacksFloat64Array for each PROFILE_* waveform).
         if cfg.do_compute_profiles {
@@ -2046,6 +2037,16 @@ impl NDPluginProcess for StatsProcessor {
             updates.push(ParamUpdate::float64_array(
                 p.profile_cursor_y,
                 result.profile_cursor_y.clone(),
+            ));
+        }
+
+        // Histogram waveform: the counts (HIST_ARRAY), after the profiles
+        // as C posts it (NDPluginStats.cpp:637). The bin X axis is posted
+        // by the HistSize/HistMin/HistMax write (`on_param_change`).
+        if cfg.do_compute_histogram {
+            updates.push(ParamUpdate::float64_array(
+                p.hist_array,
+                result.histogram.clone(),
             ));
         }
 
@@ -3175,23 +3176,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!array_reasons.contains(&p.hist_x_array));
-        for reason in [
-            p.hist_array,
-            p.profile_average_x,
-            p.profile_average_y,
-            p.profile_threshold_x,
-            p.profile_threshold_y,
-            p.profile_centroid_x,
-            p.profile_centroid_y,
-            p.profile_cursor_x,
-            p.profile_cursor_y,
-        ] {
-            assert!(
-                array_reasons.contains(&reason),
-                "missing array update for reason {reason}"
-            );
-        }
+        // Each posts where it stands, in C's order: the profiles
+        // (NDPluginStats.cpp:622-629), then the histogram (:637).
+        assert_eq!(
+            array_reasons,
+            [
+                p.profile_average_x,
+                p.profile_average_y,
+                p.profile_threshold_x,
+                p.profile_threshold_y,
+                p.profile_centroid_x,
+                p.profile_centroid_y,
+                p.profile_cursor_x,
+                p.profile_cursor_y,
+                p.hist_array,
+            ]
+        );
     }
 
     #[test]
@@ -3381,11 +3381,12 @@ mod tests {
         let names: Vec<&str> = r
             .param_updates
             .iter()
-            .map(|u| match u {
+            .filter_map(|u| match u {
                 ParamUpdate::Int32 { reason, .. }
                 | ParamUpdate::Float64 { reason, .. }
                 | ParamUpdate::Octet { reason, .. }
-                | ParamUpdate::Float64Array { reason, .. } => *reason,
+                | ParamUpdate::Float64Array { reason, .. } => Some(*reason),
+                ParamUpdate::Callbacks { .. } => None,
             })
             .map(|reason| base.params.param_name(reason).unwrap())
             .collect();
@@ -3493,11 +3494,12 @@ mod tests {
             let mut got: Vec<usize> = r
                 .param_updates
                 .iter()
-                .map(|u| match u {
+                .filter_map(|u| match u {
                     ParamUpdate::Int32 { reason, .. }
                     | ParamUpdate::Float64 { reason, .. }
                     | ParamUpdate::Octet { reason, .. }
-                    | ParamUpdate::Float64Array { reason, .. } => *reason,
+                    | ParamUpdate::Float64Array { reason, .. } => Some(*reason),
+                    ParamUpdate::Callbacks { .. } => None,
                 })
                 .collect();
             got.sort_unstable();

@@ -119,10 +119,17 @@ async fn fire(runtime: &PortRuntimeHandle) {
     let updates = values
         .into_iter()
         .enumerate()
-        .map(|(reason, value)| ParamSetValue::Value {
-            reason,
-            addr: 0,
-            value,
+        .map(|(reason, value)| {
+            // An array posts through doCallbacks*Array, never a flush.
+            if value.is_array() {
+                ParamSetValue::array(reason, 0, value)
+            } else {
+                ParamSetValue::Value {
+                    reason,
+                    addr: 0,
+                    value,
+                }
+            }
         })
         .collect();
     handle.set_params_and_notify(0, updates).await.unwrap();

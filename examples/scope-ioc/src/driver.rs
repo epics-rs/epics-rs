@@ -440,10 +440,19 @@ fn post_cycle(base: &mut PortDriverBase, idx: &ParamIndices, result: SimResult) 
     let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
     let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
     let _ = base.call_param_callbacks(0);
-    let _ = base
-        .params
-        .set_float64_array(idx.p_waveform, 0, result.waveform);
-    let _ = base.call_param_callback(0, idx.p_waveform);
+    for update in waveform_updates(idx, result.waveform) {
+        let _ = base.set_param(&update);
+    }
+}
+
+/// The trace, stored as C's pData_ for readFloat64Array and posted with
+/// doCallbacksFloat64Array.
+fn waveform_updates(idx: &ParamIndices, waveform: Vec<f64>) -> [ParamSetValue; 2] {
+    let waveform = ParamValue::Float64Array(waveform.into());
+    [
+        ParamSetValue::new(idx.p_waveform, 0, waveform.clone()),
+        ParamSetValue::array(idx.p_waveform, 0, waveform),
+    ]
 }
 
 /// Background simulation task using the concrete ScopeSimulator type.
@@ -538,14 +547,11 @@ pub async fn sim_task_handle(
                     ParamSetValue::new(idx.p_min_value, 0, ParamValue::Float64(result.min_val)),
                     ParamSetValue::new(idx.p_max_value, 0, ParamValue::Float64(result.max_val)),
                     ParamSetValue::new(idx.p_mean_value, 0, ParamValue::Float64(result.mean_val)),
-                    ParamSetValue::new(
-                        idx.p_waveform,
-                        0,
-                        ParamValue::Float64Array(result.waveform.into()),
-                    ),
                 ],
             )
             .await;
+        let waveform = waveform_updates(&idx, result.waveform);
+        let _ = handle.set_params_and_notify(0, waveform.into()).await;
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
         asyn_rs::runtime::select! {
@@ -595,6 +601,115 @@ async fn read_config_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use asyn_rs::interfaces::InterfaceType;
+    use asyn_rs::interrupt::AsyncInterruptReceiver;
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+
+    /// A scope whose interrupts are open, its constructor posts made.
+    fn open_scope(name: &str) -> ScopeSimulator {
+        let mut driver = ScopeSimulator::new(name, Arc::new(Notify::new()));
+        driver.base.own_interrupts(InterruptGate::opened());
+        driver.base.call_param_callbacks(0).unwrap();
+        driver
+    }
+
+    /// The statistics and waveform posts that reached `rx`, with their
+    /// interface.
+    fn cycle_posts(
+        rx: &mut AsyncInterruptReceiver,
+        idx: &ParamIndices,
+    ) -> Vec<(usize, Option<InterfaceType>)> {
+        let watched = [
+            idx.p_min_value,
+            idx.p_max_value,
+            idx.p_mean_value,
+            idx.p_waveform,
+        ];
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| watched.contains(&v.reason))
+            .map(|v| (v.reason, v.iface))
+            .collect()
+    }
+
+    fn result() -> SimResult {
+        SimResult {
+            waveform: vec![1.0, 2.0],
+            min_val: 1.0,
+            max_val: 2.0,
+            mean_val: 1.5,
+        }
+    }
+
+    /// simTask posts the statistics with callParamCallbacks, then the trace
+    /// with doCallbacksFloat64Array (testAsynPortDriver.cpp:224-230), and
+    /// readFloat64Array still serves it (:338-357).
+    #[test]
+    fn a_cycle_posts_the_waveform_as_an_array_callback() {
+        let mut driver = open_scope("scopeCycle");
+        let idx = driver.param_indices();
+        let mut rx = driver.base.interrupts.subscribe_async(64, 1 << 16);
+        post_cycle(&mut driver.base, &idx, result());
+        assert_eq!(
+            cycle_posts(&mut rx, &idx),
+            [
+                (idx.p_min_value, None),
+                (idx.p_max_value, None),
+                (idx.p_mean_value, None),
+                (idx.p_waveform, Some(InterfaceType::Float64Array)),
+            ]
+        );
+        driver.base.set_connected(true);
+        let mut buf = [0.0; 2];
+        let n = driver
+            .read_float64_array(&AsynUser::new(idx.p_waveform), &mut buf)
+            .unwrap();
+        assert_eq!(buf[..n], [1.0, 2.0]);
+    }
+
+    /// The PortHandle task posts as simTask does.
+    #[epics_base_rs::epics_test]
+    async fn a_handle_cycle_posts_the_waveform_as_an_array_callback() {
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        let mut driver = open_scope("scopeHandleCycle");
+        let idx = driver.param_indices();
+        driver.base.set_int32_param(idx.p_run, 0, 1).unwrap();
+        driver
+            .base
+            .set_float64_param(idx.p_update_time, 0, 10.0)
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &asyn_rs::registry::claim_port("scopeHandleCycle").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 1 << 16);
+        let task = asyn_rs::runtime::task::spawn(sim_task_handle(
+            handle.clone(),
+            Arc::new(Notify::new()),
+            idx,
+        ));
+        let mut posts = Vec::new();
+        while !posts.iter().any(|(r, _)| *r == idx.p_waveform) {
+            asyn_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+            posts.extend(cycle_posts(&mut rx, &idx));
+        }
+        task.abort();
+        assert_eq!(
+            posts[..4],
+            [
+                (idx.p_min_value, None),
+                (idx.p_max_value, None),
+                (idx.p_mean_value, None),
+                (idx.p_waveform, Some(InterfaceType::Float64Array)),
+            ]
+        );
+        std::mem::forget(runtime);
+    }
 
     /// testAsynPortDriver.cpp:52-53; asynPortDriver adds Common itself.
     #[test]

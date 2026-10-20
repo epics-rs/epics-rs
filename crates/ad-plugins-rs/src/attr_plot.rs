@@ -413,15 +413,32 @@ impl AttrPlotState {
         updates
     }
 
-    /// Metadata plus an unconditional `AP_Data` post — the shape C++ produces
-    /// for a `DataSelect` write (`callback_selected` then `callback_data`,
-    /// `NDPluginAttrPlot.cpp:286-287`). Re-arms the exposure clock so the
-    /// forced post also counts as this period's exposure.
-    fn build_updates(&mut self) -> Vec<ParamUpdate> {
-        self.last_expose = Some(std::time::Instant::now());
-        let mut updates = self.data_updates();
-        updates.extend(self.meta_updates());
+    /// C `callback_selected` (`NDPluginAttrPlot.cpp:227-244`): each block's
+    /// label and selection, flushed per block.
+    fn selected_updates(&self) -> Vec<ParamUpdate> {
+        let mut updates = Vec::new();
+        for block in 0..self.n_data_blocks {
+            let addr = block as i32;
+            if let Some(label) = self.params.data_label {
+                updates.push(ParamUpdate::octet_addr(label, addr, self.data_label(block)));
+            }
+            if let Some(select) = self.params.data_select {
+                updates.push(ParamUpdate::int32_addr(
+                    select,
+                    addr,
+                    self.data_selections[block],
+                ));
+            }
+            updates.push(ParamUpdate::callbacks(addr));
+        }
         updates
+    }
+
+    /// An `AP_Data` post outside the exposure clock, which it re-arms so the
+    /// post also counts as this period's exposure.
+    fn expose_now(&mut self) -> Vec<ParamUpdate> {
+        self.last_expose = Some(std::time::Instant::now());
+        self.data_updates()
     }
 }
 
@@ -514,14 +531,18 @@ impl NDPluginProcess for AttrPlotProcessor {
             let block = params.addr as usize;
             let value = params.value.as_i32();
             if state.set_data_select(block, value).is_ok() {
-                // Re-emit label + waveform for the rebound block.
-                return ParamChangeResult::updates(state.build_updates());
+                // C `callback_selected` then `callback_data` (:286-287).
+                let mut updates = state.selected_updates();
+                updates.extend(state.expose_now());
+                return ParamChangeResult::updates(updates);
             }
         } else if Some(reason) == state.params.reset {
             // C calls reset_data() on ANY write to the reset param — there is no
             // value test (NDPluginAttrPlot.cpp:290-292).
             state.reset();
-            return ParamChangeResult::updates(state.build_updates());
+            let mut updates = state.expose_now();
+            updates.extend(state.meta_updates());
+            return ParamChangeResult::updates(updates);
         }
         ParamChangeResult::updates(vec![])
     }
@@ -635,6 +656,46 @@ mod tests {
                 matches!(u, ParamUpdate::Float64Array { reason: r, .. } if *r == data_reason)
             }),
             "a DataSelect write must post AP_Data even inside the period",
+        );
+    }
+
+    /// A `DataSelect` write flushes each block's label before `AP_Data`
+    /// posts (NDPluginAttrPlot.cpp:286-287).
+    #[test]
+    fn a_data_select_write_posts_the_labels_before_the_data() {
+        let proc = proc_with_params(8, 100, 2);
+        let select_reason = proc.state.lock().params.data_select.unwrap();
+        let arr = make_array_with_attrs(1, &[("Temp", 25.0)]);
+        proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: select_reason,
+            addr: 0,
+            value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(select_reason, &snapshot);
+        let mut seq: Vec<(&str, i32)> = result
+            .param_updates
+            .iter()
+            .map(|u| match u {
+                ParamUpdate::Int32 { addr, .. }
+                | ParamUpdate::Float64 { addr, .. }
+                | ParamUpdate::Octet { addr, .. } => ("set", *addr),
+                ParamUpdate::Float64Array { addr, .. } => ("array", *addr),
+                ParamUpdate::Callbacks { addr } => ("flush", *addr),
+            })
+            .collect();
+        seq.dedup();
+        assert_eq!(
+            seq,
+            [
+                ("set", 0),
+                ("flush", 0),
+                ("set", 1),
+                ("flush", 1),
+                ("array", 0),
+                ("array", 1),
+            ]
         );
     }
 

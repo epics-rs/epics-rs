@@ -963,6 +963,14 @@ fn subscriber_input<'a>(payload: &'a [u8], addr: &TopicAddress) -> Option<Subscr
     std::str::from_utf8(payload).ok().map(SubscriberInput::Text)
 }
 
+/// An array payload: C posts it with Autoparam doCallbacksArray where it is
+/// decoded (drvMqtt.cpp:301-322). It is stored as well, because the rs
+/// `read_*_array` serves the last payload where C has no read handler.
+fn push_array(batch: &mut Vec<ParamSetValue>, reason: usize, value: ParamValue) {
+    batch.push(ParamSetValue::new(reason, 0, value.clone()));
+    batch.push(ParamSetValue::array(reason, 0, value));
+}
+
 /// Decode one payload for every interrupt-bound subscriber on its topic.
 ///
 /// Split out of [`handle_incoming_message`] so the per-subscriber independence
@@ -1033,11 +1041,11 @@ fn decode_for_subscribers(
                         ));
                     }
                     DecodedValue::Float64Array(v) => {
-                        batch_updates.push(ParamSetValue::new(
+                        push_array(
+                            &mut batch_updates,
                             *reason,
-                            0,
                             ParamValue::Float64Array(v.into()),
-                        ));
+                        );
                     }
                     DecodedValue::UInt32(v) => {
                         // Inbound MQTT value: changed bits derive from the value
@@ -1051,11 +1059,11 @@ fn decode_for_subscribers(
                         ));
                     }
                     DecodedValue::Int32Array(v) => {
-                        batch_updates.push(ParamSetValue::new(
+                        push_array(
+                            &mut batch_updates,
                             *reason,
-                            0,
                             ParamValue::Int32Array(v.into()),
-                        ));
+                        );
                     }
                 }
             }
@@ -1322,6 +1330,73 @@ mod tests {
     /// separately: the message-level `from_utf8` denied the topic, the
     /// subscriber-level one denied the octet store, and `ParamValue::Octet`
     /// could not hold the bytes even once they arrived.
+    /// onMessageCb posts an array with Autoparam doCallbacksArray as it
+    /// decodes it, typed, and the scalars at its closing callParamCallbacks
+    /// (drvMqtt.cpp:301-333).
+    #[test]
+    fn an_array_payload_posts_typed_ahead_of_the_scalar_flush() {
+        use crate::driver::MqttDriver;
+        use asyn_rs::interfaces::InterfaceType;
+        use asyn_rs::port::{DrvUserRequest, PortDriver};
+        use std::sync::atomic::AtomicBool;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut driver = MqttDriver::new(
+            "MQARRAY",
+            &crate::config::MqttConfig::default(),
+            Vec::new(),
+            tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let specs = [
+            "FLAT:STRING sensor/v",
+            "FLAT:FLOATARRAY sensor/v",
+            "FLAT:INTARRAY sensor/v",
+        ];
+        let reasons: Vec<usize> = specs
+            .iter()
+            .map(|spec| {
+                driver
+                    .drv_user_create(&DrvUserRequest::new(*spec, 0))
+                    .unwrap()
+                    .reason
+            })
+            .collect();
+        let base = driver.base_mut();
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        base.call_param_callbacks(0).unwrap();
+        let mut rx = base.interrupts.subscribe_async(64, 4096);
+
+        let subscribers: Vec<_> = reasons
+            .iter()
+            .zip(specs)
+            .map(|(&r, spec)| (r, TopicAddress::parse(spec).unwrap()))
+            .collect();
+        let bound: HashSet<usize> = reasons.iter().copied().collect();
+        let batch = decode_for_subscribers(b"1,2", &subscribers, &bound, "sensor/v", &mut |_| {});
+        for update in &batch {
+            base.set_param(update).unwrap();
+        }
+        base.call_param_callbacks(0).unwrap();
+
+        let posted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|v| (v.reason, v.iface))
+            .collect();
+        assert_eq!(
+            posted[..3],
+            [
+                (reasons[1], Some(InterfaceType::Float64Array)),
+                (reasons[2], Some(InterfaceType::Int32Array)),
+                (reasons[0], None),
+            ]
+        );
+        // The rs read of an array record serves the last payload.
+        let mut buf = [0.0; 4];
+        let user = asyn_rs::user::AsynUser::new(reasons[1]);
+        assert_eq!(driver.read_float64_array(&user, &mut buf).unwrap(), 2);
+        assert_eq!(buf[..2], [1.0, 2.0]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_utf8_payload_reaches_the_octet_a_string_record_reads() {
         use crate::driver::MqttDriver;

@@ -676,6 +676,62 @@ fn readback_profile_converts_each_axis_to_user_units_and_posts_it() {
     assert_eq!(next(&mut ax1), MotorCommand::ProfileReadback);
 }
 
+/// asynMotorAxis.cpp:443-444 posts through doCallbacksFloat64Array, which
+/// carries the param's status and alarm (asynPortDriver.cpp:1829-1866).
+#[test]
+fn profile_readbacks_post_with_the_param_s_status_and_alarm() {
+    use asyn_rs::error::AsynStatus;
+    use asyn_rs::interrupt::InterruptFilter;
+    let port = register_controller_port(&open_owner(), "CPPRDST", 1, ()).unwrap();
+    let mut ax = axis("CPPRDST", 0);
+    port.with_driver_blocking::<ControllerPort<()>, _>(|d| {
+        d.initialize_profile(1).unwrap();
+        d.with_params(|_, ctx| {
+            let reason = index::PROFILE_READBACKS;
+            ctx.base
+                .set_param_status(reason, 0, AsynStatus::Timeout)
+                .unwrap();
+            ctx.base.set_param_alarm_status(reason, 0, 2).unwrap();
+            ctx.base.set_param_alarm_severity(reason, 0, 1).unwrap();
+        })
+    })
+    .unwrap();
+    next(&mut ax);
+    port.write_float64_blocking(index::REC_RESOLUTION, 0, 1.0)
+        .unwrap();
+    port.write_float64_blocking(index::REC_OFFSET, 0, 0.0)
+        .unwrap();
+    port.write_int32_blocking(index::REC_DIRECTION, 0, 0)
+        .unwrap();
+    port.write_int32_blocking(index::PROFILE_NUM_READBACKS, 0, 1)
+        .unwrap();
+    let (_r, mut readbacks) = port
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(index::PROFILE_READBACKS),
+                addr: Some(0),
+                ..Default::default()
+            },
+            1024,
+        )
+        .unwrap();
+    port.write_int32_blocking(index::PROFILE_READBACK, 0, 1)
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let iv = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(1), readbacks.recv()).await })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (iv.aux_status, iv.alarm_status, iv.alarm_severity),
+        (AsynStatus::Timeout, 2, 1)
+    );
+}
+
 fn write_array(
     port: &asyn_rs::port_handle::PortHandle,
     reason: usize,

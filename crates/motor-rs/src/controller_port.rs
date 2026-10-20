@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interfaces::motor::PortSet;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
@@ -800,18 +799,14 @@ impl ControllerCtx<'_> {
             *r = *r * resolution + offset;
             *f *= resolution;
         }
+        // C drops both statuses.
         for (reason, array) in [
             (index::PROFILE_READBACKS, &axis.readbacks[..n]),
             (index::PROFILE_FOLLOWING_ERRORS, &axis.following_errors[..n]),
         ] {
-            self.base.notify_interface_value(
-                reason,
-                addr,
-                InterfaceType::Float64Array,
-                ParamValue::Float64Array(array.into()),
-                0,
-                AsynStatus::Success,
-            );
+            let _ =
+                self.base
+                    .do_callbacks_array(reason, addr, ParamValue::Float64Array(array.into()));
         }
         Ok(())
     }

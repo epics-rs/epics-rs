@@ -3502,12 +3502,35 @@ ASG(NewGroup) {
     /// C `gatePvData::death` clears both monitors (gatePv.cc:658-661) and
     /// `getCB` re-arms them only after `life()` (gatePv.cc:1702-1705). A
     /// monitor kept across the death is re-installed with the channel, so
-    /// it is on the wire while the revival is held. The property task is
-    /// held past the first life, so it starts into a dead one.
+    /// it is on the wire while the revival is held. Here the property task
+    /// is held past the first life, so it starts into a dead one.
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br3_the_property_monitor_dies_with_the_pv_and_rearms_after_revival() {
+        property_monitor_follows_the_life(CacheMode::Cached, true).await;
+    }
+
+    /// The same with the property monitor on the wire in the first life, so
+    /// the death itself must drop it.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br3_a_live_property_monitor_dies_with_the_pv() {
+        property_monitor_follows_the_life(CacheMode::Cached, false).await;
+    }
+
+    /// No-cache, a downstream property monitor and no value task: nothing
+    /// else follows the life, so the property monitor must drop by itself.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br3_no_cache_a_lone_property_monitor_dies_with_the_pv() {
+        property_monitor_follows_the_life(CacheMode::NoCache, false).await;
+    }
+
+    #[cfg(tokio_backend)]
+    async fn property_monitor_follows_the_life(mode: CacheMode, start_late: bool) {
         use epics_base_rs::server::snapshot::{DisplayInfo, Snapshot};
 
         let name = "BR3:prop";
@@ -3548,19 +3571,30 @@ ASG(NewGroup) {
         pin_env(port);
         let db = Arc::new(PvDatabase::new());
         let cache = Arc::new(RwLock::new(PvCache::new()));
-        let mgr = pinned_manager_full(
-            db.clone(),
-            cache.clone(),
-            CacheMode::Cached,
-            NO_CONNECT_DEADLINE,
-        )
-        .await;
-        let (release_prop, release) = epics_base_rs::runtime::sync::oneshot::channel();
-        *mgr.prop_gate.lock() = Some(release);
+        let mgr = pinned_manager_full(db.clone(), cache.clone(), mode, NO_CONNECT_DEADLINE).await;
+        // Upstream monitors while alive: no-cache arms only the property one.
+        let armed = if mode.is_no_cache() { 1 } else { 2 };
+        let release_prop = start_late.then(|| {
+            let (release_prop, release) = epics_base_rs::runtime::sync::oneshot::channel();
+            *mgr.prop_gate.lock() = Some(release);
+            release_prop
+        });
         mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("upstream connects");
         assert_eq!(shadow_units(db.clone()).await.as_deref(), Some("mm"));
+        mgr.ensure_prop_monitor(name.as_bytes());
+        if !start_late {
+            let first = upstream_db.find_pv(name).await.expect("upstream PV");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while first.subscriber_count() < armed {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the monitors on the wire in the first life"
+                );
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
         upstream_db
             .remove_simple_pv(name)
@@ -3571,7 +3605,9 @@ ASG(NewGroup) {
             assert!(std::time::Instant::now() < deadline, "upstream death");
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
-        let _ = release_prop.send(());
+        if let Some(release_prop) = release_prop {
+            let _ = release_prop.send(());
+        }
 
         // The revival re-registers through the cache, so holding it keeps
         // the gateway dead while the upstream comes back with new metadata.
@@ -3607,7 +3643,7 @@ ASG(NewGroup) {
             );
             epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(returned.subscriber_count(), 2);
+        assert_eq!(returned.subscriber_count(), armed);
 
         mgr.shutdown().await;
     }

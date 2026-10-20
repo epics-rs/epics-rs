@@ -520,3 +520,33 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
         "no position redefine anywhere on the parked-put path"
     );
 }
+
+#[tokio::test]
+async fn only_a_udf_put_of_one_raises_udf_alarm() {
+    // UDF is pp(TRUE) in dbCommon.dbd, and alarm_sub tests `udf == TRUE`
+    // (motorRecord.cc:3372): oracleMotorIoc reads NO_ALARM after
+    // `dbpf M1.UDF 2` and `255`, UDF/INVALID only after `1`.
+    use epics_base_rs::server::recgbl::alarm_status;
+    let state = motor_rs::device_state::new_shared_state();
+    let db = PvDatabase::new();
+    db.add_record("M1", Box::new(make_record(state.clone())))
+        .await
+        .unwrap();
+    anchor(&db, &state).await;
+
+    for (udf, sevr, stat) in [
+        ("2", 0, alarm_status::NO_ALARM),
+        ("255", 0, alarm_status::NO_ALARM),
+        ("1", 3, alarm_status::UDF_ALARM),
+        ("0", 0, alarm_status::NO_ALARM),
+    ] {
+        db.put_record_field_from_ca_no_notify("M1", "UDF", EpicsValue::String(udf.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (db.get_pv("M1.SEVR").unwrap(), db.get_pv("M1.STAT").unwrap()),
+            (EpicsValue::Short(sevr), EpicsValue::Short(stat as i16)),
+            "UDF {udf}"
+        );
+    }
+}

@@ -9682,6 +9682,22 @@ mod alarm_sub {
         assert_eq!(c.nsev, AlarmSeverity::Invalid);
     }
 
+    // C 3372 tests `udf == TRUE`: a byte of 2 or 255 is defined, so the
+    // limit arm below it runs.
+    #[test]
+    fn udf_other_than_one_falls_through_to_the_limit_checks() {
+        for udf in [2, 255] {
+            let mut rec = MotorRecord::new();
+            rec.limits.hlsv = 2; // MAJOR
+            rec.limits.hls = 1;
+            let mut c = common();
+            c.udf = udf;
+            rec.check_alarms(&mut c);
+            assert_eq!(c.nsta, alarm_status::HIGH_ALARM, "udf {udf}");
+            assert_eq!(c.nsev, AlarmSeverity::Major, "udf {udf}");
+        }
+    }
+
     // C 3379-3383: HLS at HLSV severity.
     #[test]
     fn hls_raises_high_alarm_at_hlsv() {

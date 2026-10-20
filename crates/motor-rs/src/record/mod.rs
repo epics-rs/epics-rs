@@ -942,6 +942,12 @@ impl Record for MotorRecord {
         false
     }
 
+    /// alarm_sub (3372) is motor's only UDF_ALARM raise, at INVALID and on
+    /// `udf == TRUE`; the framework's truthy UDFS check is not C's.
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     /// The rest of C init_record after the device's init, when it gets
     /// there: its tail and `monitor()` (`MotorRecord::init_tail`), and
     /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
@@ -994,7 +1000,8 @@ impl MotorRecord {
         }
 
         // C 3372-3376: an undefined VAL short-circuits every other check.
-        if common.udf != 0 {
+        // C tests `udf == TRUE`, so a put byte of 2 or 255 is defined.
+        if epics_base_rs::server::recgbl::udf_alarm_active(common.udf, true) {
             rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, AlarmSeverity::Invalid);
             return;
         }

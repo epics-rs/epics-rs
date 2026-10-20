@@ -1197,8 +1197,8 @@ impl DrvAsynIPServerPort {
     fn resolve_bind_addr(&self) -> AsynResult<SocketAddr> {
         let addr = self.lookup_bind_addr()?;
         // C `createServerSocket` (:439-443), on configure and every connect.
-        println!("serverAddr: {addr}");
-        println!("serverPort: {}", self.config.bind_port);
+        epics_libcom_rs::epics_println!("serverAddr: {addr}");
+        epics_libcom_rs::epics_println!("serverPort: {}", self.config.bind_port);
         Ok(addr)
     }
 

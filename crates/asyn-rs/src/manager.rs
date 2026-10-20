@@ -110,7 +110,7 @@ impl PortManager {
     ) -> AsynResult<PortRuntimeHandle> {
         let name = claim.name().to_string();
         // The `asynPortDriver` constructor's `registerPort` failure: the line
-        // on stdout, then the error is the constructor's throw
+        // on the thread's stdout, then the error is the constructor's throw
         // (asynPortDriver.cpp:4036-4040).
         self.register_port_inner(claim, driver, config, owner, &name)
             .inspect_err(|_| {
@@ -328,7 +328,7 @@ pub fn report_port_driver_register_failure(port_name: &str) -> PortDriverRegiste
     let failed = PortDriverRegisterFailed {
         port_name: port_name.to_string(),
     };
-    println!("{failed}");
+    epics_libcom_rs::epics_println!("{failed}");
     failed
 }
 

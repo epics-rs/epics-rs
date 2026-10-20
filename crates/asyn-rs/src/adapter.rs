@@ -1551,7 +1551,7 @@ impl AsynDeviceSupport {
                 line!(),
                 format_args!("{line}\n"),
             ),
-            (line, false) => println!("{line}"),
+            (line, false) => epics_libcom_rs::epics_println!("{line}"),
         }
     }
 
@@ -3858,7 +3858,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
         // a plain asynOctetRead, so this only fires for a CmdResponse record.
         if self.octet_cmd.is_some() && self.drv_info.is_empty() {
-            println!(
+            epics_libcom_rs::epics_println!(
                 "{}  devAsynOctet::initCmdBuffer no userParam",
                 self.record_name
             );
@@ -3873,9 +3873,10 @@ impl DeviceSupport for AsynDeviceSupport {
         if let Some(src) = self.device_job.write_read.get() {
             let held = Some((self.record_name.as_bytes(), &*record as &dyn Record));
             if !src.db.get().is_some_and(|db| db.has_pv(&src.pv, held)) {
-                println!(
+                epics_libcom_rs::epics_println!(
                     "{} devAsynOctet::initDbAddr record {} not present",
-                    self.record_name, src.pv
+                    self.record_name,
+                    src.pv
                 );
                 return Ok(DeviceInitOutcome::dead_with_alarm(
                     epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
@@ -5218,7 +5219,7 @@ impl Dset {
     fn report(self, record: &str, refusal: &LinkRefusal) {
         match self.refusal_line(record, refusal) {
             (line, true) => epics_base_rs::runtime::log::errlog_vprintf(format_args!("{line}\n")),
-            (line, false) => println!("{line}"),
+            (line, false) => epics_libcom_rs::epics_println!("{line}"),
         }
     }
 

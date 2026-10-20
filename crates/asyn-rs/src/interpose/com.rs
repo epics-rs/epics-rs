@@ -1077,8 +1077,8 @@ impl ComPortOptions {
                 }
                 Err(e) => {
                     // :615-617 — and only on this key does C print the failure to
-                    // stdout as well as returning it.
-                    println!("XON/XOFF not set.");
+                    // the thread's stdout as well as returning it.
+                    epics_libcom_rs::epics_println!("XON/XOFF not set.");
                     Err(e)
                 }
             }
@@ -1636,6 +1636,25 @@ mod tests {
             assert_eq!(server.written[4], code, "parity {name}");
             assert_eq!(com.get_option("parity").unwrap(), name);
         }
+    }
+
+    /// :615-617: the `ixon` failure line goes to the running thread's stdout;
+    /// a port thread's is the console, a `> f` caller's is `f`.
+    #[test]
+    fn the_ixon_failure_line_goes_to_the_thread_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        let mut com = ComPortOptions::new();
+        let mut server = FakeServer::new(&[]);
+        let r = epics_libcom_rs::runtime::stdio::redirect_stdout(
+            std::fs::File::create(&path).unwrap(),
+            || com.set_option(&mut AsynUser::default(), &mut server, "ixon", "y"),
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "XON/XOFF not set.\n"
+        );
     }
 
     /// Turning OFF the mode that is *not* the one in effect leaves the other one

@@ -288,11 +288,11 @@ impl PortRegistry {
 
 static GLOBAL_PORT_REGISTRY: OnceLock<PortRegistry> = OnceLock::new();
 
-/// C `registerPort`'s refusal of a taken name, on stdout, before it returns
+/// C `registerPort`'s refusal of a taken name, on the thread's stdout, before it returns
 /// `asynError` (asynManager.c:2056). The `asynPortDriver` constructor's own
 /// line follows it (see [`crate::manager::report_port_driver_register_failure`]).
 pub(crate) fn report_already_registered(name: &str) {
-    println!("asynCommon:registerDriver {name} already registered");
+    epics_libcom_rs::epics_println!("asynCommon:registerDriver {name} already registered");
 }
 
 fn global_registry() -> &'static PortRegistry {

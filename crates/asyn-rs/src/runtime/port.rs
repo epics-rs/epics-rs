@@ -361,8 +361,11 @@ pub fn create_port_runtime_boxed(
             }) {
             Ok(jh) => jh,
             Err(e) => {
-                // C's line, byte for byte and on stdout (asynManager.c:2083-2084).
-                println!("asynCommon:registerDriver {port_name} epicsThreadCreate failed ");
+                // C's line, byte for byte and on the thread's stdout
+                // (asynManager.c:2083-2084).
+                epics_libcom_rs::epics_println!(
+                    "asynCommon:registerDriver {port_name} epicsThreadCreate failed "
+                );
                 // Everything this function built for the port is dropped on the way
                 // out — C's :2085-2091 unwind — and the port is never published.
                 return Err(port_thread_unavailable(&port_name, &e));

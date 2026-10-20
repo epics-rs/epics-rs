@@ -307,12 +307,28 @@ fn shell_find_interface(
 
 /// A queued shell request's failure as C prints it: a request the queue
 /// refused is `queueRequest failed: %s` (asynShellCommands.c:128, :175),
-/// one that ran and failed is `<ran>%s` (:101, :147).
-fn shell_request_failure(ctx: &CommandContext, ran: &str, e: &AsynError) {
+/// one that ran and failed is `<ran>%s` (:101, :147), from the callback.
+fn shell_request_failure(
+    ctx: &CommandContext,
+    handle: &crate::port_handle::PortHandle,
+    ran: &str,
+    e: &AsynError,
+) {
     if e.never_ran() {
         ctx.println(&format!("queueRequest failed: {}", e.message_display()));
     } else {
-        ctx.println(&format!("{ran}{}", e.message_display()));
+        callback_println(ctx, handle, &format!("{ran}{}", e.message_display()));
+    }
+}
+
+/// A line C's option callback prints (:101, :147, :149). `queueRequest` runs
+/// the callback on the port thread of a canBlock port and on the caller's
+/// otherwise (asynManager.c:145-172), so only then does a `>` redirect take it.
+fn callback_println(ctx: &CommandContext, handle: &crate::port_handle::PortHandle, line: &str) {
+    if handle.can_block() {
+        ctx.console_println(line);
+    } else {
+        ctx.println(line);
     }
 }
 
@@ -762,12 +778,9 @@ fn shell_enable_target(
 }
 
 fn report_ports(mgr: &Arc<PortManager>, level: i32, port: Option<&str>) {
-    use std::io::Write as _;
-    // `asynReport` passes `stdout` to `pasynManager->report`
-    // (asynShellCommands.c:589): an answer to an operator's iocsh question
-    // belongs where a `>` redirect captures it, not on stderr.
-    print!("{}", ports_report(mgr, level, port));
-    let _ = std::io::stdout().flush();
+    // `asynReport` passes `stdout`, the thread's, to `pasynManager->report`
+    // (asynShellCommands.c:589).
+    epics_libcom_rs::epics_print!("{}", ports_report(mgr, level, port));
 }
 
 /// C `pasynManager->report(fp, level, portName)` (asynManager.c:1138-1173):
@@ -910,7 +923,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let iface = InterfaceType::Option;
                 if let Some(handle) = shell_find_interface(&mgr_r, ctx, port.as_deref(), iface) {
                     if let Err(e) = handle.set_option_blocking(user, &key, &value) {
-                        shell_request_failure(ctx, "setOption failed ", &e);
+                        shell_request_failure(ctx, &handle, "setOption failed ", &e);
                     }
                 }
                 Ok(CommandOutcome::Continue)
@@ -1158,8 +1171,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let iface = InterfaceType::Option;
                 if let Some(handle) = shell_find_interface(&mgr_r, ctx, port.as_deref(), iface) {
                     match handle.get_option_blocking(user, &key) {
-                        Ok(value) => ctx.println(&format!("{key}={value}")),
-                        Err(e) => shell_request_failure(ctx, "getOption failed ", &e),
+                        Ok(value) => callback_println(ctx, &handle, &format!("{key}={value}")),
+                        Err(e) => shell_request_failure(ctx, &handle, "getOption failed ", &e),
                     }
                 }
                 Ok(CommandOutcome::Continue)
@@ -1924,7 +1937,7 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
             let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
-            let driver =
+            let mut driver =
                 match build_configured_ip_port(&port, &host, no_auto_connect, no_process_eos) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1932,6 +1945,9 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                         return Ok(CommandOutcome::Continue);
                     }
                 };
+            // Before the port thread can connect it, as C's runs before the
+            // new port's first connect completes.
+            let restored = driver.restore_com_settings_at_configure();
 
             if publish_configured_port(
                 Refusal::Line("drvAsynIPPortConfigure: Can't register myself."),
@@ -1945,6 +1961,19 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
             .is_none()
             {
                 return Ok(CommandOutcome::Continue);
+            }
+            if let Some(restored) = restored {
+                // asynInterposeCom.c:834-836: the IP port has an asynOption.
+                ctx.println(
+                    "INFO -- asynInterposeCOM options extending and perhaps overriding \
+                     those of lower interface.",
+                );
+                if let Err(e) = restored {
+                    ctx.println(&format!(
+                        "WARNING -- Can't set serial port parameters: {}",
+                        e.message()
+                    ));
+                }
             }
             Ok(CommandOutcome::Continue)
         },

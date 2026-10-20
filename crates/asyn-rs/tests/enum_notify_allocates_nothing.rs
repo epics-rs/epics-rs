@@ -1,9 +1,7 @@
-//! A driver's enum-table notify runs inline under a record's hold. With the
-//! record's enum client armed behind a real database and its consumer not
-//! draining, N tables fired on the notify thread allocate nothing: the
-//! client keeps the latest in the mailbox and coalesces, it does not queue.
-//! The other half — a table fired while the gate is closed is dropped at
-//! fire time — is `an_enum_table_before_the_gate_opens_is_not_applied_or_posted`.
+//! A driver's value notify runs inline under a record's hold. An Enum
+//! param's value fire also reaches the record's asynEnum client, carrying
+//! the table it already applied; N of them on the notify thread allocate
+//! nothing. A table change may allocate: it is a configuration event.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -66,7 +64,7 @@ fn entry(s: &str, value: i32) -> EnumEntry {
 }
 
 #[epics_base_rs::epics_test]
-async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thread() {
+async fn enum_value_fires_with_a_ring_client_allocate_nothing_on_the_notify_thread() {
     const N: usize = 256;
     let mut base = PortDriverBase::new(
         "enumAlloc",
@@ -127,14 +125,15 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
         )
         .unwrap();
 
-    // Distinct tables, so each one is a change the client must hold.
+    // The seeded table at a moving index: value callbacks, not table changes.
+    let table: Arc<[EnumEntry]> = vec![entry("OFF", 0), entry("ON", 1)].into();
     let fires: Vec<InterruptValue> = (0..N)
         .map(|i| InterruptValue {
             reason: 0,
             addr: 0,
             value: ParamValue::Enum {
-                index: 0,
-                choices: vec![entry("A", i as i32), entry("B", 1)].into(),
+                index: i % 2,
+                choices: table.clone(),
             },
             ..Default::default()
         })
@@ -156,6 +155,6 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
     );
     assert_eq!(
         allocs, 0,
-        "{N} enum fires: allocations on the notify thread"
+        "{N} enum value fires: allocations on the notify thread"
     );
 }

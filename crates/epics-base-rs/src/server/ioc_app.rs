@@ -1791,7 +1791,6 @@ pub(crate) fn init_database(
     let db = db.clone();
     async move {
         if fresh {
-            setup_property_posts(db.clone()).await;
             if open_links {
                 init_links(&db).await;
             }
@@ -3461,8 +3460,6 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         // #60/#208). The device's decision is authoritative — the SCAN check
         // alone would suppress callbacks for a SCAN="Passive" motor, breaking
         // the pp(TRUE) dbPutField re-process gate.
-        // NOTE: property-post wiring (setup_property_posts) is a separate
-        // pass — an enum re-propagation callback is independent of SCAN.
         let independent = inst
             .device
             .as_ref()
@@ -3558,31 +3555,6 @@ pub(crate) fn spawn_io_intr_pump(
             }
         }
     })
-}
-
-/// Spawn the out-of-band PROPERTY-post drains for every device exposing a
-/// [`DeviceSupport::property_post_receiver`] (asyn enum-string runtime
-/// re-propagation). C `registerInterruptUser(callbackEnum)` registers the
-/// callback at init; the per-record callback re-applies the enum table and
-/// `db_post_events(DBE_PROPERTY)` independently of `SCAN`. This mirrors
-/// [`setup_io_intr`]: the device owns the source subscription (the asyn
-/// interrupt) and yields a channel of [`PropertyPost`]s; the framework owns
-/// the post (`post_property`). Each record's drain starts in
-/// [`record::RecordInstance::wire_property_posts`], which a device-link put
-/// also reaches. Returns the number of drains wired.
-///
-/// [`PropertyPost`]: crate::server::device_support::PropertyPost
-pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
-    let names = db.all_record_names();
-    let mut count = 0;
-    for name in names {
-        if let Some(rec_arc) = db.get_record(&name) {
-            if rec_arc.write().wire_property_posts() {
-                count += 1;
-            }
-        }
-    }
-    count
 }
 
 #[cfg(test)]

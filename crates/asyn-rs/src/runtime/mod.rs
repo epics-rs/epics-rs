@@ -126,7 +126,7 @@ mod tokio_is_not_the_executor {
         // Fail closed: if the slicer stops covering the guarded code, say so
         // rather than reporting a vacuous pass.
         let anchors = [
-            ("adapter.rs", "fn property_post_receiver"),
+            ("adapter.rs", "fn subscribe_enum("),
             ("asyn_record/mod.rs", "fn register_exception_callback"),
             ("transport/in_process.rs", "fn subscribe("),
             ("runtime/supervisor.rs", "pub async fn supervise<"),

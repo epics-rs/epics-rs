@@ -23,10 +23,6 @@
 //! PV itself (which is VAL) with DBE_PROPERTY is the one that learns the
 //! table moved, and a DBE_VALUE monitor on VAL learns nothing, because no
 //! value changed and the record is never processed.
-//!
-//! Asserting that the port's `property_post_receiver` channel carries the
-//! right ZRST/ONST strings — which is all the existing unit test does —
-//! cannot see either half of that.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,6 +96,21 @@ async fn enum_ioc(
     dtyp: &str,
     choices: Vec<EnumEntry>,
 ) -> (Arc<PvDatabase>, PortHandle) {
+    let (database, handle) = enum_ioc_before_run(port, record_type, dtyp, choices).await;
+    database.scan_control().run();
+    // `iocRun`'s boot flush posts the port's seeded table; let it land so a
+    // test's own subscription sees only what the test drives.
+    settle().await;
+    (database, handle)
+}
+
+/// [`enum_ioc`] stopped short of `iocRun`: `interruptAccept` is still false.
+async fn enum_ioc_before_run(
+    port: &str,
+    record_type: &str,
+    dtyp: &str,
+    choices: Vec<EnumEntry>,
+) -> (Arc<PvDatabase>, PortHandle) {
     let (runtime, _join) =
         create_port_runtime_unclaimed(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
@@ -132,10 +143,6 @@ async fn enum_ioc(
             .build()
             .await
             .unwrap();
-    database.scan_control().run();
-    // `iocRun`'s boot flush posts the port's seeded table; let it land so a
-    // test's own subscription sees only what the test drives.
-    settle().await;
     (database, handle)
 }
 
@@ -311,4 +318,57 @@ async fn an_unchanged_table_posts_nothing_on_val() {
         drain(&mut val).is_empty(),
         "a value-only callback is not a property change"
     );
+}
+
+/// C `setEnums` keeps 16 states of 25-byte strings (devAsynInt32.c:65-66), so
+/// a driver table past either limit, fired again, is the table the record
+/// already holds: no DBE_PROPERTY. A real change after it still posts.
+#[epics_base_rs::epics_test]
+async fn a_table_past_the_setenums_limits_fired_again_posts_nothing() {
+    let mut choices = vec![
+        entry("A_VERY_LONG_STATE_NAME_OF_THIRTY", 0, 0),
+        entry("ON", 1, 0),
+    ];
+    for i in 2..30 {
+        choices.push(entry(&format!("S{i}"), i, 0));
+    }
+    let (db, handle) = enum_ioc("enumMbbiClamped", "mbbi", "asynInt32", choices.clone()).await;
+    let mut val = subscribe(&db, "VAL", 1, ALL);
+
+    drive_table_change(&handle, choices);
+    settle().await;
+    assert!(drain(&mut val).is_empty(), "the clamped table is unchanged");
+
+    drive_table_change(&handle, vec![entry("LOW", 0, 0)]);
+    settle().await;
+    let on_val = drain(&mut val);
+    assert_eq!(on_val.len(), 1, "the change posts: {on_val:?}");
+    assert_eq!(on_val[0].0, EventMask::PROPERTY);
+}
+
+/// C's enum callbacks return before `dbScanLock` while `interruptAccept` is
+/// false (devAsynInt32.c:718/:732/:746/:760, devAsynUInt32Digital.c:553/
+/// :567/:581/:595): a table fired before `iocRun` is dropped, not applied
+/// later, and the next one after it is applied.
+#[epics_base_rs::epics_test]
+async fn a_table_before_iocrun_is_dropped() {
+    let (db, handle) = enum_ioc_before_run(
+        "enumMbbiBeforeRun",
+        "mbbi",
+        "asynInt32",
+        vec![entry("OFF", 0, 0), entry("ON", 1, 0)],
+    )
+    .await;
+    let mut val = subscribe(&db, "VAL", 1, ALL);
+    drive_table_change(&handle, vec![entry("EARLY", 0, 0)]);
+    db.scan_control().run();
+    settle().await;
+    let zrst = |db: &PvDatabase| db.get_record(REC).unwrap().read().record.get_field("ZRST");
+    assert_eq!(zrst(&db), Some(EpicsValue::String("OFF".into())));
+    assert!(drain(&mut val).is_empty(), "nothing posted");
+
+    drive_table_change(&handle, vec![entry("LATE", 0, 0)]);
+    settle().await;
+    assert_eq!(zrst(&db), Some(EpicsValue::String("LATE".into())));
+    assert_eq!(drain(&mut val).len(), 1);
 }

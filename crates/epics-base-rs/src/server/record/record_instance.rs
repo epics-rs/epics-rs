@@ -5431,9 +5431,6 @@ struct RecordCold {
     /// The task delivering the bound device's I/O Intr wakes, wired only by
     /// [`RecordInstance::wire_io_intr_pump`].
     io_intr_pump: Option<crate::runtime::background::AbortHandle>,
-    /// The task posting the bound device's PROPERTY changes, wired only by
-    /// [`RecordInstance::wire_property_posts`].
-    property_drain: Option<crate::runtime::background::AbortHandle>,
     /// What a [`Subroutine::Context`] routine stored as C `prec->dpvt`. Not
     /// a [`Dpvt`](crate::server::device_support::Dpvt) variant: a boxed `dyn`
     /// there makes every soft-input read's `Dpvt` overwrite an outlined drop.
@@ -7930,7 +7927,6 @@ impl RecordInstance {
                 init_subroutines: None,
                 db: Default::default(),
                 io_intr_pump: None,
-                property_drain: None,
                 subroutine_pvt: None,
                 skipped_posted: SkippedLog::default(),
                 declared_overrides: HashMap::new(),
@@ -10647,15 +10643,14 @@ impl RecordInstance {
     }
 
     /// What iocInit gives a dset before its record joins any list, for the
-    /// one a device-link put bound: the database's gates, its PROPERTY
-    /// drain, and the pump of a device that processes whatever the SCAN. An
-    /// I/O Intr record's pump follows from `restoreScan`'s join.
+    /// one a device-link put bound: the database's gates and the pump of a
+    /// device that processes whatever the SCAN. An I/O Intr record's pump
+    /// follows from `restoreScan`'s join.
     fn wire_bound_device(&mut self) {
         if let (Some(dev), Some(db)) = (self.device.as_mut(), self.cold.db.upgrade()) {
             dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
             dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
         }
-        self.wire_property_posts();
         if self
             .device
             .as_ref()
@@ -10663,41 +10658,6 @@ impl RecordInstance {
         {
             self.wire_io_intr_pump();
         }
-    }
-
-    /// Start the task that posts the bound device's PROPERTY changes, the
-    /// one place that starts it: C's `registerInterruptUser(callbackEnum)`
-    /// belongs to whichever dset object is bound, iocInit's or a device-link
-    /// put's, and runs whatever the SCAN. A fresh receiver is a newly bound
-    /// dset and replaces the old drain. Whether the record now has a live one.
-    pub(crate) fn wire_property_posts(&mut self) -> bool {
-        let drained = |p: &Option<crate::runtime::background::AbortHandle>| {
-            p.as_ref().is_some_and(|p| !p.is_finished())
-        };
-        let Some(dev) = self.device.as_mut() else {
-            return drained(&self.cold.property_drain);
-        };
-        let Some(mut rx) = dev.property_post_receiver() else {
-            return drained(&self.cold.property_drain);
-        };
-        let Some(db) = self.cold.db.upgrade() else {
-            return false;
-        };
-        dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
-        let rec_name = self.name.clone();
-        let drain =
-            crate::runtime::task::spawn_background(self.common.callback_priority(), async move {
-                // Each message is the setEnums field block plus the one field
-                // C posts on; DBE_PROPERTY on that field is what makes clients
-                // re-read the choices.
-                while let Some(post) = rx.recv().await {
-                    let _ = db.post_property(&rec_name, post);
-                }
-            });
-        if let Some(old) = self.cold.property_drain.replace(drain.abort_handle()) {
-            old.abort();
-        }
-        true
     }
 
     /// C `scanAdd`'s failure exits, `precord->scan = menuScanPassive`

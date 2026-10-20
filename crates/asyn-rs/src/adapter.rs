@@ -13,7 +13,7 @@ use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource};
 use epics_base_rs::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
 };
-use epics_base_rs::server::device_support::{ReadStart, WriteStart};
+use epics_base_rs::server::device_support::{IoIntrAction, ReadStart, WriteStart};
 use epics_base_rs::server::record::{CommonFields, DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::c_parse::{long_to_int, strtol_errno, strtoul_errno, ulong_to_uint};
@@ -22,8 +22,8 @@ use epics_libcom_rs::cfmt::CFloat;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{
-    ENUM_ENTRY_BYTES, InterruptFilter, InterruptReceiver, InterruptSubscription, MAX_ENUM_STATES,
-    clamp_enum_table,
+    InterruptFilter, InterruptReceiver, InterruptSubscription, SyncCallbackSubscription,
+    clamp_enum_table, clamps_to,
 };
 use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
@@ -452,24 +452,17 @@ pub struct AsynDeviceSupport {
     /// VAL writer so "have I produced a value yet" is exactly C's prime
     /// signal — and it does not depend on the framework's UDF lifecycle.
     smoo_primed: bool,
-    /// Enum state-field family captured at init when the record exposes
-    /// ZRST/ZNAM and the port has asynEnum (C's
-    /// `findInterface(asynEnumType) && maxEnums>0` gate). `Some` arms the
-    /// runtime re-propagation callback ([`Self::property_post_receiver`]).
-    enum_shape: Option<EnumRecordShape>,
-    /// The driver enum table applied at init, `None` when the read failed —
-    /// the diff seed for the
-    /// runtime callback so a value-only change (enum index moves, choices
-    /// unchanged) fires no DBE_PROPERTY post (C's asynEnum callback only
-    /// fires on `doCallbacksEnum`, never on an int32 value callback).
-    enum_choices: Option<Arc<[crate::param::EnumEntry]>>,
-    /// RAII subscription for the runtime enum-table interrupt — dropping
-    /// unsubscribes. Distinct from `interrupt_sub` (the value I/O Intr
-    /// subscription); C registers the asynEnum callback separately.
-    enum_interrupt_sub: Option<InterruptSubscription>,
-    /// The tables `init`'s asynEnum registration receives, until
-    /// `property_post_receiver` takes them.
-    enum_intr_rx: Option<InterruptReceiver>,
+    /// The table `setEnums` last left in the record, clamped as it does:
+    /// init's read, then each change the enum callback applied; `None` until
+    /// one has. A fire carrying it again is the param's value callback, which
+    /// C's asynEnum callback never sees, so it posts no DBE_PROPERTY.
+    enum_applied: Arc<parking_lot::Mutex<Option<Arc<[crate::param::EnumEntry]>>>>,
+    /// The record's asynEnum callback (C `callbackEnum`); dropping it
+    /// unregisters. Distinct from `interrupt_sub`, as C registers the two
+    /// separately.
+    enum_interrupt_sub: Option<SyncCallbackSubscription>,
+    /// The record's database, which the enum callback locks the record in.
+    db: Option<epics_base_rs::server::database::AsyncDbHandle>,
 }
 
 /// Shared state for an averaging (`asynInt32Average` / `asynFloat64Average`)
@@ -716,8 +709,8 @@ enum CallbackStore {
         /// time (C `result`). Replaced in place: a callback allocates
         /// nothing, the value being an `Arc`.
         last: Option<CachedInterrupt>,
-        /// `last.value` came from a good callback: C copies none other.
-        good: bool,
+        /// Where the last good callback's value is.
+        value: LatestValue,
         /// The callbacks owed a process: C `gotValue`'s `scanIoRequest`s.
         owed: u32,
         /// The callbacks before `interruptAccept` no process has taken: C
@@ -731,12 +724,25 @@ enum CallbackStore {
     },
 }
 
+/// Where a latest slot's value is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LatestValue {
+    /// No good callback has landed: C copies none other.
+    Absent,
+    /// In `last`, for the next process to store.
+    ForPass,
+    /// The callback copied it into the record ([`copy_into_record`]).
+    InRecord,
+}
+
 /// What a process takes from the store, and whether it writes the value:
 /// a ring entry's only if it is good (C `processAi`), the latest slot's
 /// whenever one good callback has landed, as C's record already holds it.
 struct Delivery {
     entry: CachedInterrupt,
     store: bool,
+    /// The record already holds the value: its callback copied it.
+    in_record: bool,
     /// The ring overflows this pop reports and clears (C `getCallbackValue`).
     overflows: u64,
     /// More than one callback landed since the latest slot's last take: C
@@ -754,7 +760,7 @@ impl CallbackStore {
         if size == 0 {
             Self::Latest {
                 last: None,
-                good: false,
+                value: LatestValue::Absent,
                 owed: 0,
                 held: 0,
                 spent: false,
@@ -864,19 +870,20 @@ impl InterruptFifo {
     /// the value (devAsynOctet.c:490-509) but its `scanIoRequest` does nothing
     /// before `scanRun` (dbScan.c:621), so no process is owed for it; the next
     /// process, PINI included, takes the value as C's `gotValue` has it do.
-    /// A ring keeps nothing it does not owe.
-    fn hold(&mut self, entry: CachedInterrupt) {
+    /// A ring keeps nothing it does not owe. `copied` as in [`Self::land`].
+    fn hold(&mut self, entry: CachedInterrupt, copied: bool) {
         if let CallbackStore::Latest { held, .. } = &mut self.store {
             *held = held.saturating_add(1);
-            self.land(entry);
+            self.land(entry, copied);
         }
     }
 
     /// The latest slot takes a callback: C copies a good value into the
     /// record and every status into `result` (devAsynOctet.c:490-510).
-    fn land(&mut self, entry: CachedInterrupt) {
+    /// `copied`: the callback already put the value in the record.
+    fn land(&mut self, entry: CachedInterrupt, copied: bool) {
         let CallbackStore::Latest {
-            last, good, spent, ..
+            last, value, spent, ..
         } = &mut self.store
         else {
             return;
@@ -890,7 +897,13 @@ impl InterruptFifo {
                 last.aux_status = entry.aux_status;
             }
             slot => {
-                *good = entry.aux_status == crate::error::AsynStatus::Success;
+                *value = if entry.aux_status != crate::error::AsynStatus::Success {
+                    LatestValue::Absent
+                } else if copied {
+                    LatestValue::InRecord
+                } else {
+                    LatestValue::ForPass
+                };
                 *slot = Some(entry);
             }
         }
@@ -912,9 +925,18 @@ impl InterruptFifo {
             }
             CallbackStore::Latest { owed, .. } => {
                 *owed = owed.saturating_add(1);
-                self.land(entry);
+                self.land(entry, false);
                 true
             }
+        }
+    }
+
+    /// A ringSize-0 callback whose value [`copy_into_record`] put in the
+    /// record: one more `gotValue`.
+    fn push_copied(&mut self, entry: CachedInterrupt) {
+        if let CallbackStore::Latest { owed, .. } = &mut self.store {
+            *owed = owed.saturating_add(1);
+            self.land(entry, true);
         }
     }
 
@@ -925,6 +947,7 @@ impl InterruptFifo {
         let delivery = match &mut self.store {
             CallbackStore::Ring { entries, .. } => entries.pop_front().map(|entry| Delivery {
                 store: entry.aux_status == crate::error::AsynStatus::Success,
+                in_record: false,
                 entry,
                 overflows: std::mem::take(&mut self.overflows),
                 backlog: false,
@@ -935,7 +958,7 @@ impl InterruptFifo {
             // its later processes skip their driver read and warn; not copied.
             CallbackStore::Latest {
                 last,
-                good,
+                value,
                 owed,
                 held,
                 spent,
@@ -945,7 +968,8 @@ impl InterruptFifo {
                 *held = 0;
                 let delivery = last.clone().map(|entry| Delivery {
                     entry,
-                    store: *good,
+                    store: *value == LatestValue::ForPass,
+                    in_record: *value == LatestValue::InRecord,
                     overflows: 0,
                     backlog,
                     spent: *spent,
@@ -1039,10 +1063,9 @@ impl AsynDeviceSupport {
             fifo_tag: None,
             output_callback_pending: false,
             smoo_primed: false,
-            enum_shape: None,
-            enum_choices: None,
+            enum_applied: Arc::default(),
             enum_interrupt_sub: None,
-            enum_intr_rx: None,
+            db: None,
             device_job: Arc::new(DeviceJob::default()),
             request_cell: None,
         }
@@ -1240,6 +1263,12 @@ impl AsynDeviceSupport {
         let scalar = self.dset.is_scalar();
         let octet = self.dset == Dset::Octet;
         let ring = self.interrupt_fifo.lock().unwrap().size();
+        // An `asyn:READBACK` output's too (devAsynOctet.c:490-503,
+        // devAsynXXXArray.cpp:412-428).
+        let copies = ring == 0 && matches!(self.dset, Dset::Octet | Dset::Array);
+        let db = self.db.clone();
+        let iface_type = self.iface_type.clone();
+        let octet_cap = self.octet_read_cap();
         let callback = if self.output {
             "interruptCallbackOutput"
         } else {
@@ -1298,7 +1327,7 @@ impl AsynDeviceSupport {
                     );
                 }
                 let open = gate.open();
-                let entry = CachedInterrupt {
+                let mut entry = CachedInterrupt {
                     value,
                     timestamp: iv.timestamp,
                     // Carry the driver alarm so the IoIntr read path can
@@ -1313,15 +1342,28 @@ impl AsynDeviceSupport {
                     aux_status: iv.aux_status,
                     octet_nul: iv.octet_counts_nul(),
                 };
+                // A ringSize-0 record copies a good value into itself before
+                // it asks for the process, devAsynOctet whether or not
+                // `interruptAccept` (devAsynOctet.c:490-518,
+                // devAsynXXXArray.cpp:410-428): a put after the callback is
+                // what that process keeps.
+                let copied = copies
+                    && (open || octet)
+                    && entry.aux_status == crate::error::AsynStatus::Success
+                    && copy_into_record(db.as_ref(), &record, &mut entry, &iface_type, octet_cap);
                 // C parity (devAsynInt32.c:564-576): an overflow drops the
                 // oldest entry, leaving what is owed unchanged; a fresh entry
                 // is owed one more process.
                 let mut g = fifo.lock().unwrap();
                 if open {
-                    g.push_with_overflow(entry);
+                    if copied {
+                        g.push_copied(entry);
+                    } else {
+                        g.push_with_overflow(entry);
+                    }
                     g.ring();
                 } else if octet {
-                    g.hold(entry);
+                    g.hold(entry, copied);
                 }
             });
         self.interrupt_sub = Some(sub?);
@@ -1448,17 +1490,15 @@ impl AsynDeviceSupport {
         Ok(())
     }
 
-    /// The record's asynEnum interrupt client (C `callbackEnum`'s
-    /// `registerInterruptUser`, devAsynInt32.c:317-323).
-    fn subscribe_enum(&mut self) -> AsynResult<InterruptReceiver> {
-        // Subscribe to the enum param's interrupts. On a `ParamType::Enum`
-        // param the enum value (index) and the enum table (choices) live on one
-        // `ParamValue::Enum`, so both a value change and a `set_enum_choices`
-        // change arrive here; C separates them across the asynInt32 and
-        // asynEnum interfaces. The bridge below recovers that separation by
-        // posting only when the *choices* differ from the last-applied table
-        // (seeded with the init table) — so an int32 value change fires no
-        // DBE_PROPERTY, matching C.
+    /// The record's asynEnum callback (C `callbackEnum`'s
+    /// `registerInterruptUser`, devAsynInt32.c:317-323), run inline in the
+    /// driver's notify as C's is.
+    fn subscribe_enum(&mut self, shape: EnumRecordShape) -> AsynResult<()> {
+        // On a `ParamType::Enum` param the enum value (index) and the enum
+        // table (choices) live on one `ParamValue::Enum`, so a value change
+        // arrives here as well as a `set_enum_choices` change; C separates
+        // them across the asynInt32 and asynEnum interfaces. Only a table
+        // that differs from the one applied is C's `doCallbacksEnum`.
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.handle.param_list(self.addr)),
@@ -1474,20 +1514,54 @@ impl AsynDeviceSupport {
             // filter.
             iface: Some(crate::interfaces::InterfaceType::Enum),
         };
-        // C's enum callbacks return before `setEnums` and the DBE_PROPERTY
-        // post while `interruptAccept` is false (devAsynInt32.c:718/:732/
-        // :746/:760, devAsynUInt32Digital.c:553/:567/:581/:595): the table
-        // is dropped, and the next one after the gate opens is applied. The
-        // gate is read when the callback fires, in the mailbox write, not
-        // when the task below drains it.
         let gate = self.gate.clone();
-        let (sub, rx) = self.handle.interrupts().register_interrupt_user_when(
-            filter,
-            MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
-            move || gate.open(),
-        )?;
+        let db = self.db.clone();
+        let record: Arc<str> = Arc::from(self.record_name.as_str());
+        let applied = self.enum_applied.clone();
+        let sub = self
+            .handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
+                let crate::param::ParamValue::Enum { choices, .. } = &iv.value else {
+                    return;
+                };
+                // C returns before `dbScanLock` while `interruptAccept` is
+                // false (devAsynInt32.c:718/:732/:746/:760,
+                // devAsynUInt32Digital.c:553/:567/:581/:595, devBusyAsyn.c:404).
+                if !gate.open()
+                    || applied
+                        .lock()
+                        .as_deref()
+                        .is_some_and(|a| clamps_to(choices, a))
+                {
+                    return;
+                }
+                let Some(db) = &db else {
+                    return;
+                };
+                let (choices, applied) = (choices.clone(), applied.clone());
+                // `dbScanLock`, `setEnums`, `db_post_events(&pr->val,
+                // DBE_PROPERTY)`, `dbScanUnlock` (devAsynInt32.c:712-766), so
+                // the driver's next value or a put after this converts
+                // through the new table.
+                let _ = db.run_io_intr_callback_with(&*record, move |held| {
+                    let choices = clamp_enum_table(&choices);
+                    {
+                        let mut last = applied.lock();
+                        if last.as_deref() == Some(&*choices) {
+                            return IoIntrAction::Skip;
+                        }
+                        *last = Some(choices.clone());
+                    }
+                    let _ = held.put_property(PropertyPost {
+                        writes: enum_table_fields(shape, &choices),
+                        post_field: "VAL".to_string(),
+                    });
+                    IoIntrAction::Skip
+                });
+            })?;
         self.enum_interrupt_sub = Some(sub);
-        Ok(rx)
+        Ok(())
     }
 
     /// C devAsyn's line for a `registerInterruptUser` the port refused
@@ -1808,6 +1882,135 @@ fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u
 /// [`asyn_error_to_alarm_with_default`] with C's input default (`READ_ALARM`).
 fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
     asyn_error_to_alarm_with_default(e, epics_base_rs::server::recgbl::alarm_status::READ_ALARM)
+}
+
+/// The value an asynOctet or array record's buffer takes from a sample, or
+/// `None` for a scalar interface ([`AsynDeviceSupport::param_value_for_iface`]).
+fn buffer_value(
+    iface_type: &str,
+    pv: &crate::param::ParamValue,
+    octet_nul: bool,
+) -> Option<Result<EpicsValue, AsynError>> {
+    if let Some(arr) = convert_param_array_to_iface(iface_type, pv) {
+        return Some(Ok(arr));
+    }
+    Some(match iface_type {
+        "asynOctet" => pv.as_octet().map(|bytes| {
+            EpicsValue::String(if octet_nul {
+                let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
+                epics_base_rs::types::PvString::from_bytes([text, &[0]].concat())
+            } else {
+                bytes.into()
+            })
+        }),
+        // An array interface reached here only because the sample is not an
+        // array (`convert_param_array_to_iface` handles every array sample):
+        // the record's interface cannot read it, same as the scalar mismatches.
+        "asynInt8Array" | "asynInt16Array" | "asynInt32Array" | "asynInt64Array"
+        | "asynFloat32Array" | "asynFloat64Array" => Err(AsynError::TypeMismatch {
+            expected: "Array",
+            actual: pv.type_name(),
+        }),
+        _ => return None,
+    })
+}
+
+/// [`AsynDeviceSupport::cap_octet_read_value`] at `cap` bytes.
+fn cap_octet_value(val: EpicsValue, cap: usize) -> EpicsValue {
+    match val {
+        EpicsValue::String(s) if s.len() > cap => EpicsValue::String(
+            epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..cap]),
+        ),
+        other => other,
+    }
+}
+
+/// A value C hands the record as it is: an asynOctet (`octet`) value into the
+/// record's own buffer, anything else by `set_val`. A read's store, and a
+/// ringSize-0 callback's copy ([`copy_into_record`]).
+fn store_delivered(octet: bool, record: &mut dyn Record, val: EpicsValue) {
+    // asynOctet: C device support hands the reply BYTES straight to the
+    // record's own buffer — `readIt(pasynUser, pwf->bptr, pwf->nelm, ...)`
+    // for waveform (devAsynOctet.c:1054), `psi->val` for stringin,
+    // `plsi->val` for lsi — and never through `dbPutConvertRoutine`. So the
+    // delivered shape follows the destination buffer, not a conversion: an
+    // array-backed VAL takes the bytes as a `CharArray`, a DBF_STRING VAL
+    // keeps the `String`. Only CHAR/UCHAR waveforms can reach here — C
+    // `initCommon` sets `pact = 1` on any other FTVL at init
+    // (devAsynOctet.c:312-316) — so there is no element-type question.
+    // Delivering a `String` instead made the bytes arrive as a DBR_STRING
+    // put, which C's `putStringChar` parses with `epicsParseInt8` and
+    // refuses for any non-numeric reply.
+    //
+    // The `n` bytes kept (see `octet_read_cap`) land as C lands them: a
+    // waveform's NORD is `n`; lsi/lso take `val[n] = 0` and `len = n + 1`;
+    // a DBF_STRING VAL reads as a C string, to the first NUL.
+    if octet {
+        if let EpicsValue::String(s) = &val {
+            use epics_base_rs::server::records::{lsi::LsiRecord, lso::LsoRecord};
+            let bytes = s.as_bytes();
+            if let Some(any) = record.as_any_mut() {
+                if let Some(lsi) = any.downcast_mut::<LsiRecord>() {
+                    lsi.val.set_read(bytes);
+                    return;
+                }
+                if let Some(lso) = any.downcast_mut::<LsoRecord>() {
+                    lso.val.set_read(bytes);
+                    return;
+                }
+            }
+            let delivered = if record.val().is_some_and(|v| v.is_array()) {
+                EpicsValue::CharArray(bytes.into())
+            } else {
+                let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+                EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&bytes[..end]))
+            };
+            let _ = record.set_val(delivered);
+            return;
+        }
+    }
+    let _ = record.set_val(val);
+}
+
+/// C's ringSize-0 `interruptCallback` copy of a good callback's value into the
+/// record, under its lock on the driver's thread (devAsynOctet.c:490-503,
+/// devAsynXXXArray.cpp:412-421). `false` leaves the value in `entry` for the
+/// process to store: no database, or the record refused the lock. A value the
+/// interface cannot read lands as a failed callback, alarmed as a read is.
+fn copy_into_record(
+    db: Option<&epics_base_rs::server::database::AsyncDbHandle>,
+    record: &str,
+    entry: &mut CachedInterrupt,
+    iface_type: &str,
+    octet_cap: usize,
+) -> bool {
+    let Some(db) = db else {
+        return false;
+    };
+    match buffer_value(iface_type, &entry.value, entry.octet_nul) {
+        Some(Ok(val)) => {
+            let val = cap_octet_value(val, octet_cap);
+            let octet = iface_type == "asynOctet";
+            let run = db.run_io_intr_callback_with(record, move |held| {
+                held.with(|record, _| store_delivered(octet, record, val));
+                IoIntrAction::Skip
+            });
+            if matches!(
+                run,
+                epics_base_rs::server::device_support::IoIntrRun::Refused
+            ) {
+                return false;
+            }
+            entry.value = crate::param::ParamValue::Undefined;
+            true
+        }
+        Some(Err(e)) => {
+            (entry.alarm_status, entry.alarm_severity) = asyn_error_to_alarm(&e);
+            entry.aux_status = e.status();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Convert a native-typed array interrupt to the element type of the consuming
@@ -2859,34 +3062,15 @@ impl AsynDeviceSupport {
         octet_nul: bool,
     ) -> Result<Option<EpicsValue>, AsynError> {
         let iface_type = self.iface_type.as_str();
-        if let Some(arr) = convert_param_array_to_iface(iface_type, pv) {
-            return Ok(Some(arr));
+        if let Some(val) = buffer_value(iface_type, pv, octet_nul) {
+            return val.map(Some);
         }
         let val = match iface_type {
             "asynInt32" => EpicsValue::Long(self.apply_int32_mask(pv.as_int32()?)),
             "asynInt64" => EpicsValue::Int64(pv.as_int64()?),
             "asynFloat64" => EpicsValue::Double(pv.as_float64()?),
-            "asynOctet" => {
-                let bytes = pv.as_octet()?;
-                EpicsValue::String(if octet_nul {
-                    let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
-                    epics_base_rs::types::PvString::from_bytes([text, &[0]].concat())
-                } else {
-                    bytes.into()
-                })
-            }
             "asynUInt32Digital" => EpicsValue::Long(pv.as_uint32()? as i32),
             "asynEnum" => EpicsValue::Enum(pv.as_enum()?.0 as u16),
-            // An array interface reached here only because the sample is not an
-            // array (`convert_param_array_to_iface` handles every array sample):
-            // the record's interface cannot read it, same as the scalar mismatches.
-            "asynInt8Array" | "asynInt16Array" | "asynInt32Array" | "asynInt64Array"
-            | "asynFloat32Array" | "asynFloat64Array" => {
-                return Err(AsynError::TypeMismatch {
-                    expected: "Array",
-                    actual: pv.type_name(),
-                });
-            }
             _ => return Ok(None),
         };
         Ok(Some(val))
@@ -2954,13 +3138,7 @@ impl AsynDeviceSupport {
     /// untouched. Bytes are truncated verbatim — `PvString` is raw bytes, matching the
     /// polled path's `&d[..n]` slice.
     fn cap_octet_read_value(&self, val: EpicsValue) -> EpicsValue {
-        let cap = self.octet_read_cap();
-        match val {
-            EpicsValue::String(s) if s.len() > cap => EpicsValue::String(
-                epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..cap]),
-            ),
-            other => other,
-        }
+        cap_octet_value(val, self.octet_read_cap())
     }
 
     /// The most bytes a read hands the record: C `if (nBytesRead == valSize)
@@ -3538,47 +3716,7 @@ impl AsynDeviceSupport {
                 }
             }
         }
-        // asynOctet: C device support hands the reply BYTES straight to the
-        // record's own buffer — `readIt(pasynUser, pwf->bptr, pwf->nelm, ...)`
-        // for waveform (devAsynOctet.c:1054), `psi->val` for stringin,
-        // `plsi->val` for lsi — and never through `dbPutConvertRoutine`. So the
-        // delivered shape follows the destination buffer, not a conversion: an
-        // array-backed VAL takes the bytes as a `CharArray`, a DBF_STRING VAL
-        // keeps the `String`. Only CHAR/UCHAR waveforms can reach here — C
-        // `initCommon` sets `pact = 1` on any other FTVL at init
-        // (devAsynOctet.c:312-316) — so there is no element-type question.
-        // Delivering a `String` instead made the bytes arrive as a DBR_STRING
-        // put, which C's `putStringChar` parses with `epicsParseInt8` and
-        // refuses for any non-numeric reply.
-        //
-        // The `n` bytes kept (see `octet_read_cap`) land as C lands them: a
-        // waveform's NORD is `n`; lsi/lso take `val[n] = 0` and `len = n + 1`;
-        // a DBF_STRING VAL reads as a C string, to the first NUL.
-        if self.iface_type == "asynOctet" {
-            if let EpicsValue::String(s) = &val {
-                use epics_base_rs::server::records::{lsi::LsiRecord, lso::LsoRecord};
-                let bytes = s.as_bytes();
-                if let Some(any) = record.as_any_mut() {
-                    if let Some(lsi) = any.downcast_mut::<LsiRecord>() {
-                        lsi.val.set_read(bytes);
-                        return true;
-                    }
-                    if let Some(lso) = any.downcast_mut::<LsoRecord>() {
-                        lso.val.set_read(bytes);
-                        return true;
-                    }
-                }
-                let delivered = if record.val().is_some_and(|v| v.is_array()) {
-                    EpicsValue::CharArray(bytes.into())
-                } else {
-                    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
-                    EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&bytes[..end]))
-                };
-                let _ = record.set_val(delivered);
-                return true;
-            }
-        }
-        let _ = record.set_val(val);
+        store_delivered(self.iface_type == "asynOctet", record, val);
         true
     }
 
@@ -3676,10 +3814,9 @@ impl AsynDeviceSupport {
     /// — the C `setEnums` call from `initCommon:314`. Discriminates the
     /// record family via [`EnumRecordShape::of_record`] and applies the
     /// [`enum_table_fields`] delta directly to the record. Anything that is
-    /// not an enum state record is left untouched. The runtime
-    /// re-propagation path ([`Self::property_post_receiver`]) reuses the
-    /// same [`enum_table_fields`] producer, posting the delta DBE_PROPERTY
-    /// instead of writing the record in-band.
+    /// not an enum state record is left untouched. The runtime callback
+    /// ([`Self::subscribe_enum`]) puts the same fields under the record's
+    /// lock and posts DBE_PROPERTY on VAL.
     fn apply_enum_table(&self, record: &mut dyn Record, entries: &[crate::param::EnumEntry]) {
         let Some(shape) = EnumRecordShape::of_record(record) else {
             return;
@@ -3964,21 +4101,16 @@ impl DeviceSupport for AsynDeviceSupport {
             if let Err(dead) = self.sync_io_connect(drv_user, "EnumSyncIO") {
                 return Ok(dead);
             }
-            self.enum_shape = Some(shape);
             let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
-                    // The table setEnums leaves in the record, which is also
-                    // what a ring slot carries back, and the runtime
-                    // callback's diff seed.
                     let entries = clamp_enum_table(&entries);
                     self.apply_enum_table(record, &entries);
-                    self.enum_choices = Some(entries);
+                    *self.enum_applied.lock() = Some(entries);
                 }
             }
-            match self.subscribe_enum() {
-                Ok(rx) => self.enum_intr_rx = Some(rx),
-                Err(e) => self.report_register_refusal(Register::Enum, &e),
+            if let Err(e) = self.subscribe_enum(shape) {
+                self.report_register_refusal(Register::Enum, &e);
             }
         }
 
@@ -4227,6 +4359,7 @@ impl DeviceSupport for AsynDeviceSupport {
             if let Some(Delivery {
                 entry: ci,
                 store,
+                in_record,
                 spent,
                 ..
             }) = entry
@@ -4321,6 +4454,11 @@ impl DeviceSupport for AsynDeviceSupport {
                             self.last_alarm_severity = severity;
                         }
                     }
+                } else if in_record && good {
+                    // "Data has already been copied to the record in
+                    // interruptCallback" (devAsynOctet.c:772,
+                    // devAsynXXXArray.cpp:301).
+                    read_outcome = stored(true);
                 } else if spent {
                     read_outcome = stored(false);
                 }
@@ -4657,8 +4795,9 @@ impl DeviceSupport for AsynDeviceSupport {
 
     fn bind_database(&mut self, db: epics_base_rs::server::database::AsyncDbHandle) {
         if let Some(src) = self.device_job.write_read.get() {
-            let _ = src.db.set(db);
+            let _ = src.db.set(db.clone());
         }
+        self.db = Some(db);
     }
 
     fn async_write_completed_common(
@@ -4900,51 +5039,6 @@ impl DeviceSupport for AsynDeviceSupport {
         // keep the full output stage on callback cycles, like any C
         // `dbProcess`.
         self.asyn_readback
-    }
-
-    fn property_post_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<PropertyPost>> {
-        // Runtime asynEnum table re-propagation. C devAsynInt32.c registers a
-        // per-record enum callback (callbackEnum, :712-766) that re-applies
-        // `setEnums` + `db_post_events(DBE_PROPERTY)` whenever the driver
-        // changes the table via `doCallbacksEnum`. Gate exactly as C's
-        // `findInterface(asynEnumType) && maxEnums>0`: only a record that
-        // exposed an enum state family on a port with asynEnum (so
-        // `enum_shape` is set) arms the callback. Independent of SCAN —
-        // a property post is not a value scan, so it never processes the
-        // record.
-        let shape = self.enum_shape?;
-
-        let mut intr_rx = self.enum_intr_rx.take()?;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let mut last_choices = self.enum_choices.clone();
-        crate::runtime::task::spawn(async move {
-            while let Some(iv) = intr_rx.recv().await {
-                let crate::param::ParamValue::Enum { choices, .. } = &iv.value else {
-                    continue;
-                };
-                let changed = match &last_choices {
-                    Some(prev) => prev.as_ref() != choices.as_ref(),
-                    None => true,
-                };
-                if !changed {
-                    continue;
-                }
-                last_choices = Some(choices.clone());
-                // C posts on VAL for every one of the eight callbacks —
-                // mbbi/mbbo (`&pr->val` after a 16-state setEnums) and bi/bo
-                // (2-state) alike — so the target is uniform across both
-                // `EnumRecordShape`s and needs no per-shape branch.
-                let post = PropertyPost {
-                    writes: enum_table_fields(shape, choices),
-                    post_field: "VAL".to_string(),
-                };
-                if tx.send(post).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Some(rx)
     }
 }
 
@@ -8031,57 +8125,6 @@ mod tests {
         }
     }
 
-    /// C's enum callbacks return before `setEnums` and the DBE_PROPERTY post
-    /// while `interruptAccept` is false (devAsynInt32.c:718/:732/:746/:760,
-    /// devAsynUInt32Digital.c:553/:567/:581/:595). The gate is read when the
-    /// callback fires: on a current-thread runtime the consumer task cannot
-    /// drain before the gate opens, so a drain-time read would post it.
-    #[tokio::test]
-    async fn an_enum_table_before_the_gate_opens_is_not_applied_or_posted() {
-        use crate::interrupt::InterruptValue;
-        use crate::param::{EnumEntry, ParamValue};
-        use epics_base_rs::server::records::mbbi::MbbiRecord;
-        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
-
-        let gate = InterruptGate::new();
-        let init: Arc<[EnumEntry]> =
-            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
-        let mut ads = make_enum_adapter(init);
-        ads.bind_interrupt_gate(&gate);
-        let mut rec = MbbiRecord::new(0);
-        ads.init(&mut rec).unwrap();
-        let mut rx = ads.property_post_receiver().expect("armed");
-        let table: Arc<[EnumEntry]> =
-            Arc::from(vec![enum_entry("LOW", 0, 0), enum_entry("HIGH", 1, 1)]);
-        let (reason, addr, interrupts) = (ads.reason, ads.addr, ads.handle.interrupts().clone());
-        let fire = || {
-            interrupts.notify(InterruptValue {
-                reason,
-                addr,
-                value: ParamValue::Enum {
-                    index: 0,
-                    choices: table.clone(),
-                },
-                ..Default::default()
-            });
-        };
-
-        fire();
-        gate.set(true);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "fired closed, drained open: the table is not posted"
-        );
-
-        fire();
-        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("open: the table is applied and posted")
-            .expect("channel open");
-        assert_eq!(post.post_field, "VAL");
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_callback_before_the_records_gate_opens_leaves_the_ring_empty() {
         use epics_base_rs::server::records::longin::LonginRecord;
@@ -9232,87 +9275,17 @@ mod tests {
         assert_eq!(get("OSV"), Some(EpicsValue::Short(1)));
     }
 
-    /// C `setEnums` keeps 16 states of 25-byte strings (devAsynInt32.c:65-66),
-    /// so a driver table past either limit equals what the ring carries back:
-    /// a value-only interrupt posts nothing, and a real change still does.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_driver_table_past_the_setenums_limits_posts_nothing_on_a_value_change() {
-        use crate::interrupt::InterruptValue;
-        use crate::param::{EnumEntry, ParamValue};
-        use epics_base_rs::server::records::mbbi::MbbiRecord;
-
-        let long = "A_VERY_LONG_STATE_NAME_OF_THIRTY";
-        let mut table = vec![enum_entry(long, 0, 0), enum_entry("ON", 1, 0)];
-        for i in 2..30 {
-            table.push(enum_entry(&format!("S{i}"), i, 0));
-        }
-        let table: Arc<[EnumEntry]> = Arc::from(table);
-        let mut ads = make_enum_adapter(table.clone());
-        let gate = open_gate();
-        ads.bind_interrupt_gate(&gate);
-        let mut rec = MbbiRecord::new(0);
-        ads.init(&mut rec).unwrap();
-        let mut rx = ads.property_post_receiver().expect("armed");
-
-        let notify = |ads: &AsynDeviceSupport, index, choices: Arc<[EnumEntry]>| {
-            ads.handle.interrupts().notify(InterruptValue {
-                reason: ads.reason,
-                addr: ads.addr,
-                value: ParamValue::Enum { index, choices },
-                ..Default::default()
-            });
-        };
-        notify(&ads, 1, table.clone());
-        // The mailbox keeps the latest value, so let the receiver drain this
-        // one before the change replaces it.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), rx.recv())
-                .await
-                .is_err(),
-            "a value-only interrupt posts no DBE_PROPERTY"
-        );
-        let changed: Arc<[EnumEntry]> = Arc::from(vec![enum_entry("LOW", 0, 0)]);
-        notify(&ads, 0, changed);
-        // The value-only interrupt was consumed before the change arrived; a
-        // coalesce would mean the change replaced it unread and the silence
-        // above proved nothing.
-        assert_eq!(
-            ads.handle.interrupts().coalesce_count(),
-            0,
-            "the value-only interrupt must be drained before the change"
-        );
-        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("the table change posts")
-            .expect("channel open");
-        assert!(
-            post.writes
-                .iter()
-                .any(|(f, v)| f == "ZRST" && *v == EpicsValue::String("LOW".into())),
-            "the first post is the real change, not the value-only interrupt: {:?}",
-            post.writes
-        );
-    }
-
-    /// Runtime asynEnum re-propagation: after init captures the table, a
-    /// driver enum-table change delivered through the interrupt path must
-    /// surface on the `property_post_receiver` channel as the new mbb field
-    /// block — but an interrupt carrying the SAME choices (a value-only
-    /// change) must fire NO post (C's asynEnum callback only runs on a table
-    /// change, never on an int32 value callback).
     /// C `initCommon` registers `callbackEnum` in `init_record`, right after
-    /// `setEnums` (devAsynInt32.c:317-323); iocInit's `property_post_receiver`
-    /// only takes that registration.
+    /// `setEnums` (devAsynInt32.c:317-323).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enum_registers_in_init() {
         use crate::param::EnumEntry;
         use epics_base_rs::server::records::mbbi::MbbiRecord;
         let choices: Arc<[EnumEntry]> = Arc::from(vec![enum_entry("OFF", 0, 0)]);
-        let mut ads = make_enum_adapter(choices);
+        let mut ads = make_enum_adapter(choices.clone());
         ads.init(&mut MbbiRecord::new(0)).unwrap();
         assert!(ads.enum_interrupt_sub.is_some(), "after init");
-        assert!(ads.property_post_receiver().is_some(), "at iocInit");
-        assert!(ads.property_post_receiver().is_none(), "registered once");
+        assert_eq!(ads.enum_applied.lock().as_deref(), Some(&*choices));
     }
 
     /// C enters the asynEnum block on `findInterface(asynEnumType) &&
@@ -9334,82 +9307,12 @@ mod tests {
                 ads.handle.set_interfaces(caps);
             }
             ads.init(&mut MbbiRecord::new(0)).unwrap();
-            assert!(ads.enum_choices.is_none(), "the Int32 param has no table");
+            assert!(
+                ads.enum_applied.lock().is_none(),
+                "the Int32 param has no table"
+            );
             assert_eq!(ads.enum_interrupt_sub.is_some(), registered, "{enum_iface}");
-            assert_eq!(ads.property_post_receiver().is_some(), registered);
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn property_post_receiver_emits_only_on_table_change() {
-        use crate::interrupt::InterruptValue;
-        use crate::param::{EnumEntry, ParamValue};
-        use epics_base_rs::server::records::mbbi::MbbiRecord;
-
-        let init_choices: Arc<[EnumEntry]> =
-            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
-        let mut ads = make_enum_adapter(init_choices.clone());
-        let gate = open_gate();
-        ads.bind_interrupt_gate(&gate);
-        let mut rec = MbbiRecord::new(0);
-        ads.init(&mut rec).unwrap();
-
-        let mut rx = ads
-            .property_post_receiver()
-            .expect("enum record arms the property callback");
-
-        // 1. A value-only interrupt (same choices) → no post.
-        ads.handle.interrupts().notify(InterruptValue {
-            reason: ads.reason,
-            addr: ads.addr,
-            value: ParamValue::Enum {
-                index: 1,
-                choices: init_choices.clone(),
-            },
-            ..Default::default()
-        });
-
-        // 2. A table-change interrupt (new choices) → post the new block.
-        let new_choices: Arc<[EnumEntry]> = Arc::from(vec![
-            enum_entry("LOW", 0, 0),
-            enum_entry("MID", 1, 1),
-            enum_entry("HIGH", 2, 2),
-        ]);
-        ads.handle.interrupts().notify(InterruptValue {
-            reason: ads.reason,
-            addr: ads.addr,
-            value: ParamValue::Enum {
-                index: 0,
-                choices: new_choices.clone(),
-            },
-            ..Default::default()
-        });
-
-        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("property post must arrive within timeout")
-            .expect("channel open");
-        // C names `&pr->val` in all eight callbacks; the setEnums block below
-        // is written, never posted on.
-        assert_eq!(post.post_field, "VAL");
-        let get = |name: &str| {
-            post.writes
-                .iter()
-                .find(|(f, _)| f == name)
-                .map(|(_, v)| v.clone())
-        };
-        // The delivered block is the NEW table (value-only #1 was suppressed).
-        assert_eq!(get("ZRST"), Some(EpicsValue::String("LOW".into())));
-        assert_eq!(get("ONST"), Some(EpicsValue::String("MID".into())));
-        assert_eq!(get("TWST"), Some(EpicsValue::String("HIGH".into())));
-        assert_eq!(get("TWVL"), Some(EpicsValue::ULong(2)));
-        assert_eq!(get("TWSV"), Some(EpicsValue::Short(2)));
-
-        // No further post is queued (the value-only interrupt produced none).
-        assert!(
-            rx.try_recv().is_err(),
-            "value-only interrupt must not post a property update"
-        );
     }
 
     /// The interface traits are asynInt32Base/asynInt64Base, whose getBounds
@@ -10153,13 +10056,13 @@ mod tests {
     fn a_take_counts_held_callbacks_once() {
         let mut f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
         f.resize(0);
-        f.hold(intr_entry(1, 1));
+        f.hold(intr_entry(1, 1), false);
         assert_eq!(f.pop().map(|d| d.backlog), Some(false), "one held");
-        f.hold(intr_entry(2, 2));
-        f.hold(intr_entry(3, 3));
+        f.hold(intr_entry(2, 2), false);
+        f.hold(intr_entry(3, 3), false);
         assert_eq!(f.pop().map(|d| d.backlog), Some(true), "two held");
         assert!(f.pop().is_none());
-        f.hold(intr_entry(4, 4));
+        f.hold(intr_entry(4, 4), false);
         f.push_with_overflow(intr_entry(5, 5));
         assert_eq!(f.pop().map(|d| d.backlog), Some(true), "held + owed");
         assert!(f.pop().is_none(), "C's gotValue stays one ahead here");
@@ -14218,51 +14121,5 @@ mod tests {
             sequence.lock().unwrap().is_empty(),
             "empty command must perform no driver I/O"
         );
-    }
-
-    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed under
-    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
-    /// A table fired on the asynEnum interface (`do_callbacks_enum` for a param
-    /// that is not an `Enum`) reaches an `asynInt32` record's property
-    /// callback: that callback is the record's asynEnum client, not a second
-    /// asynInt32 one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn property_post_receiver_takes_a_table_fired_on_the_enum_interface() {
-        use crate::interrupt::InterruptValue;
-        use crate::param::{EnumEntry, ParamValue};
-        use epics_base_rs::server::records::mbbi::MbbiRecord;
-
-        let init_choices: Arc<[EnumEntry]> =
-            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
-        let mut ads = make_enum_adapter_as(init_choices, "asynInt32");
-        let gate = open_gate();
-        ads.bind_interrupt_gate(&gate);
-        let mut rec = MbbiRecord::new(0);
-        ads.init(&mut rec).unwrap();
-        let mut rx = ads
-            .property_post_receiver()
-            .expect("enum record arms the property callback");
-
-        ads.handle.interrupts().notify(InterruptValue {
-            reason: ads.reason,
-            addr: ads.addr,
-            value: ParamValue::Enum {
-                index: 0,
-                choices: Arc::from(vec![enum_entry("LOW", 0, 0), enum_entry("HIGH", 5, 0)]),
-            },
-            iface: Some(crate::interfaces::InterfaceType::Enum),
-            ..Default::default()
-        });
-
-        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("property post must arrive within timeout")
-            .expect("channel open");
-        let onst = post
-            .writes
-            .iter()
-            .find(|(f, _)| f == "ONST")
-            .map(|(_, v)| v);
-        assert_eq!(onst, Some(&EpicsValue::String("HIGH".into())));
     }
 }

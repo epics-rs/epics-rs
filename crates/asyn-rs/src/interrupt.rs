@@ -297,6 +297,21 @@ pub(crate) fn clamp_enum_table(
         .collect()
 }
 
+/// Whether [`clamp_enum_table`] of `fired` is `applied`, allocating nothing,
+/// so a value callback can ask it inline in the driver's notify.
+#[cfg(any(feature = "epics", test))]
+pub(crate) fn clamps_to(
+    fired: &[crate::param::EnumEntry],
+    applied: &[crate::param::EnumEntry],
+) -> bool {
+    fired.len().min(MAX_ENUM_STATES) == applied.len()
+        && fired.iter().zip(applied).all(|(f, a)| {
+            f.string[..setenums_string_len(&f.string)] == a.string
+                && f.value == a.value
+                && f.severity == a.severity
+        })
+}
+
 /// C `MAX_ENUM_STATES` (devAsynInt32.c:65): the most choices a record takes.
 pub const MAX_ENUM_STATES: usize = 16;
 
@@ -1439,6 +1454,29 @@ mod tests {
         let t = super::clamp_enum_table(&[entry("ON\0junk", 7)]);
         assert_eq!(t[0].string, "ON");
         assert_eq!(t[0].value, 7);
+    }
+
+    /// A driver table past C `setEnums`' limits (devAsynInt32.c:65-66) is the
+    /// table already applied once clamped, so its value fire is no change.
+    #[test]
+    fn clamps_to_reads_a_table_past_the_setenums_limits_as_its_clamp() {
+        let long = "A_VERY_LONG_STATE_NAME_OF_THIRTY";
+        let mut table = vec![entry(long, 0), entry("ON\0junk", 1)];
+        for i in 2..30 {
+            table.push(entry(&format!("S{i}"), i));
+        }
+        let applied = super::clamp_enum_table(&table);
+        assert!(super::clamps_to(&table, &applied));
+        assert!(super::clamps_to(&applied, &applied));
+        table[15].value = 99;
+        assert!(!super::clamps_to(&table, &applied), "a kept state changed");
+        table[15].value = 15;
+        table[20].value = 99;
+        assert!(
+            super::clamps_to(&table, &applied),
+            "a dropped state changed"
+        );
+        assert!(!super::clamps_to(&table[..15], &applied), "one state fewer");
     }
 
     /// Boundary — a port follows its owner's gate only; one with none is

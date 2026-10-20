@@ -1048,31 +1048,6 @@ pub trait DeviceSupport: Send + Sync + 'static {
         None
     }
 
-    /// Return a receiver of out-of-band PROPERTY-class field posts.
-    ///
-    /// C parity: `registerInterruptUser(callbackEnum)` (devAsynInt32.c:319)
-    /// plus the per-record enum callback
-    /// (`interruptCallbackEnumMbbi`/`…Bi`, devAsynInt32.c:712-766), which
-    /// calls `setEnums` to re-key the record's state strings/values/
-    /// severities and then `db_post_events(precord, &precord->val,
-    /// DBE_PROPERTY)` so CA/PVA clients re-read the enum choices. This is
-    /// driven by the driver's `doCallbacksEnum`, independent of the
-    /// record's `SCAN` (it is not a value scan, so it does not process the
-    /// record).
-    ///
-    /// Each delivered message is one [`PropertyPost`]: the field block to
-    /// write (the C `setEnums` block) and, separately, the single field
-    /// `db_post_events` names. The framework drains this receiver and calls
-    /// [`crate::server::database::PvDatabase::post_property`].
-    /// Mirrors [`io_intr_receiver`](Self::io_intr_receiver): the device owns
-    /// the source subscription, the framework owns the post. Default:
-    /// `None` (device drives no property posts).
-    fn property_post_receiver(
-        &mut self,
-    ) -> Option<crate::runtime::sync::mpsc::Receiver<PropertyPost>> {
-        None
-    }
-
     /// Whether this device posts monitors itself: after `init_common`,
     /// `get_ioint_info`, `io_intr_callback` and `write_begin_common` the
     /// record's holder posts

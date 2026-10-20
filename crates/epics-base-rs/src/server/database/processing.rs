@@ -4560,6 +4560,9 @@ impl PvDatabase {
             inst.notify_field_written(&field);
             written.push(field);
         }
+        // Likewise a source the dset wrote in place before it asked for the
+        // post (devOpcua.cpp:710-732).
+        inst.settle_metadata_cache();
         inst.notify_field(&post.post_field, crate::server::recgbl::EventMask::PROPERTY);
         Ok(written)
     }

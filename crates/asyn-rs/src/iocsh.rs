@@ -1203,7 +1203,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = arg_str(args, 0)?.filter(|s| !s.is_empty());
                 let addr = arg_int(args, 1).unwrap_or(-1) as i32;
-                let size = arg_int(args, 2).unwrap_or(0).max(0) as usize;
+                // C's `int size` reaches setTraceIOTruncateSize as a `size_t`,
+                // so a negative one sign-extends into a size it refuses.
+                let typed = arg_int(args, 2).unwrap_or(0) as i32;
+                let size = typed as usize;
                 // UPSTREAM DEFECT (asynShellCommands.c:923): the same
                 // strlen(portName) as asynSetTraceFile; no port name is global.
                 let trace = match trace_for(&mgr_r, port.as_deref()) {
@@ -1217,10 +1220,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // asynUser to (port, addr) first, so `addr >= 0` writes the
                 // device's dpCommon and `addr < 0` the port's
                 // (asynManager.c:2957-2984 via findTracePvt).
-                match port.as_deref() {
+                let set = match port.as_deref() {
                     Some(p) if addr >= 0 => trace.set_device_io_truncate_size(p, addr, size),
                     Some(p) => trace.set_io_truncate_size(Some(p), size),
                     None => trace.set_io_truncate_size(None, size),
+                };
+                // UPSTREAM DEFECT (asynShellCommands.c:929-931): C prints the
+                // asynUser's errorMessage, which the refusal never writes — a
+                // blank line, or connectDevice's stale text on the global rung.
+                if set.is_err() {
+                    ctx.println(&format!(
+                        "asynSetTraceIOTruncateSize: size {typed} cannot be allocated"
+                    ));
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -2983,6 +2994,33 @@ mod tests {
         assert_eq!(
             trace.snapshot(Some("trunc_port"), None).io_truncate_size,
             40
+        );
+    }
+
+    /// C hands `int size` to `setTraceIOTruncateSize` as a `size_t`, so a
+    /// negative size is one `calloc` refuses and nothing changes
+    /// (asynShellCommands.c:916-931, asynManager.c:2963-2975); the shell
+    /// clamped it to 0 and wrote that.
+    #[test]
+    fn iocsh_set_trace_io_truncate_size_refuses_a_negative_size() {
+        let mgr = fresh_mgr_with_multi_device_port("trunc_neg_port", 8);
+        let trace = mgr.trace_manager().clone();
+        let out = shell_output(
+            mgr,
+            &[
+                "asynSetTraceIOTruncateSize trunc_neg_port -1 40",
+                "asynSetTraceIOTruncateSize trunc_neg_port -1 -1",
+            ],
+        );
+        assert_eq!(
+            trace
+                .snapshot(Some("trunc_neg_port"), None)
+                .io_truncate_size,
+            40
+        );
+        assert_eq!(
+            out,
+            "asynSetTraceIOTruncateSize: size -1 cannot be allocated\n"
         );
     }
 

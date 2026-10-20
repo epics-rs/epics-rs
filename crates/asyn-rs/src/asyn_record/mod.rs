@@ -26,7 +26,7 @@ pub use crate::registry::{
 use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan, RegisterRefusal};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -404,6 +404,11 @@ fn open_trace_file(tfil: &str) -> std::io::Result<TraceFile> {
 
 // ===== AsynRecord =====
 
+// `AsynRecord::own_raise` states.
+const RAISE_IDLE: u8 = 0;
+const RAISE_OPEN: u8 = 1;
+const RAISE_HEARD: u8 = 2;
+
 /// Full asynRecord with all 67 fields.
 pub struct AsynRecord {
     // --- Address fields ---
@@ -553,10 +558,10 @@ pub struct AsynRecord {
     // both, the callback refreshes under the record's hold at once, as C
     // does, and never sets this flag.
     status_dirty: Arc<AtomicBool>,
-    // Set by [`AsynRecord::raise_exception`] while one of the record's own
-    // setters runs, so the registered callback leaves that exception to the
-    // refresh `special()` runs after it.
-    own_raise: Arc<AtomicBool>,
+    // The window [`AsynRecord::raise_exception`] holds open while one of the
+    // record's own setters runs: `RAISE_OPEN`, or `RAISE_HEARD` once the
+    // registered callback has left an exception to the refresh after it.
+    own_raise: Arc<AtomicU8>,
     // Owner handle for the registered exception callback so it can
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
@@ -2834,12 +2839,13 @@ impl AsynRecord {
         let value = self.tsiz as usize;
         self.raise_exception(|rec| {
             let rung = rec.trace_rung();
-            match (rung.port, rung.addr) {
+            // special() drops the status.
+            let _ = match (rung.port, rung.addr) {
                 (Some(port), Some(addr)) => {
                     rung.trace.set_device_io_truncate_size(port, addr, value)
                 }
                 (port, _) => rung.trace.set_io_truncate_size(port, value),
-            }
+            };
         });
     }
 
@@ -2850,11 +2856,14 @@ impl AsynRecord {
     /// callback stands down while `own_raise` is set — the setter announces
     /// before it returns, on the port actor before its reply — and a foreign
     /// exception it skips in that window is read by the refresh after it.
+    ///
+    /// The refresh runs only when an exception reached the callback, as C's
+    /// does: a set the port refuses announces nothing (`setTraceIOTruncateSize`,
+    /// asynManager.c:2963-2975) and leaves every field as it was put.
     fn raise_exception(&mut self, set: impl FnOnce(&Self)) {
-        self.own_raise.store(true, Ordering::Release);
+        self.own_raise.store(RAISE_OPEN, Ordering::Release);
         set(self);
-        self.own_raise.store(false, Ordering::Release);
-        if self.except_cb.is_some() {
+        if self.own_raise.swap(RAISE_IDLE, Ordering::AcqRel) == RAISE_HEARD {
             self.monitor_status();
         }
     }
@@ -2968,8 +2977,14 @@ impl AsynRecord {
         // so `asynReport` counts it there and another device's exceptions
         // never reach it.
         self.except_cb = self.device_user.exception_callback_add(move |_| {
-            if own_raise.load(Ordering::Acquire) {
-                return;
+            match own_raise.compare_exchange(
+                RAISE_OPEN,
+                RAISE_HEARD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(RAISE_HEARD) => return,
+                Err(_) => {}
             }
             let Some((name, db)) = immediate.clone() else {
                 dirty.store(true, Ordering::Release);
@@ -7384,7 +7399,7 @@ mod tests {
 
         // A foreign `asynSetTraceIOTruncateSize` — the iocsh path, not this
         // record — must show up in TSIZ on the next monitorStatus.
-        trace.set_io_truncate_size(Some(port_name), 17);
+        trace.set_io_truncate_size(Some(port_name), 17).unwrap();
         rec.monitor_status();
         assert_eq!(rec.tsiz, 17);
         assert_eq!(rec.tfil, "Unknown", "the trace file did not change");
@@ -7400,6 +7415,67 @@ mod tests {
         trace.set_trace_file(Some(port_name), TraceFile::Stderr);
         rec.monitor_status();
         assert_eq!(rec.tfil, "Unknown");
+    }
+
+    /// C refreshes the putting record's status from `exceptCallback`, which
+    /// only an announced set reaches (asynRecord.c:451, :911-916). A TSIZ the
+    /// port refuses announces nothing (asynManager.c:2963-2975), so TSIZ keeps
+    /// the value put and the port keeps its size: `caput A.TSIZ -1` after 100
+    /// reads A.TSIZ -1, B.TSIZ 100.
+    #[test]
+    fn a_refused_tsiz_keeps_the_put_value_and_the_port_size() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct D(PortDriverBase);
+        impl PortDriver for D {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "refused_tsiz";
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(
+            Box::new(D(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ))),
+            rx,
+        );
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let trace = Arc::new(TraceManager::new());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            trace.clone(),
+        );
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        assert!(rec.except_cb.is_some(), "the refresh under test is armed");
+        rec.tsiz = 100;
+        rec.special("TSIZ", true, &Default::default()).unwrap();
+        assert_eq!(rec.tsiz, 100);
+
+        rec.tsiz = -1;
+        rec.special("TSIZ", true, &Default::default()).unwrap();
+        assert_eq!(rec.tsiz, -1, "no exception, so no monitorStatus refresh");
+        assert_eq!(trace.snapshot(Some(port_name), None).io_truncate_size, 100);
     }
 
     #[test]
@@ -7816,7 +7892,7 @@ mod tests {
         let mut fresh = AsynRecord::default();
         fresh.tfil = String::new();
         fresh.read_trace_state();
-        trace.set_io_truncate_size(None, size_before);
+        trace.set_io_truncate_size(None, size_before).unwrap();
         assert_eq!(rec.errs, "", "the refused mask write reports nothing");
         assert_eq!(
             fresh.tmsk,
@@ -13286,10 +13362,10 @@ A.OEOS
                     .unwrap();
                 Arc::clone(&rec.own_raise)
             };
-            own_raise.store(true, Ordering::Release);
+            own_raise.store(RAISE_OPEN, Ordering::Release);
             let h = handle.clone();
             on_thread(Box::new(move || h.disconnect_blocking().unwrap()));
-            own_raise.store(false, Ordering::Release);
+            own_raise.store(RAISE_IDLE, Ordering::Release);
             let rec = held
                 .record
                 .as_any_mut()

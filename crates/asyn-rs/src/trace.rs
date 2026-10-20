@@ -479,6 +479,23 @@ impl Default for TraceConfig {
     }
 }
 
+/// C `setTraceIOTruncateSize`'s `asynError`: the `calloc` that grows
+/// `traceBuffer` to the new size failed, and C returns before it writes the
+/// size or announces anything (asynManager.c:2963-2975). Every negative
+/// `epicsInt32` size lands here, sign-extended past what any allocation can
+/// hold; `isize::MAX` is that bound in Rust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncateSizeRefused(pub usize);
+
+impl TruncateSizeRefused {
+    fn check(size: usize) -> Result<(), Self> {
+        match std::alloc::Layout::array::<u8>(size) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Self(size)),
+        }
+    }
+}
+
 /// One port's `dpCommon` trace state — C's `port` struct as the trace
 /// facility sees it (asynManager.c:512-531).
 ///
@@ -1184,7 +1201,13 @@ impl TraceManager {
     /// C also re-allocates `traceBuffer` to `size` when the new truncate size
     /// exceeds the current buffer (asynManager.c:2963-2979) — see
     /// [`TraceConfig::trace_buffer_size`], which bounds the errlog ESCAPE form.
-    pub fn set_io_truncate_size(&self, port: Option<&str>, size: usize) {
+    /// A size that buffer cannot be grown to is refused: [`TruncateSizeRefused`].
+    pub fn set_io_truncate_size(
+        &self,
+        port: Option<&str>,
+        size: usize,
+    ) -> Result<(), TruncateSizeRefused> {
+        TruncateSizeRefused::check(size)?;
         match port {
             Some(name) => self.write_one_slot(
                 name,
@@ -1204,6 +1227,7 @@ impl TraceManager {
                 // (asynManager.c:2981).
             }
         }
+        Ok(())
     }
 
     /// Per-device variant of [`Self::set_io_truncate_size`].
@@ -1212,7 +1236,13 @@ impl TraceManager {
     /// the truncate size into the device `dpCommon` resolved by
     /// `findTracePvt` when the asynUser carries a device, and announces
     /// `asynExceptionTraceIOTruncateSize` per device.
-    pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
+    pub fn set_device_io_truncate_size(
+        &self,
+        port: &str,
+        addr: i32,
+        size: usize,
+    ) -> Result<(), TruncateSizeRefused> {
+        TruncateSizeRefused::check(size)?;
         self.write_one_slot(
             port,
             Some(addr),
@@ -1222,6 +1252,7 @@ impl TraceManager {
                 cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
             },
         );
+        Ok(())
     }
 
     pub fn get_trace_mask(&self, port: Option<&str>) -> TraceMask {
@@ -2170,11 +2201,53 @@ mod tests {
     #[test]
     fn a_bigger_truncate_size_grows_the_trace_buffer_and_a_smaller_one_does_not_shrink_it() {
         let mgr = TraceManager::new();
-        mgr.set_io_truncate_size(None, 400);
+        mgr.set_io_truncate_size(None, 400).unwrap();
         assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
-        mgr.set_io_truncate_size(None, 8);
+        mgr.set_io_truncate_size(None, 8).unwrap();
         assert_eq!(mgr.global_config.lock().unwrap().io_truncate_size, 8);
         assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
+    }
+
+    /// A negative `epicsInt32` TSIZ reaches C `setTraceIOTruncateSize` as a
+    /// `size_t` no `calloc` can satisfy, and C returns `asynError` before it
+    /// writes or announces anything (asynManager.c:2963-2975). Every rung.
+    #[test]
+    fn an_unallocatable_truncate_size_is_refused_with_nothing_changed() {
+        use crate::exception::AsynException;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering as O;
+
+        let exc = Arc::new(ExceptionManager::new());
+        let mgr = TraceManager::new();
+        mgr.set_exception_sink(exc.clone());
+        mgr.register_port("p", true);
+        mgr.set_io_truncate_size(Some("p"), 100).unwrap();
+        mgr.set_device_io_truncate_size("p", 0, 100).unwrap();
+        mgr.set_io_truncate_size(None, 100).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = hits.clone();
+        exc.add_callback(move |ev| {
+            if ev.exception == AsynException::TraceIoTruncateSize {
+                h2.fetch_add(1, O::Relaxed);
+            }
+        });
+
+        for tsiz in [-1i32, i32::MIN] {
+            let refused = Err(TruncateSizeRefused(tsiz as usize));
+            assert_eq!(mgr.set_io_truncate_size(Some("p"), tsiz as usize), refused);
+            assert_eq!(
+                mgr.set_device_io_truncate_size("p", 0, tsiz as usize),
+                refused
+            );
+            assert_eq!(mgr.set_io_truncate_size(None, tsiz as usize), refused);
+        }
+
+        assert_eq!(mgr.snapshot(Some("p"), None).io_truncate_size, 100);
+        assert_eq!(mgr.snapshot(Some("p"), Some(0)).io_truncate_size, 100);
+        let global = mgr.global_config.lock().unwrap();
+        assert_eq!(global.io_truncate_size, 100);
+        assert_eq!(global.trace_buffer_size, 100);
+        assert_eq!(hits.load(O::Relaxed), 0, "a refusal announces nothing");
     }
 
     #[test]
@@ -2262,7 +2335,7 @@ mod tests {
         mgr.set_trace_info_mask(Some("p"), TraceInfoMask::PORT);
         // An I/O form is an operator's choice — a port has none by default.
         mgr.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
-        mgr.set_io_truncate_size(Some("p"), 3);
+        mgr.set_io_truncate_size(Some("p"), 3).unwrap();
 
         let dir = tempfile::tempdir().expect("fixture root");
         let temp = dir.path().join("asyn_trace_trunc_test.txt");
@@ -2324,7 +2397,7 @@ mod tests {
         mgr.set_trace_info_mask(Some("p"), TraceInfoMask::TIME);
         let file = TraceFile::Stderr;
         mgr.set_trace_file(Some("p"), file);
-        mgr.set_io_truncate_size(Some("p"), 16);
+        mgr.set_io_truncate_size(Some("p"), 16).unwrap();
         mgr.set_device_trace_mask("p", 3, TraceMask::ERROR);
 
         assert_eq!(n.load(O::Relaxed), 6);
@@ -2391,7 +2464,7 @@ mod tests {
             _ => {}
         });
         mgr.set_trace_file(None, TraceFile::Stderr);
-        mgr.set_io_truncate_size(None, 32);
+        mgr.set_io_truncate_size(None, 32).unwrap();
         assert_eq!(file_hits.load(O::Relaxed), 0);
         assert_eq!(trunc_hits.load(O::Relaxed), 0);
     }
@@ -2542,10 +2615,10 @@ mod tests {
         let mgr = TraceManager::new();
         mgr.register_port("p", true);
         mgr.set_trace_mask(Some("p"), TraceMask::IO_DRIVER);
-        mgr.set_io_truncate_size(Some("p"), 64);
+        mgr.set_io_truncate_size(Some("p"), 64).unwrap();
         // Device override: truncate to 3 bytes.
         mgr.set_device_trace_mask("p", 0, TraceMask::IO_DRIVER);
-        mgr.set_device_io_truncate_size("p", 0, 3);
+        mgr.set_device_io_truncate_size("p", 0, 3).unwrap();
         mgr.set_device_trace_info_mask("p", 0, TraceInfoMask::PORT);
         mgr.set_device_trace_io_mask("p", 0, TraceIoMask::ASCII);
 

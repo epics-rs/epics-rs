@@ -1290,12 +1290,12 @@ impl Record for EpidRecord {
     /// `VAL` via `multi_input_links` every cycle; the constant seed
     /// here matters for the supervisory (`SMSL=0`) case and for the
     /// first cycle before any process.
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         let parsed = epics_base_rs::server::record::parse_link_v2(&self.stpl);
         if parsed.link_type() == LinkType::Constant {
             if let Some(EpicsValue::Double(v)) = parsed.constant_value() {
                 self.val = v;
-                *udf = false;
+                *udf = 0;
             }
         }
         Ok(())

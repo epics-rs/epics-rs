@@ -8211,14 +8211,9 @@ impl RecordInstance {
         // because it is part of the same C pass: a creation path that ran the
         // passes but skipped the tail (iocsh `dbLoadRecords` did) left those
         // records UDF=1 where C has UDF=0.
-        // The `post_init_finalize_undef` hook is a cross-crate record-trait API
-        // over a `bool` (histogram/aao/mbboDirect implement it); bridge the raw
-        // `u8` carrier through it here at the single init owner.
-        let mut udf = self.common.udf != 0;
-        if let Err(e) = self.record.post_init_finalize_undef(&mut udf) {
+        if let Err(e) = self.record.post_init_finalize_undef(&mut self.common.udf) {
             crate::stderr_println!("post_init_finalize_undef failed for {name}: {e}");
         }
-        self.common.udf = udf as u8;
         // C `init_record` that calls `recGblResetAlarms(prec)` (asyn, table).
         // The born `UDF`/`INVALID` (and the UDF-severity derivation above) are
         // overwritten here: at init `nsta`/`nsev` are 0, so

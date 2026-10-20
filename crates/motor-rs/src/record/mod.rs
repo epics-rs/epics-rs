@@ -947,7 +947,7 @@ impl Record for MotorRecord {
     /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
     /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
     /// collection's first read (1994-2005).
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if !self.initialized {
             return Ok(());
         }
@@ -956,7 +956,7 @@ impl Record for MotorRecord {
             parse_link_v2(&self.links.dol),
             ParsedLink::None | ParsedLink::Constant(_)
         ) {
-            *udf = false;
+            *udf = 0;
         }
         Ok(())
     }
@@ -1401,9 +1401,9 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        let mut udf = CommonFields::default().udf != 0; // dbCommon default
+        let mut udf = CommonFields::default().udf; // dbCommon default
         rec.post_init_finalize_undef(&mut udf).unwrap();
-        assert!(!udf, "CONSTANT DOL motor is defined after init");
+        assert_eq!(udf, 0, "CONSTANT DOL motor is defined after init");
     }
 
     // C init_record returns before its tail with no dset or a failed dset
@@ -1411,9 +1411,9 @@ mod tests {
     #[test]
     fn a_record_whose_init_returns_early_stays_undefined() {
         let mut rec = MotorRecord::new();
-        let mut udf = true;
+        let mut udf = 1;
         rec.post_init_finalize_undef(&mut udf).unwrap();
-        assert!(udf);
+        assert_eq!(udf, 1);
         assert!(!rec.init_resets_alarms());
     }
 
@@ -1430,7 +1430,7 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        rec.post_init_finalize_undef(&mut true).unwrap();
+        rec.post_init_finalize_undef(&mut 1).unwrap();
         assert!(rec.ctrl.cnen, "CNEN follows EA_POSITION at init");
         assert_eq!(rec.internal.mmap, 0, "init monitor() drains the marks");
     }
@@ -1452,10 +1452,10 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        let mut udf = CommonFields::default().udf != 0;
+        let mut udf = CommonFields::default().udf;
         rec.post_init_finalize_undef(&mut udf).unwrap();
-        assert!(
-            udf,
+        assert_eq!(
+            udf, 1,
             "DB_LINK DOL motor stays undefined until the first DOL read"
         );
     }

@@ -5429,8 +5429,8 @@ impl Record for AsynRecord {
     /// C `asynRecord.c` init_record pass 0: `pasynRec->udf = 0;` (`:303`) —
     /// set unconditionally, before any connect, so a freshly loaded asyn
     /// record is defined even against a disconnected port.
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
-        *udf = false;
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
+        *udf = 0;
         Ok(())
     }
 

@@ -8540,12 +8540,12 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
 
     let mut rec = MbboDirectRecord::default();
-    // Operator set B3=1 in the .db; framework UDF=true (no VAL).
+    // Operator set B3=1 in the .db; framework UDF=1 (no VAL).
     rec.put_field("B3", EpicsValue::Char(1)).unwrap();
-    let mut udf = true;
+    let mut udf = 1;
     rec.post_init_finalize_undef(&mut udf).unwrap();
-    assert!(
-        !udf,
+    assert_eq!(
+        udf, 0,
         "UDF must be cleared once bits supplied an initial value"
     );
     assert!(matches!(rec.get_field("VAL"), Some(EpicsValue::Long(8))));
@@ -8554,10 +8554,10 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     // be derived from VAL, by the init tail (`mbboDirectRecord.c:142-143`).
     let mut rec2 = MbboDirectRecord::default();
     rec2.put_field("VAL", EpicsValue::Long(0b0101)).unwrap();
-    let mut udf2 = false;
+    let mut udf2 = 0;
     rec2.post_init_finalize_undef(&mut udf2).unwrap();
     rec2.init_record_tail(&mut epics_base_rs::server::record::CommonFields::default());
-    assert!(!udf2, "UDF stays cleared");
+    assert_eq!(udf2, 0, "UDF stays cleared");
     assert!(matches!(rec2.get_field("VAL"), Some(EpicsValue::Long(5))));
     // bits[0] and bits[2] should reflect VAL=5 (binary 0101). B0..B1F are
     // DBF_UCHAR, so mbboDirect serves the bit as the native unsigned `UChar`.
@@ -8567,9 +8567,9 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
 
     // Sibling case: nothing set — UDF stays true, VAL stays 0.
     let mut rec3 = MbboDirectRecord::default();
-    let mut udf3 = true;
+    let mut udf3 = 1;
     rec3.post_init_finalize_undef(&mut udf3).unwrap();
-    assert!(udf3, "UDF stays true when nothing initialised");
+    assert_eq!(udf3, 1, "UDF stays true when nothing initialised");
     assert!(matches!(rec3.get_field("VAL"), Some(EpicsValue::Long(0))));
 }
 

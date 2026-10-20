@@ -238,6 +238,11 @@ impl Record for BiRecord {
         true
     }
 
+    /// C `biRecord.c:237` `if (prec->udf == TRUE)`.
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// C `biRecord.c::checkAlarms` (biRecord.c:232-280 at `678092d03`; the
     /// AFTC/AFVL alarm filter reached `bi` five lines earlier in EPICS PR
     /// #817 `c9817fa59`, so it is `678092d03` that every `biRecord.c` number
@@ -245,7 +250,7 @@ impl Record for BiRecord {
     /// where checkAlarms is :220-243 and has no AFVL) — UDF
     /// alarm, STATE alarm (ZSV/OSV) through the AFTC alarm-range low-pass
     /// filter, and COS alarm (COSV). C `checkAlarms:237-240` raises
-    /// `UDF_ALARM/udfs` and returns early when `udf` is set; we mirror that
+    /// `UDF_ALARM/udfs` and returns early when `udf == TRUE`; we mirror that
     /// (raising UDF is idempotent with the framework's own `rec_gbl_check_udf`,
     /// which also runs on the process path). Unlike `mbbiRecord.c`, the `bi`
     /// UDF path does **not** zero `AFVL`, so this matches `biRecord.c` exactly.
@@ -253,7 +258,7 @@ impl Record for BiRecord {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
 
-        if common.udf != 0 {
+        if recgbl::udf_alarm_active(common.udf, self.udf_alarm_on_exact_one()) {
             recgbl::rec_gbl_set_sevr(
                 common,
                 alarm_status::UDF_ALARM,

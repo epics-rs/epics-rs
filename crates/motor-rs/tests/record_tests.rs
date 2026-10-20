@@ -7552,7 +7552,7 @@ fn test_runtime_srev_nonpositive_clamped_to_200() {
 /// The device's init and the rest of C init_record after it.
 fn init_device_half(rec: &mut MotorRecord, status: &asyn_rs::interfaces::motor::MotorStatus) {
     rec.initial_readback(status);
-    rec.post_init_finalize_undef(&mut true).unwrap();
+    rec.post_init_finalize_undef(&mut 1).unwrap();
 }
 
 /// A done driver status whose readback is `drbv`, a whole step at MRES

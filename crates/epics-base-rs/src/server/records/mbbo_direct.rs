@@ -425,10 +425,10 @@ impl Record for MbboDirectRecord {
     /// here: it must observe the constant-DOL seed, and the seed owner runs
     /// after this hook. It lives in [`Self::seed_deadband_tracking`], the
     /// post-seed tail, where C's own `bitsFromVAL` sits relative to the seed.
-    fn post_init_finalize_undef(&mut self, common_udf: &mut bool) -> CaResult<()> {
-        if *common_udf && self.bits.iter().any(|&b| b != 0) {
+    fn post_init_finalize_undef(&mut self, common_udf: &mut u8) -> CaResult<()> {
+        if *common_udf != 0 && self.bits.iter().any(|&b| b != 0) {
             self.bits_to_val();
-            *common_udf = false;
+            *common_udf = 0;
         }
         Ok(())
     }

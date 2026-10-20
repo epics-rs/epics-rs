@@ -5507,8 +5507,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     fn state_table_written(&mut self) {}
 
     /// Post-init finalisation hook with mutable access to the
-    /// framework's UDF flag. Called once after both `init_record`
-    /// passes complete. Default implementation is a no-op.
+    /// framework's UDF byte, C's `epicsUInt8`: a `.db` can load any value,
+    /// and a record that does not write it must leave it as loaded. Called
+    /// once after both `init_record` passes complete. Default implementation
+    /// is a no-op.
     ///
     /// epics-base PR `dabcf89` (mbboDirect): when VAL is undefined
     /// at init time but the user populated B0..B1F bits, the bits
@@ -5516,7 +5518,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// owns `common.udf`, so the record cannot mutate it from
     /// `init_record` alone — this hook is the controlled point of
     /// access.
-    fn post_init_finalize_undef(&mut self, _udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, _udf: &mut u8) -> CaResult<()> {
         Ok(())
     }
 
@@ -6567,13 +6569,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// `busyRecord.c:337`) do NOT raise UDF_ALARM for a `udf` byte that is
     /// neither 0 nor 1.
     ///
-    /// This only changes behavior for a record whose `udf` byte can actually
-    /// hold such a value at `checkAlarms` time — one that does NOT re-derive
-    /// `udf` every cycle ([`Record::clears_udf`] `== false`), reached via a
-    /// direct `caput .UDF 255` (or `-1`, stored as `255` in the `DBF_UCHAR`
-    /// field). For the re-deriving records (`clears_udf() == true`, e.g.
-    /// `bi`/`busy`/the calc family) the byte is always 0/1 here, so exact-one
-    /// and truthy agree and the flag is left at its default. Default `false`.
+    /// Any record's byte can hold such a value at `checkAlarms` time: a `.db`
+    /// load or a `UDF` put stores it verbatim, and a cycle that does not
+    /// re-derive it (bi's failed read) keeps it. Default `false`.
     fn udf_alarm_on_exact_one(&self) -> bool {
         false
     }

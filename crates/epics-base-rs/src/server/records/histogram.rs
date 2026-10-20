@@ -646,9 +646,9 @@ impl Record for HistogramRecord {
     /// The UDF half of the constant-SVL load (`devHistogramSoft.c:44-45`):
     /// `if (recGblInitConstantLink(...)) prec->udf = FALSE;`. UDF is a common
     /// field, which `init_record` cannot reach.
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if self.constant_svl_loaded {
-            *udf = false;
+            *udf = 0;
         }
         Ok(())
     }

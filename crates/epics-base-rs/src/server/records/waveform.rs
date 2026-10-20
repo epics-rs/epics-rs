@@ -1273,9 +1273,9 @@ impl Record for WaveformRecord {
     /// prec->udf = FALSE; }` (aaoRecord.c:371-374) — the UDF half of the
     /// constant-DOL load, which `init_record` cannot apply itself (UDF is a
     /// common field). An aao whose value came from a constant DOL is DEFINED.
-    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+    fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if self.constant_dol_loaded {
-            *udf = false;
+            *udf = 0;
         }
         Ok(())
     }

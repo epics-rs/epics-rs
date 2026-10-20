@@ -1691,7 +1691,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     // UDF gate does not pre-empt the trigger path — isolate the
     // CA-TRIG path under test.
     rec.stpl = "10.0".into();
-    let mut udf = true;
+    let mut udf = 1;
     rec.post_init_finalize_undef(&mut udf).unwrap();
 
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));

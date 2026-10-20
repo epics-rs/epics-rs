@@ -210,6 +210,15 @@ impl DbStatus {
     pub const BAD_DBRTYPE: Self = Self::of((511 << 16) | 3);
     /// `S_dev_missingSup`: a `process()` whose dset routine is absent.
     pub const MISSING_SUP: Self = Self::of((514 << 16) | 5);
+    /// pcas `S_casApp_canceledAsyncIO` (`casdef.h:95`), which no `errSymTbl`
+    /// names, so it reads "Error (523,7)".
+    pub const CANCELED_ASYNC_IO: Self = Self::of((523 << 16) | 7);
+    /// pcas `S_cas_badType` (`casdef.h:61`), unnamed too.
+    pub const CAS_BAD_TYPE: Self = Self::of((521 << 16) | 14);
+    /// pcas `S_casApp_noSupport` (`casdef.h:92`), unnamed too.
+    pub const CAS_APP_NO_SUPPORT: Self = Self::of((523 << 16) | 4);
+    /// pcas `S_cas_noWrite` (`casdef.h:67`), unnamed too.
+    pub const CAS_NO_WRITE: Self = Self::of((521 << 16) | 20);
 
     const fn of(status: i32) -> Self {
         match Self::new(status) {

@@ -1302,7 +1302,10 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 
     let server = CaServer::builder()
         .port(0)
-        .pv("WRBAD:PV", EpicsValue::Double(0.0))
+        .record(
+            "WRBAD:PV",
+            epics_base_rs::server::records::ao::AoRecord::new(0.0),
+        )
         .build()
         .await
         .expect("build CA server");
@@ -2073,7 +2076,10 @@ async fn server_read_notify_bad_type_closes_silently() {
 
     let server = CaServer::builder()
         .port(0)
-        .pv("RDBAD:PV", EpicsValue::Double(0.0))
+        .record(
+            "RDBAD:PV",
+            epics_base_rs::server::records::ao::AoRecord::new(0.0),
+        )
         .build()
         .await
         .expect("build CA server");

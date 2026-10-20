@@ -113,12 +113,11 @@
 //! question: it queues, so neither loop has a database-level refusal to
 //! relay.
 //!
-//! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
-//! async branch a READ can reach; it is unreachable for a local record
-//! (`try_get_read_snapshot_local` returns `Some`). A blocking driver serving
-//! a hooked (gateway) PV would drive that upstream fetch under `park_on` with
-//! no reactor and the client thread would block — so this driver targets
-//! local-record IOCs, and hooked-PV routing is S1c background-executor work.
+//! A READ goes async only on a gateway PV (a `-no_cache` read hook or a pending
+//! PV), which `handle_client` answers later through `ParkedReads`; it is
+//! unreachable for a local record (`try_get_read_snapshot_local` returns
+//! `Some`). The gateway is `tokio_backend`-only, as C's is `PROD_HOST`, so this
+//! driver refuses such a READ rather than block the client thread on it.
 //!
 //! Framing parity is also coarser than `handle_client`: the malformed-frame
 //! refuse-but-keep-serving edges (ECA_TOLARGE / ECA_DEFUNCT drain,
@@ -144,6 +143,7 @@ use epics_base_rs::runtime::task::{
 };
 use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::pv::IoBlocked;
 use tokio::sync::mpsc;
 
 use crate::protocol::{
@@ -157,7 +157,7 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::stats::ServerStats;
 use crate::server::tcp::{
-    CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
+    CancelInfo, ChannelTarget, ClientState, Dispatched, EventTaskControl, MonitorDelivery,
     RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
     cancel_subscription_reply, dispatch_message, is_peer_disconnect, log_circuit,
     print_forcing_disconnect, refuse_bad_tcp_command, register_subscription, report_gate_error,
@@ -1644,7 +1644,7 @@ fn handle_client_blocking(
                         Ok(Ok(SubscriptionOutcome::Circuit(_))) => {
                             unreachable!("HandOff mode never spawns a task")
                         }
-                        Ok(Ok(SubscriptionOutcome::Retired)) => {}
+                        Ok(Ok(SubscriptionOutcome::Refused)) => {}
                         // No broadcast wakes this driver, so the request that
                         // found the PV gone hands the retirement over.
                         Ok(Ok(SubscriptionOutcome::ChannelGone { cid })) => {
@@ -1712,37 +1712,56 @@ fn handle_client_blocking(
                     // thread), so an async record returns `AsyncPending` and this
                     // thread returns at once, staying responsive to further
                     // commands.
-                    match block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox)) {
-                        // Sync WRITE_NOTIFY reply / fire-and-forget WRITE / any
-                        // error frame is already queued in `outbox`; it flushes at
-                        // the loop top under the send lock.
-                        Ok(Ok(WriteHeadOutcome::Done)) => {}
-                        Ok(Ok(WriteHeadOutcome::AsyncPending(pending))) => {
-                            // The record's process cycle went async. Do NOT park
-                            // this thread on `rx`: hand the completion to the event
-                            // thread, which awaits the oneshot in its `select` and
-                            // writes the deferred WRITE_NOTIFY reply under the SAME
-                            // send lock (single owner of async socket writes). A
-                            // plain WRITE never reaches here (fire-and-forget is
-                            // always synchronous). If the event thread is already
-                            // gone the client is ending — drop the completion.
-                            let _ = ev_tx.send(EventTaskControl::WriteComplete(Box::new(pending)));
+                    // A write the PV postponed blocks this thread, which reads
+                    // nothing more, until the PV signals; then it is served
+                    // again (pcas `S_casApp_postponeAsyncIO`). The event
+                    // thread keeps sending meanwhile.
+                    let mut postponed: Option<IoBlocked> = None;
+                    loop {
+                        // Not blockable here, the head below refuses the same.
+                        if let Some(mut blocked) = postponed.take() {
+                            let _ = block_on_sync(blocked.signalled());
                         }
-                        Ok(Err(e)) => {
-                            // A protocol violation (bad SID/type/payload) queued its
-                            // error frame; ship it, then end the circuit — same rule
-                            // as the async server (RSRV_ERROR).
-                            let _ = drain_outbox_locked(&send_lock, &mut drain);
-                            print_forcing_disconnect(peer);
-                            return Err(e);
+                        match block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox))
+                        {
+                            Ok(Ok(WriteHeadOutcome::Postponed(blocked))) => {
+                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                postponed = Some(blocked);
+                                continue;
+                            }
+                            // Sync WRITE_NOTIFY reply / fire-and-forget WRITE / any
+                            // error frame is already queued in `outbox`; it flushes at
+                            // the loop top under the send lock.
+                            Ok(Ok(WriteHeadOutcome::Done)) => {}
+                            Ok(Ok(WriteHeadOutcome::AsyncPending(pending))) => {
+                                // The record's process cycle went async. Do NOT park
+                                // this thread on `rx`: hand the completion to the event
+                                // thread, which awaits the oneshot in its `select` and
+                                // writes the deferred WRITE_NOTIFY reply under the SAME
+                                // send lock (single owner of async socket writes). A
+                                // plain WRITE never reaches here (fire-and-forget is
+                                // always synchronous). If the event thread is already
+                                // gone the client is ending — drop the completion.
+                                let _ =
+                                    ev_tx.send(EventTaskControl::WriteComplete(Box::new(pending)));
+                            }
+                            Ok(Err(e)) => {
+                                // A protocol violation (bad SID/type/payload) queued its
+                                // error frame; ship it, then end the circuit — same rule
+                                // as the async server (RSRV_ERROR).
+                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                print_forcing_disconnect(peer);
+                                return Err(e);
+                            }
+                            Err(_not_blockable) => {
+                                return Err(CaError::Protocol(
+                                    "blocking CA driver: WRITE head not blockable in this \
+                                     thread context"
+                                        .into(),
+                                ));
+                            }
                         }
-                        Err(_not_blockable) => {
-                            return Err(CaError::Protocol(
-                                "blocking CA driver: WRITE head not blockable in this \
-                                 thread context"
-                                    .into(),
-                            ));
-                        }
+                        break;
                     }
                 } else if command_drives_without_spawn(hdr.cmmd) {
                     // Drive the shared handler to completion on this thread. No
@@ -1751,54 +1770,67 @@ fn handle_client_blocking(
                     // locks (DB / PV / ACF), which for a local record are Ready on
                     // the first poll. Spawning commands are gated out above; the
                     // gateway read-hook GET is unreachable for a local record.
-                    match block_on_sync(dispatch_message(
-                        &hdr,
-                        &payload,
-                        &mut state,
-                        &db,
-                        &outbox,
-                        peer,
-                        None,
-                        SubscriptionDelivery::HandOff,
-                    )) {
-                        Ok(Ok(())) => {
-                            // CLEAR_CHANNEL retires a channel's monitors in the
-                            // shared handler, which revoked their gates before it
-                            // queued the delete-confirmed echo but cannot reach
-                            // this driver's producers. Finish that teardown here,
-                            // BEFORE the echo is drained to the socket, so the
-                            // whole `db_cancel_event`-then-confirm order of C
-                            // `clear_channel_reply` (`camessage.c:1890-1912`)
-                            // holds on this driver too.
-                            for id in state.take_retired_subscriptions() {
-                                if let Some(sub) = blk_subs.remove(&id) {
-                                    let _ = ev_tx.send(EventTaskControl::Cancel(id));
-                                    match &sub.target {
-                                        ChannelTarget::SimplePv(pv) => {
-                                            pv.remove_subscriber(id);
-                                        }
-                                        ChannelTarget::RecordField { record, .. } => {
-                                            record.write().remove_subscriber(id);
+                    // A postponed request blocks this thread as a WRITE does.
+                    let mut postponed: Option<IoBlocked> = None;
+                    loop {
+                        if let Some(mut blocked) = postponed.take() {
+                            let _ = block_on_sync(blocked.signalled());
+                        }
+                        match block_on_sync(dispatch_message(
+                            &hdr,
+                            &payload,
+                            &mut state,
+                            &db,
+                            &outbox,
+                            peer,
+                            None,
+                            SubscriptionDelivery::HandOff,
+                        )) {
+                            Ok(Ok(Dispatched::Postponed(blocked))) => {
+                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                postponed = Some(blocked);
+                                continue;
+                            }
+                            Ok(Ok(Dispatched::Done)) => {
+                                // CLEAR_CHANNEL retires a channel's monitors in the
+                                // shared handler, which revoked their gates before it
+                                // queued the delete-confirmed echo but cannot reach
+                                // this driver's producers. Finish that teardown here,
+                                // BEFORE the echo is drained to the socket, so the
+                                // whole `db_cancel_event`-then-confirm order of C
+                                // `clear_channel_reply` (`camessage.c:1890-1912`)
+                                // holds on this driver too.
+                                for id in state.take_retired_subscriptions() {
+                                    if let Some(sub) = blk_subs.remove(&id) {
+                                        let _ = ev_tx.send(EventTaskControl::Cancel(id));
+                                        match &sub.target {
+                                            ChannelTarget::SimplePv(pv) => {
+                                                pv.remove_subscriber(id);
+                                            }
+                                            ChannelTarget::RecordField { record, .. } => {
+                                                record.write().remove_subscriber(id);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Ok(Err(e)) => {
-                            // Ship anything an earlier handler in this burst (or
-                            // this handler's own error frame) queued, then end.
-                            let _ = drain_outbox_locked(&send_lock, &mut drain);
-                            print_forcing_disconnect(peer);
-                            return Err(e);
-                        }
-                        Err(_not_blockable) => {
-                            // Only possible inside a current-thread tokio runtime;
-                            // a blocking client thread never enters one.
-                            return Err(CaError::Protocol(
+                            Ok(Err(e)) => {
+                                // Ship anything an earlier handler in this burst (or
+                                // this handler's own error frame) queued, then end.
+                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                print_forcing_disconnect(peer);
+                                return Err(e);
+                            }
+                            Err(_not_blockable) => {
+                                // Only possible inside a current-thread tokio runtime;
+                                // a blocking client thread never enters one.
+                                return Err(CaError::Protocol(
                                 "blocking CA driver: handler not blockable in this thread context"
                                     .into(),
                             ));
+                            }
                         }
+                        break;
                     }
                 } else {
                     // A legal opcode this driver does not route; the set is
@@ -2593,6 +2625,19 @@ mod tests {
                 .expect("no runtime on test thread")
                 .expect("add_pv");
         }
+        db
+    }
+
+    /// A one-`ao` database. rsrv's put semantics are a record's; a simple PV
+    /// follows pcas.
+    fn seed_ao_db(name: &str) -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        block_on_sync(db.add_record(
+            name,
+            Box::new(epics_base_rs::server::records::ao::AoRecord::new(0.0)),
+        ))
+        .expect("no runtime on test thread")
+        .expect("add_record");
         db
     }
 
@@ -4108,6 +4153,106 @@ mod tests {
         accept.join().unwrap();
     }
 
+    /// The blocking driver answers a put callback in flight on a destroyed PV
+    /// before the channel's retirement frame, as the async server does:
+    /// `~gateVcData` posts it canceled (gateVc.cc:430-433) ahead of `~casPV`'s
+    /// channel destroy, and libca would give it ECA_DISCONN past
+    /// `CA_PROTO_SERVER_DISCONN`.
+    #[test]
+    fn a_put_callback_in_flight_is_answered_before_its_channel_retires() {
+        use epics_base_rs::server::pv::WriteForward;
+        const CID: u32 = 0x0BAD_0001;
+        let db = Arc::new(PvDatabase::new());
+        block_on_sync(db.add_pv("BLK:WIO", EpicsValue::Double(1.0)))
+            .expect("no async runtime on this thread")
+            .expect("add_pv");
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        simple_pv(&db, "BLK:WIO").set_write_hook(Arc::new({
+            let open = open.clone();
+            move |_value, _ctx| {
+                let open = open.clone();
+                Box::pin(async move {
+                    let forward: WriteForward = Box::new(move |done| {
+                        open.lock().unwrap().extend(done);
+                        Ok(())
+                    });
+                    Ok(forward)
+                })
+            }
+        }));
+
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(CID, "BLK:WIO")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        // The monitor whose end of stream retires the channel on this driver.
+        c.write_all(&event_add_double_frame_masked(sid, 1, 1))
+            .unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        c.write_all(&put_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            epics_base_rs::types::DBR_DOUBLE,
+            1,
+            sid,
+            7,
+            &5f64.to_be_bytes(),
+        ))
+        .unwrap();
+        let sent = std::time::Instant::now();
+        while open.lock().unwrap().is_empty() {
+            assert!(sent.elapsed() < Duration::from_secs(5), "sent upstream");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        block_on_sync(db.remove_simple_pv("BLK:WIO"))
+            .expect("no async runtime on this thread")
+            .expect("was registered");
+
+        // Read the whole stream, as `two_monitors_on_one_channel_retire_it_once`
+        // does: EOF comes after every frame the event task stages.
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("the circuit never reached EOF: {e}"),
+            }
+        }
+        let mut seen: Vec<(u16, u32, u32)> = Vec::new();
+        let mut i = 0;
+        while i + CaHeader::SIZE <= acc.len() {
+            let (h, size) = CaHeader::from_bytes_extended(&acc[i..]).expect("header");
+            seen.push((h.cmmd, h.cid, h.available));
+            i += size + h.actual_postsize();
+        }
+        assert_eq!(
+            seen,
+            [
+                (CA_PROTO_WRITE_NOTIFY, crate::protocol::ECA_PUTFAIL, 7),
+                (
+                    crate::protocol::CA_PROTO_ERROR,
+                    CID,
+                    crate::protocol::ECA_NOCONVERT
+                ),
+                (crate::protocol::CA_PROTO_SERVER_DISCONN, CID, 0),
+            ]
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
     /// Two monitors on ONE channel produce ONE retirement frame.
     ///
     /// The boundary the once-per-channel rule exists for. libca resolves
@@ -4301,7 +4446,20 @@ mod tests {
         OutboxDrain,
         u32,
     ) {
-        let db = seed_db(&[(pv, seed)]);
+        write_test_session_on(seed_db(&[(pv, seed)]), pv)
+    }
+
+    /// [`write_test_session`] on a database the caller built.
+    fn write_test_session_on(
+        db: Arc<PvDatabase>,
+        pv: &str,
+    ) -> (
+        Arc<PvDatabase>,
+        ClientState,
+        outbox::Outbox,
+        OutboxDrain,
+        u32,
+    ) {
         let acf = new_acf();
         let mut state = ClientState::new(acf, 5064, db.clone());
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
@@ -4396,7 +4554,7 @@ mod tests {
     #[test]
     fn write_notify_count_above_capacity_clamps_to_channel_elements() {
         let (db, mut state, outbox, mut drain, sid) =
-            write_test_session("WR:CLAMP", EpicsValue::Double(1.0));
+            write_test_session_on(seed_ao_db("WR:CLAMP"), "WR:CLAMP");
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
         // count=4 doubles on a scalar channel, payload fully present.
@@ -4429,7 +4587,7 @@ mod tests {
         .unwrap();
 
         // The scalar channel holds the FIRST element, not a 4-element array.
-        assert_eq!(simple_pv(&db, "WR:CLAMP").get(), EpicsValue::Double(9.0));
+        assert_eq!(db.get_pv("WR:CLAMP").unwrap(), EpicsValue::Double(9.0));
 
         // The WRITE_NOTIFY reply echoes the clamped count (C echoes the
         // mutated mp->m_count).
@@ -5188,7 +5346,7 @@ mod tests {
             .expect("head ok");
         let mut p = match outcome {
             WriteHeadOutcome::AsyncPending(p) => p,
-            WriteHeadOutcome::Done => {
+            WriteHeadOutcome::Done | WriteHeadOutcome::Postponed(_) => {
                 panic!("WRITE_NOTIFY on the async record must fork to AsyncPending")
             }
         };
@@ -5326,7 +5484,7 @@ mod tests {
     /// circuit that stays up.
     #[test]
     fn compound_dbr_write_notify_is_putfail_and_keeps_the_circuit() {
-        let db = seed_db(&[("BLK:CMPWN", EpicsValue::Double(0.0))]);
+        let db = seed_ao_db("BLK:CMPWN");
         let server =
             Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
         let addr = server.local_addr().unwrap();
@@ -5384,7 +5542,7 @@ mod tests {
     /// the status/severity/timestamp the client sent are discarded.
     #[test]
     fn compound_dbr_plain_write_strips_metadata_and_writes_the_value() {
-        let db = seed_db(&[("BLK:CMPW", EpicsValue::Double(0.0))]);
+        let db = seed_ao_db("BLK:CMPW");
         let server =
             Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
         let addr = server.local_addr().unwrap();
@@ -5444,7 +5602,7 @@ mod tests {
     /// therefore puttable" from "at or below `LAST_BUFFER_TYPE`".
     #[test]
     fn metadata_only_dbr_plain_write_is_putfail_and_keeps_the_circuit() {
-        let db = seed_db(&[("BLK:MDO", EpicsValue::Double(0.0))]);
+        let db = seed_ao_db("BLK:MDO");
         let server =
             Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
         let addr = server.local_addr().unwrap();
@@ -5502,7 +5660,7 @@ mod tests {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == b"BLK:TRAPREF" {
+            if msg.pv_name == b"BLK:TRAPREF.VAL" {
                 sink.lock().unwrap().push((
                     msg.op,
                     msg.status.map(str::to_owned),
@@ -5512,7 +5670,7 @@ mod tests {
             }
         }));
 
-        let db = seed_db(&[("BLK:TRAPREF", EpicsValue::Double(0.0))]);
+        let db = seed_ao_db("BLK:TRAPREF");
         let server =
             Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
         let addr = server.local_addr().unwrap();
@@ -5589,7 +5747,7 @@ mod tests {
     /// compound tolerance above from widening into "accept anything".
     #[test]
     fn dbr_type_above_last_buffer_type_still_drops_the_circuit() {
-        let db = seed_db(&[("BLK:BADT", EpicsValue::Double(0.0))]);
+        let db = seed_ao_db("BLK:BADT");
         let server =
             Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
         let addr = server.local_addr().unwrap();
@@ -5673,6 +5831,76 @@ mod tests {
             "the deferred WRITE_NOTIFY completion echoes its request ioid"
         );
 
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// With ca-gateway's `maxSimlWriteIO` (100) put callbacks in flight, the
+    /// next write blocks the dispatch thread until one ends; then it goes and
+    /// the request behind it is answered (gateVc.cc:1483).
+    #[test]
+    fn a_postponed_write_blocks_the_dispatch_thread_until_the_pv_signals() {
+        use epics_base_rs::server::pv::WriteForward;
+        let db = seed_db(&[("BLK:PP", EpicsValue::Double(0.0))]);
+        let open = Arc::new(Mutex::new(Vec::new()));
+        simple_pv(&db, "BLK:PP").set_write_hook(Arc::new({
+            let open = open.clone();
+            move |_value, _ctx| {
+                let open = open.clone();
+                Box::pin(async move {
+                    let forward: WriteForward = Box::new(move |done| {
+                        open.lock().unwrap().extend(done);
+                        Ok(())
+                    });
+                    Ok(forward)
+                })
+            }
+        }));
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:PP");
+        for ioid in 1..=101 {
+            c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, 3.0))
+                .unwrap();
+        }
+        c.write_all(&read_notify_frame(sid, 500, DBR_DOUBLE_MON))
+            .unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let peeked = c.peek(&mut probe);
+        assert!(
+            peeked.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "nothing is answered behind the postponed write, got {peeked:?}"
+        );
+        assert_eq!(open.lock().unwrap().len(), 100, "the 101st is not sent");
+
+        let first = open.lock().unwrap().remove(0);
+        first.succeed();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut answered = Vec::new();
+        while answered.len() < 2 {
+            let frame = read_one_frame(&mut c);
+            let cmmd = u16::from_be_bytes([frame[0], frame[1]]);
+            if cmmd == CA_PROTO_WRITE_NOTIFY || cmmd == CA_PROTO_READ_NOTIFY {
+                answered.push((
+                    cmmd,
+                    u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+                ));
+            }
+        }
+        answered.sort();
+        assert_eq!(
+            answered,
+            [(CA_PROTO_READ_NOTIFY, 500), (CA_PROTO_WRITE_NOTIFY, 1)]
+        );
+        assert_eq!(open.lock().unwrap().len(), 100, "the 101st went");
+
+        drop(c);
         server.shutdown();
         accept.join().unwrap();
     }

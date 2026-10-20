@@ -2929,6 +2929,12 @@ impl CaChannel {
     /// waiting for server acknowledgement. Used by ophyd's EpicsMotor.set()
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
+        self.put_no_callback(value)
+    }
+
+    /// `ca_array_put`: the request is sent when this returns, and nothing
+    /// reports its completion.
+    pub fn put_no_callback(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
         // Native encoding to match the native-typed header; see `put`.
         let value = value.convert_to(snap.native_type);
@@ -3003,6 +3009,12 @@ impl CaChannel {
     /// sends the payload under `dbr_type` via `CA_PROTO_WRITE` without
     /// waiting for server acknowledgement.
     pub async fn put_as_dbr_nowait(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
+        self.put_as_dbr_no_callback(dbr_type, value)
+    }
+
+    /// [`Self::put_as_dbr_nowait`] for a caller that cannot await:
+    /// `ca_array_put`'s status is known once the request is queued.
+    pub fn put_as_dbr_no_callback(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
         let count = value.count() as u32;
         validate_put_count(&snap, count)?;

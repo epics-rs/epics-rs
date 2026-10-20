@@ -430,7 +430,15 @@ async fn after_an_unresponsive_window(
     };
     let hook = back.access_hook().expect("access hook");
     let first = rights(&hook);
-    let value = back.get().to_f64().expect("numeric value");
+    // The PV is back at the reconnect, pending; a GET is answered with the
+    // first event of its new monitors (gateVc.cc:1323-1326).
+    let value = tokio::time::timeout(bound, back.read_snapshot())
+        .await
+        .expect("the revived PV never took a first event")
+        .expect("the revived PV died again")
+        .value
+        .to_f64()
+        .expect("numeric value");
     // A disconnect would have cleared the rights and passed for that reason.
     assert_eq!(
         rig.accepted(),

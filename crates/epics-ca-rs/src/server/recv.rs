@@ -334,6 +334,12 @@ impl RecvAccumulator {
             .saturating_add(64 * 1024)
     }
 
+    /// The most [`Self::accept`] can still append.
+    #[cfg(tokio_backend)]
+    pub(crate) fn room(&self) -> usize {
+        self.accumulation_ceiling().saturating_sub(self.buf.len())
+    }
+
     /// Take `chunk` from the socket.
     ///
     /// The single growth point. Runs C's drain preamble

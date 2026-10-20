@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::error::CaError;
+use crate::error::{CaError, DbResult, DbStatus};
 use crate::server::database::filters::FilterChain;
 use crate::server::event_queue::{
     AttachId, DeliveryContext, EventReader, EventSink, EventUser, PostBurst, PostOutcome, RowOwner,
     SubscriberList, TryRecvError, no_context,
 };
+use crate::server::record::{AlarmAck, ProcessCompletion};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, RecordName, WallTime};
 
@@ -88,22 +89,44 @@ pub struct WriteContext {
     pub peer: String,
 }
 
+/// A client write to a simple PV. pcas hands both kinds to `casPV::write`
+/// as one gdd and its application type tells them apart (`gddDbrToAit`,
+/// casStrmClient.cc:2499-2520).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PvWrite {
+    /// A put of the value.
+    Value(EpicsValue),
+    /// `DBR_PUT_ACKT` / `DBR_PUT_ACKS`, with the buffer the client sent in
+    /// its wire carrier (`Short`).
+    AlarmAck(AlarmAck, EpicsValue),
+}
+
+impl From<EpicsValue> for PvWrite {
+    fn from(value: EpicsValue) -> Self {
+        Self::Value(value)
+    }
+}
+
 /// Async hook invoked by client-originated writes (CA `caput`, CA
 /// `WRITE_NOTIFY`) before the PV's local value is set. Used by the CA
 /// gateway and similar proxies to forward writes upstream instead of
 /// landing them in the local `ProcessVariable`.
 ///
-/// The hook receives the proposed new value plus a [`WriteContext`]
+/// The hook receives the proposed write plus a [`WriteContext`]
 /// identifying the client, and must return either:
-/// * `Ok(())` — the write was accepted (e.g. forwarded to upstream).
-///   The caller does NOT update the local `value` field — the
-///   subsequent upstream-monitor event is expected to do that. This
+/// * `Ok(forward)` — the write was accepted, and [`WriteForward`] sends it
+///   (e.g. upstream). The caller does NOT update the local `value` field —
+///   the subsequent upstream-monitor event is expected to do that. This
 ///   matches CA-gateway semantics where the cached value reflects
 ///   reality after the round-trip.
-/// * `Err(CaError)` — the write was rejected. The caller surfaces
-///   the error to the CA client (`WRITE_NOTIFY` carries the ECA
-///   status). The hook itself decides whether to update local state
-///   on rejection.
+/// * `Err(status)` — the write was refused with the status a pcas `write()`
+///   returns, which the client is answered with (casStrmClient.cc:1088-1096,
+///   1180-1187). The hook itself decides whether to update local state on
+///   rejection.
+///
+/// The hook's future resolves before the write is sent, so a hook must not
+/// wait on a remote party in it: the CA server awaits it inside the circuit's
+/// dispatch.
 ///
 /// The hook is consulted only on the client → server path. Internal
 /// callers (`ProcessVariable::set`, `put_pv_and_post`) bypass it so
@@ -139,13 +162,167 @@ pub struct WriteContext {
 /// upstream event.
 pub type WriteHook = Arc<
     dyn Fn(
-            EpicsValue,
+            PvWrite,
             WriteContext,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaError>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<WriteForward, DbStatus>> + Send>,
+        > + Send
         + Sync,
 >;
+
+/// Sends a write a [`WriteHook`] accepted. `Some(done)` sends it as a put
+/// callback and ends `done` when upstream answers; `None` sends a plain write,
+/// whose completion nothing reports — C `ca_array_put_callback` and
+/// `ca_array_put`. `Err` is a write that could not be sent; a put callback's
+/// `done`, dropped with it, posts the failure.
+pub type WriteForward = Box<dyn FnOnce(Option<WriteDone>) -> Result<(), CaError> + Send>;
+
+/// ca-gateway `maxSimlWriteIO` (gateVc.h:248).
+const MAX_SIMUL_WRITE_IO: usize = 100;
+
+/// A put callback a [`WriteForward`] sent and upstream has not answered,
+/// one of ca-gateway's `pendWio`. It posts its status when it ends, which
+/// wakes the writes the PV postponed (`putCB` → `postIOCompletion`,
+/// gateVc.cc:1519-1533).
+pub struct WriteDone {
+    done: Option<crate::runtime::sync::oneshot::Sender<DbResult>>,
+    io: Arc<WriteIo>,
+}
+
+impl WriteDone {
+    fn start(io: &Arc<WriteIo>, done: crate::runtime::sync::oneshot::Sender<DbResult>) -> Self {
+        io.in_flight.fetch_add(1, Ordering::SeqCst);
+        Self {
+            done: Some(done),
+            io: io.clone(),
+        }
+    }
+
+    /// Post `S_casApp_success`.
+    pub fn succeed(mut self) {
+        self.post(Ok(()));
+    }
+
+    /// Post `status`. Dropped without either, it posts `-1`, the failure
+    /// `gatePvData::put` returns (gatePv.cc:1142-1146).
+    pub fn fail(mut self, status: DbStatus) {
+        self.post(Err(status));
+    }
+
+    fn post(&mut self, status: DbResult) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(status);
+        }
+    }
+}
+
+impl Drop for WriteDone {
+    fn drop(&mut self) {
+        self.post(Err(DbStatus::FAILED));
+        self.io.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.io.signal();
+    }
+}
+
+/// A write the PV postponed, pcas `S_casApp_postponeAsyncIO`: the client
+/// waits on the PV's `ioBlockedList` until an IO on it ends, then runs the
+/// request again (casPVI.cc:422-433, casStreamOS.cc:255-283).
+pub struct IoBlocked(tokio::sync::watch::Receiver<()>);
+
+impl IoBlocked {
+    /// Resolves once an IO on the PV has ended since the write was
+    /// postponed. Cancel-safe.
+    pub async fn signalled(&mut self) {
+        let _ = self.0.changed().await;
+    }
+}
+
+/// How a simple PV took a client write.
+pub enum PutStarted {
+    /// Taken, and done when `ProcessCompletion` reports.
+    Started(ProcessCompletion),
+    /// Taken as write IO, which posts its status when it ends.
+    Posted(WriteEnd),
+    /// Not taken: the write failed at once with this status, as a pcas
+    /// `write()` returns one (casStrmClient.cc:1088-1096).
+    Failed(DbStatus),
+    /// Not taken: run the request again once the PV signals.
+    Postponed(IoBlocked),
+}
+
+/// The status a simple PV's write IO posts when it ends, pcas
+/// `casAsyncIOI::postIOCompletion`. One the PV dropped un-sent, at a
+/// destroy, ends canceled as `~gateVcData` posts it (gateVc.cc:426-433).
+/// Cancel-safe.
+pub struct WriteEnd(WriteEndState);
+
+enum WriteEndState {
+    Pending(crate::runtime::sync::oneshot::Receiver<DbResult>),
+    Ended(DbResult),
+}
+
+impl WriteEnd {
+    fn pending(posted: crate::runtime::sync::oneshot::Receiver<DbResult>) -> Self {
+        Self(WriteEndState::Pending(posted))
+    }
+
+    /// The posted status, once it is.
+    pub fn try_end(&mut self) -> Option<DbResult> {
+        use crate::runtime::sync::oneshot::error::TryRecvError;
+        if let WriteEndState::Pending(posted) = &mut self.0 {
+            let status = match posted.try_recv() {
+                Ok(status) => status,
+                Err(TryRecvError::Closed) => Err(DbStatus::CANCELED_ASYNC_IO),
+                Err(TryRecvError::Empty) => return None,
+            };
+            self.0 = WriteEndState::Ended(status);
+        }
+        match self.0 {
+            WriteEndState::Ended(status) => Some(status),
+            WriteEndState::Pending(_) => None,
+        }
+    }
+}
+
+impl std::future::Future for WriteEnd {
+    type Output = DbResult;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<DbResult> {
+        if let WriteEndState::Pending(posted) = &mut self.0 {
+            let status = std::task::ready!(std::pin::Pin::new(posted).poll(cx))
+                .unwrap_or(Err(DbStatus::CANCELED_ASYNC_IO));
+            self.0 = WriteEndState::Ended(status);
+        }
+        match self.0 {
+            WriteEndState::Ended(status) => std::task::Poll::Ready(status),
+            WriteEndState::Pending(_) => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// One vc's write IO: ca-gateway's `nrWio` and `pendWio`, and the pcas
+/// `ioBlockedList` a write postponed on their count waits on.
+struct WriteIo {
+    /// `nrWio`, the writes held while the PV is pending. Only
+    /// [`ProcessVariable::forward_write`] adds, and only
+    /// [`ProcessVariable::make_ready`] and [`ProcessVariable::destroy`] empty
+    /// it, each under this lock.
+    held: parking_lot::Mutex<Vec<DeferredWrite>>,
+    /// `pendWio`: one per live [`WriteDone`], added only under `held`.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// `ioBlockedList`.
+    unblocked: tokio::sync::watch::Sender<()>,
+}
+
+impl WriteIo {
+    /// `ioBlockedList::signal`.
+    fn signal(&self) {
+        self.unblocked.send_modify(|()| {});
+    }
+}
 
 /// read/write access decision for a gateway shadow PV,
 /// evaluated for a specific downstream `(user, host)`. Mirrors the CA
@@ -942,6 +1119,37 @@ pub struct ProcessVariable {
     /// the optional `Arc` without an `.await`, then awaits the hook
     /// outside any lock. See [`ReadHook`].
     read_hook: parking_lot::RwLock<Option<ReadHook>>,
+    /// Whether the PV still waits for the value it will serve
+    /// ([`Self::pending`]). Cleared only by [`Self::make_ready`], under the
+    /// `value` write hold an attach reads it under.
+    pending: std::sync::atomic::AtomicBool,
+    /// Wakes the GETs parked on a pending PV, at [`Self::make_ready`] or
+    /// [`Self::destroy`].
+    ready_wake: tokio::sync::Notify,
+    /// The writes held, the put callbacks in flight, and the writes
+    /// postponed on them.
+    writes: Arc<WriteIo>,
+}
+
+/// A write a pending PV holds until [`ProcessVariable::make_ready`] sends it.
+/// `done` posts its status as C posts a queued write's completion
+/// (gateVc.cc:984-1012).
+struct DeferredWrite {
+    forward: WriteForward,
+    notify: bool,
+    done: crate::runtime::sync::oneshot::Sender<DbResult>,
+}
+
+impl DeferredWrite {
+    fn send(self, io: &Arc<WriteIo>) {
+        if self.notify {
+            // The forward owns `done` from here, and posts through it.
+            let _ = (self.forward)(Some(WriteDone::start(io, self.done)));
+        } else {
+            let status = (self.forward)(None).map_err(|_| DbStatus::FAILED);
+            let _ = self.done.send(status);
+        }
+    }
 }
 
 impl ProcessVariable {
@@ -955,6 +1163,139 @@ impl ProcessVariable {
             write_hook: parking_lot::RwLock::new(None),
             access_hook: parking_lot::RwLock::new(None),
             read_hook: parking_lot::RwLock::new(None),
+            pending: std::sync::atomic::AtomicBool::new(false),
+            ready_wake: tokio::sync::Notify::new(),
+            writes: Arc::new(WriteIo {
+                held: parking_lot::Mutex::new(Vec::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                unblocked: tokio::sync::watch::Sender::new(()),
+            }),
+        }
+    }
+
+    /// This PV with no value to serve yet: a GET parks and a monitor gets its
+    /// first event when [`Self::make_ready`] supplies one — pcas's server-tool
+    /// `read` returning `S_casApp_asyncCompletion` while the ca-gateway vc is
+    /// not ready (gateVc.cc:1323-1347, casStrmClient.cc:2085-2097).
+    pub fn pending(self) -> Self {
+        self.pending.store(true, Ordering::Release);
+        self
+    }
+
+    /// Whether [`Self::make_ready`] is still owed.
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// End [`Self::pending`] with `snapshot`, as ca-gateway's `vcAdd` →
+    /// `vcNew` completes the reads queued while the vc was not ready
+    /// (gateVc.cc:944-962, 1018-1072): each write held meanwhile is sent, then
+    /// each parked GET is answered with `snapshot` and each monitor attached
+    /// meanwhile gets it as its first event. A PV that is not pending ignores
+    /// it.
+    pub fn make_ready(&self, snapshot: Snapshot) {
+        // Held across the clear of `pending`, so a write that finds the PV
+        // ready goes after the held ones.
+        let mut deferred = self.writes.held.lock();
+        if !self.is_pending() {
+            return;
+        }
+        // C sends them before it answers a read (vcNew, gateVc.cc:956).
+        for write in deferred.drain(..) {
+            write.send(&self.writes);
+        }
+        let mut value = self.value.write();
+        *self.posted_meta.write() = Some(PostedMeta {
+            alarm: snapshot.alarm.clone(),
+            timestamp: snapshot.timestamp,
+            user_tag: snapshot.user_tag,
+        });
+        *value = snapshot.value;
+        self.pending.store(false, Ordering::Release);
+        // Loaded in the write hold: a monitor attached after it found the PV
+        // ready and took its own first event.
+        let waiting = self.subscribers.load();
+        let value = parking_lot::RwLockWriteGuard::downgrade(value);
+        let first = Arc::new(self.snapshot_of(value.clone()));
+        for sub in waiting.of(0) {
+            sub.post_single(first.clone());
+        }
+        drop(value);
+        drop(deferred);
+        self.ready_wake.notify_waiters();
+        self.writes.signal();
+    }
+
+    /// Send `forward`, the write a [`WriteHook`] accepted, as a put callback
+    /// when `notify`. A pending PV holds it for [`Self::make_ready`] instead,
+    /// as ca-gateway queues a write to a vc that is not ready
+    /// (gateVc.cc:1464-1482); a destroyed one refuses it. Past
+    /// `maxSimlWriteIO` held writes, or put callbacks in flight, the write
+    /// is postponed (gateVc.cc:1467, 1483), plain or not.
+    pub(crate) fn forward_write(
+        &self,
+        forward: WriteForward,
+        notify: bool,
+    ) -> Result<PutStarted, CaError> {
+        let mut held = self.writes.held.lock();
+        if self.is_destroyed() {
+            return Err(CaError::Disconnected);
+        }
+        if self.is_pending() {
+            // Only this lock's holders change the count, so no wake is lost.
+            if held.len() > MAX_SIMUL_WRITE_IO {
+                return Ok(PutStarted::Postponed(IoBlocked(
+                    self.writes.unblocked.subscribe(),
+                )));
+            }
+            let (done, posted) = crate::runtime::sync::oneshot::channel();
+            held.push(DeferredWrite {
+                forward,
+                notify,
+                done,
+            });
+            return Ok(PutStarted::Posted(WriteEnd::pending(posted)));
+        }
+        if self.writes.in_flight.load(Ordering::SeqCst) >= MAX_SIMUL_WRITE_IO {
+            // A put callback that ends after the subscribe wakes it; one that
+            // ended before it shows in the second count.
+            let blocked = IoBlocked(self.writes.unblocked.subscribe());
+            if self.writes.in_flight.load(Ordering::SeqCst) >= MAX_SIMUL_WRITE_IO {
+                return Ok(PutStarted::Postponed(blocked));
+            }
+        }
+        if !notify {
+            drop(held);
+            // gatePvData::put's -1, which ca-gateway returns from write().
+            return Ok(match forward(None) {
+                Ok(()) => PutStarted::Started(ProcessCompletion::Unprocessed),
+                Err(_) => PutStarted::Failed(DbStatus::FAILED),
+            });
+        }
+        // Counted under the lock, so concurrent writes cannot pass the bound
+        // together. A forward that fails has dropped `done`, which posts the
+        // failure: ca-gateway posts it and still answers asyncCompletion
+        // (gateVc.cc:1504-1510).
+        let (done, posted) = crate::runtime::sync::oneshot::channel();
+        let done = WriteDone::start(&self.writes, done);
+        drop(held);
+        let _ = forward(Some(done));
+        Ok(PutStarted::Posted(WriteEnd::pending(posted)))
+    }
+
+    /// Park until [`Self::make_ready`]; `Err` if the PV is destroyed first, as
+    /// C's `delete vc` drops the queued reads unanswered (gatePv.cc:599).
+    async fn until_ready(&self) -> Result<(), CaError> {
+        loop {
+            // Taken before the checks, so a wake between them is kept.
+            let woken = self.ready_wake.notified();
+            if !self.is_pending() {
+                return Ok(());
+            }
+            if self.is_destroyed() {
+                return Err(CaError::Disconnected);
+            }
+            woken.await;
         }
     }
 
@@ -1135,7 +1476,11 @@ impl ProcessVariable {
     /// (the stored value), so a no-cache PV still backs a downstream
     /// monitor with its upstream subscription's events rather than a
     /// per-event upstream get.
+    ///
+    /// A [`Self::pending`] PV parks the read until [`Self::make_ready`], and
+    /// fails it if the PV is destroyed first.
     pub async fn read_snapshot(&self) -> Result<Snapshot, CaError> {
+        self.until_ready().await?;
         match self.read_hook() {
             Some(hook) => {
                 // The hook issues a metadata-bearing upstream GET
@@ -1165,12 +1510,16 @@ impl ProcessVariable {
     /// every record-backed and cached PV takes: [`Self::snapshot`] of the
     /// stored value, produced with no `.await` and no reactor dependency.
     /// `None` when a gateway no-cache [`ReadHook`] IS installed, whose `hook()`
-    /// is a genuine upstream network GET; the caller must then take the async
+    /// is a genuine upstream network GET, or while the PV is
+    /// [`Self::pending`]; the caller must then take the async
     /// [`Self::read_snapshot`] instead. This keeps the hook / no-hook decision
     /// in one owner, in lockstep with `read_snapshot` — the only difference is
-    /// that the async fallible upstream fetch is surfaced to the caller as
-    /// `None` rather than performed here.
+    /// that the async wait is surfaced to the caller as `None` rather than
+    /// performed here.
     pub fn read_snapshot_local(&self) -> Option<Snapshot> {
+        if self.is_pending() {
+            return None;
+        }
         match self.read_hook() {
             Some(_) => None,
             None => Some(self.snapshot()),
@@ -1232,6 +1581,10 @@ impl ProcessVariable {
     /// by the caller (one timestamp per logical event); each subscriber gets
     /// a fixed field log of it, a wide value read at delivery.
     fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot, origin: u64) {
+        // A pending PV's only event is the one `make_ready` gives.
+        if self.is_pending() {
+            return;
+        }
         // Same ambient-origin inheritance as the record funnels
         // (`notify_field_with_origin` / `notify_from_snapshot`): a post
         // carrying no origin of its own inherits the current thread's
@@ -1376,8 +1729,9 @@ impl ProcessVariable {
     /// CA EVENT_ADD on this PV: [`Self::add_subscriber_on`] with the
     /// channel's `filters` in the monitor before it is published, so no post
     /// reaches it unfiltered, then C `db_post_single_event`'s first value
-    /// (`camessage.c:1904`) through that chain. Pass a fresh chain per
-    /// monitor: `dbnd`, `dec` and `sync` keep state.
+    /// (`camessage.c:1904`) through that chain — on a pending PV,
+    /// [`Self::make_ready`]'s. Pass a fresh chain per monitor: `dbnd`, `dec`
+    /// and `sync` keep state.
     pub fn add_monitor_on(
         self: &Arc<Self>,
         user: &EventUser,
@@ -1387,8 +1741,11 @@ impl ProcessVariable {
         context: &DeliveryContext,
         filters: FilterChain,
     ) -> Result<EventReader, SubscribeRefused> {
+        // One value hold over the attach and the first event, so a
+        // `make_ready` either finds this monitor waiting or comes after it.
+        let value = self.value.read();
         let reader = self.attach(user, sid, data_type, mask, context, filters)?;
-        self.post_single_event(reader.id());
+        self.post_single_held(reader.id(), &value);
         Ok(reader)
     }
 
@@ -1402,7 +1759,8 @@ impl ProcessVariable {
         filters: FilterChain,
     ) -> Result<EventReader, SubscribeRefused> {
         let cap = max_subscribers_per_pv();
-        let kind = crate::server::event_queue::LogKind::of_value(&self.value.read());
+        // Recursive: `add_monitor_on` attaches under its own value hold.
+        let kind = crate::server::event_queue::LogKind::of_value(&self.value.read_recursive());
         let (sink, reader) = crate::server::event_queue::attach_with(user, sid, kind, context);
         let mut sub = Subscriber::new(sid, data_type, mask, sink);
         sub.set_filters(filters);
@@ -1428,8 +1786,16 @@ impl ProcessVariable {
     /// as C's dbScanLock does: a set waits for it, so the monitor's last
     /// value is never older than the PV's.
     pub fn post_single_event(&self, id: AttachId) {
+        self.post_single_held(id, &self.value.read());
+    }
+
+    /// [`Self::post_single_event`] under the caller's hold of `value`. A
+    /// pending PV posts nothing: [`Self::make_ready`] gives the first event.
+    fn post_single_held(&self, id: AttachId, value: &EpicsValue) {
+        if self.is_pending() {
+            return;
+        }
         if let Some(sub) = self.subscribers.load().of(0).find(|s| s.id() == id) {
-            let value = self.value.read();
             sub.post_single(Arc::new(self.snapshot_of(value.clone())));
         }
     }
@@ -1470,7 +1836,12 @@ impl ProcessVariable {
     pub(crate) fn destroy(&self) -> bool {
         // Destroyed is the list's closed state: one writer section empties
         // it and refuses every later add; the monitors end after it.
-        self.subscribers.close().map(RemovedMonitors).is_some()
+        let destroyed = self.subscribers.close().map(RemovedMonitors).is_some();
+        // C cancels the writes `delete vc` finds queued (gateVc.cc:426-429).
+        drop(std::mem::take(&mut *self.writes.held.lock()));
+        self.ready_wake.notify_waiters();
+        self.writes.signal();
+        destroyed
     }
 
     /// Whether `Self::destroy` has run. A server holding an `Arc` to this
@@ -2449,7 +2820,12 @@ mod destruction_tests {
     #[epics_macros_rs::epics_test]
     async fn respawn_carries_the_hooks_and_metadata_onto_a_live_pv() {
         let pv = ProcessVariable::new("D:respawn", EpicsValue::Double(1.0));
-        pv.set_write_hook(Arc::new(|_v, _ctx| Box::pin(async { Ok(()) })));
+        pv.set_write_hook(Arc::new(|_v, _ctx| {
+            Box::pin(async {
+                let sent: WriteForward = Box::new(|_| Ok(()));
+                Ok(sent)
+            })
+        }));
         pv.set_access_hook(Arc::new(|_user, _host| AccessDecision {
             read: true,
             write: false,
@@ -2505,6 +2881,356 @@ mod destruction_tests {
             rec.read().is_destroyed(),
             "the record funnel marks the instance a CA channel still holds"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    const DBE_VALUE: u16 = 1;
+    const DBE_PROPERTY: u16 = 8;
+
+    fn pending() -> Arc<ProcessVariable> {
+        Arc::new(ProcessVariable::new("P:pending", EpicsValue::Double(0.0)).pending())
+    }
+
+    fn first(value: f64) -> Snapshot {
+        Snapshot::new(
+            EpicsValue::Double(value),
+            3,
+            2,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7),
+        )
+    }
+
+    async fn poll_once<F: Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        let mut fut = Some(fut);
+        std::future::poll_fn(|cx| Poll::Ready(fut.take().unwrap().poll(cx))).await
+    }
+
+    fn value_of(event: MonitorEvent) -> EpicsValue {
+        event.value().as_value().cloned().expect("a value event")
+    }
+
+    /// A GET on a pending PV waits for `make_ready` and is answered with its
+    /// snapshot, alarm and time included, never the placeholder.
+    #[epics_macros_rs::epics_test]
+    async fn a_get_waits_for_make_ready() {
+        let pv = pending();
+        assert!(pv.read_snapshot_local().is_none(), "no sync answer");
+        let mut read = std::pin::pin!(pv.read_snapshot());
+        assert!(poll_once(read.as_mut()).await.is_pending());
+
+        pv.make_ready(first(9.0));
+        let got = read.await.expect("answered");
+        assert_eq!(got.value, EpicsValue::Double(9.0));
+        assert_eq!((got.alarm.status, got.alarm.severity), (3, 2));
+        assert_eq!(got.timestamp, first(9.0).timestamp);
+        assert_eq!(
+            pv.read_snapshot_local().map(|s| s.value),
+            Some(EpicsValue::Double(9.0))
+        );
+    }
+
+    /// The writes a [`forward`] sent, by tag, and whether as a put callback.
+    type Sent = Arc<parking_lot::Mutex<Vec<(u32, bool)>>>;
+
+    /// Records itself in `sent` as `tag`, then completes at once, or fails.
+    fn forward(sent: &Sent, tag: u32, ok: bool) -> WriteForward {
+        let sent = sent.clone();
+        Box::new(move |done| {
+            sent.lock().push((tag, done.is_some()));
+            if !ok {
+                return Err(CaError::Disconnected);
+            }
+            if let Some(done) = done {
+                done.succeed();
+            }
+            Ok(())
+        })
+    }
+
+    /// Records itself in `sent` as `tag` and keeps its put callback in
+    /// flight in `open`.
+    fn held_open(sent: &Sent, tag: u32, open: &Open) -> WriteForward {
+        let (sent, open) = (sent.clone(), open.clone());
+        Box::new(move |done| {
+            sent.lock().push((tag, done.is_some()));
+            open.lock().extend(done);
+            Ok(())
+        })
+    }
+
+    /// The put callbacks [`held_open`] keeps in flight.
+    type Open = Arc<parking_lot::Mutex<Vec<WriteDone>>>;
+
+    /// The write IO a taken write started; `None` for a plain write sent at
+    /// once.
+    fn started(put: Result<PutStarted, CaError>) -> Option<WriteEnd> {
+        match put.expect("taken") {
+            PutStarted::Started(ProcessCompletion::Unprocessed) => None,
+            PutStarted::Started(other) => panic!("{other:?}"),
+            PutStarted::Posted(end) => Some(end),
+            PutStarted::Postponed(_) => panic!("postponed"),
+            PutStarted::Failed(status) => panic!("{status}"),
+        }
+    }
+
+    fn postponed(put: Result<PutStarted, CaError>) -> IoBlocked {
+        match put.expect("not refused") {
+            PutStarted::Postponed(blocked) => blocked,
+            PutStarted::Started(_) | PutStarted::Posted(_) | PutStarted::Failed(_) => {
+                panic!("taken")
+            }
+        }
+    }
+
+    /// A pending PV holds every write until `make_ready` sends them, in
+    /// arrival order and ahead of any write after it, each completing as what
+    /// it sent did (gateVc.cc:956, 984-1012, 1464-1482).
+    #[test]
+    fn a_pending_pv_holds_its_writes_until_make_ready() {
+        let pv = pending();
+        let sent = Sent::default();
+        let mut held =
+            [(1, true, false), (2, true, true), (3, false, false)].map(|(tag, ok, notify)| {
+                started(pv.forward_write(forward(&sent, tag, ok), notify)).expect("held")
+            });
+        assert!(sent.lock().is_empty(), "nothing is sent while pending");
+        assert_eq!(held[0].try_end(), None);
+
+        pv.make_ready(first(1.0));
+        assert_eq!(*sent.lock(), [(1, false), (2, true), (3, false)]);
+        assert_eq!(held[0].try_end(), Some(Ok(())), "a plain write, sent");
+        assert_eq!(held[1].try_end(), Some(Ok(())), "a put callback, completed");
+        assert_eq!(
+            held[2].try_end(),
+            Some(Err(DbStatus::FAILED)),
+            "a write that failed to send"
+        );
+
+        let mut after = started(pv.forward_write(forward(&sent, 4, true), true)).expect("posted");
+        assert_eq!(after.try_end(), Some(Ok(())), "completed at once");
+        assert_eq!(sent.lock().last(), Some(&(4, true)));
+    }
+
+    /// A put callback posts the status it ends with, `-1` when it was not
+    /// sent or ended without one, as `gatePvData::put` returns and ca-gateway
+    /// posts it (gateVc.cc:1504-1510, 1519-1533).
+    #[test]
+    fn a_put_callback_posts_its_status() {
+        let pv = ProcessVariable::new("P:ready", EpicsValue::Double(0.0));
+        let (sent, open) = (Sent::default(), Open::default());
+        let mut unsent = started(pv.forward_write(forward(&sent, 1, false), true)).expect("posted");
+        assert_eq!(unsent.try_end(), Some(Err(DbStatus::FAILED)));
+
+        let mut ends: Vec<_> = (2..5)
+            .map(|tag| {
+                started(pv.forward_write(held_open(&sent, tag, &open), true)).expect("posted")
+            })
+            .collect();
+        let mut open = std::mem::take(&mut *open.lock()).into_iter();
+        open.next().expect("in flight").succeed();
+        open.next()
+            .expect("in flight")
+            .fail(DbStatus::CANCELED_ASYNC_IO);
+        drop(open.next());
+        let ended: Vec<_> = ends.iter_mut().map(WriteEnd::try_end).collect();
+        assert_eq!(
+            ended,
+            [
+                Some(Ok(())),
+                Some(Err(DbStatus::CANCELED_ASYNC_IO)),
+                Some(Err(DbStatus::FAILED))
+            ]
+        );
+    }
+
+    /// A destroy cancels the writes held un-sent, and a destroyed PV takes
+    /// none (gateVc.cc:426-429).
+    #[test]
+    fn a_destroy_cancels_the_held_writes() {
+        let pv = pending();
+        let sent = Sent::default();
+        let mut held = started(pv.forward_write(forward(&sent, 1, true), true)).expect("held");
+        assert!(pv.destroy());
+        assert_eq!(held.try_end(), Some(Err(DbStatus::CANCELED_ASYNC_IO)));
+        assert!(matches!(
+            pv.forward_write(forward(&sent, 2, true), false),
+            Err(CaError::Disconnected)
+        ));
+        assert!(sent.lock().is_empty());
+    }
+
+    /// A pending PV holds `maxSimlWriteIO + 1` writes and postpones the
+    /// next until `make_ready` sends them (gateVc.cc:1467, `>`).
+    #[epics_macros_rs::epics_test]
+    async fn a_pending_pv_postpones_past_max_simul_write_io_held() {
+        let pv = pending();
+        let sent = Sent::default();
+        let held: Vec<_> = (0..=MAX_SIMUL_WRITE_IO as u32)
+            .map(|tag| started(pv.forward_write(forward(&sent, tag, true), tag % 2 == 0)))
+            .collect();
+        let mut blocked = postponed(pv.forward_write(forward(&sent, 999, true), false));
+        let mut woken = std::pin::pin!(blocked.signalled());
+        assert!(poll_once(woken.as_mut()).await.is_pending());
+
+        pv.make_ready(first(1.0));
+        assert!(poll_once(woken.as_mut()).await.is_ready());
+        assert_eq!(sent.lock().len(), held.len(), "the postponed one was not");
+        started(pv.forward_write(forward(&sent, 1000, true), false));
+    }
+
+    /// With only plain writes held no put callback ends to wake the
+    /// postponed one: `make_ready` does, as each held write's IO ends at
+    /// `vcNew` (gateVc.cc:984-1012).
+    #[epics_macros_rs::epics_test]
+    async fn make_ready_wakes_a_write_postponed_behind_plain_writes() {
+        let pv = pending();
+        let sent = Sent::default();
+        for tag in 0..=MAX_SIMUL_WRITE_IO as u32 {
+            started(pv.forward_write(forward(&sent, tag, true), false));
+        }
+        let mut blocked = postponed(pv.forward_write(forward(&sent, 999, true), false));
+        let mut woken = std::pin::pin!(blocked.signalled());
+        assert!(poll_once(woken.as_mut()).await.is_pending());
+
+        pv.make_ready(first(1.0));
+        assert!(poll_once(woken.as_mut()).await.is_ready());
+    }
+
+    /// A ready PV postpones any write, plain or not, while `maxSimlWriteIO`
+    /// put callbacks are in flight, until one ends either way
+    /// (gateVc.cc:1483, `>=`; putCB, :1519-1533).
+    #[epics_macros_rs::epics_test]
+    async fn a_ready_pv_postpones_at_max_simul_write_io_in_flight() {
+        let pv = ProcessVariable::new("P:ready", EpicsValue::Double(0.0));
+        let (sent, open) = (Sent::default(), Open::default());
+        for tag in 0..MAX_SIMUL_WRITE_IO as u32 - 1 {
+            started(pv.forward_write(held_open(&sent, tag, &open), true));
+        }
+        started(pv.forward_write(forward(&sent, 200, true), false));
+        started(pv.forward_write(held_open(&sent, 99, &open), true));
+        for notify in [false, true] {
+            postponed(pv.forward_write(forward(&sent, 100, true), notify));
+        }
+
+        for end in [WriteDone::succeed as fn(WriteDone), drop] {
+            let mut blocked = postponed(pv.forward_write(forward(&sent, 100, true), true));
+            let mut woken = std::pin::pin!(blocked.signalled());
+            assert!(poll_once(woken.as_mut()).await.is_pending());
+            end(open.lock().pop().expect("in flight"));
+            assert!(poll_once(woken.as_mut()).await.is_ready());
+            started(pv.forward_write(held_open(&sent, 101, &open), true));
+        }
+        assert_eq!(sent.lock().len(), MAX_SIMUL_WRITE_IO + 3);
+    }
+
+    /// A destroy wakes the writes postponed on the PV, which then find it
+    /// gone.
+    #[epics_macros_rs::epics_test]
+    async fn a_destroy_wakes_a_postponed_write() {
+        let pv = pending();
+        let sent = Sent::default();
+        for tag in 0..=MAX_SIMUL_WRITE_IO as u32 {
+            started(pv.forward_write(forward(&sent, tag, true), false));
+        }
+        let mut blocked = postponed(pv.forward_write(forward(&sent, 999, true), false));
+        let mut woken = std::pin::pin!(blocked.signalled());
+        assert!(poll_once(woken.as_mut()).await.is_pending());
+        assert!(pv.destroy());
+        assert!(poll_once(woken.as_mut()).await.is_ready());
+        assert!(matches!(
+            pv.forward_write(forward(&sent, 1000, true), false),
+            Err(CaError::Disconnected)
+        ));
+    }
+
+    /// A destroy ends a parked GET with an error instead of an answer.
+    #[epics_macros_rs::epics_test]
+    async fn a_destroy_ends_a_parked_get() {
+        let pv = pending();
+        let mut read = std::pin::pin!(pv.read_snapshot());
+        assert!(poll_once(read.as_mut()).await.is_pending());
+
+        assert!(pv.destroy());
+        let ended = crate::runtime::task::timeout(std::time::Duration::from_secs(10), read).await;
+        assert!(matches!(ended, Ok(Err(CaError::Disconnected))));
+    }
+
+    /// A monitor attached while pending gets nothing, re-posts included,
+    /// until `make_ready` gives it one first event whatever its mask; one
+    /// attached after gets its own.
+    #[test]
+    fn a_monitor_takes_its_first_event_from_make_ready() {
+        let pv = pending();
+        let user = EventUser::new();
+        let attach = |sid, mask| {
+            pv.add_monitor_on(
+                &user,
+                sid,
+                DbFieldType::Double,
+                mask,
+                no_context(),
+                FilterChain::new(),
+            )
+            .expect("added")
+        };
+        let mut value = attach(1, DBE_VALUE);
+        let mut property = attach(2, DBE_PROPERTY);
+        pv.post_single_event(value.id());
+        pv.set(EpicsValue::Double(5.0));
+        pv.post_alarm(1, 1);
+        assert!(matches!(value.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(property.try_recv(), Err(TryRecvError::Empty)));
+
+        pv.make_ready(first(9.0));
+        for reader in [&mut value, &mut property] {
+            let event = reader.try_recv().expect("the first event");
+            assert_eq!((event.stat(), event.sevr()), (3, 2));
+            assert_eq!(value_of(event), EpicsValue::Double(9.0));
+            assert!(matches!(reader.try_recv(), Err(TryRecvError::Empty)));
+        }
+
+        let mut late = attach(3, DBE_VALUE);
+        assert_eq!(
+            value_of(late.try_recv().expect("its own first event")),
+            EpicsValue::Double(9.0)
+        );
+        assert!(matches!(late.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// An attach racing `make_ready` gets exactly one first event: neither
+    /// lost between the two nor posted by both.
+    #[test]
+    fn an_attach_racing_make_ready_gets_one_first_event() {
+        for _ in 0..300 {
+            let pv = pending();
+            let user = EventUser::new();
+            let mut reader = std::thread::scope(|s| {
+                let ready = s.spawn(|| pv.make_ready(first(9.0)));
+                let reader = pv
+                    .add_monitor_on(
+                        &user,
+                        1,
+                        DbFieldType::Double,
+                        DBE_VALUE,
+                        no_context(),
+                        FilterChain::new(),
+                    )
+                    .expect("added");
+                ready.join().unwrap();
+                reader
+            });
+            assert_eq!(
+                value_of(reader.try_recv().expect("a first event")),
+                EpicsValue::Double(9.0)
+            );
+            assert!(matches!(reader.try_recv(), Err(TryRecvError::Empty)));
+        }
     }
 }
 

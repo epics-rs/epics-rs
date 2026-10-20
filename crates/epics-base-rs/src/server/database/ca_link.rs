@@ -28,7 +28,7 @@ use super::link_set::{
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
 use crate::runtime::task::TaskHandle;
 use crate::server::event_queue::{AttachId, EvQue, EventReader, EventUser, no_context};
-use crate::server::pv::{MonitorEvent, SubscribeRefused, WriteContext};
+use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
 use crate::server::record::ProcessCompletion;
 use crate::server::snapshot::Snapshot;
 use crate::types::{
@@ -882,14 +882,13 @@ impl LocalChannel {
                     .map_err(|r| format!("db_put_field() completed unsuccessfully: {}", r.error)),
             ),
             LinkPutOp::Async => {
-                let (completion, status) =
-                    crate::server::record::PutRefused::outcome(self.put(value, true).await);
+                let (issued, status) = Issued::outcome(self.put(value, true).await);
                 let status = status.map_err(|e| format!("put notify unsuccessful: {e}"));
-                let done = match completion {
-                    ProcessCompletion::Unprocessed => LinkPutDone::Inline,
+                let done = match issued {
+                    Issued::Record(ProcessCompletion::Unprocessed) => LinkPutDone::Inline,
                     _ => LinkPutDone::Callback,
                 };
-                let settled = settle(completion).await;
+                let settled = issued.settle().await;
                 (done, status.and(settled))
             }
         }
@@ -914,7 +913,7 @@ impl LocalChannel {
         let (completion, status, blocker) = self.put_notify(value).await?;
         Ok(Some(Box::pin(async move {
             let _blocker = blocker;
-            let settled = settle(completion).await;
+            let settled = completion.settle().await;
             status.and(settled)
         })))
     }
@@ -926,53 +925,85 @@ impl LocalChannel {
     async fn put_notify(
         &self,
         value: EpicsValue,
-    ) -> Result<
-        (
-            ProcessCompletion,
-            Result<(), String>,
-            tokio::sync::OwnedMutexGuard<()>,
-        ),
-        String,
-    > {
+    ) -> Result<(Issued, Result<(), String>, tokio::sync::OwnedMutexGuard<()>), String> {
         let blocker = crate::runtime::task::timeout(
             PUT_NOTIFY_BLOCK_TIMEOUT,
             self.blocker.clone().lock_owned(),
         )
         .await
         .map_err(|_| "put callback request timed out".to_string())?;
-        let (completion, status) =
-            crate::server::record::PutRefused::outcome(self.put(value, true).await);
+        let (issued, status) = Issued::outcome(self.put(value, true).await);
         let status = status.map_err(|e| format!("put notify unsuccessful: {e}"));
-        Ok((completion, status, blocker))
+        Ok((issued, status, blocker))
     }
 
     async fn put(
         &self,
         value: EpicsValue,
         notify: bool,
-    ) -> Result<ProcessCompletion, crate::server::record::PutRefused> {
+    ) -> Result<Issued, crate::server::record::PutRefused> {
         let db = self
             .db()
             .ok_or_else(|| crate::error::CaError::ChannelNotFound("database gone".into()))?;
-        channel_io::put(
-            &db,
-            &self.chan.target,
-            self.chan.long_string_mode,
-            value,
-            notify,
-            WriteContext::default,
-        )
-        .await
+        loop {
+            // A postponed put is sent again once the PV signals, as libca's
+            // request waits behind the server's postponed circuit.
+            let mut blocked = match channel_io::put(
+                &db,
+                &self.chan.target,
+                self.chan.long_string_mode,
+                value.clone(),
+                notify,
+                WriteContext::default,
+            )
+            .await?
+            {
+                PutStarted::Started(completion) => return Ok(Issued::Record(completion)),
+                PutStarted::Posted(end) => return Ok(Issued::Pv(end)),
+                // The ECA_PUTFAIL a pcas server answers it with.
+                PutStarted::Failed(_) => {
+                    return Err(
+                        crate::error::CaError::WriteFailed(crate::error::ECA_PUTFAIL).into(),
+                    );
+                }
+                PutStarted::Postponed(blocked) => blocked,
+            };
+            blocked.signalled().await;
+        }
     }
 }
 
-/// Wait out a put callback's completion.
-async fn settle(completion: ProcessCompletion) -> Result<(), String> {
-    match completion.into_handle() {
-        Some(done) => done
-            .await
-            .map_err(|_| "put notify unsuccessful: canceled".to_string()),
-        None => Ok(()),
+/// A put the link issued: a record's processing, or a simple PV's write IO,
+/// which posts its status.
+enum Issued {
+    Record(ProcessCompletion),
+    Pv(WriteEnd),
+}
+
+impl Issued {
+    /// A put callback's two answers: when it completes, and its status.
+    fn outcome(
+        put: Result<Self, crate::server::record::PutRefused>,
+    ) -> (Self, crate::error::CaResult<()>) {
+        match put {
+            Ok(issued) => (issued, Ok(())),
+            Err(refused) => (Self::Record(refused.completion), Err(refused.error)),
+        }
+    }
+
+    /// Wait out a put callback's completion.
+    async fn settle(self) -> Result<(), String> {
+        match self {
+            Self::Record(completion) => match completion.into_handle() {
+                Some(done) => done
+                    .await
+                    .map_err(|_| "put notify unsuccessful: canceled".to_string()),
+                None => Ok(()),
+            },
+            Self::Pv(end) => end
+                .await
+                .map_err(|status| format!("put notify unsuccessful: {status}")),
+        }
     }
 }
 

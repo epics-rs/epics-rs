@@ -5232,8 +5232,12 @@ mod tests {
         db.add_pv("A", EpicsValue::Double(1.0)).await.unwrap();
         // Same name as simple_pv — every namespace must see it.
         assert!(db.add_pv("A", EpicsValue::Double(2.0)).await.is_err());
-        let noop_hook: crate::server::pv::WriteHook =
-            std::sync::Arc::new(|_v, _ctx| Box::pin(async { Ok(()) }));
+        let noop_hook: crate::server::pv::WriteHook = std::sync::Arc::new(|_v, _ctx| {
+            Box::pin(async {
+                let sent: crate::server::pv::WriteForward = Box::new(|_| Ok(()));
+                Ok(sent)
+            })
+        });
         assert!(
             db.add_pv_with_hook("A", EpicsValue::Double(2.0), noop_hook)
                 .await

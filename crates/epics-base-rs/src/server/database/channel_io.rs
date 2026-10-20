@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::server::database::filters::{ChannelCreateError, FilterChain};
 use crate::server::database::{PvDatabase, PvEntry};
 use crate::server::event_queue::{DeliveryContext, EventReader, EventUser};
-use crate::server::pv::{ProcessVariable, SubscribeRefused};
+use crate::server::pv::{ProcessVariable, PutStarted, PvWrite, SubscribeRefused};
 use crate::server::record::{FieldDeclaration, RecordCell};
 use crate::server::record::{ProcessCompletion, PutRefused};
 use crate::types::{DbFieldType, EpicsValue};
@@ -444,8 +444,10 @@ pub async fn get_read_snapshot(
 ///   reactor. `inner` is the `Option<Snapshot>` the async path also yields:
 ///   `Some(snap)` for a value, `None` for an absent record field.
 /// - `None` — a gateway `-no_cache` [`ReadHook`](crate::server::pv::ReadHook) is installed, whose upstream
-///   GET is genuine network I/O; the caller must fall back to the async
-///   [`get_read_snapshot`]. Only `SimplePv` can reach this.
+///   GET is genuine network I/O, or the PV is
+///   [`pending`](crate::server::pv::ProcessVariable::pending); the caller must
+///   fall back to the async [`get_read_snapshot`]. Only `SimplePv` can reach
+///   this.
 ///
 /// This is the item-3 sans-io boundary: local-record READ reply production
 /// never touches this crate's async runtime, while the gateway-upstream read
@@ -458,9 +460,9 @@ pub fn try_get_read_snapshot_local(
         ChannelTarget::RecordField { record, field } => {
             Some(record_field_snapshot_scan_locked(db, record, field, false))
         }
-        // `read_snapshot_local` is `None` exactly when a read hook is
-        // installed — the async upstream-GET signal — so it maps straight to
-        // this fn's "not sync-resolvable" `None`; a hookless `SimplePv` always
+        // `read_snapshot_local` is `None` exactly when the read must wait — a
+        // read hook's upstream GET or a pending PV — so it maps straight to
+        // this fn's "not sync-resolvable" `None`; otherwise a `SimplePv` always
         // yields a snapshot, so its `Some(snap)` maps to `Some(Some(snap))`
         // and never collides with the async-signal `None`.
         ChannelTarget::SimplePv(pv) => pv.read_snapshot_local().map(Some),
@@ -484,29 +486,50 @@ pub fn read_ack_state(target: &ChannelTarget, alarm: &mut crate::server::snapsho
 /// The put C reaches through `dbChannel_put` (a plain write, `dbPutField`,
 /// `notify == false`) or through `dbProcessNotify` → `db_put_process` (a put
 /// callback, `notify == true`). `ctx` names the writer for a simple PV's
-/// write hook, the gateway's forwarded put. A refusal says whether the put
-/// callback still processed the record.
+/// write hook, the gateway's forwarded put, which alone can be postponed. A
+/// refusal says whether the put callback still processed the record.
 pub async fn put(
     db: &PvDatabase,
     target: &ChannelTarget,
     long_string_mode: LongStringMode,
-    value: EpicsValue,
+    write: impl Into<PvWrite>,
     notify: bool,
     ctx: impl FnOnce() -> crate::server::pv::WriteContext,
-) -> Result<ProcessCompletion, PutRefused> {
+) -> Result<PutStarted, PutRefused> {
+    let write = write.into();
     match target {
-        ChannelTarget::SimplePv(pv) => {
-            if let Some(hook) = pv.write_hook() {
-                Ok(hook(value, ctx())
-                    .await
-                    .map(|()| ProcessCompletion::Unprocessed)?)
-            } else {
+        ChannelTarget::SimplePv(pv) => match (pv.write_hook(), write) {
+            (Some(hook), write) => match hook(write, ctx()).await {
+                Ok(forward) => Ok(pv.forward_write(forward, notify)?),
+                Err(status) => Ok(PutStarted::Failed(status)),
+            },
+            (None, PvWrite::Value(value)) => {
                 pv.set(value);
-                Ok(ProcessCompletion::Unprocessed)
+                Ok(PutStarted::Started(ProcessCompletion::Unprocessed))
             }
-        }
+            // pcas's own `casPV::write` (casPV.cc:107-110).
+            (None, PvWrite::AlarmAck(..)) => Ok(PutStarted::Failed(
+                crate::error::DbStatus::CAS_APP_NO_SUPPORT,
+            )),
+        },
         ChannelTarget::RecordField { record, field } => {
             let name: &[u8] = record.name();
+            let value = match write {
+                PvWrite::Value(value) => value,
+                // `dbPut` dispatches on the request type (`dbAccess.c:1333-1336`)
+                // and `putAckt`/`putAcks` read the buffer's first element.
+                PvWrite::AlarmAck(ack, levels) => {
+                    let level = match &levels {
+                        EpicsValue::Short(v) => *v as u16,
+                        EpicsValue::ShortArray(a) => a.first().map_or(0, |v| *v as u16),
+                        _ => 0,
+                    };
+                    return Ok(db
+                        .put_alarm_ack_from_ca(name, field, ack, level)
+                        .await
+                        .map(|()| PutStarted::Started(ProcessCompletion::Sync))?);
+                }
+            };
             // A `$` channel puts by its `$` name, which the database
             // resolves to C's DBR_CHAR address of the field.
             let dollar;
@@ -518,7 +541,9 @@ pub async fn put(
                 _ => field,
             };
             if notify {
-                db.put_record_field_notify(name, field, value).await
+                db.put_record_field_notify(name, field, value)
+                    .await
+                    .map(PutStarted::Started)
             } else {
                 // C `write_action` (`rsrv/camessage.c:781-789`)
                 // routes CA_PROTO_WRITE through `dbPutField` —
@@ -532,7 +557,7 @@ pub async fn put(
                 Ok(db
                     .put_record_field_from_ca_no_notify(name, field, value)
                     .await
-                    .map(|()| ProcessCompletion::Sync)?)
+                    .map(|()| PutStarted::Started(ProcessCompletion::Sync))?)
             }
         }
     }

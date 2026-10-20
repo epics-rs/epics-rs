@@ -427,7 +427,7 @@ pub struct AsynRecord {
     // --- asynOctet output ---
     pub aout: String,
     pub oeos: String,
-    pub bout: Vec<u8>,
+    pub bout: Vec<u8>, // head of the OMAX-byte buffer; reads serve NOWT bytes
     pub omax: i32,
     pub nowt: i32,
     pub nawt: i32,
@@ -437,7 +437,7 @@ pub struct AsynRecord {
     pub ainp: String,
     pub tinp: String,
     pub ieos: String,
-    pub binp: Vec<u8>,
+    pub binp: Vec<u8>, // head of the IMAX-byte buffer; reads serve NORD bytes
     pub imax: i32,
     pub nrrd: i32,
     pub nord: i32,
@@ -796,6 +796,35 @@ fn post_if_new<T: PartialEq + Copy>(cur: T, old: &mut T) -> bool {
     let moved = cur != *old;
     *old = cur;
     moved
+}
+
+// BOUT/BINP hold the written head of C's `cap`-byte `optr`/`iptr`, which
+// `init_record` callocs (asynRecord.c:295-298): bytes past the head are zero.
+
+/// Write `data` over the buffer's head, clamped to `cap` as `dbPut` clamps
+/// `nRequest` (dbAccess.c:1365-1366); the bytes past it keep their value.
+fn write_head(buf: &mut Vec<u8>, data: &[u8], cap: i32) -> i32 {
+    let n = data.len().min(cap.max(0) as usize);
+    if buf.len() < n {
+        buf.resize(n, 0);
+    }
+    buf[..n].copy_from_slice(&data[..n]);
+    n as i32
+}
+
+/// Append the buffer's first `count` bytes, as `get_array_info` reports them
+/// (asynRecord.c:966-976). C does not clamp `count` to the buffer, so a client
+/// NOWT past OMAX reads past `optr`; clamped here.
+fn extend_head(out: &mut Vec<u8>, buf: &[u8], count: i32, cap: i32) {
+    let n = count.clamp(0, cap.max(0)) as usize;
+    out.extend_from_slice(&buf[..n.min(buf.len())]);
+    out.resize(out.len() + n.saturating_sub(buf.len()), 0);
+}
+
+fn read_head(buf: &[u8], count: i32, cap: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    extend_head(&mut out, buf, count, cap);
+    out
 }
 
 impl Default for AsynRecord {
@@ -4058,15 +4087,12 @@ impl AsynRecord {
     /// stale value, and [`Self::fill_octet_output`] then sent `bout[..NOWT]`
     /// — 80 bytes on the wire where C sends 120.
     fn put_array_field(&mut self, field: AsynArrayField, data: Vec<u8>) {
-        let n_new = data.len().min(i32::MAX as usize) as i32;
         match field {
             AsynArrayField::Bout => {
-                self.bout = data;
-                self.nowt = n_new;
+                self.nowt = write_head(&mut self.bout, &data, self.omax);
             }
             AsynArrayField::Binp => {
-                self.binp = data;
-                self.nord = n_new;
+                self.nord = write_head(&mut self.binp, &data, self.imax);
             }
         }
     }
@@ -4098,10 +4124,7 @@ impl AsynRecord {
     fn fill_octet_output(&self, payload: &mut Vec<u8>) {
         payload.clear();
         match self.ofmt {
-            ASYN_FMT_BINARY => {
-                let nowt = self.nowt.max(0) as usize;
-                payload.extend_from_slice(&self.bout[..nowt.min(self.bout.len())]);
-            }
+            ASYN_FMT_BINARY => extend_head(payload, &self.bout, self.nowt, self.omax),
             ASYN_FMT_HYBRID => {
                 let end = self
                     .bout
@@ -4599,7 +4622,9 @@ impl Record for AsynRecord {
             "F64IV" => Some(EpicsValue::Long(self.f64iv)),
             "AOUT" => Some(EpicsValue::String(self.aout.clone().into())),
             "OEOS" => Some(EpicsValue::String(self.oeos.clone().into())),
-            "BOUT" => Some(EpicsValue::CharArray(self.bout.clone().into())),
+            "BOUT" => Some(EpicsValue::CharArray(
+                read_head(&self.bout, self.nowt, self.omax).into(),
+            )),
             "OMAX" => Some(EpicsValue::Long(self.omax)),
             "NOWT" => Some(EpicsValue::Long(self.nowt)),
             "NAWT" => Some(EpicsValue::Long(self.nawt)),
@@ -4607,7 +4632,9 @@ impl Record for AsynRecord {
             "AINP" => Some(EpicsValue::String(self.ainp.clone().into())),
             "TINP" => Some(EpicsValue::String(self.tinp.clone().into())),
             "IEOS" => Some(EpicsValue::String(self.ieos.clone().into())),
-            "BINP" => Some(EpicsValue::CharArray(self.binp.clone().into())),
+            "BINP" => Some(EpicsValue::CharArray(
+                read_head(&self.binp, self.nord, self.imax).into(),
+            )),
             "IMAX" => Some(EpicsValue::Long(self.imax)),
             "NRRD" => Some(EpicsValue::Long(self.nrrd)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
@@ -10977,6 +11004,52 @@ mod tests {
         assert_eq!(rec.octet_output_buffer(), vec![9, 9]);
     }
 
+    /// C's BOUT/BINP are the `omax`/`imax`-byte buffers `init_record` callocs
+    /// (asynRecord.c:295-298), read through `get_array_info`'s NOWT/NORD
+    /// (:966-976). `dbPut` writes only the `nRequest` elements that arrived,
+    /// clamped to the buffer (dbAccess.c:1365-1366), and leaves the rest.
+    #[test]
+    fn bout_binp_read_their_count_from_a_fixed_buffer() {
+        let bytes = |rec: &AsynRecord, f: &str| match rec.get_field(f) {
+            Some(EpicsValue::CharArray(v)) => v.to_vec(),
+            other => panic!("{f}: {other:?}"),
+        };
+        let mut rec = AsynRecord::default();
+        rec.ofmt = ASYN_FMT_BINARY;
+        // A fresh record: NOWT = 80 bytes of the zeroed buffer, on the channel
+        // and on the wire.
+        assert_eq!(bytes(&rec, "BOUT"), vec![0; 80]);
+        assert_eq!(rec.octet_output_buffer(), vec![0; 80]);
+
+        rec.put_field("BOUT", EpicsValue::CharArray(b"abcdefghij".to_vec().into()))
+            .unwrap();
+        rec.put_field("BOUT", EpicsValue::CharArray(b"xyz".to_vec().into()))
+            .unwrap();
+        assert_eq!(bytes(&rec, "BOUT"), b"xyz");
+        // NOWT is a client field of its own: raising it re-exposes the bytes the
+        // shorter put left in place.
+        rec.put_field("NOWT", EpicsValue::Long(10)).unwrap();
+        assert_eq!(bytes(&rec, "BOUT"), b"xyzdefghij");
+        assert_eq!(rec.octet_output_buffer(), b"xyzdefghij");
+        rec.ofmt = ASYN_FMT_HYBRID;
+        assert_eq!(rec.octet_output_buffer(), b"xyzdefghij");
+
+        // A count past the buffer reads the buffer: C's dbGet would read past
+        // `optr` (get_array_info does not clamp NOWT), a C defect not copied.
+        rec.put_field("NOWT", EpicsValue::Long(200)).unwrap();
+        assert_eq!(bytes(&rec, "BOUT").len(), 80);
+        // A put longer than the buffer stores, and counts, OMAX elements.
+        rec.put_field("BOUT", EpicsValue::CharArray(vec![7; 100].into()))
+            .unwrap();
+        assert_eq!(rec.nowt, 80);
+        assert_eq!(bytes(&rec, "BOUT"), vec![7; 80]);
+
+        // BINP is the same buffer model over IMAX/NORD.
+        let mut rec = AsynRecord::default();
+        rec.put_field("NORD", EpicsValue::Long(5)).unwrap();
+        assert_eq!(bytes(&rec, "BINP"), vec![0; 5]);
+    }
+
     /// The BOUT/BINP channel's native element count is the buffer capacity
     /// (OMAX/IMAX = 80 by default) — C `cvt_dbaddr` `no_elements = omax`/`imax`
     /// — distinct from the current transferred length the *value* carries.
@@ -10990,11 +11063,11 @@ mod tests {
         // Capacity is OMAX/IMAX, served independent of the (empty) value.
         assert_eq!(rec.field_native_count("BOUT"), Some(80));
         assert_eq!(rec.field_native_count("BINP"), Some(80));
-        // The value itself is still the current transferred bytes (empty here),
-        // so channel count and value count are genuinely decoupled.
+        // The value is NOWT/NORD bytes (80 and 0 here), so channel count and
+        // value count are genuinely decoupled.
         assert_eq!(
             rec.get_field("BOUT"),
-            Some(EpicsValue::CharArray(vec![].into()))
+            Some(EpicsValue::CharArray(vec![0; 80].into()))
         );
         assert_eq!(
             rec.get_field("BINP"),

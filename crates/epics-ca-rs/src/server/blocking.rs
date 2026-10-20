@@ -1071,10 +1071,9 @@ fn handle_udp_search_blocking(
             }
         };
         // C `cast_server.c:182-189`: a source on `casIgnoreAddrs` is dropped
-        // before `camessage`, as is a datagram too short to hold a header,
-        // yet both still reach the FIONREAD flush below.
+        // before `camessage`, yet still reaches the FIONREAD flush below.
         let ignored = matches!(src, SocketAddr::V4(v4) if ignore.contains(v4.ip()));
-        if len >= CaHeader::SIZE && !ignored {
+        if !ignored {
             // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
             // to its source; if this datagram is from a different peer, flush the
             // held batch to the old peer before adopting the new one.
@@ -3566,7 +3565,10 @@ mod tests {
             .unwrap();
         rearm.connect(client.local_addr().unwrap()).unwrap();
         client
-            .send_to(&udp_search_frame(7, "BLK:RERR"), resp_addr)
+            .send_to(
+                &[udp_version_prelude(7), udp_search_frame(7, "BLK:RERR")].concat(),
+                resp_addr,
+            )
             .unwrap();
         let mut rbuf = vec![0u8; 64 * 1024];
         let (n, _) = client
@@ -3605,14 +3607,20 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
         ignored
-            .send_to(&udp_search_frame(1, "BLK:IGN"), resp_addr)
+            .send_to(
+                &[udp_version_prelude(1), udp_search_frame(1, "BLK:IGN")].concat(),
+                resp_addr,
+            )
             .unwrap();
         let other = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
         other
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         other
-            .send_to(&udp_search_frame(2, "BLK:IGN"), resp_addr)
+            .send_to(
+                &[udp_version_prelude(2), udp_search_frame(2, "BLK:IGN")].concat(),
+                resp_addr,
+            )
             .unwrap();
 
         let (n, _) = other

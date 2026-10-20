@@ -37,8 +37,9 @@ pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
 /// C `CA_VSUPPORTED` (`caProto.h:35`), and it gates four handlers:
 /// `tcp_version_action` (`camessage.c:366`), `udp_version_action` (`:2098`),
 /// `search_reply_udp` (`:2151`) and `search_reply_tcp` (`:2238`). All four
-/// read `mp->m_count` — the version the message in hand declares — and all
-/// four answer `RSRV_ERROR`, which stops the server reading from that peer.
+/// read `mp->m_count` — the version the message in hand declares, see
+/// [`declared_minor`] — and all four answer `RSRV_ERROR`, which stops the
+/// server reading from that peer.
 ///
 /// It takes the header rather than a number on purpose. The other version a
 /// CA server holds is the one its circuit negotiated
@@ -47,7 +48,20 @@ pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
 /// signature makes unwritable: a SEARCH may arrive on a circuit whose
 /// handshake said something else entirely, and C answers the frame.
 pub fn declares_supported_version(hdr: &CaHeader) -> bool {
-    hdr.count >= CA_MINIMUM_SUPPORTED_VERSION
+    declared_minor(hdr) >= CA_MINIMUM_SUPPORTED_VERSION
+}
+
+/// The minor version a VERSION or SEARCH declares: `msg.m_count`, which an
+/// extended header carries in its annex (`camessage.c:2464-2471`).
+pub fn declared_minor(hdr: &CaHeader) -> u16 {
+    minor_from(hdr.actual_count())
+}
+
+/// C's `unsigned minor_version_number` (`server.h:100`) as the `u16` kept
+/// here. Every `CA_Vxx` test is `>=` a constant below 14, so saturating
+/// answers each one as the full value does.
+pub fn minor_from(version: u32) -> u16 {
+    u16::try_from(version).unwrap_or(u16::MAX)
 }
 
 /// **The one owner of "is this a CA opcode a TCP circuit may carry?"**

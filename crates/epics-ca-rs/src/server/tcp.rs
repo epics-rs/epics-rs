@@ -2686,7 +2686,7 @@ pub(crate) async fn dispatch_message(
             if !declares_supported_version(hdr) {
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "unsupported CA minor version {} (matches C tcp_version_action drop)",
-                    hdr.count
+                    hdr.actual_count()
                 )));
             }
             // C `tcp_version_action` (`rsrv/camessage.c:371-373`) drops
@@ -2706,7 +2706,7 @@ pub(crate) async fn dispatch_message(
             }
             // No reply: C's one VERSION is `rsrv_version_reply` at connect
             // (`caservertask.c:1525`), which each driver sends before its loop.
-            state.client_minor_version = hdr.count;
+            state.client_minor_version = crate::protocol::declared_minor(hdr);
         }
 
         CA_PROTO_HOST_NAME => {
@@ -2926,8 +2926,9 @@ pub(crate) async fn dispatch_message(
             // downstream `CA_V49` extended-form framing (nElem >= 0xffff)
             // then honours; pre-fix Rust ignored `hdr.available` entirely,
             // so a peer using the upgrade pattern saw truncated large arrays.
-            if (hdr.available as u16) > state.client_minor_version {
-                state.client_minor_version = hdr.available as u16;
+            let claimed = crate::protocol::minor_from(hdr.available);
+            if claimed > state.client_minor_version {
+                state.client_minor_version = claimed;
             }
 
             // C `claim_ciu_action` (`rsrv/camessage.c`) forces
@@ -3735,12 +3736,22 @@ pub(crate) async fn dispatch_message(
             // responses ship along with this echo — preserving the
             // barrier semantic. Pre-fix Rust silently no-op-ed; this
             // restores wire parity.
-            let mut resp = CaHeader::new(CA_PROTO_READ_SYNC);
-            resp.data_type = hdr.data_type;
-            resp.count = hdr.count;
-            resp.cid = hdr.cid;
-            resp.available = hdr.available;
-            writer.push(resp.to_bytes().to_vec());
+            let Ok(frame) = copy_in_header(
+                CA_PROTO_READ_SYNC,
+                hdr.data_type,
+                hdr.actual_count(),
+                hdr.cid,
+                hdr.available,
+                &[],
+                state.client_minor_version,
+            ) else {
+                // `read_sync_reply` (`camessage.c:2111-2116`).
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "READ_SYNC count {} needs an extended header (C read_sync_reply RSRV_ERROR)",
+                    hdr.actual_count()
+                )));
+            };
+            writer.push(frame);
         }
 
         CA_PROTO_ECHO => {
@@ -3757,33 +3768,25 @@ pub(crate) async fn dispatch_message(
             // proxy) gets a stripped, all-zero reply from us — wire
             // divergence that breaks the documented round-trip
             // semantics.
-            let mut resp = CaHeader::new(CA_PROTO_ECHO);
-            // Preserve the request fields. set_payload_size handles
-            // both the short and extended encodings transparently.
-            resp.data_type = hdr.data_type;
-            resp.set_payload_size(
-                hdr.actual_postsize(),
+            //
+            // Abort-safety: header and payload are ONE frame in a single
+            // `push`, so a `send_timeout` cancel can never enqueue an orphan
+            // header for the connection loop to write.
+            //
+            // A pre-V49 client's 16-bit count of 0xffff needs the extended
+            // form it cannot parse; C sends nothing and keeps the circuit
+            // (`camessage.c:416-424`).
+            if let Ok(frame) = copy_in_header(
+                CA_PROTO_ECHO,
+                hdr.data_type,
                 hdr.actual_count(),
+                hdr.cid,
+                hdr.available,
+                payload,
                 state.client_minor_version,
-            )
-            .expect("the client framed this very ECHO request");
-            resp.cid = hdr.cid;
-            resp.available = hdr.available;
-            // Abort-safety: build header + echoed payload as ONE
-            // contiguous frame and hand it to the outbox in a single
-            // `push`, so a `send_timeout` cancel can never enqueue an
-            // orphan header for the connection loop to write.
-            let mut frame = Vec::new();
-            if resp.is_extended() {
-                frame.extend_from_slice(&resp.to_bytes_extended());
-            } else {
-                frame.extend_from_slice(&resp.to_bytes());
+            ) {
+                writer.push(frame);
             }
-            // Echo the payload back verbatim (truncated to the actual
-            // postsize advertised by the request — `payload` here is
-            // already that slice).
-            frame.extend_from_slice(payload);
-            writer.push(frame);
         }
 
         CA_PROTO_SEARCH => {
@@ -3798,7 +3801,7 @@ pub(crate) async fn dispatch_message(
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "TCP SEARCH declaring minor {} (< {CA_MINIMUM_SUPPORTED_VERSION}) — \
                      C search_reply_tcp RSRV_ERROR parity",
-                    hdr.count
+                    hdr.actual_count()
                 )));
             }
             // C `search_reply_tcp` (rsrv/camessage.c:2297-2301) rejects
@@ -3868,12 +3871,23 @@ pub(crate) async fn dispatch_message(
                 // libca search frames, but the parity intent is
                 // "echo m_cid"). With this fix the reply is byte-
                 // equivalent to a C softIoc fail reply.
-                let mut nf = CaHeader::new(CA_PROTO_NOT_FOUND);
-                nf.data_type = hdr.data_type;
-                nf.count = hdr.count;
-                nf.cid = hdr.cid;
-                nf.available = hdr.available;
-                writer.push(nf.to_bytes().to_vec());
+                match copy_in_header(
+                    CA_PROTO_NOT_FOUND,
+                    hdr.data_type,
+                    hdr.actual_count(),
+                    hdr.cid,
+                    hdr.available,
+                    &[],
+                    state.client_minor_version,
+                ) {
+                    Ok(frame) => writer.push(frame),
+                    // `camessage.c:2133-2139`, `__FILE__`/`__LINE__` as softIoc
+                    // prints them; the circuit stays.
+                    Err(ExtendedHeaderUnsupported) => epics_base_rs::runtime::log::errlog_printf(
+                        "../rsrv/camessage.c at 2138: should always get sufficient space for \
+                         search fail reply?\n",
+                    ),
+                }
             }
             // Otherwise silent — clients without CA_DO_REPLY treat absence
             // as "this server doesn't have it" and move on.
@@ -3900,12 +3914,24 @@ pub(crate) async fn dispatch_message(
                 )));
             }
             if destroy_channel(state, sid, peer, conn_events).is_some() {
-                let mut resp = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
-                resp.data_type = hdr.data_type;
-                resp.count = hdr.count;
-                resp.cid = sid;
-                resp.available = cid;
-                writer.push(resp.to_bytes().to_vec());
+                let Ok(frame) = copy_in_header(
+                    CA_PROTO_CLEAR_CHANNEL,
+                    hdr.data_type,
+                    hdr.actual_count(),
+                    sid,
+                    cid,
+                    &[],
+                    state.client_minor_version,
+                ) else {
+                    // `clear_channel_reply` (`camessage.c:1966-1971`); the
+                    // teardown takes the rest of the circuit's channels.
+                    return Err(epics_base_rs::error::CaError::Protocol(format!(
+                        "CLEAR_CHANNEL count {} needs an extended header (C clear_channel_reply \
+                         RSRV_ERROR)",
+                        hdr.actual_count()
+                    )));
+                };
+                writer.push(frame);
             }
         }
 
@@ -5402,16 +5428,25 @@ pub(crate) fn cancel_subscription_reply(
     // caller's own teardown (abort the task, drop the subscriber) may then run
     // at its leisure, because nothing it races with can still emit.
     info.monitor.gate.revoke();
-    // C `event_cancel_reply` (`camessage.c:2089-2091`): echo the stored
+    // C `event_cancel_reply` (`camessage.c:2089-2095`): echo the stored
     // EVENT_ADD request — m_dataType / m_count / m_cid (the SID) / m_available —
-    // with a zero payload, in the extended form when the count needs it.
-    let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
-    resp.data_type = info.data_type;
-    resp.set_payload_size(0, info.data_count, state.client_minor_version)
-        .expect("the client framed this very EVENT_ADD count");
-    resp.cid = info.channel_sid;
-    resp.available = sub_id;
-    writer.push(resp.to_bytes_extended().to_vec());
+    // with a zero payload. A pre-V49 client's 16-bit count of 0xffff needs the
+    // extended form, which ends the circuit.
+    let Ok(frame) = copy_in_header(
+        CA_PROTO_EVENT_ADD,
+        info.data_type,
+        info.data_count,
+        info.channel_sid,
+        sub_id,
+        &[],
+        state.client_minor_version,
+    ) else {
+        return Err(epics_base_rs::error::CaError::Protocol(format!(
+            "EVENT_CANCEL count {} needs an extended header (C event_cancel_reply RSRV_ERROR)",
+            info.data_count
+        )));
+    };
+    writer.push(frame);
     Ok(info.id)
 }
 
@@ -6016,6 +6051,29 @@ impl NotifyReplyKind {
             NotifyReplyKind::Completion => "CA server corrupted - put call back(s) discarded\n",
         }
     }
+}
+
+/// C `cas_copy_in_header` (`caserverio.c:250-326`) for a reply that echoes a
+/// request: `count` is the request's annex `m_count` when it had one, and the
+/// header goes extended when the count or `payload` needs 32 bits. `Err` is
+/// C's `ECA_16KARRAYCLIENT`, which each C handler answers in its own way.
+fn copy_in_header(
+    cmmd: u16,
+    data_type: u16,
+    count: u32,
+    cid: u32,
+    available: u32,
+    payload: &[u8],
+    client_minor: u16,
+) -> Result<Vec<u8>, ExtendedHeaderUnsupported> {
+    let mut hdr = CaHeader::new(cmmd);
+    hdr.data_type = data_type;
+    hdr.cid = cid;
+    hdr.available = available;
+    hdr.set_payload_size(payload.len(), count, client_minor)?;
+    let mut frame = hdr.to_bytes_extended().to_vec();
+    frame.extend_from_slice(payload);
+    Ok(frame)
 }
 
 /// CA_PROTO_WRITE_NOTIFY reply with extended-form
@@ -9531,7 +9589,7 @@ mod non_graceful_disconnect_teardown_tests {
             let mut batch = crate::server::udp::SearchReplyBatch::default();
             let mut ready = Vec::new();
             crate::server::udp::parse_search_datagram(
-                &search(1, name),
+                &[version_frame(), search(1, name)].concat(),
                 &db,
                 5064,
                 peer,

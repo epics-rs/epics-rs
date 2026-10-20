@@ -17,11 +17,11 @@ use std::time::Duration;
 
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::protocol::{
-    CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CLIENT_NAME, CA_PROTO_CREATE_CHAN, CA_PROTO_ECHO,
-    CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_HOST_NAME, CA_PROTO_READ,
-    CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
-    CaHeader, ECA_16KARRAYCLIENT, ECA_ALLOCMEM, ECA_BADMONID, ECA_INTERNAL, ECA_PUTCBINPROG,
-    ECA_TOLARGE,
+    CA_DO_REPLY, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CLIENT_NAME, CA_PROTO_CREATE_CHAN, CA_PROTO_ECHO,
+    CA_PROTO_ERROR, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_HOST_NAME,
+    CA_PROTO_NOT_FOUND, CA_PROTO_READ, CA_PROTO_READ_NOTIFY, CA_PROTO_READ_SYNC, CA_PROTO_SEARCH,
+    CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY, CaHeader, ECA_16KARRAYCLIENT,
+    ECA_ALLOCMEM, ECA_BADMONID, ECA_INTERNAL, ECA_PUTCBINPROG, ECA_TOLARGE,
 };
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
@@ -261,6 +261,210 @@ async fn a_client_version_draws_no_reply() {
             hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0),
             hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0),
         ]
+    );
+}
+
+/// `tcp_version_action` (`camessage.c:369-373`) takes an extended VERSION's
+/// version from its annex `m_count`, all 32 bits (`server.h:100`): softIoc
+/// keeps the circuit for an annex of 13, 0x10000 and 0x10003 and closes it
+/// for 3, whatever the 16-bit `m_count` says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_extended_version_is_its_annex_count() {
+    let port = server().await;
+    let kept = blocking(move || {
+        [(13u32, 0), (3, 13), (0x10000, 0), (0x10003, 13)].map(|(count, raw)| {
+            let mut c = Client::connect(port, 13);
+            let mut out = hdr(CA_PROTO_VERSION, 0xFFFF, 0, raw, 0, 0);
+            out.extend(0u32.to_be_bytes());
+            out.extend(count.to_be_bytes());
+            out.extend(hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0));
+            c.send(&out);
+            std::iter::from_fn(|| c.next())
+                .any(|f| u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_ECHO)
+        })
+    })
+    .await;
+    assert_eq!(kept, [true, false, true, true]);
+}
+
+/// `cmmd` carrying `count` in the extended annex when `annex`, else in the
+/// 16-bit `m_count`.
+fn counted(cmmd: u16, dt: u16, count: u32, annex: bool, p1: u32, p2: u32, body: &[u8]) -> Vec<u8> {
+    let mut f = if annex {
+        let mut f = hdr(cmmd, 0xFFFF, dt, 0, p1, p2);
+        f.extend((body.len() as u32).to_be_bytes());
+        f.extend(count.to_be_bytes());
+        f
+    } else {
+        hdr(cmmd, body.len() as u16, dt, count as u16, p1, p2)
+    };
+    f.extend_from_slice(body);
+    f
+}
+
+/// READ_SYNC, search-fail and CLEAR_CHANNEL echo the request's `msg.m_count`,
+/// which an extended request carries in its annex (`camessage.c:2464-2471`),
+/// through `cas_copy_in_header`, extended once it reaches 0xffff
+/// (`caserverio.c:302-316`). softIoc's frames for each request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_header_echo_carries_the_request_s_count() {
+    let port = server().await;
+    let (got, want) = blocking(move || {
+        let mut c = Client::connect(port, 13);
+        let name = padded("NOPE");
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (count, annex) in [(5, true), (0x10000, true), (0xffff, false)] {
+            let wide = count >= 0xffff;
+            let cid = got.len() as u32 + 1;
+            let sid = c.create(cid, "LO");
+            for (request, reply) in [
+                (
+                    counted(CA_PROTO_READ_SYNC, 3, count, annex, 0x11, 0x22, &[]),
+                    counted(CA_PROTO_READ_SYNC, 3, count, wide, 0x11, 0x22, &[]),
+                ),
+                (
+                    counted(
+                        CA_PROTO_SEARCH,
+                        CA_DO_REPLY,
+                        count,
+                        annex,
+                        0x33,
+                        0x33,
+                        &name,
+                    ),
+                    counted(
+                        CA_PROTO_NOT_FOUND,
+                        CA_DO_REPLY,
+                        count,
+                        wide,
+                        0x33,
+                        0x33,
+                        &[],
+                    ),
+                ),
+                (
+                    counted(CA_PROTO_CLEAR_CHANNEL, 3, count, annex, sid, cid, &[]),
+                    counted(CA_PROTO_CLEAR_CHANNEL, 3, count, wide, sid, cid, &[]),
+                ),
+            ] {
+                c.send(&request);
+                got.push(c.next().expect("echo"));
+                want.push(reply);
+            }
+        }
+        (got, want)
+    })
+    .await;
+    assert_eq!(got, want);
+}
+
+/// A count of 0xffff needs the extended form, which a pre-V49 client cannot
+/// take (`caserverio.c:266-269`). softIoc ends the circuit for READ_SYNC and
+/// CLEAR_CHANNEL (`camessage.c:2114-2116`, `:1969-1971`), and logs a search
+/// fail reply it cannot send and keeps the circuit (`:2135-2139`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_pre_v49_client_draws_no_0xffff_echo() {
+    const LOST: &str =
+        "../rsrv/camessage.c at 2138: should always get sufficient space for search fail reply?\n";
+    let port = server().await;
+    let (closed, search) = blocking(move || {
+        // Each circuit opens a channel first, which also reads past the
+        // greeting VERSION.
+        let closed = [false, true].map(|clear| {
+            let mut c = Client::connect(port, 8);
+            let sid = c.create(1, "LO");
+            let request = if clear {
+                hdr(CA_PROTO_CLEAR_CHANNEL, 0, 3, 0xffff, sid, 1)
+            } else {
+                hdr(CA_PROTO_READ_SYNC, 0, 3, 0xffff, 0x11, 0x22)
+            };
+            let peer = c.sock.local_addr().unwrap();
+            let mut rest = Vec::new();
+            let lines = errlog_lines(|| {
+                c.send(&request);
+                rest = c.rest_until_closed();
+            });
+            (
+                rest,
+                lines == [format!("CAS: forcing disconnect from {peer}\n")],
+            )
+        });
+        let mut c = Client::connect(port, 8);
+        c.create(1, "LO");
+        let name = padded("NOPE");
+        let mut after = None;
+        let lines = errlog_lines(|| {
+            let mut out = hdr(
+                CA_PROTO_SEARCH,
+                name.len() as u16,
+                CA_DO_REPLY,
+                0xffff,
+                0x33,
+                0x33,
+            );
+            out.extend(name);
+            out.extend(hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0));
+            c.send(&out);
+            after = c.next().map(|f| f[..16].to_vec());
+        });
+        (closed, (after, lines))
+    })
+    .await;
+    assert_eq!(closed, [(vec![], true), (vec![], true)]);
+    assert_eq!(
+        search,
+        (
+            Some(hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0)),
+            vec![LOST.to_string()]
+        )
+    );
+}
+
+/// The same refusal for an ECHO sends nothing and keeps the circuit
+/// (`camessage.c:416-424`); for the EVENT_CANCEL echo of a subscription's
+/// count it ends the circuit (`:2089-2095`). softIoc on a CA_V48 client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_pre_v49_0xffff_echo_is_dropped_and_its_cancel_closes() {
+    const WC_DB: &str = "record(waveform,\"WC\"){ field(FTVL,\"CHAR\") field(NELM,\"70000\") }\n";
+    const DBR_CHAR: u16 = 4;
+    // SAFETY: before the server reads it, in a test of its own.
+    unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "1000000") };
+    let port = serve_db(CaServer::builder(), WC_DB).await;
+    let (echo, cancel) = blocking(move || {
+        let mut c = Client::connect(port, 8);
+        c.create(1, "WC");
+        let mut out = hdr(CA_PROTO_ECHO, 0, 3, 0xffff, 0x44, 0x55);
+        out.extend(hdr(CA_PROTO_ECHO, 0, 0, 0, 0x99, 0x99));
+        c.send(&out);
+        let echo = c.next().map(|f| f[..16].to_vec());
+
+        let mut c = Client::connect(port, 8);
+        let sid = c.create(1, "WC");
+        let mut add = hdr(CA_PROTO_EVENT_ADD, 16, DBR_CHAR, 0xffff, sid, 7);
+        add.extend([0u8; 12]);
+        add.extend(5u16.to_be_bytes());
+        add.extend([0u8; 2]);
+        c.send(&add);
+        // The first update draws the same refusal (`camessage.c:519-528`).
+        let update = c.error()[12..16].to_vec();
+        let peer = c.sock.local_addr().unwrap();
+        let mut rest = Vec::new();
+        let lines = errlog_lines(|| {
+            c.send(&hdr(CA_PROTO_EVENT_CANCEL, 0, DBR_CHAR, 0xffff, sid, 7));
+            rest = c.rest_until_closed();
+        });
+        let closed = lines == [format!("CAS: forcing disconnect from {peer}\n")];
+        (echo, (update, rest, closed))
+    })
+    .await;
+    assert_eq!(echo, Some(hdr(CA_PROTO_ECHO, 0, 0, 0, 0x99, 0x99)));
+    assert_eq!(
+        cancel,
+        (ECA_16KARRAYCLIENT.to_be_bytes().to_vec(), vec![], true)
     );
 }
 
@@ -775,7 +979,8 @@ async fn an_empty_pv_name_is_logged_at_each_refusal() {
             u.send_to(&dg, ("127.0.0.1", udp)).unwrap();
             // A reply to a later datagram proves the first was handled.
             let name = padded("LO");
-            let mut found = hdr(CA_PROTO_SEARCH, name.len() as u16, 10, 13, 1, 1);
+            let mut found = hdr(CA_PROTO_VERSION, 0, 0, 13, 0, 0);
+            found.extend(hdr(CA_PROTO_SEARCH, name.len() as u16, 10, 13, 1, 1));
             found.extend(name);
             u.send_to(&found, ("127.0.0.1", udp)).unwrap();
             u.recv(&mut [0; 512]).expect("SEARCH reply");

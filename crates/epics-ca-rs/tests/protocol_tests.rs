@@ -1921,13 +1921,16 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
         while !padded.len().is_multiple_of(8) {
             padded.push(0);
         }
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
         let mut h = CaHeader::new(CA_PROTO_SEARCH);
         h.postsize = padded.len() as u16;
         h.data_type = CA_DO_REPLY;
         h.count = CA_MINOR_VERSION;
         h.cid = cid;
         h.available = cid;
-        let mut bytes = h.to_bytes().to_vec();
+        let mut bytes = ver.to_bytes().to_vec();
+        bytes.extend_from_slice(&h.to_bytes());
         bytes.extend_from_slice(&padded);
         bytes
     };

@@ -215,8 +215,17 @@ impl PortDriver for SimDetector {
                 .port_base
                 .set_int32_param(reason, user.addr, value)?;
             self.set_dirty_for_int32(reason);
-            self.ad.port_base.call_param_callback(0, reason)?;
-            return Ok(());
+            let base = &self.ad.params.base;
+            // simDetector.cpp:937-944: every base-class parameter but
+            // NDDataType and NDColorMode goes on to ADDriver::writeInt32.
+            if reason < self.sim_params.gain_x
+                && reason != base.data_type
+                && reason != base.color_mode
+            {
+                let status = self.ad_write_int32(user, value);
+                self.ad.port_base.call_param_callbacks(0)?;
+                return status;
+            }
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
@@ -366,6 +375,29 @@ mod tests {
             det.ad.port_base.interface_mask(),
             interrupts | InterfaceMask::DRV_USER | InterfaceMask::COMMON
         );
+    }
+
+    /// A base-class parameter reaches ADDriver::writeInt32
+    /// (simDetector.cpp:943), whose pool branch clears the busy command
+    /// (asynNDArrayDriver.cpp:686-688); left set, the PreAllocBuffers busy
+    /// record never returns to Done.
+    #[test]
+    fn test_write_int32_hands_a_base_param_to_ad_driver() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let mut det = SimDetector::new(
+            "SIM_PREALLOC",
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            acq_tx,
+            dirty,
+        )
+        .unwrap();
+        let pre_alloc = det.ad.params.base.pool_pre_alloc;
+        det.write_int32(&mut AsynUser::new(pre_alloc), 1).unwrap();
+        assert_eq!(det.ad.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
     }
 
     #[test]

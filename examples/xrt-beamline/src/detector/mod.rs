@@ -146,6 +146,10 @@ impl PortDriver for XrtDetector {
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
             }
+        } else if reason < self.xrt_params.und_gap {
+            // und_gap is the driver's first parameter; ADDriver::writeInt32
+            // owns the ones below it (ADDriver.cpp:84-116).
+            return self.ad_write_int32(user, value);
         } else {
             self.ad
                 .port_base
@@ -253,4 +257,21 @@ pub fn create_xrt_detector(
         array_output: shared_output,
         task_handle: Some(task_handle),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A base-class parameter reaches ADDriver::writeInt32, whose pool branch
+    /// clears the PreAllocBuffers busy command (asynNDArrayDriver.cpp:686-688).
+    #[test]
+    fn test_write_int32_hands_a_base_param_to_ad_driver() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let mut det = XrtDetector::new("XRT_PREALLOC", 8, 8, 1_000_000, acq_tx, dirty).unwrap();
+        let pre_alloc = det.ad.params.base.pool_pre_alloc;
+        det.write_int32(&mut AsynUser::new(pre_alloc), 1).unwrap();
+        assert_eq!(det.ad.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
+    }
 }

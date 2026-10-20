@@ -121,6 +121,11 @@ impl PortDriver for MovingDotDetector {
             if reason == self.dot_params.shutter_open {
                 self.dirty.lock().set();
             }
+            // motor_x_pos is the driver's first parameter; ADDriver::writeInt32
+            // owns the ones below it (ADDriver.cpp:84-116).
+            if reason < self.dot_params.motor_x_pos {
+                return self.ad_write_int32(user, value);
+            }
             self.ad.port_base.call_param_callback(0, reason)?;
             return Ok(());
         }
@@ -260,6 +265,19 @@ pub fn create_moving_dot_with_config(
 mod tests {
     use super::*;
     use ad_core_rs::plugin::channel::NDArrayOutput;
+
+    /// A base-class parameter reaches ADDriver::writeInt32, whose pool branch
+    /// clears the PreAllocBuffers busy command (asynNDArrayDriver.cpp:686-688).
+    #[test]
+    fn test_write_int32_hands_a_base_param_to_ad_driver() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let mut det =
+            MovingDotDetector::new("DOT_PREALLOC", 8, 8, 1_000_000, acq_tx, dirty).unwrap();
+        let pre_alloc = det.ad.params.base.pool_pre_alloc;
+        det.write_int32(&mut AsynUser::new(pre_alloc), 1).unwrap();
+        assert_eq!(det.ad.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
+    }
 
     #[test]
     fn test_create_moving_dot() {

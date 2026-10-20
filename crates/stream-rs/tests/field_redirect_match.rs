@@ -55,7 +55,7 @@ record(ao, "h") { field(DTYP, "stream") field(OUT, "@redirect.proto get_time R")
 
         // this record's own field
         process(&db, "b", 1).await;
-        assert_eq!(get(&db, "b.EGU").to_string(), "degC");
+        assert_eq!(get(&db, "b.EGU").text_g(), "degC");
 
         // a string into a CHAR array
         process(&db, "c", 1).await;

@@ -1093,8 +1093,12 @@ impl Record for ASubRecord {
     /// C `fetch_values` asks `dbGetLink` for the channel's declared FTx with
     /// `nRequest = NOx` (`aSubRecord.c:283-284`). One element is the scalar
     /// request; a wider channel is the array one, which converts whatever
-    /// the source is, so no read resolves the source first.
+    /// the source is, so no read resolves the source first. `SUBL` is
+    /// `dbGetLink(&subl, DBR_STRING, ...)` (`aSubRecord.c:256`).
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
+        if link_field == "SUBL" {
+            return InputLinkRequest::As(LinkReadAs::String);
+        }
         let Some(idx) = parse_channel(link_field)
             .filter(|&(chan, _)| chan == Chan::Inp)
             .map(|(_, idx)| idx)
@@ -1482,6 +1486,11 @@ mod tests {
         );
         assert_eq!(
             rec.input_link_request("SUBL"),
+            InputLinkRequest::As(LinkReadAs::String),
+            "SUBL is read as DBR_STRING"
+        );
+        assert_eq!(
+            rec.input_link_request("SIML"),
             InputLinkRequest::As(LinkReadAs::Native),
             "only INPx links carry a channel FTx"
         );

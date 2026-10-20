@@ -41,7 +41,7 @@ async fn state(db: &PvDatabase, rec: &str) -> String {
     let val = match db.get_pv(format!("{rec}.VAL")).unwrap() {
         EpicsValue::Double(d) => d.to_string(),
         EpicsValue::Enum(e) => e.to_string(),
-        other => other.to_string(),
+        other => other.text_g(),
     };
     let inst = db.get_record(rec).unwrap();
     let inst = inst.read();

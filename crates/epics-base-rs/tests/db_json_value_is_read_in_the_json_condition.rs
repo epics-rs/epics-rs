@@ -79,7 +79,7 @@ fn check(name: &str, body: &str, want: &str, have: &[&str], lack: &[&str]) {
 fn field(db: &PvDatabase, rec: &str, field: &str) -> String {
     let rec = db.get_record(rec).expect("the record loads");
     let value = rec.read().resolve_field(field).expect("a declared field");
-    value.to_string()
+    value.text_g()
 }
 
 #[epics_macros_rs::epics_test]

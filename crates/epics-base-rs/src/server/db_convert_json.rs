@@ -1374,7 +1374,9 @@ impl Token {
 }
 
 fn truncate(v: &EpicsValue) -> PvString {
-    let text = v.to_string();
+    let EpicsValue::String(text) = v else {
+        unreachable!("both callers hand a DBR_STRING row");
+    };
     let bytes = text.as_bytes();
     PvString::from_bytes(&bytes[..bytes.len().min(DBR_STRING_CAPACITY)])
 }

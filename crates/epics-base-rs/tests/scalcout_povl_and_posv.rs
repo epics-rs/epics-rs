@@ -157,7 +157,7 @@ async fn scalcout_keeps_povl_and_posv_and_posts_oval_from_povl() {
         let got = db
             .get_pv(pv)
             .unwrap_or_else(|e| panic!("{pv}: {e}"))
-            .to_string();
+            .text_g();
         assert_eq!(got, want, "{pv}");
     }
 }

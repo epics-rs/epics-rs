@@ -15,6 +15,7 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::snl::qxbpm::{
     CalibrationData, DEFAULT_GX, DEFAULT_GY, DEFAULT_LOW_CURRENT_RAW, DiodeCurrents, RawDiodeData,
@@ -483,7 +484,11 @@ impl QxbpmHolder {
                     .lock()
                     .unwrap()
                     .insert(port.clone(), port_handle);
-                println!("simQxbpmCreate: port={port} x={x_pos} y={y_pos} poll={poll_ms}ms");
+                println!(
+                    "simQxbpmCreate: port={port} x={} y={} poll={poll_ms}ms",
+                    CFloat(x_pos).g(),
+                    CFloat(y_pos).g()
+                );
                 Ok(CommandOutcome::Continue)
             },
         )

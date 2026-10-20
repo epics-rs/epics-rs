@@ -2279,7 +2279,7 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
         }
         _ => v,
     };
-    let s = format!("{v_for_format}");
+    let s = v_for_format.text_g();
     if s.len() <= max_len {
         s
     } else {
@@ -2298,6 +2298,19 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `gdd_to_log_string` prints a real as `%g` (gateResources.cc:229).
+    #[test]
+    fn an_audited_real_is_c_percent_g() {
+        assert_eq!(
+            format_value_for_audit(&EpicsValue::Double(0.1 + 0.2), 256),
+            "0.3"
+        );
+        assert_eq!(
+            format_value_for_audit(&EpicsValue::DoubleArray(vec![1e20, 0.5].into()), 256),
+            "[1e+20, 0.5]"
+        );
+    }
     // Only the eight gated tests below host a real async CA server, so the
     // import carries their predicate — otherwise it is unused on the exec
     // backend.

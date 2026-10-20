@@ -87,7 +87,7 @@ record(ai, "cy") { field(DTYP, "stream") field(INP, "@redirect.proto cross_y R")
             }
         }
         for r in ["cx", "cy"] {
-            assert_eq!(get(&db, &format!("{r}.DESC")).to_string(), "a", "{r}");
+            assert_eq!(get(&db, &format!("{r}.DESC")).text_g(), "a", "{r}");
             assert_eq!(f(&db, &format!("{r}.SEVR")), 0.0, "{r}");
         }
     });

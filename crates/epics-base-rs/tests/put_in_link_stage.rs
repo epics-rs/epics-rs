@@ -73,8 +73,8 @@ impl Record for Clearing {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "GO" => self.go = value.to_f64().unwrap_or(0.0) as i16,
-            "OGO" => self.ogo = value.to_string(),
-            "OLD" => self.old = value.to_string(),
+            "OGO" => self.ogo = value.text_g(),
+            "OLD" => self.old = value.text_g(),
             _ => return Err(CaError::FieldNotFound(name.into())),
         }
         Ok(())

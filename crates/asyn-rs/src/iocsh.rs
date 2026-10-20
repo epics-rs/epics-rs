@@ -144,12 +144,13 @@ fn arg_f64(args: &[ArgValue], i: usize) -> Option<f64> {
 }
 
 /// A text argument. The port registry and the drivers key on `String`, so
-/// bytes that are not UTF-8 are refused here rather than renamed.
+/// bytes that are not UTF-8 are refused here rather than renamed. No command
+/// reads a `Double` argument as text; C's `iocshArgString` is the token itself,
+/// so there is no C spelling to give one.
 fn arg_str(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     Ok(match args.get(i) {
         Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
         Some(ArgValue::Int(v)) => Some(v.to_string()),
-        Some(ArgValue::Double(v)) => Some(v.to_string()),
         _ => None,
     })
 }
@@ -2656,6 +2657,11 @@ mod tests {
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::user::AsynUser;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_double_argument_has_no_text() {
+        assert_eq!(arg_str(&[ArgValue::Double(0.5)], 0), Ok(None));
+    }
 
     /// C `report` writes a missing port's line to the report's `fp`
     /// (asynManager.c:1150-1153), the stream an `asynReport` redirect captures.

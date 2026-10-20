@@ -685,3 +685,34 @@ jobs:
           echo "::endgroup::"
         done
         exit "$rc"
+
+  # raw_float_format (lints/raw_float_format) needs a format argument's type,
+  # which only a rustc_private lint sees, so it runs on the nightly its
+  # rust-toolchain.toml pins while the workspace stays on stable. That pin must
+  # be a rust-clippy sync date: dylint_driver registers the clippy_utils
+  # symbols of the nearest sync, and on any other nightly rustc panics on the
+  # ones it has since gained.
+  raw-float-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2026-10-01
+        components: llvm-tools-preview, rustc-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: raw-float-format
+    - name: Install dylint
+      run: cargo install --locked cargo-dylint@6.2.0 dylint-link@6.2.0
+    - name: Lint UI tests
+      working-directory: lints/raw_float_format
+      run: cargo test
+    - name: raw_float_format
+      run: cargo dylint --all --workspace -- --all-features --keep-going
+    - name: raw_float_format (thread backend)
+      env:
+        EPICS_RS_BUILD_EXEC_BACKEND: thread
+      run: cargo dylint --all --workspace -- --all-features --keep-going

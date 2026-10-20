@@ -1352,9 +1352,10 @@ impl PartialEq for CalcVal {
     }
 }
 
+/// `clink->val` as `lnkCalc_report` prints a value (`lnkCalc.c:382`), `%g`.
 impl std::fmt::Debug for CalcVal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.get().fmt(f)
+        write!(f, "{}", epics_libcom_rs::cfmt::CFloat(self.get()).g())
     }
 }
 
@@ -4796,6 +4797,13 @@ mod json_link_tests {
             report("[1.5]", 2),
             ["      'const': array of 1 double", "        [1.5]"]
         );
+    }
+
+    #[test]
+    fn a_calc_val_debugs_as_c_percent_g() {
+        let val = CalcVal::default();
+        val.set(0.1 + 0.2);
+        assert_eq!(format!("{val:?}"), "0.3");
     }
 
     #[test]

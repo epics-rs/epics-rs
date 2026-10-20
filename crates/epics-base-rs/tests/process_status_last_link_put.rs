@@ -55,7 +55,7 @@ impl Record for LastPut {
             .iter()
             .position(|f| *f == name)
             .ok_or_else(|| CaError::FieldNotFound(name.into()))?;
-        self.links[i] = value.to_string();
+        self.links[i] = value.text_g();
         Ok(())
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {

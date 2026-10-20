@@ -47,6 +47,8 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use crate::trace::TraceMask;
@@ -1022,7 +1024,8 @@ impl ComPortOptions {
             self.stop = i32::from(r[0]);
             if self.stop as f32 != b {
                 return Err(asyn_error(format!(
-                    "Tried to set {b} stop bits, actually set {} stop bits.",
+                    "Tried to set {} stop bits, actually set {} stop bits.",
+                    CFloat(f64::from(b)).g(),
                     self.stop
                 )));
             }

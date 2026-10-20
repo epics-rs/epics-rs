@@ -10191,6 +10191,36 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     );
 }
 
+/// C reads `SUBL` with `dbGetLink(&subl, DBR_STRING, snam)` (`aSubRecord.c:256`),
+/// so a numeric source names the subroutine in its own `getDoubleString` text,
+/// at its PREC (`dbFastLinkConv.c:1333`).
+#[epics_macros_rs::epics_test]
+async fn asub_subl_names_a_float_source_at_its_precision() {
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+
+    let db = PvDatabase::new();
+    let mut holder = AiRecord::new(1.5);
+    holder.prec = 2;
+    db.add_record("NUM_HOLDER", Box::new(holder)).await.unwrap();
+    let mut rec = ASubRecord::default();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ
+    rec.put_field("SUBL", EpicsValue::String("NUM_HOLDER".into()))
+        .unwrap();
+    db.add_record("ASUB_N", Box::new(rec)).await.unwrap();
+
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    db.process_record_with_links("ASUB_N", &mut visited)
+        .await
+        .unwrap();
+    let snam = db
+        .get_record("ASUB_N")
+        .unwrap()
+        .read()
+        .record
+        .get_field("SNAM");
+    assert_eq!(snam, Some(EpicsValue::String("1.50".into())));
+}
+
 /// aSub `LFLG=IGNORE` (the default) resolves its subroutine from SNAM once at
 /// init via the function registry (C `aSubRecord.c::init_record` ->
 /// `registryFunctionFind`), wired by `wire_subroutines` on the `.db` path.

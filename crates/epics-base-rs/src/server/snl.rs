@@ -196,6 +196,11 @@ enum Request {
         name: Arc<str>,
         reply: oneshot::Sender<CaResult<EpicsValue>>,
     },
+    /// A `string` variable's `pvGet`, which asks for `DBR_STRING`.
+    GetText {
+        name: Arc<str>,
+        reply: oneshot::Sender<CaResult<String>>,
+    },
     Flush {
         reply: oneshot::Sender<()>,
     },
@@ -377,6 +382,9 @@ async fn serve(
             Request::Get { name, reply } => {
                 let _ = reply.send(db.get_pv(&*name));
             }
+            Request::GetText { name, reply } => {
+                let _ = reply.send(db.get_pv(&*name).map(|v| db.pv_dbr_string(&name, &v)));
+            }
             Request::Flush { reply } => {
                 let _ = reply.send(());
             }
@@ -548,10 +556,14 @@ impl SeqPv {
     }
 
     pub async fn get_string(&self) -> String {
-        match self.get().await {
-            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-            Some(v) => v.to_string(),
-            None => String::new(),
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::GetText {
+            name: self.name.clone(),
+            reply,
+        });
+        match crate::runtime::task::timeout(DEFAULT_TIMEOUT, rx).await {
+            Ok(Ok(Ok(text))) => text,
+            _ => String::new(),
         }
     }
 

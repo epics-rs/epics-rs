@@ -100,10 +100,10 @@ impl DbChannel {
             .unwrap_or(0)
     }
 
+    /// The field as `dbGetField(DBR_STRING)` reads it.
     pub async fn get_string(&self) -> String {
         match self.db.get_pv(&self.name) {
-            Ok(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-            Ok(v) => v.to_string(),
+            Ok(v) => self.db.pv_dbr_string(&self.name, &v),
             Err(_) => String::new(),
         }
     }
@@ -1324,6 +1324,21 @@ mod multi_monitor_tests {
             .await
             .unwrap();
         assert_eq!(monitor.wait_change().await, ("X".to_string(), 5.0));
+    }
+
+    /// `get_string` is `dbGetField(DBR_STRING)`: a real at the record's
+    /// `get_precision`.
+    #[epics_macros_rs::epics_test]
+    async fn get_string_renders_at_the_record_precision() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "P",
+            Box::new(crate::server::records::ai::AiRecord::new(1.5)),
+        )
+        .await
+        .unwrap();
+        db.put_pv("P.PREC", EpicsValue::Short(2)).await.unwrap();
+        assert_eq!(DbChannel::new(&db, "P").get_string().await, "1.50");
     }
 
     /// The first put of an unchanged value clears UDF, an alarm-only post,

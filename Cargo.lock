@@ -3867,6 +3867,7 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "record-seam-gate",
  "scaler-rs",
  "tempfile",

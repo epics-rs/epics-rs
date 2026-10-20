@@ -114,7 +114,11 @@ fn value_string(v: &EpicsValue) -> String {
             String::from_utf8_lossy(&b[..end]).into_owned()
         }
         EpicsValue::Char(c) if *c == 0 => String::new(),
-        other => other.to_string(),
+        // Every read here asks for DBR_STRING; a number is that conversion.
+        other => match other.convert_to(epics_base_rs::types::DbFieldType::String) {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            _ => String::new(),
+        },
     }
 }
 

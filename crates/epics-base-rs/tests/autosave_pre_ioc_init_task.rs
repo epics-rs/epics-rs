@@ -57,7 +57,7 @@ async fn child_ioc() {
             for name in names {
                 let val = config.db.get_pv(&name).unwrap();
                 let udf = config.db.get_pv(format!("{name}.UDF")).unwrap();
-                println!("{name}={val}/{udf}");
+                println!("{name}={}/{}", val.text_g(), udf.text_g());
             }
             if let Some(mgr) = config.autosave_manager {
                 mgr.shutdown();

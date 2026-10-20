@@ -135,7 +135,7 @@ async fn a_put_opened_without_an_lset_reads_as_constant() {
     .unwrap();
     lset.calls.store(0, Ordering::Relaxed);
     db.process_record("OL:AI").await.unwrap();
-    assert_eq!(db.get_pv("OL:AI.SEVR").unwrap().to_string(), "0");
+    assert_eq!(db.get_pv("OL:AI.SEVR").unwrap().text_g(), "0");
     assert_eq!(
         lset.calls.load(Ordering::Relaxed),
         0,

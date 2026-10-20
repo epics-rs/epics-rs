@@ -69,9 +69,9 @@ impl Record for Readback {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "TAG" => self.name = value.to_string(),
-            "L0" => self.links[0] = value.to_string(),
-            "L1" => self.links[1] = value.to_string(),
+            "TAG" => self.name = value.text_g(),
+            "L0" => self.links[0] = value.text_g(),
+            "L1" => self.links[1] = value.text_g(),
             "G0" => self.gate[0] = value.to_f64() != Some(0.0),
             "G1" => self.gate[1] = value.to_f64() != Some(0.0),
             "R0" => self.r[0] = value.to_f64().unwrap_or(f64::NAN),
@@ -192,7 +192,7 @@ record(calc, "AO") { field(CALC, "VAL+1") field(VAL, "7.5") field(HOPR, "9") }
     // An INVALID inherit and then a failed read's LINK/INVALID tie on
     // severity, so the first one taken keeps STAT and AMSG: C applies each
     // inline as its dbGetLink returns (dbDbLink.c:225-229, dbLink.c:337-338).
-    let namsg = |rec: &str| db.get_pv(format!("{rec}.NAMSG")).unwrap().to_string();
+    let namsg = |rec: &str| db.get_pv(format!("{rec}.NAMSG")).unwrap().text_g();
     assert_eq!(alarm("TIEMS"), (Some(14.0), Some(3.0)));
     assert_eq!(namsg("TIEMS"), "");
     assert_eq!(alarm("TIEMSS"), (Some(3.0), Some(3.0)));

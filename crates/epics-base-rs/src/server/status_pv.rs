@@ -401,7 +401,7 @@ mod tests {
              read hook would not have"
         );
         assert_eq!(
-            format!("{}", pv.get()),
+            pv.get().text_g(),
             "42",
             "and the stored value must be the pushed sample, not the registered one"
         );
@@ -449,7 +449,7 @@ mod tests {
             "a string reader must produce a string PV; a double PV here would \
              make UPTIME a number and break every site's stringin client"
         );
-        assert_eq!(format!("{}", text.get()), "00:00:07");
+        assert_eq!(text.get().text_g(), "00:00:07");
     }
 
     /// Every value in one tick is read before any of them is published, so
@@ -482,7 +482,7 @@ mod tests {
             let seen = seen.clone();
             let first = first.clone();
             move || {
-                *seen.lock().expect("observation") = format!("{}", first.get());
+                *seen.lock().expect("observation") = first.get().text_g();
                 EpicsValue::Double(2.0)
             }
         };
@@ -499,7 +499,7 @@ mod tests {
              spans two instants instead of one"
         );
         assert_eq!(
-            format!("{}", first.get()),
+            first.get().text_g(),
             "9",
             "precondition: this tick's sample really was published by it"
         );

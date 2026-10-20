@@ -308,8 +308,8 @@ impl Record for Throttle {
             "DLY" => self.dly = f(),
             "DRVLH" => self.drvlh = f(),
             "DRVLL" => self.drvll = f(),
-            "OUTL" => self.outl = value.to_string(),
-            "SINP" => self.sinp = value.to_string(),
+            "OUTL" => self.outl = value.text_g(),
+            "SINP" => self.sinp = value.text_g(),
             _ => return Err(CaError::FieldNotFound(name.into())),
         }
         Ok(())

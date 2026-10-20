@@ -3383,7 +3383,11 @@ impl PvDatabase {
                     }
                 }
             }
-            let text = value.to_string();
+            // C prints the `.db` text; a numeric field's was converted on the way
+            // in, so this is its `DBR_STRING` form.
+            let text = crate::server::record::record_instance::value_as_dbr_string(&value)
+                .map(|s| s.as_str_lossy().into_owned())
+                .unwrap_or_default();
             if let Err(e) = instance.put_common_field_db_load(&field, value) {
                 let line = crate::server::db_loader::field_refusal_line(
                     entry,

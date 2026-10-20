@@ -572,9 +572,9 @@ mod ioc {
              MEM_FREE={mem_free} MEM_USED={mem_used}",
         );
         for rec in ["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"] {
-            let val = db.get_pv(rec).map(|v| v.to_string());
-            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.to_string());
-            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.to_string());
+            let val = db.get_pv(rec).map(|v| v.text_g());
+            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.text_g());
+            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.text_g());
             println!("STAGE5 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
     }

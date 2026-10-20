@@ -205,7 +205,7 @@ async fn lso_seeds_olen_from_a_number_dol_only_after_a_successful_dset_init() {
     let db = probe_ioc_of("lso", r#"field(DOL, "5") field(SIZV, "40")"#).await;
     let olen = by_outcome(&db, "lso", "OLEN").map(|v| v.and_then(|v| v.to_f64()));
     assert_eq!(olen, [Some(1.0), Some(0.0), Some(0.0)], "lso.OLEN");
-    let oval = by_outcome(&db, "lso", "OVAL").map(|v| v.map(|v| v.to_string()));
+    let oval = by_outcome(&db, "lso", "OVAL").map(|v| v.map(|v| v.text_g()));
     assert_eq!(oval, [const { Some(String::new()) }; 3], "lso.OVAL");
 }
 

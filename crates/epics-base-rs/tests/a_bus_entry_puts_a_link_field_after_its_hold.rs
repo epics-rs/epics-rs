@@ -37,7 +37,7 @@ async fn ioc() -> Arc<PvDatabase> {
 }
 
 fn link(db: &PvDatabase, pv: &str) -> String {
-    db.get_pv(pv).unwrap().to_string()
+    db.get_pv(pv).unwrap().text_g()
 }
 
 fn set(db: &PvDatabase, record: &str) -> u64 {

@@ -103,7 +103,7 @@ impl Record for Probe {
     }
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "COUT" => self.cout = value.to_string(),
+            "COUT" => self.cout = value.text_g(),
             _ => return Err(CaError::FieldNotFound(name.into())),
         }
         Ok(())

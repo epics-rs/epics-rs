@@ -109,7 +109,7 @@ record(seq, "SQ") {
             "{w} INVALID"
         );
         let kept = if pv == "WF.NELM" { "4" } else { "" };
-        assert_eq!(db.get_pv(pv).unwrap().to_string(), kept, "{pv} kept");
+        assert_eq!(db.get_pv(pv).unwrap().text_g(), kept, "{pv} kept");
     }
     db.put_record_field_from_ca("W4", "VAL", EpicsValue::String("Bogus".into()))
         .await

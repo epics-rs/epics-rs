@@ -1,3 +1,5 @@
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::types::EpicsValue;
 
 /// Alarm severity levels matching EPICS base.
@@ -290,7 +292,7 @@ impl AlarmLimit {
 impl std::fmt::Display for AlarmLimit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Double(v) => write!(f, "{v}"),
+            Self::Double(v) => write!(f, "{}", CFloat(*v).g()),
             Self::Long(v) => write!(f, "{v}"),
             Self::Int64(v) => write!(f, "{v}"),
         }
@@ -332,6 +334,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_limit_displays_as_c_percent_g() {
+        assert_eq!(AlarmLimit::Double(1e20).to_string(), "1e+20");
+        assert_eq!(AlarmLimit::Double(f64::NAN).to_string(), "nan");
+        assert_eq!(AlarmLimit::Double(0.5).to_string(), "0.5");
+    }
 
     #[test]
     fn range_is_normal_with_no_level_enabled_and_fires_with_any_one() {

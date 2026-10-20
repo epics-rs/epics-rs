@@ -52,7 +52,7 @@ fn f64_of(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 fn str_of(db: &PvDatabase, pv: &str) -> String {
-    db.get_pv(pv).unwrap().to_string()
+    db.get_pv(pv).unwrap().text_g()
 }
 
 fn arr(db: &PvDatabase, pv: &str, n: usize) -> Vec<f64> {

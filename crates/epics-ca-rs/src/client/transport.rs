@@ -1269,53 +1269,29 @@ fn resolve_connection_timeout() -> Duration {
         .parse()
         .expect("EPICS_CA_CONN_TMO's compiled default is a number");
     // Unset resolves to the compiled default string and parses, silently — so
-    // only a set-but-bad value reaches the error arm.
-    let secs = match EPICS_CA_CONN_TMO.double() {
-        Ok(v) => v,
-        // C `cac::cac` (`cac.cpp:189-194`) — both lines, verbatim, on top
-        // of the "Unable to find a real number in ..." that
-        // `envGetDoubleConfigParam` already printed.
-        Err(_) => {
-            epics_libcom_rs::stderr_println!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
+    // only a set-but-bad value reaches the refusal.
+    //
+    // C `cac::cac` (`cac.cpp:189-195`, since `a8180003e`) refuses a failed
+    // fetch, a non-finite and a non-positive period alike, with the same two
+    // lines on top of whatever `envGetDoubleConfigParam` printed. Before it, C
+    // stored a non-positive period and its connection watchdog fired on every
+    // check: the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
+    // `=-5`. A huge finite period such as `1e300` is obeyed, as in C; it is
+    // `Duration::MAX` here, which is why every deadline built from it goes
+    // through `runtime::task::deadline_from_now` rather than a bare
+    // `Instant + Duration`, which panics instead of never firing.
+    match EPICS_CA_CONN_TMO.double() {
+        Ok(secs) if secs > 0.0 && secs.is_finite() => crate::estdlib::duration_from_secs(secs),
+        _ => {
+            epics_libcom_rs::stderr_println!(
+                "EPICS \"EPICS_CA_CONN_TMO\" was not a positive real number"
+            );
             epics_libcom_rs::stderr_println!(
                 "Defaulting \"EPICS_CA_CONN_TMO\" = {:.6}",
                 CFloat(default_secs)
             );
-            default_secs
+            crate::estdlib::duration_from_secs(default_secs)
         }
-    };
-    // A non-positive or non-finite period does not become a zero-period
-    // watchdog here — and no longer as a deviation.
-    //
-    // At the pinned R7.0.10 C stored whatever `envGetDoubleConfigParam`
-    // parsed (`cac.cpp:188-193`: the default was applied ONLY when the fetch
-    // failed, never when it succeeded with a useless number) and handed it to
-    // the circuit's connection-verify watchdog. With `EPICS_CA_CONN_TMO=-5`
-    // or `=0` the deadline is already in the past on every check, so the
-    // compiled `camonitor` — still delivering updates, so the client is not
-    // "broken" — emitted 177_182 stderr lines in 3 seconds on this platform,
-    // a "Virtual circuit unresponsive" flood spinning a core.
-    //
-    // Upstream then adopted the same refusal: `a8180003e` ("cac: reject a
-    // non-positive or non-finite EPICS_CA_CONN_TMO", after R7.0.10, in
-    // `origin/7.0`) guards with `status || ! finite(connTMO) ||
-    // connTMO <= 0.0` and falls back to `CA_CONN_VERIFY_PERIOD` with two
-    // `errlogPrintf` lines. So the guard below is C's, and it takes C's
-    // `finite()` half too — `inf` and `NaN` are refused, while a merely
-    // enormous finite period such as `1e300` is obeyed, as it is in C. That
-    // period is `Duration::MAX` here, which is why every deadline built from
-    // it goes through `runtime::task::deadline_from_now` rather than a bare
-    // `Instant + Duration`, which panics instead of never firing.
-    if secs > 0.0 && secs.is_finite() {
-        crate::estdlib::duration_from_secs(secs)
-    } else {
-        epics_libcom_rs::stderr_println!(
-            "Warning: \"EPICS_CA_CONN_TMO\" = {secs} is not a positive period; \
-             using {:.6} (a non-positive period fires the connection \
-             watchdog continuously)",
-            CFloat(default_secs)
-        );
-        crate::estdlib::duration_from_secs(default_secs)
     }
 }
 /// Legacy seconds accessor kept for call sites that need a coarse

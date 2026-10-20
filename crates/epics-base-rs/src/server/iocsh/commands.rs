@@ -1648,7 +1648,7 @@ pub(crate) fn db_get_string(
         (Some(text), _) => text.into_bytes(),
         // C returns the field's own bytes.
         (None, EpicsValue::String(s)) => s.as_bytes().to_vec(),
-        (None, value) => value.to_string().into_bytes(),
+        (None, value) => value.text_with(usize::MAX, real_to_string).into_bytes(),
     }
 }
 
@@ -13125,7 +13125,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
                 "the existing record keeps its own type"
             );
             assert_eq!(
-                inst.resolve_field("DESC").unwrap().to_string(),
+                inst.resolve_field("DESC").unwrap().text_g(),
                 "from mbbo",
                 "a field the existing type declares is applied to it"
             );
@@ -14335,8 +14335,8 @@ record(mbboDirect, "MBD0") {{ }}
                  so can't modify record."
             )
         );
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "first");
-        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().to_string(), "");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "first");
+        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().text_g(), "");
     }
 
     /// Clear — C's default — the same file merges, which is the whole
@@ -14352,8 +14352,8 @@ record(mbboDirect, "MBD0") {{ }}
                record(ai, "D:ONE") { field(DESC, "second") field(EGU, "V") }"#,
         )
         .expect("the default merges");
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "second");
-        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().to_string(), "V");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "second");
+        assert_eq!(db.get_pv("D:ONE.EGU").unwrap().text_g(), "V");
     }
 
     /// `record("*", …)` returns from C's `dbRecordHead` before
@@ -14369,7 +14369,7 @@ record(mbboDirect, "MBD0") {{ }}
         let outcome = load_records(&ctx, r#"record("*", "D:ONE") { field(DESC, "edited") }"#);
         run_cmd(&ctx, "var", &["dbRecordsOnceOnly", "0"]);
         outcome.expect("a modify block is exempt");
-        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().to_string(), "edited");
+        assert_eq!(db.get_pv("D:ONE.DESC").unwrap().text_g(), "edited");
     }
 
     /// C `createAlias` (`dbLexRoutines.c:1459-1476`): an alias that already
@@ -14389,7 +14389,7 @@ record(mbboDirect, "MBD0") {{ }}
                alias("D:TWO", "D:ALIAS")"#,
         )
         .expect("the default accepts the repeat");
-        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().to_string(), "t");
+        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().text_g(), "t");
 
         run_cmd(&ctx, "var", &["dbRecordsOnceOnly", "1"]);
         let err = load_records(&ctx, r#"alias("D:TWO", "D:ALIAS")"#).expect_err("once-only");
@@ -14399,7 +14399,7 @@ record(mbboDirect, "MBD0") {{ }}
             format!("{ERL_ERROR}: Alias 'D:ALIAS' already defined; dbRecordsOnceOnly is set.")
         );
         // The alias the FIRST declaration made is untouched either way.
-        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().to_string(), "t");
+        assert_eq!(db.get_pv("D:ALIAS.DESC").unwrap().text_g(), "t");
     }
 
     /// An alias name already taken by something else is C's OTHER arm and
@@ -14446,7 +14446,7 @@ record(mbboDirect, "MBD0") {{ }}
             ("A:CAO.OUT", "OTHER:PV CA NMS"),
             ("L:B.FLNK", ""),
         ] {
-            assert_eq!(db.get_pv(pv).unwrap().to_string(), want, "{pv}");
+            assert_eq!(db.get_pv(pv).unwrap().text_g(), want, "{pv}");
         }
     }
 

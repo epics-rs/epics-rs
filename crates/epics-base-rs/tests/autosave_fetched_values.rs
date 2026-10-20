@@ -24,11 +24,7 @@ async fn child_ioc() {
         .run(|config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             for _ in 0..200 {
-                if config
-                    .db
-                    .get_pv("P:DONE")
-                    .is_ok_and(|v| v.to_string() == "1")
-                {
+                if config.db.get_pv("P:DONE").is_ok_and(|v| v.text_g() == "1") {
                     break;
                 }
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
@@ -61,8 +57,16 @@ fn run(script: &str) -> (Vec<String>, tempfile::TempDir) {
 /// [`run`]'s stdout and stderr apart: errlog's lines land on stderr, where
 /// no `echo` marker places them.
 fn run_split(script: &str) -> (Vec<String>, Vec<String>, tempfile::TempDir) {
+    run_with(script, &[])
+}
+
+/// [`run_split`] with `files` (name, contents) also in the directory.
+fn run_with(script: &str, files: &[(&str, &str)]) -> (Vec<String>, Vec<String>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
+    for (name, contents) in files {
+        std::fs::write(d.join(name), contents).unwrap();
+    }
     std::fs::write(d.join("a.db"), RECORDS).unwrap();
     std::fs::write(d.join("a.req"), "A\n").unwrap();
     std::fs::write(d.join("s.req"), "A\nW\nS\n").unwrap();
@@ -507,4 +511,48 @@ fn a_refused_put_reports_by_the_tasks_ca_context() {
         "{lines:#?}"
     );
     assert!(!lines.iter().any(|l| l == heartbeat), "{lines:#?}");
+}
+
+/// A one-element array member restores `pchannel->value`, the text
+/// `get_channel_values` made with DOUBLE_FMT (save_restore.c:1623-1624,
+/// :3244-3245), so 0.1+0.2 comes back as `%.14g`'s 0.3.
+#[test]
+fn a_one_element_array_restores_the_double_fmt_text() {
+    let (lines, _, _dir) = run_with(
+        "dbLoadRecords(\"d.db\")\n\
+         create_manual_set(\"d.req\")\n\
+         iocInit\n\
+         dbpf WD.VAL \"[0.30000000000000004]\"\n\
+         epicsThreadSleep 2\n\
+         manual_save(\"d.req\")\n\
+         epicsThreadSleep 2\n\
+         dbpf WD.VAL \"[4,5]\"\n\
+         fdbrestore(\"d.sav\")\n\
+         epicsThreadSleep 1\n\
+         dbpf EQ.PROC 1\n\
+         echo ==values\n\
+         dbgf WD.NORD\n\
+         dbgf EQ\n\
+         echo ==end\n",
+        &[
+            (
+                "d.db",
+                "record(waveform, \"WD\") { field(NELM, \"3\") field(FTVL, \"DOUBLE\") }\n\
+                 record(calc, \"EQ\") { field(INPA, \"WD NPP\") field(CALC, \"A=0.3\") }\n",
+            ),
+            ("d.req", "WD\n"),
+        ],
+    );
+    let values: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .skip_while(|l| *l != "==values")
+        .skip(1)
+        .take_while(|l| *l != "==end")
+        .collect();
+    assert_eq!(
+        values,
+        ["DBF_ULONG:          1 = 0x1", "DBF_DOUBLE:         1"],
+        "{lines:#?}"
+    );
 }

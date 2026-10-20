@@ -1,5 +1,7 @@
 use std::sync::Weak;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
@@ -812,7 +814,10 @@ impl NDArray {
         ));
         out.push_str(&format!(
             "  uniqueId={}, timeStamp={}, epicsTS.secPastEpoch={}, epicsTS.nsec={}\n",
-            self.unique_id, self.time_stamp, self.timestamp.sec, self.timestamp.nsec
+            self.unique_id,
+            CFloat(self.time_stamp),
+            self.timestamp.sec,
+            self.timestamp.nsec
         ));
         out.push_str(&format!("  poolId={}\n", self.pool_id()));
         match &self.codec {
@@ -1117,5 +1122,12 @@ mod tests {
         assert_eq!(v, &[1, 2]);
         let mut empty = NDDataBuffer::F64(vec![]);
         assert!(empty.as_u8_slice_mut().is_empty());
+    }
+
+    #[test]
+    fn report_prints_the_time_stamp_as_c_percent_f() {
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.time_stamp = 1.5;
+        assert!(arr.report(0).contains(", timeStamp=1.500000, "));
     }
 }

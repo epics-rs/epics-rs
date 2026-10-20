@@ -26,7 +26,7 @@ async fn child_ioc() {
             epics_base_rs::server::db_server::announce_serving("probe");
             for field in FIELDS {
                 let value = config.db.get_pv(format!("A.{}", field.0)).unwrap();
-                println!("{}={value}", field.0);
+                println!("{}={}", field.0, value.text_g());
             }
             Ok(())
         })

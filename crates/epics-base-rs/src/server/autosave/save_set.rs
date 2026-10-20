@@ -1157,10 +1157,9 @@ impl SaveSet {
                 // on the list's channel, not as this status.
                 _ if f.entry.connected => {
                     let text = match &f.value {
-                        Some(value) if value.is_array() => value
-                            .first_element()
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
+                        Some(value) if value.is_array() => {
+                            super::manager::channel_value(db, pv, Some(value)).0
+                        }
                         _ => String::from_utf8_lossy(
                             &epics_libcom_rs::runtime::epics_string::raw_from_escaped(
                                 &f.entry.value,
@@ -1382,7 +1381,7 @@ impl FileMacros {
 /// to a directory named by stale stack bytes.
 pub(super) fn file_pv_value(db: &PvDatabase, pv: &str) -> String {
     match super::manager::ca_get(db, pv) {
-        Ok(live) => super::manager::dbr_string(db, pv, &live),
+        Ok(live) => db.pv_dbr_string(pv, &live),
         Err(_) => String::new(),
     }
 }

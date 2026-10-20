@@ -85,7 +85,12 @@ impl Cam {
                 let value = e
                     .delivered_value(&self.db.get_record(rec).unwrap().read(), field)
                     .unwrap();
-                out.push(format!("{m} {pv} {value} {} {}", e.stat(), e.sevr()));
+                out.push(format!(
+                    "{m} {pv} {} {} {}",
+                    value.text_g(),
+                    e.stat(),
+                    e.sevr()
+                ));
             }
         }
         out
@@ -414,7 +419,7 @@ record(swait, "SW") { field(INAN, "SWIN") field(CALC, "A") }
         errlog(),
         ["recGblRecordError: swaitRecord:special: Illegal CALC field Illegal field value PV: SW\n"]
     );
-    assert_eq!(cam.db.get_pv("SW.CALC").unwrap().to_string(), "A+");
+    assert_eq!(cam.db.get_pv("SW.CALC").unwrap().text_g(), "A+");
     assert_eq!(cam.db.get_pv("SW.CLCV").unwrap().to_f64(), Some(-1.0));
 }
 
@@ -441,6 +446,6 @@ async fn swait_init_bad_calc_matches_oracle() {
         heard,
         ["recGblRecordError: swait:init_record: Illegal CALC field Illegal field value PV: SW\n"]
     );
-    assert_eq!(cam.db.get_pv("SW.CALC").unwrap().to_string(), "A+");
+    assert_eq!(cam.db.get_pv("SW.CALC").unwrap().text_g(), "A+");
     assert_eq!(cam.db.get_pv("SW.CLCV").unwrap().to_f64(), Some(-1.0));
 }

@@ -68,7 +68,7 @@ impl Record for CoutpRecord {
                 Ok(())
             }
             "COUTP" => {
-                self.coutp = value.to_string();
+                self.coutp = value.text_g();
                 Ok(())
             }
             _ => Err(CaError::FieldNotFound(name.into())),

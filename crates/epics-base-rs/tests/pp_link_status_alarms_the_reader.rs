@@ -62,7 +62,7 @@ async fn a_failing_pp_target_alarms_the_link_holder() {
         let _ = db
             .put_record_field_from_ca_no_notify(name, "PROC", EpicsValue::Long(1))
             .await;
-        let get = |f: &str| db.get_pv(format!("{name}.{f}")).unwrap().to_string();
+        let get = |f: &str| db.get_pv(format!("{name}.{f}")).unwrap().text_g();
         let got = (get("SEVR"), get("STAT"), get("AMSG"));
         if got != ("3".into(), "14".into(), format!("field {link}")) {
             wrong.push(format!("{name}: {got:?}"));

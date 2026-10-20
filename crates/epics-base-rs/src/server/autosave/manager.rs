@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::server::database::PvDatabase;
-use crate::server::record::record_instance::value_as_dbr_string;
 use crate::types::{DbFieldType, EpicsValue};
 use epics_libcom_rs::cfmt::CFloat;
 use tokio::sync::watch;
@@ -1173,21 +1172,6 @@ impl AutosaveManager {
     }
 }
 
-/// `ca_get(DBR_STRING)` of `name`, whose value is `live`: a menu field as
-/// its choice.
-pub(super) fn dbr_string(db: &PvDatabase, name: &str, live: &EpicsValue) -> String {
-    let (base, field) = crate::server::database::parse_pv_name(name);
-    match db.get_record(base) {
-        Some(rec) => rec
-            .read()
-            .source_render_of(field, live)
-            .dbr_string(live.clone()),
-        None => value_as_dbr_string(live),
-    }
-    .map(|s| s.to_string())
-    .unwrap_or_default()
-}
-
 /// C `channel_connected` of member `name`, `None` with no chid: what
 /// `ca_connection_callback` makes of the channel `connect_list` made, once
 /// the server has answered (save_restore.c:731-745). A channel the server
@@ -1257,7 +1241,7 @@ pub(super) fn channel_value(
             _ => String::new(),
         }
     } else {
-        dbr_string(db, name, live)
+        db.pv_dbr_string(name, live)
     };
     let enum_val = match live {
         EpicsValue::Enum(i) => Some(*i as i16),

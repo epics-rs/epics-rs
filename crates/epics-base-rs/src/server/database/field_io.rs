@@ -2365,6 +2365,23 @@ impl PvDatabase {
         self.get_pv(name)
     }
 
+    /// C `dbGetField(&addr, DBR_STRING, ...)` of `name`, `live` being what was
+    /// just read from it: its record renders it (a float at its PREC, an index
+    /// as its state label, an array as element 0); a simple PV is rendered by
+    /// the value alone.
+    pub(crate) fn pv_dbr_string(&self, name: &str, live: &EpicsValue) -> String {
+        let (base, field) = super::parse_pv_name(name);
+        match self.get_record(base) {
+            Some(rec) => rec
+                .read()
+                .source_render_of(field, live)
+                .dbr_string(live.clone()),
+            None => crate::server::record::record_instance::value_as_dbr_string(live),
+        }
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+    }
+
     /// Get the current value of a PV or record field.
     /// Uses resolve_field for records (3-level priority).
     pub fn get_pv(&self, name: impl AsRef<[u8]>) -> CaResult<EpicsValue> {

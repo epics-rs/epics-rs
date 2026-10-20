@@ -25,11 +25,7 @@ async fn child_ioc() {
         .run(|config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             for _ in 0..200 {
-                if config
-                    .db
-                    .get_pv("P:DONE")
-                    .is_ok_and(|v| v.to_string() == "1")
-                {
+                if config.db.get_pv("P:DONE").is_ok_and(|v| v.text_g() == "1") {
                     break;
                 }
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;

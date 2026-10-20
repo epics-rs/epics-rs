@@ -135,7 +135,7 @@ async fn dbloadrecords_keeps_the_records_above_a_syntax_error() {
     }
     assert!(db.get_record("F3C").is_none(), "F3C is past the abort");
     let f3b = db.get_record("F3B").expect("F3B");
-    assert_eq!(f3b.read().resolve_field("DESC").unwrap().to_string(), "b");
+    assert_eq!(f3b.read().resolve_field("DESC").unwrap().text_g(), "b");
 }
 
 /// `softIoc -d f1.db -d f3.db` prints the same lines and exits 2; the builder

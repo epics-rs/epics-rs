@@ -813,9 +813,9 @@ mod ioc {
             "RTEMS:CA:C8",
             "RTEMS:CA:OTHER",
         ] {
-            let val = db.get_pv(rec).map(|v| v.to_string());
-            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.to_string());
-            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.to_string());
+            let val = db.get_pv(rec).map(|v| v.text_g());
+            let sevr = db.get_pv(format!("{rec}.SEVR")).map(|v| v.text_g());
+            let stat = db.get_pv(format!("{rec}.STAT")).map(|v| v.text_g());
             println!("C6 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
     }

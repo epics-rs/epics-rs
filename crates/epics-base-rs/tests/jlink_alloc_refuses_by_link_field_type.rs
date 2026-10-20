@@ -102,7 +102,7 @@ async fn a_link_type_refusing_the_field_type_prints_both_lines() {
     let field = |rec: &str, field: &str| {
         let rec = db.get_record(rec).expect("the record loads");
         let value = rec.read().resolve_field(field).expect("a declared field");
-        value.to_string()
+        value.text_g()
     };
     assert_eq!(field("F1", "DESC"), "f1");
     assert_eq!(field("F1", "FLNK"), "");

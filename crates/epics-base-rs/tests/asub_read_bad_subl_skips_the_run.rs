@@ -35,16 +35,8 @@ fn get(db: &PvDatabase, pv: &str) -> EpicsValue {
 
 async fn check(db: &PvDatabase, rec: &str, snam: &str) {
     process(db, rec).await;
-    assert_eq!(
-        get(db, &format!("{rec}.SNAM")).to_string(),
-        snam,
-        "{rec}.SNAM"
-    );
-    assert_eq!(
-        get(db, &format!("{rec}.ONAM")).to_string(),
-        "",
-        "{rec}.ONAM"
-    );
+    assert_eq!(get(db, &format!("{rec}.SNAM")).text_g(), snam, "{rec}.SNAM");
+    assert_eq!(get(db, &format!("{rec}.ONAM")).text_g(), "", "{rec}.ONAM");
     assert_eq!(
         get(db, &format!("{rec}.VAL")).to_f64(),
         Some(0.0),

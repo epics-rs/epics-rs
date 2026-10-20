@@ -38,7 +38,7 @@ fn text(s: &str) -> EpicsValue {
 }
 
 fn sdis(db: &PvDatabase) -> String {
-    db.get_pv("X.SDIS").unwrap().to_string()
+    db.get_pv("X.SDIS").unwrap().text_g()
 }
 
 #[epics_macros_rs::epics_test]

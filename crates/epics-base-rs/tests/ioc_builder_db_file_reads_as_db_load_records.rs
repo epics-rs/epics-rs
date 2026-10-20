@@ -34,7 +34,7 @@ async fn db_file_resolves_its_includes_on_the_path_list() {
         .await
         .expect("top2.db loads");
     let rec = db.get_record("OK").expect("the included record loads");
-    assert_eq!(rec.read().resolve_field("DESC").unwrap().to_string(), "ok");
+    assert_eq!(rec.read().resolve_field("DESC").unwrap().text_g(), "ok");
 }
 
 #[epics_macros_rs::epics_test]

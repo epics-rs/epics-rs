@@ -125,6 +125,8 @@ impl NDAttrValue {
         }
     }
 
+    /// The value as text; a float is `NDAttribute::report`'s `%f`
+    /// (NDAttribute.cpp:464, :468).
     pub fn as_string(&self) -> String {
         match self {
             Self::Int8(v) => v.to_string(),
@@ -135,8 +137,8 @@ impl NDAttrValue {
             Self::UInt32(v) => v.to_string(),
             Self::Int64(v) => v.to_string(),
             Self::UInt64(v) => v.to_string(),
-            Self::Float32(v) => v.to_string(),
-            Self::Float64(v) => v.to_string(),
+            Self::Float32(v) => epics_libcom_rs::cfmt::CFloat(f64::from(*v)).to_string(),
+            Self::Float64(v) => epics_libcom_rs::cfmt::CFloat(*v).to_string(),
             Self::String(v) => v.clone(),
             Self::Undefined => String::new(),
         }
@@ -526,12 +528,21 @@ pub fn spawn_ca_monitor(
     let pv_name = source.pv_name.clone();
     let dbr_type = source.dbr_type;
     let cell = source.cell().clone();
+    // C subscribes as `dbrtype` (PVAttribute.cpp:294); a DBR_STRING request
+    // has the IOC render a float at its PREC and an enum as its label.
+    let as_text = dbr_type == PvAttrDbrType::String;
     runtime.spawn(async move {
-        let _ = client
-            .camonitor(&pv_name, |value| {
-                cell.set(dbr_type.publish(epics_value_to_nd_attr(&value)));
-            })
-            .await;
+        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        let channel = client.create_channel(&pv_name);
+        let Ok(mut monitor) = channel
+            .subscribe_with_mask_readback(0.0, DBE_VALUE | DBE_LOG | DBE_ALARM, as_text, as_text)
+            .await
+        else {
+            return;
+        };
+        while let Some(Ok(snapshot)) = monitor.recv().await {
+            cell.set(dbr_type.publish(epics_value_to_nd_attr(&snapshot.value)));
+        }
     })
 }
 
@@ -877,6 +888,10 @@ mod tests {
         assert_eq!(s.as_f64(), None);
         assert_eq!(s.as_i64(), None);
         assert_eq!(s.as_string(), "hello");
+
+        // NDAttribute::report's `value=%f` (NDAttribute.cpp:464, :468).
+        assert_eq!(NDAttrValue::Float64(1.5).as_string(), "1.500000");
+        assert_eq!(NDAttrValue::Float32(f32::NAN).as_string(), "nan");
     }
 
     #[test]

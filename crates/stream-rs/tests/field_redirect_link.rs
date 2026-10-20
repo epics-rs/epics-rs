@@ -35,16 +35,16 @@ record(ai, "a0") { field(DTYP, "stream") field(INP, "@redirect.proto names_tb R"
 "#;
 
 fn link(db: &PvDatabase, pv: &str) -> String {
-    get(db, pv).to_string()
+    get(db, pv).text_g()
 }
 
 /// `pv` once it is `want`, or after two seconds.
 async fn settled(db: &PvDatabase, pv: &str, want: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(2);
-    while get(db, pv).to_string() != want && Instant::now() < deadline {
+    while get(db, pv).text_g() != want && Instant::now() < deadline {
         sleep(Duration::from_millis(5)).await;
     }
-    get(db, pv).to_string()
+    get(db, pv).text_g()
 }
 
 /// What `capture` took until `done` holds of it, or two seconds.
@@ -100,7 +100,7 @@ record(ai, "a") { field(DTYP, "stream") field(INP, "@redirect.proto put_link R")
         .await;
         assert_eq!(process(&db, "a", 1).await, ["H7"]);
         assert_eq!(f(&db, "a.SEVR"), 0.0, "the put answered Ok");
-        assert_eq!(get(&db, "lk.OUT").to_string(), "t2 NPP NMS");
+        assert_eq!(get(&db, "lk.OUT").text_g(), "t2 NPP NMS");
         assert_eq!(f(&db, "lk"), 0.0, "dbPutFieldLink processes nothing");
         assert_eq!(set_id(&db, "lk"), set_id(&db, "t2"));
         assert_ne!(set_id(&db, "lk"), set_id(&db, "t1"));

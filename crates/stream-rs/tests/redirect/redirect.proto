@@ -51,3 +51,6 @@ fail_lk { out "F5"; in "%(lk.OUT).1/(?=(@instio))/"; }
 cross_x { out "CX"; in "%(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s"; }
 cross_y { out "CY"; in "%(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s"; }
 intr_feed { in "%d %(it.VAL)d"; }
+
+# matchValue's debug line: the field buffer, expanded
+put_double { out "Q7"; in "%(t4.VAL)f"; }

@@ -21,7 +21,7 @@ fn f(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 fn s(db: &PvDatabase, pv: &str) -> String {
-    get(db, pv).to_string()
+    get(db, pv).text_g()
 }
 
 /// The protocol's second line prints `cnt`, which `t`'s FLNK counted.

@@ -1159,8 +1159,9 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         UShort(x) => x.to_string(),
         UInt(x) => x.to_string(),
         ULong(x) => x.to_string(),
-        Float(x) => x.to_string(),
-        Double(x) => x.to_string(),
+        // `SB()<<double` (`data.cpp:602`).
+        Float(x) => crate::pvdata::fmt::render_real(f64::from(*x)),
+        Double(x) => crate::pvdata::fmt::render_real(*x),
         String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
@@ -1317,6 +1318,18 @@ impl IntoScalarValue for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real stored into a string field is `SB()<<double` (`data.cpp:602`).
+    #[test]
+    fn a_real_coerces_to_the_stream_default_text() {
+        let text = |sv| match coerce_scalar(&sv, ScalarType::String) {
+            Some(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(ScalarValue::Double(1e20)), "1e+20");
+        assert_eq!(text(ScalarValue::Double(1.0 / 3.0)), "0.333333");
+        assert_eq!(text(ScalarValue::Float(0.1)), "0.1");
+    }
     use crate::nt::NTScalar;
 
     fn make_nt_int() -> Value {

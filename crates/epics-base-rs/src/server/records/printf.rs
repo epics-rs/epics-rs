@@ -172,7 +172,15 @@ impl PrintfRecord {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 Cow::Borrowed(&bytes[..end])
             }
-            other => Cow::Owned(format!("{other}").into_bytes()),
+            // `dbGetLink(DBR_STRING)` asks for one element.
+            EpicsValue::StringArray(a) => {
+                Cow::Owned(a.first().map(|s| s.as_bytes().to_vec()).unwrap_or_default())
+            }
+            other => Cow::Owned(
+                crate::server::record::record_instance::value_as_dbr_string(other)
+                    .map(|s| s.as_bytes().to_vec())
+                    .unwrap_or_default(),
+            ),
         }
     }
 
@@ -1640,6 +1648,15 @@ mod tests {
         rec.set_input(0, EpicsValue::String("motor1".into()));
         rec.process().unwrap();
         assert_eq!(val(&rec), "name=motor1");
+    }
+
+    /// `%s` of a numeric slot is its `DBR_STRING` form, one element of it.
+    #[test]
+    fn percent_s_of_a_double_array_is_its_first_element() {
+        let mut rec = rec_with("v=%s");
+        rec.set_input(0, EpicsValue::DoubleArray(vec![1.5, 2.5].into()));
+        rec.process().unwrap();
+        assert_eq!(val(&rec), "v=1.500000");
     }
 
     /// a string input survives even when other slots are numeric.

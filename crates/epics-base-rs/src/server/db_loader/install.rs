@@ -417,7 +417,12 @@ pub(crate) async fn install_records<H: InstallHost>(
                 }
                 for (name, value) in common_fields {
                     use crate::server::record::CommonFieldPutResult;
-                    let text = value.to_string();
+                    // C prints the `.db` text; a numeric field's was converted on
+                    // the way in, so this is its `DBR_STRING` form.
+                    let text =
+                        crate::server::record::record_instance::value_as_dbr_string(&value)
+                            .map(|s| s.as_str_lossy().into_owned())
+                            .unwrap_or_default();
                     // `.db` load: C's loader converter, whose menu
                     // bound differs from a runtime dbPut's
                     // (`dbStaticRun.c::dbPutStringNum`).

@@ -1,5 +1,4 @@
 use crate::error::{CaError, CaResult};
-use std::fmt;
 
 use super::DbFieldType;
 use super::PvString;
@@ -98,95 +97,6 @@ pub enum EpicsValue {
     /// of NUL-padded strings. Used by `mbbo`/`mbbi` choice arrays
     /// (ZNAM..FFNAM as a single read), NTNDArray dim labels, etc.
     StringArray(SharedArray<PvString>),
-}
-
-impl fmt::Display for EpicsValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::String(s) => write!(f, "{s}"),
-            Self::Short(v) => write!(f, "{v}"),
-            Self::Float(v) => write!(f, "{v}"),
-            Self::Enum(v) => write!(f, "{v}"),
-            // Transient NTEnum carrier: render the index, identical to
-            // `Enum`. The labels are only consumed by a string-target
-            // `put_field`, never by Display.
-            Self::EnumWithChoices { index, .. } => write!(f, "{index}"),
-            // DBF_CHAR is epicsInt8 (signed); C `getCharString`
-            // (dbConvert.c) renders it via cvtCharToString → signed
-            // cvtInt32ToString, so 0xFF -> "-1". Render the storage byte as
-            // i8 to match — consistent with the signed `to_f64` view below.
-            Self::Char(v) => write!(f, "{}", *v as i8),
-            Self::Long(v) => write!(f, "{v}"),
-            Self::Double(v) => write!(f, "{v}"),
-            Self::Int64(v) => write!(f, "{v}"),
-            Self::UInt64(v) => write!(f, "{v}"),
-            Self::UShort(v) => write!(f, "{v}"),
-            Self::ULong(v) => write!(f, "{v}"),
-            // DBF_UCHAR is epicsUInt8: render the storage byte unsigned
-            // (0xFF -> "255"), the counterpart of `Char`'s signed render.
-            Self::UChar(v) => write!(f, "{v}"),
-            Self::ShortArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::FloatArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::EnumArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::DoubleArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::LongArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::Int64Array(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::UInt64Array(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::UShortArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::ULongArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            // DBF_UCHAR[] is a numeric unsigned-byte buffer (image/waveform
-            // data), not text — render as a numeric array, unlike the signed
-            // `CharArray` which decodes as a UTF-8 long string.
-            Self::UCharArray(arr) => {
-                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-                write!(f, "[{}]", parts.join(", "))
-            }
-            Self::CharArray(arr) => {
-                let text = nul_terminated(arr);
-                match std::str::from_utf8(text) {
-                    Ok(s) => write!(f, "{s}"),
-                    Err(_) => write!(f, "{text:?}"),
-                }
-            }
-            Self::StringArray(arr) => {
-                write!(f, "[")?;
-                for (i, s) in arr.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{s:?}")?;
-                }
-                write!(f, "]")
-            }
-        }
-    }
 }
 
 /// A char array's text: its elements before the first NUL.
@@ -376,52 +286,71 @@ impl EpicsValue {
             .unwrap_or_else(|| PvString::from(index.to_string()))
     }
 
-    /// Render for audit / log paths with array truncation. The full
-    /// `Display` impl allocates `Vec<String>` of length N and joins —
-    /// for a peer-controlled `LongArray` of millions of elements that
-    /// is tens of MB of churn before any post-truncation. This helper
-    /// caps array element count to `max_elems`, appending `, …+K
-    /// more` on overflow.
+    /// Render for audit / log paths, the array element count capped to
+    /// `max_elems`: a peer-controlled `LongArray` of millions of elements is
+    /// never rendered whole. No C text exists for it, so a float is C `%g`.
     pub fn display_truncated(&self, max_elems: usize) -> String {
-        fn render<T: fmt::Display>(arr: &[T], max: usize) -> String {
-            if arr.len() <= max {
-                let parts: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
-                format!("[{}]", parts.join(", "))
-            } else {
-                let parts: Vec<String> = arr[..max].iter().map(|v| v.to_string()).collect();
-                format!("[{}, …+{} more]", parts.join(", "), arr.len() - max)
+        self.text_with(max_elems, |v, _| {
+            epics_libcom_rs::cfmt::CFloat(v).g().to_string()
+        })
+    }
+
+    /// [`Self::text_with`] whole, a float as C `%g`: the text for a caller
+    /// that prints no C conversion of its own.
+    pub fn text_g(&self) -> String {
+        self.display_truncated(usize::MAX)
+    }
+
+    /// The port's text for a value whose caller has no C conversion for its
+    /// type: a scalar alone, an array as `[a, b, …+K more]` past `max_elems`.
+    /// `real(v, is_double)` spells a float, so every caller names the C
+    /// format it prints.
+    pub fn text_with(&self, max_elems: usize, real: impl Fn(f64, bool) -> String) -> String {
+        fn list<T>(arr: &[T], max: usize, text: impl Fn(&T) -> String) -> String {
+            let parts: Vec<String> = arr.iter().take(max).map(text).collect();
+            match arr.len().saturating_sub(max) {
+                0 => format!("[{}]", parts.join(", ")),
+                more => format!("[{}, …+{more} more]", parts.join(", ")),
             }
         }
+        let max = max_elems;
         match self {
-            Self::ShortArray(arr) => render(arr, max_elems),
-            Self::FloatArray(arr) => render(arr, max_elems),
-            Self::EnumArray(arr) => render(arr, max_elems),
-            Self::DoubleArray(arr) => render(arr, max_elems),
-            Self::LongArray(arr) => render(arr, max_elems),
-            Self::Int64Array(arr) => render(arr, max_elems),
-            Self::UInt64Array(arr) => render(arr, max_elems),
-            Self::UShortArray(arr) => render(arr, max_elems),
-            Self::ULongArray(arr) => render(arr, max_elems),
-            // Numeric unsigned-byte preview (not the binary/text CharArray
-            // path below): DBF_UCHAR carries image/waveform numbers.
-            Self::UCharArray(arr) => render(arr, max_elems),
-            Self::StringArray(arr) => {
-                if arr.len() <= max_elems {
-                    let parts: Vec<String> = arr.iter().map(|s| format!("{s:?}")).collect();
-                    format!("[{}]", parts.join(", "))
-                } else {
-                    let parts: Vec<String> =
-                        arr[..max_elems].iter().map(|s| format!("{s:?}")).collect();
-                    format!("[{}, …+{} more]", parts.join(", "), arr.len() - max_elems)
-                }
-            }
-            Self::CharArray(arr) if arr.len() > max_elems * 4 => {
-                // 4× because chars are bytes; let scalar+small-array
-                // CharArray fall through to Display.
+            Self::String(s) => s.as_str_lossy().into_owned(),
+            Self::Float(v) => real(f64::from(*v), false),
+            Self::Double(v) => real(*v, true),
+            Self::Enum(v) | Self::UShort(v) => v.to_string(),
+            Self::EnumWithChoices { index, .. } => index.to_string(),
+            Self::Short(v) => v.to_string(),
+            // DBF_CHAR is epicsInt8, DBF_UCHAR epicsUInt8.
+            Self::Char(v) => (*v as i8).to_string(),
+            Self::UChar(v) => v.to_string(),
+            Self::Long(v) => v.to_string(),
+            Self::ULong(v) => v.to_string(),
+            Self::Int64(v) => v.to_string(),
+            Self::UInt64(v) => v.to_string(),
+            Self::ShortArray(arr) => list(arr, max, ToString::to_string),
+            Self::FloatArray(arr) => list(arr, max, |v| real(f64::from(*v), false)),
+            Self::EnumArray(arr) => list(arr, max, ToString::to_string),
+            Self::DoubleArray(arr) => list(arr, max, |v| real(*v, true)),
+            Self::LongArray(arr) => list(arr, max, ToString::to_string),
+            Self::Int64Array(arr) => list(arr, max, ToString::to_string),
+            Self::UInt64Array(arr) => list(arr, max, ToString::to_string),
+            Self::UShortArray(arr) => list(arr, max, ToString::to_string),
+            Self::ULongArray(arr) => list(arr, max, ToString::to_string),
+            // DBF_UCHAR carries image/waveform numbers, not text.
+            Self::UCharArray(arr) => list(arr, max, ToString::to_string),
+            Self::StringArray(arr) => list(arr, max, |s| format!("{s:?}")),
+            // 4× because chars are bytes.
+            Self::CharArray(arr) if arr.len() > max.saturating_mul(4) => {
                 format!("<binary {} bytes>", arr.len())
             }
-            // Scalars + short CharArray: full Display is bounded.
-            other => format!("{other}"),
+            Self::CharArray(arr) => {
+                let text = nul_terminated(arr);
+                match std::str::from_utf8(text) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => format!("{text:?}"),
+                }
+            }
         }
     }
 
@@ -1036,12 +965,9 @@ impl EpicsValue {
     /// `cvtInt64ToString` prints the exact integer). A float element is
     /// `putFloatString`/`putDoubleString` with no `get_precision` to ask, so
     /// precision 6.
-    fn element_texts(&self, nums: &[f64]) -> SharedArray<PvString> {
-        fn texts<T: fmt::Display>(a: &[T]) -> SharedArray<PvString> {
-            a.iter().map(|v| v.to_string().into()).collect()
-        }
+    fn element_texts(&self) -> SharedArray<PvString> {
         match self {
-            Self::UInt64Array(a) => texts(a),
+            Self::UInt64Array(a) => a.iter().map(|v| v.to_string().into()).collect(),
             Self::FloatArray(a) => a
                 .iter()
                 .map(|&v| super::codec::cvt_float_to_string(v, 6).into())
@@ -1051,8 +977,8 @@ impl EpicsValue {
                 .map(|&v| super::codec::cvt_double_to_string(v, 6).into())
                 .collect(),
             _ => match self.as_int_i64_array() {
-                Some(ints) => texts(&ints),
-                None => texts(nums),
+                Some(ints) => ints.iter().map(|v| v.to_string().into()).collect(),
+                None => unreachable!("a StringArray is its own String target"),
             },
         }
     }
@@ -1189,7 +1115,7 @@ impl EpicsValue {
                     Some(v) => v.iter().map(|&x| Scalar::Int(x).to_u8()).collect(),
                     None => nums.iter().map(|&v| Scalar::Float(v).to_u8()).collect(),
                 }),
-                DbFieldType::String => EpicsValue::StringArray(self.element_texts(&nums)),
+                DbFieldType::String => EpicsValue::StringArray(self.element_texts()),
             };
         }
         if let EpicsValue::CharArray(bytes) = self {
@@ -1272,11 +1198,20 @@ impl EpicsValue {
             (DbFieldType::String, EpicsValue::Double(v)) => {
                 EpicsValue::String(super::codec::cvt_double_to_string(*v, 6).into())
             }
+            // `cvtInt32ToString` and its siblings: an integer is its digits.
+            (DbFieldType::String, _) => EpicsValue::String(
+                match self.num() {
+                    Some(Scalar::Int(v)) => v.to_string(),
+                    Some(Scalar::U64(v)) => v.to_string(),
+                    other => unreachable!("{other:?} has its own String arm"),
+                }
+                .into(),
+            ),
             _ => self
                 .num()
                 .unwrap_or_else(|| Scalar::Float(self.to_f64().unwrap_or(0.0)))
                 .to_field(target)
-                .unwrap_or_else(|| EpicsValue::String(format!("{self}").into())),
+                .expect("only a String target has no scalar row"),
         }
     }
 
@@ -1894,16 +1829,31 @@ mod parse_radix_tests {
         );
     }
 
+    /// No C text: a real is C `%g`, an array lists its elements.
+    #[test]
+    fn display_truncated_prints_a_real_as_c_percent_g() {
+        assert_eq!(EpicsValue::Double(0.1 + 0.2).text_g(), "0.3");
+        assert_eq!(EpicsValue::Float(1e20).text_g(), "1e+20");
+        assert_eq!(
+            EpicsValue::DoubleArray(vec![0.1 + 0.2, 1.5, 2.0].into()).display_truncated(2),
+            "[0.3, 1.5, …+1 more]"
+        );
+    }
+
     #[test]
     fn char_renders_signed_to_string() {
         // C getCharString sign-extends DBF_CHAR (epicsInt8): 0xFF -> "-1",
         // 0x80 -> "-128". A DBR_STRING GET of a scalar DBF_CHAR routes the
-        // value through Display, so the rendered byte must be signed.
-        assert_eq!(EpicsValue::Char(0xFF).to_string(), "-1");
-        assert_eq!(EpicsValue::Char(0x80).to_string(), "-128");
-        assert_eq!(EpicsValue::Char(0xC8).to_string(), "-56");
-        assert_eq!(EpicsValue::Char(0x7F).to_string(), "127");
-        assert_eq!(EpicsValue::Char(0).to_string(), "0");
+        // value through `convert_to`, so the rendered byte must be signed.
+        let dbr_string = |v: EpicsValue| match v.convert_to(DbFieldType::String) {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(dbr_string(EpicsValue::Char(0xFF)), "-1");
+        assert_eq!(dbr_string(EpicsValue::Char(0x80)), "-128");
+        assert_eq!(dbr_string(EpicsValue::Char(0xC8)), "-56");
+        assert_eq!(dbr_string(EpicsValue::Char(0x7F)), "127");
+        assert_eq!(dbr_string(EpicsValue::Char(0)), "0");
         // The same byte promotes to f64 signed, so the two views agree.
         assert_eq!(EpicsValue::Char(0xFF).to_f64(), Some(-1.0));
     }

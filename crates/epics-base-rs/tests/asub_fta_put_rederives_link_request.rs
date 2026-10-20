@@ -39,16 +39,16 @@ async fn an_fta_put_mid_run_rederives_the_link_request() {
 
     process(&db).await;
     assert_eq!(
-        db.get_pv("S.A").unwrap().to_string(),
+        db.get_pv("S.A").unwrap().text_g(),
         "one",
         "a STRING channel reads the source's label"
     );
 
     set_fta(&db, 10);
     process(&db).await;
-    assert_ne!(db.get_pv("S.A").unwrap().to_string(), "one");
+    assert_ne!(db.get_pv("S.A").unwrap().text_g(), "one");
 
     set_fta(&db, 0);
     process(&db).await;
-    assert_eq!(db.get_pv("S.A").unwrap().to_string(), "one");
+    assert_eq!(db.get_pv("S.A").unwrap().text_g(), "one");
 }

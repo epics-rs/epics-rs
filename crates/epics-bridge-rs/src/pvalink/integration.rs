@@ -1331,7 +1331,10 @@ impl LinkSet for PvaLinkResolver {
                     .await
                     .map_err(|e| e.to_string())
             } else {
-                let value_str = value.to_string();
+                // The channel parses this text back into its own type, where
+                // pvxs puts the value typed (`pvaPutValueX`,
+                // pvalink_lset.cpp:608), so a real is its round-trip digits.
+                let value_str = value.text_with(usize::MAX, |real, _| real.to_string());
                 link.put_out_str(&cfg, &value_str, block)
                     .await
                     .map_err(|e| e.to_string())
@@ -5038,7 +5041,7 @@ record(ai, "AR:JSON") { field(INP, {pva:{pv:"AR:PV", sevr:"MS"}}) }
     }
 
     fn alarm_of(db: &PvDatabase, rec: &str) -> (String, String) {
-        let pv = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_string();
+        let pv = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().text_g();
         (pv("SEVR"), pv("AMSG"))
     }
 

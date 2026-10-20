@@ -1,3 +1,5 @@
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::flags::{FreezeOffset, MotorDir, MotorError};
 
 /// Convert dial position to user position.
@@ -23,7 +25,9 @@ pub fn dial_to_raw(dial: f64, mres: f64) -> Result<i32, MotorError> {
     // 0 or i64::MIN/MAX. Reject it so the caller does not corrupt RVAL.
     if !raw.is_finite() {
         return Err(MotorError::InvalidFieldValue(format!(
-            "dial/mres is not finite (dial={dial}, mres={mres})"
+            "dial/mres is not finite (dial={}, mres={})",
+            CFloat(dial).g(),
+            CFloat(mres).g()
         )));
     }
     Ok(to_long(raw.round()))
@@ -97,6 +101,14 @@ pub fn cascade_from_val(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_to_raw_names_a_non_finite_dial_in_c_spelling() {
+        let Err(MotorError::InvalidFieldValue(msg)) = dial_to_raw(f64::NAN, 1e-5) else {
+            panic!("a NaN dial is refused");
+        };
+        assert_eq!(msg, "dial/mres is not finite (dial=nan, mres=1e-05)");
+    }
 
     #[test]
     fn test_dial_to_user_pos_no_off() {

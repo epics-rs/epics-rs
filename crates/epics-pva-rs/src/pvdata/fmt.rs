@@ -81,7 +81,7 @@ pub(crate) fn format_g(v: f64, precision: usize) -> String {
 
 /// pvxs's precision for a real (`datafmt.cpp:148-151`): the C++ stream
 /// default of six significant digits.
-fn render_real(v: f64) -> String {
+pub(crate) fn render_real(v: f64) -> String {
     format_g(v, 6)
 }
 

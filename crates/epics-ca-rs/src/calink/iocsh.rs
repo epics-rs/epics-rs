@@ -72,7 +72,7 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                                 "    {field}={raw:?}  ca://{name}  connected={connected}"
                             ));
                             if let Some(v) = value {
-                                ctx.println(&format!("        value={v}"));
+                                ctx.println(&format!("        value={}", v.text_g()));
                             }
                             if let Some(sev) = alarm {
                                 ctx.println(&format!("        alarmSeverity={sev}"));

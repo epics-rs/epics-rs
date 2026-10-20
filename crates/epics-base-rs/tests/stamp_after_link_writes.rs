@@ -57,7 +57,7 @@ impl Record for Stamping {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => self.val = value.to_f64().unwrap_or(0.0),
-            "OUT" => self.out = value.to_string(),
+            "OUT" => self.out = value.text_g(),
             _ => return Err(CaError::FieldNotFound(name.into())),
         }
         Ok(())

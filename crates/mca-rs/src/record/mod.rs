@@ -606,10 +606,12 @@ fn as_u32(name: &str, v: &EpicsValue) -> CaResult<u32> {
     Ok(as_f64(name, v)?.max(0.0) as u32)
 }
 
-fn as_string(v: &EpicsValue) -> PvString {
+/// A string field's put: the framework's put row has already rendered a
+/// number at the record's `get_precision` (`mcaRecord.c:892`).
+fn as_string(name: &str, v: &EpicsValue) -> CaResult<PvString> {
     match v {
-        EpicsValue::String(s) => s.clone(),
-        other => PvString::from(other.to_string().as_str()),
+        EpicsValue::String(s) => Ok(s.clone()),
+        _ => Err(CaError::TypeMismatch(name.into())),
     }
 }
 
@@ -773,7 +775,7 @@ impl Record for McaRecord {
                 "BG" => self.roi[i].nbg = as_i16(name, &value)?,
                 "IP" => self.roi[i].is_preset = as_u16(name, &value)?,
                 "P" => self.roi[i].preset = as_f64(name, &value)?,
-                "NM" => self.roi[i].name = as_string(&value),
+                "NM" => self.roi[i].name = as_string(name, &value)?,
                 // `R{i}` and `R{i}N` are `special(SPC_NOMOD)`: the record
                 // computes them. The framework's put gate refuses a client write
                 // from the declaration; an internal put lands here.
@@ -825,13 +827,13 @@ impl Record for McaRecord {
             "CALO" => self.calo = as_f64(name, &value)?,
             "CALS" => self.cals = as_f64(name, &value)?,
             "CALQ" => self.calq = as_f64(name, &value)?,
-            "EGU" => self.egu = as_string(&value),
+            "EGU" => self.egu = as_string(name, &value)?,
             "TTH" => self.tth = as_f64(name, &value)?,
             "ERTM" => self.ertm = as_f64(name, &value)?,
             "ELTM" => self.eltm = as_f64(name, &value)?,
             "DTIM" => self.dtim = as_f64(name, &value)?,
             "IDTIM" => self.idtim = as_f64(name, &value)?,
-            "STIM" => self.stim = as_string(&value),
+            "STIM" => self.stim = as_string(name, &value)?,
             "RTIM" => self.rtim = as_f64(name, &value)?,
             "ACT" => self.act = as_i32(name, &value)?,
             "NACK" => self.nack = as_i16(name, &value)?,

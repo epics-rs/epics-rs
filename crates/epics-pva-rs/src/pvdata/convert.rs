@@ -288,19 +288,12 @@ pub fn as_u8(f: &PvField) -> Result<u8, NoConvert> {
 /// `"true"`/`"false"` (`data.cpp:438`); every integer and real renders through
 /// `SB()<<src` (`copyOutScalar`, `data.cpp:409`). Array, struct and unselected
 /// union storage have no arm → [`NoConvert`]; a selected union derefs.
-///
-/// DEVIATION, deliberate and recorded: `SB()<<double` is `std::ostream`'s
-/// default float format (6 significant digits, `1e+20`); the port renders a
-/// real with Rust's shortest round-trip form. No `record._options` reader
-/// observes that text — a numeric store always satisfies the integer/bool
-/// conversion the readers try first — so this only affects the reason text of
-/// a [`NoConvert`], never a decision.
 pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
     match store_of(f) {
         Store::Bool(b) => Ok(if b { "true".into() } else { "false".into() }),
         Store::Integer(n) => Ok(n.to_string()),
         Store::UInteger(n) => Ok(n.to_string()),
-        Store::Real(n) => Ok(n.to_string()),
+        Store::Real(n) => Ok(super::fmt::render_real(n)),
         Store::Str(s) => Ok(s.into_owned()),
         Store::Compound(Some(inner)) => as_string(inner),
         Store::Array | Store::Compound(None) | Store::Null => Err(no_scalar_arm(f, "string")),
@@ -348,6 +341,21 @@ fn parse_base0<T>(
 mod tests {
     use super::*;
     use crate::pvdata::{PvStructure, TypedScalarArray, VariantValue};
+
+    /// `SB()<<src` (`data.cpp:409`): the stream default, `%g` at six digits.
+    #[test]
+    fn as_string_renders_a_real_as_the_stream_default() {
+        for (v, want) in [(0.1 + 0.2, "0.3"), (1e20, "1e+20"), (-f64::NAN, "-nan")] {
+            assert_eq!(
+                as_string(&PvField::Scalar(ScalarValue::Double(v))).unwrap(),
+                want
+            );
+        }
+        assert_eq!(
+            as_string(&PvField::Scalar(ScalarValue::Float(0.1))).unwrap(),
+            "0.1"
+        );
+    }
 
     #[test]
     fn as_bool_converts_every_numeric_storage_class() {

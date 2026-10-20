@@ -77,7 +77,7 @@ record(longout, "NL:FL") { field(FLNK, {pva:{pv:"NL:NOPE", local:true}}) }
 "#;
 
 fn field(db: &PvDatabase, name: &str) -> String {
-    db.get_pv(name).unwrap().to_string()
+    db.get_pv(name).unwrap().text_g()
 }
 
 #[epics_macros_rs::epics_test]

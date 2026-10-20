@@ -35,6 +35,8 @@ use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
 
 const PV: &str = "ADATTR:Temp";
+#[cfg(tokio_backend)]
+const PREC_PV: &str = "ADATTR:Prec";
 
 fn attributes_xml() -> String {
     format!(
@@ -91,9 +93,12 @@ fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
 #[cfg(tokio_backend)]
 #[tokio::test]
 async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
+    let mut prec3 = AiRecord::new(42.5);
+    prec3.prec = 3;
     let server = CaServer::builder()
         .port(0)
         .record(PV, AiRecord::new(42.5))
+        .record(PREC_PV, prec3)
         .build()
         .await
         .expect("build CA server");
@@ -120,7 +125,14 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     .expect("driver");
     drv.set_ca_client(client, tokio::runtime::Handle::current());
 
-    load_attributes(&mut drv, &attributes_xml()).expect("a fed EPICS_PV attribute loads clean");
+    // C asks the IOC for DBR_STRING (PVAttribute.cpp:294), which renders the
+    // ai at its PREC.
+    let xml = format!(
+        "<Attributes><Attribute name=\"Temp\" type=\"EPICS_PV\" source=\"{PV}\" \
+         dbrtype=\"DBR_DOUBLE\"/><Attribute name=\"Text\" type=\"EPICS_PV\" \
+         source=\"{PREC_PV}\" dbrtype=\"DBR_STRING\"/></Attributes>"
+    );
+    load_attributes(&mut drv, &xml).expect("a fed EPICS_PV attribute loads clean");
     assert_eq!(status(&drv), ATTR_STATUS_OK);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -128,6 +140,21 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
         match attribute_value(&drv, "Temp") {
             NDAttrValue::Float64(v) => {
                 assert!((v - 42.5).abs() < 1e-9, "monitored value was {v}");
+                break;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the EPICS_PV attribute never left {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    loop {
+        match attribute_value(&drv, "Text") {
+            NDAttrValue::String(text) => {
+                assert_eq!(text, "42.500");
                 break;
             }
             other => {

@@ -38,7 +38,7 @@ const PVS: [&str; 3] = ["SET", "SSET", "SUSE"];
 fn as_dbr_string(s: &Snapshot) -> String {
     match (&s.value, &s.enums) {
         (EpicsValue::Enum(i), Some(e)) => e.strings[usize::from(*i)].to_string(),
-        (v, _) => v.to_string(),
+        (v, _) => v.text_g(),
     }
 }
 

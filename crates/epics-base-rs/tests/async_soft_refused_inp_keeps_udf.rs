@@ -22,7 +22,7 @@ async fn proc_state(db: &epics_base_rs::server::database::PvDatabase, rec: &str)
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
-    let g = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().to_string();
+    let g = |f: &str| db.get_pv(format!("{rec}.{f}")).unwrap().text_g();
     format!("{} {} {}", g("UDF"), g("SEVR"), g("STAT"))
 }
 

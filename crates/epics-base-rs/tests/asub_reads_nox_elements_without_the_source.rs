@@ -127,5 +127,5 @@ async fn a_string_channel_renders_each_element_as_text() {
     let want: Vec<String> = (0..16).map(|i| i.to_string()).collect();
     assert_eq!(got.iter().map(|s| s.to_string()).collect::<Vec<_>>(), want);
     process(&db, "A_STR_3S").await;
-    assert_eq!(db.get_pv("A_STR_3S.A").unwrap().to_string(), "[\"7\"]");
+    assert_eq!(db.get_pv("A_STR_3S.A").unwrap().text_g(), "[\"7\"]");
 }

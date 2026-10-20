@@ -54,7 +54,7 @@ async fn state_posts_val_only_on_a_change_staterecord_c_115() {
                 event
                     .delivered_value(&db.get_record("ST").unwrap().read(), "VAL")
                     .unwrap()
-                    .to_string(),
+                    .text_g(),
             );
         }
     }
@@ -107,7 +107,7 @@ async fn an_alarm_only_change_posts_no_val_staterecord_c_118() {
                 event
                     .delivered_value(&db.get_record("ST").unwrap().read(), "VAL")
                     .unwrap()
-                    .to_string(),
+                    .text_g(),
             );
         }
     }
@@ -151,7 +151,7 @@ async fn an_alarm_only_change_posts_no_val_permissiverecord_c_107() {
                 event
                     .delivered_value(&db.get_record("PM").unwrap().read(), "VAL")
                     .unwrap()
-                    .to_string(),
+                    .text_g(),
             );
         }
     }

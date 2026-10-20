@@ -12,6 +12,7 @@ use epics_base_rs::server::records::link_status::{
     LinkStatusGen, classify_link, link_is_external,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
+use epics_libcom_rs::cfmt::CFloat;
 
 // `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
 // real link operation (`valuePut`/`valueSync`), never by the limit block.
@@ -254,12 +255,15 @@ const MAX_DLY: f64 = 86_400.0;
 fn validate_dly(v: f64) -> CaResult<()> {
     if !v.is_finite() {
         return Err(CaError::InvalidValue(format!(
-            "throttle DLY must be finite, got {v}"
+            "throttle DLY must be finite, got {}",
+            CFloat(v).g()
         )));
     }
     if v > MAX_DLY {
         return Err(CaError::InvalidValue(format!(
-            "throttle DLY must not exceed {MAX_DLY} seconds, got {v}"
+            "throttle DLY must not exceed {} seconds, got {}",
+            CFloat(MAX_DLY).g(),
+            CFloat(v).g()
         )));
     }
     Ok(())
@@ -1100,5 +1104,23 @@ mod menu_choice_tests {
         assert_eq!(menu("SIV"), Some(ov));
         assert_eq!(menu("SYNC"), Some(&["Idle", "Process"][..]));
         assert_eq!(menu("VAL"), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_dly_names_the_value_as_c_percent_g() {
+        let text = |v| match validate_dly(v) {
+            Err(CaError::InvalidValue(msg)) => msg,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(f64::NAN), "throttle DLY must be finite, got nan");
+        assert_eq!(
+            text(1e20),
+            "throttle DLY must not exceed 86400 seconds, got 1e+20"
+        );
     }
 }

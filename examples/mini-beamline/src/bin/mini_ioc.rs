@@ -24,6 +24,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
 use ad_core_rs::plugin::channel::NDArrayOutput;
@@ -193,7 +194,10 @@ async fn main() -> CaResult<()> {
                 let beam_interval = env_u64("BEAM_UPDATE_MS", 100);
                 println!(
                     "  Beam config: offset={}, amp={}, period={}s, interval={}ms",
-                    beam_config.offset, beam_config.amplitude, beam_config.period, beam_interval
+                    CFloat(beam_config.offset).g(),
+                    CFloat(beam_config.amplitude).g(),
+                    CFloat(beam_config.period).g(),
+                    beam_interval
                 );
 
                 let (_beam_jh, beam_rx) = beam_current::start_beam_current_thread(
@@ -237,10 +241,10 @@ async fn main() -> CaResult<()> {
                     "  MovingDot config: {}x{}, sigma=({},{}), bg={}, N/I/s={}",
                     dot_size_x,
                     dot_size_y,
-                    dot_image_config.sigma_x,
-                    dot_image_config.sigma_y,
-                    dot_image_config.background,
-                    dot_image_config.n_per_i_per_s
+                    CFloat(dot_image_config.sigma_x).g(),
+                    CFloat(dot_image_config.sigma_y).g(),
+                    CFloat(dot_image_config.background).g(),
+                    CFloat(dot_image_config.n_per_i_per_s).g()
                 );
 
                 let dot_claim =

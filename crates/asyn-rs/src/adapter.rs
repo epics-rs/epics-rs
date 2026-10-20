@@ -3047,12 +3047,16 @@ impl AsynDeviceSupport {
             }
             ("asynOctet", EpicsValue::String(s)) => Some(self.text_octet_write(s.as_bytes())),
             ("asynOctet", EpicsValue::CharArray(data)) => Some(self.text_octet_write(data)),
-            // Coerce numeric types to octet (e.g. longout writing to NDArrayPort string param)
+            // Coerce numeric types to octet (e.g. longout writing to NDArrayPort
+            // string param). C's devAsynOctet takes no numeric record, so a
+            // float is C `%g`.
             ("asynOctet", v) => {
                 // A number's text holds no NUL, so the strnlen cut is moot.
-                use std::io::Write as _;
                 let mut bytes = self.recycled();
-                let _ = write!(bytes, "{v}");
+                bytes.extend_from_slice(
+                    v.text_with(usize::MAX, |x, _| CFloat(x).g().to_string())
+                        .as_bytes(),
+                );
                 Some(RequestOp::OctetWrite {
                     data: self.cap_octet_write(bytes),
                 })
@@ -13766,6 +13770,31 @@ mod tests {
         match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
             Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABCDEFG".to_vec()),
             other => panic!("expected OctetWrite, got {other:?}"),
+        }
+    }
+
+    /// A number written to an octet param has no C devAsynOctet row: a real
+    /// is C `%g`.
+    #[test]
+    fn a_real_written_to_an_octet_is_c_percent_g() {
+        let (handle, _) = spawn_cmd_response_port("octet_real", b"");
+        let link = AsynLink {
+            port_name: "octet_real".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_len_cap = None;
+        for (val, text) in [
+            (EpicsValue::Double(0.1 + 0.2), &b"0.3"[..]),
+            (EpicsValue::Float(1e20), b"1e+20"),
+            (EpicsValue::Long(-7), b"-7"),
+        ] {
+            match ads.write_op(&val) {
+                Some(RequestOp::OctetWrite { data }) => assert_eq!(data, text, "{val:?}"),
+                other => panic!("expected OctetWrite, got {other:?}"),
+            }
         }
     }
 

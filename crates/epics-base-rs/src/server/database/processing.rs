@@ -4912,14 +4912,14 @@ impl PvDatabase {
         // (`aSubRecord.c:126`) loaded at init — which is also what a `caput
         // REC.SNAM other` leaves in place.
         use crate::server::recgbl::simm::LinkFetch;
-        let name: Option<String> = match self.db_get_link_in(rec, "SUBL", &subl, visited) {
-            LinkFetch::Value(v) => Some(match v {
-                EpicsValue::String(s) => s.as_str_lossy().into_owned(),
-                o => o.to_f64().map(|f| f.to_string()).unwrap_or_default(),
-            }),
-            LinkFetch::NoData => Some(snam),
-            LinkFetch::Failed => None,
-        };
+        let (fetch, render) = self.db_get_link_rendered_in(rec, "SUBL", &subl, true, visited);
+        let name: Option<String> =
+            match self.convert_link_fetch(rec, "SUBL", &subl, fetch, render).0 {
+                LinkFetch::Value(EpicsValue::String(s)) => Some(s.as_str_lossy().into_owned()),
+                LinkFetch::Value(other) => unreachable!("a DBR_STRING read delivered {other:?}"),
+                LinkFetch::NoData => Some(snam),
+                LinkFetch::Failed => None,
+            };
 
         let Some(name) = name else {
             // Link read failed — C `if (status) return status` skips do_sub.

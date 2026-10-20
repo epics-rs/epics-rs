@@ -3359,7 +3359,10 @@ impl AsynRecord {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 Errs::from_bytes_lossy(&bytes[..end])
             }
-            other => Errs::format(format_args!("{other}")),
+            EpicsValue::String(s) => Errs::from_bytes_lossy(s.as_bytes()),
+            // ERRS is SPC_NOMOD (asynRecord.c:962): only the record's own
+            // text is stored here.
+            _ => return Err(CaError::TypeMismatch("ERRS".into())),
         };
         Ok(())
     }
@@ -4719,7 +4722,14 @@ impl Record for AsynRecord {
         let to_i32 = |v: &EpicsValue| -> i32 { v.to_f64().unwrap_or(0.0) as i32 };
         let to_u32 = |v: &EpicsValue| -> u32 { v.to_f64().unwrap_or(0.0) as u32 };
         let to_f64 = |v: &EpicsValue| -> f64 { v.to_f64().unwrap_or(0.0) };
-        let to_str = |v: &EpicsValue| -> String { format!("{v}") };
+        // The framework's put row has already rendered a number put to a
+        // string field, at this record's `get_precision` (`asynRecord.c:994`).
+        let to_str = |v: &EpicsValue| -> CaResult<String> {
+            match v {
+                EpicsValue::String(s) => Ok(s.as_str_lossy().into_owned()),
+                _ => Err(CaError::TypeMismatch(name.into())),
+            }
+        };
         let to_bytes = |v: &EpicsValue| -> Vec<u8> {
             match v {
                 EpicsValue::CharArray(b) => b.clone().to_vec(),
@@ -4730,7 +4740,7 @@ impl Record for AsynRecord {
 
         match name {
             "PORT" => {
-                self.port = to_str(&value);
+                self.port = to_str(&value)?;
             }
             "ADDR" => {
                 self.addr = to_i32(&value);
@@ -4739,7 +4749,7 @@ impl Record for AsynRecord {
                 self.pcnct = to_i32(&value);
             }
             "DRVINFO" => {
-                self.drvinfo = to_str(&value);
+                self.drvinfo = to_str(&value)?;
             }
             "REASON" => {
                 self.reason = to_i32(&value);
@@ -4772,10 +4782,10 @@ impl Record for AsynRecord {
                 self.f64iv = to_i32(&value);
             }
             "AOUT" => {
-                self.aout = to_str(&value);
+                self.aout = to_str(&value)?;
             }
             "OEOS" => {
-                self.oeos = to_str(&value);
+                self.oeos = to_str(&value)?;
             }
             "BOUT" => {
                 self.put_array_field(AsynArrayField::Bout, to_bytes(&value));
@@ -4793,13 +4803,13 @@ impl Record for AsynRecord {
                 self.ofmt = to_i32(&value);
             }
             "AINP" => {
-                self.ainp = to_str(&value);
+                self.ainp = to_str(&value)?;
             }
             "TINP" => {
-                self.tinp = to_str(&value);
+                self.tinp = to_str(&value)?;
             }
             "IEOS" => {
-                self.ieos = to_str(&value);
+                self.ieos = to_str(&value)?;
             }
             "BINP" => {
                 self.put_array_field(AsynArrayField::Binp, to_bytes(&value));
@@ -4871,7 +4881,7 @@ impl Record for AsynRecord {
                 self.ixany = to_i32(&value);
             }
             "HOSTINFO" => {
-                self.hostinfo = to_str(&value);
+                self.hostinfo = to_str(&value)?;
             }
             "DRTO" => {
                 self.drto = to_i32(&value);
@@ -4937,7 +4947,7 @@ impl Record for AsynRecord {
                 self.tsiz = to_i32(&value);
             }
             "TFIL" => {
-                self.tfil = to_str(&value);
+                self.tfil = to_str(&value)?;
             }
             "AUCT" => {
                 self.auct = to_i32(&value);

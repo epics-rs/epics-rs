@@ -69,7 +69,7 @@ async fn indx_clamps_at_process_and_never_at_init() {
     // The values: B (INDX 3) serves [4]; C/D serve [4] only after process.
     let val = |r: &str| db.get_pv(r).unwrap();
     assert_eq!(
-        val("B").to_string(),
-        EpicsValue::LongArray(vec![4].into()).to_string()
+        val("B").text_g(),
+        EpicsValue::LongArray(vec![4].into()).text_g()
     );
 }

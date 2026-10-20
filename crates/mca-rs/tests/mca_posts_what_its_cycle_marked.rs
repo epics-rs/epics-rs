@@ -74,7 +74,7 @@ impl SubscriptionFilter for Line {
                 }
                 s
             }
-            Some(v) => format!("{v}"),
+            Some(v) => v.text_g(),
             None => String::new(),
         };
         let mut line = format!("{} {value}", self.pv).trim_end().to_string();

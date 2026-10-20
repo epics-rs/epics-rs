@@ -83,10 +83,8 @@ fn periodic_priority(ind: usize) -> ThreadPriority {
 
 /// C names the thread `scan-%g` of the period in seconds
 /// (`dbScan.c:954`): `scan-10`, `scan-5`, … `scan-0.5`, `scan-0.1`.
-/// Rust's shortest-roundtrip `f64` Display reproduces `%g` for every
-/// menuScan period.
 fn periodic_thread_name(period: Duration) -> String {
-    format!("scan-{}", period.as_secs_f64())
+    format!("scan-{}", CFloat(period.as_secs_f64()).g())
 }
 
 /// Shutdown signal shared by the periodic scan threads.
@@ -2930,6 +2928,15 @@ mod tests {
             let period = scan_type.interval().expect("periodic rate has a period");
             assert_eq!(periodic_thread_name(period), name);
         }
+    }
+
+    /// A site menuScan period is not one of C's short decimals.
+    #[test]
+    fn periodic_thread_name_is_percent_g_of_any_period() {
+        let third = Duration::from_nanos(333_333_333);
+        assert_eq!(periodic_thread_name(third), "scan-0.333333");
+        let tiny = Duration::from_micros(10);
+        assert_eq!(periodic_thread_name(tiny), "scan-1e-05");
     }
 
     /// The whole ladder stays inside the scan band: above every CA

@@ -754,9 +754,9 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
         ScalarType::ULong => ScalarValue::ULong(v as u64),
         ScalarType::Float => ScalarValue::Float(v as f32),
         ScalarType::Double => ScalarValue::Double(v),
-        // String values are non-numeric and never reach the limit
-        // builders; fall back to the textual rendering for completeness.
-        ScalarType::String => ScalarValue::String(v.to_string().into()),
+        // Every caller is gated on `is_numeric_scalar`, as pvxs builds
+        // limit members only `if(isnumeric)` (`nt.cpp:58`, `:87`, `:96`).
+        ScalarType::String => unreachable!("a string value has no limits"),
     }
 }
 

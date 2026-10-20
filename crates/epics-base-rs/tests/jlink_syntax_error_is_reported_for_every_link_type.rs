@@ -120,10 +120,10 @@ async fn a_link_yajl_rejects_prints_the_yajl_error() {
     assert_eq!(err, want);
 
     let s1 = db.get_record("S1").expect("S1 loads");
-    assert_eq!(s1.read().resolve_field("DESC").unwrap().to_string(), "s1");
+    assert_eq!(s1.read().resolve_field("DESC").unwrap().text_g(), "s1");
     let s3 = db.get_record("S3").expect("S3 loads");
     assert_eq!(
-        s3.read().resolve_field("INP").unwrap().to_string(),
+        s3.read().resolve_field("INP").unwrap().text_g(),
         "{calc:{expr:'A+1', args:[1,2],},}"
     );
 }

@@ -546,7 +546,7 @@ mod tests {
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th", &bridge, &db).unwrap();
         for _ in 0..300 {
-            if db.get_pv("Y:ml_monoTheta2Pv").unwrap().to_string() == "Y:m12" {
+            if db.get_pv("Y:ml_monoTheta2Pv").unwrap().text_g() == "Y:m12" {
                 return;
             }
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;

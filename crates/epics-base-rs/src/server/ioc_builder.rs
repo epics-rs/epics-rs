@@ -902,7 +902,7 @@ record(ai, "A:ONE") {
             .await
             .expect("a script's failed load still boots");
         assert_eq!(db.get_pv("AI.SCAN").unwrap().to_f64(), Some(0.0), "Passive");
-        assert_eq!(db.get_pv("AI.DESC").unwrap().to_string(), "kept");
+        assert_eq!(db.get_pv("AI.DESC").unwrap().text_g(), "kept");
     }
 
     /// C creates the record and only THEN puts its fields, so a value

@@ -1225,6 +1225,52 @@ impl StreamHooks {
             STRING_FORMAT => shown_at(strings[0].as_bytes(), consumed).to_vec(),
             _ => Vec::new(),
         };
+        // The debug line prints the field buffer itself, `nelem` slots of
+        // the put's DBF type: `fieldBuffer.expand()` (StreamEpics.cc:1445).
+        let shown = {
+            let (slots, width): (Vec<u8>, usize) = match format.type_ {
+                STRING_FORMAT if char_array => (chars.clone(), 1),
+                UNSIGNED_FORMAT => (
+                    longs
+                        .iter()
+                        .flat_map(|&v| (v as u32).to_ne_bytes())
+                        .collect(),
+                    4,
+                ),
+                SIGNED_FORMAT => (
+                    longs
+                        .iter()
+                        .flat_map(|&v| (v as i32).to_ne_bytes())
+                        .collect(),
+                    4,
+                ),
+                ENUM_FORMAT => (
+                    longs
+                        .iter()
+                        .flat_map(|&v| (v as u16).to_ne_bytes())
+                        .collect(),
+                    2,
+                ),
+                DOUBLE_FORMAT => (doubles.iter().flat_map(|v| v.to_ne_bytes()).collect(), 8),
+                _ => (
+                    strings
+                        .iter()
+                        .flat_map(|s| {
+                            let mut slot = [0; MAX_STRING_SIZE];
+                            let text = s.as_bytes();
+                            let n = text.len().min(MAX_STRING_SIZE);
+                            slot[..n].copy_from_slice(&text[..n]);
+                            slot
+                        })
+                        .collect(),
+                    MAX_STRING_SIZE,
+                ),
+            };
+            let mut field_buffer = StreamBuffer::new();
+            field_buffer.append(&slots);
+            field_buffer.append_repeat(0, (nelem * width).saturating_sub(slots.len()) as isize);
+            String::from_utf8_lossy(field_buffer.expand().bytes()).into_owned()
+        };
         let value = match format.type_ {
             STRING_FORMAT if char_array => EpicsValue::CharArray(chars.into()),
             // nord elements: one is the field's scalar, more an array
@@ -1259,12 +1305,6 @@ impl StreamHooks {
             Dbf::Char
         } else {
             Dbf::of(format.type_)
-        };
-        let shown = match &value {
-            EpicsValue::CharArray(a) => {
-                String::from_utf8_lossy(a.split(|&b| b == 0).next().unwrap_or(&[])).into_owned()
-            }
-            _ => value.to_string(),
         };
         let put = PutShown {
             putfunc: if own || init_run {

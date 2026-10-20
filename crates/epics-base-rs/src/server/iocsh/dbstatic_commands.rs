@@ -1492,7 +1492,10 @@ fn dump_one_record(
         lines.push(format!(
             "\tfield({},\"{}\")",
             desc.name,
-            print_escaped(&value.to_string())
+            // `dbGetString` (`dbStaticLib.c:850`).
+            print_escaped(&String::from_utf8_lossy(
+                &crate::server::iocsh::db_get_string(&inst, desc, &value)
+            ))
         ));
     }
 
@@ -1994,6 +1997,21 @@ variable(seqDLYprecision,int)
             "a non-default field is printed at level 0 — got:\n{out}"
         );
         assert!(out.contains("\n}\n"), "C closes the block — got:\n{out}");
+    }
+
+    /// A real field prints as `dbGetString`'s `realToString`
+    /// (`dbStaticLib.c:233`), not as the `.db` text.
+    #[test]
+    fn dump_record_prints_a_real_as_real_to_string() {
+        let (_db, ctx) = make_ctx();
+        load(
+            &ctx,
+            "record(ao,\"AO:BIG\") { field(DRVH,\"1e20\") field(DRVL,\"0.5\") }\n",
+        );
+
+        let out = run(&ctx, "dbDumpRecord", &["pdbbase"]).unwrap();
+        assert!(out.contains("\tfield(DRVH,\"1.0e+20\")\n"), "{out}");
+        assert!(out.contains("\tfield(DRVL,\"0.5\")\n"), "{out}");
     }
 
     /// C's level gate: level 0 prints only fields differing from the `.dbd`

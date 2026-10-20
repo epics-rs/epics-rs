@@ -47,7 +47,7 @@ async fn a_same_type_duplicate_adds_and_overrides_fields() {
     assert_eq!(err, "", "softIoc prints nothing for a same-type duplicate");
     let (db, _) = built.expect("the duplicate merges");
     let rec = db.get_record("D1").expect("D1 loads");
-    let field = |name: &str| rec.read().resolve_field(name).unwrap().to_string();
+    let field = |name: &str| rec.read().resolve_field(name).unwrap().text_g();
     assert_eq!(field("DESC"), "first");
     assert_eq!(field("EGU"), "cm");
     assert_eq!(field("PREC"), "3");
@@ -118,7 +118,7 @@ ERROR: Failed to load '{path}'
     );
     let (db, _) = built.expect("a st.cmd goes on");
     let rec = db.get_record("DUP").expect("DUP loads");
-    let field = |name: &str| rec.read().resolve_field(name).unwrap().to_string();
+    let field = |name: &str| rec.read().resolve_field(name).unwrap().text_g();
     assert_eq!(field("EGU"), "mm");
     assert_eq!(field("DESC"), "first");
     // menuScan choice 0, "Passive".

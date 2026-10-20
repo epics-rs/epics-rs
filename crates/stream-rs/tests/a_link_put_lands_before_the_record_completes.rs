@@ -73,8 +73,8 @@ record(ai, "by") {{ field(DTYP, "stream") field(INP, "@{0} y R") }}
                 assert!(Instant::now() < deadline, "{round}: still processing");
                 sleep(Duration::from_millis(1)).await;
             }
-            assert_eq!(get(&db, "t3.FLNK").to_string(), "by", "{round}");
-            assert_eq!(get(&db, "t4.FLNK").to_string(), "ax", "{round}");
+            assert_eq!(get(&db, "t3.FLNK").text_g(), "by", "{round}");
+            assert_eq!(get(&db, "t4.FLNK").text_g(), "ax", "{round}");
         }
     });
 }

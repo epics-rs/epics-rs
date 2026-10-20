@@ -94,7 +94,7 @@ async fn an_mss_link_copies_its_source_message_without_allocating() {
         .unwrap()
         .0;
     db.ioc_init().await;
-    let amsg = |db: &PvDatabase| db.get_pv("MSS:RD.AMSG").unwrap().to_string();
+    let amsg = |db: &PvDatabase| db.get_pv("MSS:RD.AMSG").unwrap().text_g();
     alarm_source(&db, "src-msg");
     assert_eq!(allocs(db.clone()), 0);
     assert_eq!(amsg(&db), "src-msg");

@@ -54,6 +54,10 @@ default-members = [
 ]
 resolver = "3"
 
+# cargo dylint --all: the lint crate builds on its own pinned nightly.
+[workspace.metadata.dylint]
+libraries = [{ path = "lints/raw_float_format" }]
+
 [workspace.package]
 edition = "2024"
 version = "0.32.0"

@@ -319,8 +319,8 @@ pub fn ioc_log_flush() {
 }
 
 /// C `iocLogShow` (`iocLog.c:145-152`). Returns the bytes C's `printf`s
-/// write rather than printing them, so the iocsh command can send them through
-/// its own redirected output.
+/// write rather than printing them, so the iocsh command can write them to its
+/// console.
 #[must_use]
 pub fn ioc_log_show(level: u32) -> Vec<u8> {
     CLIENT

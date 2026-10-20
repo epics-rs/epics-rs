@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = CaClient::new_with_config(config).await?;
     let (_dbf, value) = client.caget(&pv_name).await?;
-    println!("{pv_name} = {value}");
+    println!("{pv_name} = {}", value.text_g());
     Ok(())
 }
 

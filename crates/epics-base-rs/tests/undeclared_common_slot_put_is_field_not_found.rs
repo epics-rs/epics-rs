@@ -52,7 +52,7 @@ record(swait, "W") { field(OUTN, "A") }
         db.put_pv_no_process(pv, EpicsValue::String("B".into()))
             .await
             .unwrap();
-        let text = db.get_pv(pv).unwrap().to_string();
+        let text = db.get_pv(pv).unwrap().text_g();
         assert!(text.starts_with('B'), "{pv}: {text}");
     }
     assert_eq!(

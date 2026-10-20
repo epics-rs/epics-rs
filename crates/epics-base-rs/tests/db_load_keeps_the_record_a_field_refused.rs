@@ -125,10 +125,7 @@ async fn a_refused_noaccess_field_loses_the_field_and_keeps_the_record() {
     let rec = db.get_record("N1").expect("N1 survives its refused field");
     let held = rec.read();
     assert_eq!(
-        held.record
-            .get_field("EGU")
-            .map(|v| v.to_string())
-            .as_deref(),
+        held.record.get_field("EGU").map(|v| v.text_g()).as_deref(),
         Some("volts"),
         "the field BEHIND the refusal still loads, as it does in C",
     );
@@ -175,10 +172,7 @@ async fn a_refused_json_link_loses_the_field_and_keeps_the_record() {
     let rec = db.get_record("J1").expect("J1 survives its refused link");
     let held = rec.read();
     assert_eq!(
-        held.record
-            .get_field("EGU")
-            .map(|v| v.to_string())
-            .as_deref(),
+        held.record.get_field("EGU").map(|v| v.text_g()).as_deref(),
         Some("amps"),
         "the field BEHIND the refusal still loads, as it does in C",
     );

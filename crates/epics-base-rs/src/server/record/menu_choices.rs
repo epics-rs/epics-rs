@@ -43,6 +43,7 @@
 
 use crate::error::{CaError, CaResult, Owed};
 use crate::server::snapshot::EnumStringForm;
+use crate::types::c_parse::{epics_parse_uint16, epics_parse_uint16_units};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// The shared `menu()` choice tables, re-exported from the tables the generator
@@ -267,95 +268,6 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         "PRIO" => Some(MENU_PRIORITY),
         _ => None,
     }
-}
-
-/// C `strtoul(str, &end, 0)` — the parse `epicsParseULong` runs
-/// (`epicsStdlib.c:57-79`) with `dbConvertBase`, which is 0 unless
-/// `EPICS_DB_CONVERT_DECIMAL_ONLY=YES` (`epicsConvert.c:37`, `iocInit.c:140`).
-/// Base 0 means: leading whitespace, optional sign, `0x`/`0X` hex, leading-`0`
-/// octal, else decimal. A `-` negates modulo 2^64, exactly as C's `strtoul`
-/// does — `"-65534"` is a *valid* parse producing 0xFFFF…0002.
-///
-/// Returns `(value, rest)`; `None` is C's `S_stdlib_noConversion` /
-/// `S_stdlib_overflow`.
-fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
-    use crate::runtime::stdlib::c_isspace;
-
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let mut negate = false;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        negate = b[i] == b'-';
-        i += 1;
-    }
-
-    let mut base: u64 = 10;
-    if i < b.len() && b[i] == b'0' {
-        if i + 1 < b.len() && (b[i + 1] | 0x20) == b'x' {
-            if i + 2 < b.len() && b[i + 2].is_ascii_hexdigit() {
-                base = 16;
-                i += 2;
-            } else {
-                // C strtoul consumes the leading "0" and stops at the 'x'.
-                return Some((0, &s[i + 1..]));
-            }
-        } else {
-            base = 8;
-        }
-    }
-
-    let start = i;
-    let mut acc: u64 = 0;
-    while i < b.len() {
-        let digit = match b[i] {
-            c @ b'0'..=b'9' => u64::from(c - b'0'),
-            c @ b'a'..=b'f' => u64::from(c - b'a') + 10,
-            c @ b'A'..=b'F' => u64::from(c - b'A') + 10,
-            _ => break,
-        };
-        if digit >= base {
-            break;
-        }
-        // C reports ERANGE, which epicsParseULong turns into an error return.
-        acc = acc.checked_mul(base)?.checked_add(digit)?;
-        i += 1;
-    }
-    if i == start {
-        return None; // S_stdlib_noConversion
-    }
-    let value = if negate { acc.wrapping_neg() } else { acc };
-    Some((value, &s[i..]))
-}
-
-/// C `epicsParseUInt16(str, &val, dbConvertBase, NULL)` (`epicsStdlib.c:229-243`).
-///
-/// Whitespace is legal *around* the number (strtoul skips leading, the
-/// `units == NULL` tail check skips trailing) but any other trailing character
-/// is `S_stdlib_extraneous`. The range check is C's, verbatim: a value that
-/// wrapped through the negative side (`> ~0xffff`) is NOT an overflow — it
-/// truncates to its low 16 bits.
-fn epics_parse_uint16(s: &str) -> Option<u16> {
-    let (_, rest) = c_strtoul_base0(s)?;
-    if !rest
-        .bytes()
-        .all(|b| crate::runtime::stdlib::c_isspace(b as char))
-    {
-        return None; // S_stdlib_extraneous
-    }
-    epics_parse_uint16_units(s)
-}
-
-/// [`epics_parse_uint16`] with a `units` pointer, as `putStringEnum` passes
-/// `&end`: trailing text after the number is left to the caller, not refused.
-fn epics_parse_uint16_units(s: &str) -> Option<u16> {
-    let (value, _) = c_strtoul_base0(s)?;
-    if value > 0xffff && value <= !0xffff_u64 {
-        return None; // S_stdlib_overflow
-    }
-    Some(value as u16)
 }
 
 /// Resolve a `DBF_MENU` field's `DBR_STRING` write against THAT field's own
@@ -928,5 +840,14 @@ mod tests {
         // 0xFFFF_FFFF_FFFF_FFFF, which is `> ~0xffff` is false, so it
         // truncates to 0xffff instead of erroring.
         assert_eq!(epics_parse_uint16("-1"), Some(0xffff));
+    }
+
+    /// glibc's base-0 `strtoul` reads C23 `0b` under EPICS' `_GNU_SOURCE`,
+    /// so `putStringMenu` and `dbPutStringNum` take `0b1` as choice 1.
+    #[test]
+    fn a_menu_index_takes_glibc_s_binary_prefix() {
+        for bound in [MenuBound::DbPut, MenuBound::DbLoad] {
+            assert_eq!(menu_index_from_string(MENU_PRIORITY, "0b1", bound), Some(1));
+        }
     }
 }

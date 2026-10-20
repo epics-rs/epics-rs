@@ -19,6 +19,18 @@ const TYPES: [&str; 10] = [
     "LONG", "SHORT", "USHORT", "ULONG", "CHAR", "UCHAR", "FLOAT", "DOUBLE", "INT64", "UINT64",
 ];
 
+/// The last element, `4000000000`, as the `atol` fields store it: LONG,
+/// SHORT, USHORT and CHAR/UCHAR. Past a 32-bit `long`, `atol` saturates to
+/// `LONG_MAX` before the field's cast keeps the low bits; the oracle rows
+/// are the 64-bit ones, the 32-bit ones are derived.
+fn atol_4e9() -> [&'static str; 4] {
+    if std::ffi::c_long::BITS == 64 {
+        ["-294967296", "10240", "10240", "0"]
+    } else {
+        ["2147483647", "-1", "65535", "255"]
+    }
+}
+
 /// Each record's `name value,value,..` line, in the child only.
 #[epics_macros_rs::epics_test]
 async fn child_restore() {
@@ -118,20 +130,21 @@ fn restored(before_init: &str, after_init: &str) -> Vec<String> {
 
 #[test]
 fn a_boot_restore_converts_each_element_as_c() {
+    let [l, sh, us, ch] = atol_4e9();
     assert_eq!(
         restored("set_pass1_restoreFile(\"s.sav\")\n", ""),
         [
-            "ALONG 3,5,-1,0,10,70000,1,-294967296",
+            format!("ALONG 3,5,-1,0,10,70000,1,{l}").as_str(),
             "BLONG 5",
-            "ASHORT 3,5,-1,0,10,4464,1,10240",
+            format!("ASHORT 3,5,-1,0,10,4464,1,{sh}").as_str(),
             "BSHORT 5",
-            "AUSHORT 3,5,65535,0,10,4464,1,10240",
+            format!("AUSHORT 3,5,65535,0,10,4464,1,{us}").as_str(),
             "BUSHORT 5",
             "AULONG 3,5,4294967295,16,8,70000,1,4000000000",
             "BULONG 5",
-            "ACHAR 3,5,255,0,10,112,1,0",
+            format!("ACHAR 3,5,255,0,10,112,1,{ch}").as_str(),
             "BCHAR 5",
-            "AUCHAR 3,5,255,0,10,112,1,0",
+            format!("AUCHAR 3,5,255,0,10,112,1,{ch}").as_str(),
             "BUCHAR 5",
             "AFLOAT 3,5,-1,16,10,70000,1000,4000000000",
             "BFLOAT 5",
@@ -148,20 +161,21 @@ fn a_boot_restore_converts_each_element_as_c() {
 /// The 64-bit and ULONG fields take the CA `DBR_DOUBLE`'s `atof`.
 #[test]
 fn a_manual_restore_converts_each_element_as_c() {
+    let [l, sh, us, ch] = atol_4e9();
     assert_eq!(
         restored("", "fdbrestore(\"s.sav\")\n"),
         [
-            "ALONG 3,5,-1,0,10,70000,1,-294967296",
+            format!("ALONG 3,5,-1,0,10,70000,1,{l}").as_str(),
             "BLONG 5",
-            "ASHORT 3,5,-1,0,10,4464,1,10240",
+            format!("ASHORT 3,5,-1,0,10,4464,1,{sh}").as_str(),
             "BSHORT 5",
-            "AUSHORT 3,5,65535,0,10,4464,1,10240",
+            format!("AUSHORT 3,5,65535,0,10,4464,1,{us}").as_str(),
             "BUSHORT 5",
             "AULONG 3,5,4294967295,16,10,70000,1000,4000000000",
             "BULONG 5",
-            "ACHAR 3,5,255,0,10,112,1,0",
+            format!("ACHAR 3,5,255,0,10,112,1,{ch}").as_str(),
             "BCHAR 5",
-            "AUCHAR 3,5,255,0,10,112,1,0",
+            format!("AUCHAR 3,5,255,0,10,112,1,{ch}").as_str(),
             "BUCHAR 5",
             "AFLOAT 3,5,-1,16,10,70000,1000,4000000000",
             "BFLOAT 5",

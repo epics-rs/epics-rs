@@ -920,11 +920,9 @@ fn cmd_epics_thread_show() -> CommandDef {
             let mut header_printed = false;
             let mut failed = false;
             for token in rest {
-                // C `strtoull(cp, &endp, 0)`; a non-empty remainder means the
-                // argument was a name, not a handle.
-                let id = match super::registry::parse_iocsh_int(&token.to_str_lossy()) {
-                    Ok(value) => value as u64,
-                    Err(_) => match thread_by_name(token) {
+                let id = match thread_handle(token) {
+                    Some(id) => id,
+                    None => match thread_by_name(token) {
                         Some(thread) => thread.id(),
                         None => {
                             ctx.eprintln(&format!("\t'{token}' is not a known thread name"));
@@ -947,6 +945,14 @@ fn cmd_epics_thread_show() -> CommandDef {
             }
         },
     )
+}
+
+/// C `strtoull(cp, &endp, 0)` under `if (*endp)` (`libComRegister.c:371-372`,
+/// `:443-444`): a handle when the whole token converts, else a name. C never
+/// reads `errno`, so a number past `ULLONG_MAX` is that handle.
+fn thread_handle(token: &IocshString) -> Option<u64> {
+    let (id, end) = crate::types::c_parse::strtoull(token.as_bytes(), 0);
+    (end == token.as_bytes().len()).then_some(id)
 }
 
 /// `epicsThreadResume [thread ...]` — C `libComRegister.c:408-452`,
@@ -991,9 +997,9 @@ fn cmd_epics_thread_resume() -> CommandDef {
             };
             let mut failed = false;
             for token in argv {
-                let (kind, found) = match super::registry::parse_iocsh_int(&token.to_str_lossy()) {
-                    Ok(id) => ("thread id", crate::runtime::task::thread_by_id(id as u64)),
-                    Err(_) => ("thread name", thread_by_name(token)),
+                let (kind, found) = match thread_handle(token) {
+                    Some(id) => ("thread id", crate::runtime::task::thread_by_id(id)),
+                    None => ("thread name", thread_by_name(token)),
                 };
                 let Some(thread) = found else {
                     ctx.eprintln(&format!("'{token}' is not a valid {kind}"));
@@ -1581,6 +1587,24 @@ mod tests {
     fn a_handle_that_names_no_thread_is_the_id_diagnostic() {
         let ctx = make_ctx();
         for token in ["0", "18446744073709551615"] {
+            let (out, err, failed) = run_split(&ctx, "epicsThreadResume", &[token]);
+            assert!(failed, "{token}");
+            assert_eq!(out, "", "{token}");
+            assert_eq!(err, format!("'{token}' is not a valid thread id\n"));
+        }
+    }
+
+    /// C reads a thread argument with `strtoull(cp, &endp, 0)` and tests only
+    /// `*endp` (`libComRegister.c:371-372`, `:443-444`), so glibc's `0b`
+    /// prefix is a handle, and so is a number past `ULLONG_MAX`, which
+    /// saturates.
+    #[test]
+    fn a_thread_argument_strtoull_takes_whole_is_a_handle() {
+        let ctx = make_ctx();
+        for token in ["0b0", "18446744073709551616"] {
+            let (_, err, failed) = run_split(&ctx, "epicsThreadShow", &[token]);
+            assert!(!failed, "{token}: {err}");
+            assert_eq!(err, "", "{token}");
             let (out, err, failed) = run_split(&ctx, "epicsThreadResume", &[token]);
             assert!(failed, "{token}");
             assert_eq!(out, "", "{token}");

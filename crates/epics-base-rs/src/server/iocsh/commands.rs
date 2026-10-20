@@ -8942,7 +8942,17 @@ mod tests {
             ("WU.VAL", "-9223372036854775809", "DBF_ULONG[2]: 77 78"),
             ("LO.VAL", "18446744073709551615", "DBF_LONG: 77"),
             ("IQ.VAL", "18446744073709551615", "DBF_INT64: 77"),
-            ("MB.RVAL", "18446744073709551615", "DBF_ULONG: 4294967295"),
+            // A 32-bit `unsigned long` overflows in strtoul instead
+            // (epicsStdlib.c:73); derived, not measured.
+            (
+                "MB.RVAL",
+                "18446744073709551615",
+                if std::ffi::c_ulong::BITS == 64 {
+                    "DBF_ULONG: 4294967295"
+                } else {
+                    "DBF_ULONG: 77"
+                },
+            ),
             ("WU.VAL", "18446744073709551615", "DBF_ULONG[2]: 77 78"),
             ("LO.VAL", "18446744073709551616", "DBF_LONG: 77"),
             ("IQ.VAL", "18446744073709551616", "DBF_INT64: 77"),

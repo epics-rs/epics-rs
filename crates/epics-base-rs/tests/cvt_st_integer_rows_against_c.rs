@@ -206,6 +206,19 @@ const C_MEASURED: &[[&str; 9]] = &[
     ],
 ];
 
+/// The cells that differ where `long` is 32 bits, derived from
+/// `epicsStdlib.c` rather than measured: `strtoul` overflows past 2^32
+/// (`:73`), and the `value <= ~0xffUL` / `~0xffffUL` windows of
+/// `epicsParseUInt8`/`16` (`:206`, `:238`) end below `0xFFFFFFFF`, which
+/// then wraps instead of overflowing.
+const LONG32: &[(&str, &str, &str)] = &[
+    ("4294967295.5", "uc", "255"),
+    ("4294967295.5", "us", "65535"),
+    ("18446744073709551615.5", "uc", "REFUSE"),
+    ("18446744073709551615.5", "us", "REFUSE"),
+    ("18446744073709551615.5", "ul", "REFUSE"),
+];
+
 fn port(t: NumericField, s: &str) -> String {
     match put_string("F", t, s) {
         Ok(Converted::Stored(EpicsValue::Char(v))) => format!("{}", v as i8),
@@ -240,7 +253,10 @@ fn every_integer_row_matches_c() {
     for line in C_MEASURED {
         let input = line[0];
         for (i, (name, target)) in rows.iter().enumerate() {
-            let c_says = line[i + 1];
+            let c_says = match LONG32.iter().find(|(i, n, _)| *i == input && n == name) {
+                Some((_, _, v)) if std::ffi::c_long::BITS == 32 => v,
+                _ => line[i + 1],
+            };
             let got = port(*target, input);
             cells += 1;
             if c_says == "NOSTORE" {

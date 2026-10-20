@@ -16,6 +16,7 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::device_support::{ReadStart, WriteStart};
 use epics_base_rs::server::record::{CommonFields, DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::c_parse::{long_to_int, strtol_errno, strtoul_errno, ulong_to_uint};
 use epics_libcom_rs::cfmt::CFloat;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -73,68 +74,20 @@ fn stored(wrote_val: bool) -> DeviceReadOutcome {
     }
 }
 
-/// C `strtol(s, &endp, 0)` / `strtoul`'s scan: optional sign, then `0x`
-/// hex, leading-`0` octal or decimal digits. Returns the sign, the magnitude
-/// and the unread rest; no digits is C's `endp == s` (0, nothing read), and
-/// `None` is `errno == ERANGE`.
-fn strto_base0(s: &str) -> Option<(bool, u64, &str)> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let neg = match b.first() {
-        Some(b'-') => {
-            i = 1;
-            true
-        }
-        Some(b'+') => {
-            i = 1;
-            false
-        }
-        _ => false,
-    };
-    // `0x` counts as a prefix only with a hex digit after it; otherwise the
-    // `0` is the whole number and `x` is where the scan stops.
-    let radix = if b.get(i) == Some(&b'0')
-        && matches!(b.get(i + 1), Some(b'x' | b'X'))
-        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
-    {
-        i += 2;
-        16
-    } else if b.get(i) == Some(&b'0') {
-        8
-    } else {
-        10
-    };
-    let start = i;
-    let mut mag: Option<u64> = Some(0);
-    while let Some(d) = b.get(i).and_then(|&c| (c as char).to_digit(radix)) {
-        mag = mag.and_then(|m| m.checked_mul(u64::from(radix))?.checked_add(u64::from(d)));
-        i += 1;
-    }
-    if i == start {
-        return Some((false, 0, s));
-    }
-    Some((neg, mag?, &s[i..]))
-}
-
-/// C `strtol(s, &endp, 0)` into the link's `int addr`: `long` range, then the
-/// C assignment's truncation to `int`.
+/// C `strtol(s, &endp, 0)` into the link's `int addr`, `errno` tested
+/// (asynEpicsUtils.c:113-115, :185-187): `long` range, then the `int`
+/// assignment's truncation.
 fn strtol_i32(s: &str) -> Option<(i32, &str)> {
-    let (neg, mag, rest) = strto_base0(s)?;
-    let value = if neg {
-        0i64.checked_sub_unsigned(mag)?
-    } else {
-        i64::try_from(mag).ok()?
-    };
-    Some((value as i32, rest))
+    let (value, end) = strtol_errno(s, 0)?;
+    Some((long_to_int(value), &s[end..]))
 }
 
 /// C `strtoul(s, &endp, 0)` into the link's `epicsUInt32 mask`: a leading `-`
 /// negates modulo 2^64 (so `-8` is `0xFFFFFFF8` after the cast — the bit
 /// pattern asynInt32 reads as a signed nbits, see [`Int32Mask::from_nbits`]).
 fn strtoul_u32(s: &str) -> Option<(u32, &str)> {
-    let (neg, mag, rest) = strto_base0(s)?;
-    let value = if neg { mag.wrapping_neg() } else { mag };
-    Some((value as u32, rest))
+    let (value, end) = strtoul_errno(s, 0)?;
+    Some((ulong_to_uint(value), &s[end..]))
 }
 
 /// C `skipWhite` (asynEpicsUtils.c:48-52): whitespace, and commas too where
@@ -1746,24 +1699,6 @@ fn compute_mask_shift(mask: u32) -> u32 {
 /// which only treats `"0"` / non-numeric as falsey. Our parse is a
 /// strict superset for the documented `"1"` / `"0"` values and
 /// additionally accepts the human-friendly `"Y"` / `"true"` forms.
-/// C `atoi`: leading white space, a sign, then decimal digits up to the
-/// first other byte; no digits is 0.
-fn c_atoi(s: &str) -> i64 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (neg, digits) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let v = digits
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .fold(0i64, |v, c| {
-            v.saturating_mul(10).saturating_add(i64::from(c - b'0'))
-        });
-    if neg { -v } else { v }
-}
-
 fn parse_info_bool(raw: &str) -> bool {
     let v = raw.trim();
     !v.is_empty()
@@ -4663,7 +4598,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // is no number is 0. A negative size crashes C (a NULL or negative
         // ring); the default stands.
         if let Some(raw) = info.get("asyn:FIFO") {
-            if let Ok(n) = usize::try_from(c_atoi(raw)) {
+            if let Ok(n) = usize::try_from(epics_base_rs::types::c_parse::atoi(raw)) {
                 self.fifo_tag = Some(n);
             }
         }
@@ -6765,9 +6700,21 @@ mod tests {
         // No digits: nothing read, `endp == s`.
         assert_eq!(strtol_i32("abc"), Some((0, "abc")));
         assert_eq!(strtol_i32("-x"), Some((0, "-x")));
-        // `long` overflow is ERANGE; the `int` assignment then truncates.
+        // `long` overflow is ERANGE; the `int` assignment then truncates
+        // what a 64-bit `long` holds.
         assert_eq!(strtol_i32("99999999999999999999"), None);
-        assert_eq!(strtol_i32("0x100000001"), Some((1, "")));
+        assert_eq!(
+            strtol_i32("0x100000001"),
+            (std::ffi::c_long::BITS == 64).then_some((1, ""))
+        );
+    }
+
+    /// glibc's base-0 `strtol`/`strtoul` read C23 `0b` under EPICS'
+    /// `_GNU_SOURCE`, so C `parseLinkMask` takes addr 3 and mask 5 here.
+    #[test]
+    fn a_link_addr_and_mask_take_glibc_s_binary_prefix() {
+        let link = parse_asyn_mask_link("@asynMask(p 0b11 0b101 1.0)x").unwrap();
+        assert_eq!((link.addr, link.mask), (3, 5));
     }
 
     #[test]
@@ -9582,12 +9529,24 @@ mod tests {
     #[test]
     fn apply_record_info_parses_asyn_fifo_as_atoi() {
         let mut ads = make_adapter(ScanType::IoIntr);
+        let long64 = std::ffi::c_long::BITS == 64;
         for (raw, tag) in [
             ("32", Some(32)),
             (" +7x", Some(7)),
             ("garbage", Some(0)),
             ("0", Some(0)),
             ("-3", Some(0)),
+            // glibc's atoi is the saturated `long` cut to `int`: 1, then -1
+            // which leaves the last, with a 64-bit `long`; INT_MAX twice with
+            // a 32-bit one.
+            (
+                "4294967297",
+                Some(if long64 { 1 } else { i32::MAX as usize }),
+            ),
+            (
+                "99999999999999999999",
+                Some(if long64 { 1 } else { i32::MAX as usize }),
+            ),
         ] {
             let info =
                 std::collections::HashMap::from([("asyn:FIFO".to_string(), raw.to_string())]);

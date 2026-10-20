@@ -875,70 +875,25 @@ pub(super) enum IntArgError {
 }
 
 /// Parse an `iocshArgInt` token the way C `cvtArg` does
-/// (`iocsh.cpp:820-842`): `strtol(arg, &endp, 0)`. Base-0 means a
-/// `0x`/`0X` prefix is hex and a leading `0` is octal — so `dbpr REC 010`
-/// is 8, not 10, and `postEvent 0x10` is 16, not an error. On signed
-/// overflow C retries with `strtoul` (`0xFFFFFFFFFFFFFFFF` → the same
-/// bit pattern reinterpreted into the signed `long`), and an empty arg
-/// defaults to 0. Trailing non-numeric characters are rejected, matching
-/// C's `if (*endp)` "Invalid integer" check.
-pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, IntArgError> {
-    // C `if (arg && *arg)` — an empty token defaults to 0.
+/// (`iocsh.cpp:820-842`): `strtol(arg, &endp, 0)`, retried as `strtoul` on
+/// `ERANGE`, stored in the `int` `iocshArgBuf.ival`. An empty arg is 0, and
+/// C returns from the range arm before it tests `*endp`.
+pub(super) fn parse_iocsh_int(token: &str) -> Result<i32, IntArgError> {
+    use crate::types::c_parse::{long_to_int, strtol_errno, strtoul_errno, ulong_to_uint};
     if token.is_empty() {
         return Ok(0);
     }
-    // strtol skips leading whitespace, then takes an optional sign.
-    let s = token.trim_start();
-    if s.is_empty() {
-        // Whitespace-only: strtol converts nothing and leaves *endp set
-        // → C reports "Invalid integer".
-        return Err(IntArgError::Invalid);
-    }
-    let (neg, body) = match s.as_bytes()[0] {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
+    let (value, end) = match strtol_errno(token, 0) {
+        Some((v, end)) => (long_to_int(v), end),
+        None => match strtoul_errno(token, 0) {
+            Some((v, end)) => (ulong_to_uint(v) as i32, end),
+            None => return Err(IntArgError::OutOfRange),
+        },
     };
-    // Base-0 prefix detection on the unsigned magnitude.
-    let (radix, rest): (u32, &str) =
-        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, hex)
-        } else if body.len() > 1 && body.starts_with('0') {
-            // Leading `0` + at least one more char → octal (the C
-            // convention); `0` alone stays decimal so it parses to 0.
-            (8, &body[1..])
-        } else {
-            (10, body)
-        };
-    // `strtol` converts the LONGEST valid prefix and points `endp` at the
-    // first character it could not use, so the digit run and what follows
-    // it are two separate facts: the run alone decides `ERANGE`, the
-    // leftover alone decides `*endp`. Reading them as one — parsing the
-    // whole tail and calling any failure the same thing — is what made
-    // `99999999999999999999abc` "invalid" here where C calls it out of
-    // range.
-    let run_len = rest
-        .find(|c: char| !c.is_digit(radix))
-        .unwrap_or(rest.len());
-    let (digits, leftover) = rest.split_at(run_len);
-    if digits.is_empty() {
-        // strtol converted nothing — a bare sign, `0x` with no hex digit,
-        // octal `08` — so `endp == arg` and C takes the `*endp` arm.
+    if end != token.len() {
         return Err(IntArgError::Invalid);
     }
-    // Signed first; on overflow fall back to unsigned (C `strtol`
-    // ERANGE → `strtoul`) and reinterpret the bit pattern into the
-    // signed result exactly as C stores it in `long ival`. `digits` holds
-    // only characters valid for the radix, so the unsigned parse can fail
-    // for one reason: the magnitude does not fit.
-    let parsed = match i64::from_str_radix(digits, radix) {
-        Ok(v) => v,
-        Err(_) => u64::from_str_radix(digits, radix).map_err(|_| IntArgError::OutOfRange)? as i64,
-    };
-    if !leftover.is_empty() {
-        return Err(IntArgError::Invalid);
-    }
-    Ok(if neg { parsed.wrapping_neg() } else { parsed })
+    Ok(value)
 }
 
 /// C `epicsStrtod(s, &endp)` under the `*endp == '\0'` whole-token check
@@ -1061,7 +1016,7 @@ pub(crate) fn parse_args(
             // `strtol`/`epicsStrtod` read the bytes; a non-UTF-8 byte is
             // not a digit to them, and U+FFFD is not one to these.
             ArgType::Int => parse_iocsh_int(&token.to_str_lossy())
-                .map(ArgValue::Int)
+                .map(|v| ArgValue::Int(v.into()))
                 .map_err(|why| match why {
                     IntArgError::OutOfRange => format!("Integer '{token}' out of range."),
                     IntArgError::Invalid => format!("Invalid integer '{token}'."),
@@ -1458,11 +1413,38 @@ mod tests {
         assert!(parse_args(&tokens, &descs).is_err());
     }
 
+    /// C `cvtArg` stores `strtol(arg, &endp, 0)`, or its `strtoul` retry, in
+    /// `iocshArgBuf.ival`, an `int` (`iocsh.cpp:822-829`): glibc's base-0
+    /// `0b`, C `isspace` only, and the `long` truncated to `int`.
+    #[test]
+    fn an_iocsh_int_is_c_strtol_into_an_int() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        assert_eq!(parse_iocsh_int("0b101"), Ok(5));
+        assert_eq!(parse_iocsh_int("\u{a0}5"), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("2147483648"), Ok(-2147483648));
+        assert_eq!(
+            parse_iocsh_int("4294967296"),
+            if lp64 {
+                Ok(0)
+            } else {
+                Err(IntArgError::OutOfRange)
+            }
+        );
+    }
+
     /// `iocshArgInt` must parse like C `strtol(arg, &endp, 0)`
     /// (base-0: `0x` hex, leading `0` octal), with a `strtoul` overflow
     /// fallback and empty→0 — not Rust's decimal-only `parse::<i64>`.
     #[test]
     fn test_parse_iocsh_int_base0() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        let wide = |v| {
+            if lp64 {
+                Ok(v)
+            } else {
+                Err(IntArgError::OutOfRange)
+            }
+        };
         // Decimal.
         assert_eq!(parse_iocsh_int("10"), Ok(10));
         assert_eq!(parse_iocsh_int("0"), Ok(0));
@@ -1477,9 +1459,10 @@ mod tests {
         assert_eq!(parse_iocsh_int("-0x10"), Ok(-16));
         // Empty arg defaults to 0 (C `if (arg && *arg)` else branch).
         assert_eq!(parse_iocsh_int(""), Ok(0));
-        // strtoul fallback: bit pattern reinterpreted into signed long.
-        assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), Ok(-1));
-        assert_eq!(parse_iocsh_int("18446744073709551615"), Ok(-1));
+        // strtoul fallback, truncated to the int: only a 64-bit unsigned
+        // long holds these.
+        assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), wide(-1));
+        assert_eq!(parse_iocsh_int("18446744073709551615"), wide(-1));
         // Errors: trailing garbage, invalid octal digit, bare/oversized.
         // Which of C's two sentences each one earns is the point — C
         // returns from the `ERANGE` arm before the `*endp` check, so a
@@ -1502,9 +1485,9 @@ mod tests {
             parse_iocsh_int("99999999999999999999abc"),
             Err(IntArgError::OutOfRange)
         );
-        // `LONG_MIN` itself is in range for `strtol`, and reaches the
-        // same value here through the unsigned retry.
-        assert_eq!(parse_iocsh_int("-9223372036854775808"), Ok(i64::MIN));
+        // A 64-bit `LONG_MIN` is in range for `strtol`, and its low 32 bits
+        // are 0.
+        assert_eq!(parse_iocsh_int("-9223372036854775808"), wide(0));
     }
 
     /// C `cvtArg` quotes the offending VALUE and never the parameter

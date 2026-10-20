@@ -1,5 +1,5 @@
-//! C's `strtod`, ported once ([`strtod`]), and the `epicsStdlib` parsers
-//! built on it.
+//! C's `strtod` and `strtol`/`strtoul`, ported once ([`strtod`], [`strtol`],
+//! [`strtoul`]), and the `epicsStdlib` parsers built on them.
 //!
 //! The hex-float ports used to build the significand in an `f64` (`mant = mant * 16.0 +
 //! digit`) and then scale it with `mant * 2.0f64.powi(exp)`. That composition
@@ -19,6 +19,8 @@
 //! `f64` is a SINGLE correctly-rounded step (ties to even) and knows precisely
 //! whether it was inexact. Every row of the boundary table in this module's
 //! tests was probed against the compiled glibc `strtod` on this platform.
+
+use std::ffi::{c_long, c_longlong, c_ulong, c_ulonglong};
 
 /// C `isspace` in the "C" locale: space, `\t`, `\n`, `\v`, `\f`, `\r`.
 ///
@@ -419,6 +421,241 @@ pub fn epics_scan_double(s: &str) -> Option<f64> {
     epics_parse_double(s).ok()
 }
 
+/// What the integer scanner found, before it is given a signedness.
+struct Digits {
+    negative: bool,
+    /// Magnitude, without the sign. `None` once it exceeds `u64`, which is what
+    /// `strtol`/`strtoul` report as `ERANGE`.
+    magnitude: Option<u128>,
+    /// Whether any digit was consumed at all. `false` is `strtol`'s
+    /// `endp == str`, i.e. `S_stdlib_noConversion`.
+    any: bool,
+    /// Byte index where scanning stopped — `strtol`'s `*endp`.
+    end: usize,
+}
+
+/// glibc refuses these bases with `EINVAL` before reading a byte.
+fn einval(base: u32) -> bool {
+    base == 1 || base > 36
+}
+
+/// The scanning half of `strtol`/`strtoul`: leading space, an optional sign,
+/// the base prefix, then the digits. Trailing text is left unread — whether
+/// that is legal is the caller's `units` argument, not this scanner's business.
+///
+/// `base == 0` is `strtol`'s auto-detect, which is what `dbConvertBase` gives
+/// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
+/// scans as the single digit `0` and leaves `x10` for the extraneous test.
+fn scan_int(b: &[u8], mut base: u32) -> Digits {
+    if einval(base) {
+        return Digits {
+            negative: false,
+            magnitude: Some(0),
+            any: false,
+            end: 0,
+        };
+    }
+    let mut i = 0;
+    while i < b.len() && c_isspace(b[i] as char) {
+        i += 1;
+    }
+    let negative = i < b.len() && b[i] == b'-';
+    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+        i += 1;
+    }
+
+    // The base prefix: `0x` under base 0 and 16, `0b` under base 0 and 2. The
+    // `0b` is glibc's C23 binary literal, which EPICS gets because it builds
+    // with `_GNU_SOURCE` (`CONFIG.Common.linuxCommon`; measured: `caput
+    // REC.PREC 0b11` stores 3). A prefix only counts when a digit of that base
+    // follows it; otherwise the leading `0` is itself the number and the
+    // `x`/`b` is trailing text.
+    if b.get(i) == Some(&b'0') {
+        let next = b.get(i + 1).map(u8::to_ascii_lowercase);
+        let after = b.get(i + 2).copied();
+        if matches!(base, 0 | 16)
+            && next == Some(b'x')
+            && after.is_some_and(|c| c.is_ascii_hexdigit())
+        {
+            base = 16;
+            i += 2;
+        } else if matches!(base, 0 | 2)
+            && next == Some(b'b')
+            && after.is_some_and(|c| c == b'0' || c == b'1')
+        {
+            base = 2;
+            i += 2;
+        }
+    }
+    if base == 0 {
+        // A leading `0` is a valid octal digit and is consumed by the loop.
+        base = if b.get(i) == Some(&b'0') { 8 } else { 10 };
+    }
+
+    let mut magnitude = Some(0u128);
+    let mut any = false;
+    while i < b.len() {
+        let Some(d) = (b[i] as char).to_digit(base) else {
+            break;
+        };
+        any = true;
+        magnitude = magnitude
+            .and_then(|m| m.checked_mul(u128::from(base)))
+            .and_then(|m| m.checked_add(u128::from(d)));
+        i += 1;
+    }
+    Digits {
+        negative,
+        magnitude,
+        any,
+        end: i,
+    }
+}
+
+/// The C integer types `strto*` reads into, by their range: `long` and
+/// `unsigned long` at whatever width the target gives them, `long long` and
+/// `unsigned long long` at 64 bits.
+trait CInt: Copy {
+    const MIN: i128;
+    const MAX: i128;
+    /// `v` is inside `MIN..=MAX`.
+    fn from_i128(v: i128) -> Self;
+}
+
+macro_rules! c_int {
+    ($($t:ty),*) => {$(
+        impl CInt for $t {
+            const MIN: i128 = <$t>::MIN as i128;
+            const MAX: i128 = <$t>::MAX as i128;
+            fn from_i128(v: i128) -> Self {
+                v as $t
+            }
+        }
+    )*};
+}
+c_int!(i32, i64, u32, u64);
+
+/// The digits at `T`'s width: `Err` is `ERANGE`, carrying the saturated value
+/// C returns in its place. An unsigned read negates a leading `-` modulo
+/// 2^bits and is NOT an error — that is what lets `-1` reach an unsigned field
+/// as `ULONG_MAX`.
+fn ranged<T: CInt>(d: &Digits) -> Result<T, T> {
+    let signed = T::MIN < 0;
+    let over = T::from_i128(if signed && d.negative { T::MIN } else { T::MAX });
+    let m = d
+        .magnitude
+        .and_then(|m| i128::try_from(m).ok())
+        .ok_or(over)?;
+    let v = match (signed, d.negative) {
+        (true, true) => -m,
+        (false, true) if m <= T::MAX => (T::MAX + 1 - m) % (T::MAX + 1),
+        _ => m,
+    };
+    if (T::MIN..=T::MAX).contains(&v) {
+        Ok(T::from_i128(v))
+    } else {
+        Err(over)
+    }
+}
+
+/// `strto*` at `T`'s width: `ERANGE` saturates, and nothing converted is
+/// `(0, 0)`, as is a base outside 0 and 2..=36 (`EINVAL`).
+fn strto<T: CInt>(s: &[u8], base: u32) -> (T, usize) {
+    let d = scan_int(s, base);
+    if !d.any {
+        return (T::from_i128(0), 0);
+    }
+    (ranged(&d).unwrap_or_else(|over| over), d.end)
+}
+
+/// [`strto`] with `errno` read back: `None` is `ERANGE` or `EINVAL`; nothing
+/// converted is `Some((0, 0))`, as glibc sets no `errno` for it.
+fn strto_errno<T: CInt>(s: &[u8], base: u32) -> Option<(T, usize)> {
+    if einval(base) {
+        return None;
+    }
+    let d = scan_int(s, base);
+    if !d.any {
+        return Some((T::from_i128(0), 0));
+    }
+    Some((ranged(&d).ok()?, d.end))
+}
+
+/// C `strtol(s, &end, base)` as EPICS gets it from glibc with `_GNU_SOURCE`:
+/// the value and the end offset, at C `long`'s width — 64 bits on LP64, 32 on
+/// LLP64 Windows and 32-bit targets — so `ERANGE` saturates at `c_long`'s
+/// bounds.
+pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (c_long, usize) {
+    strto(s.as_ref(), base)
+}
+
+/// C `strtoul(s, &end, base)`, likewise at `unsigned long`'s width; `ERANGE`
+/// is `c_ulong::MAX` whatever the sign.
+pub fn strtoul(s: impl AsRef<[u8]>, base: u32) -> (c_ulong, usize) {
+    strto(s.as_ref(), base)
+}
+
+/// [`strtol`] with `errno` read back, for a caller that tests it: `None` is
+/// `ERANGE` or `EINVAL`; nothing converted is `Some((0, 0))`.
+pub fn strtol_errno(s: impl AsRef<[u8]>, base: u32) -> Option<(c_long, usize)> {
+    strto_errno(s.as_ref(), base)
+}
+
+/// [`strtoul`] likewise.
+pub fn strtoul_errno(s: impl AsRef<[u8]>, base: u32) -> Option<(c_ulong, usize)> {
+    strto_errno(s.as_ref(), base)
+}
+
+/// C `strtoll`: [`strtol`] at 64 bits whatever `long` is.
+pub fn strtoll(s: impl AsRef<[u8]>, base: u32) -> (c_longlong, usize) {
+    strto(s.as_ref(), base)
+}
+
+/// C `strtoull` likewise.
+pub fn strtoull(s: impl AsRef<[u8]>, base: u32) -> (c_ulonglong, usize) {
+    strto(s.as_ref(), base)
+}
+
+/// C `strtoll`, `errno` read back as [`strtol_errno`]: `epicsParseInt64`'s
+/// read where `long` is narrower than 64 bits (`epicsStdlib.c:284-290`).
+pub fn strtoll_errno(s: impl AsRef<[u8]>, base: u32) -> Option<(c_longlong, usize)> {
+    strto_errno(s.as_ref(), base)
+}
+
+/// C `strtoull` likewise, for `epicsParseUInt64` (`epicsStdlib.c:302-308`).
+pub fn strtoull_errno(s: impl AsRef<[u8]>, base: u32) -> Option<(c_ulonglong, usize)> {
+    strto_errno(s.as_ref(), base)
+}
+
+/// C `atoi`, which glibc implements as `(int) strtol(s, NULL, 10)`: an
+/// out-of-range value is the saturated `long` truncated to `int`, so on LP64
+/// `2147483648` is `INT_MIN` and `99999999999999999999` is -1.
+pub fn atoi(s: impl AsRef<[u8]>) -> i32 {
+    long_to_int(strtol(s, 10).0)
+}
+
+/// C's `(int)` of a `long`: the low 32 bits where `long` is 64, the value
+/// itself where it is 32. Through `i128` because a bare `as i32` is a
+/// same-type cast on LLP64, which clippy refuses there.
+pub fn long_to_int(v: c_long) -> i32 {
+    i128::from(v) as i32
+}
+
+/// C's `(unsigned int)` of an `unsigned long`, as [`long_to_int`].
+pub fn ulong_to_uint(v: c_ulong) -> u32 {
+    u128::from(v) as u32
+}
+
+/// C `atol` (glibc `strtol(s, NULL, 10)`), as autosave's array restore uses it.
+pub fn atol(s: &str) -> c_long {
+    strtol(s, 10).0
+}
+
+/// C `strtoul(s, NULL, 0)`.
+pub fn strtoul_auto(s: &str) -> c_ulong {
+    strtoul(s, 0).0
+}
+
 /// C `epicsStrHash` (`libcom/src/misc/epicsString.c:365-376` at `R7.0.10`) —
 /// the string hash every general-purpose hash table in base keys on
 /// (`gpHashLib.c:107`, the registry, the record-name directory).
@@ -459,6 +696,141 @@ pub fn epics_str_hash(s: impl AsRef<[u8]>, seed: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strtol_strtoul_atoi_match_glibc_with_gnu_source() {
+        // gcc -D_GNU_SOURCE on glibc 2.39: (input, base, strtol, end,
+        // strtoul, end). The rows past `long`'s range are
+        // `overflow_saturates_at`'s.
+        const STRTO: &[(&str, u32, c_long, usize, c_ulong, usize)] = &[
+            ("  -17x", 10, -17, 5, c_ulong::MAX - 16, 5),
+            ("+0x1F", 0, 31, 5, 31, 5),
+            ("+0x1F", 10, 0, 2, 0, 2),
+            ("+0x1F", 16, 31, 5, 31, 5),
+            ("0x", 0, 0, 1, 0, 1),
+            ("0x", 16, 0, 1, 0, 1),
+            ("0xg", 16, 0, 1, 0, 1),
+            ("0b101", 0, 5, 5, 5, 5),
+            ("0b101", 10, 0, 1, 0, 1),
+            ("0b101", 16, 45313, 5, 45313, 5),
+            ("0b101", 2, 5, 5, 5, 5),
+            ("0B2", 2, 0, 1, 0, 1),
+            ("010", 0, 8, 3, 8, 3),
+            ("010", 10, 10, 3, 10, 3),
+            ("09", 0, 0, 1, 0, 1),
+            ("-1", 10, -1, 2, c_ulong::MAX, 2),
+            ("", 10, 0, 0, 0, 0),
+            (" +", 10, 0, 0, 0, 0),
+            ("-", 10, 0, 0, 0, 0),
+            ("\t\n\x0b\x0c\r7", 10, 7, 6, 7, 6),
+            ("Zz", 36, 1295, 2, 1295, 2),
+        ];
+        const ATOI: &[(&str, i32)] = &[("  -17x", -17), ("2147483647", 2147483647), ("", 0)];
+        for &(s, base, l, l_end, u, u_end) in STRTO {
+            assert_eq!(strtol(s, base), (l, l_end), "strtol({s:?}, {base})");
+            assert_eq!(strtoul(s, base), (u, u_end), "strtoul({s:?}, {base})");
+        }
+        for &(s, v) in ATOI {
+            assert_eq!(atoi(s), v, "atoi({s:?})");
+        }
+    }
+
+    /// [`strto`] at `T`'s width, widened for the comparison.
+    fn wide<T: CInt + Into<i128>>(s: &str, base: u32) -> (i128, usize) {
+        let (v, end) = strto::<T>(s.as_bytes(), base);
+        (v.into(), end)
+    }
+
+    /// The rows past `long`'s range, written against `L`'s and `U`'s own
+    /// bounds so they hold at any width. At 64 bits every row is glibc 2.39's
+    /// (`9223372036854775808` reads as `LONG_MAX` and `2^63`, `-2^64` as
+    /// `LONG_MIN` and `ULONG_MAX`, ...).
+    fn overflow_saturates_at<L: CInt + Into<i128>, U: CInt + Into<i128>>() {
+        let (min, max, umax) = (L::MIN, L::MAX, U::MAX);
+        let rows = [
+            ((max + 1).to_string(), 10, max, max + 1),
+            (min.to_string(), 10, min, max + 1),
+            ((min - 1).to_string(), 10, min, max),
+            ((umax + 1).to_string(), 10, max, umax),
+            ((-umax).to_string(), 10, min, 1),
+            ((-umax - 1).to_string(), 10, min, umax),
+            (format!("{umax:#x}"), 0, max, umax),
+            (format!("{:#x}", umax + 1), 16, max, umax),
+            ("9".repeat(41), 10, max, umax),
+        ];
+        for (s, base, l, u) in rows {
+            assert_eq!(wide::<L>(&s, base), (l, s.len()), "strtol({s:?}, {base})");
+            assert_eq!(wide::<U>(&s, base), (u, s.len()), "strtoul({s:?}, {base})");
+        }
+    }
+
+    #[test]
+    fn overflow_saturates_at_c_long() {
+        overflow_saturates_at::<c_long, c_ulong>();
+    }
+
+    /// LLP64 Windows and 32-bit targets: the same rows at a 32-bit `long`.
+    #[test]
+    fn overflow_saturates_at_a_32_bit_long() {
+        overflow_saturates_at::<i32, u32>();
+    }
+
+    /// `strtoll`/`strtoull` are 64 bits whatever `long` is.
+    #[test]
+    fn overflow_saturates_at_long_long() {
+        overflow_saturates_at::<c_longlong, c_ulonglong>();
+        let past = (i128::from(c_longlong::MAX) + 1).to_string();
+        assert_eq!(strtoll(&past, 10), (c_longlong::MAX, 19));
+        assert_eq!(strtoull(&past, 10), (1 << 63, 19));
+        assert_eq!(strtoll_errno(&past, 10), None);
+        assert_eq!(
+            strtoll_errno(&past[1..], 10),
+            Some((223372036854775808, 18))
+        );
+        assert_eq!(strtoull_errno(&past, 10), Some((1 << 63, 19)));
+        assert_eq!(strtoull_errno("-1", 10), Some((c_ulonglong::MAX, 2)));
+    }
+
+    /// Boundary: `long_to_int` and `ulong_to_uint` keep the low 32 bits of a
+    /// 64-bit `long` and are the identity on a 32-bit one.
+    #[test]
+    fn long_to_int_is_c_int_cast_at_both_widths() {
+        let lp64 = c_long::BITS == 64;
+        assert_eq!(long_to_int(-7), -7);
+        assert_eq!(long_to_int(c_long::MAX), if lp64 { -1 } else { i32::MAX });
+        assert_eq!(long_to_int(c_long::MIN), if lp64 { 0 } else { i32::MIN });
+        assert_eq!(ulong_to_uint(c_ulong::MAX), u32::MAX);
+        assert_eq!(ulong_to_uint(7), 7);
+    }
+
+    /// glibc `atoi` is `(int) strtol`: the `long` saturates first and is then
+    /// truncated, so where `long` is 64 bits a value past `int` wraps, and
+    /// where it is 32 the same text saturates.
+    #[test]
+    fn atoi_truncates_the_saturated_long() {
+        let lp64 = c_long::BITS == 64;
+        for (s, wrapped) in [
+            ("2147483648", i32::MIN),
+            ("-2147483649", i32::MAX),
+            ("4294967297", 1),
+            ("3000000000", -1_294_967_296),
+        ] {
+            let saturated = long_to_int(if s.starts_with('-') {
+                c_long::MIN
+            } else {
+                c_long::MAX
+            });
+            assert_eq!(
+                atoi(s),
+                if lp64 { wrapped } else { saturated },
+                "atoi({s:?})"
+            );
+        }
+        assert_eq!(atoi("99999999999999999999"), long_to_int(c_long::MAX));
+        assert_eq!(atoi("-99999999999999999999"), long_to_int(c_long::MIN));
+        assert_eq!(atol("99999999999999999999"), c_long::MAX);
+        assert_eq!(atol("-99999999999999999999"), c_long::MIN);
+    }
 
     /// Boundary: the empty string is the seed untouched — C's `while` never
     /// runs — and an odd length exits through the mid-loop `break` while an

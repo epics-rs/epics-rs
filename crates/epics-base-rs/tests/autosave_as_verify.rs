@@ -251,6 +251,33 @@ fn a_file_without_its_end_marker_is_named_and_compared() {
     );
 }
 
+/// An enum's saved value is C `atoi`'d (verify.c:298, :309): glibc's
+/// saturating `strtol` cut to `int`, so twenty nines read -1 where `long` is
+/// 64 bits.
+#[test]
+fn an_enum_value_is_read_as_c_atoi_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("e.sav"),
+        "A 1.5\nA.SCAN 99999999999999999999\n<END>\n",
+    )
+    .unwrap();
+    assert_eq!(
+        output_of(dir.path(), "asVerify(\"e.sav\", 1, \"\")"),
+        [
+            "    PVname saved_value live_value".to_string(),
+            "    =============================".to_string(),
+            "    A                         1.500000                  1.500000".to_string(),
+            format!(
+                "*** {:<25} {:<25} 0",
+                "A.SCAN",
+                epics_base_rs::types::c_parse::long_to_int(std::ffi::c_long::MAX)
+            ),
+            "1 PV differed.  (2 PVs checked; 0 PVs not connected)".to_string(),
+        ]
+    );
+}
+
 /// :44-47.
 #[test]
 fn a_file_that_cannot_be_opened_is_named() {

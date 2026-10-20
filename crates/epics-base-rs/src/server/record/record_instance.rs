@@ -827,45 +827,6 @@ fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
     }
 }
 
-/// Port of libcom `epicsParseInt32(str, &to, 10, NULL)`
-/// (`libcom/src/misc/epicsStdlib.c:26-53,245-261`), which is how pvxs parses
-/// the `nsec:lsb:` digit count. Returns `None` for every status the C
-/// returns non-zero for:
-///
-/// - `S_stdlib_noConversion` — `strtol` consumed nothing (empty / no digits)
-/// - `S_stdlib_extraneous` — trailing non-space bytes with `units == NULL`
-/// - `S_stdlib_overflow` — outside `epicsInt32`
-///
-/// Leading and trailing whitespace — C `isspace`, vertical tab included — and
-/// a leading `+`/`-` sign are accepted, matching `epicsParseLong`'s skips and
-/// `strtol`.
-fn epics_parse_int32_base10(s: &str) -> Option<i32> {
-    // `while ((c = *str) && isspace(c)) ++str;` then `strtol(str, &endp, 10)`.
-    let body = s.trim_start_matches(crate::runtime::stdlib::c_isspace);
-    let (sign, digits) = match body.strip_prefix(['+', '-']) {
-        Some(rest) if body.starts_with('-') => (-1i64, rest),
-        Some(rest) => (1i64, rest),
-        None => (1i64, body),
-    };
-    let end = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    if end == 0 {
-        return None; // endp == str → S_stdlib_noConversion
-    }
-    // `if (c && !units) return S_stdlib_extraneous;` after skipping trailing
-    // whitespace.
-    if !digits[end..]
-        .trim_start_matches(crate::runtime::stdlib::c_isspace)
-        .is_empty()
-    {
-        return None;
-    }
-    // ERANGE from `strtol`, then the explicit `epicsInt32` range check.
-    let magnitude: i64 = digits[..end].parse().ok()?;
-    i32::try_from(sign * magnitude).ok()
-}
-
 /// The STORED type of a `dbCommon` field — the variant its
 /// [`RecordInstance::put_common_field_bounded`] arm binds, which is not always
 /// the type the `.dbd` DECLARES it as (a `menu()` field is declared `DBF_MENU`
@@ -9867,7 +9828,10 @@ impl RecordInstance {
         else {
             return 0;
         };
-        let Some(dig) = epics_parse_int32_base10(rest) else {
+        // epicsParseInt32(&val[9], &dig, 10, nullptr) (typeutils.cpp:85).
+        let Some(EpicsValue::Long(dig)) =
+            c_parse::parse_base10_units_null(c_parse::NumericField::Long, rest)
+        else {
             return 0;
         };
         // C shifts `uint64_t(1u)` by an `epicsInt32`. A `dig` outside

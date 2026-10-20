@@ -1623,63 +1623,6 @@ impl EpicsValue {
                 .ok_or_else(|| CaError::InvalidValue(format!("invalid double literal: {s}"))),
         }
     }
-
-    /// Parse an integer string with C-style radix prefixes (0x for hex, 0 for
-    /// octal). Shared C base-0 parser for the `DBF_*` string PUT path and the
-    /// QSRV bridge's `ScalarValue::String` → integer conversion, matching
-    /// pvxs `parseTo<int64_t>` (`std::stoll(s,&idx,0)`). Rejects empty input.
-    pub fn parse_int(s: &str) -> CaResult<i64> {
-        let s = s.trim();
-        if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16).map_err(|e| CaError::InvalidValue(e.to_string()))
-        } else if s.starts_with('0')
-            && s.len() > 1
-            && s.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-        {
-            i64::from_str_radix(&s[1..], 8).map_err(|e| CaError::InvalidValue(e.to_string()))
-        } else {
-            s.parse::<i64>()
-                .map_err(|e| CaError::InvalidValue(e.to_string()))
-        }
-    }
-
-    /// Parse an unsigned integer string with C-style radix prefixes
-    /// (`0x` hex, leading-`0` octal) and `strtoul` sign handling. Mirrors C
-    /// `epicsParseUInt8/16/32/64`, which dbStaticLib.c calls with `base = 0`
-    /// for DBF_UCHAR/USHORT/ULONG/UINT64: an optional leading `+`/`-` precedes
-    /// the radix prefix, and a `-` negates in wrapping unsigned arithmetic
-    /// exactly like `strtoul` (e.g. DBF_ULONG `TEVL="-1"` → `0xFFFFFFFF`,
-    /// the areaDetector "all-bits / undefined" convention). Parsing keeps the
-    /// full unsigned 64-bit range — `i64`-based parsing would reject
-    /// `DBF_UINT64` values above `i64::MAX`; callers cast to the field width,
-    /// matching C's final `(epicsUIntN)` cast of the wrapped value. Shared
-    /// with the QSRV bridge's `ScalarValue::String` → `DBF_UINT64` conversion
-    /// (pvxs `parseTo<uint64_t>` = `std::stoull(s,&idx,0)`). Rejects empty
-    /// input.
-    pub fn parse_uint(s: &str) -> CaResult<u64> {
-        let s = s.trim();
-        let (negative, body) = match s.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, s.strip_prefix('+').unwrap_or(s)),
-        };
-        let magnitude =
-            if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-                u64::from_str_radix(hex, 16)
-            } else if body.starts_with('0')
-                && body.len() > 1
-                && body.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-            {
-                u64::from_str_radix(&body[1..], 8)
-            } else {
-                body.parse::<u64>()
-            }
-            .map_err(|e| CaError::InvalidValue(e.to_string()))?;
-        Ok(if negative {
-            0u64.wrapping_sub(magnitude)
-        } else {
-            magnitude
-        })
-    }
 }
 
 /// Convert a string value to f64 with C-style hex/octal auto-detection.

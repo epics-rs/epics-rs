@@ -12,6 +12,7 @@ use bitflags::bitflags;
 use epics_libcom_rs::runtime::log::{
     StagedLine, StagedStderr, errlog_printf_bytes, errlog_vprintf,
 };
+use epics_libcom_rs::runtime::stdlib::{long_to_int, strtol};
 
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 
@@ -122,9 +123,10 @@ fn c_mask_string_to_int<'a>(
     let mut mask = 0u32;
     let mut i = 0;
     loop {
-        if let Some((value, len)) = c_strtol_base0(&b[i..]) {
+        // C's `end != maskStr`.
+        if let (value, len @ 1..) = strtol(&b[i..], 0) {
             // C stores strtol's long in an int.
-            mask |= value as i32 as u32;
+            mask |= long_to_int(value) as u32;
             i += len;
         } else {
             i = skip_space(i);
@@ -153,66 +155,6 @@ fn c_mask_string_to_int<'a>(
 /// C `isspace` in the "C" locale.
 fn is_c_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-}
-
-/// C `strtol(s, &end, 0)` on an LP64 `long`: the value and the bytes consumed,
-/// or `None` when no conversion was made (`end == s`). Out-of-range values
-/// clamp to `LONG_MIN`/`LONG_MAX` as glibc does.
-fn c_strtol_base0(b: &[u8]) -> Option<(i64, usize)> {
-    let mut i = 0;
-    while i < b.len() && is_c_space(b[i]) {
-        i += 1;
-    }
-    let negative = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let radix = if b.get(i) == Some(&b'0')
-        && matches!(b.get(i + 1), Some(b'x' | b'X'))
-        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
-    {
-        i += 2;
-        16
-    } else if b.get(i) == Some(&b'0') {
-        8
-    } else {
-        10
-    };
-    let start = i;
-    let mut magnitude: u64 = 0;
-    let mut overflow = false;
-    while let Some(d) = b.get(i).and_then(|&c| (c as char).to_digit(radix)) {
-        match magnitude
-            .checked_mul(radix as u64)
-            .and_then(|m| m.checked_add(d as u64))
-        {
-            Some(m) => magnitude = m,
-            None => overflow = true,
-        }
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    let value = if negative {
-        if overflow || magnitude > i64::MIN.unsigned_abs() {
-            i64::MIN
-        } else {
-            (magnitude as i64).wrapping_neg()
-        }
-    } else if overflow || magnitude > i64::MAX as u64 {
-        i64::MAX
-    } else {
-        magnitude as i64
-    };
-    Some((value, i))
 }
 
 bitflags! {
@@ -1909,8 +1851,9 @@ mod tests {
         );
     }
 
-    /// C keeps strtol's long in an int: `-1` and an out-of-range number (glibc
-    /// clamps to `LONG_MAX`) both set every bit.
+    /// C keeps strtol's long in an int: `-1` sets every bit, and so does an
+    /// out-of-range number (glibc clamps to `LONG_MAX`) where `long` is 64
+    /// bits; where it is 32, `LONG_MAX` is the int's own maximum.
     #[test]
     fn trace_mask_string_number_is_cs_int() {
         assert_eq!(TraceMask::from_c_mask_string("-1").0.bits(), u32::MAX);
@@ -1918,9 +1861,21 @@ mod tests {
             TraceMask::from_c_mask_string("0xfffffffffffffffffff")
                 .0
                 .bits(),
-            u32::MAX
+            if std::ffi::c_long::BITS == 64 {
+                u32::MAX
+            } else {
+                0x7fff_ffff
+            }
         );
         assert_eq!(TraceMask::from_c_mask_string("-0x10").0.bits(), 0xffff_fff0);
+    }
+
+    /// glibc's base-0 `strtol` reads C23 `0b` under EPICS' `_GNU_SOURCE`
+    /// (asynShellCommands.c:676).
+    #[test]
+    fn trace_mask_string_number_takes_glibc_s_binary_prefix() {
+        let (mask, rest) = TraceMask::from_c_mask_string("0b101|");
+        assert_eq!((mask.bits(), rest), (0b101, ""));
     }
 
     #[test]

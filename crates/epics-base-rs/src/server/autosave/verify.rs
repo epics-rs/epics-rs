@@ -8,6 +8,7 @@ use crate::calc::engine::string::{escaped_from_raw, raw_from_escaped};
 use crate::runtime::stdlib::strtod;
 use crate::server::database::{ClientChannel, Connection, PvDatabase};
 use crate::server::record::record_instance::value_as_dbr_string;
+use crate::types::c_parse::atoi;
 use crate::types::{
     DBR_CHAR, DBR_DOUBLE, DBR_FLOAT, DBR_SHORT, DBR_STRING, DbFieldType, EpicsValue,
 };
@@ -46,23 +47,6 @@ impl<'a> Lines<'a> {
         self.pos += n;
         Some(&rest[..n])
     }
-}
-
-/// C `atoi`: leading space, a sign, decimal digits, wrapping as `int`.
-fn atoi(s: &[u8]) -> i32 {
-    let s = &s[s.iter().take_while(|c| c.is_ascii_whitespace()).count()..];
-    let (neg, digits) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let v = digits
-        .iter()
-        .take_while(|c| c.is_ascii_digit())
-        .fold(0i64, |v, &c| {
-            v.wrapping_mul(10).wrapping_add((c - b'0') as i64)
-        });
-    (if neg { v.wrapping_neg() } else { v }) as i32
 }
 
 fn atof(s: &[u8]) -> f64 {

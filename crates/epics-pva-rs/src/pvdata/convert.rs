@@ -28,6 +28,8 @@
 
 use std::borrow::Cow;
 
+use epics_base_rs::runtime::stdlib::{c_isspace, strtoll_errno, strtoull_errno};
+
 use super::scalar::{ScalarType, ScalarValue};
 use super::structure::PvField;
 
@@ -307,85 +309,34 @@ pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
 
 /// pvxs `parseTo<uint64_t>` (`util.cpp:786-799`) — `std::stoull(s, &idx, 0)`
 /// followed by a trailing-whitespace skip and an "extraneous characters"
-/// check.
-///
-/// `strtoull` with base 0 is not a decimal parse: it skips leading
-/// whitespace, takes an optional sign, then picks the radix from the prefix —
-/// `0x`/`0X` → 16, a leading `0` → 8, otherwise 10. A leading `-` NEGATES the
-/// parsed unsigned value (defined by C, not an error), so `"-1"` is
-/// `u64::MAX`. Overflow is `std::out_of_range` → `NoConvert`.
-///
-/// So `"0x10"` is 16, `"010"` is 8, `"10"` is 10, and `"12abc"` is NoConvert
-/// (the `abc` is extraneous). The port's decimal-only `str::parse` rejected
-/// the first two and accepted nothing pvxs rejects.
+/// check. `std::stoull` is libcom's [`strtoull_errno`] at base 0: a leading
+/// `-` negates (`"-1"` is `u64::MAX`), `0x`/`0b`/leading-`0` pick the radix,
+/// and overflow is `std::out_of_range` → `NoConvert`.
 pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
-    parse_base0(s, "integer", |negate, v| {
-        // C: "if the subject sequence begins with a minus sign, the value is
-        // negated" — a wrap, not an error.
-        Some(if negate { v.wrapping_neg() } else { v })
-    })
+    parse_base0(s, "integer", |b| strtoull_errno(b, 0))
 }
 
 /// pvxs `parseTo<int64_t>` (`util.cpp:802-816`) — `std::stoll(s, &idx, 0)`,
 /// the same scan as [`parse_to_u64`] with a signed range. Its extraneous text
 /// says "unsigned", as pvxs's does.
 pub fn parse_to_i64(s: &str) -> Result<i64, NoConvert> {
-    parse_base0(s, "unsigned", |negate, v| match negate {
-        false => i64::try_from(v).ok(),
-        true => (v <= 1 << 63).then(|| (v as i64).wrapping_neg()),
-    })
+    parse_base0(s, "unsigned", |b| strtoll_errno(b, 0))
 }
 
-/// The `strtoull` / `strtoll` base-0 scan `parseTo` wraps. `range` turns the
-/// sign and magnitude into the value, `None` being `std::out_of_range`, which
-/// C raises before the trailing check.
+/// `parseTo` around its `std::stoll`/`std::stoull` `scan`: `None` (ERANGE)
+/// is `std::out_of_range`, raised before the trailing check; nothing
+/// converted is `std::invalid_argument`.
 fn parse_base0<T>(
     s: &str,
     what: &str,
-    range: impl FnOnce(bool, u64) -> Option<T>,
+    scan: impl FnOnce(&[u8]) -> Option<(T, usize)>,
 ) -> Result<T, NoConvert> {
-    let b = s.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let negate = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    // base 0 radix selection, exactly as strtoull does it: `0x` is a prefix
-    // only with a hex digit after it, else the `0` is the number and the
-    // scan stops at the `x`.
-    let (radix, start) = match (b.get(i), b.get(i + 1), b.get(i + 2)) {
-        (Some(b'0'), Some(b'x' | b'X'), Some(h)) if h.is_ascii_hexdigit() => (16u32, i + 2),
-        (Some(b'0'), _, _) => (8u32, i),
-        _ => (10u32, i),
-    };
-    let mut end = start;
-    while end < b.len() && (b[end] as char).is_digit(radix) {
-        end += 1;
-    }
-    if end == start {
-        // No digit sequence at all — `std::stoull` raises `invalid_argument`,
-        // which `parseTo` re-raises as NoConvert.
+    let (v, end) =
+        scan(s.as_bytes()).ok_or_else(|| NoConvert::new(format!("Out of range : \"{s}\"")))?;
+    if end == 0 {
         return Err(NoConvert::new(format!("Invalid input : \"{s}\"")));
     }
-    let v = u64::from_str_radix(&s[start..end], radix)
-        .ok()
-        .and_then(|v| range(negate, v))
-        .ok_or_else(|| NoConvert::new(format!("Out of range : \"{s}\"")))?;
-    let mut j = end;
-    while j < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[j] as char) {
-        j += 1;
-    }
-    if j != b.len() {
+    if !s.as_bytes()[end..].iter().all(|&c| c_isspace(c as char)) {
         return Err(NoConvert::new(format!(
             "Extraneous characters after {what}: \"{s}\""
         )));
@@ -567,6 +518,19 @@ mod tests {
         assert_eq!(parse_to_u64("0x1"), Ok(1));
         // Overflow is `std::out_of_range` → NoConvert.
         assert!(parse_to_u64("18446744073709551616").is_err());
+    }
+
+    /// libstdc++ `stoll`/`stoull` are glibc `strtoll`/`strtoull`, which g++'s
+    /// `_GNU_SOURCE` builds with the C23 `0b` prefix under base 0.
+    #[test]
+    fn parse_to_takes_the_glibc_binary_prefix() {
+        assert_eq!(parse_to_i64("0b101"), Ok(5));
+        assert_eq!(parse_to_i64("-0b11"), Ok(-3));
+        assert_eq!(parse_to_u64("0B11"), Ok(3));
+        assert_eq!(
+            parse_to_u64("0b2").unwrap_err().message(),
+            "Extraneous characters after integer: \"0b2\""
+        );
     }
 
     #[test]

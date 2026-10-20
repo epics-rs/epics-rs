@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+use epics_pva_rs::pvdata::convert::parse_to_i64;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -552,40 +553,12 @@ fn json_value_as_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Parse a string to `i64` exactly as pvxs `parseTo<int64_t>` does
-/// (`util.cpp:803-817`): `std::stoll(s, &idx, 0)` — base auto-detected
-/// (`0x`/`0X` hex, a leading `0` octal, else decimal), an optional sign,
-/// leading whitespace skipped and trailing whitespace tolerated; any other
-/// trailing character is `NoConvert`. `None` mirrors that throw.
-fn parse_stoll_base0(s: &str) -> Option<i64> {
-    // stoll skips leading whitespace and its caller tolerates trailing
-    // whitespace, so trimming both reproduces the accepted set.
-    let t = s.trim();
-    let (neg, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if body.is_empty() {
-        return None;
-    }
-    let (radix, digits) =
-        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, hex)
-        } else if body.len() > 1 && body.starts_with('0') {
-            (8, &body[1..])
-        } else {
-            (10, body)
-        };
-    let mag = i64::from_str_radix(digits, radix).ok()?;
-    if neg { mag.checked_neg() } else { Some(mag) }
-}
-
 /// Coerce a JSON `+putorder` value to an `i64` exactly as pvxs
 /// `Value::as<int64_t>()` coerces the parsed scalar
 /// (groupprocessorcontext.cpp:75 → data.cpp:426/448): a JSON integer maps
 /// directly; a JSON real truncates toward zero (`copyOutScalar` static_cast);
 /// a JSON bool becomes 1/0; a JSON string is parsed via
-/// [`parse_stoll_base0`] (pvxs `parseTo<int64_t>`). Any other value (array,
+/// [`parse_to_i64`] (pvxs `parseTo<int64_t>`). Any other value (array,
 /// object, null) or an unparsable string is unconvertible — `None` → the caller
 /// SKIPS this group (stricter than pvxs, which swallows the `as<int64_t>`
 /// NoConvert and serves the group; see the annotation-coercion divergence note
@@ -597,7 +570,7 @@ fn json_value_as_i64(v: &serde_json::Value) -> Option<i64> {
             .or_else(|| n.as_u64().map(|u| u as i64))
             .or_else(|| n.as_f64().map(|f| f as i64)),
         serde_json::Value::Bool(b) => Some(*b as i64),
-        serde_json::Value::String(s) => parse_stoll_base0(s),
+        serde_json::Value::String(s) => parse_to_i64(s).ok(),
         _ => None,
     }
 }
@@ -2719,19 +2692,22 @@ mod tests {
 
     // ---- Q2: member-level annotations coerce via as<T>() like group-level ----
 
-    /// `parse_stoll_base0` mirrors pvxs `parseTo<int64_t>` (`std::stoll(s,_,0)`):
-    /// base auto-detect, sign, leading/trailing whitespace tolerated.
+    /// A string annotation is pvxs `parseTo<int64_t>` (`std::stoll(s,_,0)`):
+    /// base auto-detect, sign, C `isspace` around the number.
     #[test]
-    fn parse_stoll_base0_matches_pvxs() {
-        assert_eq!(parse_stoll_base0("2"), Some(2));
-        assert_eq!(parse_stoll_base0("-7"), Some(-7));
-        assert_eq!(parse_stoll_base0("+9"), Some(9));
-        assert_eq!(parse_stoll_base0("0x10"), Some(16), "hex auto-detect");
-        assert_eq!(parse_stoll_base0("010"), Some(8), "octal auto-detect");
-        assert_eq!(parse_stoll_base0("  42  "), Some(42), "leading/trailing ws");
-        assert_eq!(parse_stoll_base0("2x"), None, "extraneous trailing char");
-        assert_eq!(parse_stoll_base0("abc"), None, "non-numeric");
-        assert_eq!(parse_stoll_base0(""), None, "empty");
+    fn a_string_annotation_is_pvxs_parse_to() {
+        let as_i64 = |s: &str| json_value_as_i64(&serde_json::Value::String(s.into()));
+        assert_eq!(as_i64("2"), Some(2));
+        assert_eq!(as_i64("-7"), Some(-7));
+        assert_eq!(as_i64("+9"), Some(9));
+        assert_eq!(as_i64("0x10"), Some(16), "hex auto-detect");
+        assert_eq!(as_i64("010"), Some(8), "octal auto-detect");
+        assert_eq!(as_i64("  42  "), Some(42), "leading/trailing ws");
+        assert_eq!(as_i64("2x"), None, "extraneous trailing char");
+        assert_eq!(as_i64("abc"), None, "non-numeric");
+        assert_eq!(as_i64(""), None, "empty");
+        assert_eq!(as_i64("0b11"), Some(3), "glibc C23 binary");
+        assert_eq!(as_i64("\u{a0}4"), None, "only C isspace");
     }
 
     /// A `+putorder` given as a numeric string coerces to the integer (pvxs

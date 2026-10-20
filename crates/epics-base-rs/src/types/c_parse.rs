@@ -45,7 +45,12 @@
 //! stores 1 (`strtol` stops at the `.`).
 
 use crate::error::{CaError, CaResult};
+pub use crate::runtime::stdlib::{
+    atoi, atol, long_to_int, strtol, strtol_errno, strtoll, strtoll_errno, strtoul, strtoul_auto,
+    strtoul_errno, strtoull, strtoull_errno, ulong_to_uint,
+};
 use crate::types::{DbFieldType, EpicsValue};
+use std::ffi::{c_long, c_ulong};
 
 /// A destination C reaches through a numeric parse on a `DBR_STRING` put.
 ///
@@ -364,12 +369,11 @@ fn parse_two_way(target: NumericField, s: &str) -> Option<EpicsValue> {
         // value outside it (`epicsStdlib.c:181-261`).
         NumericField::Char => EpicsValue::Char(in_range(parse_long(s)?, -0x80, 0x7f)? as i8 as u8),
         NumericField::Short => EpicsValue::Short(in_range(parse_long(s)?, -0x8000, 0x7fff)? as i16),
-        NumericField::Long => {
-            EpicsValue::Long(in_range(parse_long(s)?, -0x8000_0000, 0x7fff_ffff)? as i32)
-        }
-        // `epicsParseInt64` adds no check of its own: `long` is 64 bits here, so
-        // `strtol`'s own ERANGE is the whole range test (`epicsStdlib.c:281-297`).
-        NumericField::Int64 => EpicsValue::Int64(parse_long(s)?),
+        NumericField::Long => EpicsValue::Long(epics_parse_int32_units(s)?),
+        // `epicsParseInt64` adds no check of its own: it reads `long long`
+        // where `long` is narrower, so `strtoll`'s ERANGE is the whole range
+        // test (`epicsStdlib.c:281-297`).
+        NumericField::Int64 => EpicsValue::Int64(converted(strtoll_errno(s, 0))?.0),
 
         // The unsigned widths deliberately admit a NEGATIVE value. C's test is
         //
@@ -382,8 +386,9 @@ fn parse_two_way(target: NumericField, s: &str) -> Option<EpicsValue> {
         // out-of-range *positive* band is rejected.
         NumericField::UChar => EpicsValue::UChar(outside_band(parse_ulong(s)?, 0xff)? as u8),
         NumericField::UShort => EpicsValue::UShort(outside_band(parse_ulong(s)?, 0xffff)? as u16),
-        // No band: the destination is as wide as `unsigned long`.
-        NumericField::UInt64 => EpicsValue::UInt64(parse_ulong(s)?),
+        // No band: `epicsParseUInt64` reads `unsigned long long` where
+        // `unsigned long` is narrower (`epicsStdlib.c:300-315`).
+        NumericField::UInt64 => EpicsValue::UInt64(converted(strtoull_errno(s, 0))?.0),
 
         NumericField::Float => EpicsValue::Float(narrow_to_f32(parse_double(s)?)?),
         NumericField::Double => EpicsValue::Double(parse_double(s)?),
@@ -426,13 +431,13 @@ pub(crate) fn narrow_to_f32(v: f64) -> Option<f32> {
 }
 
 /// `value < lo || value > hi` -> `S_stdlib_overflow`.
-fn in_range(v: i64, lo: i64, hi: i64) -> Option<i64> {
+fn in_range(v: c_long, lo: c_long, hi: c_long) -> Option<c_long> {
     (lo..=hi).contains(&v).then_some(v)
 }
 
 /// C's unsigned band test: reject only `value > max && value <= !max`. The
 /// complement — a sign-extended negative — is accepted and truncated.
-fn outside_band(v: u64, max: u64) -> Option<u64> {
+fn outside_band(v: c_ulong, max: c_ulong) -> Option<c_ulong> {
     (!(v > max && v <= !max)).then_some(v)
 }
 
@@ -458,26 +463,23 @@ fn outside_band(v: u64, max: u64) -> Option<u64> {
 /// field becomes 1); this owner refuses without writing — puts here are atomic.
 fn parse_ulong_via_double(s: &str) -> Row {
     let stored = |v: u32| Row::Stored(EpicsValue::ULong(v));
-    let d = scan_int(s.as_bytes(), 0);
-    let int_value = if d.any {
-        let parsed = (|| {
-            let v = u64::try_from(d.magnitude?).ok()?;
-            let v = if d.negative { v.wrapping_neg() } else { v };
-            Some(outside_band(v, 0xffff_ffff)? as u32)
-        })();
-        match parsed {
-            // An integer parse that overflowed gets NO fallback: C's `status`
-            // is not `S_stdlib_noConversion`, so the via-double arm is skipped
-            // and the overflow is returned.
-            None => return Row::Refused,
-            some => some,
-        }
+    // An integer parse that overflowed gets NO fallback: C's `status` is not
+    // `S_stdlib_noConversion`, so the via-double arm is skipped and the
+    // overflow is returned.
+    let Some((v, end)) = strtoul_errno(s, 0) else {
+        return Row::Refused;
+    };
+    let int_value = if end > 0 {
+        let Some(v) = outside_band(v, 0xffff_ffff) else {
+            return Row::Refused;
+        };
+        Some(v as u32)
     } else {
         None
     };
     let stopped_at_float = s
         .as_bytes()
-        .get(d.end)
+        .get(end)
         .is_some_and(|c| matches!(c, b'.' | b'e' | b'E'));
     match int_value {
         Some(prefix) if stopped_at_float => match parse_double(s) {
@@ -499,170 +501,20 @@ fn parse_ulong_via_double(s: &str) -> Row {
     }
 }
 
-/// What the integer scanner found, before it is given a signedness.
-struct Digits {
-    negative: bool,
-    /// Magnitude, without the sign. `None` once it exceeds `u64`, which is what
-    /// `strtol`/`strtoul` report as `ERANGE`.
-    magnitude: Option<u128>,
-    /// Whether any digit was consumed at all. `false` is `strtol`'s
-    /// `endp == str`, i.e. `S_stdlib_noConversion`.
-    any: bool,
-    /// Byte index where scanning stopped — `strtol`'s `*endp`. C's
-    /// `putStringUlong` reads the character here to decide on the
-    /// via-double fallback.
-    end: usize,
-}
-
-/// The scanning half of `strtol`/`strtoul`: leading space, an optional sign,
-/// the base prefix, then the digits. Trailing text is left unread — whether
-/// that is legal is the caller's `units` argument, not this scanner's business.
-///
-/// `base == 0` is `strtol`'s auto-detect, which is what `dbConvertBase` gives
-/// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
-/// scans as the single digit `0` and leaves `x10` for the extraneous test.
-fn scan_int(b: &[u8], mut base: u32) -> Digits {
-    // glibc refuses these with EINVAL before reading a byte.
-    if base == 1 || base > 36 {
-        return Digits {
-            negative: false,
-            magnitude: Some(0),
-            any: false,
-            end: 0,
-        };
-    }
-    let mut i = 0;
-    while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let negative = i < b.len() && b[i] == b'-';
-    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
-        i += 1;
-    }
-
-    // The base prefix: `0x` under base 0 and 16, `0b` under base 0 and 2. The
-    // `0b` is glibc's C23 binary literal, which EPICS gets because it builds
-    // with `_GNU_SOURCE` (`CONFIG.Common.linuxCommon`; measured: `caput
-    // REC.PREC 0b11` stores 3). A prefix only counts when a digit of that base
-    // follows it; otherwise the leading `0` is itself the number and the
-    // `x`/`b` is trailing text.
-    if b.get(i) == Some(&b'0') {
-        let next = b.get(i + 1).map(u8::to_ascii_lowercase);
-        let after = b.get(i + 2).copied();
-        if matches!(base, 0 | 16)
-            && next == Some(b'x')
-            && after.is_some_and(|c| c.is_ascii_hexdigit())
-        {
-            base = 16;
-            i += 2;
-        } else if matches!(base, 0 | 2)
-            && next == Some(b'b')
-            && after.is_some_and(|c| c == b'0' || c == b'1')
-        {
-            base = 2;
-            i += 2;
-        }
-    }
-    if base == 0 {
-        // A leading `0` is a valid octal digit and is consumed by the loop.
-        base = if b.get(i) == Some(&b'0') { 8 } else { 10 };
-    }
-
-    let mut magnitude = Some(0u128);
-    let mut any = false;
-    while i < b.len() {
-        let Some(d) = (b[i] as char).to_digit(base) else {
-            break;
-        };
-        any = true;
-        magnitude = magnitude
-            .and_then(|m| m.checked_mul(u128::from(base)))
-            .and_then(|m| m.checked_add(u128::from(d)));
-        i += 1;
-    }
-    Digits {
-        negative,
-        magnitude,
-        any,
-        end: i,
-    }
-}
-
-/// C `strtol`'s signed result plus `epicsParseLong`'s status: `None` for
-/// `S_stdlib_noConversion` and for `ERANGE`.
-fn long_from(d: &Digits) -> Option<i64> {
-    if !d.any {
-        return None;
-    }
-    let m = d.magnitude?;
-    if d.negative {
-        // `-i64::MIN` has no positive counterpart, so the bound is asymmetric.
-        (m <= i64::MAX as u128 + 1).then(|| (m as i128).wrapping_neg() as i64)
-    } else {
-        (m <= i64::MAX as u128).then_some(m as i64)
-    }
-}
-
-/// C `strtoul`'s unsigned result plus `epicsParseULong`'s status. A leading `-`
-/// negates modulo 2^64 and is NOT an error — that is what lets `-1` reach an
-/// unsigned field as `ULONG_MAX`.
-fn ulong_from(d: &Digits) -> Option<u64> {
-    if !d.any {
-        return None;
-    }
-    let m = d.magnitude?;
-    let v = u64::try_from(m).ok()?;
-    Some(if d.negative { v.wrapping_neg() } else { v })
+/// `epicsParse*`'s status over a `strto*_errno` read: `None` for `ERANGE` and
+/// for `S_stdlib_noConversion` (`endp == str`).
+fn converted<T>(read: Option<(T, usize)>) -> Option<(T, usize)> {
+    read.filter(|&(_, end)| end > 0)
 }
 
 /// C `strtol(s, &end, 0)` plus `epicsParseLong`'s status.
-fn parse_long(s: &str) -> Option<i64> {
-    long_from(&scan_int(s.as_bytes(), 0))
+fn parse_long(s: &str) -> Option<c_long> {
+    converted(strtol_errno(s, 0)).map(|(v, _)| v)
 }
 
 /// C `strtoul(s, &end, 0)` plus `epicsParseULong`'s status.
-fn parse_ulong(s: &str) -> Option<u64> {
-    ulong_from(&scan_int(s.as_bytes(), 0))
-}
-
-/// C `strtol(s, &end, base)` as EPICS gets it on Linux: glibc with
-/// `_GNU_SOURCE` and a 64-bit `long`. The value and the end offset; `ERANGE`
-/// saturates at `i64::MIN`/`i64::MAX` and nothing converted is `(0, 0)`, as
-/// is a base outside 0 and 2..=36 (`EINVAL`).
-pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (i64, usize) {
-    let d = scan_int(s.as_ref(), base);
-    if !d.any {
-        return (0, 0);
-    }
-    let v = long_from(&d).unwrap_or(if d.negative { i64::MIN } else { i64::MAX });
-    (v, d.end)
-}
-
-/// C `strtoul(s, &end, base)`, likewise: a leading `-` negates modulo 2^64,
-/// and `ERANGE` is `u64::MAX` whatever the sign.
-pub fn strtoul(s: impl AsRef<[u8]>, base: u32) -> (u64, usize) {
-    let d = scan_int(s.as_ref(), base);
-    if !d.any {
-        return (0, 0);
-    }
-    (ulong_from(&d).unwrap_or(u64::MAX), d.end)
-}
-
-/// C `atoi`, which glibc implements as `(int) strtol(s, NULL, 10)`: an
-/// out-of-range value is the saturated `long` truncated to `int`, so
-/// `2147483648` is `INT_MIN` and `99999999999999999999` is -1.
-pub fn atoi(s: impl AsRef<[u8]>) -> i32 {
-    strtol(s, 10).0 as i32
-}
-
-/// C `atol` (glibc `strtol(s, NULL, 10)`), as autosave's array restore uses it.
-pub fn atol(s: &str) -> i64 {
-    strtol(s, 10).0
-}
-
-/// C `strtoul(s, NULL, 0)`.
-pub fn strtoul_auto(s: &str) -> u64 {
-    strtoul(s, 0).0
+fn parse_ulong(s: &str) -> Option<c_ulong> {
+    converted(strtoul_errno(s, 0)).map(|(v, _)| v)
 }
 
 /// `if (c && !units) return S_stdlib_extraneous;`, after the trailing
@@ -673,16 +525,10 @@ fn extraneous(s: &str, end: usize) -> bool {
         .is_empty()
 }
 
-fn strict_long(s: &str, base: u32) -> Option<i64> {
-    let d = scan_int(s.as_bytes(), base);
-    let v = long_from(&d)?;
-    (!extraneous(s, d.end)).then_some(v)
-}
-
-fn strict_ulong(s: &str, base: u32) -> Option<u64> {
-    let d = scan_int(s.as_bytes(), base);
-    let v = ulong_from(&d)?;
-    (!extraneous(s, d.end)).then_some(v)
+/// A `strto*_errno` read under `units == NULL`.
+fn strict<T>(s: &str, read: Option<(T, usize)>) -> Option<T> {
+    let (v, end) = converted(read)?;
+    (!extraneous(s, end)).then_some(v)
 }
 
 /// The `epicsParse*(str, &value, 10, NULL)` family — the STRICT form, which
@@ -718,26 +564,49 @@ pub fn parse_auto_base_units_null(target: NumericField, s: &str) -> Option<Epics
     parse_units_null(target, s, 0)
 }
 
+/// C `epicsParseUInt16(s, &val, dbConvertBase, NULL)` (`epicsStdlib.c:229-243`),
+/// as `putStringMenu` and `dbPutStringNum` call it: any tail but whitespace is
+/// extraneous.
+pub fn epics_parse_uint16(s: &str) -> Option<u16> {
+    Some(outside_band(strict(s, strtoul_errno(s, 0))?, 0xffff)? as u16)
+}
+
+/// C `epicsParseInt32(s, &val, 0, &end)` (`epicsStdlib.c:246-261`): the
+/// tail after the number is the caller's.
+pub fn epics_parse_int32_units(s: &str) -> Option<i32> {
+    Some(in_range(parse_long(s)?, -0x8000_0000, 0x7fff_ffff)? as i32)
+}
+
+/// [`epics_parse_uint16`] with a `units` pointer, as `putStringEnum` passes
+/// `&end`: the tail after the number is the caller's.
+pub fn epics_parse_uint16_units(s: &str) -> Option<u16> {
+    Some(outside_band(parse_ulong(s)?, 0xffff)? as u16)
+}
+
 fn parse_units_null(target: NumericField, s: &str, base: u32) -> Option<EpicsValue> {
     Some(match target {
         NumericField::Char => {
-            EpicsValue::Char(in_range(strict_long(s, base)?, -0x80, 0x7f)? as i8 as u8)
+            EpicsValue::Char(in_range(strict(s, strtol_errno(s, base))?, -0x80, 0x7f)? as i8 as u8)
         }
         NumericField::Short => {
-            EpicsValue::Short(in_range(strict_long(s, base)?, -0x8000, 0x7fff)? as i16)
+            EpicsValue::Short(in_range(strict(s, strtol_errno(s, base))?, -0x8000, 0x7fff)? as i16)
         }
         NumericField::Long => {
-            EpicsValue::Long(in_range(strict_long(s, base)?, -0x8000_0000, 0x7fff_ffff)? as i32)
+            EpicsValue::Long(
+                in_range(strict(s, strtol_errno(s, base))?, -0x8000_0000, 0x7fff_ffff)? as i32,
+            )
         }
-        NumericField::Int64 => EpicsValue::Int64(strict_long(s, base)?),
-        NumericField::UChar => EpicsValue::UChar(outside_band(strict_ulong(s, base)?, 0xff)? as u8),
+        NumericField::Int64 => EpicsValue::Int64(strict(s, strtoll_errno(s, base))?),
+        NumericField::UChar => {
+            EpicsValue::UChar(outside_band(strict(s, strtoul_errno(s, base))?, 0xff)? as u8)
+        }
         NumericField::UShort => {
-            EpicsValue::UShort(outside_band(strict_ulong(s, base)?, 0xffff)? as u16)
+            EpicsValue::UShort(outside_band(strict(s, strtoul_errno(s, base))?, 0xffff)? as u16)
         }
         NumericField::ULong => {
-            EpicsValue::ULong(outside_band(strict_ulong(s, base)?, 0xffff_ffff)? as u32)
+            EpicsValue::ULong(outside_band(strict(s, strtoul_errno(s, base))?, 0xffff_ffff)? as u32)
         }
-        NumericField::UInt64 => EpicsValue::UInt64(strict_ulong(s, base)?),
+        NumericField::UInt64 => EpicsValue::UInt64(strict(s, strtoull_errno(s, base))?),
         // `epicsParseFloat32`/`Float64` are `epicsParseDouble` with the same
         // NULL `units`, which is the one this workspace already owns.
         NumericField::Float => EpicsValue::Float(narrow_to_f32(
@@ -1104,115 +973,5 @@ mod tests {
             NumericField::of(DbFieldType::Double),
             Some(NumericField::Double)
         );
-    }
-
-    #[test]
-    fn strtol_strtoul_atoi_match_glibc_with_gnu_source() {
-        // gcc -D_GNU_SOURCE on glibc 2.39: (input, base, strtol, end,
-        // strtoul, end).
-        const STRTO: &[(&str, u32, i64, usize, u64, usize)] = &[
-            ("  -17x", 10, -17, 5, 18446744073709551599, 5),
-            ("+0x1F", 0, 31, 5, 31, 5),
-            ("+0x1F", 10, 0, 2, 0, 2),
-            ("+0x1F", 16, 31, 5, 31, 5),
-            ("0x", 0, 0, 1, 0, 1),
-            ("0x", 16, 0, 1, 0, 1),
-            ("0xg", 16, 0, 1, 0, 1),
-            ("0b101", 0, 5, 5, 5, 5),
-            ("0b101", 10, 0, 1, 0, 1),
-            ("0b101", 16, 45313, 5, 45313, 5),
-            ("0b101", 2, 5, 5, 5, 5),
-            ("0B2", 2, 0, 1, 0, 1),
-            ("010", 0, 8, 3, 8, 3),
-            ("010", 10, 10, 3, 10, 3),
-            ("09", 0, 0, 1, 0, 1),
-            (
-                "9223372036854775808",
-                10,
-                9223372036854775807,
-                19,
-                9223372036854775808,
-                19,
-            ),
-            (
-                "-9223372036854775808",
-                10,
-                i64::MIN,
-                20,
-                9223372036854775808,
-                20,
-            ),
-            (
-                "-9223372036854775809",
-                10,
-                i64::MIN,
-                20,
-                9223372036854775807,
-                20,
-            ),
-            (
-                "18446744073709551616",
-                10,
-                9223372036854775807,
-                20,
-                18446744073709551615,
-                20,
-            ),
-            ("-1", 10, -1, 2, 18446744073709551615, 2),
-            ("-18446744073709551615", 10, i64::MIN, 21, 1, 21),
-            (
-                "-18446744073709551616",
-                10,
-                i64::MIN,
-                21,
-                18446744073709551615,
-                21,
-            ),
-            (
-                "99999999999999999999999999999999999999999",
-                10,
-                9223372036854775807,
-                41,
-                18446744073709551615,
-                41,
-            ),
-            ("", 10, 0, 0, 0, 0),
-            (" +", 10, 0, 0, 0, 0),
-            ("-", 10, 0, 0, 0, 0),
-            ("\t\n\x0b\x0c\r7", 10, 7, 6, 7, 6),
-            (
-                "0xffffffffffffffff",
-                0,
-                9223372036854775807,
-                18,
-                18446744073709551615,
-                18,
-            ),
-            (
-                "0x10000000000000000",
-                16,
-                9223372036854775807,
-                19,
-                18446744073709551615,
-                19,
-            ),
-            ("Zz", 36, 1295, 2, 1295, 2),
-        ];
-        const ATOI: &[(&str, i32)] = &[
-            ("  -17x", -17),
-            ("99999999999999999999999999999999999999999", -1),
-            ("2147483647", 2147483647),
-            ("2147483648", -2147483648),
-            ("-2147483649", 2147483647),
-            ("4294967297", 1),
-            ("", 0),
-        ];
-        for &(s, base, l, l_end, u, u_end) in STRTO {
-            assert_eq!(strtol(s, base), (l, l_end), "strtol({s:?}, {base})");
-            assert_eq!(strtoul(s, base), (u, u_end), "strtoul({s:?}, {base})");
-        }
-        for &(s, v) in ATOI {
-            assert_eq!(atoi(s), v, "atoi({s:?})");
-        }
     }
 }

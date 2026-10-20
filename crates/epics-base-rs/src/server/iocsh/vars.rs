@@ -278,31 +278,6 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_var());
 }
 
-/// C `strtol(s, &endp, 0)` with the `*endp == '\0'` whole-string check
-/// `varHandler` applies: leading whitespace is skipped, then an optional
-/// sign, then `0x` hex, a leading `0` octal, or decimal. Anything left
-/// over rejects the value.
-fn strtol_base0(s: &str) -> Option<i64> {
-    // C's `strtol` skips leading whitespace before it converts anything,
-    // so `var X " 1"` sets X to 1 there and must here.
-    let s = s.trim_start();
-    let (neg, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let magnitude = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse::<i64>().ok()?
-    };
-    Some(if neg { -magnitude } else { magnitude })
-}
-
 /// C `varHandler(v, NULL)` — `int %s = %d` / `double %s = %g` on stdout
 /// (`iocsh.cpp:1400-1408`). The `%g` is a bare one, so six significant
 /// digits.
@@ -392,14 +367,16 @@ fn cmd_var() -> CommandDef {
                 return Ok(CommandOutcome::Failed);
             };
             match &def.access {
-                VarAccess::Int { set, .. } => match strtol_base0(&value) {
-                    Some(parsed) => set(parsed),
+                // `strtol(setString, &endp, 0)` taken whole and non-empty,
+                // its `long` stored through an `int *` (iocsh.cpp:1420-1428).
+                VarAccess::Int { set, .. } => match crate::types::c_parse::strtol(&*value, 0) {
+                    (parsed, end) if !value.is_empty() && end == value.len() => {
+                        set(i64::from(parsed as i32))
+                    }
                     // C leaves the variable alone and prints, but does
                     // not fail the command (`varHandler` never calls
                     // `iocshSetError`).
-                    None => {
-                        ctx.eprintln(&format!("Invalid integer, var '{}' not changed.", def.name))
-                    }
+                    _ => ctx.eprintln(&format!("Invalid integer, var '{}' not changed.", def.name)),
                 },
                 // C reaches `epicsStrtod` from here and from `cvtArg`
                 // alike, so both go through the one port of it.
@@ -805,14 +782,35 @@ mod tests {
         crate::server::records::seq::set_seq_dly_limit(100000.0);
     }
 
+    /// C `strtol(setString, &endp, 0)` then the `int` store (`iocsh.cpp:
+    /// 1422-1424`): glibc's base-0 prefixes, `ERANGE` saturation truncated to
+    /// `int`, and only an `endp` at the end accepted.
     #[test]
-    fn strtol_base0_takes_hex_octal_and_sign() {
-        assert_eq!(strtol_base0("0x10"), Some(16));
-        assert_eq!(strtol_base0("010"), Some(8));
-        assert_eq!(strtol_base0("-3"), Some(-3));
-        assert_eq!(strtol_base0("12"), Some(12));
-        assert_eq!(strtol_base0(""), None);
-        assert_eq!(strtol_base0("1 "), None);
-        assert_eq!(strtol_base0("nope"), None);
+    fn an_int_var_takes_c_strtol_into_an_int() {
+        use crate::server::db_loader::{db_template_max_vars, set_db_template_max_vars};
+        use crate::types::c_parse::long_to_int;
+
+        let ctx = make_ctx();
+        let restore = db_template_max_vars();
+        let long64 = std::ffi::c_long::BITS == 64;
+        for (token, want) in [
+            ("0x10", 16),
+            ("010", 8),
+            ("0b101", 5),
+            ("-3", -3),
+            (" 12", 12),
+            ("4294967297", if long64 { 1 } else { i32::MAX }),
+            ("99999999999999999999", long_to_int(std::ffi::c_long::MAX)),
+            ("-99999999999999999999", long_to_int(std::ffi::c_long::MIN)),
+            ("", -1),
+            ("1 ", -1),
+            ("nope", -1),
+            ("+-1", -1),
+        ] {
+            set_db_template_max_vars(-1);
+            assert_eq!(run_var(&ctx, &["dbTemplateMaxVars", token]).unwrap(), "");
+            assert_eq!(db_template_max_vars(), want, "{token:?}");
+        }
+        set_db_template_max_vars(restore);
     }
 }

@@ -28,7 +28,7 @@ use super::registry::*;
 use crate::server::record::{
     Asl, FieldDeclaration, FieldDesc, HwLink, HwLinkKind, ParsedLink, Special,
 };
-use crate::types::DbfCode;
+use crate::types::{DbfCode, c_parse};
 
 /// Register the `dbStaticIocRegister.c` command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
@@ -1543,78 +1543,33 @@ fn is_default_value(
             // (`dbStaticRun.c:330-344`).
             match desc.menu.and_then(|m| m.iter().position(|c| *c == init)) {
                 Some(index) => u64::from(*v) == index as u64,
-                None => init.parse::<u16>().map(|def| *v == def).unwrap_or(false),
+                None => c_parse::epics_parse_uint16(init) == Some(*v),
             }
         }
-        V::Char(v) => int_is_default(u64::from(*v), initial),
-        V::UChar(v) => int_is_default(u64::from(*v), initial),
-        V::UShort(v) => int_is_default(u64::from(*v), initial),
-        V::ULong(v) => int_is_default(u64::from(*v), initial),
-        V::UInt64(v) => int_is_default(*v, initial),
-        V::Short(v) => signed_is_default(i64::from(*v), initial),
-        V::Long(v) => signed_is_default(i64::from(*v), initial),
-        V::Int64(v) => signed_is_default(*v, initial),
-        V::Float(v) => float_is_default(f64::from(*v), initial),
-        V::Double(v) => float_is_default(*v, initial),
+        V::Char(_)
+        | V::UChar(_)
+        | V::Short(_)
+        | V::UShort(_)
+        | V::Long(_)
+        | V::ULong(_)
+        | V::Int64(_)
+        | V::UInt64(_)
+        | V::Float(_)
+        | V::Double(_) => {
+            let Some(init) = initial else {
+                return value.to_f64() == Some(0.0);
+            };
+            // `epicsParse*(initial, &def, 0, NULL)` at the field's width
+            // (`dbStaticRun.c:245-327`).
+            c_parse::NumericField::of(value.db_field_type())
+                .and_then(|target| c_parse::parse_auto_base_units_null(target, init))
+                .is_some_and(|def| def == *value)
+        }
         // C's `default:` arm answers TRUE — an array or any type it has no
         // comparison for is treated as still holding its default
         // (`dbStaticRun.c:365-366`).
         _ => true,
     }
-}
-
-fn int_is_default(value: u64, initial: Option<&str>) -> bool {
-    match initial {
-        // C parses with base 0, so `0x10` and `020` are accepted
-        // (`epicsParseUInt32(pflddes->initial, &def, 0, NULL)`).
-        Some(init) => parse_c_unsigned(init)
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0,
-    }
-}
-
-fn signed_is_default(value: i64, initial: Option<&str>) -> bool {
-    match initial {
-        Some(init) => parse_c_signed(init)
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0,
-    }
-}
-
-fn float_is_default(value: f64, initial: Option<&str>) -> bool {
-    match initial {
-        Some(init) => init
-            .trim()
-            .parse::<f64>()
-            .map(|def| value == def)
-            .unwrap_or(false),
-        None => value == 0.0,
-    }
-}
-
-/// C's `epicsParseUInt*(s, &v, 0, NULL)` — base 0, so a `0x`/`0X` prefix is
-/// hex, a leading `0` is octal, anything else decimal.
-fn parse_c_unsigned(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if s.len() > 1 && s.starts_with('0') {
-        return u64::from_str_radix(&s[1..], 8).ok();
-    }
-    s.parse::<u64>().ok()
-}
-
-fn parse_c_signed(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix('-') {
-        return parse_c_unsigned(rest)
-            .and_then(|v| i64::try_from(v).ok())
-            .map(|v| -v);
-    }
-    parse_c_unsigned(s.strip_prefix('+').unwrap_or(s)).and_then(|v| i64::try_from(v).ok())
 }
 
 #[cfg(test)]
@@ -2966,6 +2921,30 @@ variable(seqDLYprecision,int)
         assert!(is_default_value(
             &desc(Some("020"), None),
             &EpicsValue::Long(16)
+        ));
+
+        // `epicsParse*` is libcom's at the field's width: a negative into
+        // an unsigned field wraps, a FLOAT `initial` narrows to float, and
+        // the glibc `0b` prefix counts.
+        assert!(is_default_value(
+            &desc(Some("-1"), None),
+            &EpicsValue::UChar(255)
+        ));
+        assert!(is_default_value(
+            &desc(Some("-1"), None),
+            &EpicsValue::Char(0xff)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0.1"), None),
+            &EpicsValue::Float(0.1)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0b11"), None),
+            &EpicsValue::Long(3)
+        ));
+        assert!(is_default_value(
+            &desc(Some("0x1"), Some(&["NO", "YES"])),
+            &EpicsValue::Enum(1)
         ));
 
         // A menu `initial` resolves against the choice list first

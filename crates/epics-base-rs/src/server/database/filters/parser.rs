@@ -793,31 +793,6 @@ impl Opts {
     }
 }
 
-/// C `epicsParseInt32(val, ival, 0, &end)` as `store_string_value` calls
-/// it (`chfPlugin.c:253`): leading whitespace skipped, `strtol` with base
-/// 0 so `0x`/`0` prefixes are honoured, at least one digit required, and
-/// trailing text ALLOWED because the `units` out-parameter is non-NULL
-/// and then ignored (`epicsStdlib.c:33-53`).
-fn epics_parse_int32(s: &str) -> Option<i32> {
-    let s = s.trim_start();
-    let (neg, s) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(rest) => (16, rest),
-        None if s.starts_with('0') => (8, s),
-        None => (10, s),
-    };
-    let len = digits.chars().take_while(|c| c.is_digit(radix)).count();
-    if len == 0 {
-        // `strtol` consumed the leading `0` of a bare `0x` and stopped.
-        return (radix == 16).then_some(0);
-    }
-    let mag = i64::from_str_radix(&digits[..len], radix).ok()?;
-    i32::try_from(if neg { -mag } else { mag }).ok()
-}
-
 /// C `epicsParseDouble(val, dval, &end)` (`chfPlugin.c:273`): the numeric
 /// prefix wins and the remainder lands in the ignored `units` pointer, so
 /// `"0.5 V"` stores 0.5 exactly as `"0.5"` does, while an `ERANGE` result
@@ -881,7 +856,8 @@ fn store_string(def: &ArgDef, val: &str) -> Option<ArgValue> {
         return None;
     }
     Some(match def.ty {
-        ArgType::Int32 => ArgValue::Int(epics_parse_int32(val)?),
+        // C `epicsParseInt32(val, ival, 0, &end)` (`chfPlugin.c:253`).
+        ArgType::Int32 => ArgValue::Int(crate::types::c_parse::epics_parse_int32_units(val)?),
         ArgType::Double => ArgValue::Double(epics_parse_double(val)?),
         ArgType::Str => ArgValue::Str(val.to_string()),
         ArgType::Enum(map) => {
@@ -1973,6 +1949,18 @@ mod tests {
             conv_doubles(r#"{"arr":{"s":"0x2","e":" 5 elements"}}"#, all),
             vec![2.0, 3.0, 4.0, 5.0]
         );
+    }
+
+    /// `epicsParseInt32` is libcom's `strtol` (`epicsStdlib.c:26-53`): the
+    /// glibc `0b` prefix counts, and only C `isspace` is skipped.
+    #[test]
+    fn arr_string_bounds_are_libcom_strtol() {
+        let all: Vec<f64> = (0..10).map(f64::from).collect();
+        assert_eq!(
+            conv_doubles(r#"{"arr":{"s":"0b10","e":"0b101"}}"#, all),
+            vec![2.0, 3.0, 4.0, 5.0]
+        );
+        assert!(try_parse_filter_chain(r#"{"arr":{"e":"\u00a05"}}"#).is_err());
     }
 
     /// The same `Conv = 1` reached from the other side:

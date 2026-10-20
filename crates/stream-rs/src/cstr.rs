@@ -136,16 +136,17 @@ fn rest<'a>(s: &CPtr<'a>) -> &'a [u8] {
     s.base().get(s.offset()..).unwrap_or(&[])
 }
 
-/// `strtoul(s, &end, base)` with a 64-bit `unsigned long`: the value and the
-/// end offset, which stays at `s` when nothing converted.
+/// `strtoul(s, &end, base)` with a 64-bit `unsigned long` whatever the target's
+/// is, i.e. `strtoull`: the value and the end offset, which stays at `s` when
+/// nothing converted.
 pub fn c_strtoul(s: CPtr<'_>, base: u32) -> (u64, usize) {
-    let (v, end) = epics_base_rs::types::c_parse::strtoul(rest(&s), base);
+    let (v, end) = epics_base_rs::types::c_parse::strtoull(rest(&s), base);
     (v, s.offset() + end)
 }
 
-/// `strtol(s, &end, base)` with a 64-bit `long`.
+/// `strtol(s, &end, base)` with a 64-bit `long`, i.e. `strtoll`.
 pub fn c_strtol(s: CPtr<'_>, base: u32) -> (i64, usize) {
-    let (v, end) = epics_base_rs::types::c_parse::strtol(rest(&s), base);
+    let (v, end) = epics_base_rs::types::c_parse::strtoll(rest(&s), base);
     (v, s.offset() + end)
 }
 

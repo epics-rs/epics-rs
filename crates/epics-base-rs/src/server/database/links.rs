@@ -884,10 +884,9 @@ pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
 
 /// Does a record of this type read `SELL` into `SELN` at any phase?
 ///
-/// The outer gate of [`PvDatabase::read_sell_into_seln`], whose own match
-/// then picks the phase. Named here so a process cycle can skip the call —
-/// and the record lock it takes — without spelling the type list a second
-/// time.
+/// The process plan's gate for [`PvDatabase::read_sell_into_seln`], so a
+/// cycle can skip the call and the record lock it takes; the function's own
+/// match picks the phase.
 pub(crate) fn reads_sell(record_type: &str) -> bool {
     matches!(record_type, "dfanout" | "fanout" | "seq")
 }
@@ -4525,9 +4524,6 @@ impl PvDatabase {
         let parsed = {
             let instance = rec.read();
             let record_type = instance.record.record_type();
-            if !reads_sell(record_type) {
-                return;
-            }
             let reads = match (record_type, phase) {
                 ("dfanout", SellPhase::BeforeAlarms) | ("fanout", SellPhase::OutputDispatch) => {
                     true

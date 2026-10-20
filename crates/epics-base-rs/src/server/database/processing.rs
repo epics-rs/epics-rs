@@ -2654,6 +2654,23 @@ struct CycleCtx<'c, 'a> {
     input_link_texts: &'c InputLinkTexts,
 }
 
+/// What a cycle that reached C's `recGblFwdLink` leaves for
+/// [`PvDatabase::run_cycle_tail`].
+enum CycleTail<'c> {
+    /// A simulation exit: the FLNK as the record holds it, then the cycle end.
+    Sim(CycleStatus),
+    /// The complete pass: the FLNK resolved under the monitor segment's
+    /// guard, the late restamp, the deferred actions, then the cycle end.
+    Full {
+        flnk: crate::server::record::record_instance::ForwardTarget,
+        plan: &'c crate::server::record::record_instance::ProcessPlan,
+        defers_output: bool,
+        restamps: bool,
+        actions: crate::server::record::ProcessActions,
+        status: CycleStatus,
+    },
+}
+
 struct DataGuard<'a> {
     /// The frame's record, reached through the set the frame took at its
     /// entry. A `DataGuard` exists only inside a frame that holds it, so a
@@ -2699,6 +2716,7 @@ impl<'a> DataGuard<'a> {
 /// cycle, so what an early or failed exit left marked posts in this cycle; the
 /// complete path drained its own ahead of `monitor()`.
 impl Drop for DataGuard<'_> {
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn drop(&mut self) {
         if self.rec.process_plan().hooks.has(CycleHooks::HAND_POSTED) {
             post_hand_marks(self);
@@ -3221,6 +3239,43 @@ impl PvDatabase {
         is_continuation: bool,
         device_callback: bool,
     ) -> CaResult<()> {
+        self.process_frame::<false>(
+            target,
+            visited,
+            acquire_gate,
+            is_continuation,
+            device_callback,
+        )
+    }
+
+    /// [`Self::run_process_frame`] for a FLNK/OUT/CP target, with the cycle
+    /// in a frame of its own so a hop holds only this one. The name must end
+    /// in `run_process_frame`: the PT rigs count cycles by its entries.
+    #[inline(never)]
+    fn recursive_run_process_frame(
+        &self,
+        name: &[u8],
+        rec: &Arc<RecordCell>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        self.process_frame::<true>(
+            ProcessTarget::Resolved(name, rec),
+            visited,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[inline(always)]
+    fn process_frame<const HOP: bool>(
+        &self,
+        target: ProcessTarget<'_>,
+        visited: &mut ProcStack,
+        acquire_gate: bool,
+        is_continuation: bool,
+        device_callback: bool,
+    ) -> CaResult<()> {
         // A `None` here found the name already present, so the marker is the
         // outer frame's and there is nothing to unwind.
         // Holds the registry's share of the name when the frame looked the
@@ -3311,7 +3366,7 @@ impl PvDatabase {
 
         // NO `.await` may appear below this line while `_record_gate` is
         // live — see the module note on `process_record_with_links_body`.
-        let result = self.process_record_with_links_body(
+        let result = self.process_record_with_links_body::<HOP>(
             name,
             record_gate.frame(rec),
             visited,
@@ -3383,13 +3438,7 @@ impl PvDatabase {
             0,
             "a frame dispatched a FLNK/OUT/CP target with a record borrow live"
         );
-        self.run_process_frame(
-            ProcessTarget::Resolved(name, rec),
-            visited,
-            false,
-            false,
-            false,
-        )
+        self.recursive_run_process_frame(name, rec, visited)
     }
 
     /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
@@ -4326,6 +4375,7 @@ impl PvDatabase {
     /// A `Name` entry's lookup lands in the caller's `looked_up`, so both arms
     /// hand the frame a plain borrow: a resolved sweep entry pays no refcount
     /// and no per-use arm test.
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn process_entry_prelude<'a>(
         &self,
         target: ProcessTarget<'a>,
@@ -5668,7 +5718,7 @@ impl PvDatabase {
     #[cold]
     #[inline(never)]
     fn run_reentered_pass(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
-        let _ = self.process_record_with_links_body(name, rec, visited, true, false, false);
+        let _ = self.process_record_with_links_body::<true>(name, rec, visited, true, false, false);
     }
 
     /// The record process cycle itself — C `dbProcess`'s body
@@ -5687,7 +5737,7 @@ impl PvDatabase {
     /// does the same — it stages work on a queue or spawns a task and returns.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn process_record_with_links_body(
+    fn process_record_with_links_body<const HOP: bool>(
         &self,
         name: &[u8],
         rec: InFrame<'_>,
@@ -5768,17 +5818,80 @@ impl PvDatabase {
             facts,
             input_link_texts,
         };
-        match cycle_plan {
-            crate::server::record::record_instance::CyclePlan::General => {
-                self.process_cycle::<false, false>(ctx, &mut cycle_end, &mut guard, visited)
-            }
-            crate::server::record::record_instance::CyclePlan::ConstSoftIn => {
-                self.process_cycle::<true, false>(ctx, &mut cycle_end, &mut guard, visited)
-            }
-            crate::server::record::record_instance::CyclePlan::DbSoftIn => {
-                self.process_cycle::<true, true>(ctx, &mut cycle_end, &mut guard, visited)
-            }
+        use crate::server::record::record_instance::CyclePlan;
+        if !HOP {
+            // Never written: a foreign entry runs its tail in place.
+            let unused = &mut None;
+            return match cycle_plan {
+                CyclePlan::General => self.process_cycle::<false, false, false>(
+                    ctx,
+                    &mut cycle_end,
+                    &mut guard,
+                    visited,
+                    unused,
+                ),
+                CyclePlan::ConstSoftIn => self.process_cycle::<true, false, false>(
+                    ctx,
+                    &mut cycle_end,
+                    &mut guard,
+                    visited,
+                    unused,
+                ),
+                CyclePlan::DbSoftIn => self.process_cycle::<true, true, false>(
+                    ctx,
+                    &mut cycle_end,
+                    &mut guard,
+                    visited,
+                    unused,
+                ),
+            };
         }
+        let mut tail = None;
+        match cycle_plan {
+            CyclePlan::General => self.process_cycle_outlined::<false, false>(
+                ctx,
+                &mut cycle_end,
+                &mut guard,
+                visited,
+                &mut tail,
+            ),
+            CyclePlan::ConstSoftIn => self.process_cycle_outlined::<true, false>(
+                ctx,
+                &mut cycle_end,
+                &mut guard,
+                visited,
+                &mut tail,
+            ),
+            CyclePlan::DbSoftIn => self.process_cycle_outlined::<true, true>(
+                ctx,
+                &mut cycle_end,
+                &mut guard,
+                visited,
+                &mut tail,
+            ),
+        }?;
+        match tail {
+            None => Ok(()),
+            Some(tail) => self.run_cycle_tail(name, tail, &mut cycle_end, &mut guard, visited),
+        }
+    }
+
+    /// [`Self::process_cycle`] in a frame of its own, for a hop: the outlined
+    /// call and the handed-out tail cost a hop ~75 instructions, so a foreign
+    /// entry keeps it inlined.
+    #[inline(never)]
+    fn process_cycle_outlined<'c, const PLAIN: bool, const DB_INP: bool>(
+        &self,
+        ctx: CycleCtx<'c, '_>,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+        tail_out: &mut Option<CycleTail<'c>>,
+    ) -> CaResult<()>
+    where
+        Arm<DB_INP>: ArmInp,
+    {
+        self.process_cycle::<PLAIN, DB_INP, true>(ctx, cycle_end, guard, visited, tail_out)
     }
 
     /// The cycle past the prologue, once per [`CyclePlan`](crate::server::record::record_instance::CyclePlan) arm. `PLAIN` is a
@@ -5789,13 +5902,18 @@ impl PvDatabase {
     /// unoptimized build shares no stack slot between inlined callees, so the
     /// recursive FLNK frame carried all three arms and their fetches (~120 KB
     /// a hop) and a C-sized chain overflowed a 2 MiB callback stack.
+    ///
+    /// `HOP`: entered through [`Self::process_cycle_outlined`], so a cycle
+    /// that reaches `recGblFwdLink` hands its [`CycleTail`] out through
+    /// `tail_out` and the FLNK it takes no longer holds this frame.
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn process_cycle<const PLAIN: bool, const DB_INP: bool>(
+    fn process_cycle<'c, const PLAIN: bool, const DB_INP: bool, const HOP: bool>(
         &self,
-        ctx: CycleCtx<'_, '_>,
+        ctx: CycleCtx<'c, '_>,
         cycle_end: &mut CycleEndGuard<'_>,
         guard: &mut DataGuard<'_>,
         visited: &mut ProcStack,
+        tail_out: &mut Option<CycleTail<'c>>,
     ) -> CaResult<()>
     where
         Arm<DB_INP>: ArmInp,
@@ -6071,10 +6189,12 @@ impl PvDatabase {
         let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated(read) => {
-                self.run_forward_link_tail(name, rec, visited);
-                self.end_process_cycle(name, rec, cycle_end.take());
                 cycle_status.io(read);
-                return cycle_status.frame_result(guard);
+                if HOP {
+                    *tail_out = Some(CycleTail::Sim(cycle_status));
+                    return Ok(());
+                }
+                return self.run_sim_tail(name, cycle_status, cycle_end, guard, visited);
             }
             SimOutcome::AbortedBeforeWrite => {
                 // C busy `writeValue`: `status = dbGetLink(&prec->siml, ...);
@@ -6112,9 +6232,11 @@ impl PvDatabase {
                             rec.process_plan(),
                         );
                     }
-                    self.run_forward_link_tail(name, rec, visited);
-                    self.end_process_cycle(name, rec, cycle_end.take());
-                    return cycle_status.frame_result(guard);
+                    if HOP {
+                        *tail_out = Some(CycleTail::Sim(cycle_status));
+                        return Ok(());
+                    }
+                    return self.run_sim_tail(name, cycle_status, cycle_end, guard, visited);
                 }
             }
             SimOutcome::SimulatedInputStage => {
@@ -6184,7 +6306,7 @@ impl PvDatabase {
         // The epilogue's results, each stored once by the arm that ends it
         // rather than gathered into a tuple and moved out of the block.
         let tail_flnk;
-        let tail_actions;
+        let mut tail_actions;
         let tail_defers_output;
         let tail_restamps;
         'epilogue: {
@@ -7906,6 +8028,105 @@ impl PvDatabase {
             }
         }
 
+        if HOP {
+            *tail_out = Some(CycleTail::Full {
+                flnk: tail_flnk,
+                plan,
+                defers_output: tail_defers_output,
+                restamps: tail_restamps,
+                actions: tail_actions,
+                status: cycle_status,
+            });
+            return Ok(());
+        }
+        self.run_full_tail(
+            name,
+            &tail_flnk,
+            plan,
+            tail_defers_output,
+            tail_restamps,
+            &mut tail_actions,
+            &cycle_status,
+            cycle_end,
+            guard,
+            visited,
+        )
+    }
+
+    /// C `recGblFwdLink` and what `process()` runs after it, for the cycle a
+    /// hop's [`Self::process_cycle`] handed out as a [`CycleTail`]. Run by the
+    /// caller, so a FLNK target is processed after the cycle's frame is gone:
+    /// that frame is kilobytes, where C's `dbProcess` hop is about 100 bytes,
+    /// and holding it across the hop overflowed `cbLow` 500 records into a
+    /// chain C runs 12000 deep.
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn run_cycle_tail(
+        &self,
+        name: &[u8],
+        tail: CycleTail<'_>,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        match tail {
+            CycleTail::Sim(status) => self.run_sim_tail(name, status, cycle_end, guard, visited),
+            CycleTail::Full {
+                flnk,
+                plan,
+                defers_output,
+                restamps,
+                mut actions,
+                status,
+            } => self.run_full_tail(
+                name,
+                &flnk,
+                plan,
+                defers_output,
+                restamps,
+                &mut actions,
+                &status,
+                cycle_end,
+                guard,
+                visited,
+            ),
+        }
+    }
+
+    /// [`CycleTail::Sim`]'s tail, taken in place by a foreign entry.
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn run_sim_tail(
+        &self,
+        name: &[u8],
+        status: CycleStatus,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        let rec = guard.rec;
+        self.run_forward_link_tail(name, rec, visited);
+        self.end_process_cycle(name, rec, cycle_end.take());
+        status.frame_result(guard)
+    }
+
+    /// [`CycleTail::Full`]'s tail, taken in place by a foreign entry: passed
+    /// as borrowed parts, since moving them costs that path ~20 instructions a
+    /// cycle.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn run_full_tail(
+        &self,
+        name: &[u8],
+        flnk: &crate::server::record::record_instance::ForwardTarget,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        defers_output: bool,
+        restamps: bool,
+        actions: &mut crate::server::record::ProcessActions,
+        status: &CycleStatus,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        let rec = guard.rec;
         // 4.5 - 7. Multi-output / event / generic-multi-out / FLNK /
         // CP / RPRO tail. Shared with the simulation-mode path so a
         // simulated record runs the exact same `recGblFwdLink`
@@ -7916,14 +8137,8 @@ impl PvDatabase {
         // and `recGblFwdLink` runs only at delay-END (C `execOutput`) — the
         // continuation drives the whole tail. The deferred-actions site below
         // still runs (it dispatches this cycle's `ReprocessAfter`).
-        if !tail_defers_output {
-            self.run_forward_link_tail_with_putf(
-                name,
-                guard,
-                &tail_flnk,
-                TailCtx { plan },
-                visited,
-            );
+        if !defers_output {
+            self.run_forward_link_tail_with_putf(name, guard, flnk, TailCtx { plan }, visited);
         }
 
         // Deferred restamp for a `restamps_time_after_completion` record (sseq):
@@ -7934,7 +8149,7 @@ impl PvDatabase {
         // BUSY post (sseq's out-of-band `post_fields`) and the next cycle. Soft
         // record (no device support), so `apply_timestamp` resolves TSE→TIME
         // the same as the pre-output site it replaces.
-        if tail_restamps {
+        if restamps {
             // A whole `recGblGetTimeStamp` AFTER `recGblFwdLink`, so a `.TIME`
             // TSEL adopts whatever the forward-link chain just did to its
             // source.
@@ -7950,9 +8165,9 @@ impl PvDatabase {
         // output (C `transformRecord.c:605-621` / `scalerRecord.c:457-480`
         // put before `monitor()` + `recGblFwdLink()`), so a downstream FLNK
         // target still reads the freshly written value.
-        if !tail_actions.is_empty() {
+        if !actions.is_empty() {
             guard.release();
-            self.execute_process_actions_in(name, rec, tail_actions, visited);
+            self.execute_process_actions_in(name, rec, std::mem::take(actions), visited);
         }
 
         // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
@@ -7980,7 +8195,7 @@ impl PvDatabase {
         guard.release();
         self.apply_pact_exit(name, cycle_end.take());
 
-        cycle_status.frame_result(guard)
+        status.frame_result(guard)
     }
 
     /// The end of a synchronous process cycle — C `recGblFwdLink`'s tail

@@ -1588,21 +1588,161 @@ impl From<StackSizeClass> for StackSpec {
 /// `None` where glibc's call is unavailable.
 pub fn current_thread_stack_bytes() -> Option<usize> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `attr` is initialised by `pthread_getattr_np` before it is read
-    // and destroyed once; both out-pointers are valid locals.
+    {
+        pthread_stack().map(|(_, size)| size)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    None
+}
+
+/// The lowest address of the calling thread's stack, which a frame below it
+/// overflows. `None` on a target this reads no call on, none of which this
+/// workspace builds for: illumos, Haiku, Hurd, Fuchsia, AIX, QNX and the
+/// rest.
+pub fn current_thread_stack_low() -> Option<usize> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "rtems"
+    ))]
+    {
+        pthread_stack().map(|(low, _)| low)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: both read the calling thread's own record.
+        let (top, size) = unsafe {
+            let me = libc::pthread_self();
+            (
+                libc::pthread_get_stackaddr_np(me).addr(),
+                libc::pthread_get_stacksize_np(me),
+            )
+        };
+        // Apple reports the stack's top, the address it grows down from.
+        top.checked_sub(size)
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        // SAFETY: `seg` is a valid local the call fills for this thread.
+        let (rc, seg) = unsafe {
+            let mut seg: libc::stack_t = std::mem::zeroed();
+            (
+                libc::pthread_stackseg_np(libc::pthread_self(), &mut seg),
+                seg,
+            )
+        };
+        // `ss_sp` is the stack's top.
+        if rc == 0 {
+            seg.ss_sp.addr().checked_sub(seg.ss_size)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "vxworks")]
+    {
+        epics_rtems_boot::current_task_stack_low()
+    }
+    #[cfg(windows)]
+    {
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: both out-pointers are valid locals.
+        unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high)
+        };
+        Some(low)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "rtems",
+        target_vendor = "apple",
+        target_os = "openbsd",
+        target_os = "vxworks",
+        windows
+    )))]
+    None
+}
+
+/// The calling thread's stack as its pthread attributes report it: its lowest
+/// address and its size.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "rtems"
+))]
+fn pthread_stack() -> Option<(usize, usize)> {
+    use pthread_attr::{Attr, destroy, get, getstack, init};
+    // SAFETY: `attr` is initialised before `get` fills it and destroyed once;
+    // the out-pointers are valid locals.
     unsafe {
-        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+        let mut attr: Attr = std::mem::zeroed();
+        if init(&mut attr) != 0 {
             return None;
         }
         let mut addr: *mut libc::c_void = std::ptr::null_mut();
         let mut size: libc::size_t = 0;
-        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
-        libc::pthread_attr_destroy(&mut attr);
-        (rc == 0).then_some(size)
+        let rc = match get(libc::pthread_self(), &mut attr) {
+            0 => getstack(&attr, &mut addr, &mut size),
+            refused => refused,
+        };
+        destroy(&mut attr);
+        (rc == 0).then_some((addr.addr(), size))
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    None
+}
+
+/// The calls [`pthread_stack`] makes. FreeBSD's `pthread_attr_get_np` fills
+/// an initialised set, which is why every platform initialises first.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "rtems"
+))]
+mod pthread_attr {
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    pub(super) use libc::pthread_attr_get_np as get;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "netbsd"))]
+    pub(super) use libc::pthread_getattr_np as get;
+    #[cfg(not(target_os = "rtems"))]
+    pub(super) use libc::{
+        pthread_attr_destroy as destroy, pthread_attr_getstack as getstack,
+        pthread_attr_init as init, pthread_attr_t as Attr,
+    };
+
+    /// RTEMS's `pthread_attr_t`: 96 bytes aligned to 8, as `arm-rtems6-gcc`
+    /// and `arm-rtems7-gcc` measure it against `<pthread.h>`. `libc`'s is
+    /// byte-aligned and it declares neither `pthread_getattr_np` nor
+    /// `pthread_attr_getstack` for the target; both are in `librtemscpu.a`.
+    #[cfg(target_os = "rtems")]
+    #[repr(C, align(8))]
+    pub(super) struct Attr([u8; 96]);
+
+    #[cfg(target_os = "rtems")]
+    unsafe extern "C" {
+        #[link_name = "pthread_attr_init"]
+        pub(super) fn init(attr: *mut Attr) -> libc::c_int;
+        #[link_name = "pthread_getattr_np"]
+        pub(super) fn get(thread: libc::pthread_t, attr: *mut Attr) -> libc::c_int;
+        #[link_name = "pthread_attr_getstack"]
+        pub(super) fn getstack(
+            attr: *const Attr,
+            addr: *mut *mut libc::c_void,
+            size: *mut libc::size_t,
+        ) -> libc::c_int;
+        #[link_name = "pthread_attr_destroy"]
+        pub(super) fn destroy(attr: *mut Attr) -> libc::c_int;
+    }
 }
 
 /// Outcome of a best-effort OS-scheduler priority change.
@@ -4966,6 +5106,25 @@ mod tests {
                 "{class:?}: asked for {asked} bytes, thread reports {got}"
             );
         }
+    }
+
+    /// A frame on a thread lies above the low end its stack reports, and
+    /// within the stack the thread asked for.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_frame_lies_within_its_threads_stack() {
+        let asked = StackSizeClass::Big.bytes();
+        std::thread::Builder::new()
+            .stack_size(asked)
+            .spawn(move || {
+                let here = 0u8;
+                let at = std::ptr::addr_of!(here).addr();
+                let low = current_thread_stack_low().unwrap();
+                assert!(low < at && at - low < asked, "low {low:#x}, frame {at:#x}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// The distinguishing half of the readback: a class below `std`'s default

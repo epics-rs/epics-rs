@@ -51,7 +51,7 @@ pub(crate) use links::{
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
     FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
-    ProcessCallback, TokenWatch,
+    ProcessCallback, TokenWatch, hop_floor,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
 #[cfg(feature = "test-hooks")]

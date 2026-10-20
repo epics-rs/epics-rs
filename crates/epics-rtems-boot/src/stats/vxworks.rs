@@ -295,6 +295,13 @@ fn name_of(d: &TaskDesc) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The lowest address of the calling task's stack: `td_pStackEnd`, "the
+/// actual end of the stack" on a stack that grows down.
+pub(crate) fn current_task_stack_low() -> Option<usize> {
+    // SAFETY: `taskIdSelf` takes nothing and reads no memory of ours.
+    task_info(unsafe { libc::taskIdSelf() }).map(|d| d.td_stack_end.addr())
+}
+
 /// One task's descriptor, or [`None`] if the id names no live task.
 fn task_info(id: TaskId) -> Option<TaskDesc> {
     // SAFETY: `taskInfoGet` writes only into the descriptor it is given, which
@@ -543,16 +550,19 @@ impl TaskRegistry {
 /// and the assertions are mandatory: an SDK whose layout drifts must stop the
 /// build.
 ///
-/// Only the five fields the census prints are named. The padding between them
-/// carries no meaning and is named for the field it precedes; the whole run
-/// 0..68 is padding because `td_id` and `td_rtpId` live there and neither is
-/// read — the registry already holds the id, and an RTP's tasks are all its
-/// own. Offsets measured with `wr-cc` against `taskLibCommon.h` (via
-/// `<taskLib.h>`), `x86_64-wrs-vxworks`, LP64; the SDK spells these fields
-/// `td_stackSize`, `td_stackCurrent`, `td_stackHigh`, `td_stackMargin`.
+/// Only the five fields the census prints are named, and the stack's end for
+/// [`current_task_stack_low`]. The padding between them carries no meaning
+/// and is named for the field it precedes; `td_id` and `td_rtpId` live in
+/// the first run and neither is read — the registry already holds the id,
+/// and an RTP's tasks are all its own. Offsets measured with `wr-cc` against
+/// `taskLibCommon.h` (via `<taskLib.h>`), `x86_64-wrs-vxworks`, LP64; the SDK
+/// spells these fields `td_pStackEnd`, `td_stackSize`, `td_stackCurrent`,
+/// `td_stackHigh`, `td_stackMargin`.
 #[repr(C)]
 struct TaskDesc {
-    _pad_priority: [u8; 68],
+    _pad_stack_end: [u8; 56],
+    td_stack_end: *mut libc::c_char,
+    _pad_priority: [u8; 4],
     td_priority: i32,
     _pad_stack: [u8; 8],
     td_stack_size: usize,
@@ -566,6 +576,7 @@ struct TaskDesc {
 const _VXWORKS_TASK_DESC_LAYOUT: () = {
     use core::mem::{offset_of, size_of};
     assert!(size_of::<TaskId>() == 4, "TASK_ID is int");
+    assert!(offset_of!(TaskDesc, td_stack_end) == 56);
     assert!(offset_of!(TaskDesc, td_priority) == 68);
     assert!(offset_of!(TaskDesc, td_stack_size) == 80);
     assert!(offset_of!(TaskDesc, td_stack_current) == 88);

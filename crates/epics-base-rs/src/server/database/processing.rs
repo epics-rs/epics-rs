@@ -22,6 +22,8 @@ pub struct ProcStack {
     head: Option<CellId>,
     /// Depth two and beyond.
     rest: Vec<CellId>,
+    /// The cycles of this chain parked at a hop.
+    conts: Conts,
 }
 
 /// A record cell's address, compared and never dereferenced. It stays unique
@@ -84,6 +86,25 @@ impl ProcStack {
     pub fn holds(&self, rec: &Arc<RecordCell>) -> bool {
         let id = CellId::of(rec);
         self.head == Some(id) || self.rest.contains(&id)
+    }
+
+    /// How many cycles of this chain are parked at a hop.
+    fn parked(&self) -> usize {
+        self.conts.0.len()
+    }
+
+    /// Park the cycle `cycle_end` ends at `hop`, owing `after` once the
+    /// target has returned ([`PvDatabase::drive_hops`]).
+    #[inline(always)]
+    fn park(&mut self, cycle_end: &mut CycleEndGuard<'_>, after: After, hop: Hop) {
+        self.conts.push(Cont {
+            rec: Arc::clone(cycle_end.rec.unframed()),
+            claimed: cycle_end.claimed,
+            pact_was: None,
+            exit: cycle_end.exit.take(),
+            after,
+            hop,
+        });
     }
 }
 
@@ -2756,8 +2777,8 @@ struct CycleCtx<'c, 'a> {
     input_link_texts: &'c InputLinkTexts,
 }
 
-/// What a cycle that reached C's `recGblFwdLink` leaves for
-/// [`PvDatabase::run_cycle_tail`].
+/// What a cycle that reached C's `recGblFwdLink`, or a hop cycle's OUT
+/// `processTarget`, leaves for [`PvDatabase::run_cycle_tail`].
 enum CycleTail<'c> {
     /// A simulation exit: the FLNK as the record holds it, then the cycle end.
     Sim(CycleStatus),
@@ -2771,6 +2792,310 @@ enum CycleTail<'c> {
         actions: crate::server::record::ProcessActions,
         status: CycleStatus,
     },
+}
+
+/// The output stage of a hop cycle past its OUT put, which
+/// [`PvDatabase::resume_out`] runs once the put's target has returned.
+struct OutRest {
+    stage: OutStage,
+    actions: crate::server::record::ProcessActions,
+    status: CycleStatus,
+    restamps: bool,
+    defers_output: bool,
+}
+
+/// What the dispatchers after a cycle's OUT put act on
+/// ([`PvDatabase::output_rest`]).
+struct OutStage {
+    reached_conditional_write: bool,
+    skip_out: bool,
+    putf: bool,
+    notify: Option<Arc<NotifyWaitSet>>,
+    sim_output: Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
+    link_writes: crate::server::record::ProcessActions,
+}
+
+/// The hop cycles parked on a chain, innermost last
+/// ([`PvDatabase::drive_hops`]): the frames a recursing chain held on the
+/// thread's stack. Their records stay claimed on the same [`ProcStack`]. The
+/// buffer is the thread's between chains, so a chain's first park does not
+/// allocate.
+#[derive(Default)]
+struct Conts(Vec<Cont>);
+
+thread_local! {
+    /// The [`Conts`] buffer no chain on this thread holds.
+    static CONT_BUFFER: std::cell::Cell<Vec<Cont>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Conts {
+    #[inline(always)]
+    fn push(&mut self, cont: Cont) {
+        if self.0.capacity() == 0 {
+            self.borrow_buffer();
+        }
+        self.0.push(cont);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn borrow_buffer(&mut self) {
+        self.0 = CONT_BUFFER
+            .try_with(std::cell::Cell::take)
+            .unwrap_or_default();
+    }
+
+    fn pop(&mut self) -> Cont {
+        self.0.pop().expect("a parked hop source")
+    }
+
+    fn top(&self) -> &Cont {
+        self.0.last().expect("a parked hop source")
+    }
+
+    fn top_mut(&mut self) -> &mut Cont {
+        self.0.last_mut().expect("a parked hop source")
+    }
+
+    /// The buffer back to the thread, which keeps the larger of two.
+    #[cold]
+    #[inline(never)]
+    fn return_buffer(&mut self) {
+        let mut buffer = std::mem::take(&mut self.0);
+        buffer.clear();
+        let _ = CONT_BUFFER.try_with(move |kept| {
+            let held = kept.take();
+            kept.set(if held.capacity() < buffer.capacity() {
+                buffer
+            } else {
+                held
+            });
+        });
+    }
+}
+
+impl Drop for Conts {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0.capacity() != 0 {
+            self.return_buffer();
+        }
+    }
+}
+
+impl std::fmt::Debug for Conts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Conts").field(&self.0.len()).finish()
+    }
+}
+
+/// A hop cycle parked at its DB FLNK or OUT target while the target runs from
+/// [`PvDatabase::drive_hops`]; [`PvDatabase::resume_cont`] runs the rest once
+/// the target has returned.
+///
+/// Its set stays held by the chain's entry, or by the frame that took it,
+/// which drives the chain itself; a gate held by the thread already is all
+/// the cycle had.
+struct Cont {
+    rec: Arc<RecordCell>,
+    /// A `dbProcess` frame's cycle, whose unwind the resume runs; a reentered
+    /// pass ([`PvDatabase::run_reentered_pass`]) has none.
+    claimed: bool,
+    /// The source PACT the target's `processTarget` holds, put back as the
+    /// cycle resumes.
+    pact_was: Option<bool>,
+    /// The cycle end's token ([`CycleEndGuard`]).
+    exit: Option<PactExit>,
+    after: After,
+    /// The target the cycle handed out, which [`PvDatabase::enter_hop`]
+    /// enters.
+    hop: Hop,
+}
+
+/// What a cycle owes after its hop's target: [`CycleTail`] past the FLNK,
+/// or past the OUT put.
+enum After {
+    Flnk(AfterFlnk),
+    Out(OutRest),
+}
+
+/// What a cycle owes after its FLNK target: [`CycleTail`] past the FLNK.
+enum AfterFlnk {
+    Sim(CycleStatus),
+    Full {
+        restamps: bool,
+        actions: crate::server::record::ProcessActions,
+        status: CycleStatus,
+    },
+}
+
+/// The `processTarget` a parked cycle hands out, with the source's PUTF and
+/// wait-set.
+struct Hop {
+    to: HopTo,
+    putf: bool,
+    notify: Option<Arc<NotifyWaitSet>>,
+}
+
+enum HopTo {
+    /// C `dbScanFwdLink`'s.
+    Flnk(super::RecordIdx),
+    /// `dbDbPutValue`'s, on the lent target of the cycle's OUT put.
+    Out(super::links::OutHop),
+}
+
+/// A [`HopTo`]'s target as its gate admitted it.
+enum HopTarget<'d> {
+    Db(&'d Arc<RecordCell>),
+    Lent(ManuallyDrop<Arc<RecordCell>>),
+}
+
+/// A target's status as [`PvDatabase::drive_hops`] carries it to the cycle
+/// that resumes on it: a word where a [`CaResult`] is twelve, an error being
+/// rare.
+type HopResult = Result<(), Box<CaError>>;
+
+/// The cycles a [`PvDatabase::drive_hops`] runs above `base`: a panic
+/// unwinding out of the driver abandons each as unwinding its frame would
+/// have ended it.
+struct HopChain<'a, 'v> {
+    db: &'a PvDatabase,
+    visited: &'v mut ProcStack,
+    base: usize,
+}
+
+impl Drop for HopChain<'_, '_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.visited.parked() > self.base {
+            self.abandon();
+        }
+    }
+}
+
+impl HopChain<'_, '_> {
+    #[cold]
+    #[inline(never)]
+    fn abandon(&mut self) {
+        while self.visited.parked() > self.base {
+            let cont = self.visited.conts.pop();
+            self.db.abandon_cont(cont);
+        }
+    }
+}
+
+/// The stack a thread keeps under the last target it recurses into: that
+/// cycle's own calls, the hop frame below it and the driver. Four times a
+/// debug build's need: 20000-deep FLNK and OUT PP chains on a `cbLow` stack
+/// ran with 64 KiB and overflowed with 32.
+const HOP_STACK_MARGIN: usize = 256 * 1024;
+
+/// [`HOP_FLOOR`] before the thread's first target has read its stack.
+const FLOOR_UNREAD: usize = usize::MAX;
+/// [`HOP_FLOOR`] where every target asks [`hop_floor`]: the thread has no
+/// stack bound to read, or a test rule.
+const FLOOR_ASK: usize = usize::MAX - 1;
+
+thread_local! {
+    /// The address a target must be entered above to recurse on this thread.
+    static HOP_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(FLOOR_UNREAD) };
+}
+
+/// Whether a target entered here recurses, its hops processed in its frame
+/// as C's `processTarget` does, or runs as a hop frame that parks at each:
+/// the thread has [`HOP_STACK_MARGIN`] left below this frame. The order is
+/// the same either way.
+#[inline(always)]
+fn hop_recurses() -> bool {
+    let here = 0u8;
+    let at = std::ptr::addr_of!(here).addr();
+    let floor = HOP_FLOOR.with(std::cell::Cell::get);
+    if at > floor {
+        return true;
+    }
+    floor >= FLOOR_ASK && hop_floor::ask(at, floor)
+}
+
+/// The hop rule's floor on the calling thread, which a test sets.
+#[doc(hidden)]
+pub mod hop_floor {
+    use super::{FLOOR_ASK, FLOOR_UNREAD, HOP_FLOOR, HOP_STACK_MARGIN};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    }
+
+    /// Where a target entered on this thread recurses.
+    pub enum Rule {
+        /// Above the low end of the thread's stack plus the margin.
+        Os,
+        /// Everywhere, each address a target is entered at logged
+        /// ([`take_log`]).
+        Log,
+        /// Above `floor`, an address on the thread's stack.
+        Floor(usize),
+        /// Nowhere: every target is a hop frame.
+        Park,
+    }
+
+    pub fn set(rule: Rule) {
+        let (floor, log) = match rule {
+            Rule::Os => (FLOOR_UNREAD, None),
+            Rule::Log => (FLOOR_ASK, Some(Vec::new())),
+            Rule::Floor(floor) => (floor.min(FLOOR_ASK - 1), None),
+            Rule::Park => (FLOOR_ASK, None),
+        };
+        HOP_FLOOR.with(|f| f.set(floor));
+        LOG.with(|l| *l.borrow_mut() = log);
+    }
+
+    /// The addresses [`Rule::Log`] logged, in entry order.
+    pub fn take_log() -> Vec<usize> {
+        LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// [`super::hop_recurses`] at a floor that is no address.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn ask(at: usize, floor: usize) -> bool {
+        if floor == FLOOR_UNREAD {
+            let floor = crate::runtime::task::current_thread_stack_low()
+                .and_then(|low| low.checked_add(HOP_STACK_MARGIN))
+                .map_or(FLOOR_ASK, |floor| floor.min(FLOOR_ASK - 1));
+            HOP_FLOOR.with(|f| f.set(floor));
+            return at > floor;
+        }
+        LOG.with(|l| l.borrow_mut().as_mut().map(|log| log.push(at)).is_some())
+    }
+}
+
+/// C `swaitRecord.c::process` (lines 425-481) on a deferring cycle:
+/// `schedOutput` armed the ODLY watchdog (`async=TRUE`), so `process` ran
+/// `monitor()` but skipped the `if(!async){recGblFwdLink; pact=FALSE;}`
+/// tail, and the deferred `execOutput` (the scheduled `ReprocessAfter`
+/// reprocess at delay-END) runs the OUT write, OEVT and FLNK. PACT is held
+/// across the wait so a foreign `dbProcess` bails at the entry guard (C
+/// keeps the record ACTIVE on the watchdog, swaitRecord.c:716), gated on
+/// the `ReprocessAfter` that releases it. The tail's deferred-actions site
+/// dispatches that `ReprocessAfter`; an `execute_process_actions_in` in the
+/// cycle would enlarge its recursive frame (one overflowed the stack in the
+/// deep-chain tests). The held PACT also makes the tail's putf-clear (gated
+/// on `!is_processing()`) a no-op, leaving putf for the continuation.
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn hold_deferred_pact(
+    guard: &mut DataGuard<'_>,
+    defers_output: bool,
+    actions: &crate::server::record::ProcessActions,
+) {
+    if defers_output {
+        let holds_pact_until_continuation = actions
+            .iter()
+            .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
+        if holds_pact_until_continuation {
+            guard.hold().enter_pact();
+        }
+    }
 }
 
 struct DataGuard<'a> {
@@ -3329,7 +3654,8 @@ impl PvDatabase {
     ///
     /// **Owner/gate:** this function. [`Self::process_entry_prelude`]
     /// returning `Some` means THIS frame inserted the name, and this is the
-    /// only place that takes it out again. A `Some` returning through any
+    /// only place that takes it out again, or [`Self::resume_cont`] for a
+    /// frame that parked at its FLNK. A `Some` returning through any
     /// other path would leave a marker outliving the stack it describes, and
     /// the guard would start refusing records C processes again — which is
     /// exactly what a diamond FLNK (`F` → `A`,`B`; `A` → `C`; `B` → `C`) hit.
@@ -3350,9 +3676,13 @@ impl PvDatabase {
         )
     }
 
-    /// [`Self::run_process_frame`] for a FLNK/OUT/CP target, with the cycle
-    /// in a frame of its own so a hop holds only this one. The name must end
-    /// in `run_process_frame`: the PT rigs count cycles by its entries.
+    /// [`Self::run_process_frame`] for a FLNK/OUT/CP target. The name must
+    /// end in `run_process_frame`: the PT rigs count cycles by its entries.
+    ///
+    /// The target recurses as the entry's cycle does while the thread has
+    /// the stack for it ([`hop_recurses`]); below that its cycle runs in a
+    /// hop frame of its own, which parks on `visited` at a hop instead of
+    /// processing the hop's target ([`Self::drive_hops`]).
     #[inline(never)]
     fn recursive_run_process_frame(
         &self,
@@ -3360,13 +3690,11 @@ impl PvDatabase {
         rec: &Arc<RecordCell>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
-        self.process_frame::<true>(
-            ProcessTarget::Resolved(name, rec),
-            visited,
-            false,
-            false,
-            false,
-        )
+        let target = ProcessTarget::Resolved(name, rec);
+        if hop_recurses() {
+            return self.process_frame::<false>(target, visited, false, false, false);
+        }
+        self.process_frame::<true>(target, visited, false, false, false)
     }
 
     #[inline(always)]
@@ -3468,6 +3796,7 @@ impl PvDatabase {
 
         // NO `.await` may appear below this line while `_record_gate` is
         // live — see the module note on `process_record_with_links_body`.
+        let parked = visited.parked();
         let result = self.process_record_with_links_body::<HOP>(
             name,
             record_gate.frame(rec),
@@ -3475,7 +3804,17 @@ impl PvDatabase {
             is_continuation,
             device_callback,
             traced,
+            true,
         );
+        if HOP && visited.parked() > parked {
+            // The rest of this frame, its unwind included, runs in
+            // `resume_cont` once its target has returned.
+            if let FrameGate::Taken(_) = record_gate {
+                // A set only this frame holds is released by it alone.
+                return self.drive_hops(parked, visited);
+            }
+            return result;
+        }
         record_gate.frame(rec).publish_hints();
 
         // Breakpoint auto-print, C `dbAccess.c:614-616` — after record
@@ -3540,7 +3879,163 @@ impl PvDatabase {
             0,
             "a frame dispatched a FLNK/OUT/CP target with a record borrow live"
         );
-        self.recursive_run_process_frame(name, rec, visited)
+        let parked = visited.parked();
+        let result = self.recursive_run_process_frame(name, rec, visited);
+        if visited.parked() == parked {
+            return result;
+        }
+        self.drive_hops(parked, visited)
+    }
+
+    /// The chain whose first cycle parked above `base`, run to its end from
+    /// here: each target is entered by this loop and each parked cycle
+    /// resumed by it, so a hop costs the chain a [`Cont`] and no stack. C
+    /// recurses (`dbScanFwdLink` or `dbDbPutValue` -> `processTarget` ->
+    /// `dbProcess`) at about 100 bytes a hop; a frame here is kilobytes.
+    #[inline(never)]
+    fn drive_hops(&self, base: usize, visited: &mut ProcStack) -> CaResult<()> {
+        let chain = HopChain {
+            db: self,
+            visited,
+            base,
+        };
+        loop {
+            let parked = chain.visited.parked();
+            let mut result = self.enter_hop(chain.visited);
+            if chain.visited.parked() > parked {
+                // The target parked handing out a target of its own.
+                continue;
+            }
+            // A finished target's source resumes; one that parks again
+            // hands out its next target.
+            loop {
+                let parked = chain.visited.parked();
+                self.resume_cont(&mut result, chain.visited);
+                if chain.visited.parked() == parked {
+                    break;
+                }
+                if chain.visited.parked() == chain.base {
+                    return result.map_err(|e| *e);
+                }
+            }
+        }
+    }
+
+    /// C `processTarget` (`dbDbLink.c:474-528`) for the target the cycle
+    /// parked on top handed out, with its hold of the source's PACT
+    /// (`dbDbLink.c:457`) that [`Self::resume_cont`] puts back: the target's
+    /// frame, or `Ok` when the gate refused it.
+    #[inline(always)]
+    fn enter_hop(&self, visited: &mut ProcStack) -> HopResult {
+        let src = visited.conts.top();
+        let Hop { to, putf, notify } = &src.hop;
+        let target_src = super::links::TargetSrc {
+            rec: Some(&src.rec),
+            putf: *putf,
+            notify: notify.as_ref(),
+        };
+        let admitted = match to {
+            HopTo::Flnk(target) => self
+                .record_at(*target)
+                .filter(|target| {
+                    self.admit_target(
+                        target_src,
+                        target,
+                        super::links::ProcessTargetGate::ScanPassive,
+                        None,
+                        visited,
+                    )
+                })
+                .map(HopTarget::Db),
+            HopTo::Out(out) => {
+                let gate = FrameGate::of_held(src.rec.lock_record());
+                let held = gate.set();
+                // SAFETY: the source parked holding `held` with nothing
+                // run since its OUT put, a `dbPut`, which refuses a link
+                // field; so its OUT cache is as `write_out_hop` read it.
+                let target = unsafe { out.target.lend(held, &src.rec) };
+                self.admit_target(target_src, &target, out.gate, Some(held), visited)
+                    .then_some(HopTarget::Lent(target))
+            }
+        };
+        let target: &Arc<RecordCell> = match &admitted {
+            None => return Ok(()),
+            Some(HopTarget::Db(target)) => target,
+            Some(HopTarget::Lent(target)) => target,
+        };
+        let src = visited.conts.top_mut();
+        src.pact_was = Some(src.rec.take_chain_pact());
+        self.recursive_run_process_frame(target.name(), target, visited)
+            .map_err(Box::new)
+    }
+
+    /// The rest of the cycle parked on top, once its target has returned
+    /// `result`, which the cycle's own result replaces:
+    /// `processTarget`'s PACT restore (`dbDbLink.c:514`), the rest of
+    /// `process()` and the frame's unwind, as [`Self::process_frame`] would
+    /// have run them. A cycle that reaches another hop parks again.
+    #[inline(never)]
+    fn resume_cont(&self, result: &mut HopResult, visited: &mut ProcStack) {
+        let Cont {
+            rec,
+            claimed,
+            pact_was,
+            exit,
+            after,
+            hop: _,
+        } = visited.conts.pop();
+        if let Some(was) = pact_was {
+            rec.restore_chain_pact(was);
+        }
+        let gate = FrameGate::of_held(rec.lock_record());
+        let frame = gate.frame(&rec);
+        let name: &[u8] = rec.name();
+        let parked = visited.parked();
+        *result = {
+            let mut cycle_end = CycleEndGuard::new(self, name, frame, claimed);
+            cycle_end.exit = exit;
+            let mut guard = DataGuard::new(frame);
+            let result = self.after_hop(name, after, result, &mut cycle_end, &mut guard, visited);
+            if visited.parked() > parked {
+                // The next resume drops a guard of its own.
+                std::mem::forget(guard);
+            }
+            result.map_err(Box::new)
+        };
+        if !claimed || visited.parked() > parked {
+            return;
+        }
+        frame.publish_hints();
+        if debug_armed() {
+            if let Some(table) = self.breakpoints_if_debugging() {
+                table.after_process(self, name);
+            }
+            frame.trace_exit();
+        }
+        visited.release(&rec);
+    }
+
+    /// A parked cycle a panic unwound past, ended as unwinding its frame
+    /// would have: the PACT hold, the guard's drop, then the cycle end's.
+    #[cold]
+    fn abandon_cont(&self, cont: Cont) {
+        let Cont {
+            rec,
+            claimed,
+            pact_was,
+            exit,
+            after,
+            hop,
+        } = cont;
+        if let Some(was) = pact_was {
+            rec.restore_chain_pact(was);
+        }
+        drop((after, hop));
+        let gate = FrameGate::of_held(rec.lock_record());
+        let frame = gate.frame(&rec);
+        let mut cycle_end = CycleEndGuard::new(self, rec.name(), frame, claimed);
+        cycle_end.exit = exit;
+        drop(DataGuard::new(frame));
     }
 
     /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
@@ -5829,7 +6324,12 @@ impl PvDatabase {
     #[cold]
     #[inline(never)]
     fn run_reentered_pass(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
-        let _ = self.process_record_with_links_body::<true>(name, rec, visited, true, false, false);
+        let parked = visited.parked();
+        let _ = self
+            .process_record_with_links_body::<true>(name, rec, visited, true, false, false, false);
+        if visited.parked() > parked {
+            let _ = self.drive_hops(parked, visited);
+        }
     }
 
     /// The record process cycle itself — C `dbProcess`'s body
@@ -5856,8 +6356,9 @@ impl PvDatabase {
         is_continuation: bool,
         device_callback: bool,
         traced: bool,
+        claimed: bool,
     ) -> CaResult<()> {
-        let mut cycle_end = CycleEndGuard::new(self, name, rec);
+        let mut cycle_end = CycleEndGuard::new(self, name, rec, claimed);
         let mut guard = DataGuard::new(rec);
 
         // 0a. PACT entry guard — C `dbProcess`'s PACT test (dbAccess.c:536,
@@ -5931,8 +6432,9 @@ impl PvDatabase {
         };
         use crate::server::record::record_instance::CyclePlan;
         if !HOP {
-            // Never written: a foreign entry runs its tail in place.
-            let unused = &mut None;
+            // Never written: a frame that is no hop frame runs its tail in
+            // place.
+            let unused = &mut ManuallyDrop::new(None);
             return match cycle_plan {
                 CyclePlan::General => self.process_cycle::<false, false, false>(
                     ctx,
@@ -5957,6 +6459,7 @@ impl PvDatabase {
                 ),
             };
         }
+        let parked = visited.parked();
         let mut tail = None;
         match cycle_plan {
             CyclePlan::General => self.process_cycle_outlined::<false, false>(
@@ -5981,15 +6484,20 @@ impl PvDatabase {
                 &mut tail,
             ),
         }?;
-        match tail {
-            None => Ok(()),
+        let result = match tail {
             Some(tail) => self.run_cycle_tail(name, tail, &mut cycle_end, &mut guard, visited),
+            None => Ok(()),
+        };
+        if visited.parked() > parked {
+            // The continuation drops a guard of its own when it resumes.
+            std::mem::forget(guard);
         }
+        result
     }
 
-    /// [`Self::process_cycle`] in a frame of its own, for a hop: the outlined
-    /// call and the handed-out tail cost a hop ~75 instructions, so a foreign
-    /// entry keeps it inlined.
+    /// [`Self::process_cycle`] in a frame of its own, for a hop frame: the
+    /// outlined call and the handed-out tail cost a hop ~75 instructions, so
+    /// any other frame keeps it inlined.
     #[inline(never)]
     fn process_cycle_outlined<'c, const PLAIN: bool, const DB_INP: bool>(
         &self,
@@ -7682,16 +8190,19 @@ impl PvDatabase {
             // non-reentrant gate). The async device-write branch inside the
             // `out_info` match returns straight from the function.
             // The cycle's link-carried writes and reads, split off the record's
-            // other actions; `None` when it has none, which is the usual cycle.
+            // other actions; empty when it has none, which is the usual cycle.
             let (link_writes, process_actions): (
-                Option<Vec<_>>,
+                crate::server::record::ProcessActions,
                 crate::server::record::ProcessActions,
             ) = if process_actions.is_empty() {
-                (None, process_actions)
+                (
+                    crate::server::record::ProcessActions::new(),
+                    process_actions,
+                )
             } else {
                 let (writes, rest): (Vec<_>, Vec<_>) =
                     process_actions.into_iter().partition(runs_in_link_stage);
-                ((!writes.is_empty()).then_some(writes), rest.into())
+                (writes.into(), rest.into())
             };
             // Whether this cycle has an output stage at all — the one rule that
             // decides both the output segment and the guard release it needs.
@@ -7703,7 +8214,7 @@ impl PvDatabase {
             let has_output = !skip_out
                 || plan.multi_output_dispatch
                 || sim_output.is_some()
-                || link_writes.is_some();
+                || !link_writes.is_empty();
             let dispatched = if !has_output {
                 super::links::MultiOutDispatch::default()
             } else {
@@ -7979,165 +8490,82 @@ impl PvDatabase {
                     notify: src_notify.as_ref(),
                     field: "OUT",
                 };
-                if let Some((out, out_val)) = out_info
-                    && let Err(e) = self.write_out(rec, out, out_val, src, visited)
-                {
-                    cycle_status.soft_failed(e, !self.link_connected(&rec.read().parsed_out));
-                }
-                // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
-                // the OOPT reference advances on a suppressed cycle too, which
-                // is the only reason a transition can ever be detected.
-                if reached_conditional_write && plan.redecides_after_output {
-                    rec.write().record.after_output_decision();
-                }
-                if !skip_out && plan.dispatches_generic_multi_output {
-                    self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
-                }
-                // The multi-output records — dfanout `OUTn`, seq `LNKn`, fanout
-                // `LNKn` — dispatch HERE, with the record's other outputs, so
-                // the whole output stage sits between `checkAlarms` and the
-                // alarm commit exactly as C's does (`dfanoutRecord.c:128-146`
-                // push_values → monitor; `seqRecord.c:264` dbPutLink →
-                // asyncFinish's `recGblResetAlarms`, :227; `fanoutRecord.c:103-
-                // 148` SELL read and dbScanFwdLink → `recGblResetAlarms`). A
-                // failed put's LINK_ALARM and a SELN-range SOFT INVALID
-                // therefore fold into THIS cycle's committed SEVR, and the SELN
-                // the SELL read moved posts in this cycle's monitor.
-                let dispatched = if plan.multi_output_dispatch {
-                    self.dispatch_multi_output(name, rec, skip_out, visited)
-                } else {
-                    super::links::MultiOutDispatch::default()
-                };
-                if sim_output.is_some() {
-                    cycle_status.io(self.write_simulated_output_siol(
-                        rec,
-                        &sim_output,
-                        skip_out,
-                        src,
-                        visited,
-                    ));
-                }
-                if let Some(link_writes) = link_writes {
-                    match self.execute_link_writes_in(name, rec, link_writes, visited) {
-                        ControlFlow::Continue(status) => cycle_status.record(status),
-                        ControlFlow::Break(e) => {
-                            cycle_status.record(Err(e.status));
-                            self.return_from_process(name, rec, e.pact, cycle_end.take());
-                            return cycle_status.frame_result(guard);
+                if let Some((out, out_val)) = out_info {
+                    if HOP {
+                        match self.write_out_hop(rec, out, out_val, src, visited) {
+                            // The rest of the stage runs once the target has
+                            // returned (`resume_out`): an OUT PP chain holds
+                            // no frame of this cycle per hop.
+                            Ok(Some(hop)) => {
+                                let hop = Hop {
+                                    to: HopTo::Out(hop),
+                                    putf: src_putf,
+                                    notify: src_notify.clone(),
+                                };
+                                let rest = OutRest {
+                                    stage: OutStage {
+                                        reached_conditional_write,
+                                        skip_out,
+                                        putf: src_putf,
+                                        notify: src_notify,
+                                        sim_output,
+                                        link_writes,
+                                    },
+                                    actions: process_actions,
+                                    status: cycle_status,
+                                    restamps: restamps_after,
+                                    defers_output: result_is_defer_output,
+                                };
+                                visited.park(cycle_end, After::Out(rest), hop);
+                                return Ok(());
+                            }
+                            Ok(None) => {}
+                            Err(e) => cycle_status
+                                .soft_failed(e, !self.link_connected(&rec.read().parsed_out)),
                         }
+                    } else if let Err(e) = self.write_out(rec, out, out_val, src, visited) {
+                        cycle_status.soft_failed(e, !self.link_connected(&rec.read().parsed_out));
                     }
                 }
-                dispatched
+                match self.output_rest(
+                    name,
+                    rec,
+                    plan,
+                    reached_conditional_write,
+                    skip_out,
+                    src,
+                    &sim_output,
+                    link_writes,
+                    &mut cycle_status,
+                    cycle_end,
+                    guard,
+                    visited,
+                ) {
+                    ControlFlow::Break(result) => return result,
+                    ControlFlow::Continue(dispatched) => dispatched,
+                }
             };
-
-            // The seq record armed its delayed group chain: C `process` has
-            // set `pact = TRUE` and returned through `processNextLink`
-            // (`seqRecord.c:143`, `:196`), so THIS cycle commits nothing. The
-            // alarm/timestamp/monitor/FLNK epilogue is `asyncFinish`'s
-            // (`:219-241`), reached from the chain's last hop via
-            // `complete_async_record`. Same shape as the `AsyncPending` arm
-            // above; PACT was set by the dispatch before it spawned, so the
-            // chain cannot complete ahead of it.
-            if dispatched.went_async {
-                guard.release();
-                if plan.hooks.has(CycleHooks::HAND_POSTED) {
-                    super::field_io::emit_cycle_posts(&mut rec.write());
-                }
-                self.execute_process_actions_in(name, rec, process_actions, visited);
-                self.apply_pact_exit(name, cycle_end.take());
-                return Ok(());
-            }
-            let push_alarm = dispatched.alarm;
-
-            if plan.works_before_monitor {
-                guard.release();
-                // What `process()` marked by hand, its own alarm reset
-                // included, posts ahead of the `monitor()` commit below.
-                if plan.hooks.has(CycleHooks::HAND_POSTED) {
-                    self.drain_cycle_marks(rec, visited);
-                }
-                // Past every put of the cycle, so a return above never stamps.
-                if plan.stamp_point == StampPoint::AfterLinkWrites {
-                    self.stamp_at_late_point(rec, visited);
+            match self.monitor_stage(
+                name,
+                rec,
+                plan,
+                dispatched,
+                process_actions,
+                cycle_end,
+                guard,
+                visited,
+            ) {
+                ControlFlow::Break(result) => return result,
+                ControlFlow::Continue((flnk, actions)) => {
+                    tail_flnk = flnk;
+                    tail_actions = actions;
                 }
             }
-
-            // Segment E (guarded): commit alarms, build the snapshot, resolve the
-            // FLNK target, and store the epilogue's results. Re-acquire the data lock.
-            let instance = guard.hold();
-            if let Some((stat, sevr)) = push_alarm {
-                crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
-            }
-            // A pass past the write: C's code after `if (!pact && prec->pact)
-            // return`, from the record as it now is. A hand-off above ended
-            // the pass there, and its completing pass asks the same.
-            let mut process_actions = process_actions;
-            if plan.acts_after_write {
-                for action in instance.record.after_write_actions() {
-                    process_actions.push(action);
-                }
-            }
-
-            // C `monitor()` with its opening `recGblResetAlarms` — AFTER every
-            // output of the cycle, so a failed put's LINK_ALARM is committed
-            // here and no async write advances MLST/ALST before it returns.
-            let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
-            let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
-
-            // An own-stamp type's FLNK is its `valuePut`'s, fired by the drain
-            // above; its `process()` has none (`throttleRecord.c:308`).
-            let flnk_name = if plan.hooks.stamps_at_own_reset() {
-                crate::server::record::record_instance::ForwardTarget::None
-            } else {
-                instance.forward_target()
-            };
-
-            // Put-notify completion is NOT fired here. Firing before the
-            // OUT/FLNK/process-action tail (below) would report the
-            // WRITE_NOTIFY done while the chain it triggers — including
-            // an async FLNK target — is still running (C `dbNotify.c`
-            // keeps the originating record in the waitList until the
-            // chain settles). The originating record instead `leave`s
-            // the wait-set at the END of this function, after every PP
-            // target it drives has joined. See `complete_put_notify`
-            // at the tail.
-
-            // 3. Notify subscribers, still under the segment's own guard.
-            publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
-            tail_flnk = flnk_name;
-            tail_actions = process_actions;
             tail_defers_output = result_is_defer_output;
             tail_restamps = restamps_after;
         }
 
-        // C `swaitRecord.c::process` (lines 425-481): `schedOutput` armed the
-        // ODLY watchdog (`async=TRUE`), so `process` ran `monitor()` — the
-        // value-publication epilogue above just posted VAL + the alarm fields at
-        // the START of the delay — but SKIPPED the `if(!async){recGblFwdLink;
-        // pact=FALSE;}` tail. The OUT write / OEVT are already gated out this
-        // cycle by `should_output()==false`; `recGblFwdLink` is NOT
-        // should_output-gated, so the forward-link tail below is skipped when
-        // deferring (`tail_defers_output`). The deferred `execOutput` — the
-        // scheduled `ReprocessAfter` reprocess at delay-END — runs the OUT write
-        // + OEVT + FLNK. Hold PACT across the wait so a foreign `dbProcess` bails
-        // at the entry guard (C keeps the record ACTIVE on the watchdog,
-        // swaitRecord.c:716); the hold is gated on the `ReprocessAfter` that
-        // releases it (the same by-construction invariant as the
-        // `AsyncPendingNotify` ODLY defer above). The `ReprocessAfter` itself is
-        // dispatched by the shared deferred-actions site at the tail, NOT a
-        // separate `execute_process_actions_in().await` here — adding one would
-        // enlarge this hot recursive function's frame (one overflowed the
-        // stack in the deep-chain tests).
-        // Holding `processing=true` also makes the tail's putf-clear (gated on
-        // `!is_processing()`) a no-op, leaving putf for the continuation.
-        if tail_defers_output {
-            let holds_pact_until_continuation = tail_actions
-                .iter()
-                .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
-            if holds_pact_until_continuation {
-                guard.hold().enter_pact();
-            }
-        }
+        hold_deferred_pact(guard, tail_defers_output, &tail_actions);
 
         if HOP {
             *tail_out = Some(CycleTail::Full {
@@ -8164,12 +8592,177 @@ impl PvDatabase {
         )
     }
 
+    /// C `process()` past its OUT put: the cycle's other outputs. A hop cycle
+    /// parked at its OUT target resumes here ([`Self::resume_out`]) with what
+    /// its [`OutStage`] kept.
+    ///
+    /// The frame passes the parts where it holds them: moving them into a
+    /// stage for the call cost every cycle, outputs or not, their drop flags.
+    ///
+    /// `Break` ends the cycle with no tail.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn output_rest(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        reached_conditional_write: bool,
+        skip_out: bool,
+        src: super::links::OutLinkSrc<'_>,
+        sim_output: &Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
+        link_writes: crate::server::record::ProcessActions,
+        cycle_status: &mut CycleStatus,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> ControlFlow<CaResult<()>, super::links::MultiOutDispatch> {
+        // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
+        // the OOPT reference advances on a suppressed cycle too, which
+        // is the only reason a transition can ever be detected.
+        if reached_conditional_write && plan.redecides_after_output {
+            rec.write().record.after_output_decision();
+        }
+        if !skip_out && plan.dispatches_generic_multi_output {
+            self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
+        }
+        // The multi-output records — dfanout `OUTn`, seq `LNKn`, fanout
+        // `LNKn` — dispatch HERE, with the record's other outputs, so
+        // the whole output stage sits between `checkAlarms` and the
+        // alarm commit exactly as C's does (`dfanoutRecord.c:128-146`
+        // push_values → monitor; `seqRecord.c:264` dbPutLink →
+        // asyncFinish's `recGblResetAlarms`, :227; `fanoutRecord.c:103-
+        // 148` SELL read and dbScanFwdLink → `recGblResetAlarms`). A
+        // failed put's LINK_ALARM and a SELN-range SOFT INVALID
+        // therefore fold into THIS cycle's committed SEVR, and the SELN
+        // the SELL read moved posts in this cycle's monitor.
+        let dispatched = if plan.multi_output_dispatch {
+            self.dispatch_multi_output(name, rec, skip_out, visited)
+        } else {
+            super::links::MultiOutDispatch::default()
+        };
+        if sim_output.is_some() {
+            cycle_status
+                .io(self.write_simulated_output_siol(rec, sim_output, skip_out, src, visited));
+        }
+        if !link_writes.is_empty() {
+            match self.execute_link_writes_in(name, rec, link_writes, visited) {
+                ControlFlow::Continue(status) => cycle_status.record(status),
+                ControlFlow::Break(e) => {
+                    cycle_status.record(Err(e.status));
+                    self.return_from_process(name, rec, e.pact, cycle_end.take());
+                    return ControlFlow::Break(cycle_status.frame_result(guard));
+                }
+            }
+        }
+        ControlFlow::Continue(dispatched)
+    }
+
+    /// C `process()` past its outputs: `monitor()` with the FLNK resolve.
+    ///
+    /// `Break` ends the cycle with no tail; `Continue` hands back the FLNK and
+    /// the deferred actions.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn monitor_stage(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        plan: &crate::server::record::record_instance::ProcessPlan,
+        dispatched: super::links::MultiOutDispatch,
+        process_actions: crate::server::record::ProcessActions,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> ControlFlow<
+        CaResult<()>,
+        (
+            crate::server::record::record_instance::ForwardTarget,
+            crate::server::record::ProcessActions,
+        ),
+    > {
+        // The seq record armed its delayed group chain: C `process` has
+        // set `pact = TRUE` and returned through `processNextLink`
+        // (`seqRecord.c:143`, `:196`), so THIS cycle commits nothing. The
+        // alarm/timestamp/monitor/FLNK epilogue is `asyncFinish`'s
+        // (`:219-241`), reached from the chain's last hop via
+        // `complete_async_record`. Same shape as the `AsyncPending` arm
+        // above; PACT was set by the dispatch before it spawned, so the
+        // chain cannot complete ahead of it.
+        if dispatched.went_async {
+            guard.release();
+            if plan.hooks.has(CycleHooks::HAND_POSTED) {
+                super::field_io::emit_cycle_posts(&mut rec.write());
+            }
+            self.execute_process_actions_in(name, rec, process_actions, visited);
+            self.apply_pact_exit(name, cycle_end.take());
+            return ControlFlow::Break(Ok(()));
+        }
+        let push_alarm = dispatched.alarm;
+
+        if plan.works_before_monitor {
+            guard.release();
+            // What `process()` marked by hand, its own alarm reset
+            // included, posts ahead of the `monitor()` commit below.
+            if plan.hooks.has(CycleHooks::HAND_POSTED) {
+                self.drain_cycle_marks(rec, visited);
+            }
+            // Past every put of the cycle, so a return above never stamps.
+            if plan.stamp_point == StampPoint::AfterLinkWrites {
+                self.stamp_at_late_point(rec, visited);
+            }
+        }
+
+        // Segment E (guarded): commit alarms, build the snapshot, resolve the
+        // FLNK target, and store the epilogue's results. Re-acquire the data lock.
+        let instance = guard.hold();
+        if let Some((stat, sevr)) = push_alarm {
+            crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
+        }
+        // A pass past the write: C's code after `if (!pact && prec->pact)
+        // return`, from the record as it now is. A hand-off above ended
+        // the pass there, and its completing pass asks the same.
+        let mut process_actions = process_actions;
+        if plan.acts_after_write {
+            for action in instance.record.after_write_actions() {
+                process_actions.push(action);
+            }
+        }
+
+        // C `monitor()` with its opening `recGblResetAlarms` — AFTER every
+        // output of the cycle, so a failed put's LINK_ALARM is committed
+        // here and no async write advances MLST/ALST before it returns.
+        let mut cycle_snapshot = crate::server::record::ProcessSnapshot::new();
+        let cycle_alarm_posts = instance.monitor_cycle(&mut cycle_snapshot);
+
+        // An own-stamp type's FLNK is its `valuePut`'s, fired by the drain
+        // above; its `process()` has none (`throttleRecord.c:308`).
+        let flnk_name = if plan.hooks.stamps_at_own_reset() {
+            crate::server::record::record_instance::ForwardTarget::None
+        } else {
+            instance.forward_target()
+        };
+
+        // Put-notify completion is NOT fired here. Firing before the
+        // OUT/FLNK/process-action tail (below) would report the
+        // WRITE_NOTIFY done while the chain it triggers — including
+        // an async FLNK target — is still running (C `dbNotify.c`
+        // keeps the originating record in the waitList until the
+        // chain settles). The originating record instead `leave`s
+        // the wait-set at the END of this function, after every PP
+        // target it drives has joined. See `complete_put_notify`
+        // at the tail.
+
+        // 3. Notify subscribers, still under the segment's own guard.
+        publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
+        ControlFlow::Continue((flnk_name, process_actions))
+    }
+
     /// C `recGblFwdLink` and what `process()` runs after it, for the cycle a
-    /// hop's [`Self::process_cycle`] handed out as a [`CycleTail`]. Run by the
-    /// caller, so a FLNK target is processed after the cycle's frame is gone:
-    /// that frame is kilobytes, where C's `dbProcess` hop is about 100 bytes,
-    /// and holding it across the hop overflowed `cbLow` 500 records into a
-    /// chain C runs 12000 deep.
+    /// hop's [`Self::process_cycle`] handed out as a [`CycleTail`]. A DB FLNK
+    /// target is not processed here: the cycle parks on `visited` with what
+    /// it owes after the target, so a chain holds no frame of it across the
+    /// hop ([`Self::drive_hops`]).
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn run_cycle_tail(
         &self,
@@ -8179,31 +8772,219 @@ impl PvDatabase {
         guard: &mut DataGuard<'_>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
-        match tail {
-            CycleTail::Sim(status) => self.run_sim_tail(name, status, cycle_end, guard, visited),
+        let rec = guard.rec;
+        let (flnk, plan, after) = match tail {
+            CycleTail::Sim(status) => (
+                rec.read().forward_target(),
+                rec.process_plan(),
+                AfterFlnk::Sim(status),
+            ),
             CycleTail::Full {
                 flnk,
                 plan,
-                defers_output,
+                defers_output: true,
                 restamps,
                 mut actions,
                 status,
-            } => self.run_full_tail(
-                name,
-                &flnk,
+            } => {
+                return self.run_full_tail(
+                    name,
+                    &flnk,
+                    plan,
+                    true,
+                    restamps,
+                    &mut actions,
+                    &status,
+                    cycle_end,
+                    guard,
+                    visited,
+                );
+            }
+            CycleTail::Full {
+                flnk,
                 plan,
-                defers_output,
+                defers_output: false,
                 restamps,
-                &mut actions,
-                &status,
-                cycle_end,
-                guard,
-                visited,
+                actions,
+                status,
+            } => (
+                flnk,
+                plan,
+                AfterFlnk::Full {
+                    restamps,
+                    actions,
+                    status,
+                },
             ),
+        };
+        if plan.posts_software_event {
+            guard.release();
+            self.dispatch_event_record(rec);
+        }
+        use crate::server::record::record_instance::ForwardTarget;
+        if let ForwardTarget::Db {
+            target,
+            putf,
+            notify,
+        } = flnk
+        {
+            guard.release();
+            let notify = if notify {
+                rec.read().notify.clone()
+            } else {
+                None
+            };
+            let hop = Hop {
+                to: HopTo::Flnk(target),
+                putf,
+                notify,
+            };
+            visited.park(cycle_end, After::Flnk(after), hop);
+            return Ok(());
+        } else if !matches!(flnk, ForwardTarget::None) {
+            guard.release();
+            self.scan_forward_target(rec, &flnk, visited);
+        }
+        self.after_flnk(name, after, cycle_end, guard, visited)
+    }
+
+    /// What a cycle owes once its hop's target has returned `target`: past
+    /// an OUT put, [`Self::resume_out`]; past the FLNK, whose status C
+    /// `dbScanFwdLink` drops, [`Self::after_flnk`].
+    fn after_hop(
+        &self,
+        name: &[u8],
+        after: After,
+        target: &HopResult,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        match after {
+            After::Out(rest) => self.resume_out(name, rest, target, cycle_end, guard, visited),
+            After::Flnk(after) => self.after_flnk(name, after, cycle_end, guard, visited),
         }
     }
 
-    /// [`CycleTail::Sim`]'s tail, taken in place by a foreign entry.
+    /// [`After::Out`] once the OUT put's target has returned `target`:
+    /// `dbDbPutValue` returns `processTarget`'s status (`dbDbLink.c:387-392`)
+    /// to `dbPutLink`, then the output stage goes on and the cycle takes its
+    /// tail.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn resume_out(
+        &self,
+        name: &[u8],
+        rest: OutRest,
+        target: &HopResult,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        let OutRest {
+            stage,
+            actions,
+            mut status,
+            restamps,
+            defers_output,
+        } = rest;
+        let rec = guard.rec;
+        if let Err(e) = target {
+            super::links::set_out_link_alarm(rec, "OUT");
+            status.soft_failed(
+                DbStatus::of_error(e),
+                !self.link_connected(&rec.read().parsed_out),
+            );
+        }
+        let plan = rec.process_plan();
+        let OutStage {
+            reached_conditional_write,
+            skip_out,
+            putf,
+            notify,
+            sim_output,
+            link_writes,
+        } = stage;
+        let src = super::links::OutLinkSrc {
+            putf,
+            notify: notify.as_ref(),
+            field: "OUT",
+        };
+        let dispatched = match self.output_rest(
+            name,
+            rec,
+            plan,
+            reached_conditional_write,
+            skip_out,
+            src,
+            &sim_output,
+            link_writes,
+            &mut status,
+            cycle_end,
+            guard,
+            visited,
+        ) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(dispatched) => dispatched,
+        };
+        let (flnk, actions) = match self.monitor_stage(
+            name, rec, plan, dispatched, actions, cycle_end, guard, visited,
+        ) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(tail) => tail,
+        };
+        hold_deferred_pact(guard, defers_output, &actions);
+        let tail = CycleTail::Full {
+            flnk,
+            plan,
+            defers_output,
+            restamps,
+            actions,
+            status,
+        };
+        self.run_cycle_tail(name, tail, cycle_end, guard, visited)
+    }
+
+    /// What a cycle owes once its FLNK target has returned: the rest of C
+    /// `recGblFwdLink`, then `process()`'s tail.
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn after_flnk(
+        &self,
+        name: &[u8],
+        after: AfterFlnk,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        match after {
+            AfterFlnk::Sim(status) => {
+                let rec = guard.rec;
+                // `run_forward_link_tail`'s own guard, dropped as it returns.
+                self.rpro_tail(name, &mut DataGuard::new(rec));
+                self.end_process_cycle(name, rec, cycle_end.take());
+                status.frame_result(guard)
+            }
+            AfterFlnk::Full {
+                restamps,
+                mut actions,
+                status,
+            } => {
+                self.rpro_tail(name, guard);
+                self.finish_full_tail(
+                    name,
+                    restamps,
+                    &mut actions,
+                    &status,
+                    cycle_end,
+                    guard,
+                    visited,
+                )
+            }
+        }
+    }
+
+    /// [`CycleTail::Sim`]'s tail, taken in place by a frame that is no hop
+    /// frame.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn run_sim_tail(
         &self,
@@ -8219,7 +9000,8 @@ impl PvDatabase {
         status.frame_result(guard)
     }
 
-    /// [`CycleTail::Full`]'s tail, taken in place by a foreign entry: passed
+    /// [`CycleTail::Full`]'s tail, taken in place by a frame that is no hop
+    /// frame: passed
     /// as borrowed parts, since moving them costs that path ~20 instructions a
     /// cycle.
     #[allow(clippy::too_many_arguments)]
@@ -8237,7 +9019,6 @@ impl PvDatabase {
         guard: &mut DataGuard<'_>,
         visited: &mut ProcStack,
     ) -> CaResult<()> {
-        let rec = guard.rec;
         // 4.5 - 7. Multi-output / event / generic-multi-out / FLNK /
         // CP / RPRO tail. Shared with the simulation-mode path so a
         // simulated record runs the exact same `recGblFwdLink`
@@ -8251,7 +9032,23 @@ impl PvDatabase {
         if !defers_output {
             self.run_forward_link_tail_with_putf(name, guard, flnk, TailCtx { plan }, visited);
         }
+        self.finish_full_tail(name, restamps, actions, status, cycle_end, guard, visited)
+    }
 
+    /// [`Self::run_full_tail`] past `recGblFwdLink`.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn finish_full_tail(
+        &self,
+        name: &[u8],
+        restamps: bool,
+        actions: &mut crate::server::record::ProcessActions,
+        status: &CycleStatus,
+        cycle_end: &mut CycleEndGuard<'_>,
+        guard: &mut DataGuard<'_>,
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        let rec = guard.rec;
         // Deferred restamp for a `restamps_time_after_completion` record (sseq):
         // C `sseqRecord.c::asyncFinish` calls `recGblGetTimeStamp` (`:501`)
         // AFTER the VAL post (`:474`) and `recGblFwdLink` (`:499`). The VAL
@@ -8452,20 +9249,24 @@ impl PvDatabase {
         // to be doing double duty as an escape hatch from the cycle
         // guard, which over-blocked; the guard is frame-scoped now
         // ([`Self::run_process_frame`]), so there is nothing to escape.
-        {
-            let needs_rpro = {
-                let instance = guard.hold();
-                if instance.common.rpro != 0 {
-                    instance.common.rpro = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            if needs_rpro {
-                // C `recGblFwdLink` (`recGbl.c:297-300`).
-                self.scan_once(name);
+        self.rpro_tail(name, guard);
+    }
+
+    /// Step 7 of [`Self::run_forward_link_tail_with_putf`]: C `recGblFwdLink`'s
+    /// RPRO restart (`recGbl.c:297-300`).
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn rpro_tail(&self, name: &[u8], guard: &mut DataGuard<'_>) {
+        let needs_rpro = {
+            let instance = guard.hold();
+            if instance.common.rpro != 0 {
+                instance.common.rpro = 0;
+                true
+            } else {
+                false
             }
+        };
+        if needs_rpro {
+            self.scan_once(name);
         }
     }
 
@@ -11702,15 +12503,19 @@ struct CycleEndGuard<'a> {
     name: &'a [u8],
     rec: InFrame<'a>,
     exit: Option<crate::server::record::PactExit>,
+    /// Whether the frame the cycle runs in claimed `rec` on the chain: what
+    /// a cycle that parks hands its continuation to unwind.
+    claimed: bool,
 }
 
 impl<'a> CycleEndGuard<'a> {
-    fn new(db: &'a PvDatabase, name: &'a [u8], rec: InFrame<'a>) -> Self {
+    fn new(db: &'a PvDatabase, name: &'a [u8], rec: InFrame<'a>, claimed: bool) -> Self {
         Self {
             db,
             name,
             rec,
             exit: None,
+            claimed,
         }
     }
 
@@ -12534,5 +13339,30 @@ impl<'a> ReadPolicy<'a> {
             } if std::ptr::eq(own, cell) => Some(record),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod hop_rule_tests {
+    use super::{hop_floor, hop_recurses};
+
+    /// The thread's own rule recurses a frame entered high on its stack, the
+    /// first time and once its floor is read, and parks one entered below it.
+    #[test]
+    fn a_frame_above_the_floor_recurses_and_one_below_parks() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                hop_floor::set(hop_floor::Rule::Os);
+                assert!(hop_recurses(), "first read");
+                assert!(hop_recurses(), "read floor");
+                let here = 0u8;
+                let above = std::ptr::addr_of!(here).addr() + 4096;
+                hop_floor::set(hop_floor::Rule::Floor(above));
+                assert!(!hop_recurses(), "a frame below the floor parks");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

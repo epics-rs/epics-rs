@@ -1,14 +1,17 @@
-//! A 200-deep FLNK chain fits the stack a `cbLow` thread gets
-//! (`StackSizeClass::Big`, `callback_executor.rs`), debug build included.
+//! A FLNK chain as deep as C runs on `cbLow`, 20000 records, fits the stack
+//! a `cbLow` thread gets (`StackSizeClass::Big`, `callback_executor.rs`),
+//! debug build included.
 //!
 //! `#[inline(always)]` in `processing.rs` folded every helper's locals into
 //! `run_process_frame`, about 100 KB per hop unoptimised, so a debug
 //! `ad-simdetector-ioc` overflowed `cbLow` on `cam1:Acquire=1`. Release
 //! frames are unchanged by keeping the attribute release-only.
 //!
-//! The hop itself is taken after `process_cycle`'s frame is popped
-//! (`run_cycle_tail`); holding it across the hop overflowed this chain
-//! 130 records in (debug) and 600 in (release), where C runs 12000.
+//! Targets recurse down to the thread's hop margin; below it each hop's
+//! cycle parks at its FLNK and the chain's driver runs the target
+//! (`drive_hops`), so the rest of the chain costs no stack. Recursing every
+//! hop, a chain overflowed `cbLow` 400 records in (debug) and 2500 in
+//! (release).
 
 use std::collections::HashMap;
 
@@ -16,10 +19,10 @@ use epics_base_rs::runtime::task::StackSizeClass;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
-const CHAIN: usize = 200;
+const CHAIN: usize = 20000;
 
 #[test]
-fn a_two_hundred_deep_flnk_chain_runs_on_a_callback_sized_stack() {
+fn a_twenty_thousand_deep_flnk_chain_runs_on_a_callback_sized_stack() {
     std::thread::Builder::new()
         .stack_size(StackSizeClass::Big.bytes())
         .spawn(|| {

@@ -3547,6 +3547,16 @@ impl RecordCell {
         ChainPactHold { flag, was }
     }
 
+    /// [`Self::hold_chain_pact`] for a hold that outlives the frame taking
+    /// it: the value [`Self::restore_chain_pact`] puts back.
+    pub(crate) fn take_chain_pact(&self) -> bool {
+        self.chain_pact.swap(true, Ordering::Relaxed)
+    }
+
+    pub(crate) fn restore_chain_pact(&self, was: bool) {
+        self.chain_pact.store(was, Ordering::Relaxed);
+    }
+
     /// Record borrows the calling thread holds, for a test binary's
     /// allocator to tell allocations under a hold from the rest; `0` in
     /// builds without debug assertions.

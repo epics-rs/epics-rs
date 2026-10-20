@@ -70,20 +70,23 @@ tokio = { version = "1", default-features = false, features = [
 libc = "0.2"
 
 # `runtime::socket::poll_ready`'s `WSAPoll`; `net::win_adapters`'s
-# `GetAdaptersAddresses`.
+# `GetAdaptersAddresses`; `runtime::task::current_thread_stack_low`'s
+# `GetCurrentThreadStackLimits`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_System_Threading",
 ] }
 
 # VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
 # the statistics funnel's thread census. VxWorks 7 gives an RTP no task
 # enumerator at all (`taskIdListGet` and `taskEach` are kernel-mode only), so
 # unlike RTEMS — where `rtems_task_iterate` walks the kernel's own table — the
-# list has to be built as the threads start.
+# list has to be built as the threads start. `current_thread_stack_low` reads
+# the task's stack end from the `TASK_DESC` this package binds.
 #
 # Target-gated rather than a plain dependency, and the gate is doing real work:
 # on RTEMS `epics-rtems-boot`'s build script emits an *image* link contract

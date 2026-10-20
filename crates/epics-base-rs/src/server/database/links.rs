@@ -567,6 +567,19 @@ struct LentOut {
     acts: TargetActs,
 }
 
+/// The `processTarget` a lent OUT put owes once it has succeeded, handed
+/// out of the writing frame by [`PvDatabase::write_out_hop`].
+pub(crate) struct OutHop {
+    pub(super) target: crate::server::record::record_instance::OutTarget,
+    pub(super) gate: ProcessTargetGate,
+}
+
+// SAFETY: an `OutHop` leaves the frame only into its parked cycle on the
+// chain's `ProcStack`, which the chain's driver empties before the call
+// returns, so the stack moves between threads without one; the target is
+// lent only under the owning set, which no other thread holds meanwhile.
+unsafe impl Send for OutHop {}
+
 /// What a DB link's parse settled about acting on its local target after
 /// the put: C `dbDbPutValue`'s `processTarget` gate and the MS inherit.
 #[derive(Clone, Copy)]
@@ -3093,25 +3106,50 @@ impl PvDatabase {
         held: Option<&super::SetGuard>,
         visited: &mut ProcStack,
     ) -> DbResult {
+        if !self.admit_target(src, target_rec, gate, held, visited) {
+            return Ok(());
+        }
+        // Recursive target processing within one chain — the gate is already
+        // held by the foreign entry record. Unconditional, as C's
+        // `dbProcess(pdst)` is: an active target is refused inside
+        // `process_record_with_links_body`'s PACT arm, the single owner of
+        // that decision, and the refusal is counted there. Its status is
+        // `processTarget`'s return (`dbDbLink.c:511-528`).
+        let _pact = src.rec.map(|src| src.hold_chain_pact());
+        self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited)
+            .map_err(|e| DbStatus::of_error(&e))
+    }
+
+    /// [`Self::process_target_at`] up to `dbProcess`: whether the target
+    /// passes the gate, with its PUTF/RPRO and put-notify join written.
+    #[inline(always)]
+    pub(super) fn admit_target(
+        &self,
+        src: TargetSrc<'_>,
+        target_rec: &Arc<crate::server::record::RecordCell>,
+        gate: ProcessTargetGate,
+        held: Option<&super::SetGuard>,
+        visited: &ProcStack,
+    ) -> bool {
         let TargetSrc {
             rec: src_rec,
             putf: src_putf,
             notify: src_notify,
         } = src;
+        let mut tg = target_rec.write_under(held);
+        // A forward bound before the target was removed still reaches its
+        // cell (the record table keeps it); a removed record runs nothing.
+        if tg.is_destroyed() {
+            return false;
+        }
+        // The gate. A target that does not pass it never reaches
+        // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
+        // join — the join in particular would `enter` the wait-set without
+        // ever `leave`ing it.
+        if !gate.admits(tg.common.scan) {
+            return false;
+        }
         {
-            let mut tg = target_rec.write_under(held);
-            // A forward bound before the target was removed still reaches its
-            // cell (the record table keeps it); a removed record runs nothing.
-            if tg.is_destroyed() {
-                return Ok(());
-            }
-            // The gate. A target that does not pass it never reaches
-            // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
-            // join — the join in particular would `enter` the wait-set without
-            // ever `leave`ing it.
-            if !gate.admits(tg.common.scan) {
-                return Ok(());
-            }
             // C `dbDbLink.c:439`: the source, when its set traces.
             let traced = src_rec
                 .filter(|src| super::db_access_debug_putf() != 0 && src.lock_record().tracing());
@@ -3147,15 +3185,7 @@ impl PvDatabase {
                 ));
             }
         }
-        // Recursive target processing within one chain — the gate is already
-        // held by the foreign entry record. Unconditional, as C's
-        // `dbProcess(pdst)` is: an active target is refused inside
-        // `process_record_with_links_body`'s PACT arm, the single owner of
-        // that decision, and the refusal is counted there. Its status is
-        // `processTarget`'s return (`dbDbLink.c:511-528`).
-        let _pact = src_rec.map(|src| src.hold_chain_pact());
-        self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited)
-            .map_err(|e| DbStatus::of_error(&e))
+        true
     }
 
     /// C `dbDbPutValue` (`dbDbLink.c:372-392`) for a caller with no frame —
@@ -4285,12 +4315,46 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) -> DbResult {
         match out.0 {
-            OutWrite::Lent(ref lent) => self.write_lent_out(src_rec, lent, value, src, visited),
+            OutWrite::Lent(ref lent) => {
+                self.write_lent_out(src_rec, lent, value, src, visited)?;
+                match lent.acts.gate {
+                    None => Ok(()),
+                    Some(gate) => self.process_lent_target(src_rec, lent, gate, src, visited),
+                }
+            }
             OutWrite::Link(link) => self.write_out_link_value(src_rec, link, value, src, visited),
         }
     }
 
-    /// C `dbDbPutValue` at the lent target, which needs no link.
+    /// [`Self::write_out`] for a hop's frame: a lent target's
+    /// `processTarget` is handed back, for the frame to take once it has
+    /// parked ([`PvDatabase::drive_hops`]).
+    #[inline(always)]
+    pub(crate) fn write_out_hop(
+        &self,
+        src_rec: InFrame<'_>,
+        out: OutLinkWrite,
+        value: super::field_io::PutSrc<'_>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> Result<Option<OutHop>, DbStatus> {
+        match out.0 {
+            OutWrite::Lent(ref lent) => {
+                self.write_lent_out(src_rec, lent, value, src, visited)?;
+                Ok(lent.acts.gate.map(|gate| OutHop {
+                    target: lent.target,
+                    gate,
+                }))
+            }
+            OutWrite::Link(link) => self
+                .write_out_link_value(src_rec, link, value, src, visited)
+                .map(|()| None),
+        }
+    }
+
+    /// C `dbDbPutValue` at the lent target, which needs no link, up to its
+    /// `processTarget`: [`Self::process_lent_target`] takes that once this
+    /// frame, about 2 KB, is popped, or an OUT PP chain holds it per hop.
     fn write_lent_out(
         &self,
         src_rec: InFrame<'_>,
@@ -4315,8 +4379,40 @@ impl PvDatabase {
             staged: &mut staged.0,
             visited,
         };
-        let write = self.write_local_target(Some(held), to, lent.acts, value, &mut out);
+        let acts = TargetActs {
+            gate: None,
+            ..lent.acts
+        };
+        let write = self.write_local_target(Some(held), to, acts, value, &mut out);
         let status = self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited);
+        if status.is_err() {
+            set_out_link_alarm(src_rec, src.field);
+        }
+        status
+    }
+
+    /// C `dbDbPutValue`'s `processTarget` (`dbDbLink.c:384-390`) after a
+    /// successful [`Self::write_lent_out`], and `dbPutLink`'s alarm when it
+    /// fails.
+    #[inline(never)]
+    fn process_lent_target(
+        &self,
+        src_rec: InFrame<'_>,
+        lent: &LentOut,
+        gate: ProcessTargetGate,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> DbResult {
+        let held = src_rec.set();
+        // SAFETY: as in `write_lent_out`; the put since was a `dbPut`, which
+        // refuses a link field, so it left the OUT cache as the frame read it.
+        let rec = unsafe { lent.target.lend(held, src_rec.unframed()) };
+        let target_src = TargetSrc {
+            rec: Some(src_rec.unframed()),
+            putf: src.putf,
+            notify: src.notify,
+        };
+        let status = self.process_target_at(target_src, &rec, gate, Some(held), visited);
         if status.is_err() {
             set_out_link_alarm(src_rec, src.field);
         }
@@ -5726,7 +5822,7 @@ pub(crate) type RenderedFetch = (
 
 /// The INVALID every failing OUT put owes its record (`setLinkAlarm`).
 #[cold]
-fn set_out_link_alarm(src_rec: InFrame<'_>, field: &'static str) {
+pub(super) fn set_out_link_alarm(src_rec: InFrame<'_>, field: &'static str) {
     let mut inst = src_rec.write();
     crate::server::recgbl::rec_gbl_set_link_alarm(&mut inst.common, field);
 }

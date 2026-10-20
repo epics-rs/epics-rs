@@ -156,6 +156,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/pva_link_empty_name_processes_invalid.rs",
     ),
     ("epics-bridge-rs", "tests/pva_link_parse_warnings.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pva_link_put_error_prints_the_pvxs_line.rs",
+    ),
     ("epics-bridge-rs", "tests/pva_link_put_relinks_cp_holder.rs"),
     ("epics-bridge-rs", "tests/pva_link_scan_needs_an_inlink.rs"),
     ("epics-bridge-rs", "tests/pva_local_link_unfulfilled.rs"),

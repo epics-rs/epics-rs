@@ -197,13 +197,46 @@ struct UpstreamSubscription {
     /// `asg`/`asl` capture that left hooks enforcing the identity
     /// resolved at first subscription forever.
     acl: PvAclCell,
-    /// watcher that wakes downstream clients when the upstream rights
-    /// change. Aborted on drop (when the subscription is removed via
-    /// `unsubscribe`).
-    _access_rights_watcher: AbortOnDrop,
+    /// The [`ChannelEventOwner`] task. Aborted on drop (when the
+    /// subscription is removed via `unsubscribe`).
+    channel_events: AbortOnDrop,
+    /// The shadow PV's life, which the forwarding tasks follow.
+    life: tokio::sync::watch::Receiver<ShadowLife>,
 }
 
-/// Aborts the access-rights watcher with the subscription that owns it.
+/// One registration of the shadow PV: C `gatePvData` between `life()` and
+/// `death()`. The number counts the lives, so a follower can tell a revival
+/// from the life it already served.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShadowLife {
+    Alive(u64),
+    Dead(u64),
+}
+
+impl ShadowLife {
+    fn alive(self) -> Option<u64> {
+        match self {
+            Self::Alive(n) => Some(n),
+            Self::Dead(_) => None,
+        }
+    }
+
+    /// The shadow PV is removed.
+    fn die(&mut self) {
+        if let Self::Alive(n) = *self {
+            *self = Self::Dead(n);
+        }
+    }
+
+    /// The replacement shadow PV is registered.
+    fn revive(&mut self) {
+        if let Self::Dead(n) = *self {
+            *self = Self::Alive(n + 1);
+        }
+    }
+}
+
+/// Aborts the channel-event owner with the subscription that owns it.
 struct AbortOnDrop(TaskHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -355,35 +388,156 @@ pub struct UpstreamManagerConfig {
     pub upstream_tls_server_name: Option<String>,
 }
 
+/// C `gatePvData::connectCB` and `accessCB` for one subscription: the one
+/// consumer of the channel's connection events, and the only writer of the
+/// shadow PV's [`ShadowLife`]. Death and revival happen here and nowhere
+/// else, whatever upstream monitors are armed.
+#[cfg(tokio_backend)]
+struct ChannelEventOwner {
+    channel: std::sync::Weak<CaChannel>,
+    name: RecordName,
+    cache: Arc<RwLock<PvCache>>,
+    db: Arc<PvDatabase>,
+    life: tokio::sync::watch::Sender<ShadowLife>,
+    /// The shadow PV the last death removed, kept for its hooks; `Some`
+    /// while dead.
+    retired: Option<Arc<epics_base_rs::server::pv::ProcessVariable>>,
+    notifier: Arc<ArcSwapOption<AccessRightsNotifier>>,
+    beacon_anomaly: Arc<super::beacon::BeaconAnomaly>,
+    /// Bound on the revival's control get (`metadata_seed_timeout`); zero
+    /// skips it.
+    ctrl_timeout: Duration,
+    shown: AccessRights,
+}
+
+#[cfg(tokio_backend)]
+impl ChannelEventOwner {
+    async fn run(mut self, mut events: broadcast::Receiver<ConnectionEvent>) {
+        loop {
+            let event = events.recv().await;
+            let Some(channel) = self.channel.upgrade() else {
+                break;
+            };
+            match event {
+                Ok(ConnectionEvent::Disconnected) => self.death().await,
+                Ok(ConnectionEvent::Connected) => self.revive(&channel).await,
+                Ok(ConnectionEvent::AccessRightsChanged { .. }) => self.access(&channel),
+                Ok(ConnectionEvent::NativeTypeChanged { .. }) => {}
+                // The lost events may have been a death or a revival.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if channel.info().await.is_ok() {
+                        self.revive(&channel).await;
+                    } else {
+                        self.death().await;
+                    }
+                    self.access(&channel);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    /// `gatePvData::death` (gatePv.cc:575-601): mark the cache entry
+    /// disconnected and DELETE the downstream virtual channel.
+    ///
+    /// `delete vc; vc = NULL;` (`:600-601`) is the whole point — the
+    /// downstream monitors STOP. Removing the shadow PV destroys it, which
+    /// retires every downstream channel with `CA_PROTO_SERVER_DISCONN`; while
+    /// it is gone the name answers does-not-exist, C's `pverDoesNotExistHere`
+    /// (`:622`). The followers drop their upstream monitors on the
+    /// transition, as `death` unmonitors (`:658-661`).
+    async fn death(&mut self) {
+        if self.life.borrow().alive().is_none() {
+            return;
+        }
+        if let Some(entry) = self.cache.read().await.get(&self.name) {
+            entry.write().await.set_state(PvState::Disconnect);
+        }
+        self.retired = self.db.remove_simple_pv(&self.name).await;
+        self.life.send_modify(ShadowLife::die);
+    }
+
+    /// `gatePvData::life` then `activate` → `get(ctrlType)` → `getCB` →
+    /// `setPvData` (gatePv.cc:547-556, 398-401, 1693-1695): a fresh shadow PV
+    /// with the dead one's hooks, seeded from the returning upstream before
+    /// it is registered. A failed control get keeps the dead PV's value and
+    /// metadata, which the property monitor's first event then refreshes.
+    async fn revive(&mut self, channel: &CaChannel) {
+        if self.life.borrow().alive().is_some() {
+            return;
+        }
+        let Some(dead) = self.retired.clone() else {
+            return;
+        };
+        let ctrl = if self.ctrl_timeout.is_zero() {
+            None
+        } else {
+            epics_base_rs::runtime::task::timeout(
+                self.ctrl_timeout,
+                channel.get_with_metadata(DbrClass::Ctrl),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        };
+        let replacement = match &ctrl {
+            Some(snap) => {
+                let pv = dead.respawn(snap.value.clone());
+                pv.set_metadata(epics_base_rs::server::pv::PvMetadata {
+                    display: snap.display.clone(),
+                    control: snap.control.clone(),
+                    enums: snap.enums.clone(),
+                });
+                pv
+            }
+            None => dead.respawn(dead.snapshot().value),
+        };
+        if let Some(entry) = self.cache.read().await.get(&self.name) {
+            let mut entry = entry.write().await;
+            if entry.state == PvState::Disconnect {
+                let next = if entry.subscriber_count() > 0 {
+                    PvState::Active
+                } else {
+                    PvState::Inactive
+                };
+                entry.set_state(next);
+            }
+        }
+        if let Err(e) = self.db.add_simple_pv(replacement).await {
+            tracing::debug!(
+                pv = %self.name,
+                error = %e,
+                "ca-gateway-rs: shadow PV re-registration after upstream reconnect failed"
+            );
+            return;
+        }
+        self.retired = None;
+        self.life.send_modify(ShadowLife::revive);
+        // `life()` for a disconnected PV (gatePv.cc:543-545).
+        self.beacon_anomaly.request();
+    }
+
+    /// C accessCB (gatePv.cc:1851-1852) updates BOTH read and write from
+    /// ca_read_access/ca_write_access; postAccessRights re-pushes when the
+    /// computed level changed on either bit. The hook reads the channel
+    /// itself, so this only wakes downstream clients when either bit
+    /// flipped; a lag loses nothing the hook reads.
+    fn access(&mut self, channel: &CaChannel) {
+        let now = channel.access_rights();
+        if (now.read, now.write) != (self.shown.read, self.shown.write) {
+            self.shown = now;
+            if let Some(n) = self.notifier.load_full() {
+                n.notify();
+            }
+        }
+    }
+}
+
 /// Manages upstream CA client connections for the gateway.
 ///
 /// Holds a single shared `CaClient` and tracks per-PV channel +
 /// monitor task pairs. The channel is reused for PUT / GET so the
 /// gateway does not re-do CA handshake on every write.
-/// The gateway's `gatePvData::death` (gatePv.cc:575-601): the upstream
-/// channel is gone, so mark the cache entry disconnected and DELETE the
-/// downstream virtual channel.
-///
-/// `delete vc; vc = NULL;` (`:600-601`) is the whole point — the downstream
-/// monitors STOP. Removing the shadow PV destroys it, which retires every
-/// downstream channel with `CA_PROTO_SERVER_DISCONN`; while it is gone the
-/// name answers does-not-exist, C's `pverDoesNotExistHere` (`:622`).
-///
-/// Returns the retired PV so the reconnect path can
-/// [`respawn`](epics_base_rs::server::pv::ProcessVariable::respawn) it with
-/// its hooks and shadow metadata intact. `None` when there was nothing to
-/// retire (already dead, or evicted meanwhile).
-async fn upstream_death(
-    cache: &Arc<RwLock<PvCache>>,
-    db: &Arc<PvDatabase>,
-    name: &[u8],
-) -> Option<Arc<epics_base_rs::server::pv::ProcessVariable>> {
-    if let Some(entry_arc) = cache.read().await.get(name) {
-        entry_arc.write().await.set_state(PvState::Disconnect);
-    }
-    db.remove_simple_pv(name).await
-}
-
 #[cfg(tokio_backend)]
 pub struct UpstreamManager {
     /// The executor every upstream forwarding task is spawned through.
@@ -970,44 +1124,34 @@ impl UpstreamManager {
             let _ = gate.reached.send(channel.clone());
             let _ = gate.release.await;
         }
-        let access_rights_watcher = AbortOnDrop(self.reactor.spawn({
-            let notifier = self.access_notifier.clone();
-            let channel = Arc::downgrade(&channel);
-            async move {
-                // C accessCB (gatePv.cc:1851-1852) updates BOTH read and
-                // write from ca_read_access/ca_write_access; postAccessRights
-                // re-pushes when the computed level changed on either bit.
-                // The hook reads the channel itself, so this task only wakes
-                // downstream clients when either bit flipped; a lag loses
-                // nothing the hook reads.
-                let mut shown = initial_rights;
-                loop {
-                    match conn_rx.recv().await {
-                        Ok(ConnectionEvent::AccessRightsChanged { .. })
-                        | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let Some(ch) = channel.upgrade() else { break };
-                            let now = ch.access_rights();
-                            if (now.read, now.write) != (shown.read, shown.write) {
-                                shown = now;
-                                if let Some(n) = notifier.load_full() {
-                                    n.notify();
-                                }
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
+        // The shadow PV is registered above, so this is its first life.
+        let (life_tx, life) = tokio::sync::watch::channel(ShadowLife::Alive(0));
+        let channel_events = AbortOnDrop(
+            self.reactor.spawn(
+                ChannelEventOwner {
+                    channel: Arc::downgrade(&channel),
+                    name: RecordName::from(served_name),
+                    cache: self.cache.clone(),
+                    db: self.shadow_db.clone(),
+                    life: life_tx,
+                    retired: None,
+                    notifier: self.access_notifier.clone(),
+                    beacon_anomaly: self.write_env.beacon_anomaly.clone(),
+                    ctrl_timeout: self.metadata_seed_timeout,
+                    shown: initial_rights,
                 }
-            }
-        }));
+                .run(conn_rx),
+            ),
+        );
 
         // Spawn the monitor-forwarding task. CACHED: spawn now, seeded
         // with the monitor subscribed above. NO-CACHE: `initial_monitor`
         // is `None`, so no task spawns here — `ensure_monitor` creates it
         // (self-subscribing) on the first downstream monitor, and
         // `release_monitor` aborts it when the last monitor leaves.
-        let task = initial_monitor
-            .map(|monitor| self.spawn_forward_task(served_name, channel.clone(), Some(monitor)));
+        let task = initial_monitor.map(|monitor| {
+            self.spawn_forward_task(served_name, channel.clone(), Some(monitor), life.clone())
+        });
 
         // Property monitor: CACHED spawns it eagerly alongside the value
         // monitor (C `getCB` [CACHE] enables `propMonitor()` unconditionally,
@@ -1019,7 +1163,12 @@ impl UpstreamManager {
         let prop_task = if self.cache_mode.is_no_cache() {
             None
         } else {
-            Some(self.spawn_prop_forward_task(served_name, channel.clone(), seed_succeeded))
+            Some(self.spawn_prop_forward_task(
+                served_name,
+                channel.clone(),
+                seed_succeeded,
+                life.clone(),
+            ))
         };
 
         // subscription dedup keys on `served_name` so a
@@ -1033,7 +1182,8 @@ impl UpstreamManager {
                 prop_task,
                 seed_succeeded,
                 acl,
-                _access_rights_watcher: access_rights_watcher,
+                channel_events,
+                life,
             },
         );
         Ok(())
@@ -1041,11 +1191,12 @@ impl UpstreamManager {
 
     /// Spawn the upstream monitor-forwarding task for `served_name`.
     ///
-    /// The single owner of one PV's upstream-subscription lifetime:
-    /// subscribes (autosize count=0 + configured `-mask` event mask),
-    /// forwards every event into the gateway cache + shadow PvDatabase,
-    /// surfaces an INVALID alarm on upstream disconnect, and re-subscribes
-    /// with exponential backoff. Used by `ensure_subscribed` (cached
+    /// Within each shadow PV life ([`ChannelEventOwner`] owns the deaths and
+    /// revivals) it subscribes (autosize count=0 + configured `-mask` event
+    /// mask), forwards every event into the gateway cache + shadow
+    /// PvDatabase, and drops the subscription when the life ends, as C
+    /// `death` unmonitors and `getCB` re-arms (gatePv.cc:658-661, 1702).
+    /// Re-subscribes with exponential backoff. Used by `ensure_subscribed` (cached
     /// mode, seeded with `initial_monitor`) and by `ensure_monitor`
     /// (no-cache, `initial_monitor = None` → the task subscribes itself).
     ///
@@ -1059,11 +1210,11 @@ impl UpstreamManager {
         served_name: &[u8],
         channel: Arc<CaChannel>,
         initial_monitor: Option<MonitorHandle>,
+        mut life: tokio::sync::watch::Receiver<ShadowLife>,
     ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let stats_for_task = self.write_env.stats.clone();
-        let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
         // The reconnect / first-subscribe re-arm must use the same
         // autosize (wire count=0) + configured `-mask` event mask as the
         // seeded subscribe, not the DBE_LOG-bearing CaChannel default.
@@ -1075,32 +1226,29 @@ impl UpstreamManager {
         self.reactor.spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
-            // The shadow PV this task destroyed on the last upstream death,
-            // held only to seed its replacement. `Some` exactly while the
-            // downstream name is unresolvable, so it is also the flag that
-            // says "the next event has to re-register before it can post".
-            let mut retired: Option<std::sync::Arc<epics_base_rs::server::pv::ProcessVariable>> =
-                None;
-            // Seed the first iteration with the monitor the caller
-            // subscribed (cached mode); `None` (no-cache) subscribes at
-            // the top of the loop. Every reconnect re-subscribes the same
-            // way, so there is ONE subscribe site, not two.
+            // The monitor the caller subscribed (cached mode) belongs to the
+            // first life; `None` (no-cache, or any later life) subscribes at
+            // the loop top, the one subscribe site.
             let mut next_monitor = initial_monitor;
+            // The life the live subscription belongs to.
+            let mut lived = None;
             loop {
-                // Set by the death event: this monitor is dropped and the
-                // loop top re-subscribes at once, not after a backoff.
-                let mut died = false;
-                let mut monitor = match next_monitor.take() {
+                let Ok(now) = life
+                    .wait_for(|l| l.alive().is_some_and(|n| Some(n) != lived))
+                    .await
+                    .map(|l| l.alive())
+                else {
+                    return;
+                };
+                let seeded = next_monitor.take().filter(|_| now == Some(0));
+                let mut monitor = match seeded {
                     Some(m) => m,
                     None => match channel.subscribe_with_mask_autosize(0.0, event_mask).await {
                         Ok(m) => m,
                         // `CaError::Shutdown` means the CA client
                         // coordinator is gone — `subscribe()` will never
                         // succeed again, so retrying just spins at the
-                        // backoff cap forever. Exit cleanly; the cache
-                        // entry stays in Disconnect and the next search
-                        // resolver pass re-creates the channel against a
-                        // live client.
+                        // backoff cap forever. Exit cleanly.
                         Err(CaError::Shutdown) => {
                             tracing::debug!(
                                 pv = %name,
@@ -1123,56 +1271,34 @@ impl UpstreamManager {
                         }
                     },
                 };
-                while let Some(result) = monitor.recv().await {
-                    let snapshot = match result {
-                        Ok(s) => s,
-                        // THIS is the death event, not the end of the stream.
-                        // A CA subscription SURVIVES a disconnect — it parks
-                        // one `ECA_DISCONN` in the subscriber's error slot
-                        // (`client/subscription.rs:485-506`) and resumes when
-                        // the circuit comes back, so `monitor.recv()` keeps
-                        // yielding and the loop below it is reached only when
-                        // the subscription is cancelled or the CA coordinator
-                        // shuts down. C drives `gatePvData::death` from the
-                        // connection callback for exactly this reason
-                        // (gatePv.cc:575), and swallowing the error here left
-                        // the downstream channel connected on a dead upstream
-                        // with no event of any kind — not even the INVALID
-                        // alarm this path used to claim to post.
-                        //
-                        // `death` also unmonitors (gatePv.cc:658-661) and the
-                        // revived channel subscribes afresh, so an event the
-                        // server held across an unresponsive window lands on a
-                        // cancelled subid instead of reviving the shadow PV.
-                        Err(CaError::ServerError(epics_ca_rs::protocol::ECA_DISCONN)) => {
-                            if let Some(pv) = upstream_death(&cache_clone, &db_clone, &name).await {
-                                retired = Some(pv);
-                            }
-                            died = true;
-                            break;
-                        }
-                        // Any other per-event error is a lost update, not a
-                        // lost channel.
-                        Err(_) => continue,
+                lived = now;
+                let ended = loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = life.wait_for(|l| l.alive() != lived) => break false,
+                        result = monitor.recv() => match result {
+                            Some(result) => result,
+                            None => break true,
+                        },
+                    };
+                    // A CA subscription survives a disconnect: it parks one
+                    // `ECA_DISCONN` here and resumes with the circuit. That
+                    // death reaches this task through `life`, which drops the
+                    // subscription, so an event the server held across an
+                    // unresponsive window lands on a cancelled subid. Any
+                    // other error is a lost update.
+                    let Ok(snapshot) = result else {
+                        continue;
                     };
 
                     stats_for_task.record_event();
 
-                    // Update gateway cache.
-                    //
-                    // First event after Connecting / Disconnect:
-                    //   * If subscribers are already attached
-                    //     (downstream re-attached during the gap), go
-                    //     straight to `Active` — naive demote to
-                    //     `Inactive` would otherwise regress an
-                    //     already-active PV every time the upstream
-                    //     reconnects.
-                    //   * Otherwise → `Inactive`.
-                    let mut transitioned_from_disconnect = false;
+                    // First event of the first life: `Connecting` → `Active`
+                    // when downstream already attached, else `Inactive`. A
+                    // revival's state is the channel-event owner's.
                     if let Some(entry_arc) = cache_clone.read().await.get(&name) {
                         let mut entry = entry_arc.write().await;
-                        let was_disconnect = matches!(entry.state, PvState::Disconnect);
-                        if matches!(entry.state, PvState::Connecting | PvState::Disconnect) {
+                        if entry.state == PvState::Connecting {
                             let next = if entry.subscriber_count() > 0 {
                                 PvState::Active
                             } else {
@@ -1181,35 +1307,6 @@ impl UpstreamManager {
                             entry.set_state(next);
                         }
                         entry.update(snapshot.clone());
-                        transitioned_from_disconnect = was_disconnect;
-                    }
-
-                    // trigger a beacon anomaly when the upstream
-                    // reconnects so other gateway-aware clients
-                    // re-discover and the downstream side knows the
-                    // gateway is alive again. Mirrors C++ ca-gateway
-                    // gateServer::generateBeaconAnomaly on reconnect.
-                    if transitioned_from_disconnect {
-                        beacon_anomaly_for_task.request();
-                    }
-
-                    // Upstream is back and the last death destroyed the
-                    // shadow PV, so build its replacement before posting —
-                    // ca-gateway's new `gateVcData` after `death()` deleted
-                    // the old one. `respawn` carries the retired PV's hooks
-                    // and shadow metadata onto a fresh, live object; the
-                    // destroyed one is never revived, so the channels retired
-                    // with it cannot come back to life.
-                    if let Some(old_pv) = retired.take() {
-                        let replacement = old_pv.respawn(snapshot.value.clone());
-                        if let Err(e) = db_clone.add_simple_pv(replacement).await {
-                            tracing::debug!(
-                                pv = %name,
-                                error = %e,
-                                "ca-gateway-rs: shadow PV re-registration after \
-                                 upstream reconnect failed"
-                            );
-                        }
                     }
 
                     // Push upstream snapshot (value + alarm + timestamp) to
@@ -1237,30 +1334,19 @@ impl UpstreamManager {
 
                     // Re-arm the backoff after a successful event.
                     backoff = Duration::from_millis(250);
-                }
-                if died {
-                    continue;
-                }
-
-                // The subscription itself ended — cancelled, or the CA
-                // coordinator shut down. Same death, same owner: the
-                // downstream virtual channel goes with it. The retired PV is
-                // kept, not dropped, because it carries this subscription's
-                // write / access / read hooks and shadow DBR_CTRL metadata,
-                // which `respawn` puts back on the replacement.
-                if let Some(pv) = upstream_death(&cache_clone, &db_clone, &name).await {
-                    retired = Some(pv);
-                }
-
-                // Back off, then loop: the top of the loop re-subscribes
-                // (the single subscribe site). Bail out if the cache
-                // entry has been evicted (nobody cares anymore). The
-                // CaChannel itself drives reconnect under the hood; this
-                // loop merely re-arms the monitor stream once it is back.
-                epics_base_rs::runtime::task::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, max_backoff);
-                if cache_clone.read().await.get(&name).is_none() {
-                    return;
+                };
+                drop(monitor);
+                if ended {
+                    // The subscription itself ended within this life —
+                    // cancelled, or the CA coordinator shut down. Back off,
+                    // then the loop top re-subscribes. Bail out if the cache
+                    // entry has been evicted (nobody cares anymore).
+                    lived = None;
+                    epics_base_rs::runtime::task::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    if cache_clone.read().await.get(&name).is_none() {
+                        return;
+                    }
                 }
             }
         })
@@ -1294,20 +1380,19 @@ impl UpstreamManager {
     /// may carry metadata that changed during the outage) refreshes
     /// `setPvData` and posts `propertyEventMask()`.
     ///
-    /// Re-subscribes with exponential backoff on upstream disconnect, exits
+    /// Re-subscribes with exponential backoff when its subscription ends, exits
     /// cleanly on `CaError::Shutdown` or cache eviction, and changes no
     /// external truth (aborting only drops the in-memory monitor stream and
     /// leaves the last-installed metadata in place), so
     /// `release_prop_monitor` may abort the returned handle with no
-    /// finalizer — symmetric to `spawn_forward_task`. Unlike the value task
-    /// it surfaces no disconnect alarm: the value task already owns the
-    /// downstream disconnect signal; this task only re-arms its metadata
-    /// stream.
+    /// finalizer — symmetric to `spawn_forward_task`, and like it follows
+    /// the lives [`ChannelEventOwner`] owns.
     fn spawn_prop_forward_task(
         &self,
         served_name: &[u8],
         channel: Arc<CaChannel>,
         seed_succeeded: bool,
+        mut life: tokio::sync::watch::Receiver<ShadowLife>,
     ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
@@ -1329,11 +1414,25 @@ impl UpstreamManager {
             // propMonitor() only after getCB seeds (gatePv.cc:1702-1705).
             // When the seed did NOT land (slow/failed 500 ms get), consume the
             // first event to seed instead — its DBR_CTRL payload carries the
-            // full metadata, so metadata is never left zeroed. Tracked across
-            // reconnects so a reconnect's initial event DOES refresh — it may
-            // carry metadata that changed while upstream was gone.
-            let mut first_event_seen = !seed_succeeded;
+            // full metadata, so metadata is never left zeroed. Only the first
+            // life skips: C sets `prop_get_state` in the constructor alone
+            // (gatePv.cc:203), so a revival's initial event refreshes and
+            // posts. `Some(life)` while
+            // that life's initial event is still to be skipped.
+            let mut seeded = seed_succeeded.then_some(0);
+            // The life the live subscription belongs to. C `death` clears the
+            // property monitor with the PV (gatePv.cc:661) and `getCB` re-arms
+            // it only once the PV lives again (gatePv.cc:1705); one kept
+            // across the death refreshed a shadow PV that was not there.
+            let mut lived = None;
             loop {
+                let Ok(now) = life
+                    .wait_for(|l| l.alive().is_some_and(|n| Some(n) != lived))
+                    .await
+                    .map(|l| l.alive())
+                else {
+                    return;
+                };
                 let mut monitor = match channel
                     .subscribe_with_mask_autosize(0.0, DBE_PROPERTY)
                     .await
@@ -1357,14 +1456,23 @@ impl UpstreamManager {
                         continue;
                     }
                 };
-                while let Some(result) = monitor.recv().await {
+                lived = now;
+                let ended = loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = life.wait_for(|l| l.alive() != lived) => break false,
+                        result = monitor.recv() => match result {
+                            Some(result) => result,
+                            None => break true,
+                        },
+                    };
                     // The trigger payload is discarded; a decode error is a
-                    // missed trigger, not fatal.
+                    // missed trigger, not fatal, and a disconnect is the
+                    // death the channel-event owner reports through `life`.
                     if result.is_err() {
                         continue;
                     }
-                    if !first_event_seen {
-                        first_event_seen = true;
+                    if seeded.take_if(|&mut n| Some(n) == lived).is_some() {
                         continue;
                     }
                     // A property change fired: re-read the full control
@@ -1388,14 +1496,18 @@ impl UpstreamManager {
                         ),
                     }
                     backoff = Duration::from_millis(250);
-                }
-                // Subscription closed (upstream disconnect). Back off, then
-                // the top of the loop re-subscribes. Bail if the cache entry
-                // was evicted (nobody cares anymore).
-                epics_base_rs::runtime::task::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, max_backoff);
-                if cache_clone.read().await.get(&name).is_none() {
-                    return;
+                };
+                drop(monitor);
+                if ended {
+                    // The subscription itself ended within this life. Back
+                    // off, then the top of the loop re-subscribes. Bail if the
+                    // cache entry was evicted (nobody cares anymore).
+                    lived = None;
+                    epics_base_rs::runtime::task::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    if cache_clone.read().await.get(&name).is_none() {
+                        return;
+                    }
                 }
             }
         })
@@ -1421,15 +1533,15 @@ impl UpstreamManager {
         // (spawn is sync but keep the critical section minimal), then
         // store the handle under the lock — re-checking no peer raced a
         // task in between.
-        let channel = {
+        let (channel, life) = {
             let subs = self.subs.lock();
             match subs.get(served_name) {
-                Some(sub) if sub.task.is_none() => sub.channel.clone(),
+                Some(sub) if sub.task.is_none() => (sub.channel.clone(), sub.life.clone()),
                 // No subscription (evicted) or a task already runs.
                 _ => return,
             }
         };
-        let handle = self.spawn_forward_task(served_name, channel, None);
+        let handle = self.spawn_forward_task(served_name, channel, None, life);
         let mut subs = self.subs.lock();
         match subs.get_mut(served_name) {
             // Re-check: another caller may have raced a task in, or the
@@ -1477,15 +1589,17 @@ impl UpstreamManager {
         if !self.cache_mode.is_no_cache() {
             return;
         }
-        let (channel, seed_succeeded) = {
+        let (channel, seed_succeeded, life) = {
             let subs = self.subs.lock();
             match subs.get(served_name) {
-                Some(sub) if sub.prop_task.is_none() => (sub.channel.clone(), sub.seed_succeeded),
+                Some(sub) if sub.prop_task.is_none() => {
+                    (sub.channel.clone(), sub.seed_succeeded, sub.life.clone())
+                }
                 // No subscription (evicted) or a prop task already runs.
                 _ => return,
             }
         };
-        let handle = self.spawn_prop_forward_task(served_name, channel, seed_succeeded);
+        let handle = self.spawn_prop_forward_task(served_name, channel, seed_succeeded, life);
         let mut subs = self.subs.lock();
         match subs.get_mut(served_name) {
             // Re-check: another caller may have raced a prop task in, or the
@@ -1530,13 +1644,16 @@ impl UpstreamManager {
     /// pass the served name they read from the cache / subs map.
     pub async fn unsubscribe(&self, served_name: &[u8]) {
         let removed = self.subs.lock().remove(served_name);
-        if let Some(sub) = removed {
+        if let Some(mut sub) = removed {
             if let Some(task) = sub.task {
                 task.abort();
             }
             if let Some(prop_task) = sub.prop_task {
                 prop_task.abort();
             }
+            // A revival in flight must not re-add the PV removed below.
+            sub.channel_events.0.abort();
+            let _ = (&mut sub.channel_events.0).await;
         }
         // Best-effort: if the PV is gone already (concurrent reload
         // path) `remove_simple_pv` returns None; we don't care.
@@ -2982,7 +3099,7 @@ ASG(NewGroup) {
     /// first-event skip conditional on the seed outcome (`seed_succeeded`).
     /// Forcing a zero seed budget makes every connect-time seed miss, so a
     /// non-empty downstream `units` proves the first-event recovery seeded
-    /// it. Reverting `first_event_seen = !seed_succeeded` to `= false`
+    /// it. Reverting `seeded = seed_succeeded.then_some(0)` to `= Some(0)`
     /// leaves units empty and fails this test.
     // Stands up an in-process async `CaServer`, whose accept/search
     // loops reach the network through the `runtime::task` seam. Under
@@ -3265,8 +3382,8 @@ ASG(NewGroup) {
         );
 
         // Upstream returns. C rebuilds the virtual channel on the next
-        // exist-test after `life()`; here the forward task respawns it from
-        // the retired one on the first event, so the replacement keeps this
+        // exist-test after `life()`; here the channel-event owner respawns it
+        // from the retired one on reconnect, so the replacement keeps this
         // subscription's write hook instead of coming back unwritable.
         upstream_db
             .add_pv(name, EpicsValue::Double(7.0))
@@ -3294,6 +3411,203 @@ ASG(NewGroup) {
             "the replacement carries the subscription's write hook, so a \
              downstream caput still forwards upstream"
         );
+
+        mgr.shutdown().await;
+    }
+
+    /// No-cache: death and revival come from the channel's connection
+    /// events, as C `connectCB`, so they happen with no downstream monitor —
+    /// `release_monitor` once took the only task that could revive the PV.
+    /// The revival seeds the replacement from the control get, which is the
+    /// only source of 7.0 with no monitor armed.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br3_no_cache_dies_and_revives_with_no_downstream_monitor() {
+        let name = "BR3:nc";
+        let server = CaServer::builder()
+            .port(0)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let port = server.udp_port();
+        let upstream_db = server.database().clone();
+        let _upstream = tokio::spawn(async move { server.run().await });
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let mgr = pinned_manager_full(
+            db.clone(),
+            cache.clone(),
+            CacheMode::NoCache,
+            NO_CONNECT_DEADLINE,
+        )
+        .await;
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
+            .await
+            .expect("connects");
+        let upstream = upstream_db.find_pv(name).await.expect("upstream PV");
+
+        // With a monitor that is released while the PV is dead.
+        mgr.ensure_monitor(name.as_bytes());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while upstream.subscriber_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "value monitor");
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+        }
+        let wait_for = |live: bool, what: &'static str| {
+            let db = db.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while db.find_pv(name).await.is_some() != live {
+                    assert!(std::time::Instant::now() < deadline, "{what}");
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        upstream_db
+            .remove_simple_pv(name)
+            .await
+            .expect("upstream PV");
+        wait_for(false, "death with a monitor").await;
+        mgr.release_monitor(name.as_bytes());
+        upstream_db
+            .add_pv(name, EpicsValue::Double(7.0))
+            .await
+            .expect("upstream back");
+        wait_for(true, "revival after the monitor left").await;
+
+        // With no monitor at all.
+        upstream_db
+            .remove_simple_pv(name)
+            .await
+            .expect("upstream PV");
+        wait_for(false, "death with no monitor").await;
+        upstream_db
+            .add_pv(name, EpicsValue::Double(7.0))
+            .await
+            .expect("upstream back");
+        wait_for(true, "revival with no monitor").await;
+        let revived = db.find_pv(name).await.expect("revived");
+        assert_eq!(
+            revived.snapshot().value,
+            EpicsValue::Double(7.0),
+            "the replacement is seeded by the control get"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// C `gatePvData::death` clears both monitors (gatePv.cc:658-661) and
+    /// `getCB` re-arms them only after `life()` (gatePv.cc:1702-1705). A
+    /// monitor kept across the death is re-installed with the channel, so
+    /// it is on the wire while the revival is held. The property task is
+    /// held past the first life, so it starts into a dead one.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br3_the_property_monitor_dies_with_the_pv_and_rearms_after_revival() {
+        use epics_base_rs::server::snapshot::{DisplayInfo, Snapshot};
+
+        let name = "BR3:prop";
+        let units_of = |units: &str| {
+            let mut ctrl = Snapshot::new(
+                EpicsValue::Double(1.0),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            ctrl.display = Some(DisplayInfo {
+                units: units.into(),
+                ..Default::default()
+            });
+            ctrl
+        };
+        let shadow_units = |db: Arc<PvDatabase>| async move {
+            db.find_pv(name)
+                .await
+                .and_then(|pv| pv.snapshot().display)
+                .map(|d| d.units.to_string())
+        };
+
+        let server = CaServer::builder()
+            .port(0)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let port = server.udp_port();
+        let upstream_db = server.database().clone();
+        let _upstream = tokio::spawn(async move { server.run().await });
+        upstream_db
+            .set_pv_metadata(name, &units_of("mm"))
+            .await
+            .expect("upstream metadata");
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let mgr = pinned_manager_full(
+            db.clone(),
+            cache.clone(),
+            CacheMode::Cached,
+            NO_CONNECT_DEADLINE,
+        )
+        .await;
+        let (release_prop, release) = epics_base_rs::runtime::sync::oneshot::channel();
+        *mgr.prop_gate.lock() = Some(release);
+        mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
+            .await
+            .expect("upstream connects");
+        assert_eq!(shadow_units(db.clone()).await.as_deref(), Some("mm"));
+
+        upstream_db
+            .remove_simple_pv(name)
+            .await
+            .expect("upstream PV");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while db.find_pv(name).await.is_some() {
+            assert!(std::time::Instant::now() < deadline, "upstream death");
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = release_prop.send(());
+
+        // The revival re-registers through the cache, so holding it keeps
+        // the gateway dead while the upstream comes back with new metadata.
+        let hold = cache.write().await;
+        upstream_db
+            .add_pv(name, EpicsValue::Double(7.0))
+            .await
+            .expect("upstream PV comes back");
+        upstream_db
+            .set_pv_metadata(name, &units_of("cm"))
+            .await
+            .expect("upstream metadata");
+        let returned = upstream_db.find_pv(name).await.expect("upstream PV");
+        let channel = mgr.subs.lock()[name.as_bytes()].channel.clone();
+        channel
+            .wait_connected(Duration::from_secs(30))
+            .await
+            .expect("the channel reconnects");
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            returned.subscriber_count(),
+            0,
+            "no monitor is on the wire before the revival"
+        );
+        drop(hold);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while shadow_units(db.clone()).await.as_deref() != Some("cm") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the revived PV takes the returning upstream's metadata, got {:?}",
+                shadow_units(db.clone()).await
+            );
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(returned.subscriber_count(), 2);
 
         mgr.shutdown().await;
     }

@@ -23,6 +23,18 @@ const VERSION: f64 = 4.1;
 /// `sCalcoutRecord.dbd:877,883` `unsigned char rpcl[282]`, `orpc[282]`.
 const SCALCOUT_RPCL_SIZE: usize = 282;
 
+/// This cycle's CALC pass (C `sCalcoutRecord.c:356-367`), for `check_alarms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CalcPass {
+    /// No `sCalcPerform` ran: `fetch_values` failed, or an ODLY / WAIT re-entry.
+    #[default]
+    NotRun,
+    /// CALC_ALARM, UDF untouched.
+    Failed,
+    /// `pcalc->udf = FALSE`.
+    Defined,
+}
+
 /// Scalcout record — string calc with output.
 ///
 /// Like calcout but uses the string calc engine (sCalcPerform).
@@ -138,11 +150,12 @@ pub struct ScalcoutRecord {
     /// The private `prev_sval` it replaces was a copy of SVAL taken at the top of
     /// `process()` and read by nothing.
     psvl: PvString,
-    /// This cycle's `sCalcPerform` outcome — set when the CALC or OCAL
-    /// evaluation fails (C `sCalcoutRecord.c:357-363`, `:786-808`). A per-cycle
-    /// fact, not record state: `check_alarms` — the owner of this record's alarm
-    /// transitions — consumes it, so it cannot outlive the cycle that set it.
-    calc_alarm: bool,
+    /// Consumed by `check_alarms` every cycle, so it cannot outlive its cycle.
+    calc_pass: CalcPass,
+    /// OCAL's `sCalcPerform` failed in `execOutput` (`:768-774`). C raises it
+    /// after `checkAlarms`, so `check_analog_alarms` consumes it after the
+    /// ladder; it never decides UDF.
+    ocal_failed: bool,
     /// This cycle's `fetch_values()` outcome, pushed by the framework through
     /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
     /// `sCalcPerform` only `if (fetch_values(pcalc)==0)`, and `fetch_values`
@@ -265,7 +278,8 @@ impl Default for ScalcoutRecord {
             mlst: 0.0,
             alst: 0.0,
             psvl: PvString::new(),
-            calc_alarm: false,
+            calc_pass: CalcPass::NotRun,
+            ocal_failed: false,
             fetch_gate_failed: false,
             cached_should_output: false,
             odly: 0.0,
@@ -424,7 +438,7 @@ impl ScalcoutRecord {
                 // VAL=-1 sentinel.
                 self.oval = -1.0;
                 self.osv = PvString::from("***ERROR***");
-                self.calc_alarm = true;
+                self.ocal_failed = true;
             }
         }
         self.apply_stores(&inputs);
@@ -1141,8 +1155,8 @@ impl Record for ScalcoutRecord {
         // CALC-pass store (`A:=A+1`, `AA:="x"`) is what the OCAL pass fetches,
         // and both land in the record's A..L / AA..LL ([`Self::apply_stores`]).
         let mut inputs = self.build_inputs(self.val, &self.sval);
-        let calc_failed = if self.fetch_gate_failed {
-            false
+        self.calc_pass = if self.fetch_gate_failed {
+            CalcPass::NotRun
         } else {
             // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
             // psresult = pcalc->sval: the VAL/SVAL tokens read this cycle's
@@ -1155,9 +1169,9 @@ impl Record for ScalcoutRecord {
                 // the VAL=-1 / SVAL="***ERROR***" branch below.
                 Ok(result) if !result.non_finite => {
                     self.apply_result(&result);
-                    false
+                    CalcPass::Defined
                 }
-                _ => true,
+                _ => CalcPass::Failed,
             }
         };
 
@@ -1167,6 +1181,7 @@ impl Record for ScalcoutRecord {
         // alongside the CALC_ALARM raise: a failed calc or failed input fetch
         // (`fetch_gate_failed`, which C's `if (fetch_values==0)` gate skips)
         // both leave `common.udf` untouched.
+        let calc_failed = self.calc_pass == CalcPass::Failed;
 
         // IVOA=Don't_drive on a failed calc vetoes the OUT WRITE only. C
         // applies the veto inside `execOutput` (sCalcoutRecord.c:430), which
@@ -1176,10 +1191,9 @@ impl Record for ScalcoutRecord {
         // as an early `return` skipped the ODLY branch entirely.
         let mut ivoa_veto_out = false;
         if calc_failed {
-            self.calc_alarm = true;
             // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces
             // VAL=-1 and SVAL="***ERROR***" (the CALC_ALARM severity itself
-            // is raised by `check_alarms` from this flag). Before
+            // is raised by `check_alarms` from `calc_pass`). Before
             // this the failed cycle kept the previous VAL/SVAL with no value
             // sentinel, diverging from C.
             self.val = -1.0;
@@ -1667,36 +1681,42 @@ impl Record for ScalcoutRecord {
         self.fetch_gate_failed = failed;
     }
 
-    /// C `sCalcoutRecord.c:357-363` (CALC) and `:786-808` (OCAL, inside
-    /// `execOutput`) — a failed `sCalcPerform` is `recGblSetSevr(pcalc,
-    /// CALC_ALARM, INVALID_ALARM)`, raised in `process()` before `checkAlarms`.
-    ///
-    /// Consuming the flag keeps it a per-cycle fact: a cycle whose input fetch
-    /// failed runs no `sCalcPerform` (`:356`) and raises nothing.
+    /// C `sCalcoutRecord.c:357-367`, ahead of `checkAlarms`: a failed CALC
+    /// `sCalcPerform` is `recGblSetSevr(pcalc, CALC_ALARM, INVALID_ALARM)`, a
+    /// successful one is `pcalc->udf = FALSE`, and a cycle whose input fetch
+    /// failed runs neither (`:356`).
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        // C `sCalcoutRecord.c:356` gates the whole calc+afterCalc body on
-        // `if (fetch_values(pcalc)==0)`; a failed input fetch runs no
-        // `sCalcPerform`, raises nothing, and leaves `udf` untouched.
-        if self.fetch_gate_failed {
-            return;
-        }
-        if std::mem::take(&mut self.calc_alarm) {
+        match std::mem::take(&mut self.calc_pass) {
             // C `sCalcoutRecord.c:364,774` use PLAIN `recGblSetSevr(pcalc,
             // CALC_ALARM, INVALID_ALARM)` — NULL message (empty namsg); PVA
             // falls back to the "CALC" condition string. No fabricated literal.
+            // UDF is left as it is, so a `caput UDF <byte>` keeps its raw byte.
+            CalcPass::Failed => {
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    common,
+                    crate::server::recgbl::alarm_status::CALC_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                );
+            }
+            // This hook is the SINGLE owner of `common.udf` —
+            // [`Self::clears_udf`] is false, so the framework never re-derives
+            // it from VAL and never collapses the put byte.
+            CalcPass::Defined => common.udf = 0,
+            CalcPass::NotRun => {}
+        }
+    }
+
+    /// `checkAlarms`' ladder, then the OCAL failure `execOutput` raises after
+    /// it (`sCalcoutRecord.c:771-774`): an equal-severity UDF or limit alarm
+    /// raised first keeps the status.
+    fn check_analog_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        crate::server::record::analog_alarm_ladder(self, common);
+        if std::mem::take(&mut self.ocal_failed) {
             crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::CALC_ALARM,
                 crate::server::record::AlarmSeverity::Invalid,
             );
-            // C's failed-calc branch leaves `udf` untouched, so a `caput UDF
-            // <byte>` before a failing cycle keeps its raw byte — byte fidelity.
-        } else {
-            // C `sCalcoutRecord.c:366` `else pcalc->udf = FALSE`: a successful
-            // fetch+calc DEFINES VAL/SVAL. This hook is the SINGLE owner of
-            // `common.udf` — [`Self::clears_udf`] is false, so the framework
-            // never re-derives it from VAL and never collapses the put byte.
-            common.udf = 0;
         }
     }
 

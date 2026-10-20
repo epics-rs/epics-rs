@@ -645,7 +645,10 @@ pub struct SscanRecord {
     /// Generation of the one delayed callback C's `dlyCallback` timer is:
     /// a newer request or a cancel retires the older ones.
     pub(crate) dly_gen: u64,
-    pub(crate) defined: bool,
+    /// `psscan->udf = 0` from an acquisition (`sscanRecord.c:3549`, `:3813`),
+    /// for the pass's `check_alarms`: C writes nothing else to UDF, so a
+    /// client's UDF put stands until data is next taken.
+    pub(crate) udf_clear: bool,
     pub(crate) fire_fwd: bool,
     pub(crate) stamp: bool,
     /// `psscan->scan = 0` from `special()`, for [`Record::take_scan_store`].
@@ -746,7 +749,7 @@ impl Default for SscanRecord {
             prio: CallbackPriority::Low,
             time: WallTime::now(),
             dly_gen: 0,
-            defined: false,
+            udf_clear: false,
             fire_fwd: false,
             stamp: false,
             scan_store: None,
@@ -1424,8 +1427,14 @@ impl Record for SscanRecord {
         self.fire_fwd
     }
 
-    fn value_is_undefined(&self) -> bool {
-        !self.defined
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        if std::mem::take(&mut self.udf_clear) {
+            common.udf = 0;
+        }
     }
 
     fn raises_udf_alarm(&self) -> bool {

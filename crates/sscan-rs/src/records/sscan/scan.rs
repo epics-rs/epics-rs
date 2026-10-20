@@ -517,7 +517,7 @@ impl SscanRecord {
         if self.copyto != 0 && self.atime >= 0.1 {
             self.copy_last_point(self.cpt, i64::from(self.copyto));
         }
-        self.defined = true;
+        self.udf_clear = true;
         if self.acqt == ACQT_1D_ARRAY {
             self.cpt = self.npts;
         } else {
@@ -655,7 +655,7 @@ impl SscanRecord {
             }
         }
 
-        self.defined = true;
+        self.udf_clear = true;
         if self.acqt == ACQT_1D_ARRAY {
             self.cpt = self.npts;
         }

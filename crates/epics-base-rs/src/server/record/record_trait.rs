@@ -1758,6 +1758,8 @@ pub(crate) fn analog_alarm_ladder<R: Record + ?Sized>(r: &mut R, common: &mut Co
     // out records (ao/longout/int64out/calcout) have no `AFVL` and just
     // return. Running the range check here would drift `LALM` to `val`
     // (NaN on an undefined cycle) and filter `AFVL` — both observable.
+    // "A UDF cycle" is the record's own UDF_ALARM test: sCalcout's is
+    // `udf == TRUE` (`sCalcoutRecord.c:705`), so a byte of 2 runs the ladder.
     let AnalogAlarmInput {
         val,
         hyst,
@@ -1765,7 +1767,7 @@ pub(crate) fn analog_alarm_ladder<R: Record + ?Sized>(r: &mut R, common: &mut Co
         aftc,
         afvl,
     } = input;
-    if common.udf != 0 {
+    if crate::server::recgbl::udf_alarm_active(common.udf, r.udf_alarm_on_exact_one()) {
         if afvl != 0.0 {
             r.store_alarm_filter_value(0.0);
         }
@@ -5889,8 +5891,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// C `checkAlarms`' analog ladder — HIHI/HIGH/LOW/LOLO with HYST, the
     /// AFTC filter and the LALM latch — for a record with an analog alarm
-    /// config. Not overridden, for the reason [`Self::monitor_value_classes`]
-    /// gives: compiled per type, the cells are read and stored as members.
+    /// config. The ladder is this default body, compiled per type for the
+    /// reason [`Self::monitor_value_classes`] gives; an override only appends
+    /// what C raises after `checkAlarms` (calcout's and sCalcout's
+    /// `execOutput`).
     fn check_analog_alarms(&mut self, common: &mut CommonFields) {
         analog_alarm_ladder(self, common);
     }

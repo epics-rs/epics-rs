@@ -95,8 +95,8 @@ pub use record_trait::{
 };
 pub(crate) use record_trait::{InitGetFailure, InitRead};
 pub(crate) use record_trait::{
-    SoftRead, SoftReading, StoredShape, dbput_coerce_value_in, put_string_precision,
-    seed_trackers_from_val, served_element_size,
+    SoftRead, SoftReading, StoredShape, analog_alarm_ladder, dbput_coerce_value_in,
+    put_string_precision, seed_trackers_from_val, served_element_size,
 };
 pub use scan::{ScanList, ScanType, SimModeScan};
 pub use sparse_text::{AlarmText, SparseText};

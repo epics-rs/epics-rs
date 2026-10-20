@@ -99,18 +99,38 @@ pub(crate) fn set_calcout_odly_limit(value: f64) {
     CALCOUT_ODLY_LIMIT.store(value.to_bits(), Ordering::Relaxed);
 }
 
+/// This cycle's CALC pass (`calcoutRecord.c:237-242`), for `check_alarms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CalcPass {
+    /// No `calcPerform` ran: `fetch_values` failed, or an ODLY expiry.
+    #[default]
+    NotRun,
+    /// `recGblSetSevrMsg(prec, CALC_ALARM, INVALID_ALARM, "calcPerform")`.
+    Failed,
+    /// `prec->udf = isnan(prec->val)`.
+    Done { undefined: bool },
+}
+
+/// This cycle's `execOutput` (`calcoutRecord.c:613-630`), which C runs after
+/// `checkAlarms`, for `check_analog_alarms` to apply after the ladder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ExecPass {
+    #[default]
+    NotRun,
+    /// DOPT Use VAL: UDF is not written.
+    UseVal,
+    /// `recGblSetSevrMsg(prec, CALC_ALARM, INVALID_ALARM, "OCAL calcPerform")`.
+    OcalFailed,
+    /// `prec->udf = isnan(prec->oval)`.
+    Ocal { undefined: bool },
+}
+
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
     pub val: f64,
     pub calc: String,
     pub oopt: i16, // Output Option: 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     cached_should_output: bool, // Cached result from process() for framework
-    // C `calcoutRecord.c::execOutput:620-625`: on a DOPT=Use_OVAL output cycle,
-    // a successful OCAL `calcPerform` sets `udf = isnan(oval)` (NOT VAL-based),
-    // which raises UDF_ALARM and lets IVOA gate the OUT write. `Some(_)` carries
-    // that per-cycle decision to `value_is_undefined()`; `None` (Use_VAL, an OCAL
-    // calc error, or a non-output cycle) leaves udf VAL-based, matching C.
-    ocal_udf_override: Option<bool>,
     pub dopt: i16, // Data Option: 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     pub oval: f64,
@@ -226,28 +246,15 @@ pub struct CalcoutRecord {
     /// with PACT held, so a re-entry after a device-link put cleared it
     /// (`dbAccess.c:1194`) is a fresh cycle.
     pact: bool,
-    // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
-    // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
-    // owner of this record's alarm transitions — consumes it, so it cannot
-    // outlive the cycle that set it. `Some(msg)` also carries WHICH failure C's
-    // amsg names: `"calcPerform"` (CALC, `:239`) or `"OCAL calcPerform"`
-    // (OCAL, `:622`). C raises CALC before OCAL and `recGblSetSevrMsg` is
-    // raise-only, so when both fail in one cycle the CALC message wins — which
-    // `get_or_insert` at the two set sites reproduces (CALC runs first).
-    calc_alarm: Option<&'static str>,
+    // Per-cycle facts, consumed by the alarm hooks of the cycle that set them.
+    calc_pass: CalcPass,
+    exec_pass: ExecPass,
     // This cycle's `fetch_values()` outcome, pushed by the framework through
     // `set_fetch_gate_failed`. C `calcoutRecord.c::process` (237) runs
     // `calcPerform` only `if (fetch_values(prec) == 0)`: a failed input link
     // freezes VAL/UDF and raises no CALC_ALARM, while the OOPT switch, the
     // output and the monitors still run against the frozen VAL.
     fetch_gate_failed: bool,
-    // This cycle reached one of C's two `prec->udf` writes: the CALC pass's
-    // `else prec->udf = isnan(prec->val)` (`calcoutRecord.c:241`) or
-    // `execOutput`'s `else prec->udf = isnan(prec->oval)` (`:624`). Both sit on
-    // a `calcPerform` SUCCESS arm, the CALC one additionally inside the
-    // `fetch_values` gate. Consumed by `check_alarms`, which owns the write;
-    // a cycle that sets neither leaves UDF frozen, as C does.
-    value_computed: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
     // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
     // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
@@ -297,7 +304,6 @@ impl Default for CalcoutRecord {
             calc: String::new(),
             oopt: 0,
             cached_should_output: false,
-            ocal_udf_override: None,
             dopt: 0,
             ocal: String::new(),
             oval: 0.0,
@@ -384,9 +390,9 @@ impl Default for CalcoutRecord {
             oevt: PvString::new(),
             pending_output: false,
             pact: false,
-            calc_alarm: None,
+            calc_pass: CalcPass::NotRun,
+            exec_pass: ExecPass::NotRun,
             fetch_gate_failed: false,
-            value_computed: false,
             rpcl: crate::calc::Rpcl::empty(),
             orpc: crate::calc::Rpcl::empty(),
             clcv: 0,
@@ -502,6 +508,7 @@ impl CalcoutRecord {
     fn exec_output_data(&mut self) {
         if self.dopt != 1 {
             self.oval = self.val;
+            self.exec_pass = ExecPass::UseVal;
             return;
         }
         // Use OCAL. C `:621` calls calcPerform on ORPC unconditionally on this
@@ -518,16 +525,13 @@ impl CalcoutRecord {
                 // successful-OCAL branch. A NaN OVAL then raises UDF_ALARM
                 // (`:628`) so IVOA gates the OUT write — without this a finite
                 // VAL but NaN OVAL drives NaN to OUT with NO_ALARM.
-                self.ocal_udf_override = Some(self.oval.is_nan());
-                self.value_computed = true;
+                self.exec_pass = ExecPass::Ocal {
+                    undefined: v.is_nan(),
+                };
             }
             // C `:622`: OCAL calcPerform failure raises CALC_ALARM (amsg "OCAL
-            // calcPerform") and leaves udf VAL-based (no override).
-            // `get_or_insert` keeps a prior CALC "calcPerform" if CALC also
-            // failed this cycle — matching C's raise-only order.
-            Err(_) => {
-                self.calc_alarm.get_or_insert("OCAL calcPerform");
-            }
+            // calcPerform") and leaves udf as the CALC pass set it.
+            Err(_) => self.exec_pass = ExecPass::OcalFailed,
         }
         self.apply_stores(&inputs.vars);
     }
@@ -977,27 +981,6 @@ impl Record for CalcoutRecord {
             })
     }
 
-    // C raises UDF_ALARM from BOTH `checkAlarms` and `execOutput`, and
-    // `recGblSetSevr` only raises (never lowers), so the effective UDF
-    // condition is the OR of the two:
-    //   * `checkAlarms` (`calcoutRecord.c:244`, BEFORE the output switch) sees
-    //     `udf = isnan(VAL)` (set at line 241) and raises UDF_ALARM if VAL is
-    //     NaN — independent of OVAL.
-    //   * `execOutput` (`calcoutRecord.c:620-630`, Use_OVAL output cycle) then
-    //     sets `udf = isnan(OVAL)` and raises UDF_ALARM if OVAL is NaN.
-    // So a NaN VAL keeps the record INVALID even when OCAL yields a finite OVAL
-    // (the `checkAlarms` raise stands). `ocal_udf_override` carries the
-    // execOutput half — `Some(true)` when a Use_OVAL output cycle produced a
-    // NaN OVAL — and is OR'd with the VAL-NaN half. `None` (Use_VAL / OCAL calc
-    // error / non-output cycle) leaves udf purely VAL-based, matching the trait
-    // default. (Residual: C's udf *field* ends at `isnan(OVAL)` on a Use_OVAL
-    // output cycle, so for NaN VAL + finite OVAL C reports UDF field 0 with
-    // SEVR INVALID; Rust's single value_is_undefined() reports the field as 1.
-    // The SEVR/STAT — the parity-critical observables — match.)
-    fn value_is_undefined(&self) -> bool {
-        self.val.is_nan() || matches!(self.ocal_udf_override, Some(true))
-    }
-
     // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
     // then sends OVAL. VAL is the calc *result* and remains intact.
     //
@@ -1086,6 +1069,7 @@ impl Record for CalcoutRecord {
         // lands before `exec_output_data` reads the vars back; two independent
         // copies made CALC's stores invisible to OCAL and dropped them both.
         let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+        self.calc_pass = CalcPass::NotRun;
         if !self.fetch_gate_failed {
             // C `calcoutRecord.c:238-241` — `calcPerform` runs unconditionally
             // inside the fetch gate and a -1 is CALC_ALARM/INVALID with VAL
@@ -1102,20 +1086,14 @@ impl Record for CalcoutRecord {
                     self.val = v;
                     // C `:241` `else prec->udf = isnan(prec->val)` — this arm
                     // only; the write itself is made in `check_alarms`.
-                    self.value_computed = true;
+                    self.calc_pass = CalcPass::Done {
+                        undefined: v.is_nan(),
+                    };
                 }
                 // C `calcoutRecord.c:239`: CALC failure → amsg "calcPerform".
-                Err(_) => {
-                    self.calc_alarm.get_or_insert("calcPerform");
-                }
+                Err(_) => self.calc_pass = CalcPass::Failed,
             }
         }
-
-        // C `:240` `prec->udf = isnan(prec->val)` — the CALC-pass half of udf.
-        // The OCAL half lives in `exec_output_data` (C `execOutput:624`) and is
-        // therefore absent during an ODLY window, exactly as in C, where udf is
-        // VAL-based until the delayed `execOutput` runs.
-        self.ocal_udf_override = None;
 
         // The CALC pass's stores. C wrote them into A..U through `&prec->a` as
         // the pass ran; `exec_output_data` reads them back for the OCAL pass.
@@ -1925,35 +1903,44 @@ impl Record for CalcoutRecord {
         &["CLCV", "OCLV"]
     }
 
+    /// C `calcoutRecord.c:237-242`, ahead of `checkAlarms`. A cycle whose
+    /// `fetch_values` failed runs no `calcPerform`, so UDF freezes.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        // C's two `prec->udf` writes (`calcoutRecord.c:241` CALC, `:624` OCAL),
-        // applied here because `check_alarms` is the record's only hook holding
-        // `CommonFields` and it runs before `recGblCheckUDF`. A cycle whose
-        // `fetch_values` failed reaches neither write, so UDF freezes — the
-        // blanket re-derive used to clear it and report a never-computed record
-        // as defined.
-        if std::mem::take(&mut self.value_computed) {
-            common.udf = self.value_is_undefined() as u8;
+        match std::mem::take(&mut self.calc_pass) {
+            // calcout is the one calc-family record whose C attaches an amsg.
+            CalcPass::Failed => {
+                crate::server::recgbl::rec_gbl_set_sevr_msg(
+                    common,
+                    crate::server::recgbl::alarm_status::CALC_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                    "calcPerform",
+                );
+            }
+            CalcPass::Done { undefined } => common.udf = undefined as u8,
+            CalcPass::NotRun => {}
         }
+    }
 
-        // C `calcoutRecord.c:238-241` (CALC) and `:622` (OCAL, inside
-        // `execOutput`) — a failed `calcPerform` is `recGblSetSevr(prec,
-        // CALC_ALARM, INVALID_ALARM)`, raised in `process()` before
-        // `checkAlarms(prec)`. Consuming the flag keeps it a per-cycle fact: a
-        // cycle whose input fetch failed runs no `calcPerform` (`:237`) and
-        // raises nothing.
-        if let Some(msg) = self.calc_alarm.take() {
-            // C `calcoutRecord.c:239` (CALC) / `:622` (OCAL) attach the exact
-            // amsg via `recGblSetSevrMsg`: "calcPerform" / "OCAL calcPerform".
-            // (calcout is the one calc-family record whose C uses a message;
-            // calc/scalcout/acalcout/swait use plain recGblSetSevr.)
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
-                common,
-                crate::server::recgbl::alarm_status::CALC_ALARM,
-                crate::server::record::AlarmSeverity::Invalid,
-                msg,
-            );
+    /// `checkAlarms`' ladder, then `execOutput`'s alarms (`:620-630`), which C
+    /// raises after it: an equal-severity alarm raised first keeps the status,
+    /// and the UDF field ends at the OCAL verdict.
+    fn check_analog_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        crate::server::record::analog_alarm_ladder(self, common);
+        match std::mem::take(&mut self.exec_pass) {
+            ExecPass::NotRun => return,
+            ExecPass::UseVal => {}
+            ExecPass::OcalFailed => {
+                crate::server::recgbl::rec_gbl_set_sevr_msg(
+                    common,
+                    crate::server::recgbl::alarm_status::CALC_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                    "OCAL calcPerform",
+                );
+            }
+            ExecPass::Ocal { undefined } => common.udf = undefined as u8,
         }
+        // `:628-630` `if (prec->udf) recGblSetSevr(prec, UDF_ALARM, prec->udfs)`.
+        crate::server::recgbl::rec_gbl_check_udf(common, false, None, "");
     }
 }
 
@@ -2165,6 +2152,7 @@ mod process_tests {
     /// literals via `recGblSetSevrMsg`: "calcPerform" and "OCAL calcPerform".
     /// pvxs serves these verbatim on alarm.message (iocsource.cpp:230-236);
     /// calcout is the one calc-family record whose C uses a message at all.
+    /// The OCAL raise is `execOutput`'s, after `checkAlarms`, so both hooks run.
     #[test]
     fn calcout_calc_fail_amsg_is_calcperform_ocal_fail_is_ocal_calcperform() {
         use crate::server::record::CommonFields;
@@ -2176,6 +2164,7 @@ mod process_tests {
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);
+        rec.check_analog_alarms(&mut common);
         assert_eq!(common.nsta, crate::server::recgbl::alarm_status::CALC_ALARM);
         assert_eq!(common.namsg, "calcPerform");
 
@@ -2192,6 +2181,7 @@ mod process_tests {
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);
+        rec.check_analog_alarms(&mut common);
         assert_eq!(common.namsg, "OCAL calcPerform");
 
         // Both fail in one cycle: C raises CALC first (raise-only), so the
@@ -2208,6 +2198,7 @@ mod process_tests {
         rec.process().unwrap();
         let mut common = CommonFields::default();
         rec.check_alarms(&mut common);
+        rec.check_analog_alarms(&mut common);
         assert_eq!(
             common.namsg, "calcPerform",
             "both-fail keeps the CALC message (C raises CALC before OCAL)"

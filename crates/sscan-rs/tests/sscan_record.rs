@@ -160,6 +160,29 @@ async fn start_pos_returns_the_positioner_after_the_scan() {
     wait_until("M back at P1SP", || f64_of(&db, "M") == 1.0).await;
 }
 
+/// UDF is written only where data is acquired, `psscan->udf = 0`
+/// (`sscanRecord.c:3549`, `:3813`), so a client's UDF put stands across a
+/// pass that acquires nothing. oracle (oracleSscanIoc): born 1, after the
+/// scan 0, `UDF 1` then PROC 1, `UDF 2` then PROC 2, the next scan 0.
+#[epics_base_rs::epics_test]
+async fn only_an_acquisition_clears_udf() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    let udf = |db: &PvDatabase| db.get_record("S").unwrap().read().common.udf;
+    assert_eq!(udf(&db), 1, "born undefined");
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(udf(&db), 0, "the scan acquired");
+    for byte in [1.0, 2.0] {
+        put_field(&db, "S", "UDF", EpicsValue::Double(byte)).await;
+        db.process_record("S").await.unwrap();
+        assert_eq!(f64::from(udf(&db)), byte, "an idle pass keeps UDF {byte}");
+    }
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(udf(&db), 0, "the next scan acquired");
+}
+
 #[epics_base_rs::epics_test]
 async fn a_table_scan_visits_the_table() {
     let db = ioc(ONE_D).await;

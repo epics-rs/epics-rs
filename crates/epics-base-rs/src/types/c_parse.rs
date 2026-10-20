@@ -522,6 +522,15 @@ struct Digits {
 /// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
 /// scans as the single digit `0` and leaves `x10` for the extraneous test.
 fn scan_int(b: &[u8], mut base: u32) -> Digits {
+    // glibc refuses these with EINVAL before reading a byte.
+    if base == 1 || base > 36 {
+        return Digits {
+            negative: false,
+            magnitude: Some(0),
+            any: false,
+            end: 0,
+        };
+    }
     let mut i = 0;
     while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
@@ -618,8 +627,8 @@ fn parse_ulong(s: &str) -> Option<u64> {
 
 /// C `strtol(s, &end, base)` as EPICS gets it on Linux: glibc with
 /// `_GNU_SOURCE` and a 64-bit `long`. The value and the end offset; `ERANGE`
-/// saturates at `i64::MIN`/`i64::MAX` and nothing converted is `(0, 0)`.
-/// `base` is 0 or 2..=36 (anything else panics).
+/// saturates at `i64::MIN`/`i64::MAX` and nothing converted is `(0, 0)`, as
+/// is a base outside 0 and 2..=36 (`EINVAL`).
 pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (i64, usize) {
     let d = scan_int(s.as_ref(), base);
     if !d.any {

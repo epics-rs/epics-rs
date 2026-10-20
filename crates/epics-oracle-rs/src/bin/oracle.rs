@@ -349,8 +349,8 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     // type-family allowlist row's scope, and must not read that partial silence
     // as the deviation having stopped.
     allowlist.note_types_driven(&types, &surface.covered_types);
-    let probe = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
-    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, probe, &allowlist);
+    let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {

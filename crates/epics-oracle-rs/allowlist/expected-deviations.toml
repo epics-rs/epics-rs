@@ -363,6 +363,30 @@ split, which is what this row exists to allowlist. Those 10 SGNL cases are its
 live scope.
 """
 
+[[deviation]]
+id = "CBUG-F12-MONITOR"
+bucket = "NOT-REPRODUCED"
+upstream = "epics-base / histogram"
+record_types = ["histogram"]
+fields = ["VAL"]
+surface = ["event_count", "update_events"]
+classes = ["scanned"]
+why = """
+CBUG-F12 on the PVA monitor surface. A bare histogram has LLIM == ULIM == 0, so
+every process takes add_count's direct stat=SOFT/sevr=INVALID write
+(histogramRecord.c:329-332); monitor's recGblResetAlarms resets it to NO_ALARM
+and reports a transition (:284), and db_post_events posts VAL with DBE_ALARM
+(:293-294) while the alarm a client sees stays 0/0. C therefore posts one event
+per process with nothing changed. The port raises no alarm on an empty range
+(CBUG-F12) and posts only what changed.
+
+Scoped to the pva-monitor scanned reproducer, the one case that processes a
+histogram: its VAL put does not process the record, so the passive case agrees.
+Expect: driven 1,2,2,3 with a harness-posted scan after each put, softIocPVX
+posts 8 updates (each put, and an alarm event per scan) and the port 5 (each
+put, and the first scan clearing UDF).
+"""
+
 # --------------------------------------------------------------------------
 
 [[deviation]]

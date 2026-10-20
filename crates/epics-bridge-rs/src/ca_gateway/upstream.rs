@@ -52,7 +52,7 @@ use epics_base_rs::runtime::sync::broadcast;
 use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
-use epics_base_rs::server::snapshot::DbrClass;
+use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName};
 use epics_ca_rs::client::{AccessRights, CaChannel, CaClient, ConnectionEvent, MonitorHandle};
 use epics_ca_rs::protocol::DBE_PROPERTY;
@@ -202,7 +202,13 @@ struct UpstreamSubscription {
     channel_events: AbortOnDrop,
     /// The shadow PV's life, which the forwarding tasks follow.
     life: tokio::sync::watch::Receiver<ShadowLife>,
+    /// Where a value forwarding task hands a [`ShadowLife::Reviving`] life's
+    /// first event to the [`ChannelEventOwner`].
+    first_events: FirstEventTx,
 }
+
+/// A reviving life's first value event, for the owner to register from.
+type FirstEventTx = tokio::sync::mpsc::UnboundedSender<(u64, Snapshot)>;
 
 /// One registration of the shadow PV: C `gatePvData` between `life()` and
 /// `death()`. The number counts the lives, so a follower can tell a revival
@@ -210,6 +216,11 @@ struct UpstreamSubscription {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ShadowLife {
     Alive(u64),
+    /// Cached mode, upstream back: the value monitor is armed for this life
+    /// and its first event registers the PV, as C `eventCB` `vcAdd`s the vc
+    /// on the first event of the monitor `getCB` armed (gatePv.cc:1432-1441,
+    /// 1703).
+    Reviving(u64),
     Dead(u64),
 }
 
@@ -217,21 +228,38 @@ impl ShadowLife {
     fn alive(self) -> Option<u64> {
         match self {
             Self::Alive(n) => Some(n),
+            Self::Reviving(_) | Self::Dead(_) => None,
+        }
+    }
+
+    /// The life a value monitor serves, a reviving one included.
+    fn armed(self) -> Option<u64> {
+        match self {
+            Self::Alive(n) | Self::Reviving(n) => Some(n),
             Self::Dead(_) => None,
         }
     }
 
-    /// The shadow PV is removed.
+    /// Upstream is gone: the shadow PV, if registered, is removed.
     fn die(&mut self) {
-        if let Self::Alive(n) = *self {
+        if let Self::Alive(n) | Self::Reviving(n) = *self {
             *self = Self::Dead(n);
+        }
+    }
+
+    /// Cached mode, upstream back: the next life's value monitor is armed.
+    fn arm(&mut self) {
+        if let Self::Dead(n) = *self {
+            *self = Self::Reviving(n + 1);
         }
     }
 
     /// The replacement shadow PV is registered.
     fn revive(&mut self) {
-        if let Self::Dead(n) = *self {
-            *self = Self::Alive(n + 1);
+        match *self {
+            Self::Dead(n) => *self = Self::Alive(n + 1),
+            Self::Reviving(n) => *self = Self::Alive(n),
+            Self::Alive(_) => {}
         }
     }
 }
@@ -408,13 +436,25 @@ struct ChannelEventOwner {
     /// skips it.
     ctrl_timeout: Duration,
     shown: AccessRights,
+    /// Cached mode: a revival waits for its value monitor's first event.
+    cached: bool,
 }
 
 #[cfg(tokio_backend)]
 impl ChannelEventOwner {
-    async fn run(mut self, mut events: broadcast::Receiver<ConnectionEvent>) {
+    async fn run(
+        mut self,
+        mut events: broadcast::Receiver<ConnectionEvent>,
+        mut first_events: tokio::sync::mpsc::UnboundedReceiver<(u64, Snapshot)>,
+    ) {
         loop {
-            let event = events.recv().await;
+            let event = tokio::select! {
+                event = events.recv() => event,
+                Some((life, snapshot)) = first_events.recv() => {
+                    self.first_event(life, snapshot).await;
+                    continue;
+                }
+            };
             let Some(channel) = self.channel.upgrade() else {
                 break;
             };
@@ -447,51 +487,37 @@ impl ChannelEventOwner {
     /// (`:622`). The followers drop their upstream monitors on the
     /// transition, as `death` unmonitors (`:658-661`).
     async fn death(&mut self) {
-        if self.life.borrow().alive().is_none() {
+        let life = *self.life.borrow();
+        if let ShadowLife::Dead(_) = life {
             return;
         }
         if let Some(entry) = self.cache.read().await.get(&self.name) {
             entry.write().await.set_state(PvState::Disconnect);
         }
-        self.retired = self.db.remove_simple_pv(&self.name).await;
+        // A reviving PV is not registered yet; only its armed monitor goes.
+        if let ShadowLife::Alive(_) = life {
+            self.retired = self.db.remove_simple_pv(&self.name).await;
+        }
         self.life.send_modify(ShadowLife::die);
     }
 
     /// `gatePvData::life` then `activate` → `get(ctrlType)` → `getCB` →
     /// `setPvData` (gatePv.cc:547-556, 398-401, 1693-1695): a fresh shadow PV
     /// with the dead one's hooks, seeded from the returning upstream before
-    /// it is registered. A failed control get keeps the dead PV's value and
-    /// metadata, which the property monitor's first event then refreshes.
+    /// it is registered. A failed control get keeps the dead PV's metadata,
+    /// which the property monitor's first event then refreshes. Cached, the
+    /// get is followed by `monitor()` (`:1703`) and the PV is registered from
+    /// that monitor's first event ([`Self::first_event`]); no-cache
+    /// `activate` adds the vc at once (`:397-398`).
     async fn revive(&mut self, channel: &CaChannel) {
-        if self.life.borrow().alive().is_some() {
+        if !matches!(*self.life.borrow(), ShadowLife::Dead(_)) {
             return;
         }
         let Some(dead) = self.retired.clone() else {
             return;
         };
-        let ctrl = if self.ctrl_timeout.is_zero() {
-            None
-        } else {
-            epics_base_rs::runtime::task::timeout(
-                self.ctrl_timeout,
-                channel.get_with_metadata(DbrClass::Ctrl),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-        };
-        let replacement = match &ctrl {
-            Some(snap) => {
-                let pv = dead.respawn(snap.value.clone());
-                pv.set_metadata(epics_base_rs::server::pv::PvMetadata {
-                    display: snap.display.clone(),
-                    control: snap.control.clone(),
-                    enums: snap.enums.clone(),
-                });
-                pv
-            }
-            None => dead.respawn(dead.snapshot().value),
-        };
+        // `life()`'s state change (gatePv.cc:536), ahead of the get and the
+        // monitors.
         if let Some(entry) = self.cache.read().await.get(&self.name) {
             let mut entry = entry.write().await;
             if entry.state == PvState::Disconnect {
@@ -503,6 +529,49 @@ impl ChannelEventOwner {
                 entry.set_state(next);
             }
         }
+        let ctrl = if self.ctrl_timeout.is_zero() {
+            None
+        } else {
+            epics_base_rs::runtime::task::timeout(
+                self.ctrl_timeout,
+                channel.get_with_metadata(DbrClass::Ctrl),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        };
+        if let Some(snap) = &ctrl {
+            dead.set_metadata(epics_base_rs::server::pv::PvMetadata {
+                display: snap.display.clone(),
+                control: snap.control.clone(),
+                enums: snap.enums.clone(),
+            });
+        }
+        if self.cached {
+            self.life.send_modify(ShadowLife::arm);
+            return;
+        }
+        let value = ctrl.map_or_else(|| dead.snapshot().value, |snap| snap.value);
+        self.register(dead.respawn(value)).await;
+    }
+
+    /// C `eventCB`'s `vcAdd` (gatePv.cc:1432-1441): the reviving life's first
+    /// value event, with its alarm and IOC time, is what the PV comes back
+    /// with.
+    async fn first_event(&mut self, life: u64, snapshot: Snapshot) {
+        if *self.life.borrow() != ShadowLife::Reviving(life) {
+            return;
+        }
+        let Some(dead) = self.retired.clone() else {
+            return;
+        };
+        let pv = dead.respawn(snapshot.value.clone());
+        pv.set_snapshot(snapshot);
+        self.register(pv).await;
+    }
+
+    /// Register the revived shadow PV and start its life.
+    async fn register(&mut self, replacement: epics_base_rs::server::pv::ProcessVariable) {
         if let Err(e) = self.db.add_simple_pv(replacement).await {
             tracing::debug!(
                 pv = %self.name,
@@ -1126,6 +1195,7 @@ impl UpstreamManager {
         }
         // The shadow PV is registered above, so this is its first life.
         let (life_tx, life) = tokio::sync::watch::channel(ShadowLife::Alive(0));
+        let (first_events, first_rx) = tokio::sync::mpsc::unbounded_channel();
         let channel_events = AbortOnDrop(
             self.reactor.spawn(
                 ChannelEventOwner {
@@ -1139,8 +1209,9 @@ impl UpstreamManager {
                     beacon_anomaly: self.write_env.beacon_anomaly.clone(),
                     ctrl_timeout: self.metadata_seed_timeout,
                     shown: initial_rights,
+                    cached: !self.cache_mode.is_no_cache(),
                 }
-                .run(conn_rx),
+                .run(conn_rx, first_rx),
             ),
         );
 
@@ -1150,7 +1221,13 @@ impl UpstreamManager {
         // (self-subscribing) on the first downstream monitor, and
         // `release_monitor` aborts it when the last monitor leaves.
         let task = initial_monitor.map(|monitor| {
-            self.spawn_forward_task(served_name, channel.clone(), Some(monitor), life.clone())
+            self.spawn_forward_task(
+                served_name,
+                channel.clone(),
+                Some(monitor),
+                life.clone(),
+                first_events.clone(),
+            )
         });
 
         // Property monitor: CACHED spawns it eagerly alongside the value
@@ -1184,6 +1261,7 @@ impl UpstreamManager {
                 acl,
                 channel_events,
                 life,
+                first_events,
             },
         );
         Ok(())
@@ -1211,6 +1289,7 @@ impl UpstreamManager {
         channel: Arc<CaChannel>,
         initial_monitor: Option<MonitorHandle>,
         mut life: tokio::sync::watch::Receiver<ShadowLife>,
+        first_events: FirstEventTx,
     ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
@@ -1234,9 +1313,9 @@ impl UpstreamManager {
             let mut lived = None;
             loop {
                 let Ok(now) = life
-                    .wait_for(|l| l.alive().is_some_and(|n| Some(n) != lived))
+                    .wait_for(|l| l.armed().is_some_and(|n| Some(n) != lived))
                     .await
-                    .map(|l| l.alive())
+                    .map(|l| l.armed())
                 else {
                     return;
                 };
@@ -1275,7 +1354,7 @@ impl UpstreamManager {
                 let ended = loop {
                     let result = tokio::select! {
                         biased;
-                        _ = life.wait_for(|l| l.alive() != lived) => break false,
+                        _ = life.wait_for(|l| l.armed() != lived) => break false,
                         result = monitor.recv() => match result {
                             Some(result) => result,
                             None => break true,
@@ -1307,6 +1386,16 @@ impl UpstreamManager {
                             entry.set_state(next);
                         }
                         entry.update(snapshot.clone());
+                    }
+
+                    // A reviving life's first event is the owner's to register
+                    // the PV from; the next ones post to that PV.
+                    if let Some(n) = lived
+                        && *life.borrow() == ShadowLife::Reviving(n)
+                    {
+                        let _ = first_events.send((n, snapshot));
+                        let _ = life.wait_for(|l| *l != ShadowLife::Reviving(n)).await;
+                        continue;
                     }
 
                     // Push upstream snapshot (value + alarm + timestamp) to
@@ -1533,15 +1622,19 @@ impl UpstreamManager {
         // (spawn is sync but keep the critical section minimal), then
         // store the handle under the lock — re-checking no peer raced a
         // task in between.
-        let (channel, life) = {
+        let (channel, life, first_events) = {
             let subs = self.subs.lock();
             match subs.get(served_name) {
-                Some(sub) if sub.task.is_none() => (sub.channel.clone(), sub.life.clone()),
+                Some(sub) if sub.task.is_none() => (
+                    sub.channel.clone(),
+                    sub.life.clone(),
+                    sub.first_events.clone(),
+                ),
                 // No subscription (evicted) or a task already runs.
                 _ => return,
             }
         };
-        let handle = self.spawn_forward_task(served_name, channel, None, life);
+        let handle = self.spawn_forward_task(served_name, channel, None, life, first_events);
         let mut subs = self.subs.lock();
         match subs.get_mut(served_name) {
             // Re-check: another caller may have raced a task in, or the
@@ -3645,6 +3738,135 @@ ASG(NewGroup) {
         }
         assert_eq!(returned.subscriber_count(), armed);
 
+        mgr.shutdown().await;
+    }
+
+    /// A death while a revival waits for its value monitor's first event ends
+    /// that life: the armed monitor goes and the late first event adds nothing
+    /// — C `death` with no vc yet unmonitors and clears needAddRemove
+    /// (gatePv.cc:599, 656-658). The next life registers from its own event.
+    // Same in-process `CaServer` gate as the tests above.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn a_death_during_a_revival_ends_that_life() {
+        let bound = Duration::from_secs(10);
+        let name = "BR3:revive-death";
+        let server = CaServer::builder()
+            .port(0)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let port = server.udp_port();
+        let upstream_pv = server.database().find_pv(name).await.expect("upstream PV");
+        let _upstream = tokio::spawn(async move { server.run().await });
+        let monitors = |want: usize, what: &'static str| {
+            let pv = upstream_pv.clone();
+            async move {
+                let deadline = std::time::Instant::now() + bound;
+                while pv.subscriber_count() != want {
+                    assert!(std::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let mgr = pinned_manager_full(
+            db.clone(),
+            cache.clone(),
+            CacheMode::Cached,
+            NO_CONNECT_DEADLINE,
+        )
+        .await;
+        let channel = Arc::new(mgr.client.create_channel(name));
+        channel
+            .wait_connected(bound)
+            .await
+            .expect("upstream connects");
+        let entry = cache.write().await.get_or_create(name);
+        db.add_pv(name, EpicsValue::Double(1.0))
+            .await
+            .expect("the first life's PV");
+
+        // The test plays the connection events, and stands between the value
+        // task and the owner so it decides when a first event arrives.
+        let (life_tx, mut life) = tokio::sync::watch::channel(ShadowLife::Alive(0));
+        let (events, events_rx) = broadcast::channel(8);
+        let (to_owner, owner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (from_task, mut first_events) = tokio::sync::mpsc::unbounded_channel();
+        let owner = tokio::spawn(
+            ChannelEventOwner {
+                channel: Arc::downgrade(&channel),
+                name: RecordName::from(name),
+                cache: cache.clone(),
+                db: db.clone(),
+                life: life_tx,
+                retired: None,
+                notifier: Arc::new(ArcSwapOption::empty()),
+                beacon_anomaly: mgr.write_env.beacon_anomaly.clone(),
+                ctrl_timeout: Duration::ZERO,
+                shown: AccessRights {
+                    read: true,
+                    write: true,
+                },
+                cached: true,
+            }
+            .run(events_rx, owner_rx),
+        );
+        let _task = mgr.spawn_forward_task(
+            name.as_bytes(),
+            channel.clone(),
+            None,
+            life.clone(),
+            from_task,
+        );
+        monitors(1, "the first life's monitor").await;
+
+        let mut reach = async |want: ShadowLife| {
+            tokio::time::timeout(bound, life.wait_for(|l| *l == want))
+                .await
+                .unwrap_or_else(|_| panic!("never reached {want:?}"))
+                .expect("the owner runs");
+        };
+        events.send(ConnectionEvent::Disconnected).unwrap();
+        reach(ShadowLife::Dead(0)).await;
+        monitors(0, "the death unmonitors").await;
+
+        events.send(ConnectionEvent::Connected).unwrap();
+        reach(ShadowLife::Reviving(1)).await;
+        let late = tokio::time::timeout(bound, first_events.recv())
+            .await
+            .expect("the armed monitor's first event")
+            .expect("value task runs");
+        assert_eq!(late.0, 1);
+        events.send(ConnectionEvent::Disconnected).unwrap();
+        reach(ShadowLife::Dead(1)).await;
+        monitors(0, "a death while reviving drops the armed monitor").await;
+        assert_eq!(entry.read().await.state, PvState::Disconnect);
+
+        events.send(ConnectionEvent::Connected).unwrap();
+        reach(ShadowLife::Reviving(2)).await;
+        let next = tokio::time::timeout(bound, first_events.recv())
+            .await
+            .expect("the next life's first event")
+            .expect("value task runs");
+        assert_eq!(next.0, 2);
+        // One queue: the ended life's event is handled first, and a PV it
+        // registered would carry 1.0 and swallow this one.
+        let mut snapshot = next.1;
+        snapshot.value = EpicsValue::Double(9.0);
+        to_owner.send(late).unwrap();
+        to_owner.send((2, snapshot)).unwrap();
+        reach(ShadowLife::Alive(2)).await;
+        let pv = db.find_pv(name).await.expect("the next life registers");
+        assert_eq!(pv.snapshot().value, EpicsValue::Double(9.0));
+        monitors(1, "the next life's monitor").await;
+
+        owner.abort();
         mgr.shutdown().await;
     }
 

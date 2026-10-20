@@ -757,10 +757,21 @@ impl NDPluginProcess for FFTProcessor {
         if let Some(idx) = self.params.num_averaged {
             updates.push(ParamUpdate::int32(idx, avg_count as i32));
         }
+        // C `createAxisArrays` posts with the change itself, whatever the frame
+        // then computes (NDPluginFFT.cpp:118, :328-331).
+        if post_axes {
+            let n_time = next_pow2(array.dims[0].size);
+            if let Some(idx) = self.params.time_axis {
+                updates.push(ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
+            }
+            if let Some(idx) = self.params.freq_axis {
+                updates.push(ParamUpdate::float64_array(idx, frame.freq_axis(n_time / 2)));
+            }
+        }
 
         // Emit the C++ NDPluginFFT waveform records. On a forward transform
-        // these are the time series, the real/imaginary/abs spectrum, and
-        // the time/frequency axes (C++ doFFTCallbacks / createAxisArrays).
+        // these are the time series and the real/imaginary/abs spectrum
+        // (C++ doFFTCallbacks).
         // The inverse transform has no spectrum to publish.
         //
         // `apply_averaging` advances the EMA state, so it must be invoked at
@@ -771,16 +782,6 @@ impl NDPluginProcess for FFTProcessor {
             if let Some((time_series, real, imag)) =
                 frame.compute_row_spectrum(array, &vals, suppress_dc)
             {
-                let n_time = time_series.len();
-                let n_freq = real.len();
-                if post_axes {
-                    if let Some(idx) = self.params.time_axis {
-                        updates.push(ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
-                    }
-                    if let Some(idx) = self.params.freq_axis {
-                        updates.push(ParamUpdate::float64_array(idx, frame.freq_axis(n_freq)));
-                    }
-                }
                 if let Some(idx) = self.params.time_series {
                     updates.push(ParamUpdate::float64_array(idx, time_series));
                 }
@@ -1740,6 +1741,46 @@ mod tests {
         assert_eq!(posted(16), spectrum, "nothing changed again");
     }
 
+    /// C runs `createAxisArrays` on every size or TimePerPoint change,
+    /// whatever the frame then computes (NDPluginFFT.cpp:118, :328-331): it
+    /// reads no P_FFTDirection, and a width-1 input posts a one-point time
+    /// axis and an empty frequency axis.
+    #[test]
+    fn an_inverse_or_width_1_frame_posts_the_axes_it_changes() {
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+        let proc = fft_proc_with_params(FFTConfig::default());
+        let p = &proc.params;
+        let (time_axis, freq_axis) = (p.time_axis.unwrap(), p.freq_axis.unwrap());
+        let pool = NDArrayPool::new(0);
+        let axes = |n: usize| {
+            let arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+            let u = proc.process_array(&Arc::new(arr), &pool).param_updates;
+            (
+                find_array_update(&u, time_axis).map(<[f64]>::to_vec),
+                find_array_update(&u, freq_axis).map(<[f64]>::to_vec),
+            )
+        };
+        let direction = p.direction.unwrap();
+        let set_direction = |v| {
+            proc.on_param_change(
+                direction,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason: direction,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(v),
+                },
+            )
+        };
+        set_direction(1);
+        let (t, f) = axes(8);
+        assert_eq!((t.map(|t| t.len()), f.map(|f| f.len())), (Some(8), Some(4)));
+        set_direction(0);
+        assert_eq!(axes(8), (None, None), "a forward frame of the same size");
+        assert_eq!(axes(1), (Some(vec![0.0]), Some(vec![])), "a width-1 frame");
+        assert_eq!(axes(1), (None, None), "the same width again");
+    }
+
     #[test]
     fn test_adp25_timeseries_and_timeaxis_use_padded_length() {
         // C posts FFTTimeSeries and FFTTimeAxis at nTimeX = nextPow2(width),
@@ -1793,10 +1834,12 @@ mod tests {
             v[0] = 8.0;
         }
         let result = proc.process_array(&Arc::new(arr), &pool);
+        let p = &proc.params;
+        let spectrum = [p.time_series, p.real, p.imaginary, p.abs_value].map(Option::unwrap);
         let array_updates = result
             .param_updates
             .iter()
-            .filter(|x| matches!(x, ParamUpdate::Float64Array { .. }))
+            .filter(|x| matches!(x, ParamUpdate::Float64Array { reason, .. } if spectrum.contains(reason)))
             .count();
         assert_eq!(
             array_updates, 0,

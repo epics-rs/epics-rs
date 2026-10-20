@@ -1321,15 +1321,6 @@ mod tests {
         assert!(batch.is_empty(), "JSON octet still needs text: {batch:?}");
     }
 
-    /// MQ38 end to end: the raw bytes an inbound payload carries reach the octet
-    /// a STRING record reads back, through the real port actor and param store.
-    ///
-    /// This is the observable the row names — "a STRING record holds the raw
-    /// bytes up to the first NUL, as `setStringParam` does (drvMqtt.cpp:299)" —
-    /// and it needs the whole chain, because each link used to lose it
-    /// separately: the message-level `from_utf8` denied the topic, the
-    /// subscriber-level one denied the octet store, and `ParamValue::Octet`
-    /// could not hold the bytes even once they arrived.
     /// onMessageCb posts an array with Autoparam doCallbacksArray as it
     /// decodes it, typed, and the scalars at its closing callParamCallbacks
     /// (drvMqtt.cpp:301-333).
@@ -1383,7 +1374,7 @@ mod tests {
             .map(|v| (v.reason, v.iface))
             .collect();
         assert_eq!(
-            posted[..3],
+            posted,
             [
                 (reasons[1], Some(InterfaceType::Float64Array)),
                 (reasons[2], Some(InterfaceType::Int32Array)),
@@ -1397,6 +1388,15 @@ mod tests {
         assert_eq!(buf[..2], [1.0, 2.0]);
     }
 
+    /// MQ38 end to end: the raw bytes an inbound payload carries reach the octet
+    /// a STRING record reads back, through the real port actor and param store.
+    ///
+    /// This is the observable the row names — "a STRING record holds the raw
+    /// bytes up to the first NUL, as `setStringParam` does (drvMqtt.cpp:299)" —
+    /// and it needs the whole chain, because each link used to lose it
+    /// separately: the message-level `from_utf8` denied the topic, the
+    /// subscriber-level one denied the octet store, and `ParamValue::Octet`
+    /// could not hold the bytes even once they arrived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_non_utf8_payload_reaches_the_octet_a_string_record_reads() {
         use crate::driver::MqttDriver;

@@ -40,7 +40,7 @@ use ad_plugins_rs::fft::FFTProcessor;
 use ad_plugins_rs::file_tiff::TiffFileProcessor;
 use ad_plugins_rs::process::{ProcessConfig, ProcessProcessor};
 use ad_plugins_rs::roi::create_roi_runtime;
-use ad_plugins_rs::roi_stat::{ROIStatProcessor, ROIStatROI};
+use ad_plugins_rs::roi_stat::create_roi_stat_runtime;
 use ad_plugins_rs::stats::create_stats_runtime;
 use ad_plugins_rs::transform::{TransformProcessor, TransformType};
 
@@ -317,31 +317,38 @@ fn measure_shipped_plugin_throughput() {
     drive(&roi, &frames, 1);
     rows.push(("ROI", drive(&roi, &frames, 1), drive(&roi, &frames, 4)));
 
-    // C releases at NDPluginROIStat.cpp:267.
-    let quadrant = |x: usize, y: usize| ROIStatROI {
-        enabled: true,
-        offset: [x, y],
-        size: [WIDTH / 2, HEIGHT / 2],
-        bgd_width: 0,
-    };
-    let (roi_stat, _j) = create_plugin_runtime(
+    // C releases at NDPluginROIStat.cpp:267. Four quadrants, one per address,
+    // set through the port as a database sets them.
+    let (roi_stat, roi_stat_params, _j) = create_roi_stat_runtime(
         &asyn_rs::asyn_record::claim_port("POOL_ROISTAT").unwrap(),
-        ROIStatProcessor::new(
-            vec![
-                quadrant(0, 0),
-                quadrant(WIDTH / 2, 0),
-                quadrant(0, HEIGHT / 2),
-                quadrant(WIDTH / 2, HEIGHT / 2),
-            ],
-            16,
-        ),
         pool.max_memory(),
         QUEUE,
         0,
         "",
         wiring.clone(),
+        4,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
+    let sp = roi_stat.port_runtime().port_handle();
+    let quadrants = [
+        (0, 0),
+        (WIDTH / 2, 0),
+        (0, HEIGHT / 2),
+        (WIDTH / 2, HEIGHT / 2),
+    ];
+    for (addr, (x, y)) in quadrants.into_iter().enumerate() {
+        let p = &roi_stat_params;
+        for (reason, value) in [
+            (p.use_, 1),
+            (p.dim0_min, x),
+            (p.dim1_min, y),
+            (p.dim0_size, WIDTH / 2),
+            (p.dim1_size, HEIGHT / 2),
+        ] {
+            sp.write_int32_blocking(reason, addr as i32, value as i32)
+                .unwrap();
+        }
+    }
     drive(&roi_stat, &frames, 1);
     rows.push((
         "ROIStat",

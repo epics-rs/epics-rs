@@ -694,11 +694,18 @@ mod tests {
             idx,
         ));
         let mut posts = Vec::new();
-        while !posts.iter().any(|(r, _)| *r == idx.p_waveform) {
+        for _ in 0..1000 {
+            if posts.iter().any(|(r, _)| *r == idx.p_waveform) {
+                break;
+            }
             asyn_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
             posts.extend(cycle_posts(&mut rx, &idx));
         }
         task.abort();
+        assert!(
+            posts.iter().any(|(r, _)| *r == idx.p_waveform),
+            "no Waveform post in 5 s: {posts:?}"
+        );
         assert_eq!(
             posts[..4],
             [

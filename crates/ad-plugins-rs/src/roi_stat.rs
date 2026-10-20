@@ -158,7 +158,9 @@ pub struct ROIStatProcessor {
 }
 
 impl ROIStatProcessor {
-    /// Create a new processor with the given ROI definitions.
+    /// Create a new processor; `rois` seeds the geometry of the first
+    /// addresses. On a port the table holds one ROI per address
+    /// (`register_params`).
     pub fn new(rois: Vec<ROIStatROI>, ts_num_points: usize) -> Self {
         let n = rois.len();
         let results = vec![ROIStatResult::default(); n];
@@ -192,9 +194,9 @@ impl ROIStatProcessor {
         self.state.lock().rois.clone()
     }
 
-    /// Mutable access to ROI definitions.
-    pub fn rois_mut(&self) -> MappedMutexGuard<'_, Vec<ROIStatROI>> {
-        MutexGuard::map(self.state.lock(), |s| &mut s.rois)
+    /// Mutable access to ROI definitions; their count is the port's.
+    pub fn rois_mut(&self) -> MappedMutexGuard<'_, [ROIStatROI]> {
+        MutexGuard::map(self.state.lock(), |s| s.rois.as_mut_slice())
     }
 
     /// Set the time series mode.
@@ -544,12 +546,6 @@ impl NDPluginProcess for ROIStatProcessor {
         let mut guard = self.state.lock();
         let state = &mut *guard;
         state.results = new_results;
-        // A param write can replace the ROI list while the statistics run
-        // unlocked; every loop below indexes `results` by a `rois` index, so
-        // restore the length invariant against the list as it now stands.
-        state
-            .results
-            .resize(state.rois.len(), ROIStatResult::default());
 
         // Build per-ROI param updates (only for enabled ROIs)
         let p = &self.params;
@@ -560,7 +556,7 @@ impl NDPluginProcess for ROIStatProcessor {
             updates.push(ParamUpdate::int32(reason, dim.size as i32));
         }
         for (i, roi) in rois.iter().enumerate() {
-            if !roi.enabled || i >= state.results.len() {
+            if !roi.enabled {
                 continue;
             }
             let result = &state.results[i];
@@ -602,9 +598,6 @@ impl NDPluginProcess for ROIStatProcessor {
         // point; a full series stops and posts.
         if state.ts_mode == TSMode::Acquiring {
             let n = state.ts_num_points;
-            while state.ts_buffers.len() < state.rois.len() {
-                state.ts_buffers.push(vec![vec![0.0; n]; TS_TYPES]);
-            }
             let k = state.ts_current;
             for (i, roi) in state.rois.iter().enumerate() {
                 if !roi.enabled {
@@ -649,8 +642,26 @@ impl NDPluginProcess for ROIStatProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
-        // Global params
+        // C's maxROIs is both the port's maxAddr and the ROI count
+        // (NDPluginROIStat.cpp:495, :502-505), so the table is sized from the
+        // address space and an ROI with no address of its own is refused.
         let state = self.state.get_mut();
+        let max_rois = base.max_addr;
+        if state.rois.len() > max_rois {
+            return Err(asyn_rs::error::AsynError::Status {
+                status: asyn_rs::error::AsynStatus::Error,
+                message: format!(
+                    "NDPluginROIStat: {} ROIs for maxAddr {max_rois}",
+                    state.rois.len()
+                ),
+            });
+        }
+        let ts_buffer = vec![vec![0.0; state.ts_num_points]; TS_TYPES];
+        state.rois.resize(max_rois, ROIStatROI::default());
+        state.results.resize(max_rois, ROIStatResult::default());
+        state.ts_buffers.resize(max_rois, ts_buffer);
+
+        // Global params
         self.params.reset_all = base.create_param("ROISTAT_RESETALL", ParamType::Int32)?;
         self.params.ts_control = base.create_param("ROISTAT_TS_CONTROL", ParamType::Int32)?;
         self.params.ts_num_points = base.create_param("ROISTAT_TS_NUM_POINTS", ParamType::Int32)?;
@@ -751,7 +762,8 @@ impl NDPluginProcess for ROIStatProcessor {
     }
 }
 
-/// Create a ROIStat plugin runtime.
+/// Create a ROIStat plugin runtime. `num_rois` is C's maxROIs: the port's
+/// addresses and, at least one, its ROIs.
 pub fn create_roi_stat_runtime(
     claim: &asyn_rs::registry::PortClaim,
     max_memory: usize,
@@ -766,8 +778,7 @@ pub fn create_roi_stat_runtime(
     ROIStatParams,
     std::thread::JoinHandle<()>,
 ) {
-    let rois: Vec<ROIStatROI> = (0..num_rois).map(|_| ROIStatROI::default()).collect();
-    let processor = ROIStatProcessor::new(rois, 2048);
+    let processor = ROIStatProcessor::new(Vec::new(), 2048);
     let params_handle = processor.params_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
@@ -978,6 +989,91 @@ mod tests {
             })
             .collect();
         assert_eq!(stamps, vec![vec![10.5, 11.25]]);
+    }
+
+    /// C clamps maxROIs below 1 to one ROI (NDPluginROIStat.cpp:502-505) on
+    /// the one address asynPortDriver gives it (asynPortDriver.cpp:4006).
+    #[test]
+    fn a_max_rois_below_1_still_seeds_roi_0() {
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_ZERO").unwrap(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            0,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        assert_eq!(port.read_int32_blocking(p.dim0_max_size, 0).unwrap(), 0);
+        assert_eq!(port.read_float64_blocking(p.total, 0).unwrap(), 0.0);
+    }
+
+    /// pool_throughput once put four ROIs on `create_plugin_runtime`'s one
+    /// address, which C's single maxROIs cannot express.
+    #[test]
+    #[should_panic(expected = "NDPluginROIStat: 4 ROIs for maxAddr 1")]
+    fn more_rois_than_addresses_is_refused_by_name() {
+        ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_OVER").unwrap(),
+            ROIStatProcessor::new(vec![ROIStatROI::default(); 4], 16),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+    }
+
+    /// pool_throughput's ROIStat stage as NDROIStatConfigure builds it: four
+    /// quadrants set through the port, each posting its own total.
+    #[test]
+    fn four_quadrant_rois_each_post_their_own_total() {
+        let (handle, p, _jh) = create_roi_stat_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_QUAD").unwrap(),
+            1_000_000,
+            4,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            4,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        for (addr, (x, y)) in [(0, 0), (2, 0), (0, 2), (2, 2)].into_iter().enumerate() {
+            for (reason, value) in [
+                (p.use_, 1),
+                (p.dim0_min, x),
+                (p.dim1_min, y),
+                (p.dim0_size, 2),
+                (p.dim1_size, 2),
+            ] {
+                port.write_int32_blocking(reason, addr as i32, value)
+                    .unwrap();
+            }
+        }
+        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let frame = make_2d_array(4, 4, |x, y| (1 + x / 2 + 2 * (y / 2)) as f64);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(
+            handle.array_sender().publish(
+                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                    .alloc_copy(&frame)
+                    .unwrap(),
+            ),
+        );
+        assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
+        let totals: Vec<f64> = (0..4)
+            .map(|addr| port.read_float64_blocking(p.total, addr).unwrap())
+            .collect();
+        assert_eq!(totals, [4.0, 8.0, 12.0, 16.0]);
     }
 
     #[test]

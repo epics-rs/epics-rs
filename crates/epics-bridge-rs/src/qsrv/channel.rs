@@ -731,8 +731,11 @@ impl BridgeChannel {
             // `putLongString`'s `dbPut(DBR_CHAR, str, strlen+1)` through the
             // char address — `$`, or the plain one pvxs re-views.
             char_address = self.string_view
-                || epics_base_rs::server::database::char_view::char_view(&rec.read(), &self.field)
-                    .is_some_and(|v| v.re_views_plain_channel());
+                || epics_base_rs::server::database::char_view::plain_re_view(
+                    &rec.read(),
+                    &self.field,
+                )
+                .is_some();
             if char_address {
                 let mut chars = text.as_bytes().to_vec();
                 chars.push(0);

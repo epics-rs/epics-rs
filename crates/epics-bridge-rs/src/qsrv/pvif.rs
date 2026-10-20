@@ -4,10 +4,9 @@
 
 use epics_base_rs::server::database::char_view::{DollarView, PvaDollar};
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
-use epics_pva_rs::channel_shape::ChannelShape;
+use epics_pva_rs::channel_shape::{ChannelShape, ChannelValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 use crate::convert::{epics_to_pv_field, epics_to_scalar};
@@ -506,22 +505,9 @@ impl View {
 /// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
 /// stays an `NTScalar` string.
 ///
-/// Two ways a channel is a long string, pvxs's test "final field type
-/// is `DBR_CHAR`, the field is an array, and the channel's format is
-/// `String`":
-///
-/// - The field's declaration is one (`FieldDesc::long_string` — `lsi`/`lso`
-///   VAL/OVAL, `printf` VAL). These are C's `SPC_DBADDR`
-///   fields whose `cvt_dbaddr` reports a `DBF_STRING` with `field_size >
-///   MAX_STRING_SIZE+1`; pvxs re-views them as a `DBR_CHAR` array and
-///   forces `form = "String"` (`ioc/channel.cpp:59-74`).
-/// - The record carries `info(Q:form, "String")` and the field is the VAL
-///   of a `DBF_CHAR` array — the QSRV long-string idiom for a plain
-///   `waveform`/`aai` of CHAR. The info tag applies to VAL only
-///   (`dbIsValueField`, `ioc/channel.cpp:40-47`), so another field of the
-///   same record stays a byte array.
-///
-/// A `$` channel is [`NtType::Dollar`] instead, whatever its format.
+/// A long string is [`ChannelValue::Text`] or
+/// [`ChannelValue::LongStringField`]; a `$` channel is [`NtType::Dollar`]
+/// instead, whatever its format.
 pub(crate) fn nt_type_for_channel(
     instance: &epics_base_rs::server::record::RecordInstance,
     field_upper: &str,
@@ -538,42 +524,14 @@ pub(crate) fn nt_type_for_channel(
             NtType::Dollar(dollar.serve)
         };
     }
-    if instance.record.field_is_long_string(field_upper) {
-        let re_viewed =
-            epics_base_rs::server::database::char_view::char_view(instance, field_upper)
-                .is_some_and(|v| v.re_views_plain_channel());
-        return if re_viewed {
-            NtType::LongString
-        } else {
-            NtType::LongStringField
-        };
-    }
-    // `final_field_type == DBR_CHAR && isArray && format == "String"`. The
-    // `DBR_CHAR` half is `DBR_CHAR`, not `DBR_UCHAR` — pvxs tests the signed
-    // one — and the `isArray` half is pvxs's own conjunct: a `Q:form,"String"`
-    // record whose VAL holds ONE element is a `DBR_CHAR` scalar, not a long
-    // string.
-    let is_array =
-        ChannelShape::of_channel(&*instance.record, field_upper, resolved, filters).is_array();
-    if is_array
-        && field_upper.eq_ignore_ascii_case("VAL")
-        && matches!(resolved, Some(EpicsValue::CharArray(_)))
-        && instance.get_info("Q:form") == Some("String")
-    {
-        return NtType::LongString;
-    }
-    // `TypeCode valueType(fromDbrType(final_field_type)); if(isArray)
-    // valueType = valueType.arrayOf();` — the count decides the shape and
-    // nothing else does. The element type rides on the resolved value, which
-    // is `client_field_value`, i.e. the value already projected onto the
-    // field's DECLARED type, so reading the DBF off it IS reading the
-    // declaration.
-    if is_array {
-        return NtType::ScalarArray;
-    }
-    match resolved {
-        Some(EpicsValue::Enum(_)) => NtType::Enum,
-        _ => NtType::Scalar,
+    match ChannelValue::of_channel(instance, field_upper, resolved, filters) {
+        ChannelValue::Text => NtType::LongString,
+        ChannelValue::LongStringField => NtType::LongStringField,
+        ChannelValue::Shaped(shape) if shape.is_array() => NtType::ScalarArray,
+        ChannelValue::Shaped(_) => match resolved {
+            Some(EpicsValue::Enum(_)) => NtType::Enum,
+            _ => NtType::Scalar,
+        },
     }
 }
 

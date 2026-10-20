@@ -656,15 +656,51 @@ pub fn long_string_field_text(value: EpicsValue) -> EpicsValue {
     }
 }
 
+/// The char array pvxs reshapes the channel on `field` WITHOUT `$` into
+/// (`ioc/channel.cpp:56-73`), or `None`. Only a link or a field declared
+/// `DBF_STRING` is read, so a waveform's buffer is never cloned to ask.
+pub fn plain_re_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
+    let desc = inst.field_desc(field);
+    match route_at(inst, field, desc)? {
+        CharSource::Link => {}
+        CharSource::Field => {
+            let desc = desc?;
+            if desc.runtime_typed || field_addr_types(desc, None).0 != DbfCode::String {
+                return None;
+            }
+        }
+        CharSource::Attribute => return None,
+    }
+    char_view(inst, field).filter(CharView::re_views_plain_channel)
+}
+
+/// pvxs's `chan.format() == "String"` (`ioc/channel.cpp:40-73`) for a channel
+/// on `field` whose char view is `view`: VAL's `info(Q:form, "String")`, or
+/// the reshape of a link or, without `$`, of a string wider than
+/// `MAX_STRING_SIZE + 1`. `$` keeps a link's type (`dbChannel.c:488-493`), so
+/// only a link reshapes under it.
+pub fn pvxs_form_string(
+    inst: &RecordInstance,
+    field: &str,
+    view: Option<&CharView>,
+    dollar: bool,
+) -> bool {
+    (crate::server::database::is_value_field(field) && inst.get_info("Q:form") == Some("String"))
+        || view.is_some_and(|v| {
+            if dollar {
+                v.source == CharSource::Link
+            } else {
+                v.re_views_plain_channel()
+            }
+        })
+}
+
 /// What pvxs serves a `$` channel as, from its `getChannelValueType`
 /// (`ioc/iocsource.cpp:619-643`). The native PVA source and QSRV both ask
 /// it, so the two servers cannot part on a `$` channel's type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PvaDollar {
-    /// The view's text: pvxs's format is `"String"` — a link, whose type
-    /// `dbChannelCreate` keeps so pvxs's own reshape fires
-    /// (`ioc/channel.cpp:68-73`), or a VAL carrying `info(Q:form, "String")`
-    /// (`ioc/channel.cpp:40-47`).
+    /// The view's text: its format is `"String"` ([`pvxs_form_string`]).
     Text,
     /// The `DBR_CHAR` image, `int8_t[]`: `dbChannelCreate` made the field
     /// `DBF_CHAR` (`dbChannel.c:488-493`), so the format stays `Default`.
@@ -676,9 +712,11 @@ impl PvaDollar {
     /// `S_dbLib_fieldNotFound`.
     pub fn of(inst: &RecordInstance, field: &str) -> Option<Self> {
         let view = char_view(inst, field)?;
-        let text = view.source == CharSource::Link
-            || (field.eq_ignore_ascii_case("VAL") && inst.get_info("Q:form") == Some("String"));
-        Some(if text { Self::Text } else { Self::Chars })
+        Some(if pvxs_form_string(inst, field, Some(&view), true) {
+            Self::Text
+        } else {
+            Self::Chars
+        })
     }
 }
 

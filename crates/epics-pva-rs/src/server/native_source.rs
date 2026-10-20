@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::channel_shape::ChannelShape;
+use crate::channel_shape::{ChannelShape, ChannelValue};
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{
-    DollarView, PvaDollar, char_view, long_string_field_text, long_string_text,
+    DollarView, PvaDollar, long_string_field_text, long_string_text, plain_re_view,
 };
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
@@ -1136,8 +1136,7 @@ fn read_chain(filters: &FilterChain, value: EpicsValue) -> EpicsValue {
 enum ChannelRender {
     /// The value in the channel's [`ChannelShape`].
     Shaped(ChannelShape),
-    /// A long string's `LEN` elements as their text: pvxs reshapes the plain
-    /// channel to a `form = "String"` char array (`ioc/channel.cpp:58-67`).
+    /// [`ChannelValue::Text`]: the chars as their text.
     LongStringText,
     /// A long string with no room past `MAX_STRING_SIZE + 1`: pvxs keeps its
     /// `DBF_STRING` (`ioc/channel.cpp:58-60`), the buffer read to its NUL.
@@ -1213,15 +1212,13 @@ fn record_channel_render(
     if cn.string_view {
         return DollarView::of(&inst, &cn.field, filters).map(ChannelRender::Dollar);
     }
-    Some(if rec.field_is_long_string(&cn.field) {
-        if char_view(&inst, &cn.field).is_some_and(|v| v.re_views_plain_channel()) {
-            ChannelRender::LongStringText
-        } else {
-            ChannelRender::LongStringField
-        }
-    } else {
-        ChannelRender::Shaped(ChannelShape::of_record_channel(&inst, &cn.field, filters))
-    })
+    Some(
+        match ChannelValue::of_record_channel(&inst, &cn.field, filters) {
+            ChannelValue::Shaped(shape) => ChannelRender::Shaped(shape),
+            ChannelValue::Text => ChannelRender::LongStringText,
+            ChannelValue::LongStringField => ChannelRender::LongStringField,
+        },
+    )
 }
 
 impl ChannelSource for PvDatabaseSource {
@@ -1432,7 +1429,7 @@ impl ChannelSource for PvDatabaseSource {
             // them from local defaults. A record-backed channel keeps the
             // field-write path: the record owns its alarm/time through
             // processing, and the client cannot stamp them.
-            let Some((cn, _filters)) = resolve_channel(&db, &name) else {
+            let Some((cn, filters)) = resolve_channel(&db, &name) else {
                 return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
             };
             match channel_entry(&db, &cn).await {
@@ -1461,7 +1458,7 @@ impl ChannelSource for PvDatabaseSource {
                 // parking a wait-set whose receiver is dropped would occupy
                 // `RecordInstance::notify` until the record's async work ends.
                 Some(PvEntry::Record(rec)) => {
-                    let epics = record_put_value(&rec, &cn, &value)?;
+                    let epics = record_put_value(&rec, &cn, &value, &filters)?;
                     put_record_field(&db, &cn, epics, &PutOptions::default()).await
                 }
                 // Name not in the database: report it rather than falling
@@ -1509,7 +1506,7 @@ impl ChannelSource for PvDatabaseSource {
                 return Err(crate::server_native::source::put_denied(&checked, &ctx));
             }
             let name = checked.pv_name().clone();
-            let Some((cn, _filters)) = resolve_channel(&db, &name) else {
+            let Some((cn, filters)) = resolve_channel(&db, &name) else {
                 return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
             };
             let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
@@ -1526,7 +1523,7 @@ impl ChannelSource for PvDatabaseSource {
                 &db,
                 &checked,
                 &ctx,
-                &cn,
+                (&cn, &filters),
                 &rec,
                 RecordPut::Write(value),
                 &opts,
@@ -1564,10 +1561,10 @@ impl ChannelSource for PvDatabaseSource {
                 return Err(crate::server_native::source::put_denied(&checked, &ctx));
             }
             let entry = match resolve_channel(&db, checked.pv_name()) {
-                Some((cn, _filters)) => channel_entry(&db, &cn).await.map(|e| (cn, e)),
+                Some((cn, filters)) => channel_entry(&db, &cn).await.map(|e| (cn, e, filters)),
                 None => None,
             };
-            let Some((cn, PvEntry::Record(rec))) = entry else {
+            let Some((cn, PvEntry::Record(rec), filters)) = entry else {
                 let prior = self.get_value_checked(checked.clone(), ctx.clone()).await;
                 let merged = match prior {
                     Some(prior) => fill_unmarked_from_prior(&desc, &changed, 0, delta, &prior),
@@ -1591,7 +1588,7 @@ impl ChannelSource for PvDatabaseSource {
                     &default_value_for(&desc),
                 )),
             };
-            put_record(&db, &checked, &ctx, &cn, &rec, put, &opts).await
+            put_record(&db, &checked, &ctx, (&cn, &filters), &rec, put, &opts).await
         }
     }
 
@@ -2360,7 +2357,7 @@ async fn put_record(
     db: &PvDatabase,
     checked: &epics_base_rs::server::access_security::AccessChecked,
     ctx: &crate::server_native::ChannelContext,
-    cn: &ChannelName,
+    (cn, filters): (&ChannelName, &FilterChain),
     rec: &epics_base_rs::server::record::RecordCell,
     put: RecordPut,
     opts: &PutOptions,
@@ -2373,7 +2370,7 @@ async fn put_record(
     let put = async move {
         match put {
             RecordPut::Write(value) => {
-                let (epics, char_address) = record_put_value(rec, cn, &value)?;
+                let (epics, char_address) = record_put_value(rec, cn, &value, filters)?;
                 trapped_put(checked, ctx, cn, rec, epics, |v| {
                     put_record_field(db, cn, (v, char_address), opts)
                 })
@@ -2451,18 +2448,16 @@ fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOption
 
 /// A record channel's PUT payload as the value its field's put path takes,
 /// and whether it goes through the field's char address. A string put to a
-/// char-array channel — `$`, or a plain one pvxs re-views
-/// ([`CharView::re_views_plain_channel`]) — is `putLongString`,
+/// `$` channel or a [`ChannelValue::Text`] one is `putLongString`,
 /// `dbPut(DBR_CHAR, str, strlen+1)` (`ioc/iocsource.cpp:511`), and a char
 /// array put to a `$` channel is the same `dbPut(DBR_CHAR)`. Any other string
 /// is `putScalar`'s `DBR_STRING`, `strncpy`'d into a `MAX_STRING_SIZE`
 /// buffer first (`ioc/iocsource.cpp:499-500`).
-///
-/// [`CharView::re_views_plain_channel`]: epics_base_rs::server::database::char_view::CharView::re_views_plain_channel
 fn record_put_value(
     rec: &epics_base_rs::server::record::RecordCell,
     cn: &ChannelName,
     value: &PvField,
+    filters: &FilterChain,
 ) -> Result<(EpicsValue, bool), OpError> {
     use epics_base_rs::server::database::char_view::pva_char_request;
     let epics = put_payload_to_epics(value)?;
@@ -2471,11 +2466,16 @@ fn record_put_value(
         EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) if !cn.string_view => None,
         v => pva_char_request(v),
     };
-    if let Some(chars) = chars
-        && (cn.string_view
-            || char_view(&rec.read(), &cn.field).is_some_and(|v| v.re_views_plain_channel()))
-    {
-        return Ok((chars, true));
+    if let Some(chars) = chars {
+        if cn.string_view {
+            return Ok((chars, true));
+        }
+        let inst = rec.read();
+        if ChannelValue::of_record_channel(&inst, &cn.field, filters) == ChannelValue::Text {
+            // Only a field pvxs reshaped takes its chars by the `$` name; a
+            // `DBF_CHAR` one already is them.
+            return Ok((chars, plain_re_view(&inst, &cn.field).is_some()));
+        }
     }
     let epics = match epics {
         EpicsValue::String(text) => {
@@ -6962,6 +6962,88 @@ ASG(PLAIN) {
             .put_value_ctx(name, value, make_ctx("127.0.0.1", "anon", "ca"))
             .await
             .expect("PUT must succeed");
+    }
+
+    /// A CHAR waveform's VAL tagged `info(Q:form, "String")` is pvxs's
+    /// `TypeCode::String` without `$` (`ioc/iocsource.cpp:633`): a string
+    /// NTScalar, no limits or form, and a string put is `putLongString`'s
+    /// `strlen + 1` chars (`:601-603`) — ADCore's `NDAttributesFile` idiom.
+    #[epics_macros_rs::epics_test]
+    async fn a_q_form_string_char_array_serves_text() {
+        use std::collections::HashMap;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"
+                record(waveform, "QF:W") { field(FTVL, "CHAR") field(NELM, "16") info(Q:form, "String") }
+                record(waveform, "QF:U") { field(FTVL, "UCHAR") field(NELM, "16") info(Q:form, "String") }
+                record(waveform, "QF:1") { field(FTVL, "CHAR") field(NELM, "1") info(Q:form, "String") }
+                record(waveform, "QF:N") { field(FTVL, "CHAR") field(NELM, "16") }
+                record(lso, "QF:S") { field(SIZV, "41") info(Q:form, "String") }
+                "#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        dollar_put(
+            &source,
+            "QF:W",
+            PvField::Scalar(ScalarValue::String("abc".into())),
+        )
+        .await;
+        let nord = db
+            .get_record("QF:W")
+            .unwrap()
+            .read()
+            .client_field_value("NORD");
+        assert_eq!(nord.and_then(|v| v.to_f64()), Some(4.0), "strlen + 1");
+
+        let Some(PvField::Structure(s)) = source.get_value(b"QF:W").await else {
+            panic!("expected an NTScalar");
+        };
+        assert_eq!(s.get_field("value"), dollar_text("abc").as_ref());
+        let Some(PvField::Structure(display)) = s.get_field("display") else {
+            panic!("a string NTScalar keeps display.description/units");
+        };
+        assert!(display.get_field("limitLow").is_none());
+        assert!(display.get_field("form").is_none());
+        assert!(s.get_field("control").is_none());
+
+        // Not `DBR_CHAR`, not `isArray`, no tag: each keeps its `int8_t`/
+        // `uint8_t` value, as `softIocPVX` 1.5.3 serves them.
+        for (name, array) in [("QF:U", true), ("QF:1", false), ("QF:N", true)] {
+            let Some(PvField::Structure(s)) = source.get_value(name.as_bytes()).await else {
+                panic!("{name}: expected an NT structure");
+            };
+            let value = s.get_field("value");
+            let served_array = matches!(
+                value,
+                Some(PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_))
+            );
+            let served_number =
+                matches!(value, Some(PvField::Scalar(v)) if !matches!(v, ScalarValue::String(_)));
+            assert!(
+                if array { served_array } else { served_number },
+                "{name}: {value:?}"
+            );
+        }
+
+        // A long string pvxs leaves `DBR_STRING` (`ioc/channel.cpp:56-60`) is
+        // `putScalar`'s 39-char `strncpy`, not `putLongString`, under any form.
+        let long = "y".repeat(45);
+        dollar_put(
+            &source,
+            "QF:S",
+            PvField::Scalar(ScalarValue::String(long.as_str().into())),
+        )
+        .await;
+        assert_eq!(
+            dollar_value(source.get_value(b"QF:S").await),
+            dollar_text(&long[..39])
+        );
     }
 
     /// A `$` GET per shape, each the `pvxget -r value` answer of

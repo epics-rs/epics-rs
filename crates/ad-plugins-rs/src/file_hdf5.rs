@@ -1444,17 +1444,38 @@ impl Hdf5Writer {
             }
             Err(e) => {
                 self.layout = None;
-                // NDFileHDF5.cpp:279-284.
-                lines.push(
-                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout\n"
-                        .to_owned(),
-                );
-                Err(ADError::Reported {
-                    lines,
-                    message: format!("Failed to create the specified file layout: {e}"),
-                })
+                Err(layout_failed(lines, &e))
             }
         }
+    }
+
+    /// The default NDAttribute group C `createAttributeDataset` names the
+    /// host on, ignoring a failure (NDFileHDF5.cpp:2768-2769): after the
+    /// layout is accepted, so a refused file has none.
+    fn hostname_group(&self) -> Option<&str> {
+        self.resolved_ndattr_group
+            .as_deref()
+            .filter(|p| !p.is_empty() && self.cfg.store_attributes && !self.hostname.is_empty())
+    }
+
+    /// The layout's detector datasets (C `detDataMap`), or C
+    /// `createXMLFileLayout`'s refusal of a layout without one
+    /// (NDFileHDF5.cpp:471-491), made after `createTree` built the rest (:463).
+    /// A root detector dataset counts for none: C takes it as the default but
+    /// never creates it, and its first `writeFile` dereferences the missing
+    /// `detDataMap` entry (:1501, a C defect not copied).
+    fn layout_detector_paths(layout: &Hdf5Layout) -> ADResult<Vec<String>> {
+        let paths = layout.detector_dataset_paths();
+        if paths.is_empty() {
+            return Err(layout_failed(
+                vec![
+                    "NDFileHDF5::createXMLFileLayout No detector datasets found, cannot continue\n"
+                        .to_owned(),
+                ],
+                "No detector datasets found",
+            ));
+        }
+        Ok(paths)
     }
 
     /// C `createNewFile`'s failure (NDFileHDF5.cpp:3846-3851) as `openFile`
@@ -1915,6 +1936,16 @@ impl Hdf5Writer {
         self.configure_compression(array);
         let mut swmr = SwmrFileWriter::create(path).map_err(|e| Self::create_failed(path, e))?;
         self.build_swmr_layout_groups(&mut swmr)?;
+        if let Some(layout) = self.layout.as_ref() {
+            Self::layout_detector_paths(layout)?;
+        }
+        if let Some(path) = self.hostname_group() {
+            let group_path = format!("/{path}");
+            let _ = self
+                .created_attrs
+                .on(path, SwmrGroup(&mut swmr, &group_path))
+                .string("hostname", &self.hostname);
+        }
 
         let usize_frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
         let frame_dims: Vec<u64> = usize_frame_dims.iter().map(|&d| d as u64).collect();
@@ -2081,6 +2112,10 @@ impl Hdf5Writer {
             Some(l) => l,
             None => return Ok(()),
         };
+        post_unknown_types(
+            &self.open_posts,
+            layout.tree_attributes(self.cfg.store_attributes),
+        );
         fn collect<'a>(
             g: &'a crate::hdf5_layout::LayoutGroup,
             prefix: &str,
@@ -2130,11 +2165,6 @@ impl Hdf5Writer {
                 let group_path = format!("/{}", path);
                 let mut target = self.created_attrs.on(path, SwmrGroup(swmr, &group_path));
                 write_swmr_group_constant_attrs(&mut target, &group_path, &node.attributes)?;
-                // createAttributeDataset names the host on the default
-                // NDAttribute group, ignoring a failure (:2768-2772).
-                if self.resolved_ndattr_group.as_ref() == Some(path) && !self.hostname.is_empty() {
-                    let _ = target.string("hostname", &self.hostname);
-                }
             }
         }
         Ok(())
@@ -2270,6 +2300,10 @@ impl Hdf5Writer {
             Some(l) => l,
             None => return Ok(()),
         };
+        post_unknown_types(
+            &self.open_posts,
+            layout.tree_attributes(self.cfg.store_attributes),
+        );
         fn collect<'a>(
             g: &'a crate::hdf5_layout::LayoutGroup,
             prefix: &str,
@@ -2325,11 +2359,6 @@ impl Hdf5Writer {
             if self.cfg.store_attributes {
                 let mut target = self.created_attrs.on(path, &group);
                 write_group_constant_attrs(&mut target, &node.attributes);
-                // createAttributeDataset names the host on the default
-                // NDAttribute group, ignoring a failure (:2768-2772).
-                if self.resolved_ndattr_group.as_ref() == Some(path) && !self.hostname.is_empty() {
-                    let _ = target.string("hostname", &self.hostname);
-                }
             }
         }
         Ok(())
@@ -2461,13 +2490,7 @@ impl Hdf5Writer {
         // NeXus `signal=1` marker). Keys are leading-slash full names so the
         // `detector_data_destination` routing value matches C `detDataMap`.
         let detector_keys: Vec<String> = match self.layout.as_ref() {
-            Some(l) => {
-                let mut keys = l.detector_dataset_paths();
-                if keys.is_empty() {
-                    keys.push(format!("/{}", self.resolved_dataset_path));
-                }
-                keys
-            }
+            Some(l) => Self::layout_detector_paths(l)?,
             None => vec![format!("/{}", self.resolved_dataset_path)],
         };
         let detector_specs: Vec<(String, Vec<crate::hdf5_layout::LayoutAttribute>)> = detector_keys
@@ -2509,6 +2532,14 @@ impl Hdf5Writer {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
         };
+        if let Some(path) = self.hostname_group()
+            && let Ok(group) = Self::open_write_group(h5file, path)
+        {
+            let _ = self
+                .created_attrs
+                .on(path, &group)
+                .string("hostname", &self.hostname);
+        }
 
         let mut detectors: std::collections::HashMap<String, DetectorDataset> =
             std::collections::HashMap::with_capacity(detector_specs.len());
@@ -2787,6 +2818,7 @@ impl Hdf5Writer {
         let layout = self.layout.as_ref();
         let home = self.resolved_ndattr_group.as_deref();
         let shape = self.attribute_shape();
+        let mut declared = Vec::new();
         // A dimAttDatasets dataset takes the frame's offsets on its axes.
         let axes: Vec<usize> = match &shape {
             _ if !self.cfg.dim_att_datasets => Vec::new(),
@@ -2803,11 +2835,14 @@ impl Hdf5Writer {
                 // (NDFileHDF5.cpp:2792-2857).
                 let (group, dset_name, when) =
                     match layout.and_then(|l| l.ndattribute_dataset(&attr.name)) {
-                        Some((g, d)) => (
-                            g.trim_start_matches('/').to_string(),
-                            d.name.clone(),
-                            d.when,
-                        ),
+                        Some((g, d)) => {
+                            declared.extend(&d.attributes);
+                            (
+                                g.trim_start_matches('/').to_string(),
+                                d.name.clone(),
+                                d.when,
+                            )
+                        }
                         None => (home?.to_string(), attr.name.clone(), LayoutWhen::OnFrame),
                     };
                 // C `createAttributeDataset`: in PositionMode an attribute a
@@ -2827,6 +2862,8 @@ impl Hdf5Writer {
                 ))
             })
             .collect();
+        // writeHdfAttributes on each declared dataset (:2816).
+        post_unknown_types(&self.open_posts, declared);
         // C writes and flushes NDArrayUniqueId after every other attribute
         // (NDFileHDF5.cpp:355-390, :2955-2992), so a SWMR reader that sees a
         // frame's id sees the rest of it. Writes follow this list, and so does
@@ -4144,6 +4181,36 @@ fn write_swmr_const_dataset(
     Ok(index)
 }
 
+/// C `openFile`'s refusal of a layout `createFileLayout` failed, after the
+/// lines that failure printed (NDFileHDF5.cpp:278-282).
+fn layout_failed(mut lines: Vec<String>, why: &str) -> ADError {
+    lines
+        .push("NDFileHDF5::openFile ERROR Failed to create the specified file layout\n".to_owned());
+    ADError::Reported {
+        lines,
+        message: format!("Failed to create the specified file layout: {why}"),
+    }
+}
+
+/// C `writeHdfAttributes`'s line for each attribute without a known source,
+/// whose `int8` type no branch writes (NDFileHDF5.cpp:789-792).
+fn post_unknown_types<'a>(
+    posts: &Mutex<OpenPosts>,
+    attrs: impl IntoIterator<Item = &'a crate::hdf5_layout::LayoutAttribute>,
+) {
+    posts.lock().lines.extend(
+        attrs
+            .into_iter()
+            .filter(|a| a.source == crate::hdf5_layout::LayoutSource::Unset)
+            .map(|a| {
+                format!(
+                    "NDFileHDF5::writeHdfAttributes unknown type: unable to create attribute: {}\n",
+                    a.name
+                )
+            }),
+    );
+}
+
 impl AttrTarget for &rust_hdf5::H5Group {
     fn scalar<T: H5Type>(&mut self, name: &str, value: &T) -> rust_hdf5::Result<()> {
         self.set_attr_numeric(name, value)
@@ -4434,18 +4501,25 @@ impl NDFileWriter for Hdf5Writer {
                 file: h5file,
                 detectors: std::collections::HashMap::new(),
             });
+            // A failed open closes the file it built, which stays on disk as
+            // C's does; C holds it open until the next openFile (:221).
+            let mut opening = Finalize::new(self, |w: &mut Self| w.handle = None);
             // C `createFileLayout` from the open array, then
             // `createAttributeDataset` and `writeAttributeDataset(OnFileOpen)`
             // (NDFileHDF5.cpp:278, :297-299).
-            self.create_detector_datasets(array)?;
-            self.create_attribute_datasets();
-            write_attribute_datasets(
-                &mut self.attr_datasets,
-                &self.file_attributes,
-                LayoutWhen::OnFileOpen,
-                None,
-                None,
-            )
+            opening.run(|w| {
+                w.create_detector_datasets(array)?;
+                w.create_attribute_datasets();
+                write_attribute_datasets(
+                    &mut w.attr_datasets,
+                    &w.file_attributes,
+                    LayoutWhen::OnFileOpen,
+                    None,
+                    None,
+                )
+            })?;
+            opening.disarm();
+            Ok(())
         }
     }
 
@@ -4750,7 +4824,7 @@ fn verify_layout(spec: &str) -> Result<&'static str, LayoutFault> {
 }
 
 /// What C `openFile` sets and prints for one open, held for the port: the
-/// params it posts and `configureCompression`'s `asynPrint` lines.
+/// params it posts and its `ASYN_TRACE_ERROR` lines.
 #[derive(Debug, Default)]
 struct OpenPosts {
     posts: Vec<OpenPost>,
@@ -4813,7 +4887,7 @@ impl Hdf5FileProcessor {
             .collect()
     }
 
-    /// The lines `configure_compression` printed, as C's `asynPrint`.
+    /// The lines the open printed, as C's `asynPrint`.
     fn open_trace(&self) -> Vec<(TraceMask, String)> {
         let lines = std::mem::take(&mut self.open_posts.lock().lines);
         lines.into_iter().map(|l| (TraceMask::ERROR, l)).collect()
@@ -7624,6 +7698,181 @@ mod tests {
         writer.close_file().unwrap();
         std::fs::remove_file(&xml).ok();
         path
+    }
+
+    /// An attribute with no known source is notset, whose `int8` type C
+    /// `writeHdfAttributes` cannot write: it prints a line wherever it would
+    /// write one, `createTree` depth first, then `createAttributeDataset`
+    /// (NDFileHDF5.cpp:638-708, :789-792, :2816).
+    #[test]
+    fn a_notset_attribute_prints_c_unknown_type_line_where_c_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("notset.xml");
+        std::fs::write(
+            &xml,
+            r#"<hdf5_layout><group name="entry">
+              <attribute name="nosrc" value="x"/>
+              <attribute name="bogus" source="bogus" value="y"/>
+              <attribute name="kind" source="constant" value="7" type="int"/>
+              <dataset name="data" source="detector" det_default="true">
+                <attribute name="dnosrc"/></dataset>
+              <dataset name="cnos" value="3" type="int"><attribute name="never"/></dataset>
+              <dataset name="exp" source="ndattribute" ndattribute="exposure">
+                <attribute name="xnosrc"/></dataset>
+              <group name="b"><attribute name="bnull"/></group>
+              <group name="a"><attribute name="anull"/>
+                <group name="deep"><attribute name="dnull"/></group></group>
+              <group name="NDAttributes" ndattr_default="true"/>
+            </group></hdf5_layout>"#,
+        )
+        .unwrap();
+        for swmr in [false, true] {
+            for store in [true, false] {
+                let path = dir.path().join(format!("notset_{swmr}_{store}.h5"));
+                let mut writer = Hdf5Writer::new();
+                writer.set_swmr_mode(swmr);
+                writer.set_store_attributes(store);
+                writer.set_layout_filename(xml.to_str().unwrap());
+                let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+                arr.attributes.add(NDAttribute::new_static(
+                    "exposure",
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Float64(0.5),
+                ));
+                writer
+                    .open_file(&path, NDFileOpenMode::WRITE, &arr)
+                    .unwrap();
+                let expected: &[&str] = if store {
+                    &[
+                        "dnosrc", "bogus", "nosrc", "anull", "dnull", "bnull", "xnosrc",
+                    ]
+                } else {
+                    &["dnosrc"]
+                };
+                let expected: Vec<String> = expected
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "NDFileHDF5::writeHdfAttributes unknown type: \
+                             unable to create attribute: {n}\n"
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    writer.open_posts.lock().lines,
+                    expected,
+                    "swmr={swmr} store={store}"
+                );
+                writer.close_file().unwrap();
+            }
+        }
+    }
+
+    /// A detector dataset under a group C refuses lands on that group's
+    /// parent, and frames go there (C oracle).
+    #[test]
+    fn a_detector_dataset_under_a_refused_group_takes_the_frames() {
+        for swmr in [false, true] {
+            let file = write_frames_through_layout(
+                swmr,
+                "refused_parent",
+                r#"<hdf5_layout><group name="entry">
+                  <group ndattr_default="true"><dataset name="data" source="detector"/></group>
+                </group></hdf5_layout>"#,
+                2,
+            );
+            let h5 = H5File::open(&file).unwrap();
+            assert_eq!(
+                h5.dataset("entry/data").unwrap().shape(),
+                vec![2, 4],
+                "swmr={swmr}"
+            );
+            assert!(h5.dataset("exposure").is_ok(), "swmr={swmr}");
+            std::fs::remove_file(&file).ok();
+        }
+    }
+
+    /// C refuses a layout without a detector dataset once `createTree` has
+    /// built the rest, and that tree stays in the file (NDFileHDF5.cpp:463-491,
+    /// C oracle). A root detector dataset counts for none.
+    #[test]
+    fn a_layout_without_a_detector_dataset_refuses_the_open_after_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let layouts = [
+            r#"<hdf5_layout><group name="entry">
+              <attribute name="NX_class" source="constant" value="NXentry" type="string"/>
+              <attribute name="nosrc"/>
+              <dataset name="c" source="constant" value="2" type="int"/>
+              <dataset name="exp" source="ndattribute" ndattribute="exposure"/>
+              <group name="NDAttributes" ndattr_default="true"/>
+            </group></hdf5_layout>"#,
+            r#"<hdf5_layout><group name="entry">
+              <dataset name="c" source="constant" value="2" type="int"/></group>
+              <dataset name="data" source="detector" det_default="true"/>
+            </hdf5_layout>"#,
+        ];
+        let refusal = [
+            "NDFileHDF5::createXMLFileLayout No detector datasets found, cannot continue\n",
+            "NDFileHDF5::openFile ERROR Failed to create the specified file layout\n",
+        ];
+        for (i, layout) in layouts.into_iter().enumerate() {
+            let xml = dir.path().join(format!("nodet{i}.xml"));
+            std::fs::write(&xml, layout).unwrap();
+            for swmr in [false, true] {
+                let path = dir.path().join(format!("nodet{i}_{swmr}.h5"));
+                let mut writer = Hdf5Writer::new();
+                writer.set_swmr_mode(swmr);
+                writer.set_store_attributes(true);
+                writer.set_layout_filename(xml.to_str().unwrap());
+                writer.hostname = "testhost".into();
+                let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+                arr.attributes.add(NDAttribute::new_static(
+                    "exposure",
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Float64(0.5),
+                ));
+                let err = writer
+                    .open_file(&path, NDFileOpenMode::WRITE, &arr)
+                    .unwrap_err();
+                assert_eq!(err.lines(), refusal, "layout {i} swmr={swmr}");
+                let unknown: &[&str] = if i == 0 {
+                    &[
+                        "NDFileHDF5::writeHdfAttributes unknown type: unable to create attribute: nosrc\n",
+                    ]
+                } else {
+                    &[]
+                };
+                assert_eq!(
+                    writer.open_posts.lock().lines,
+                    unknown,
+                    "layout {i} swmr={swmr}"
+                );
+                assert!(writer.handle.is_none(), "layout {i} swmr={swmr}");
+                let h5 = H5File::open(&path).unwrap();
+                assert_eq!(
+                    h5.dataset("entry/c").unwrap().read_raw::<i32>().unwrap(),
+                    vec![2],
+                    "layout {i} swmr={swmr}"
+                );
+                let names = h5.dataset_names();
+                assert_eq!(names, vec!["entry/c".to_owned()], "layout {i} swmr={swmr}");
+                if i == 0 {
+                    let entry = h5.root_group().group("entry").unwrap();
+                    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+                    // createAttributeDataset never ran, so no host is named.
+                    let ndattrs = entry.group("NDAttributes").unwrap();
+                    assert!(
+                        !ndattrs
+                            .attr_names()
+                            .unwrap()
+                            .contains(&"hostname".to_owned()),
+                        "swmr={swmr}"
+                    );
+                }
+            }
+        }
     }
 
     /// C `openFile` creates the layout tree and the detector datasets

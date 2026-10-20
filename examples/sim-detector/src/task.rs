@@ -9,14 +9,14 @@ use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::runtime as rt;
 
 use ad_core_rs::color_layout::ColorLayout;
-use ad_core_rs::ndarray_pool::{DriverArray, DriverPool};
+use ad_core_rs::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::roi::crop_roi;
+use ad_core_rs::timestamp::EpicsTimestamp;
 
 use crate::compute::{self, SineState};
 use crate::params::{SimConfigSnapshot, SimDetectorParams};
@@ -66,12 +66,19 @@ impl AcquisitionContext {
     }
 }
 
+/// C's pRaw_, pBackground_, pRamp_ and pPeak_: pool arrays, charged from the
+/// reset that allocates them to the next (simDetector.cpp:625-638).
+struct SimBuffers {
+    raw: DriverArray,
+    background: DriverArray,
+    ramp: DriverArray,
+    peak: DriverArray,
+}
+
 struct TaskState {
     rng: StdRng,
-    raw_buf: NDDataBuffer,
-    background_buf: NDDataBuffer,
-    ramp_buf: NDDataBuffer,
-    peak_buf: NDDataBuffer,
+    /// `None` until the next frame allocates them.
+    bufs: Option<SimBuffers>,
     sine_state: SineState,
     use_background: bool,
 }
@@ -80,10 +87,7 @@ impl TaskState {
     fn new() -> Self {
         Self {
             rng: StdRng::from_os_rng(),
-            raw_buf: NDDataBuffer::zeros(ad_core_rs::ndarray::NDDataType::UInt8, 0),
-            background_buf: NDDataBuffer::zeros(ad_core_rs::ndarray::NDDataType::UInt8, 0),
-            ramp_buf: NDDataBuffer::zeros(ad_core_rs::ndarray::NDDataType::UInt8, 0),
-            peak_buf: NDDataBuffer::zeros(ad_core_rs::ndarray::NDDataType::UInt8, 0),
+            bufs: None,
             sine_state: SineState::new(),
             use_background: false,
         }
@@ -91,16 +95,8 @@ impl TaskState {
 
     fn apply_dirty(&mut self, dirty: &DirtyFlags, config: &SimConfigSnapshot) {
         if dirty.reallocate_buffers {
-            let layout = ColorLayout {
-                color_mode: config.color_mode,
-                size_x: config.max_size_x,
-                size_y: config.max_size_y,
-            };
-            let n = layout.num_elements();
-            self.raw_buf = NDDataBuffer::zeros(config.data_type, n);
-            self.background_buf = NDDataBuffer::zeros(config.data_type, n);
-            self.ramp_buf = NDDataBuffer::zeros(config.data_type, n);
-            self.peak_buf = NDDataBuffer::zeros(config.data_type, n);
+            // C releases the previous buffers before allocating the new ones.
+            self.bufs = None;
             self.use_background = false;
         }
 
@@ -110,24 +106,38 @@ impl TaskState {
         }
     }
 
-    /// `None` when the pool refused the frame; it has printed its limit line.
+    /// C computeImage: the image is computed into pRaw_ and converted into
+    /// pArrays[0] (simDetector.cpp:694-699). `None` when the pool refused a
+    /// buffer; it has printed its limit line.
     fn compute_frame(
         &mut self,
         pool: &DriverPool,
         config: &SimConfigSnapshot,
         reset: bool,
-    ) -> Option<DriverArray> {
+    ) -> Option<PublishedArray> {
         let layout = ColorLayout {
             color_mode: config.color_mode,
             size_x: config.max_size_x,
             size_y: config.max_size_y,
         };
 
+        let b = match &mut self.bufs {
+            Some(b) => b,
+            None => {
+                let alloc = || pool.alloc(layout.make_dims(), config.data_type).ok();
+                self.bufs.insert(SimBuffers {
+                    raw: alloc()?,
+                    background: alloc()?,
+                    ramp: alloc()?,
+                    peak: alloc()?,
+                })
+            }
+        };
         compute::compute_frame(
-            &mut self.raw_buf,
-            &mut self.background_buf,
-            &mut self.ramp_buf,
-            &mut self.peak_buf,
+            &mut b.raw.data,
+            &mut b.background.data,
+            &mut b.ramp.data,
+            &mut b.peak.data,
             &mut self.sine_state,
             &layout,
             config.sim_mode,
@@ -146,19 +156,18 @@ impl TaskState {
         let size_x = config.size_x.min(config.max_size_x - min_x).max(1);
         let size_y = config.size_y.min(config.max_size_y - min_y).max(1);
 
-        // Build a temporary NDArray wrapper for crop_roi (which now takes &NDArray)
-        let mut temp_arr = NDArray::new(layout.make_dims(), self.raw_buf.data_type());
-        temp_arr.data = self.raw_buf.clone();
-        let mut frame = crop_roi(pool, &temp_arr, &layout, min_x, min_y, size_x, size_y).ok()?;
-        // C computeImage labels every image (simDetector.cpp:171); the
-        // attribute is what `NDArray::info` reads the layout from.
-        frame.attributes.add(NDAttribute::new_static(
-            "ColorMode",
-            "Color mode",
-            NDAttrSource::Driver,
-            NDAttrValue::Int32(config.color_mode as i32),
-        ));
-        pool.adopt(frame)
+        pool.owner().replace_array(0, || {
+            let mut frame = crop_roi(pool, &b.raw, &layout, min_x, min_y, size_x, size_y).ok()?;
+            // C computeImage labels every image (simDetector.cpp:171); the
+            // attribute is what `NDArray::info` reads the layout from.
+            frame.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(config.color_mode as i32),
+            ));
+            pool.adopt(frame)
+        })
     }
 }
 
@@ -266,7 +275,8 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
             task_state.apply_dirty(&dirty_flags, &config);
 
-            let Some(mut frame) = task_state.compute_frame(&ctx.pool, &config, reset) else {
+            // It stays in pArrays[0] through the exposure wait.
+            let Some(frame) = task_state.compute_frame(&ctx.pool, &config, reset) else {
                 continue;
             };
 
@@ -286,15 +296,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             num_counter += 1;
             array_counter += 1;
 
-            frame.unique_id = array_counter;
             // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
             // the callbacks after it carry the port's updated stamp.
-            let stamp = ctx
+            let stamp: EpicsTimestamp = ctx
                 .port_handle
                 .update_time_stamp()
                 .await
-                .unwrap_or_else(|_| std::time::SystemTime::now());
-            frame.update_time_stamps(stamp.into());
+                .unwrap_or_else(|_| std::time::SystemTime::now())
+                .into();
 
             // C `simDetector::computeImage` publishes the converted array's
             // size beside the frame it belongs to (simDetector.cpp:709-712):
@@ -338,17 +347,17 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.timestamp_rbv,
                             0,
-                            ParamValue::Float64(frame.timestamp.as_f64()),
+                            ParamValue::Float64(stamp.as_f64()),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_sec,
                             0,
-                            ParamValue::Int32(frame.timestamp.sec as i32),
+                            ParamValue::Int32(stamp.sec as i32),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_nsec,
                             0,
-                            ParamValue::Int32(frame.timestamp.nsec as i32),
+                            ParamValue::Int32(stamp.nsec as i32),
                         ),
                     ],
                 )
@@ -358,10 +367,26 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
 
             // C `getAttributes(pImage->pAttributeList)` (simDetector.cpp:828).
-            if let Err(e) = ctx.pool.owner().get_attributes(&mut frame).await {
-                epics_libcom_rs::stderr_println!("getAttributes error: {e}");
-            }
+            let attributes = ctx
+                .pool
+                .owner()
+                .evaluate_attributes()
+                .await
+                .unwrap_or_else(|e| {
+                    epics_libcom_rs::stderr_println!("getAttributes error: {e}");
+                    None
+                });
 
+            // simTask stamps pArrays[0] in place (simDetector.cpp:824-828).
+            let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
+                frame.unique_id = array_counter;
+                frame.update_time_stamps(stamp);
+                if let Some(attributes) = &attributes {
+                    frame.attributes.copy_from(attributes);
+                }
+            }) else {
+                continue;
+            };
             if config.array_callbacks {
                 ctx.publisher.publish(frame).await;
             }
@@ -518,6 +543,161 @@ mod tests {
         let frame = receiver.blocking_recv().unwrap();
         let owner = frame.owner().expect("frame from an owned pool");
         assert!(Arc::ptr_eq(&owner, rt.pool().owner()));
+    }
+
+    /// One image, then `PreAllocBuffers`: C keeps the image as `pArrays[0]`
+    /// (simDetector.cpp:696) whether or not it calls back, so the pool copies
+    /// it (asynNDArrayDriver.cpp:717-726).
+    #[test]
+    fn one_image_is_the_pre_alloc_template() {
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_PREALLOC").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 0.001).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1
+            || h.read_int32_blocking(p.acquire, 0).unwrap() != 0
+        {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.write_int32_blocking(p.base.pool_poll_stats, 0, 1)
+            .unwrap();
+        let before = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        h.write_int32_blocking(p.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        h.write_int32_blocking(p.base.pool_pre_alloc, 0, 1).unwrap();
+        let after = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        assert_eq!(after - before, 2);
+    }
+
+    /// C fills pArrays[0] in computeImage before the exposure wait
+    /// (simDetector.cpp:697), so PreAllocBuffers during an exposure copies
+    /// the image being exposed.
+    #[test]
+    fn pre_alloc_during_an_exposure_copies_the_image() {
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_PREALLOC_EXP").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 1.0).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1 {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        h.write_int32_blocking(p.base.pool_poll_stats, 0, 1)
+            .unwrap();
+        let before = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        h.write_int32_blocking(p.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        h.write_int32_blocking(p.base.pool_pre_alloc, 0, 1).unwrap();
+        let after = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        assert_eq!(h.read_int32_blocking(p.base.array_counter, 0).unwrap(), 1);
+        h.write_int32_blocking(p.acquire, 0, 0).unwrap();
+        assert_eq!(after - before, 2);
+    }
+
+    /// C releases pArrays[0] and converts the next image into it under the
+    /// driver lock (simDetector.cpp:694-699), so free-running, a reader never
+    /// finds the slot empty once the first image is there.
+    #[test]
+    fn a_free_running_acquisition_never_leaves_parrays0_empty() {
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_SLOT_FREE").unwrap(),
+            1024,
+            1024,
+            NDDataType::UInt16 as i32,
+            64_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 0.0).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let owner = rt.pool().owner();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while owner.array(0).is_none() {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::yield_now();
+        }
+        let first = h.read_int32_blocking(p.base.array_counter, 0).unwrap();
+        let (mut samples, mut empty) = (0u32, 0u32);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < first + 3 {
+            assert!(std::time::Instant::now() < deadline, "no third image");
+            for _ in 0..100 {
+                samples += 1;
+                empty += u32::from(owner.array(0).is_none());
+                std::thread::yield_now();
+            }
+        }
+        h.write_int32_blocking(p.acquire, 0, 0).unwrap();
+        assert_eq!(
+            empty, 0,
+            "{empty} of {samples} samples found pArrays[0] empty"
+        );
+    }
+
+    /// C computes into pRaw_, pBackground_, pRamp_ and pPeak_ from the pool
+    /// (simDetector.cpp:635-638) beside pArrays[0], so one image then
+    /// PreAllocBuffers(3) leaves 8 buffers, 3 free, as the C IOC reports.
+    #[test]
+    fn the_compute_buffers_come_from_the_pool() {
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_POOL_BUFS").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 0.001).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1
+            || h.read_int32_blocking(p.acquire, 0).unwrap() != 0
+        {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.write_int32_blocking(p.base.pool_num_pre_alloc_buffers, 0, 3)
+            .unwrap();
+        h.write_int32_blocking(p.base.pool_pre_alloc, 0, 1).unwrap();
+        h.write_int32_blocking(p.base.pool_poll_stats, 0, 1)
+            .unwrap();
+        let alloc = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        let free = h.read_int32_blocking(p.base.pool_free_buffers, 0).unwrap();
+        assert_eq!((alloc, free), (8, 3));
     }
 
     /// C `simDetector::simTask` runs `getAttributes` on every image before

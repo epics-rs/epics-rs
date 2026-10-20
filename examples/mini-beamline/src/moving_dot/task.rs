@@ -13,6 +13,7 @@ use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
+use ad_core_rs::timestamp::EpicsTimestamp;
 
 use crate::physics::{self, MovingDotImageConfig};
 
@@ -227,8 +228,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .collect();
 
             let dims = vec![NDDimension::new(out_w), NDDimension::new(out_h)];
-            // A refused wrap has printed the pool's limit line.
-            let Ok(mut frame) = ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)) else {
+            // As C simDetector, the last image is released and the next is
+            // allocated in its place under one lock (simDetector.cpp:694-699);
+            // it stays there through the exposure wait. A refused wrap has
+            // printed the pool's limit line.
+            let Some(frame) = ctx.pool.owner().replace_array(0, || {
+                ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)).ok()
+            }) else {
                 continue;
             };
 
@@ -248,15 +254,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             num_counter += 1;
             array_counter += 1;
 
-            frame.unique_id = array_counter;
             // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
             // the callbacks after it carry the port's updated stamp.
-            let stamp = ctx
+            let stamp: EpicsTimestamp = ctx
                 .port_handle
                 .update_time_stamp()
                 .await
-                .unwrap_or_else(|_| std::time::SystemTime::now());
-            frame.update_time_stamps(stamp.into());
+                .unwrap_or_else(|_| std::time::SystemTime::now())
+                .into();
 
             // Update parameters and fire callbacks in one atomic operation.
             // Using set_params_and_notify instead of write_int32_no_wait avoids
@@ -296,17 +301,17 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.timestamp_rbv,
                             0,
-                            ParamValue::Float64(frame.timestamp.as_f64()),
+                            ParamValue::Float64(stamp.as_f64()),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_sec,
                             0,
-                            ParamValue::Int32(frame.timestamp.sec as i32),
+                            ParamValue::Int32(stamp.sec as i32),
                         ),
                         asyn_rs::request::ParamSetValue::new(
                             ctx.ad.base.epics_ts_nsec,
                             0,
-                            ParamValue::Int32(frame.timestamp.nsec as i32),
+                            ParamValue::Int32(stamp.nsec as i32),
                         ),
                     ],
                 )
@@ -315,6 +320,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 epics_libcom_rs::stderr_println!("set_params_and_notify error (frame update): {e}");
             }
 
+            // Stamped in place in pArrays[0] (simDetector.cpp:824-825).
+            let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
+                frame.unique_id = array_counter;
+                frame.update_time_stamps(stamp);
+            }) else {
+                continue;
+            };
             if config.array_callbacks {
                 ctx.publisher.publish(frame).await;
             }

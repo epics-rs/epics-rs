@@ -274,4 +274,93 @@ mod tests {
         det.write_int32(&mut AsynUser::new(pre_alloc), 1).unwrap();
         assert_eq!(det.ad.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
     }
+
+    /// C releases pArrays[0] and converts the next image into it under the
+    /// driver lock (simDetector.cpp:694-699), so free-running, a reader never
+    /// finds the slot empty once the first image is there.
+    #[test]
+    fn a_free_running_acquisition_never_leaves_parrays0_empty() {
+        let rt = create_xrt_detector(
+            &asyn_rs::registry::claim_port("XRT_SLOT_FREE").unwrap(),
+            16,
+            12,
+            64_000_000,
+            NDArrayOutput::new(),
+            SimConfig {
+                screen_nx: 16,
+                screen_nz: 12,
+                ..SimConfig::default()
+            },
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 0.0).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let owner = rt.pool().owner();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while owner.array(0).is_none() {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::yield_now();
+        }
+        let first = h.read_int32_blocking(p.base.array_counter, 0).unwrap();
+        let (mut samples, mut empty) = (0u32, 0u32);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < first + 3 {
+            assert!(std::time::Instant::now() < deadline, "no third image");
+            for _ in 0..100 {
+                samples += 1;
+                empty += u32::from(owner.array(0).is_none());
+                std::thread::yield_now();
+            }
+        }
+        h.write_int32_blocking(p.acquire, 0, 0).unwrap();
+        assert_eq!(
+            empty, 0,
+            "{empty} of {samples} samples found pArrays[0] empty"
+        );
+    }
+
+    /// One image, then `PreAllocBuffers`: the image is kept as `pArrays[0]`,
+    /// as C simDetector does (simDetector.cpp:696), so the pool copies it
+    /// (asynNDArrayDriver.cpp:717-726).
+    #[test]
+    fn one_image_is_the_pre_alloc_template() {
+        let sim = SimConfig {
+            screen_nx: 16,
+            screen_nz: 12,
+            ..SimConfig::default()
+        };
+        let rt = create_xrt_detector(
+            &asyn_rs::registry::claim_port("XRT_PREALLOC_TEMPLATE").unwrap(),
+            16,
+            12,
+            1_000_000,
+            NDArrayOutput::new(),
+            sim,
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let p = rt.ad_params;
+        h.write_int32_blocking(p.image_mode, 0, ImageMode::Single as i32)
+            .unwrap();
+        h.write_float64_blocking(p.acquire_time, 0, 0.001).unwrap();
+        h.write_int32_blocking(p.acquire, 0, 1).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1
+            || h.read_int32_blocking(p.acquire, 0).unwrap() != 0
+        {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.write_int32_blocking(p.base.pool_poll_stats, 0, 1)
+            .unwrap();
+        let before = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        h.write_int32_blocking(p.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        h.write_int32_blocking(p.base.pool_pre_alloc, 0, 1).unwrap();
+        let after = h.read_int32_blocking(p.base.pool_alloc_buffers, 0).unwrap();
+        assert_eq!(after - before, 2);
+    }
 }

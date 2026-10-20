@@ -456,6 +456,9 @@ pub fn init_read_only_params(
     Ok(())
 }
 
+/// C++ `MEGABYTE_DBL`, the unit of the pool's memory readbacks.
+const MEGABYTE: f64 = 1_048_576.0;
+
 /// What the four pool-statistics readbacks (`POOL_MAX_MEMORY`,
 /// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) say about a
 /// pool right now, as C reads them in one block
@@ -467,7 +470,6 @@ pub(crate) fn pool_stats_values(
     params: &NDArrayDriverParams,
     pool: &NDArrayPool,
 ) -> Vec<ParamSetValue> {
-    const MEGABYTE: f64 = 1_048_576.0;
     vec![
         ParamSetValue::new(
             params.pool_max_memory,
@@ -494,7 +496,7 @@ pub(crate) fn pool_stats_values(
 
 /// Refresh the pool-statistics parameters from a pool.
 ///
-/// Shared by the `NDPoolPollStats` dispatch and `preAllocateBuffers`.
+/// The `NDPoolPollStats` dispatch.
 pub fn refresh_pool_stats(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
@@ -518,6 +520,57 @@ pub fn refresh_pool_stats(
     Ok(())
 }
 
+/// C++ `asynNDArrayDriver::preAllocateBuffers` (asynNDArrayDriver.cpp:710-740):
+/// `NumPreAllocBuffers` copies of `template`, the pool posted after each,
+/// then all of them released to the free list.
+fn pre_allocate_buffers(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+    template: Option<&NDArray>,
+) -> AsynResult<()> {
+    let Some(template) = template else {
+        port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!(
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first\n"
+            ),
+        );
+        return Ok(());
+    };
+    let count = port_base
+        .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
+        .unwrap_or(0);
+    // Released when dropped, on every return. C's failure return
+    // (:726-730) skips its release loop and leaks the copies it holds.
+    let mut copies = Vec::new();
+    for i in 0..count {
+        let Ok(copy) = pool.copy(template, None, true, true, true) else {
+            port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "asynNDArrayDriver::preAllocateBuffers: ERROR, could not allocate array {i}\n"
+                ),
+            );
+            return Ok(());
+        };
+        copies.push(copy);
+        port_base.set_int32_param(
+            params.pool_alloc_buffers,
+            0,
+            pool.num_alloc_buffers() as i32,
+        )?;
+        port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
+        port_base.set_float64_param(
+            params.pool_used_memory,
+            0,
+            pool.allocated_bytes() as f64 / MEGABYTE,
+        )?;
+        port_base.call_param_callbacks(0)?;
+    }
+    Ok(())
+}
+
 /// The pool branch of C++ `asynNDArrayDriver::writeInt32`
 /// (asynNDArrayDriver.cpp:684-694), run once `param_index` is stored.
 ///
@@ -534,27 +587,7 @@ pub fn handle_pool_write_int32(
     if param_index == params.pool_empty_free_list {
         pool.empty_free_list();
     } else if param_index == params.pool_pre_alloc {
-        match template_array {
-            None => port_base.trace_print(
-                TraceMask::ERROR,
-                format_args!(
-                    "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first\n"
-                ),
-            ),
-            Some(template) => {
-                let count = port_base
-                    .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
-                    .unwrap_or(0)
-                    .max(0) as usize;
-                if let Err(e) = pool.pre_allocate_buffers(template, count) {
-                    port_base.trace_print(
-                        TraceMask::ERROR,
-                        format_args!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}\n"),
-                    );
-                }
-                refresh_pool_stats(port_base, params, pool)?;
-            }
-        }
+        pre_allocate_buffers(port_base, params, pool, template_array)?;
         port_base.set_int32_param(params.pool_pre_alloc, 0, 0)?;
     } else if param_index == params.pool_poll_stats {
         refresh_pool_stats(port_base, params, pool)?;
@@ -1281,12 +1314,8 @@ impl ArrayOwner {
     /// array at `addr`, which keeps its buffer charged; `pArrays[0]` is the
     /// `preAllocateBuffers` template (asynNDArrayDriver.cpp:717-726).
     /// Returns what the slot held.
-    pub fn store_array(&self, addr: usize, array: Option<Arc<NDArray>>) -> Option<Arc<NDArray>> {
-        let mut arrays = self.arrays.lock();
-        if arrays.len() <= addr {
-            arrays.resize(addr + 1, None);
-        }
-        std::mem::replace(&mut arrays[addr], array)
+    pub fn store_array(&self, addr: usize, array: Arc<NDArray>) -> Option<Arc<NDArray>> {
+        Self::slot(&mut self.arrays.lock(), addr).replace(array)
     }
 
     /// The array [`ArrayOwner::store_array`] last left at `addr`.
@@ -1294,16 +1323,92 @@ impl ArrayOwner {
         self.arrays.lock().get(addr).cloned().flatten()
     }
 
+    /// C's driver releasing `pArrays[addr]` and leaving it NULL, as Timepix3
+    /// does to a band it no longer fills (serval_stream.cpp:476-479).
+    /// Returns what the slot held.
+    pub fn release_array(&self, addr: usize) -> Option<Arc<NDArray>> {
+        self.arrays.lock().get_mut(addr)?.take()
+    }
+
+    /// C's driver releasing `pArrays[addr]` and allocating the next array
+    /// into it under the driver lock, as computeImage does
+    /// (simDetector.cpp:694-699): a reader waits through `make` and finds
+    /// the new array. A refused `make` leaves the slot empty, as C's
+    /// refused alloc leaves it NULL.
+    pub fn replace_array(
+        &self,
+        addr: usize,
+        make: impl FnOnce() -> Option<DriverArray>,
+    ) -> Option<PublishedArray> {
+        let mut arrays = self.arrays.lock();
+        let slot = Self::slot(&mut arrays, addr);
+        // Released first, so `make` can reuse its buffer.
+        drop(slot.take());
+        let array = make()?.share();
+        *slot = Some(array.array().clone());
+        Some(array)
+    }
+
+    /// C's driver changing its `pArrays[addr]` in place under the driver
+    /// lock, as `simTask` stamps `pArrays[0]` after the exposure wait
+    /// (simDetector.cpp:824-828): a reader waits through `change` and finds
+    /// the changed array. An array someone else still holds is changed in
+    /// a copy.
+    pub fn refill(
+        &self,
+        addr: usize,
+        array: PublishedArray,
+        change: impl FnOnce(&mut NDArray),
+    ) -> crate::error::ADResult<PublishedArray> {
+        let mut arrays = self.arrays.lock();
+        let slot = Self::slot(&mut arrays, addr);
+        // The slot's reference goes first, so `array` can be changed in place.
+        drop(slot.take());
+        let mut array = match array.try_into_driver() {
+            Ok(array) => array,
+            Err(shared) => match shared.pool().alloc_copy(&shared) {
+                Ok(copy) => copy,
+                Err(e) => {
+                    *slot = Some(shared.array().clone());
+                    return Err(e);
+                }
+            },
+        };
+        change(&mut array);
+        let array = array.share();
+        *slot = Some(array.array().clone());
+        Ok(array)
+    }
+
+    fn slot(arrays: &mut Vec<Option<Arc<NDArray>>>, addr: usize) -> &mut Option<Arc<NDArray>> {
+        if arrays.len() <= addr {
+            arrays.resize(addr + 1, None);
+        }
+        &mut arrays[addr]
+    }
+
     /// C++ `getAttributes(pArray->pAttributeList)` from a driver's own task
     /// (simDetector.cpp:828), which holds the driver lock: the set is
     /// re-evaluated on the port's actor, where its `PARAM` values live, and
     /// merged onto `array`. An empty set or a stopped port leaves it alone.
     pub async fn get_attributes(&self, array: &mut NDArray) -> AsynResult<()> {
+        if let Some(fresh) = self.evaluate_attributes().await? {
+            array.attributes.copy_from(&fresh);
+        }
+        Ok(())
+    }
+
+    /// [`ArrayOwner::get_attributes`]'s evaluated set, for an array the task
+    /// does not hold across the await; `None` for an empty set or a stopped
+    /// port.
+    pub async fn evaluate_attributes(
+        &self,
+    ) -> AsynResult<Option<crate::attributes::NDAttributeList>> {
         if self.attributes.lock().list.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(port) = self.port() else {
-            return Ok(());
+            return Ok(None);
         };
         let attributes = self.attributes.clone();
         let fresh = Arc::new(parking_lot::Mutex::new(None));
@@ -1316,10 +1421,7 @@ impl ArrayOwner {
             asyn_rs::user::AsynUser::default(),
         )
         .await?;
-        if let Some(fresh) = fresh.lock().take() {
-            array.attributes.copy_from(&fresh);
-        }
-        Ok(())
+        Ok(fresh.lock().take())
     }
 
     /// C++ `getAttributes(pList)` from a plugin's `processCallbacks`, which
@@ -1492,7 +1594,7 @@ impl NDArrayDriverBase {
         write_array_params(&mut self.port_base, &self.params, &array)?;
         let array = array.share();
 
-        self.owner.store_array(0, Some(array.array().clone()));
+        self.owner.store_array(0, array.array().clone());
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -1880,6 +1982,135 @@ pub(crate) mod tests {
         let id = arr.unique_id;
         drv.prepare_array(arr).unwrap();
         assert_ndarray_data_ahead_of_params(&posts, &drv.params, id);
+    }
+
+    /// C's `pArrays[addr]->release(); pArrays[addr] = NULL`
+    /// (serval_stream.cpp:476-479) empties the slot and lets the buffer go.
+    #[test]
+    fn release_array_empties_the_slot_and_frees_the_buffer() {
+        let pool = crate::ndarray_pool::DriverPool::standalone(1_000_000);
+        let owner = pool.owner().clone();
+        let image = pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(4)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap()
+            .share();
+        owner.store_array(2, image.array().clone());
+        drop(image);
+        assert!(owner.release_array(2).is_some());
+        assert!(owner.array(2).is_none());
+        assert_eq!(pool.num_free_buffers(), 1);
+        assert!(owner.release_array(5).is_none());
+    }
+
+    /// C changes `pArrays[0]` under the driver lock (simDetector.cpp:824-828),
+    /// so a reader arriving mid-change waits and finds the changed array.
+    #[test]
+    fn a_reader_during_refill_waits_for_the_refilled_array() {
+        let pool = crate::ndarray_pool::DriverPool::standalone(1_000_000);
+        let owner = pool.owner().clone();
+        let image = pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(4)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap()
+            .share();
+        owner.store_array(0, image.array().clone());
+        let mut reader = None;
+        let image = owner
+            .refill(0, image, |array| {
+                array.unique_id = 7;
+                let owner = owner.clone();
+                reader = Some(std::thread::spawn(move || {
+                    owner.array(0).map(|a| a.unique_id)
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+            .unwrap();
+        assert_eq!(reader.unwrap().join().unwrap(), Some(7));
+        assert_eq!(image.unique_id, 7);
+    }
+
+    /// C `preAllocateBuffers` (asynNDArrayDriver.cpp:722-733) posts the pool
+    /// after each copy and names the copy that failed.
+    #[test]
+    fn pre_alloc_posts_each_copy_and_names_the_one_that_failed() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        const PORT: &str = "PREALLOC_EACH";
+        let mut drv = NDArrayDriverBase::new(
+            PORT,
+            1,
+            3 * 64,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        )
+        .unwrap();
+        let template = drv
+            .pool
+            .alloc(
+                vec![crate::ndarray::NDDimension::new(64)],
+                crate::ndarray::NDDataType::UInt8,
+            )
+            .unwrap();
+        drv.owner.store_array(0, template.share().array().clone());
+        drv.port_base
+            .set_int32_param(drv.params.pool_num_pre_alloc_buffers, 0, 5)
+            .unwrap();
+        let log = std::env::temp_dir().join(format!("{PORT}-{}", std::process::id()));
+        PortServices::global().trace().set_trace_file(
+            Some(PORT),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&log).unwrap(),
+            ))),
+        );
+        let (posts, _sub) = record_posts(&mut drv.port_base);
+
+        let user = AsynUser::new(drv.params.pool_pre_alloc);
+        let template = drv.owner.array(0);
+        handle_write_int32(
+            &mut drv.port_base,
+            &drv.params,
+            &drv.pool,
+            template.as_deref(),
+            &user,
+            1,
+        )
+        .unwrap();
+
+        let of = |reason| {
+            posts
+                .lock()
+                .iter()
+                .filter_map(|(r, _, v)| match v {
+                    ParamValue::Int32(v) if *r == reason => Some(*v),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(of(drv.params.pool_alloc_buffers), [2, 3]);
+        assert_eq!(of(drv.params.pool_pre_alloc), [1, 0]);
+        let trace = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            trace.ends_with(
+                " asynNDArrayDriver::preAllocateBuffers: ERROR, could not allocate array 2\n"
+            ),
+            "{trace}"
+        );
+        // C returns here still holding copies 0 and 1 (:726-730); they go
+        // back to the free list instead, after the last post.
+        assert_eq!(drv.pool.num_free_buffers(), 2);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.pool_free_buffers, 0)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

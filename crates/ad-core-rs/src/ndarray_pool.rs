@@ -404,22 +404,6 @@ impl NDArrayPool {
         Ok(out)
     }
 
-    /// Allocate `count` copies of `template_array`, then immediately release
-    /// them back to the free list (C++ `asynNDArrayDriver::preAllocateBuffers`).
-    ///
-    /// The net effect is that the pool's free list is warmed with `count`
-    /// reusable buffers sized for the template array.
-    pub fn pre_allocate_buffers(&self, template_array: &NDArray, count: usize) -> ADResult<()> {
-        let mut buffers = Vec::with_capacity(count);
-        for _ in 0..count {
-            buffers.push(self.copy(template_array, None, true, true, true)?);
-        }
-        for arr in buffers {
-            self.release(arr);
-        }
-        Ok(())
-    }
-
     /// Convert data type only (no dimension changes).
     /// Allocates the output through the pool, converts data, copies metadata.
     pub fn convert_type(&self, src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
@@ -709,6 +693,20 @@ impl PublishedArray {
     /// The pool it is counted on.
     pub fn pool(&self) -> &DriverPool {
         &self.pool
+    }
+
+    /// Back to the driver to change, when this is the array's last holder.
+    pub fn try_into_driver(self) -> Result<DriverArray, PublishedArray> {
+        match Arc::try_unwrap(self.array) {
+            Ok(array) => Ok(DriverArray {
+                array,
+                pool: self.pool,
+            }),
+            Err(array) => Err(PublishedArray {
+                array,
+                pool: self.pool,
+            }),
+        }
     }
 }
 
@@ -2093,17 +2091,6 @@ mod tests {
         } else {
             panic!("wrong type");
         }
-    }
-
-    /// G2: `pre_allocate_buffers` warms the free list with reusable buffers.
-    #[test]
-    fn test_pre_allocate_buffers_warms_free_list() {
-        let pool = NDArrayPool::new(10_000_000);
-        let template = pool
-            .alloc(vec![NDDimension::new(256)], NDDataType::UInt16)
-            .unwrap();
-        pool.pre_allocate_buffers(&template, 3).unwrap();
-        assert_eq!(pool.num_free_buffers(), 3);
     }
 
     /// Concurrent allocations that have to evict free buffers never push

@@ -6085,6 +6085,7 @@ mod tests {
         port.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
             .unwrap();
         port.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        port.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
         params_applied(&handle);
         assert_eq!(port.read_int32_blocking(p.pool_free_buffers, 0).unwrap(), 2);
     }
@@ -8319,6 +8320,7 @@ mod tests {
         port.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 1)
             .unwrap();
         port.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        port.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
         params_applied(&handle);
         assert_eq!(
             port.read_int32_blocking(p.pool_free_buffers, 0).unwrap(),
@@ -8504,6 +8506,8 @@ mod tests {
             .unwrap();
         port.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
         params_applied(&handle);
+        // Posted per copy, before the release (asynNDArrayDriver.cpp:731-737).
+        port.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
         assert_eq!(free(), 2, "two buffers pre-allocated onto the free list");
         assert_eq!(
             port.read_int32_blocking(p.pool_pre_alloc, 0).unwrap(),

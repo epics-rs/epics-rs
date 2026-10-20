@@ -155,7 +155,7 @@ impl ADDriverBase {
         )?;
         let array = array.share();
 
-        self.owner.store_array(0, Some(array.array().clone()));
+        self.owner.store_array(0, array.array().clone());
 
         // Update pool stats
         self.port_base.set_float64_param(
@@ -1371,7 +1371,7 @@ mod tests {
             .unwrap();
         task_pool
             .owner()
-            .store_array(0, Some(arr.share().array().clone()));
+            .store_array(0, arr.share().array().clone());
         assert_eq!(ad.pool.allocated_bytes(), 64, "the slot keeps it charged");
         ad.port_base
             .set_int32_param(ad.params.base.pool_num_pre_alloc_buffers, 0, 2)
@@ -1381,7 +1381,15 @@ mod tests {
         assert_eq!(ad.pool.num_free_buffers(), 2);
 
         // Released before a refused alloc, the slot leaves no template.
-        task_pool.owner().store_array(0, None);
+        let refused = task_pool.owner().replace_array(0, || {
+            task_pool
+                .alloc(
+                    vec![crate::ndarray::NDDimension::new(20_000_000)],
+                    crate::ndarray::NDDataType::UInt8,
+                )
+                .ok()
+        });
+        assert!(refused.is_none());
         ad.write_int32_pool(ad.params.base.pool_empty_free_list, 1)
             .unwrap();
         ad.write_int32_pool(ad.params.base.pool_pre_alloc, 1)

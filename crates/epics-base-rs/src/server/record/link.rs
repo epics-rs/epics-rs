@@ -4,6 +4,7 @@ use crate::error::{CaError, CaResult, CalcSaid, LinkRefusal, LinkWhy};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
 use crate::server::database::LinkSerial;
 use crate::server::recgbl::ReportString;
+use crate::server::record::AlarmSeverity;
 use crate::types::{DbFieldType, DbfLinkClass, EpicsValue, PvString};
 
 /// Link processing policy for input/output links.
@@ -557,6 +558,37 @@ impl ConstantLink {
         self.json.as_ref().map(|json| json.load_scalar(dbr_type))
     }
 
+    /// C `lnkConst_report` (`lnkConst.c:286-347`) over the value its yajl
+    /// callbacks parsed, so the type word is the callback's: `true` is an
+    /// integer and `[1, 2.5]` doubles. Nothing for a `dbConstLink` text,
+    /// which is no JSON link.
+    pub(crate) fn report(&self, level: i32, indent: usize) -> Vec<String> {
+        use epics_libcom_rs::cfmt::CFloat;
+        let Some(json) = &self.json else {
+            return Vec::new();
+        };
+        let pad = " ".repeat(indent);
+        let (dtype, items): (&str, Vec<String>) = match json {
+            LnkConst::Integer(i) => return vec![format!("{pad}'const': integer {i}")],
+            LnkConst::Double(d) => return vec![format!("{pad}'const': double {}", CFloat(*d).g())],
+            LnkConst::String(s) => return vec![format!("{pad}'const': string \"{s}\"")],
+            // `a0` is not `> a0`, so it takes the scalar arm to `default:`.
+            LnkConst::Empty => return vec![format!("{pad}'const': bug -- type=4")],
+            LnkConst::Integers(v) => ("integer", v.iter().map(i64::to_string).collect()),
+            LnkConst::Doubles(v) => (
+                "double",
+                v.iter().map(|d| CFloat(*d).g().to_string()).collect(),
+            ),
+            LnkConst::Strings(v) => ("string", v.iter().map(|s| format!("\"{s}\"")).collect()),
+        };
+        let plural = if items.len() > 1 { "s" } else { "" };
+        let head = format!("{pad}'const': array of {} {dtype}{plural}", items.len());
+        if level < 2 {
+            return vec![head];
+        }
+        vec![head, format!("{pad}  [{}]", items.join(", "))]
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -668,7 +700,33 @@ pub struct StateLink {
     pub name: String,
     /// C `slink->invert`.
     pub invert: bool,
+    /// C `slink->val`, which only the report reads.
+    pub val: StateVal,
 }
+
+/// C `slink->val` (`lnkState.c:151`, `:203`): the bit the link last read or
+/// was last asked to write. Link state, not configuration: every two compare
+/// equal, and every clone of the parse shares it.
+#[derive(Clone, Debug, Default)]
+pub struct StateVal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl StateVal {
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self, v: bool) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for StateVal {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for StateVal {}
 
 impl StateLink {
     /// C `lnkState_string` (`lnkState.c:79-89`): a leading `!` inverts, but
@@ -680,19 +738,23 @@ impl StateLink {
             Some(name) if !name.is_empty() => Self {
                 name: name.to_string(),
                 invert: true,
+                val: StateVal::default(),
             },
             _ => Self {
                 name: value.to_string(),
                 invert: false,
+                val: StateVal::default(),
             },
         }
     }
 
     /// The bit a reader sees: C `lnkState_getValue` (`lnkState.c:148`)
-    /// computes `slink->invert ^ dbStateGet(slink->state)`.
+    /// computes `slink->invert ^ dbStateGet(slink->state)` into `slink->val`.
     #[must_use]
     pub fn read(&self, raw: bool) -> bool {
-        self.invert ^ raw
+        let v = self.invert ^ raw;
+        self.val.set(v);
+        v
     }
 
     /// The bit a writer stores: C `lnkState_putValue` (`lnkState.c:196-200`)
@@ -700,7 +762,19 @@ impl StateLink {
     /// what it hands `dbStateSet`/`dbStateClear`.
     #[must_use]
     pub fn write(&self, value: bool) -> bool {
+        self.val.set(value);
         self.invert ^ value
+    }
+
+    /// C `lnkState_report` (`lnkState.c:99-105`).
+    pub(crate) fn report(&self, indent: usize) -> Vec<String> {
+        vec![format!(
+            "{:indent$}'state': \"{}\" = {}{}",
+            "",
+            self.name,
+            if self.invert { "! " } else { "" },
+            if self.val.get() { "TRUE" } else { "FALSE" },
+        )]
     }
 
     /// What C `lnkState_putValue` (`lnkState.c:153-203`) does with `value`.
@@ -1117,14 +1191,88 @@ pub struct CalcLink {
     /// was; and `clink->time`/`utag`, which only a good read of the `time`
     /// input changes.
     pub val: CalcVal,
+    /// C `clink->prec` and `clink->units` (`lnkCalc.c:95`, `:125-127`,
+    /// `:172-174`): 15 and none unless the link sets them.
+    pub prec: i16,
+    pub units: Option<String>,
 }
 
-/// C `clink->arg`, `time`, `utag` and `val` (`lnkCalc.c:65-68`): what one
+impl CalcLink {
+    /// C `lnkCalc_report` (`lnkCalc.c:377-425`): the expression and the last
+    /// result; from level 1 the alarm the last evaluation raised, the alarm
+    /// expressions, the timestamp input, each argument with its child link's
+    /// report, and the output link's.
+    pub(crate) fn report(&self, level: i32, indent: usize) -> Vec<String> {
+        use epics_libcom_rs::cfmt::CFloat;
+        let pad = " ".repeat(indent);
+        // `%.*g` takes a negative precision as omitted.
+        let prec = usize::try_from(self.prec).unwrap_or(6);
+        let mut out = vec![format!(
+            "{pad}'calc': \"{}\" = {:.prec$} {}",
+            self.expr.as_deref().unwrap_or("(null)"),
+            CFloat(self.val.get()).g(),
+            self.units.as_deref().unwrap_or(""),
+        )];
+        if level <= 0 {
+            return out;
+        }
+        let sevr = self.val.post_sevr();
+        if sevr != AlarmSeverity::NoAlarm {
+            // C's output-link `minor` copies "post_major error" into the link
+            // (`lnkCalc.c:696`); the record gets "post_minor error", as here.
+            let amsg = if sevr == AlarmSeverity::Major {
+                "post_major error"
+            } else {
+                "post_minor error"
+            };
+            out.push(format!(
+                "{pad}  Alarm: {}, {}, \"{amsg}\"",
+                crate::server::record::dbd_generated::MENU_ALARM_SEVR[sevr as usize],
+                crate::server::recgbl::alarm_condition_string(
+                    crate::server::recgbl::alarm_status::LINK_ALARM
+                ),
+            ));
+        }
+        if let Some(major) = &self.major {
+            out.push(format!("{pad}  Major expression: \"{major}\""));
+        }
+        if let Some(minor) = &self.minor {
+            out.push(format!("{pad}  Minor expression: \"{minor}\""));
+        }
+        if let Some(letter) = self.time_source {
+            let time = crate::server::builtin_devices::timestamp::epics_time_to_strftime_in(
+                40,
+                "%Y-%m-%d %H:%M:%S.%09f",
+                self.val.stamp().0,
+            );
+            out.push(format!("{pad}  Timestamp input {letter}: {time}"));
+        }
+        for (i, arg) in self.args.iter().enumerate() {
+            let (value, child) = match arg {
+                CalcArg::Literal(n) => (*n, None),
+                CalcArg::Link(link) => (self.val.arg(i), Some(link)),
+            };
+            let letter = char::from(b'A' + i as u8);
+            out.push(format!("{pad}  Input {letter}: {}", CFloat(value).g()));
+            if let Some(child) = child {
+                out.extend(child.jlink_report(level - 1, indent + 4));
+            }
+        }
+        if let Some(link) = &self.out {
+            out.push(format!("{pad}  Output:"));
+            out.extend(link.jlink_report(level - 1, indent + 4));
+        }
+        out
+    }
+}
+
+/// C `clink->arg`, `time`, `utag`, `val` and `sevr` (`lnkCalc.c:53`,
+/// `:65-68`): what one
 /// evaluation leaves for the next. Link state, not configuration: every two
 /// compare equal, and every clone of the parse shares it. Behind an `Arc` so
 /// `ParsedLink` holds no cell inline (see [`ForwardSlot`]).
 #[derive(Default)]
-pub struct CalcVal(std::sync::Arc<[std::sync::atomic::AtomicU64; CalcVal::UTAG + 1]>);
+pub struct CalcVal(std::sync::Arc<[std::sync::atomic::AtomicU64; CalcVal::SEVR + 1]>);
 
 impl CalcVal {
     pub fn get(&self) -> f64 {
@@ -1144,8 +1292,20 @@ impl CalcVal {
         self.store(1 + i, val);
     }
 
+    /// C `clink->sevr` (`lnkCalc.c:587-626`): what the last evaluation's
+    /// `major` or `minor` raised, which only the report reads.
+    pub(crate) fn post_sevr(&self) -> AlarmSeverity {
+        let sevr = self.0[Self::SEVR].load(std::sync::atomic::Ordering::Relaxed);
+        AlarmSeverity::from_u16(sevr as u16)
+    }
+
+    pub(crate) fn set_post_sevr(&self, sevr: AlarmSeverity) {
+        self.0[Self::SEVR].store(sevr as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     const TIME: usize = 1 + crate::calc::engine::CALC_NARGS;
     const UTAG: usize = Self::TIME + 1;
+    const SEVR: usize = Self::UTAG + 1;
     /// The time slot counts nanoseconds from the EPICS epoch, wrapping, so
     /// the zeroed slot is `{0,0}` and every `WallTime` round-trips.
     const EPICS_EPOCH_NANOS: u64 =
@@ -2288,6 +2448,17 @@ impl ParsedLink {
         let mut constant = ConstantLink::new(decoded);
         constant.json = json;
         ParsedLink::Constant(std::sync::Arc::new(constant))
+    }
+
+    /// C `dbJLinkReport` (`dbJLink.c:468-471`): the link type's own
+    /// `report`, for a type whose jlif has one, and nothing otherwise.
+    pub(crate) fn jlink_report(&self, level: i32, indent: usize) -> Vec<String> {
+        match self {
+            ParsedLink::Constant(c) => c.report(level, indent),
+            ParsedLink::Calc(c) => c.report(level, indent),
+            ParsedLink::State(st) => st.report(indent),
+            _ => Vec::new(),
+        }
     }
 
     pub fn is_db(&self) -> bool {
@@ -3640,8 +3811,7 @@ fn try_parse_json_link_body(
         }
         "calc" => {
             // C `lnkCalc_map_key` (`lnkCalc.c:247-296`) knows expr, args,
-            // prec, time, major, minor, units and out; this port reads all
-            // but prec and units.
+            // prec, time, major, minor, units and out.
             let body = rest.trim();
             if !body.ends_with('}') {
                 return None;
@@ -3720,6 +3890,12 @@ fn try_parse_json_link_body(
                     Some(letter)
                 }
             };
+            // C `lnkCalc_integer` at `ps_prec` stores into a `short`.
+            let prec = match obj.get("prec") {
+                None => 15,
+                Some(v) => v.as_i64()? as i16,
+            };
+            let units = text("units")?;
             Some(ParsedLink::Calc(Box::new(CalcLink {
                 expr,
                 major,
@@ -3728,6 +3904,8 @@ fn try_parse_json_link_body(
                 args,
                 time_source,
                 val: CalcVal::default(),
+                prec,
+                units,
             })))
         }
         _ => None,
@@ -4596,6 +4774,29 @@ pub fn link_field_type(s: impl AsRef<[u8]>) -> LinkType {
 mod json_link_tests {
     //! epics-base PR #86 — JSON-style inline link options.
     use super::*;
+
+    /// C `lnkConst_report`'s type word comes from which yajl callback
+    /// the token reached, and its array arm prints the element list only
+    /// from level 2 (`lnkConst.c:286-347`).
+    #[test]
+    fn const_link_report_names_the_json_type_it_parsed() {
+        let report = |value: &str, level| ParsedLink::json_constant(value).jlink_report(level, 6);
+        assert_eq!(report("4.25", 0), ["      'const': double 4.25"]);
+        assert_eq!(report("4", 0), ["      'const': integer 4"]);
+        assert_eq!(report("\"hi\"", 0), ["      'const': string \"hi\""]);
+        assert_eq!(
+            report("[1, 2, 3]", 0),
+            ["      'const': array of 3 integers"]
+        );
+        assert_eq!(
+            report("[1, 2, 3]", 2),
+            ["      'const': array of 3 integers", "        [1, 2, 3]"]
+        );
+        assert_eq!(
+            report("[1.5]", 2),
+            ["      'const': array of 1 double", "        [1.5]"]
+        );
+    }
 
     #[test]
     fn json_const_numeric() {
@@ -5737,7 +5938,8 @@ mod json_link_tests {
             plain,
             ParsedLink::State(StateLink {
                 name: "GREEN".into(),
-                invert: false
+                invert: false,
+                val: Default::default(),
             })
         );
         let inverted = parse_link_field(r#"{state:"!GREEN"}"#, LinkFieldType::In);
@@ -5745,7 +5947,8 @@ mod json_link_tests {
             inverted,
             ParsedLink::State(StateLink {
                 name: "GREEN".into(),
-                invert: true
+                invert: true,
+                val: Default::default(),
             })
         );
     }
@@ -5760,14 +5963,16 @@ mod json_link_tests {
             parse_link_field(r#"{state:"!"}"#, LinkFieldType::In),
             ParsedLink::State(StateLink {
                 name: "!".into(),
-                invert: false
+                invert: false,
+                val: Default::default(),
             })
         );
         assert_eq!(
             parse_link_field(r#"{state:""}"#, LinkFieldType::In),
             ParsedLink::State(StateLink {
                 name: String::new(),
-                invert: false
+                invert: false,
+                val: Default::default(),
             })
         );
     }
@@ -5819,6 +6024,7 @@ mod json_link_tests {
         let inverted = StateLink {
             name: "X".into(),
             invert: true,
+            val: Default::default(),
         };
         for wanted in [false, true] {
             let stored = inverted.write(wanted);
@@ -5827,6 +6033,7 @@ mod json_link_tests {
         let plain = StateLink {
             name: "X".into(),
             invert: false,
+            val: Default::default(),
         };
         assert!(plain.write(true), "no inversion: the bit passes through");
         assert!(plain.read(true), "no inversion: the bit passes through");

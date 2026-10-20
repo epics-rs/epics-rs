@@ -7435,6 +7435,22 @@ impl RecordInstance {
         self.parsed_flnk.link()
     }
 
+    /// The parse a read or write of link `field` goes through, whose lset
+    /// state is what C's `dbjlr` reports: the slot's, the framework's for a
+    /// `dbCommon` link, else the multi-input cache's. `None` for a field this
+    /// instance keeps no parse of.
+    pub(crate) fn live_link(&self, field: &str) -> Option<Arc<ParsedLink>> {
+        if let Some(link) = self.stored_link_shared(field) {
+            return Some(link.clone());
+        }
+        let slot = self
+            .record
+            .multi_input_links()
+            .iter()
+            .position(|(link, _)| *link == field)?;
+        self.cached_multi_input(slot, field)
+    }
+
     /// The parse of multi-input link `slot` for a reader that holds the
     /// record shared: the field's slot parse when it has a slot, else the
     /// cached one when its text is the record's current text, a fresh parse

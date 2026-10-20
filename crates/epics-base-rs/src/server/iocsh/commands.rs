@@ -3906,104 +3906,6 @@ fn cmd_dbtr() -> CommandDef {
     )
 }
 
-/// The `dtype` word C's `lnkConst` gives a JSON value, decided the way
-/// yajl decides which jlif callback to run: an integer token reaches
-/// `lnkConst_integer` (`si64`/`ai64`), a real reaches `lnkConst_double`
-/// (`sf64`/`af64`), a quoted token reaches `lnkConst_string`
-/// (`sc40`/`ac40`) — `lnkConst.c:143-232`. Everything else is C's
-/// `type_names[0]`, `"bug"`.
-fn const_value_dtype(token: &str) -> &'static str {
-    let t = token.trim();
-    if t.starts_with('"') || t.starts_with('\'') {
-        "string"
-    } else if t.starts_with('-')
-        || t.starts_with('+')
-        || t.starts_with(|c: char| c.is_ascii_digit())
-    {
-        if t.contains(['.', 'e', 'E']) {
-            "double"
-        } else {
-            "integer"
-        }
-    } else {
-        "bug"
-    }
-}
-
-/// One `{const: …}` value rendered as C's `lnkConst_report` renders it
-/// (`lnkConst.c:286-347`), at `indent` spaces.
-///
-/// The scalar arms print `'const': <dtype> <value>`, an integer with
-/// `%lld`, a double with `%g` and a string requoted; the array arms
-/// print `'const': array of <n> <dtype>s` and, only from level 2, the
-/// bracketed element list at `indent + 2`.
-fn const_link_report_lines(value: &str, level: i32, indent: usize) -> Vec<String> {
-    let pad = " ".repeat(indent);
-    let render = |token: &str| -> String {
-        let t = token.trim();
-        match const_value_dtype(t) {
-            // `%g`, not the verbatim token: C reports the parsed double.
-            "double" => t
-                .parse::<f64>()
-                .map(|v| CFloat(v).g().to_string())
-                .unwrap_or_else(|_| t.to_string()),
-            // Requoted, because C prints `"%s"` around the decoded string.
-            "string" => format!("\"{}\"", t.trim_matches(['"', '\''])),
-            _ => t.to_string(),
-        }
-    };
-
-    let v = value.trim();
-    let Some(inner) = v.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
-        let dtype = const_value_dtype(v);
-        if dtype == "bug" {
-            // C's `default:` arm — it prints the numeric type tag it could
-            // not name. The port has no such tag, so the token stands in.
-            return vec![format!("{pad}'const': bug -- {v}")];
-        }
-        return vec![format!("{pad}'const': {dtype} {}", render(v))];
-    };
-    let elements: Vec<&str> = inner
-        .split(',')
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-        .collect();
-    let dtype = elements.first().map_or("bug", |e| const_value_dtype(e));
-    let plural = if elements.len() > 1 { "s" } else { "" };
-    let head = format!("{pad}'const': array of {} {dtype}{plural}", elements.len());
-    if level < 2 {
-        return vec![head];
-    }
-    let body: Vec<String> = elements.iter().map(|e| render(e)).collect();
-    vec![
-        head,
-        format!("{}[{}]", " ".repeat(indent + 2), body.join(", ")),
-    ]
-}
-
-/// One JSON link field's report — C `dbJLinkReport` (`dbJLink.c:468-471`),
-/// which calls the link type's own `report` **only when its jlif has
-/// one** and otherwise prints nothing under the `Link field` header.
-///
-/// `const` is the one type this port reports. C also reports `calc`
-/// (`lnkCalc_report`, `lnkCalc.c:412-460`) and pvxs reports `pva`
-/// (`pva_report`, `pvxs/ioc/pvalink_jlif.cpp:228-283`), and both print LIVE link
-/// state — `calc`'s current value, precision, units, alarm and per-input
-/// arguments; `pva`'s open channel and its in-flight put. The port's
-/// `ParsedLink::Calc` / `PvaJsonLink` are parse results with no handle on
-/// the evaluated or opened link, so those two report as a jlif with no
-/// `report` member does: header only. `ca` is a port-only link type with
-/// no C jlif to match at all.
-fn jlink_report_lines(raw: &str, level: i32, indent: usize) -> Vec<String> {
-    let Ok(normalized) = crate::json5::relaxed_to_strict(raw.trim()) else {
-        return Vec::new();
-    };
-    match crate::server::record::json_const_value(&normalized) {
-        Some(value) => const_link_report_lines(value, level, indent),
-        None => Vec::new(),
-    }
-}
-
 /// `dbior [driver name] [interest level]` — Driver Report.
 ///
 /// C `dbior` (`dbTest.c:709-771`), registered at `dbIocRegister.c:616`. Walks
@@ -4135,7 +4037,7 @@ fn cmd_dbjlr() -> CommandDef {
                 };
                 let record_type = rec.read().record.record_type();
                 ctx.console_println(&format!("  {record_type} record '{name}':"));
-                for (field, raw, _) in ctx.db().record_link_fields(&name) {
+                for (field, raw, parsed) in ctx.db().record_link_fields(&name) {
                     // A JSON link is UTF-8 or yajl never built it.
                     let Ok(text) = std::str::from_utf8(raw.as_bytes()) else {
                         continue;
@@ -4145,7 +4047,9 @@ fn cmd_dbjlr() -> CommandDef {
                         continue;
                     }
                     ctx.console_println(&format!("    Link field '{field}':"));
-                    for line in jlink_report_lines(text, level, 6) {
+                    let live = rec.read().live_link(&field);
+                    let link = live.as_deref().unwrap_or(&parsed);
+                    for line in link.jlink_report(level, 6) {
                         ctx.console_println(&line);
                     }
                 }
@@ -13529,37 +13433,6 @@ record(ai, "SIM:C") { field(VAL, "1") }
         assert_eq!(
             run_cmd(&ctx, "dbjlr", &["R:NOPE"]),
             "JSON links in record 'R:NOPE'\n\n"
-        );
-    }
-
-    /// C `lnkConst_report`'s type word comes from which yajl callback
-    /// the token reached, and its array arm prints the element list only
-    /// from level 2 (`lnkConst.c:286-347`).
-    #[test]
-    fn const_link_report_names_the_json_type_it_parsed() {
-        assert_eq!(
-            const_link_report_lines("4.25", 0, 6),
-            vec!["      'const': double 4.25"]
-        );
-        assert_eq!(
-            const_link_report_lines("4", 0, 6),
-            vec!["      'const': integer 4"]
-        );
-        assert_eq!(
-            const_link_report_lines("\"hi\"", 0, 6),
-            vec!["      'const': string \"hi\""]
-        );
-        assert_eq!(
-            const_link_report_lines("[1, 2, 3]", 0, 6),
-            vec!["      'const': array of 3 integers"]
-        );
-        assert_eq!(
-            const_link_report_lines("[1, 2, 3]", 2, 6),
-            vec!["      'const': array of 3 integers", "        [1, 2, 3]"]
-        );
-        assert_eq!(
-            const_link_report_lines("[1.5]", 2, 6),
-            vec!["      'const': array of 1 double", "        [1.5]"]
         );
     }
 

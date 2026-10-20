@@ -1690,6 +1690,7 @@ impl PvDatabase {
         let Some((vars, mut raised)) = self.calc_link_args(calc, reader) else {
             return (None, None);
         };
+        calc.val.set_post_sevr(AlarmSeverity::NoAlarm);
         // C `calcPerform(clink->arg, &val, expr)`: `VAL` reads `val`.
         let perform = |expr: &str, val: f64| {
             let compiled = crate::calc::compile(expr).ok()?;
@@ -1714,6 +1715,7 @@ impl PvDatabase {
             match perform(expr, val) {
                 None => return (None, None),
                 Some(alval) if alval != 0.0 => {
+                    calc.val.set_post_sevr(sevr);
                     let alarm = LinkAlarm {
                         stat: crate::server::recgbl::alarm_status::LINK_ALARM,
                         sevr,
@@ -4367,6 +4369,7 @@ impl PvDatabase {
         let Some((vars, mut raised)) = self.calc_link_args(calc, Some(src_rec.unframed())) else {
             return true;
         };
+        calc.val.set_post_sevr(AlarmSeverity::NoAlarm);
         // C `calcPerform(clink->arg, &val, expr)`: `VAL` reads the value
         // the expression starts from.
         let perform = |expr: &str, val: f64| {
@@ -4393,6 +4396,7 @@ impl PvDatabase {
                 ] {
                     let Some(expr) = expr else { continue };
                     if perform(expr, val)? != 0.0 {
+                        calc.val.set_post_sevr(sevr);
                         let alarm = LinkAlarm {
                             stat: crate::server::recgbl::alarm_status::LINK_ALARM,
                             sevr,

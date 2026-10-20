@@ -191,7 +191,8 @@ fn find_command(
                 ArgValue::String(s) => s.to_str().ok().and_then(|s| lookup(ctx, s)),
                 _ => None,
             };
-            ctx.println(&format_entry_address(found));
+            // A plain `printf`: registryIocRegister.c lacks `epicsStdio.h`.
+            ctx.console_println(&format_entry_address(found));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -361,19 +362,47 @@ mod tests {
         ctx
     }
 
-    /// Run one of this family's commands and return everything it printed.
+    /// Run one of this family's commands and return everything it printed,
+    /// on the thread's stdout and the console both.
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> String {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
         let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).expect("arguments parse");
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-        ctx.with_output(std::fs::File::create(&path).unwrap(), || {
-            let _ = cmd.handler.call(&args, ctx);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let console = tempfile::NamedTempFile::new().unwrap();
+        ctx.with_console(console.reopen().unwrap(), std::io::stderr(), || {
+            ctx.with_output(out.reopen().unwrap(), || {
+                let _ = cmd.handler.call(&args, ctx);
+            })
         });
-        std::fs::read_to_string(&path).unwrap()
+        let read = |f: &tempfile::NamedTempFile| std::fs::read_to_string(f.path()).unwrap();
+        read(&out) + &read(&console)
+    }
+
+    /// registryIocRegister.c does not include `epicsStdio.h`, so the four
+    /// finds stay on the console under `> f`; `registryDump`'s `gphDump` is
+    /// gpHashLib.c's, which does. C oracle (`oracleStdIoc`): the finds' `f`
+    /// empty.
+    #[test]
+    fn the_finds_stay_on_the_console_and_the_dump_follows_the_redirect() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        for find in [
+            "registryRecordTypeFind",
+            "registryDeviceSupportFind",
+            "registryDriverSupportFind",
+            "registryFunctionFind",
+        ] {
+            assert_eq!(
+                shell.file_and_console(&format!("{find} nosuchname")),
+                (String::new(), "(nil)\n".to_string()),
+                "{find}"
+            );
+        }
+        let (file, console) = shell.file_and_console("registryDump");
+        assert!(file.starts_with("Registry has "), "{file:.200}");
+        assert_eq!(console, "");
     }
 
     /// The six names `registryIocRegister()` (`registryIocRegister.c:70-76`),

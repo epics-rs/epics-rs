@@ -8637,6 +8637,8 @@ async fn test_lnk_calc_parses_and_evaluates() {
         args: vec![name_arg("pv_a"), name_arg("pv_b")],
         time_source: Some('A'),
         val: Default::default(),
+        prec: 15,
+        units: None,
     };
     let parsed = ParsedLink::Calc(Box::new(calc));
     let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -8712,6 +8714,8 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         ],
         time_source: Some('A'),
         val: Default::default(),
+        prec: 15,
+        units: None,
     };
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

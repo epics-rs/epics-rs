@@ -34,8 +34,8 @@ pub mod ioc_support {
     };
     use epics_base_rs::server::record::{Record, ScanType};
     use epics_base_rs::types::EpicsValue;
-    use epics_bridge_rs::qsrv::PvaPvHandle;
     use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
+    use epics_pva_rs::server_native::SharedPV;
 
     /// Generate `len` deterministic-random doubles in `[0.0, 1.0)`
     /// from a 64-bit seed.
@@ -87,14 +87,12 @@ pub mod ioc_support {
         /// lifetime of the PV. Mirrors pvxs `SharedPV::post`'s requirement
         /// that subsequent posts match the type of `open()`.
         field_prefix: OnceLock<String>,
-        /// The single validating write owner for this PV (pvxs
-        /// `SharedPV::post`). Created lazily on the first publish from the
+        /// The bundle's pvxs `SharedPV`, opened by the first publish on the
         /// payload's descriptor — the field names depend on the runtime
-        /// `field_prefix`, so the canonical shape is not known until then.
-        /// Every later publish posts through this same handle, which rejects
-        /// a payload whose shape drifted from the first and is the only path
-        /// that may write `latest`/`subscribers`.
-        handle: OnceLock<PvaPvHandle>,
+        /// `field_prefix`, so the shape is not known until then. Every later
+        /// publish posts through it, which refuses a payload whose shape
+        /// drifted from the first.
+        handle: OnceLock<SharedPV>,
     }
 
     impl RandomWaveformShared {
@@ -159,13 +157,10 @@ pub mod ioc_support {
             self.field_prefix.get().map(String::as_str).unwrap_or("wf")
         }
 
-        /// The latest published snapshot, read through the validating
-        /// handle (`None` until the first publish creates it). Used by the
-        /// unit tests to observe publish state without reaching into the
-        /// handle's private fields.
+        /// The latest published snapshot (`None` until the first publish).
         #[cfg(test)]
         fn current_value(&self) -> Option<PvField> {
-            self.handle.get().and_then(|h| h.current_value())
+            self.handle.get().and_then(SharedPV::current)
         }
 
         fn publish_bundle(&self) {
@@ -174,18 +169,17 @@ pub mod ioc_support {
                 build_bundle_payload(&datasets, self.len, self.field_prefix())
             };
 
-            // Route every publish through the single validating owner. The
-            // handle's descriptor is captured from the first payload (field
-            // names depend on the runtime `field_prefix`); `post` then
-            // rejects any later payload whose shape drifted from the first —
-            // pvxs `SharedPV::post`'s type-stability invariant — and never
-            // lets a mismatched value become the served snapshot or reach
-            // monitor subscribers.
-            let handle = self
-                .handle
-                .get_or_init(|| PvaPvHandle::new(Some(payload.descriptor())));
-            if let Err(err) = handle.post(payload) {
-                eprintln!(
+            // The first publish opens the PV on its own shape; a later one
+            // whose shape drifted is refused and never served (pvxs
+            // `SharedPV::post`).
+            let pv = self.handle.get_or_init(SharedPV::build_readonly);
+            let posted = if pv.is_open() {
+                pv.try_post_checked(payload).map(drop)
+            } else {
+                pv.open(payload.descriptor(), payload)
+            };
+            if let Err(err) = posted {
+                epics_libcom_rs::stderr_println!(
                     "mini:wf:bundle: dropping payload whose shape changed since the first \
                      publish ({err}); keeping already-connected monitors valid"
                 );
@@ -329,20 +323,22 @@ pub mod ioc_support {
             ))
         }
 
-        pub fn register_pva_bundle(&self, pv_name: &str, field_prefix: &str) {
+        /// Open the bundle PV and add it to the pvxs server's `__builtin`
+        /// store, as `ioc::server().addPV` (`iochooks.cpp:80-87`); the
+        /// server must be bound.
+        pub fn register_pva_bundle(
+            &self,
+            pv_name: &str,
+            field_prefix: &str,
+        ) -> Result<(), epics_pva_rs::server::iocsh::AddPvRefused> {
             self.shared.set_field_prefix(field_prefix);
-            // The first publish creates the validating handle from the
-            // payload's descriptor; register a clone so the qsrv adapter
-            // shares the same `latest`/`subscribers` state and serves the
-            // canonical descriptor for introspection.
             self.shared.publish_bundle();
-            let handle = self
+            let pv = self
                 .shared
                 .handle
                 .get()
-                .expect("publish_bundle initializes the handle")
-                .clone();
-            epics_bridge_rs::qsrv::register_pva_pv_global(pv_name, handle);
+                .expect("publish_bundle opens the PV");
+            epics_pva_rs::server::iocsh::pvxs_add_pv(pv_name, pv.clone())
         }
     }
 

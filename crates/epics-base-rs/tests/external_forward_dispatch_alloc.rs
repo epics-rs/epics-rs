@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::server::database::{
-    LinkForward, LinkForwardRefused, LinkSet, ProcStack, PvDatabase,
+    LinkForward, LinkForwardRefused, LinkRef, LinkSet, ProcStack, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -53,13 +53,13 @@ struct Forwards(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl LinkSet for Forwards {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    fn forward_handle(&self, _: &[u8]) -> Box<dyn LinkForward> {
+    fn forward_handle(&self, _: LinkRef<'_>) -> Box<dyn LinkForward> {
         Box::new(Forward(self.0.clone()))
     }
 }

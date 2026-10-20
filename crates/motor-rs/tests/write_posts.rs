@@ -51,6 +51,16 @@ impl AsynMotor for Axis {
         self.pending.push(StatusWrite::Direction(position > 1.0));
         Ok(())
     }
+    fn move_relative(
+        &mut self,
+        _: &AsynUser,
+        _distance: f64,
+        _: f64,
+        _: f64,
+        _: f64,
+    ) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         self.outcome()
     }
@@ -80,13 +90,14 @@ impl AsynMotor for Axis {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus {
             position: 1.0,
             encoder_position: 1.0,
             done: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
         std::mem::take(&mut self.pending)
@@ -147,7 +158,6 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         subscribers.attach(state.clone(), io_intr_tx, Default::default());
         Bound { io_intr, state }
     };
-    let (mut record, mut observer) = (bind(), bind());
     let mut poll_loop = MotorPollLoop::new(
         PollerInbox {
             poll,
@@ -159,8 +169,9 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         Duration::from_secs(1),
         0,
     );
-    // The records are bound before the poller starts, so its startup pass
-    // posts to them.
+    // The records are bound after the axis's constructor and before the
+    // poller starts, so its startup pass posts to them.
+    let (mut record, mut observer) = (bind(), bind());
     poll_loop.run_startup_pass();
     record.passes();
     observer.passes();
@@ -241,6 +252,41 @@ fn a_move_on_a_done_axis_posts_done_off_and_a_second_move_posts_nothing() {
     assert!(!posted.done);
     assert_eq!(posted.position, 1.0);
     assert_eq!(rig.write(move_to(6.0)), None);
+}
+
+/// Every start clears Done ahead of the driver, not only the absolute
+/// move (asynMotorController.cpp:301-353).
+#[test]
+fn each_move_start_on_a_done_axis_posts_done_off() {
+    let starts = [
+        MotorCommand::MoveRelative {
+            distance: 1.0,
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        },
+        MotorCommand::MoveVelocity {
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        },
+        MotorCommand::JogVelocity {
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        },
+        MotorCommand::Home {
+            forward: true,
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        },
+    ];
+    for start in starts {
+        let mut rig = rig(controller(), 1.0);
+        let posted = rig.write(start.clone());
+        assert!(!posted.unwrap().done, "{start:?}");
+    }
 }
 
 #[test]

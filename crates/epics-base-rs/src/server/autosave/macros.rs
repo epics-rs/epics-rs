@@ -1,18 +1,70 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
-/// Macro expansion context for `$(KEY)` and `${KEY}` patterns.
-#[derive(Debug, Clone, Default)]
+use crate::server::db_loader::{MacroDefs, MacroExpandOptions, MacroTable};
+
+/// C's `MAC_HANDLE` for one `readReqFile`, `do_manual_restore` or
+/// `reboot_restore` call: one table every line is expanded through, so a
+/// faulty definition is reported once per call rather than once per line.
+#[derive(Default)]
 pub struct MacroContext {
-    macros: HashMap<String, String>,
+    /// The definitions, in C's `macInstallMacros` order.
+    defs: MacroDefs,
+    /// C `handle`, `None` for a call with no macro string, whose lines are
+    /// read as written.
+    table: Option<Mutex<MacroTable>>,
 }
+
+impl std::fmt::Debug for MacroContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacroContext")
+            .field("defs", &self.defs)
+            .field("handle", &self.table.is_some())
+            .finish()
+    }
+}
+
+/// C `macCreateHandle(&handle, NULL)`: no environment, warnings on.
+const OPTS: MacroExpandOptions = MacroExpandOptions {
+    env_fallback: false,
+    dollar_escape: false,
+    suppress_warnings: false,
+};
 
 impl MacroContext {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A handle holding `macros`, or none when there are none.
     pub fn from_map(macros: HashMap<String, String>) -> Self {
-        Self { macros }
+        let handle = !macros.is_empty();
+        Self::from_defs((&macros).into(), handle)
+    }
+
+    /// C `if (macrostring && macrostring[0])` `macCreateHandle` +
+    /// `macParseDefns` + `macInstallMacros`.
+    pub fn from_macrostring(macrostring: &str) -> Self {
+        Self::from_defs(Self::parse_defs(macrostring), !macrostring.is_empty())
+    }
+
+    /// `defs` installed in a handle, or no handle.
+    pub fn from_defs(defs: MacroDefs, handle: bool) -> Self {
+        let table = handle.then(|| Mutex::new(MacroTable::new(&defs, OPTS)));
+        Self { defs, table }
+    }
+
+    /// [`Self::parse_inline`] in definition order.
+    pub fn parse_defs(s: &str) -> MacroDefs {
+        Self::defn_pairs(s).collect()
+    }
+
+    /// `s`'s definitions in order, as [`Self::parse_inline`] keeps them.
+    pub(super) fn defn_pairs(s: &str) -> impl Iterator<Item = (String, String)> {
+        crate::server::iocsh::macro_defn_pairs(s)
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty())
+            .filter_map(|(name, value)| value.map(|v| (name, v)))
     }
 
     /// Parse inline macro definitions like `"P=IOC:,M=m1"` into their RAW
@@ -30,54 +82,77 @@ impl MacroContext {
     /// delete path, so it is ignored rather than silently defining an
     /// empty macro.
     pub fn parse_inline(s: &str) -> HashMap<String, String> {
-        crate::server::iocsh::macro_defn_pairs(s)
-            .into_iter()
-            .filter(|(name, _)| !name.is_empty())
-            .filter_map(|(name, value)| value.map(|v| (name, v)))
-            .collect()
+        Self::defn_pairs(s).collect()
     }
 
-    /// Expand `input` as C `readReqFile` does (save_restore.c:3562-3605):
-    /// with no definitions the line is used verbatim; otherwise through
-    /// macLib with no environment, where an undefined name is written back
-    /// as `$(name,undefined)` after macLib's own warning and the line still
-    /// counts.
+    /// Whether there is a handle, which C expands each line through.
+    pub fn has_handle(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// C `macExpandString(handle, line, ...)` (save_restore.c:3601): with
+    /// no handle the line is used verbatim; otherwise an undefined name is
+    /// written back as `$(name,undefined)` after macLib's own warning and
+    /// the line still counts.
     pub fn expand(&self, input: &str) -> String {
-        if self.macros.is_empty() {
-            return input.to_string();
+        match &self.table {
+            Some(table) => table.lock().unwrap().expand(input).text,
+            None => input.to_string(),
         }
-        crate::server::db_loader::expand_macros(
-            input,
-            &self.macros,
-            crate::server::db_loader::MacroExpandOptions {
-                env_fallback: false,
-                dollar_escape: false,
-                suppress_warnings: false,
-            },
-        )
-        .text
     }
 
-    /// [`Self::expand`] without macLib's warnings, for a trace of a line
-    /// whose expansion is reported elsewhere.
-    pub(super) fn expand_quiet(&self, input: &str) -> String {
-        if self.macros.is_empty() {
+    /// [`Self::expand`]'s text for part of a line whose own expansion
+    /// already reported it, leaving the handle as that expansion did.
+    pub(super) fn expand_part(&self, input: &str) -> String {
+        if self.table.is_none() {
             return input.to_string();
         }
-        crate::server::db_loader::expand_macros(
-            input,
-            &self.macros,
-            crate::server::db_loader::MacroExpandOptions {
-                env_fallback: false,
-                dollar_escape: false,
-                suppress_warnings: true,
-            },
-        )
-        .text
+        MacroTable::new(&self.defs, OPTS)
+            .expand_deferred(input)
+            .0
+            .text
     }
 
+    /// The raw value `macros` defines for `key`.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.macros.get(key).map(|s| s.as_str())
+        self.defs
+            .iter()
+            .find(|(name, _)| *name == key.as_bytes())
+            .and_then(|(_, value)| std::str::from_utf8(value).ok())
+    }
+
+    /// C `macGetValue(handle, name, ...) > 0` (save_restore.c:3689-3699):
+    /// `name`'s value, when the handle defines it and it expands to text
+    /// with no fault.
+    pub fn get_value(&self, name: &str) -> Option<String> {
+        let table = self.table.as_ref()?;
+        if !self.defs.iter().any(|(n, _)| n == name.as_bytes()) {
+            return None;
+        }
+        let out = table.lock().unwrap().expand(&format!("$({name})"));
+        (!out.errored() && !out.text.is_empty()).then_some(out.text)
+    }
+
+    /// C `macReportMacros(handle)` (`macCore.c:472-504`): the handle's
+    /// expansion pass, then each definition with its expanded value, `*`
+    /// marking one that expanded wrong.
+    pub(super) fn report(&self) {
+        let Some(table) = &self.table else {
+            return;
+        };
+        let mut table = table.lock().unwrap();
+        let _ = table.expand("");
+        let row = |e: &str, name: &str, raw: &str, value: &str| {
+            println!("{e:<1} {name:<16} {raw:<16} {value}");
+        };
+        row("e", "name", "rawval", "value");
+        row("-", "----", "------", "-----");
+        for (name, raw) in self.defs.iter() {
+            let name = String::from_utf8_lossy(name);
+            let (value, _) = table.expand_deferred(&format!("$({name})"));
+            let e = if value.errored() { "*" } else { " " };
+            row(e, &name, &String::from_utf8_lossy(raw), &value.text);
+        }
     }
 }
 
@@ -108,6 +183,21 @@ mod tests {
     #[test]
     fn no_definitions_leave_the_line_verbatim() {
         assert_eq!(MacroContext::new().expand("$(P)temp"), "$(P)temp");
+    }
+
+    #[test]
+    fn get_value_is_a_defined_name_expanding_cleanly_to_text() {
+        let c = ctx(&[
+            ("P", "N:"),
+            ("E", ""),
+            ("X", "$(P)x"),
+            ("Y", "$(E)"),
+            ("Z", "$(Q)z"),
+        ]);
+        assert_eq!(c.get_value("X").as_deref(), Some("N:x"));
+        assert_eq!(c.get_value("Y"), None);
+        assert_eq!(c.get_value("Z"), None);
+        assert_eq!(c.get_value("Q"), None);
     }
 
     #[test]

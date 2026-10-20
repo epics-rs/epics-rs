@@ -49,7 +49,7 @@ struct MemSource {
 }
 
 struct MemSourceInner {
-    state: Mutex<MemState>,
+    state: parking_lot::Mutex<MemState>,
     /// Subscribers per PV — every push fans out to all of them.
     subs: Mutex<std::collections::HashMap<RecordName, Vec<mpsc::Sender<PvField>>>>,
     /// ordered log of every `notify_monitor_start(name, start)`
@@ -92,7 +92,7 @@ impl MemSource {
     fn new() -> Self {
         Self {
             inner: Arc::new(MemSourceInner {
-                state: Mutex::new(MemState {
+                state: parking_lot::Mutex::new(MemState {
                     values: std::collections::HashMap::new(),
                 }),
                 subs: Mutex::new(std::collections::HashMap::new()),
@@ -121,7 +121,6 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
             .insert(RecordName::from(name), pv);
     }
@@ -132,7 +131,6 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
             .insert(RecordName::from(name), pv);
     }
@@ -143,7 +141,6 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
             .insert(RecordName::from(name), pv.clone());
         let mut subs = self.inner.subs.lock().await;
@@ -157,7 +154,6 @@ impl MemSource {
         self.inner
             .state
             .lock()
-            .await
             .values
             .insert(RecordName::from(name), pv.clone());
         // Notify subscribers (reap only the dead — see `fan_out`).
@@ -199,23 +195,19 @@ fn nt_double_array_desc() -> FieldDesc {
 }
 
 impl ChannelSource for MemSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let inner = self.inner.clone();
-        async move {
-            inner
-                .state
-                .lock()
-                .await
-                .values
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.inner
+            .state
+            .lock()
+            .values
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
     }
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
         let name = RecordName::from(name);
-        async move { inner.state.lock().await.values.contains_key(&name) }
+        async move { inner.state.lock().values.contains_key(&name) }
     }
     fn get_introspection(
         &self,
@@ -226,7 +218,7 @@ impl ChannelSource for MemSource {
         async move {
             // derive the descriptor from the stored value's
             // shape so an NTScalarArray PV reports an array descriptor.
-            match inner.state.lock().await.values.get(&name) {
+            match inner.state.lock().values.get(&name) {
                 Some(PvField::Structure(s))
                     if matches!(
                         s.fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v),
@@ -243,7 +235,7 @@ impl ChannelSource for MemSource {
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
         let name = RecordName::from(name);
-        async move { inner.state.lock().await.values.get(&name).cloned() }
+        async move { inner.state.lock().values.get(&name).cloned() }
     }
     fn put_value(
         &self,
@@ -256,7 +248,6 @@ impl ChannelSource for MemSource {
             inner
                 .state
                 .lock()
-                .await
                 .values
                 .insert(name.clone(), value.clone());
             let mut subs = inner.subs.lock().await;
@@ -276,7 +267,7 @@ impl ChannelSource for MemSource {
         let inner = self.inner.clone();
         let name = RecordName::from(name);
         async move {
-            if !inner.state.lock().await.values.contains_key(&name) {
+            if !inner.state.lock().values.contains_key(&name) {
                 return None;
             }
             let (tx, rx) = mpsc::channel::<PvField>(64);

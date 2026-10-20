@@ -1,9 +1,9 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::error::{AutosaveError, AutosaveResult};
-use super::format::MAX_INCLUDE_DEPTH;
+use super::format::{BUF_SIZE, MAX_INCLUDE_DEPTH};
 use super::macros::MacroContext;
+use super::save_set::FileMacros;
 use super::settings::SrSettings;
 use super::startup::is_valid_first_pv_char;
 
@@ -27,6 +27,8 @@ pub struct RequestEntry {
 pub struct RequestList {
     pub entries: Vec<RequestEntry>,
     pub include_unopened: bool,
+    /// The list's path PV, name PV and backups its levels' macros set.
+    pub file_macros: FileMacros,
 }
 
 /// Load and parse a .req file, resolving includes and macros.
@@ -52,7 +54,7 @@ pub async fn load_request_file_with_search_paths(
     search_paths: &[PathBuf],
     macros: &MacroContext,
 ) -> AutosaveResult<RequestList> {
-    read_request_list(filename, search_paths, macros, "", &SrSettings::default()).await
+    read_request_list(filename, search_paths, macros, None, &SrSettings::default()).await
 }
 
 /// [`load_request_file_with_search_paths`] tracing as `settings` says;
@@ -61,13 +63,14 @@ pub(crate) async fn read_request_list(
     filename: &str,
     search_paths: &[PathBuf],
     macros: &MacroContext,
-    macrostring: &str,
+    macrostring: Option<&str>,
     settings: &SrSettings,
 ) -> AutosaveResult<RequestList> {
     let mut walk = IncludeWalk {
         stack: Vec::new(),
         search_paths,
         unopened: false,
+        file_macros: FileMacros::default(),
         settings,
     };
     let Some(entries) = read_req_file(filename, macrostring, macros, 0, &mut walk)? else {
@@ -76,6 +79,7 @@ pub(crate) async fn read_request_list(
     Ok(RequestList {
         entries,
         include_unopened: walk.unopened,
+        file_macros: walk.file_macros,
     })
 }
 
@@ -85,6 +89,7 @@ struct IncludeWalk<'a> {
     stack: Vec<PathBuf>,
     search_paths: &'a [PathBuf],
     unopened: bool,
+    file_macros: FileMacros,
     settings: &'a SrSettings,
 }
 
@@ -107,14 +112,14 @@ pub(crate) fn concatenate_paths(s1: &str, s2: &str, settings: &SrSettings) -> St
 /// before the C call that joins it again.
 pub(crate) fn concatenated(dest: &str, settings: &SrSettings) {
     if settings.debug() > 2 {
-        println!("save_restore:concatenate_paths: dest='{dest}'");
+        crate::epics_println!("save_restore:concatenate_paths: dest='{dest}'");
     }
 }
 
-/// C `openReqFile(reqFile, fpp)` (save_restore.c:3481-3534) without its
-/// recent-name cache: the first of `search_paths` that holds `name`, else
-/// `name` from the current directory when there are none. `want` is
-/// C's non-NULL `fpp`.
+/// C `openReqFile(reqFile, fpp)`'s search (save_restore.c:3506-3534): the
+/// first of `search_paths` that holds `name`, else `name` from the current
+/// directory when there are none, remembered for [`req_file_exists`].
+/// `want` is C's non-NULL `fpp`.
 fn open_req_file(
     name: &str,
     search_paths: &[PathBuf],
@@ -129,7 +134,7 @@ fn open_req_file(
         } else {
             "(nil)".to_string()
         };
-        println!("save_restore:openReqFile: entry: reqFile='{name}', fpp={fpp}");
+        crate::epics_println!("save_restore:openReqFile: entry: reqFile='{name}', fpp={fpp}");
     }
     if search_paths.is_empty() {
         opened = read_req(PathBuf::from(name));
@@ -144,10 +149,15 @@ fn open_req_file(
     }
     if debug > 5 {
         match opened {
-            Some(_) => println!("openReqFile: found '{name}' by searching"),
-            None => println!("openReqFile: didn't find '{name}' by searching"),
+            Some(_) => crate::epics_println!("openReqFile: found '{name}' by searching"),
+            None => crate::epics_println!("openReqFile: didn't find '{name}' by searching"),
         }
     }
+    settings
+        .recent_req_files
+        .lock()
+        .unwrap()
+        .record(name, opened.is_some());
     opened
 }
 
@@ -156,8 +166,17 @@ fn read_req(path: PathBuf) -> Option<(PathBuf, String)> {
     Some((path, content))
 }
 
-/// C `openReqFile(reqFile, NULL)`: whether the request file is found.
+/// C `openReqFile(reqFile, NULL)`: whether the request file is found, as
+/// last found or not when the name is remembered (save_restore.c:3493-3503).
 pub(crate) fn req_file_exists(name: &str, search_paths: &[PathBuf], settings: &SrSettings) -> bool {
+    let recent = settings.recent_req_files.lock().unwrap().lookup(name);
+    if let Some(found) = recent {
+        if settings.debug() > 5 {
+            let value = if found { "found" } else { "not-found" };
+            crate::epics_println!("openReqFile: using cached {value} value for '{name}'");
+        }
+        return found;
+    }
     open_req_file(name, search_paths, false, settings).is_some()
 }
 
@@ -200,11 +219,74 @@ pub fn parse_request_string(
     Ok(entries)
 }
 
+/// The lines C `readReqFile` reads with `fgets(line, BUF_SIZE, inp_fd)`
+/// (save_restore.c:3576-3590): one that does not end in a newline — too
+/// long, or the file's last — has the rest discarded and is cut at its last
+/// comma or space, so it does not end inside a macro definition.
+struct FgetsLines<'a> {
+    rest: &'a [u8],
+    debug: i32,
+}
+
+impl FgetsLines<'_> {
+    fn fgets(&mut self) -> Option<Vec<u8>> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let max = (BUF_SIZE - 1).min(self.rest.len());
+        let n = self.rest[..max]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(max, |i| i + 1);
+        let (chunk, rest) = self.rest.split_at(n);
+        self.rest = rest;
+        Some(chunk.to_vec())
+    }
+}
+
+impl Iterator for FgetsLines<'_> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut line = self.fgets()?;
+        if line.last() != Some(&b'\n') {
+            let mut eline = line.clone();
+            while !eline.is_empty() && eline.last() != Some(&b'\n') {
+                if self.debug != 0 {
+                    crate::epics_println!(
+                        "save_restore:readReqFile: didn't reach newline:\n\t'{}'",
+                        text(&eline)
+                    );
+                }
+                let Some(next) = self.fgets() else { break };
+                eline = next;
+                if self.debug != 0 {
+                    crate::epics_println!(
+                        "save_restore:readReqFile: discard:\n\t'{}'",
+                        text(&eline)
+                    );
+                }
+            }
+            // C's `isspace`, which takes `\v` too.
+            let mut c = line.len() - 1;
+            while c > 0 && line[c] != b',' && !matches!(line[c], b' ' | b'\t'..=b'\r') {
+                c -= 1;
+            }
+            line.truncate(c);
+            if self.debug != 0 {
+                crate::epics_println!("save_restore:readReqFile: line='{}'", text(&line));
+            }
+        }
+        Some(text(&line))
+    }
+}
+
 /// C `readReqFile(reqFile, plist, macrostring)` (save_restore.c:3538-3706)
 /// for one file and its includes, `None` when the file did not open.
 fn read_req_file(
     req_file: &str,
-    macrostring: &str,
+    macrostring: Option<&str>,
     macros: &MacroContext,
     depth: usize,
     walk: &mut IncludeWalk,
@@ -216,13 +298,15 @@ fn read_req_file(
     // C's `plist`: one list for the whole include tree.
     let list = format!("{:p}", walk.search_paths.as_ptr());
     if debug > 1 {
-        println!(
-            "save_restore:readReqFile: entry: reqFile='{req_file}', plist={list}, macrostring='{macrostring}'"
+        crate::epics_println!(
+            "save_restore:readReqFile: entry: reqFile='{req_file}', plist={list}, macrostring='{}'",
+            macrostring.unwrap_or("NULL")
         );
     }
+    let macrostring = macrostring.unwrap_or_default();
     let Some((path, content)) = open_req_file(req_file, walk.search_paths, true, walk.settings)
     else {
-        println!("save_restore:readReqFile: unable to open file {req_file}. Exiting.");
+        crate::epics_println!("save_restore:readReqFile: unable to open file {req_file}. Exiting.");
         return Ok(None);
     };
     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
@@ -235,31 +319,43 @@ fn read_req_file(
 
     let pairs = crate::server::iocsh::macro_defn_pairs(macrostring);
     if !macrostring.is_empty() && debug >= 5 {
-        println!("save_restore:readReqFile: Current macro definitions:");
-        super::save_set::report_macros(macrostring);
-        println!("save_restore:readReqFile: --------------------------");
+        crate::epics_println!("save_restore:readReqFile: Current macro definitions:");
+        macros.report();
+        crate::epics_println!("save_restore:readReqFile: --------------------------");
     }
 
     let mut entries = Vec::new();
 
-    for (idx, raw_line) in content.split_inclusive('\n').enumerate() {
+    let lines = FgetsLines {
+        rest: content.as_bytes(),
+        debug,
+    };
+    for (idx, raw_line) in lines.enumerate() {
+        let raw_line = raw_line.as_str();
         let line_no = idx + 1;
         let line = raw_line.trim();
 
-        if debug >= 2 {
-            // C expands only with definitions (`handle && pairs`).
-            if !macrostring.is_empty() && debug > 5 {
-                println!("save_restore:readReqFile:handle={:p}", macros);
-                if let Some((name, value)) = pairs.first() {
-                    println!("save_restore:readReqFile:pairs[0]='{name}'");
+        // C expands only with definitions (`handle && pairs`).
+        if !macrostring.is_empty() && debug > 5 {
+            crate::epics_println!("save_restore:readReqFile:handle={:p}", macros);
+            match pairs.first() {
+                Some((name, value)) => {
+                    crate::epics_println!("save_restore:readReqFile:pairs[0]='{name}'");
                     if let Some(value) = value {
-                        println!("save_restore:readReqFile:pairs[1]='{value}'");
+                        crate::epics_println!("save_restore:readReqFile:pairs[1]='{value}'");
                     }
                 }
+                // No definition: C's `pairs[0]` is NULL, printed by glibc.
+                None => crate::epics_println!("save_restore:readReqFile:pairs[0]='(null)'"),
             }
-            let eline = macros.expand_quiet(raw_line);
+        }
+        // Once per line, the line as read, so macLib names it in a notice.
+        let eline = macros.expand(raw_line);
+        if debug >= 2 {
             let name = eline.split_ascii_whitespace().next().unwrap_or("");
-            println!("save_restore:readReqFile: line='{raw_line}', eline='{eline}', name='{name}'");
+            crate::epics_println!(
+                "save_restore:readReqFile: line='{raw_line}', eline='{eline}', name='{name}'"
+            );
         }
 
         if line.is_empty() {
@@ -270,7 +366,7 @@ fn read_req_file(
             let rest = line[4..].trim();
             let (file_path, inline_macros) = parse_file_directive(rest);
 
-            let expanded_path = macros.expand(&file_path);
+            let expanded_path = macros.expand_part(&file_path);
 
             // Merge inline macros in macLib's order: split the RAW text into
             // definitions, THEN expand each value through the parent context
@@ -286,22 +382,29 @@ fn read_req_file(
             // this level after the split, so a comma from inside a value
             // does not end a definition the way C's whole-line expansion
             // lets it.
-            let child_macros = MacroContext::from_map(
-                MacroContext::parse_inline(&inline_macros)
-                    .into_iter()
-                    .map(|(name, raw)| (name, macros.expand(&raw)))
+            let (template_file, new_macro) = c_include_args(&eline);
+            let child_macros = MacroContext::from_defs(
+                MacroContext::defn_pairs(&inline_macros)
+                    .map(|(name, raw)| (name, macros.expand_part(&raw)))
                     .collect(),
+                !new_macro.is_empty(),
             );
 
-            let eline = macros.expand_quiet(raw_line);
-            let (template_file, new_macro) = c_include_args(&eline);
             if debug >= 2 {
-                println!("save_restore:readReqFile: preparing to include file: eline='{eline}'");
-                println!(
+                crate::epics_println!(
+                    "save_restore:readReqFile: preparing to include file: eline='{eline}'"
+                );
+                crate::epics_println!(
                     "save_restore:readReqFile: calling readReqFile('{template_file}', {list},'{new_macro}')"
                 );
             }
-            match read_req_file(&expanded_path, &new_macro, &child_macros, depth + 1, walk)? {
+            match read_req_file(
+                &expanded_path,
+                Some(&new_macro),
+                &child_macros,
+                depth + 1,
+                walk,
+            )? {
                 Some(sub_entries) => entries.extend(sub_entries),
                 None => walk.unopened = true,
             }
@@ -309,8 +412,7 @@ fn read_req_file(
         }
 
         // Regular PV line
-        let expanded = macros.expand(line);
-        let Some(name) = request_pv_name(&expanded) else {
+        let Some(name) = request_pv_name(&eline) else {
             continue;
         };
         entries.push(RequestEntry {
@@ -321,8 +423,9 @@ fn read_req_file(
         });
     }
     walk.stack.pop();
+    walk.file_macros.take_from(macros);
     if debug > 1 {
-        println!("save_restore:readReqFile: exit: reqFile='{req_file}'.");
+        crate::epics_println!("save_restore:readReqFile: exit: reqFile='{req_file}'.");
     }
 
     Ok(Some(entries))
@@ -399,6 +502,27 @@ fn parse_file_directive(rest: &str) -> (String, String) {
 mod tests {
     use super::*;
 
+    /// C answers an existence check from the names it last searched for,
+    /// so a file made after a failed search stays not found.
+    #[test]
+    fn an_existence_check_answers_from_the_last_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().to_path_buf()];
+        let settings = SrSettings::default();
+        assert!(!req_file_exists("a.req", &paths, &settings));
+        std::fs::write(dir.path().join("a.req"), "A\n").unwrap();
+        assert!(!req_file_exists("a.req", &paths, &settings));
+        std::fs::write(dir.path().join("b.req"), "B\n").unwrap();
+        assert!(req_file_exists("b.req", &paths, &settings));
+        std::fs::remove_file(dir.path().join("b.req")).unwrap();
+        assert!(req_file_exists("b.req", &paths, &settings));
+        // Five newer misses push `a.req` out.
+        for i in 0..5 {
+            assert!(!req_file_exists(&format!("x{i}.req"), &paths, &settings));
+        }
+        assert!(req_file_exists("a.req", &paths, &settings));
+    }
+
     #[test]
     fn a_line_names_its_first_token_if_c_would_take_it() {
         let macros = MacroContext::from_map(
@@ -445,19 +569,4 @@ mod tests {
 /// Extract just PV names from entries.
 pub fn pv_names(entries: &[RequestEntry]) -> Vec<String> {
     entries.iter().map(|e| e.pv_name.clone()).collect()
-}
-
-/// Dedup entries, keeping the last occurrence of each PV name.
-pub fn dedup_entries(entries: Vec<RequestEntry>) -> Vec<RequestEntry> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-
-    // Iterate in reverse to keep last occurrence
-    for entry in entries.into_iter().rev() {
-        if seen.insert(entry.pv_name.clone()) {
-            result.push(entry);
-        }
-    }
-    result.reverse();
-    result
 }

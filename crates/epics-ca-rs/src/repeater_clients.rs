@@ -121,7 +121,7 @@ impl Diag {
     /// C `fprintf ( stderr, … )`. None of `repeater.cpp`'s seven stderr
     /// sites is gated on `debug`, so this takes no threshold.
     pub(crate) fn stderr(self, args: fmt::Arguments<'_>) {
-        eprintln!("{args}");
+        epics_libcom_rs::stderr_println!("{args}");
     }
 
     /// C `errlogPrintf` — the errlog facility, which is a message queue

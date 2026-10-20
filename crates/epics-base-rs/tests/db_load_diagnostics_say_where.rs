@@ -551,7 +551,6 @@ async fn load_in_dir(
     unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
     let mut records: Vec<String> = pvdb
         .all_record_names()
-        .await
         .iter()
         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
         .collect();

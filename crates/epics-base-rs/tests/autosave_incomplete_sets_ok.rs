@@ -54,7 +54,7 @@ fn config(dir: &std::path::Path) -> SaveSetConfig {
         request_pvs: vec!["A".into(), "NOPE".into()],
         backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -75,8 +75,7 @@ async fn saved_by_the_task(ok: i32) -> bool {
             .build()
             .await,
     );
-    let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-    drop(mgr.clone().start(&reactor, db.clone()));
+    drop(mgr.clone().start(db.clone()));
     let path = dir.path().join("s.sav");
     for _ in 0..100 {
         if path.exists() {
@@ -162,15 +161,8 @@ async fn a_manual_restore_stops_at_the_error_line() {
     let path = dir.path().join("s.sav");
     std::fs::write(&path, INCOMPLETE).unwrap();
     let db = db().await;
-    let status = do_manual_restore(
-        &db,
-        "s.sav",
-        &path,
-        ManualSource::SaveFile,
-        "",
-        &settings(0),
-    )
-    .await;
+    let mgr = AutosaveBuilder::new().settings(settings(0)).build().await;
+    let status = do_manual_restore(&db, &mgr, "s.sav", &path, ManualSource::SaveFile, "").await;
     assert_eq!(status, -1);
     assert_eq!((value(&db, "B"), value(&db, "A")), (2.0, 0.0));
     assert!(!dir.path().join("s.sav.bu").exists());

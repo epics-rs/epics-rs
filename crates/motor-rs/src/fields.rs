@@ -89,7 +89,9 @@ impl Default for ConversionFields {
             sset: 0,
             suse: 0,
             igset: 0,
-            mres: 1.0,
+            // dbd-true default — MRES has no initial(); init sets 1.0 and
+            // marks M_MRES (motorRecord.cc:3917-3921).
+            mres: 0.0,
             eres: 0.0,
             srev: 200,
             // dbd-true default — UREV has no initial(). The init-time

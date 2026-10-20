@@ -315,8 +315,12 @@ mod tests {
         for pass in [true, false] {
             let mut chain = FilterChain::new();
             chain.push(std::sync::Arc::new(Post(pass)));
-            let stage =
-                crate::server::DeliveryStage::new(chain, crate::server::LongStringMode::Plain, 1);
+            let stage = crate::server::DeliveryStage::new(
+                chain,
+                crate::server::LongStringMode::Plain,
+                1,
+                DBR_CTRL_DOUBLE,
+            );
             let (outbox, mut drain): (Outbox, OutboxDrain) = crate::server::outbox::channel();
             let mut read = Snapshot::new(
                 EpicsValue::Double(1.5),

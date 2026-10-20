@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -15,19 +15,24 @@ struct Lset(Arc<Mutex<Vec<EpicsValue>>>);
 
 #[async_trait::async_trait]
 impl LinkSet for Lset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn put_admission(&self, _: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         PutAdmission::Connected
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, _: &[u8], value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        _: LinkRef<'_>,
+        value: EpicsValue,
+        _: LinkPutOp,
+    ) -> Result<(), String> {
         self.0.lock().unwrap().push(value);
         Ok(())
     }
@@ -64,6 +69,8 @@ async fn an_external_put_starts_no_worker() {
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(Lset(Arc::clone(&puts))))
         .await;
+    // iocInit's link pass: from here a relink adds its own link (dbAddLink).
+    db.setup_cp_links().await;
     db.process_cp_links_on_connect().await;
     db.add_record(
         "O",

@@ -2,6 +2,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::{CaClient, ChannelInfo};
 use epics_ca_rs::copt::{self, CTool};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Owner of every C-scanned option argument in this binary (see
 /// [`epics_ca_rs::copt`]).
@@ -42,7 +43,7 @@ Channel Access options:
 Example: cainfo my_channel another_channel
 
 "#,
-        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        timeout = CFloat(epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS),
         max = epics_ca_rs::copt::CA_PRIORITY_MAX,
     );
     // C's SECOND `fprintf` in `usage()` (`cainfo.c:49`): the same banner
@@ -197,10 +198,13 @@ async fn main() {
                     .write_all(&connected_block(&info, &host));
             }
             Err(e) => {
+                use std::fmt::Write as _;
                 use std::io::Write as _;
-                let mut err = std::io::stderr().lock();
-                let _ = err.write_all(pv_name.as_bytes());
-                let _ = writeln!(err, ": {e}");
+                // The name is the argument's bytes, which need not be UTF-8.
+                let mut line = epics_libcom_rs::runtime::log::StagedLine::default();
+                line.push_bytes(pv_name.as_bytes());
+                let _ = writeln!(line, ": {e}");
+                let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(line.bytes());
                 failed = true;
             }
         }

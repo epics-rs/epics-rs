@@ -1331,7 +1331,7 @@ mod link_cache {
     use crate::server::builtin_devices::soft_callback::AddRecordRefusal;
     use crate::server::database::ProcessTargetGate;
     use crate::server::device_support::SoftDtyp;
-    use crate::server::recgbl::simm::has_const_lset;
+    use crate::server::recgbl::simm::{has_const_lset, has_no_lset};
     use crate::server::record::{DbLinkType, LinkFieldType, MonitorSwitch, ParsedLink};
     use crate::types::PvString;
     use std::sync::{Arc, LazyLock};
@@ -1565,7 +1565,7 @@ mod link_cache {
         /// (`dbAccess.c:1155-1158`): the put still owes its scan exit.
         pub(super) left_io_intr: bool,
         /// The scan-list move that exit left, for the database to file.
-        pub(super) scan_moved: crate::server::record::CommonFieldPutResult,
+        pub(super) scan_moved: super::LinkScanMove,
     }
 
     pub(crate) enum NewDset {
@@ -1656,7 +1656,9 @@ mod link_cache {
                     return;
                 }
                 let dtyp = inst.common.dtyp.shared_name();
-                let bound_here = inst.device.as_ref().is_some_and(|d| d.dtyp() == &*dtyp);
+                let bound_here = inst.device.as_ref().is_some_and(|d| {
+                    d.dtyp() == super::super::served_choice(inst.record.record_type(), &dtyp)
+                });
                 let no_mod = inst.is_no_mod_at(self.field, &at);
                 (inst.record.record_type(), dtyp, bound_here, no_mod)
             };
@@ -1719,7 +1721,9 @@ mod link_cache {
                 dpvt,
                 retired_dpvt: crate::server::device_support::Dpvt::Null,
                 left_io_intr: false,
-                scan_moved: crate::server::record::CommonFieldPutResult::NoChange,
+                scan_moved: super::LinkScanMove::Done(
+                    crate::server::record::CommonFieldPutResult::NoChange,
+                ),
             });
         }
 
@@ -1812,19 +1816,19 @@ mod link_cache {
     });
     const NONE: usize = 0;
 
-    /// The shared [`ParsedLink::Removed`] for `old`: the type `plink->type`
-    /// keeps after `dbRemoveLink`. Only a link with an lset is removed
-    /// (`dbAccess.c:1150`), and a hardware link has none, so a slot never
-    /// holds one here.
-    pub(super) fn removed(old: &ParsedLink) -> Arc<ParsedLink> {
-        match old.db_link_type() {
+    /// C `dbRemoveLink` on `old`: the shared [`ParsedLink::Removed`] of the
+    /// type `plink->type` keeps, or `None` for a link with no lset — a
+    /// hardware link or one already removed — which it leaves as it is
+    /// (`dbLink.c:202-213`).
+    pub(super) fn removed(old: &ParsedLink) -> Option<Arc<ParsedLink>> {
+        if has_no_lset(old) {
+            return None;
+        }
+        Some(match old.db_link_type() {
             DbLinkType::Constant => SHARED[1].clone(),
             DbLinkType::JsonLink => SHARED[3].clone(),
-            ty => {
-                debug_assert_eq!(ty, DbLinkType::PvLink, "a removed hardware link");
-                SHARED[2].clone()
-            }
-        }
+            _ => SHARED[2].clone(),
+        })
     }
 
     fn parse(text: &[u8], ftype: LinkFieldType) -> Arc<ParsedLink> {
@@ -2038,17 +2042,20 @@ mod link_cache {
             &self.0[i].parsed
         }
 
+        /// The parse `field`'s slot holds, when `field` has a slot.
+        pub(crate) fn parse_of(&self, field: &str) -> Option<&Arc<ParsedLink>> {
+            self.position(field).map(|i| self.at(i))
+        }
+
         pub(super) fn links(&self) -> impl Iterator<Item = &Arc<ParsedLink>> {
             self.0.iter().map(|slot| &slot.parsed)
         }
 
         /// C `dbRemoveLink` on slot `i`.
         pub(super) fn remove(&mut self, i: usize) {
-            self.set(i, removed(&self.0[i].parsed));
-        }
-
-        pub(super) fn is_removed(&self, i: usize) -> bool {
-            matches!(*self.0[i].parsed, ParsedLink::Removed(_))
+            if let Some(removed) = removed(&self.0[i].parsed) {
+                self.set(i, removed);
+            }
         }
 
         pub(super) fn field(&self, i: usize) -> &'static str {
@@ -2229,6 +2236,9 @@ pub(crate) struct CycleFacts {
     /// ([`crate::server::device_support::DeviceSupport::posts_from_device`]):
     /// the cycle posts them after `write_begin_common`.
     pub(crate) device_posts: bool,
+    /// The device takes its record lent around `read_begin` and
+    /// `write_begin` ([`crate::server::device_support::DeviceSupport::lends_held`]).
+    pub(crate) device_held: bool,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -3672,6 +3682,25 @@ impl RecordCell {
         )
     }
 
+    /// C `dbNameToAddr`'s `field_type` for `field`: the declaration, or the
+    /// variant a runtime-typed field holds, read from `own` when the caller
+    /// holds this record and otherwise only while the record is free.
+    pub(crate) fn addressed_field_type(
+        &self,
+        field: &str,
+        own: Option<&dyn Record>,
+    ) -> Option<DbFieldType> {
+        let desc = field_desc_in(self.rdes.fields, field)?;
+        if !desc.runtime_typed {
+            return Some(desc.dbf_type);
+        }
+        let value = match own {
+            Some(record) => record.get_field(field),
+            None => self.try_read()?.record.get_field(field),
+        };
+        value.map(|v| v.db_field_type())
+    }
+
     /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
     /// `cvt_dbaddr` too, now if the record is free, else owed to the next
     /// fresh hold of its set (`record_lock::owe_cvt`).
@@ -4212,6 +4241,97 @@ impl Drop for RecordMut<'_> {
     }
 }
 
+impl<'a> RecordMut<'a> {
+    /// The borrow let go and the set kept, for a dset call the record is lent
+    /// to as a `HeldInstance`.
+    pub(crate) fn lend(mut self) -> LentRecord<'a> {
+        let set = self._set.take();
+        LentRecord {
+            cell: self.cell,
+            set,
+        }
+    }
+}
+
+/// A [`RecordMut`] whose borrow is lent out and whose set is still held.
+#[must_use = "the record's lock set is released as soon as the guard is dropped"]
+pub(crate) struct LentRecord<'a> {
+    cell: &'a RecordCell,
+    set: Option<crate::server::database::SetGuard>,
+}
+
+impl<'a> LentRecord<'a> {
+    /// The borrow taken back under the set kept.
+    pub(crate) fn rehold(self) -> RecordMut<'a> {
+        use std::sync::atomic::Ordering;
+        assert!(
+            self.cell.borrow.load(Ordering::Relaxed) == 0,
+            "record data written while this thread still holds a guard of it"
+        );
+        self.cell.borrow.store(-1, Ordering::Relaxed);
+        live_borrows::taken();
+        RecordMut {
+            cell: self.cell,
+            _set: self.set,
+        }
+    }
+}
+
+/// C `scanAdd`'s `recGblRecordError` text for an I/O Intr record with no list.
+const NO_LIST: &str = "scanAdd: I/O Intr not valid";
+
+/// What [`RecordInstance::set_scan`] leaves the owner of the record's hold.
+/// C calls `get_ioint_info(0)` inside the move under `dbScanLock`; a dset
+/// that `lends_held` is called only once the borrow is down, with the record
+/// lent, so until then SCAN holds I/O Intr, the record is on no list and
+/// nothing has posted SCAN. `PvDatabase::settle_scan` is the one way to the
+/// delta, so a post can follow the call and never precede it.
+#[must_use = "an owed scanAdd runs only when the owner settles the move"]
+pub(crate) enum ScanMove {
+    Done(CommonFieldPutResult),
+    AddOwed { old_scan: ScanType },
+}
+
+impl ScanMove {
+    /// For a caller with only the instance, which cannot lend the record: an
+    /// owed `scanAdd` is refused as a declining dset is (dbScan.c:280-288).
+    pub(crate) fn unlent(self, instance: &mut RecordInstance) -> CommonFieldPutResult {
+        match self {
+            Self::Done(result) => result,
+            Self::AddOwed { old_scan } => instance.settle_owed_add(old_scan, false),
+        }
+    }
+}
+
+/// [`RecordInstance::scan_add_io_intr`]'s answer.
+#[must_use = "an owed scanAdd runs only when the owner settles it"]
+pub(crate) enum ScanAdd {
+    Done(Result<(), Option<&'static str>>),
+    Owed,
+}
+
+/// A device-link put's scan exit (`dbAccess.c:1218-1233`): the move filed and
+/// SCAN posted, or `restoreScan`'s `scanAdd` owed with `postScanEvent` to
+/// follow it.
+#[must_use = "an owed scanAdd runs only when the owner settles the move"]
+pub(crate) enum LinkScanMove {
+    Done(CommonFieldPutResult),
+    RestoreOwed(ScanMove),
+}
+
+impl LinkScanMove {
+    /// [`ScanMove::unlent`] for a device-link put.
+    pub(crate) fn unlent(self, instance: &mut RecordInstance) -> CommonFieldPutResult {
+        match self {
+            Self::Done(result) => result,
+            Self::RestoreOwed(restore) => {
+                let _ = restore.unlent(instance);
+                instance.post_scan_event()
+            }
+        }
+    }
+}
+
 /// One entry of [`RecordInstance::parsed_inputs`]: a link text the record
 /// held at some read, its parse, and the local record the parse addressed.
 pub(crate) struct ParsedInputLink {
@@ -4311,7 +4431,9 @@ impl ParsedInputLink {
     /// current text is read first and the cached entry is reused only when
     /// its text is that text byte for byte, so the parse runs once per
     /// distinct text a slot has held and the invariant on the field's doc
-    /// needs no other site to hold. Takes the record's parts rather than the
+    /// needs no other site to hold. A field with a link slot takes the
+    /// slot's parse from `slots` instead of parsing: the slot's is the link
+    /// its lset opened, and a second parse would be a second link. Takes the record's parts rather than the
     /// record so the fetch stage can hold the entry while it writes the
     /// record's fields. `always`: the held and the general fetch both call
     /// it, and the held one is the loop's common frame.
@@ -4325,6 +4447,7 @@ impl ParsedInputLink {
     pub(crate) fn validated<'c>(
         cache: &'c mut [Option<ParsedInputLink>],
         record: &dyn Record,
+        slots: &LinkSlots,
         slot: usize,
         declared: &'static [(&'static str, &'static str)],
         generation: Option<u64>,
@@ -4353,7 +4476,7 @@ impl ParsedInputLink {
             }
         };
         if cell.as_ref().is_none_or(|entry| entry.text != text) {
-            *cell = Some(Self::fresh(text));
+            *cell = Some(Self::fresh(text, slots.parse_of(link_field)));
         }
         let entry = cell.as_mut()?;
         entry.generation = generation;
@@ -4371,14 +4494,15 @@ impl ParsedInputLink {
         }
     }
 
-    /// A slot's entry for a text it has not held: the parse, with no target
-    /// resolved yet. Its own frame so the cycle's byte-for-byte reuse test
-    /// does not carry the parser's.
-    fn fresh(text: &[u8]) -> ParsedInputLink {
+    /// A slot's entry for a text it has not held: `installed`, the field's
+    /// slot parse, else a parse of `text`, with no target resolved yet. Its
+    /// own frame so the cycle's byte-for-byte reuse test does not carry the
+    /// parser's.
+    fn fresh(text: &[u8], installed: Option<&Arc<ParsedLink>>) -> ParsedInputLink {
         ParsedInputLink {
             text: text.into(),
             generation: None,
-            parsed: Arc::new(parse_link_v2(text)),
+            parsed: installed.map_or_else(|| Arc::new(parse_link_v2(text)), Arc::clone),
             answers: None,
             target: None,
         }
@@ -4999,14 +5123,15 @@ impl FieldRead {
 pub struct RecordInstance {
     /// The parsed form of each [`Record::multi_input_links`] slot the record
     /// has wired, validated against the text the record holds NOW on every
-    /// read — see [`ParsedInputLink::validated`], the one writer. The record's
-    /// put paths need no hook: an entry whose text is not the record's text
-    /// is re-parsed at the next read, so `parsed == parse_link_v2(&text)`
-    /// holds for every entry by construction. C parses a link once at
-    /// `dbInitLink`; the port parsed every set `INPA`..`INPL` on every cycle.
+    /// read — see [`ParsedInputLink::validated`], the one writer. An entry
+    /// whose text is not the record's text is re-parsed at the next read; a
+    /// field with a link slot reads the slot's parse, so every write of a
+    /// slot drops the field's entry ([`Self::forget_input_entry`]). C parses
+    /// a link once at `dbInitLink`; the port parsed every set
+    /// `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
     /// Every other link field's parse — see [`Self::record_link`].
-    link_slots: LinkSlots,
+    pub(crate) link_slots: LinkSlots,
     /// The rows of `link_slots` the multi-output dispatch reads by index
     /// ([`crate::server::database::multi_out_rows`]): the output row, and
     /// seq's DOL row.
@@ -5253,6 +5378,9 @@ struct RecordCold {
     /// field still reads its `.dbd` initial. Empty for a record whose declared
     /// fields are all modeled.
     declared_overrides: HashMap<String, EpicsValue>,
+    /// [`RecordInstance::parsed_inputs`] for the
+    /// [`Record::output_time_input_links`] (swait's `DOLN`).
+    output_time_links: Vec<Option<ParsedInputLink>>,
     /// This record's OWN link fields whose target supplies some field's
     /// units/precision/graphic/alarm — the distinct answers of
     /// [`Record::link_backed_metadata_field`] over the record's declared
@@ -6716,6 +6844,7 @@ impl RecordInstance {
         if let Some(i) = self.link_slots.position(field) {
             self.invalidate_plan_for(field);
             self.link_slots.swap(i, &mut link);
+            self.forget_input_entry(field);
             return Ok(link);
         }
         if self.swap_link_cache(field, &mut link) {
@@ -7018,6 +7147,7 @@ impl RecordInstance {
         let facts = CycleFacts {
             not_simulating,
             device_posts: self.device.as_ref().is_some_and(|d| d.posts_from_device()),
+            device_held: self.device.as_ref().is_some_and(|d| d.lends_held()),
         };
         let plain = plan.is_plain_input()
             && not_simulating
@@ -7180,8 +7310,10 @@ impl RecordInstance {
         self.invalidate_plan_for(field);
         match PreparedLink::for_put(self.record.field_list(), field, &value) {
             Some(link) => {
-                self.record.load_field(link.field(), value)?;
+                let field = link.field();
+                self.record.load_field(field, value)?;
                 self.link_slots.install(link);
+                self.forget_input_entry(field);
                 Ok(())
             }
             None => {
@@ -7200,6 +7332,7 @@ impl RecordInstance {
         self.invalidate_plan_for(field);
         self.record.put_field(field, value)?;
         self.link_slots.install(link);
+        self.forget_input_entry(field);
         Ok(())
     }
 
@@ -7220,6 +7353,7 @@ impl RecordInstance {
         self.invalidate_plan_for(field);
         self.record.put_field_internal(field, value)?;
         self.link_slots.install(link);
+        self.forget_input_entry(field);
         Ok(Some(field))
     }
 
@@ -7302,14 +7436,18 @@ impl RecordInstance {
     }
 
     /// The parse of multi-input link `slot` for a reader that holds the
-    /// record shared: the cached one when its text is the record's current
-    /// text, a fresh parse otherwise — never written back, since the fetch
-    /// stage that runs under the exclusive guard validates the entry itself.
+    /// record shared: the field's slot parse when it has a slot, else the
+    /// cached one when its text is the record's current text, a fresh parse
+    /// otherwise — never written back, since the fetch stage that runs under
+    /// the exclusive guard validates the entry itself.
     pub(crate) fn cached_multi_input(
         &self,
         slot: usize,
         link_field: &str,
     ) -> Option<Arc<ParsedLink>> {
+        if let Some(link) = self.link_slots.parse_of(link_field) {
+            return (!matches!(**link, ParsedLink::None)).then(|| link.clone());
+        }
         let owned;
         let text: &[u8] = match self.record.link_text_ref(link_field) {
             Some([]) => return None,
@@ -7364,6 +7502,23 @@ impl RecordInstance {
             return LinkSlots::none();
         };
         self.slot_link(i)
+    }
+
+    /// The parse of output-time input link `i` of `links` (the record's
+    /// [`Record::output_time_input_links`]), held per text as an input's is
+    /// in [`Self::parsed_inputs`], so every output reads the one link its
+    /// lset opened. `None` when the link is unset.
+    pub(crate) fn output_time_link(
+        &mut self,
+        i: usize,
+        links: &'static [(&'static str, &'static str)],
+    ) -> Option<Arc<ParsedLink>> {
+        let cache = &mut self.cold.output_time_links;
+        if cache.len() < links.len() {
+            cache.resize_with(links.len(), || None);
+        }
+        ParsedInputLink::validated(cache, &*self.record, &self.link_slots, i, links, None)
+            .map(|entry| entry.parsed().clone())
     }
 
     /// [`Self::record_link`] for a [`CycleLink`], by the slot settled at
@@ -7642,6 +7797,7 @@ impl RecordInstance {
                 subroutine_pvt: None,
                 skipped_posted: SkippedLog::default(),
                 declared_overrides: HashMap::new(),
+                output_time_links: Vec::new(),
                 link_backed_metadata_links,
                 link_backed_metadata_input_slot,
                 info: HashMap::new(),
@@ -7803,8 +7959,14 @@ impl RecordInstance {
     ///
     /// C `doInitRecord0`: the prologue and `init_record(prec, 0)`. Returns
     /// whether the record's `init_record` gets past its dset test, i.e.
-    /// whether the two later walks have anything to do for it.
-    pub(crate) fn run_init_pass0(&mut self, name: &str) -> bool {
+    /// whether the two later walks have anything to do for it, and the dset
+    /// init a device that lends held leaves for
+    /// [`crate::server::database::PvDatabase::pay_device_init`].
+    #[must_use]
+    pub(crate) fn run_init_pass0(
+        &mut self,
+        name: &str,
+    ) -> (bool, Option<crate::server::device_support::OwedDeviceInit>) {
         let _init = crate::server::database::InitPass::enter();
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
@@ -7836,15 +7998,20 @@ impl RecordInstance {
         // see `RecordInstance::device`. Asking every record type to re-derive
         // the answer is the per-cell patch this replaces.
         if !self.init_record_reaches_body() {
-            return false;
+            return (false, None);
         }
         if let Err(e) = self.record.init_record(0) {
-            eprintln!("init_record(0) failed for {name}: {e}");
+            crate::stderr_println!("init_record(0) failed for {name}: {e}");
         }
-        if self.record.dset_init_in_pass0() {
-            crate::server::device_support::init_device_support(self);
-        }
-        true
+        let owed = if self.record.dset_init_in_pass0() {
+            crate::server::device_support::init_device_support(
+                self,
+                crate::server::device_support::InitStage::Pass0,
+            )
+        } else {
+            None
+        };
+        (true, owed)
     }
 
     /// C `doResolveLinks`' device-support half, for a record pass 0 reached.
@@ -7867,16 +8034,19 @@ impl RecordInstance {
     }
 
     /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
-    /// record pass 0 reached.
+    /// record pass 0 reached. A device that lends held leaves its dset init,
+    /// and the tail after it, for
+    /// [`crate::server::database::PvDatabase::pay_device_init`].
+    #[must_use]
     pub(crate) fn run_init_pass1(
         &mut self,
         name: &str,
         reads: &mut crate::server::record::InitLinkReads,
         err: &dyn Fn(&str),
-    ) {
+    ) -> Option<crate::server::device_support::OwedDeviceInit> {
         let _init = crate::server::database::InitPass::enter();
         if let Err(e) = self.record.init_record_with_links(reads) {
-            eprintln!("init_record(1) failed for {name}: {e}");
+            crate::stderr_println!("init_record(1) failed for {name}: {e}");
         }
         reads.apply(&mut self.common);
         // C `pdset->common.init_record(prec)` — the driver's own init, which
@@ -7891,8 +8061,20 @@ impl RecordInstance {
         // reflected in the trackers seeded a line earlier.
         crate::server::database::seed_record_constants(self);
         if !self.record.dset_init_in_pass0() {
-            crate::server::device_support::init_device_support(self);
+            let owed = crate::server::device_support::init_device_support(
+                self,
+                crate::server::device_support::InitStage::Pass1,
+            );
+            if owed.is_some() {
+                return owed;
+            }
         }
+        self.finish_init_pass1(name, err);
+        None
+    }
+
+    /// [`Self::run_init_pass1`] after the dset init.
+    pub(crate) fn finish_init_pass1(&mut self, name: &str, err: &dyn Fn(&str)) {
         self.seed_metadata_cache();
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return
@@ -7914,7 +8096,7 @@ impl RecordInstance {
         // `u8` carrier through it here at the single init owner.
         let mut udf = self.common.udf != 0;
         if let Err(e) = self.record.post_init_finalize_undef(&mut udf) {
-            eprintln!("post_init_finalize_undef failed for {name}: {e}");
+            crate::stderr_println!("post_init_finalize_undef failed for {name}: {e}");
         }
         self.common.udf = udf as u8;
         // C `init_record` that calls `recGblResetAlarms(prec)` (asyn, table).
@@ -8963,17 +9145,23 @@ impl RecordInstance {
         EpicsValue::String(rendered)
     }
 
-    /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed: a
-    /// device link's failed put leaves the record with no dset
+    /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed or its
+    /// `openLink` left with no lset: a device link's failed put leaves the
+    /// record with no dset
     /// ([`Dtyp::is_detached`](crate::server::device_support::Dtyp::is_detached)),
-    /// and any other link is [`ParsedLink::Removed`] in its slot.
+    /// and any other link is [`ParsedLink::Removed`] where it is stored.
     pub(crate) fn link_unadded(&self, field: &str) -> bool {
         if self.is_device_link(field) {
             return self.common.dtyp.is_detached();
         }
-        self.link_slots
-            .position(field)
-            .is_some_and(|i| self.link_slots.is_removed(i))
+        self.link_removed(field)
+    }
+
+    /// Read from [`Self::stored_link`], not the slots alone: FLNK, TSEL and
+    /// SDIS keep their link in the `dbCommon` cache, which
+    /// [`Self::bind_no_lset`] leaves `Removed` too.
+    fn link_removed(&self, field: &str) -> bool {
+        matches!(self.stored_link(field), Some(ParsedLink::Removed(_)))
     }
 
     /// The old dsxt's `del_record` on a device-link put (`dbAccess.c:1163`):
@@ -10080,12 +10268,13 @@ impl RecordInstance {
     /// calls exactly the same `scanDelete`/`scanAdd` pair). Returns the delta
     /// for the scan-index owner (`PvDatabase::update_scan_index`) to apply once
     /// the record lock is down; [`CommonFieldPutResult::NoChange`] when the scan
-    /// did not move.
-    pub fn set_scan(&mut self, new_scan: ScanType) -> CommonFieldPutResult {
+    /// did not move. A dset that lends_held is owed its `scanAdd` instead
+    /// ([`ScanMove::AddOwed`]).
+    pub(crate) fn set_scan(&mut self, new_scan: ScanType) -> ScanMove {
         use crate::server::device_support::IoIntrCmd;
         let old_scan = self.common.scan;
         if old_scan == new_scan {
-            return CommonFieldPutResult::NoChange;
+            return ScanMove::Done(CommonFieldPutResult::NoChange);
         }
         // C `scanDelete`/`scanAdd` call the record's device support
         // `get_ioint_info(1)` / `get_ioint_info(0)`. Only a change of I/O Intr
@@ -10098,7 +10287,7 @@ impl RecordInstance {
         // the list twice (recGbl.c:430-435, dbScan.c:1073): not copied.
         let listed = self.scan_lists_built();
         let was_io_intr = old_scan == ScanType::IoIntr;
-        let mut is_io_intr = new_scan == ScanType::IoIntr;
+        let is_io_intr = new_scan == ScanType::IoIntr;
         if listed && was_io_intr && !is_io_intr {
             if let Some(dev) = self.device.as_mut() {
                 dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Delete);
@@ -10107,20 +10296,32 @@ impl RecordInstance {
             }
         }
         self.common.scan = new_scan;
-        if listed && is_io_intr && !was_io_intr {
-            if let Err(message) = self.scan_add_io_intr() {
-                if let Some(message) = message {
-                    // C passes `-1`, whose status slot `recGblRecordError`
-                    // leaves empty (recGbl.c:65-70).
-                    crate::server::recgbl::rec_gbl_record_error(
-                        "",
-                        &self.name.to_str_lossy(),
-                        message,
-                    );
-                }
-                self.common.scan = ScanType::Passive;
-                is_io_intr = false;
+        let added = match (listed && is_io_intr && !was_io_intr).then(|| self.scan_add_io_intr()) {
+            Some(ScanAdd::Owed) => return ScanMove::AddOwed { old_scan },
+            Some(ScanAdd::Done(added)) => Some(added),
+            None => None,
+        };
+        ScanMove::Done(self.finish_scan_move(old_scan, new_scan, added))
+    }
+
+    /// [`Self::set_scan`] past `scanAdd`, whose answer `added` is, when it
+    /// was asked.
+    fn finish_scan_move(
+        &mut self,
+        old_scan: ScanType,
+        new_scan: ScanType,
+        added: Option<Result<(), Option<&'static str>>>,
+    ) -> CommonFieldPutResult {
+        let was_io_intr = old_scan == ScanType::IoIntr;
+        let mut is_io_intr = new_scan == ScanType::IoIntr;
+        if let Some(Err(message)) = added {
+            if let Some(message) = message {
+                // C passes `-1`, whose status slot `recGblRecordError`
+                // leaves empty (recGbl.c:65-70).
+                crate::server::recgbl::rec_gbl_record_error("", &self.name.to_str_lossy(), message);
             }
+            self.common.scan = ScanType::Passive;
+            is_io_intr = false;
         }
         if was_io_intr != is_io_intr && !self.record.set_io_intr_scan(is_io_intr) {
             // `scanAdd`'s `precord->scan = menuScanPassive` (dbScan.c:286-288).
@@ -10135,6 +10336,16 @@ impl RecordInstance {
             new_scan,
             phas: self.common.phas,
         }
+    }
+
+    /// The rest of [`Self::set_scan`] once the owed `scanAdd` answered.
+    pub(crate) fn settle_owed_add(
+        &mut self,
+        old_scan: ScanType,
+        added: bool,
+    ) -> CommonFieldPutResult {
+        let added = self.scan_add_after(added);
+        self.finish_scan_move(old_scan, ScanType::IoIntr, Some(added))
     }
 
     /// Whether the record's database has built its scan lists. A record in
@@ -10152,24 +10363,34 @@ impl RecordInstance {
     /// C's `menuScanPassive` exit with its `recGblRecordError` text, `None`
     /// for a hook that declined, which C demotes without a line. The
     /// trailing space of the no-DSET text is C's.
-    pub(crate) fn scan_add_io_intr(&mut self) -> Result<(), Option<&'static str>> {
+    ///
+    /// A dset that lends_held is owed the call instead ([`ScanAdd::Owed`]).
+    pub(crate) fn scan_add_io_intr(&mut self) -> ScanAdd {
         use crate::server::device_support::IoIntrCmd;
         const NO_DSET: &str = "scanAdd: I/O Intr not valid (no DSET) ";
         const NO_HOOK: &str = "scanAdd: I/O Intr not valid (no get_ioint_info)";
-        const NO_LIST: &str = "scanAdd: I/O Intr not valid";
         let row = super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str());
         if row.is_some_and(|row| !row.has_get_ioint_info()) {
-            return Err(Some(NO_HOOK));
+            return ScanAdd::Done(Err(Some(NO_HOOK)));
         }
         // A soft device is served by the framework, so no device object
         // says nothing about C's `precord->dset`; its devSup row does. A row
         // with the hook but no object to answer it is `:290-293`'s NULL list.
         let Some(dev) = self.device.as_mut() else {
-            return Err(Some(if row.is_none() { NO_DSET } else { NO_LIST }));
+            return ScanAdd::Done(Err(Some(if row.is_none() { NO_DSET } else { NO_LIST })));
         };
+        if dev.lends_held() {
+            return ScanAdd::Owed;
+        }
         let added = dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Add);
         let posts = dev.take_device_posts();
         self.post_device_values(posts);
+        ScanAdd::Done(self.scan_add_after(added))
+    }
+
+    /// [`Self::scan_add_io_intr`] past `get_ioint_info(0)`, whose answer
+    /// `added` is.
+    pub(crate) fn scan_add_after(&mut self, added: bool) -> Result<(), Option<&'static str>> {
         if !added {
             return Err(None);
         }
@@ -10298,7 +10519,7 @@ impl RecordInstance {
     /// value moves — C calls it from `special(SPC_MOD)` pass 0 (before the put)
     /// and from `recGblGetSimm`/`recGblInitSimm` before the SIML read. The
     /// `sscn == 65535` guard is C's: with SSCN unset there is no scan to swap
-    /// to, so the latch is not even taken (and [`Self::rec_gbl_check_simm`]
+    /// to, so the latch is not even taken (and `rec_gbl_check_simm`
     /// bails on the same test, so the stale OLDSIMM is never read).
     ///
     /// A record type with no SSCN/OLDSIMM in its C dbd (`busy`, `swait`) passes
@@ -10341,26 +10562,28 @@ impl RecordInstance {
     ///
     /// **The only writer of the SIMM-driven SCAN/SSCN swap.** The scan-list
     /// move itself goes through the single SCAN owner [`Self::set_scan`], whose
-    /// [`CommonFieldPutResult`] the caller hands to
-    /// `PvDatabase::update_scan_index` once the record lock is down. Runs AFTER
-    /// the SIMM value moved — C `special(SPC_MOD)` pass 1, and the tail of
+    /// [`ScanMove`] the caller settles and hands to
+    /// `PvDatabase::update_scan_index` once the record lock is down. C posts
+    /// no SCAN here (recGbl.c:427-437). Runs AFTER the SIMM value moved — C
+    /// `special(SPC_MOD)` pass 1, and the tail of
     /// `recGblGetSimm`/`recGblInitSimm`.
-    pub fn rec_gbl_check_simm(&mut self) -> CommonFieldPutResult {
+    pub(crate) fn rec_gbl_check_simm(&mut self) -> ScanMove {
+        const UNMOVED: ScanMove = ScanMove::Done(CommonFieldPutResult::NoChange);
         let Some(sim_scan) = self.common.sscn.scan() else {
             // `*psscn == USHRT_MAX` — SSCN unset, no swap. An SSCN that is
             // merely ILLEGAL still swaps: C assigns it into SCAN and `scanAdd`
             // then declines to scan the record. Asked before the helpers
             // question, which is a virtual call and a name match.
-            return CommonFieldPutResult::NoChange;
+            return UNMOVED;
         };
         if !self.record.uses_recgbl_simm_helpers() {
-            return CommonFieldPutResult::NoChange;
+            return UNMOVED;
         }
         let Some(simm) = self.record.simm_value() else {
-            return CommonFieldPutResult::NoChange;
+            return UNMOVED;
         };
         if simm == self.common.oldsimm {
-            return CommonFieldPutResult::NoChange;
+            return UNMOVED;
         }
         let previous_scan = self.common.scan;
         let result = self.set_scan(sim_scan);
@@ -10458,9 +10681,11 @@ impl RecordInstance {
                 self.gate_device_link_put(link)?;
             }
         }
-        let put = self.put_common_field_with(name, value, bound, &mut link);
+        let put = self
+            .put_common_field_with(name, value, bound, &mut link)
+            .map(|moved| moved.unlent(self));
         let scan = match link.as_mut() {
-            Some(link) => self.take_link_scan(link),
+            Some(link) => self.take_link_scan(link).unlent(self),
             None => CommonFieldPutResult::NoChange,
         };
         match put {
@@ -10477,7 +10702,7 @@ impl RecordInstance {
         name: &str,
         value: EpicsValue,
         link: &mut Option<PreparedCommonLink>,
-    ) -> CaResult<CommonFieldPutResult> {
+    ) -> CaResult<ScanMove> {
         self.put_common_field_with(name, value, MenuBound::DbPut, link)
     }
 
@@ -10487,7 +10712,7 @@ impl RecordInstance {
         name: &str,
         value: EpicsValue,
         link: &mut Option<PreparedCommonLink>,
-    ) -> CaResult<CommonFieldPutResult> {
+    ) -> CaResult<ScanMove> {
         self.put_common_field_with(name, value, MenuBound::DbLoad, link)
     }
 
@@ -10630,6 +10855,7 @@ impl RecordInstance {
             };
         };
         if self.common.scan == ScanType::IoIntr {
+            // Leaving I/O Intr owes no `scanAdd`.
             let _ = self.set_scan(ScanType::Passive);
             prepared.left_io_intr = true;
         }
@@ -10645,35 +10871,46 @@ impl RecordInstance {
     /// C `dbPutFieldLink`'s `restoreScan` and `postScanEvent` exits
     /// (`dbAccess.c:1218-1225`) for a put whose `scanDelete` ran. `restore`
     /// is `scanAdd` with the dset now bound, whose refusal leaves the record
-    /// Passive; a record that ends off I/O Intr posts SCAN and leaves the
-    /// move for [`Self::take_link_scan`].
+    /// Passive; the move is left for [`Self::take_link_scan`], and an owed
+    /// `scanAdd` with it.
     fn finish_link_scan(&mut self, prepared: &mut link_cache::PreparedDevice, restore: bool) {
         if !std::mem::take(&mut prepared.left_io_intr) {
             return;
         }
         if restore {
-            let _ = self.set_scan(ScanType::IoIntr);
+            if let moved @ ScanMove::AddOwed { .. } = self.set_scan(ScanType::IoIntr) {
+                prepared.scan_moved = LinkScanMove::RestoreOwed(moved);
+                return;
+            }
         }
-        if self.common.scan != ScanType::IoIntr {
-            prepared.scan_moved = CommonFieldPutResult::ScanChanged {
-                old_scan: ScanType::IoIntr,
-                new_scan: self.common.scan,
-                phas: self.common.phas,
-            };
-            use crate::server::recgbl::EventMask;
-            self.notify_field("SCAN", EventMask::VALUE | EventMask::LOG);
+        prepared.scan_moved = LinkScanMove::Done(self.post_scan_event());
+    }
+
+    /// `postScanEvent` (`dbAccess.c:1231-1232`): a record that ends off I/O
+    /// Intr posts SCAN, and the move is the put's.
+    pub(crate) fn post_scan_event(&mut self) -> CommonFieldPutResult {
+        if self.common.scan == ScanType::IoIntr {
+            return CommonFieldPutResult::NoChange;
+        }
+        use crate::server::recgbl::EventMask;
+        self.notify_field("SCAN", EventMask::VALUE | EventMask::LOG);
+        CommonFieldPutResult::ScanChanged {
+            old_scan: ScanType::IoIntr,
+            new_scan: self.common.scan,
+            phas: self.common.phas,
         }
     }
 
-    /// The scan-list move a device-link put leaves, for the caller to file
-    /// once the hold is down. An exit no arm settled is a failure's
+    /// The scan-list move a device-link put leaves, for the caller to settle
+    /// and file once the hold is down. An exit no arm settled is a failure's
     /// `postScanEvent`: the record stays Passive.
-    pub(crate) fn take_link_scan(&mut self, link: &mut PreparedCommonLink) -> CommonFieldPutResult {
+    pub(crate) fn take_link_scan(&mut self, link: &mut PreparedCommonLink) -> LinkScanMove {
+        const UNMOVED: LinkScanMove = LinkScanMove::Done(CommonFieldPutResult::NoChange);
         let Some(prepared) = link.device.as_mut() else {
-            return CommonFieldPutResult::NoChange;
+            return UNMOVED;
         };
         self.finish_link_scan(prepared, false);
-        std::mem::replace(&mut prepared.scan_moved, CommonFieldPutResult::NoChange)
+        std::mem::replace(&mut prepared.scan_moved, UNMOVED)
     }
 
     /// A device-link put refused by `dbPutSpecial`'s SPC_NOMOD, which C
@@ -10712,26 +10949,45 @@ impl RecordInstance {
 
     /// C `dbPutFieldLink` on a link field that is not a device link
     /// (`dbAccess.c:1168-1174`): `Some(slot)` for a field with a link slot,
-    /// and a link an earlier refused put removed fails `dbLinkIsDefined`
-    /// with `S_db_badHWaddr`, silently.
+    /// and a link with no lset — a hardware link, one an earlier refused put
+    /// removed, or one its `openLink` left so — fails `dbLinkIsDefined` with
+    /// `S_db_badHWaddr`, silently. Read from [`Self::stored_link`], as
+    /// [`Self::link_unadded`] is, so FLNK, TSEL and SDIS are covered.
     pub(crate) fn link_put_slot(&self, field: &str) -> CaResult<Option<usize>> {
-        let Some(i) = self.link_slots.position(field) else {
-            return Ok(None);
-        };
-        if self.link_slots.is_removed(i) {
+        if self
+            .stored_link(field)
+            .is_some_and(crate::server::recgbl::simm::has_no_lset)
+            && let Some(desc) = self.field_desc(field)
+        {
             return Err(CaError::BadLink(crate::error::LinkRefusal::new(
-                crate::error::LinkWhy::NotDefined(self.link_slots.field(i)),
+                crate::error::LinkWhy::NotDefined(desc.name),
             )));
         }
-        Ok(Some(i))
+        Ok(self.link_slots.position(field))
     }
 
     /// C `dbRemoveLink` on [`Self::link_put_slot`]'s slot: run before
     /// `dbPutSpecial(paddr, 0)` refuses an `SPC_NOMOD` field, and the error
     /// path does not restore it, so aSub's SUBL reads nothing afterwards.
     pub(crate) fn remove_link_slot(&mut self, i: usize) {
-        self.invalidate_plan_for(self.link_slots.field(i));
+        let field = self.link_slots.field(i);
+        self.invalidate_plan_for(field);
         self.link_slots.remove(i);
+        self.forget_input_entry(field);
+    }
+
+    /// Drop `field`'s [`Self::parsed_inputs`] entry after its slot was
+    /// written, so the next read takes the slot's new parse.
+    fn forget_input_entry(&mut self, field: &str) {
+        if let Some(i) = self
+            .record
+            .multi_input_links()
+            .iter()
+            .position(|(f, _)| *f == field)
+            && let Some(entry) = self.parsed_inputs.get_mut(i)
+        {
+            *entry = None;
+        }
     }
 
     /// An `openLink` that left `field`'s link with no lset
@@ -10744,7 +11000,9 @@ impl RecordInstance {
         let Some(old) = self.stored_link_shared(field).cloned() else {
             return;
         };
-        let mut removed = link_cache::removed(&old);
+        let Some(mut removed) = link_cache::removed(&old) else {
+            return;
+        };
         if let Some(i) = self.link_slots.position(field) {
             self.link_slots.remove(i);
         }
@@ -10773,7 +11031,7 @@ impl RecordInstance {
         value: EpicsValue,
         bound: MenuBound,
         link: &mut Option<PreparedCommonLink>,
-    ) -> CaResult<CommonFieldPutResult> {
+    ) -> CaResult<ScanMove> {
         // The put entries hand the declared spelling already; only another
         // spelling allocates, under the caller's hold.
         let name = upper_field(name);
@@ -10800,7 +11058,7 @@ impl RecordInstance {
             // C's converter returned success without storing (`cvt_st_ul`'s
             // skipped store): the field keeps its old value, so no arm below
             // runs and no SCAN/PHAS transition happened.
-            Converted::Unchanged => return Ok(CommonFieldPutResult::NoChange),
+            Converted::Unchanged => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
         };
         // C `dbPutString`/`dbPutField` route every link field's text through
         // `dbParseLink`, whose brace arm hands it to `dbJLinkParse`
@@ -10873,7 +11131,7 @@ impl RecordInstance {
             "ACKT" => match value {
                 EpicsValue::Char(v) => self.common.ackt = v != 0,
                 EpicsValue::Short(v) => self.common.ackt = v != 0,
-                _ => return Ok(CommonFieldPutResult::NoChange),
+                _ => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
             },
             "UDF" => {
                 // Store the raw put byte (C keeps the epicsUInt8 verbatim); a
@@ -10896,20 +11154,23 @@ impl RecordInstance {
                 let new_scan = match &value {
                     EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
                     EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    _ => return Ok(CommonFieldPutResult::NoChange),
+                    _ => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
                 };
-                let result = self.set_scan(new_scan);
-                if !matches!(result, CommonFieldPutResult::NoChange) {
+                let moved = self.set_scan(new_scan);
+                if !matches!(moved, ScanMove::Done(CommonFieldPutResult::NoChange)) {
                     self.record.on_put(&name);
-                    self.record.special(&name, true, &self.common)?;
-                    return Ok(result);
+                    if let Err(e) = self.record.special(&name, true, &self.common) {
+                        let _ = moved.unlent(self);
+                        return Err(e);
+                    }
+                    return Ok(moved);
                 }
             }
             "SSCN" => {
                 let new_sscn = match &value {
                     EpicsValue::Short(v) => SimModeScan::from_u16(*v as u16),
                     EpicsValue::Enum(v) => SimModeScan::from_u16(*v),
-                    _ => return Ok(CommonFieldPutResult::NoChange),
+                    _ => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
                 };
                 self.common.sscn = new_sscn;
             }
@@ -10929,7 +11190,7 @@ impl RecordInstance {
                     EpicsValue::Short(v) => *v,
                     EpicsValue::Char(v) => *v as i16,
                     EpicsValue::Enum(v) => *v as i16,
-                    _ => return Ok(CommonFieldPutResult::NoChange),
+                    _ => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
                 };
             }
             "TPRO" => {
@@ -11016,10 +11277,10 @@ impl RecordInstance {
                 EpicsValue::Enum(i) => {
                     match super::device_menu_choices(self.record.record_type()).nth(i as usize) {
                         Some(choice) => self.common.dtyp.set_menu_name(choice),
-                        None => return Ok(CommonFieldPutResult::NoChange),
+                        None => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
                     }
                 }
-                _ => return Ok(CommonFieldPutResult::NoChange),
+                _ => return Ok(ScanMove::Done(CommonFieldPutResult::NoChange)),
             },
             "TSE" => {
                 if let EpicsValue::Short(v) = value {
@@ -11088,11 +11349,11 @@ impl RecordInstance {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
                         self.record.special(&name, true, &self.common)?;
-                        return Ok(CommonFieldPutResult::PhasChanged {
+                        return Ok(ScanMove::Done(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
                             new_phas: v,
-                        });
+                        }));
                     }
                 }
             }
@@ -11194,7 +11455,7 @@ impl RecordInstance {
             "HIHI" | "HIGH" | "LOW" | "LOLO" | "HHSV" | "HSV" | "LSV" | "LLSV"
                 if self.common.analog_alarm.is_none() =>
             {
-                return self.put_declared_override(&name, value);
+                return self.put_declared_override(&name, value).map(ScanMove::Done);
             }
             "HIHI" => {
                 if let (Some(v), Some(a)) = (
@@ -11274,7 +11535,7 @@ impl RecordInstance {
             // reflects it. `put_declared_override` still returns
             // `unknown_field_error` for a name with no `dbFldDes`, so a
             // misspelled field is refused exactly as before.
-            _ => return self.put_declared_override(&name, value),
+            _ => return self.put_declared_override(&name, value).map(ScanMove::Done),
         }
         self.record.on_put(&name);
         // C `dbPut` (dbAccess.c:1399-1405) returns the after-put
@@ -11288,7 +11549,7 @@ impl RecordInstance {
             }
             _ => special?,
         }
-        Ok(CommonFieldPutResult::NoChange)
+        Ok(ScanMove::Done(CommonFieldPutResult::NoChange))
     }
 
     /// The error C reports for a write to a field name that
@@ -11383,6 +11644,7 @@ impl RecordInstance {
                     (self.link_slots.position(desc.name), &coerced)
                 {
                     self.link_slots.install_text(i, desc, text.as_bytes());
+                    self.forget_input_entry(desc.name);
                 }
                 self.cold
                     .declared_overrides
@@ -14037,7 +14299,8 @@ mod device_menu_marking_tests {
             EpicsValue::String("Raw Soft Channel".into()),
         ] {
             inst.common.dtyp.set_name("Soft Channel");
-            inst.put_common_field_prepared("DTYP", value, &mut None)
+            let _ = inst
+                .put_common_field_prepared("DTYP", value, &mut None)
                 .unwrap();
             assert!(matches!(
                 inst.common.dtyp.shared_name(),
@@ -14051,7 +14314,7 @@ mod device_menu_marking_tests {
         let mut inst = RecordInstance::new("X", AiRecord::default());
         inst.common.dtyp = "asynInt32".into();
         assert!(!inst.init_record_reaches_body());
-        inst.run_init_pass0("X");
+        let _ = inst.run_init_pass0("X");
         inst.common.dtyp.set_name("Soft Channel");
         assert_eq!(inst.common.dtyp.soft(), None);
     }

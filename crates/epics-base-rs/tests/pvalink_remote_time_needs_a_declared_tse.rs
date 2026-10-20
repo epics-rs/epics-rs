@@ -22,7 +22,7 @@ use epics_base_rs::types::WallTime;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -31,22 +31,23 @@ const REMOTE_SECS: i64 = 4_100_000;
 const REMOTE_NSEC: i32 = 246_802_468;
 const REMOTE_UTAG: u64 = 0x5A5A_0001;
 
-/// Stub `pva` lset with the `time=true` option on: it answers `time_stamp`,
-/// which is the whole gate — the real lset returns `None` without the option.
+/// Stub `pva` lset with the `time=true` option on: it answers
+/// `read_time_stamp`, which is the whole gate — the real lset returns `None`
+/// without the option.
 struct TimedLset;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for TimedLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         Some(EpicsValue::Double(3.0))
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    fn time_stamp(&self, _: &[u8]) -> Option<(i64, i32, u64)> {
+    fn read_time_stamp(&self, _: LinkRef<'_>) -> Option<(i64, i32, u64)> {
         Some((REMOTE_SECS, REMOTE_NSEC, REMOTE_UTAG))
     }
 }

@@ -794,19 +794,28 @@ pub enum ParamSetValue {
         /// interruptMask)`); `0` for a plain value set.
         interrupt_mask: u32,
     },
-    /// C `setParamStatus` / `setParamAlarmStatus` / `setParamAlarmSeverity`
-    /// from a background thread — the alarm-push half of the C pattern
-    /// `lock(); setParamStatus(..); callParamCallbacks(); unlock()`. The
-    /// value is untouched; a status/alarm transition alone marks the param
-    /// changed so the flush delivers it (paramVal.cpp:71-78,84-91,97-104),
-    /// and the devEpics fill-in maps a non-Success `status` to the EPICS alarm
-    /// (asynDisconnected → COMM/INVALID) when `alarm_status`/`alarm_severity`
-    /// are left 0 (asynEpicsUtils.c:238-265).
+    /// C `setParamStatus` from a background thread — the alarm-push half of
+    /// the C pattern `lock(); setParamStatus(..); callParamCallbacks();
+    /// unlock()`. The value is untouched; a status transition alone marks
+    /// the param changed so the flush delivers it (paramVal.cpp:71-78), and
+    /// the devEpics fill-in maps a non-Success `status` to the EPICS alarm
+    /// (asynDisconnected → COMM/INVALID) while the alarm pair is 0
+    /// (asynEpicsUtils.c:238-265).
     Status {
         reason: usize,
         addr: i32,
         status: AsynStatus,
+    },
+    /// C `setParamAlarmStatus` (paramVal.cpp:84-91).
+    AlarmStatus {
+        reason: usize,
+        addr: i32,
         alarm_status: u16,
+    },
+    /// C `setParamAlarmSeverity` (paramVal.cpp:97-104).
+    AlarmSeverity {
+        reason: usize,
+        addr: i32,
         alarm_severity: u16,
     },
 }
@@ -839,22 +848,30 @@ impl ParamSetValue {
         }
     }
 
-    /// C `setParamStatus(list, index, status)` plus the alarm pair: set the
-    /// transport status and EPICS alarm without touching the value. Pass
-    /// `alarm_status`/`alarm_severity` 0 to let the record-side fill-in map
-    /// `status` itself (the C-normal path).
-    pub fn status(
-        reason: usize,
-        addr: i32,
-        status: AsynStatus,
-        alarm_status: u16,
-        alarm_severity: u16,
-    ) -> Self {
+    /// C `setParamStatus(list, index, status)`: the transport status alone,
+    /// value untouched.
+    pub fn status(reason: usize, addr: i32, status: AsynStatus) -> Self {
         Self::Status {
             reason,
             addr,
             status,
+        }
+    }
+
+    /// C `setParamAlarmStatus(list, index, alarmStatus)`.
+    pub fn alarm_status(reason: usize, addr: i32, alarm_status: u16) -> Self {
+        Self::AlarmStatus {
+            reason,
+            addr,
             alarm_status,
+        }
+    }
+
+    /// C `setParamAlarmSeverity(list, index, alarmSeverity)`.
+    pub fn alarm_severity(reason: usize, addr: i32, alarm_severity: u16) -> Self {
+        Self::AlarmSeverity {
+            reason,
+            addr,
             alarm_severity,
         }
     }
@@ -865,7 +882,9 @@ impl ParamSetValue {
         match self {
             Self::Value { addr, .. }
             | Self::UInt32Digital { addr, .. }
-            | Self::Status { addr, .. } => *addr,
+            | Self::Status { addr, .. }
+            | Self::AlarmStatus { addr, .. }
+            | Self::AlarmSeverity { addr, .. } => *addr,
         }
     }
 }
@@ -986,6 +1005,12 @@ impl OctetRead {
     /// C `*nbytesTransferred`, before [`Self::taken_back`].
     pub fn nbytes_transferred(&self) -> usize {
         self.data.len()
+    }
+
+    /// This read, failed with `e` — the bytes, eom and take-back it made kept.
+    pub(crate) fn failing(mut self, e: AsynError) -> Self {
+        self.status = Err(e);
+        self
     }
 
     /// Tag a failure with the octet step it came from.
@@ -1434,15 +1459,6 @@ pub struct RequestResult {
     pub alarm_severity: u16,
     /// Timestamp from the driver param store (populated on reads).
     pub timestamp: Option<SystemTime>,
-    /// Device read auxiliary status (C `pasynUser->auxStatus`), populated on
-    /// reads from the param store alongside the value. Distinct from
-    /// [`Self::status`] (the request/op outcome that drives an `Err`/Error
-    /// reply): a read OP can succeed and return a value while `aux_status`
-    /// flags that value invalid. Device support gates the value store on this —
-    /// C `processAi` stores the value only when `result.status == asynSuccess`
-    /// and otherwise returns -1 keeping the prior value (devAsynInt32.c:848-855)
-    /// — the same way the I/O Intr ring gates on `CachedInterrupt.aux_status`.
-    pub aux_status: AsynStatus,
     /// Option value string (from GetOption).
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
@@ -1477,7 +1493,6 @@ impl RequestResult {
             alarm_status: 0,
             alarm_severity: 0,
             timestamp: None,
-            aux_status: AsynStatus::Success,
             option_value: None,
             bounds: None,
             dp: None,

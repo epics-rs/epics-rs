@@ -1,7 +1,7 @@
 //! [`ServerInfoSource`] — the built-in `__server` diagnostic source.
 //!
-//! Mirrors pvxs `ServerSource` (`serversource.cpp`). pvxs registers a
-//! single internal source at `(order = -1, "__server")` (src/server.cpp:542-547),
+//! Mirrors pvxs `ServerSource` (`serversource.cpp`). pvxs registers it
+//! at `(order = -1, "__server")` (src/server.cpp:542-547),
 //! consulted BEFORE default-order user sources since the lowest order is
 //! called first (server.h:108-118), that exposes one special PV
 //! named `server`. That PV answers RPC only — pvxs `ServerSource::onCreate`
@@ -50,6 +50,7 @@ use crate::pvdata::{
     FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, TypedScalarArray,
 };
 
+use super::SharedSource;
 use super::source::{ChannelSource, OpError};
 
 /// Canonical PV name the built-in source answers. pvxs `ServerSource`
@@ -71,20 +72,25 @@ const NO_SUCH_FIELD: &str = "No such field";
 /// `__` marks it internal (pvxs convention, see `composite.rs`).
 pub const SERVER_SOURCE_NAME: &str = "__server";
 
+/// Source name of the server's own [`SharedSource`], pvxs's
+/// `Server::Pvt::builtinsrc` (`serverconn.h:265`): the store `Server::addPV`
+/// and `removePV` write (`src/server.cpp:174-191`), registered at order -1
+/// beside [`SERVER_SOURCE_NAME`].
+pub const BUILTIN_SOURCE_NAME: &str = "__builtin";
+
+/// pvxs's own sources in registry order, both at order -1: what its
+/// `Server::Pvt` constructor inserts (`src/server.cpp:542-547`).
+pub(crate) const INTERNAL_SOURCES: [&str; 2] = [BUILTIN_SOURCE_NAME, SERVER_SOURCE_NAME];
+
 /// Source name under which the hand-in user source is registered.
 ///
-/// NOT pvxs's `"__builtin"`. That key belongs to `Server::Pvt::builtinsrc`
-/// (`serverconn.h:265`), a source the *server* owns and only
-/// `Server::addPV` writes into (`src/server.cpp:174-181`); an application never
-/// hands one in. `PvaServer::start` takes the application's own
-/// source, which is pvxs's `Server::addSource(name, src, order)` shape, and
-/// that defaults to order 0 (`pvxs/server.h:116-118`) — behind both
-/// internals. epics-rs has no `addPV` equivalent, so nothing occupies
-/// `(-1, "__builtin")` and claiming that key for a hand-in source would put
-/// an application source in the band pvxs reserves for its own.
+/// `PvaServer::start` takes the application's own source, which is pvxs's
+/// `Server::addSource(name, src, order)` shape, and that defaults to order 0
+/// (`pvxs/server.h:116-118`) — behind both internals.
 pub const USER_SOURCE_NAME: &str = "__user";
 
-/// Wrap a user source in the composite every PVA server must serve from.
+/// Wrap a user source and the bound server's `__builtin` store in the
+/// composite every PVA server must serve from.
 ///
 /// # Why this is a function and not two call sites
 ///
@@ -125,32 +131,39 @@ pub const USER_SOURCE_NAME: &str = "__user";
 /// (`serversource.cpp:30-33`) before the order-0 source is consulted. Since
 /// `pvxlist` reaches the facility by RPC-ing that same channel name
 /// (`tools/list.cpp:159-161`), letting a user PV win the name is exactly
-/// what takes `pvxlist` and `pvxinfo` off the air. Only pvxs's own
-/// `addPV`-backed `builtinsrc` outranks the diagnostic, and epics-rs has no
-/// `addPV`. Every name other than `server` falls through to the user
-/// source, because the built-in source claims nothing else.
+/// what takes `pvxlist` and `pvxinfo` off the air. Only the `__builtin`
+/// store outranks the diagnostic, by name at the same order. Every name
+/// other than `server` falls through to the user source, because the
+/// built-in source claims nothing else.
 ///
-/// The channel lister enumerates the **user** source directly rather than the
-/// composite. Going through the composite would also include the built-in
-/// source; that is harmless because its `list_pvs` is empty, but naming the
-/// user half keeps the intent explicit.
+/// The channel lister enumerates the user source and `__builtin`, every
+/// source with names, as pvxs's `op=channels` walks every source's `onList`
+/// (`serversource.cpp:55-69`).
+///
+/// `builtin` comes from the bind and not from here: pvxs's constructor
+/// creates it (`server.cpp:542`), so `Server::addPV` lands before `start`.
 ///
 /// # Errors
 ///
 /// Only if a `(name, order)` pair is already registered, which a freshly
 /// created composite cannot have. Returned rather than asserted so the two
 /// callers keep their own error prefixes.
-pub fn compose_with_server_info(user_source: super::DynSource) -> Result<super::DynSource, String> {
+pub fn compose_with_server_info(
+    user_source: super::DynSource,
+    builtin: Arc<SharedSource>,
+) -> Result<super::DynSource, String> {
     let server_info = Arc::new(ServerInfoSource::new({
-        let user_source = user_source.clone();
+        let (user_source, builtin) = (user_source.clone(), builtin.clone());
         move || {
-            let user_source = user_source.clone();
-            async move { user_source.list_pvs().await }
+            let mut names = user_source.list_pvs();
+            names.extend(builtin.list_pvs());
+            names
         }
     }));
 
     let composite = super::CompositeSource::new();
     composite.add_uncounted(USER_SOURCE_NAME, user_source, 0)?;
+    composite.add_uncounted(BUILTIN_SOURCE_NAME, builtin as super::DynSource, -1)?;
     composite.add_uncounted(SERVER_SOURCE_NAME, server_info as super::DynSource, -1)?;
     Ok(composite as super::DynSource)
 }
@@ -167,10 +180,8 @@ pub struct ServerInfoSource {
     channel_lister: Arc<ChannelLister>,
 }
 
-/// Async closure type for [`ServerInfoSource`]'s channel enumeration.
-type ChannelLister = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send>>
-    + Send
-    + Sync;
+/// Closure type for [`ServerInfoSource`]'s channel enumeration.
+type ChannelLister = dyn Fn() -> Vec<RecordName> + Send + Sync;
 
 impl ServerInfoSource {
     /// Build the built-in source.
@@ -178,13 +189,9 @@ impl ServerInfoSource {
     /// `channel_lister` returns the union of every user source's PV
     /// names — `runtime.rs` passes a closure over the user-source
     /// `CompositeSource`.
-    pub fn new<F, Fut>(channel_lister: F) -> Self
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Vec<RecordName>> + Send + 'static,
-    {
+    pub fn new(channel_lister: impl Fn() -> Vec<RecordName> + Send + Sync + 'static) -> Self {
         Self {
-            channel_lister: Arc::new(move || Box::pin(channel_lister())),
+            channel_lister: Arc::new(channel_lister),
         }
     }
 
@@ -333,7 +340,7 @@ impl ChannelSource for ServerInfoSource {
     /// not appear in its own channel list. Keeping this empty means
     /// `op=channels` reports only user PVs and beacons never advertise
     /// `server`.
-    async fn list_pvs(&self) -> Vec<RecordName> {
+    fn list_pvs(&self) -> Vec<RecordName> {
         Vec::new()
     }
 
@@ -429,7 +436,7 @@ impl ChannelSource for ServerInfoSource {
                 Self::extract_op(&request_value).ok_or_else(|| OpError::failed(NO_SUCH_FIELD))?;
             match op.as_str() {
                 "channels" => {
-                    let mut names = (this.channel_lister)().await;
+                    let mut names = (this.channel_lister)();
                     names.sort();
                     names.dedup();
                     Ok((Self::channels_descriptor(), Self::channels_value(names)).into())
@@ -484,11 +491,10 @@ mod tests {
 
     fn source_with(channels: Vec<String>) -> ServerInfoSource {
         ServerInfoSource::new(move || {
-            let c = channels
+            channels
                 .iter()
                 .map(|n| RecordName::from(n.as_str()))
-                .collect();
-            async move { c }
+                .collect()
         })
     }
 
@@ -502,7 +508,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn list_pvs_is_empty_so_server_never_self_lists() {
         let src = source_with(vec!["user:pv".into()]);
-        assert!(src.list_pvs().await.is_empty());
+        assert!(src.list_pvs().is_empty());
     }
 
     #[epics_macros_rs::epics_test]
@@ -560,6 +566,32 @@ mod tests {
             names,
             vec!["a:pv".to_string(), "m:pv".to_string(), "z:pv".to_string()]
         );
+    }
+
+    /// pvxs `op=channels` names the `addPV` store's PVs beside the user
+    /// source's (`serversource.cpp:55-69`).
+    #[epics_macros_rs::epics_test]
+    async fn rpc_channels_lists_the_builtin_store() {
+        let user = Arc::new(SharedSource::new());
+        user.add("u:pv", super::super::SharedPV::new());
+        let builtin = Arc::new(SharedSource::new());
+        let composed = compose_with_server_info(user, builtin.clone()).unwrap();
+        builtin.add("b:pv", super::super::SharedPV::new());
+        let (desc, value) = nturi_op("channels");
+        let (_, resp) = composed
+            .rpc(b"server", desc, value)
+            .await
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
+        let PvField::Structure(s) = resp else {
+            panic!("unexpected channels wrapper: {resp:?}")
+        };
+        let Some(PvField::ScalarArrayTyped(TypedScalarArray::String(names))) = s.get_field("value")
+        else {
+            panic!("unexpected channels value: {s:?}")
+        };
+        assert_eq!(names.to_vec(), ["b:pv".to_string(), "u:pv".to_string()]);
     }
 
     #[epics_macros_rs::epics_test]

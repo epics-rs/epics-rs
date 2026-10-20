@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::calc::engine::cvt::fmt_f;
 use epics_base_rs::server::database::PvDatabase;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::alloc_origin;
 use crate::snl::kohzu_ctl::{HC, update_set};
@@ -41,7 +41,6 @@ pub struct MlMonoConfig {
     pub m_y: String,
     pub m_z: String,
     pub y_offset: f64,
-    pub geom: i32,
 }
 
 impl MlMonoConfig {
@@ -52,7 +51,6 @@ impl MlMonoConfig {
         m_y: &str,
         m_z: &str,
         y_offset: f64,
-        geom: i32,
     ) -> Self {
         // initSequence (ml_monoCtl.st:588-590).
         let y_offset = if (y_offset < 1.0) || (y_offset > 60.0) {
@@ -67,7 +65,6 @@ impl MlMonoConfig {
             m_y: m_y.to_string(),
             m_z: m_z.to_string(),
             y_offset,
-            geom,
         }
     }
 
@@ -85,7 +82,7 @@ pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, String) {
     let result = (2.0 * d) / order;
     let op_alert = order < 1.0;
     let msg = if op_alert {
-        format!("Order == {}?", fmt_f(order, 6))
+        format!("Order == {}?", CFloat(order))
     } else {
         "New effective d spacing".to_string()
     };
@@ -631,7 +628,7 @@ impl MlMono {
                 if v.test_and_clear(Y_OFFSET) && self.init_seq_done {
                     ctl_debug!(v, "ml_monoCtl:waitForCmnd:yOffset_mon");
                     v.set(AUTO_MODE, 0.0).await;
-                    let msg = format!("y offset changed to {}", fmt_f(v.get(Y_OFFSET), 6));
+                    let msg = format!("y offset changed to {}", CFloat(v.get(Y_OFFSET)));
                     self.msg1(&msg).await;
                     self.msg2("Set to Manual Mode").await;
                     return Some(State::CalcMovements);
@@ -1065,7 +1062,7 @@ mod tests {
 
     #[test]
     fn config_pv_names() {
-        let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 35.0, 1);
+        let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 35.0);
         assert_eq!(cfg.pv("E"), "xxx:ml_monoE");
         assert_eq!(cfg.motor_pv("m9", ".RBV"), "xxx:m9.RBV");
         assert_eq!(table(&cfg).len(), N_VARS);
@@ -1074,7 +1071,7 @@ mod tests {
     #[test]
     fn y_offset_outside_1_to_60_is_35() {
         for (y, want) in [(0.5, 35.0), (1.0, 1.0), (60.0, 60.0), (100.0, 35.0)] {
-            let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", y, 1);
+            let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", y);
             assert_eq!(cfg.y_offset, want, "Y_OFF {y}");
         }
     }

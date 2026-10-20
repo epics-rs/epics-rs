@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
@@ -302,7 +302,9 @@ impl MagickWriter {
 }
 
 impl NDFileWriter for MagickWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
+        // NDFileMagick.cpp:35-38
+        mode.refuse_read_or_append("NDFileMagick")?;
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -367,74 +369,11 @@ impl NDFileWriter for MagickWriter {
         Ok(())
     }
 
+    /// C `readFile` returns asynError (NDFileMagick.cpp:163-168).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let img = image::open(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("Magick read error: {e}")))?;
-
-        let width = img.width() as usize;
-        let height = img.height() as usize;
-
-        match img {
-            DynamicImage::ImageLuma8(buf) => {
-                let mut arr = NDArray::new(
-                    vec![NDDimension::new(width), NDDimension::new(height)],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageRgb8(buf) => {
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageLuma16(buf) => {
-                let mut arr = NDArray::new(
-                    vec![NDDimension::new(width), NDDimension::new(height)],
-                    NDDataType::UInt16,
-                );
-                arr.data = NDDataBuffer::U16(buf.into_raw());
-                Ok(arr)
-            }
-            DynamicImage::ImageRgb16(buf) => {
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt16,
-                );
-                arr.data = NDDataBuffer::U16(buf.into_raw());
-                Ok(arr)
-            }
-            other => {
-                // Convert anything else to RGB8
-                let rgb = other.to_rgb8();
-                let mut arr = NDArray::new(
-                    vec![
-                        NDDimension::new(3),
-                        NDDimension::new(width),
-                        NDDimension::new(height),
-                    ],
-                    NDDataType::UInt8,
-                );
-                arr.data = NDDataBuffer::U8(rgb.into_raw());
-                Ok(arr)
-            }
-        }
+        Err(ADError::UnsupportedConversion(
+            "NDFileMagick cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -561,6 +500,7 @@ impl NDPluginProcess for MagickFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::{NDDataType, NDDimension};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -593,6 +533,28 @@ mod tests {
         ))
     }
 
+    /// C `openFile` refuses NDFileModeRead (NDFileMagick.cpp:35), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("png");
+        let mut writer = MagickWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = MagickFileProcessor::new();
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// R8-75, Magick writer: same defect as the cited TIFF site. C sets
     /// `this->colorMode = NDColorModeMono` (NDFileMagick.cpp:41) and overwrites it
     /// only from the attribute (:44-45); each 3-D branch requires the attribute
@@ -614,7 +576,7 @@ mod tests {
         let path = temp_path("png");
         let mut writer = MagickWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -644,7 +606,7 @@ mod tests {
         let path = temp_path("png");
         let mut writer = MagickWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
@@ -708,16 +670,18 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        }
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::L8);
+        let NDDataBuffer::U8(orig) = &arr.data else {
+            unreachable!()
+        };
+        assert_eq!(read_back.as_bytes(), &orig[..]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -736,16 +700,18 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt16);
-        if let (NDDataBuffer::U16(orig), NDDataBuffer::U16(read)) = (&arr.data, &read_back.data) {
-            assert_eq!(orig, read);
-        }
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::L16);
+        let NDDataBuffer::U16(orig) = &arr.data else {
+            unreachable!()
+        };
+        assert_eq!(read_back.into_luma16().into_raw(), *orig);
         std::fs::remove_file(&path).ok();
     }
 
@@ -776,14 +742,15 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.dims.len(), 3);
-        assert_eq!(read_back.dims[0].size, 3);
-
         writer.close_file().unwrap();
+
+        let read_back = image::open(&path).unwrap();
+        assert_eq!(read_back.color(), image::ColorType::Rgb8);
+        assert_eq!((read_back.width(), read_back.height()), (4, 4));
         std::fs::remove_file(&path).ok();
     }
 
@@ -858,7 +825,7 @@ mod tests {
         let mut w_none = MagickWriter::new();
         w_none.set_compress_type(0); // None
         w_none
-            .open_file(&path_none, NDFileMode::Single, &arr)
+            .open_file(&path_none, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         w_none.write_file(&Arc::new(arr.clone())).unwrap();
         w_none.close_file().unwrap();
@@ -867,7 +834,7 @@ mod tests {
         let mut w_zip = MagickWriter::new();
         w_zip.set_compress_type(7); // Zip
         w_zip
-            .open_file(&path_zip, NDFileMode::Single, &arr)
+            .open_file(&path_zip, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         w_zip.write_file(&Arc::new(arr)).unwrap();
         w_zip.close_file().unwrap();

@@ -410,12 +410,13 @@ impl std::fmt::Display for DiagnosticsSnapshot {
                 .unwrap_or_else(std::time::Instant::now);
             for rec in &self.history {
                 let elapsed = rec.time.duration_since(start);
-                writeln!(f, "  +{:.1}s  {}", elapsed.as_secs_f64(), rec.event)?;
+                writeln!(f, "  +{:.1}s  {}", CFloat(elapsed.as_secs_f64()), rec.event)?;
             }
         }
         Ok(())
     }
 }
+use epics_libcom_rs::cfmt::CFloat;
 use subscription::SubscriptionRegistry;
 use types::*;
 

@@ -71,7 +71,7 @@ impl EnvParam {
         match sscanf_long(text) {
             Some(v) => Some(v),
             None => {
-                eprintln!("Unable to find an integer in {}={text}", self.name);
+                crate::stderr_println!("Unable to find an integer in {}={text}", self.name);
                 None
             }
         }
@@ -103,7 +103,7 @@ impl EnvParam {
     pub fn double(&self) -> Result<f64, EnvDoubleError> {
         let raw = self.get().ok_or(EnvDoubleError::Unresolvable)?;
         epics_parse_double(&raw).map_err(|_| {
-            eprintln!("Unable to find a real number in {}={raw}", self.name);
+            crate::stderr_println!("Unable to find a real number in {}={raw}", self.name);
             EnvDoubleError::Invalid
         })
     }
@@ -149,16 +149,16 @@ impl EnvParam {
         let mut port = match self.long() {
             Some(v) => v,
             None => {
-                eprintln!("EPICS Environment \"{}\" integer fetch failed", self.name);
-                eprintln!("setting \"{}\" = {fallback}", self.name);
+                crate::stderr_println!("EPICS Environment \"{}\" integer fetch failed", self.name);
+                crate::stderr_println!("setting \"{}\" = {fallback}", self.name);
                 i64::from(fallback)
             }
         };
 
         if port <= i64::from(IPPORT_USERRESERVED) || port > i64::from(u16::MAX) {
-            eprintln!("EPICS Environment \"{}\" out of range", self.name);
+            crate::stderr_println!("EPICS Environment \"{}\" out of range", self.name);
             port = i64::from(fallback);
-            eprintln!("Setting \"{}\" = {fallback}", self.name);
+            crate::stderr_println!("Setting \"{}\" = {fallback}", self.name);
         }
 
         // Range-checked above, so the cast cannot truncate.

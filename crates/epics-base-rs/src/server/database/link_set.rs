@@ -37,9 +37,9 @@
 //! struct MyLset { /* ... */ }
 //! #[epics_base_rs::async_trait]
 //! impl LinkSet for MyLset {
-//!     fn is_connected(&self, name: &[u8]) -> bool { /* cached */ }
-//!     fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> { /* cached */ }
-//!     async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> { /* may do I/O */ }
+//!     fn is_connected(&self, link: LinkRef<'_>) -> bool { /* cached */ }
+//!     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> { /* cached */ }
+//!     async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> { /* may do I/O */ }
 //!     /* etc. */
 //! }
 //! db.register_link_set("pva", Arc::new(MyLset { ... })).await;
@@ -453,6 +453,67 @@ impl<'a> LinkHolder<'a> {
     }
 }
 
+/// Which link an lset call is for: one per installed parse, shared by its
+/// clones and never reused, so a relink is a new link even to the same name —
+/// C allocates a new `caLink` for it (`dbCa.c:389-414`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkSerial(u64);
+
+impl LinkSerial {
+    /// A serial no other link has.
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A fresh serial, like [`Self::new`]: a defaulted latch is a new link.
+impl Default for LinkSerial {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The link an lset call is for — C's `plink`, which every `lset` entry
+/// takes: the name the lset is addressed with (`pv_link.pvname`, scheme
+/// stripped, not necessarily UTF-8) and which link it is. An lset that keeps
+/// a channel per link, as dbCa does, keys it by [`Self::serial`]; one that
+/// shares a channel per name, as pvxs does, by `name`.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkRef<'a> {
+    pub name: &'a [u8],
+    link: &'a crate::server::record::OpenLatch,
+}
+
+impl<'a> LinkRef<'a> {
+    pub fn new(name: &'a [u8], link: &'a crate::server::record::OpenLatch) -> Self {
+        Self { name, link }
+    }
+
+    pub fn serial(&self) -> LinkSerial {
+        self.link.serial()
+    }
+
+    /// The database removed the link ([`LinkSet::remove_link`]): an lset
+    /// that keeps a channel per link checks this under the lock it inserts
+    /// the channel under, so an open that was in flight across the removal
+    /// leaves nothing behind (`dbCaTask` services `CA_CLEAR_CHANNEL` ahead
+    /// of every other action, `dbCa.c:1200`).
+    pub fn is_removed(&self) -> bool {
+        self.link.is_removed()
+    }
+
+    /// A CP or CPP link ([`OpenLatch::processes_holder`](crate::server::record::OpenLatch::processes_holder)).
+    pub fn processes_holder(&self) -> bool {
+        self.link.processes_holder()
+    }
+
+    /// A `DBF_INLINK` ([`OpenLatch::is_input`](crate::server::record::OpenLatch::is_input)).
+    pub fn is_input(&self) -> bool {
+        self.link.is_input()
+    }
+}
+
 /// What an lset's [`LinkSet::open_link`] left the link with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkOpen {
@@ -499,7 +560,7 @@ pub trait LinkSet: Send + Sync {
     ///
     /// Synchronous: asked on the record-processing thread inside the
     /// record's advisory write gate. MUST NOT perform I/O.
-    fn is_connected(&self, name: &[u8]) -> bool;
+    fn is_connected(&self, link: LinkRef<'_>) -> bool;
 
     /// True iff `name` has completed every post-connect init action
     /// `dbCaRun`'s wait holds for — C `testInitReady`
@@ -514,8 +575,8 @@ pub trait LinkSet: Send + Sync {
     /// Synchronous and non-blocking like `is_connected`; polled only by
     /// the iocInit wait. Default: `is_connected` — right for an lset
     /// with no post-connect init actions.
-    fn init_ready(&self, name: &[u8]) -> bool {
-        self.is_connected(name)
+    fn init_ready(&self, link: LinkRef<'_>) -> bool {
+        self.is_connected(link)
     }
 
     /// Read the current value of `name`. Returns None when the
@@ -525,7 +586,7 @@ pub trait LinkSet: Send + Sync {
     /// MAY perform I/O (open the channel, issue a one-shot GET). It is
     /// therefore called only from the database's link work owner task —
     /// the record-processing path uses [`Self::get_cached_value`].
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue>;
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue>;
 
     /// Read `name` from cached, monitor-fed state ONLY — the
     /// record-processing read. C `dbCaGetLink` (`dbCa.c:419-506`) copies
@@ -546,8 +607,8 @@ pub trait LinkSet: Send + Sync {
     /// open on the link work owner ([`Self::connect_link`]), which is
     /// what warms the cache for the next cycle. An lset that CAN answer
     /// from memory MUST override, or its links never read.
-    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        let _ = name;
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let _ = link;
         None
     }
 
@@ -560,8 +621,8 @@ pub trait LinkSet: Send + Sync {
     ///
     /// Default `false`: `dbCaGetLink` raises nothing itself
     /// (`dbCa.c:459-463`).
-    fn get_failure_disconn(&self, name: &[u8]) -> bool {
-        let _ = name;
+    fn get_failure_disconn(&self, link: LinkRef<'_>) -> bool {
+        let _ = link;
         false
     }
 
@@ -579,18 +640,21 @@ pub trait LinkSet: Send + Sync {
     /// [`PvDatabase::has_name_no_resolve`](super::PvDatabase::has_name_no_resolve).
     ///
     /// [`ParsedLink::Removed`]: crate::server::record::ParsedLink::Removed
-    fn open_link(&self, holder: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
-        let _ = (holder, name);
+    fn open_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
+        let _ = (holder, link);
         LinkOpen::Lset
     }
 
     /// C `lset->removeLink` (`dbLink.c:202-213`), from `dbPutFieldLink`'s
-    /// `dbRemoveLink` (`dbAccess.c:1167`): `holder` no longer carries the
-    /// link `name` that [`Self::open_link`] opened for it. Asked under the
-    /// put's hold, once the put has replaced or removed the link, before the
-    /// open of whatever replaced it. MUST NOT perform I/O.
-    fn remove_link(&self, holder: LinkHolder<'_>, name: &[u8]) {
-        let _ = (holder, name);
+    /// `dbRemoveLink` (`dbAccess.c:1167`) and `doCloseLinks`: `holder` no
+    /// longer carries `link`, which [`Self::open_link`] opened for it — or, for
+    /// a `ca` link, which `dbCaAddLink` added with no open, and which
+    /// `dbCaRemoveLink` clears (`dbCa.c:431-446`). Asked under the put's hold,
+    /// once the put has replaced or removed the link, before the open of
+    /// whatever replaced it; `link` already reads as removed. MUST NOT perform
+    /// I/O.
+    fn remove_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) {
+        let _ = (holder, link);
     }
 
     /// Open (subscribe / connect) `name` so later
@@ -622,9 +686,21 @@ pub trait LinkSet: Send + Sync {
     /// Default: drive the lset's own lazy open by reading through
     /// [`Self::get_value`] and discarding the result — correct for every
     /// existing lset, and it runs off the record-processing thread.
-    async fn connect_link(&self, name: &[u8], init: Option<super::CaLinkInit>) {
+    async fn connect_link(&self, link: LinkRef<'_>, init: Option<super::CaLinkInit>) {
         drop(init);
-        let _ = self.get_value(name).await;
+        let _ = self.get_value(link).await;
+    }
+
+    /// The CP/CPP edge of `link` is published, perhaps after the link
+    /// opened: from here its events process its holder (`dbCa.c:958-962`).
+    /// An lset whose link runs an [`super::ExternalCpProcess`] calls its
+    /// [`super::ExternalCpProcess::join`]. A link not found here must not
+    /// have started its worker yet, or a pass between the start and the
+    /// publish misses its edge with no join to follow. MUST NOT perform I/O.
+    ///
+    /// Default: nothing — an lset with no `ExternalCpProcess`.
+    fn join_cp_link(&self, link: LinkRef<'_>) {
+        let _ = link;
     }
 
     /// The CA client a `ca` network half runs its links on, for the
@@ -633,17 +709,6 @@ pub trait LinkSet: Send + Sync {
     /// Default: none.
     fn ca_client_service(&self) -> Option<Arc<dyn super::CaClientService>> {
         None
-    }
-
-    /// A CP/CPP link of `holder` was added after iocInit to `name`. C gives
-    /// the new link its own `caLink`, whose first event processes `holder`
-    /// (`dbCa.c:958-962`); an lset sharing one channel per name must
-    /// request that process itself when the channel has already delivered
-    /// its first event, and leave it to that event otherwise.
-    ///
-    /// Default: nothing — an lset with a channel per link gets the event.
-    fn cp_link_added(&self, name: &[u8], holder: super::CpTarget) {
-        let _ = (name, holder);
     }
 
     /// Non-blocking admission gate for an OUT-link write, asked on the
@@ -663,8 +728,8 @@ pub trait LinkSet: Send + Sync {
     /// one; so MUST an lset whose OUT links live in a different cache than
     /// its INP links (pvalink keys its registry on direction), or every OUT
     /// write to a perfectly healthy channel is refused.
-    fn put_admission(&self, name: &[u8]) -> PutAdmission {
-        if self.is_connected(name) {
+    fn put_admission(&self, link: LinkRef<'_>) -> PutAdmission {
+        if self.is_connected(link) {
             PutAdmission::Connected
         } else {
             PutAdmission::Refused
@@ -676,8 +741,8 @@ pub trait LinkSet: Send + Sync {
     /// (`dbCa.c:572-590`), from cached state like [`Self::put_admission`].
     /// `None`: the link is down, or the lset converts in
     /// [`Self::put_value`] itself (the default).
-    fn put_native(&self, name: &[u8]) -> Option<(crate::types::DbFieldType, u32)> {
-        let _ = name;
+    fn put_native(&self, link: LinkRef<'_>) -> Option<(crate::types::DbFieldType, u32)> {
+        let _ = link;
         None
     }
 
@@ -699,8 +764,13 @@ pub trait LinkSet: Send + Sync {
     /// method: the write is refused at `PvDatabase::external_put_gate` with
     /// nothing staged, C's shape for a put it cannot deliver
     /// (`db/dbCa.c:529-532` (`dbCaPutLinkCallback`); R7.0.10).
-    async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
-        let _ = (name, value, op);
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
+        let _ = (link, value, op);
         Err("link set is read-only".into())
     }
 
@@ -709,11 +779,11 @@ pub trait LinkSet: Send + Sync {
     /// can refute.
     async fn put_value_done(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
-        (LinkPutDone::Callback, self.put_value(name, value, op).await)
+        (LinkPutDone::Callback, self.put_value(link, value, op).await)
     }
 
     /// Open `name` as a forward link: the handle its `scanForward` runs
@@ -724,8 +794,8 @@ pub trait LinkSet: Send + Sync {
     /// (`PvDatabase::bind_external_forward`). Default: a handle that
     /// forwards nothing — a read-only or DB-local lset has no
     /// `scanForward`.
-    fn forward_handle(&self, name: &[u8]) -> Box<dyn LinkForward> {
-        let _ = name;
+    fn forward_handle(&self, link: LinkRef<'_>) -> Box<dyn LinkForward> {
+        let _ = link;
         Box::new(NoForward)
     }
 
@@ -753,7 +823,7 @@ pub trait LinkSet: Send + Sync {
     /// (`recGblSetSevrMsg`, `pvalink_lset.cpp:432-434`), and a shared text
     /// makes that store a pointer compare. A new text is allocated once per
     /// change of the remote message, never per call.
-    fn alarm_message(&self, _name: &[u8]) -> Option<Arc<str>> {
+    fn alarm_message(&self, _link: LinkRef<'_>) -> Option<Arc<str>> {
         None
     }
 
@@ -770,7 +840,7 @@ pub trait LinkSet: Send + Sync {
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
     /// `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
-    fn alarm_severity(&self, _name: &[u8]) -> Option<i32> {
+    fn alarm_severity(&self, _link: LinkRef<'_>) -> Option<i32> {
         None
     }
 
@@ -786,7 +856,7 @@ pub trait LinkSet: Send + Sync {
     /// behaviour for every non-`MSS` modifier and for lsets that leave
     /// this default. Mirrors `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm`
     /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
-    fn alarm_status(&self, _name: &[u8]) -> Option<i32> {
+    fn alarm_status(&self, _link: LinkRef<'_>) -> Option<i32> {
         None
     }
 
@@ -810,16 +880,25 @@ pub trait LinkSet: Send + Sync {
     /// `None` means the lset cannot report a snapshot: no cache, the
     /// link is not connected (pvxs `CHECK_VALID` — `pvxs/ioc/pvalink_lset.cpp:548`),
     /// or the link set does not track remote alarms. Default: none.
-    fn remote_alarm(&self, _name: &[u8]) -> Option<RemoteAlarm> {
+    fn remote_alarm(&self, _link: LinkRef<'_>) -> Option<RemoteAlarm> {
         None
     }
 
-    /// `(seconds_past_epoch, nanoseconds, userTag)` from the upstream
-    /// PV's timestamp slot, when available. The `userTag` is the remote
+    /// C `lset->getTimeStampTag`: `(seconds_past_epoch, nanoseconds,
+    /// userTag)` of the link's source. The `userTag` is the remote
     /// `timeStamp.userTag` widened to the 64-bit `epicsUTag` tag without
     /// sign extension, or `0` when the source carries none (CA links, or
-    /// a PVA source whose timeStamp omits the field).
-    fn time_stamp(&self, _name: &[u8]) -> Option<(i64, i32, u64)> {
+    /// a PVA source whose timeStamp omits the field). `None` is C's non-zero
+    /// return.
+    fn time_stamp(&self, _link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+        None
+    }
+
+    /// The stamp this lset's `getValue` writes into the reading record's
+    /// `TIME` and `UTAG`, in [`Self::time_stamp`]'s shape. Only pvalink's
+    /// `time=true` writes one, on a failed read as well
+    /// (`pvalink_lset.cpp:268-272`, `:438-442`); `None` leaves them alone.
+    fn read_time_stamp(&self, _link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
         None
     }
 
@@ -840,7 +919,7 @@ pub trait LinkSet: Send + Sync {
     /// piece of metadata — the record then keeps its local default,
     /// matching the C getters that leave the caller's buffer
     /// untouched on a missing sub-field. Default impl: no metadata.
-    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _link: LinkRef<'_>) -> Option<LinkMetadata> {
         None
     }
 
@@ -866,7 +945,7 @@ pub trait LinkSet: Send + Sync {
     /// Default: `None`, i.e. "this lset has no per-link report state".
     /// Such an lset's links are invisible to `dbcar`, which is right — C's
     /// `dbcar` walks `plink->type == CA_LINK` and no other link flavour.
-    async fn link_diagnostics(&self, _name: &[u8]) -> Option<LinkDiagnostics> {
+    async fn link_diagnostics(&self, _link: LinkRef<'_>) -> Option<LinkDiagnostics> {
         None
     }
 }
@@ -974,14 +1053,14 @@ mod tests {
     struct StubLset;
     #[async_trait::async_trait]
     impl LinkSet for StubLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Long(42))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
     }
 
@@ -992,11 +1071,10 @@ mod tests {
         reg.register("pva", Arc::new(StubLset));
         assert_eq!(reg.len(), 1);
         let lset = reg.get("pva").expect("registered");
-        assert!(lset.is_connected(b"anything"));
-        assert_eq!(
-            lset.get_value(b"anything").await,
-            Some(EpicsValue::Long(42))
-        );
+        let open = crate::server::record::OpenLatch::default();
+        let link = LinkRef::new(b"anything", &open);
+        assert!(lset.is_connected(link));
+        assert_eq!(lset.get_value(link).await, Some(EpicsValue::Long(42)));
     }
 
     #[test]

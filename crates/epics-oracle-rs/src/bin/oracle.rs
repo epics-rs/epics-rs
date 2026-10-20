@@ -99,7 +99,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("oracle: {e}");
+            epics_base_rs::stderr_println!("oracle: {e}");
             ExitCode::FAILURE
         }
     }
@@ -128,7 +128,7 @@ async fn run() -> Result<ExitCode, String> {
     // Which record types the port implements is MEASURED, not read out of its
     // source -- the field tables are being regenerated concurrently, so source
     // would be stale.
-    eprintln!("probing which record types the port implements...");
+    epics_base_rs::stderr_println!("probing which record types the port implements...");
     let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
@@ -137,7 +137,7 @@ async fn run() -> Result<ExitCode, String> {
     // as the deviation having stopped.
     allowlist.note_types_driven(&types, &surface.covered_types);
 
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "denominator: {} CA-observable fields across {} record types ({} unimplemented)",
         surface.denominator(),
         surface.covered_types.len(),
@@ -155,7 +155,7 @@ async fn run() -> Result<ExitCode, String> {
     let mut monitor_undrivable: Vec<UndrivableVal> = Vec::new();
 
     for (i, rt) in types.iter().enumerate() {
-        eprintln!("[{}/{}] {rt}", i + 1, types.len());
+        epics_base_rs::stderr_println!("[{}/{}] {rt}", i + 1, types.len());
 
         if matches!(args.phase, Phase::Read | Phase::All) {
             cases.extend(runner.probe_reads(rt, &surface, &mut allowlist));
@@ -168,7 +168,7 @@ async fn run() -> Result<ExitCode, String> {
         // `--phase all` exit never implies these were measured.
         let drivable = epics_oracle_rs::puts_are_measurable(rt);
         if drives_puts && !drivable {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "    put-driven phases (put, monitor) skipped for {rt}: read-only \
                  (unmeasurable against the disconnected ORACLEASYN port)"
             );
@@ -181,7 +181,7 @@ async fn run() -> Result<ExitCode, String> {
             // Loud, and it names the rule: a shrunken drive denominator must
             // never read as a measured-clean one.
             if let Some(why) = epics_oracle_rs::surface::val_status(&surface, rt).why() {
-                eprintln!("    monitor phase excluded for {rt}: {why}");
+                epics_base_rs::stderr_println!("    monitor phase excluded for {rt}: {why}");
                 monitor_undrivable.push(UndrivableVal {
                     record_type: rt.to_string(),
                     why: why.to_string(),
@@ -241,7 +241,7 @@ async fn run() -> Result<ExitCode, String> {
 
     if let Some(p) = &args.json {
         std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
-        eprintln!("wrote {}", p.display());
+        epics_base_rs::stderr_println!("wrote {}", p.display());
     }
     println!("{}", report.human());
 
@@ -262,9 +262,9 @@ fn verdict_exit(counts: &Counts, unimplemented: &[String], stale: &[StaleRow]) -
     if failures.is_empty() {
         return ExitCode::from(exit_status(&failures));
     }
-    eprintln!("oracle: run FAILED:");
+    epics_base_rs::stderr_println!("oracle: run FAILED:");
     for f in &failures {
-        eprintln!("  - {f}");
+        epics_base_rs::stderr_println!("  - {f}");
     }
     ExitCode::from(exit_status(&failures))
 }
@@ -286,12 +286,12 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
 
     // Which record types the port implements is MEASURED, not read out of its
     // source -- the same probe the CA phases use, for the same reason.
-    eprintln!("probing which record types the port implements...");
+    epics_base_rs::stderr_println!("probing which record types the port implements...");
     let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
 
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "denominator: {} PVA channels across {} record types ({} unimplemented)",
         surface.denominator(),
         surface.covered_types.len(),
@@ -312,7 +312,7 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
 
     if let Some(p) = &args.json {
         std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
-        eprintln!("wrote {}", p.display());
+        epics_base_rs::stderr_println!("wrote {}", p.display());
     }
     println!("{}", report.human());
 
@@ -329,12 +329,12 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     let tools = PvxTools::discover().map_err(|e| e.to_string())?;
     let dbd = Dbd::parse_file(&args.dbd)?;
 
-    eprintln!("probing which record types the port implements...");
+    epics_base_rs::stderr_println!("probing which record types the port implements...");
     let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
 
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "denominator: the VAL channel of each of {} record types, on 2 reproducers \
          (the {} channels of the read surface are NOT all driven -- see the report)",
         surface.covered_types.len(),
@@ -355,7 +355,7 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
 
     if let Some(p) = &args.json {
         std::fs::write(p, report.to_json()).map_err(|e| format!("write {}: {e}", p.display()))?;
-        eprintln!("wrote {}", p.display());
+        epics_base_rs::stderr_println!("wrote {}", p.display());
     }
     println!("{}", report.human());
 

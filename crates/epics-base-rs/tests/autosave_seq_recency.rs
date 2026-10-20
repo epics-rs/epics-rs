@@ -33,6 +33,7 @@ async fn slot(sav: &Path, index: usize, secs_ago: u64) {
             pv_name: "PV1".into(),
             value: format!("{index}"),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await
@@ -82,9 +83,12 @@ async fn an_unusable_newest_slot_falls_back_to_the_newest_valid_one() {
     slot(&sav, 1, 60).await;
     // Slot 2 is the newest on disk but was truncated mid-write.
     let torn = sav.with_extension("sav2");
-    epics_base_rs::runtime::fs::write(&torn, "# autosave-rs V1.0\nPV1 2\n")
-        .await
-        .unwrap();
+    epics_base_rs::runtime::fs::write(
+        &torn,
+        "# Autosave release 6.1, compiled Sun Oct 18 23:48:36 2026\nPV1 2\n",
+    )
+    .await
+    .unwrap();
     let file = std::fs::File::options().write(true).open(&torn).unwrap();
     file.set_modified(SystemTime::now()).unwrap();
 

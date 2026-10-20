@@ -59,18 +59,18 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::registry::CommandDef;
 
-pub use iocsh::{ca_caxr_command, db_dbcaxr_command, register_calink_commands};
+pub use iocsh::{db_dbcaxr_command, register_calink_commands};
 pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver};
 
 /// Async link-set installer for
 /// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`].
 ///
-/// Installs the `"ca"` link set on `db` and returns the `caxr` /
-/// `dbcaxr` iocsh commands. Registered at IOC construction, it is fired
+/// Installs the `"ca"` link set on `db` and returns the `dbcaxr` iocsh
+/// command. Registered at IOC construction, it is fired
 /// by `IocApplication::run` at the `AfterCaLinkInit` hook — before
 /// `setup_cp_links` warms Passive CP holders — so this is all a
 /// CA-serving IOC needs to make CA links resolve: no feature opt-in, no
-/// manual [`CaLinkResolver::open`] calls. The shared CA client is
+/// manual open calls. The shared CA client is
 /// created lazily on the first link open.
 pub async fn calink_link_set_install(
     db: Arc<PvDatabase>,

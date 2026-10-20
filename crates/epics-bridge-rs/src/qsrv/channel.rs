@@ -99,10 +99,7 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 /// asked one question here — [`MemberChannel::value_in`], which resolves
 /// through the member's own view — and an ineligible `$` fails it with the
 /// same `Invalid PV:` text pvxs prints.
-pub(super) async fn resolve_db_channel(
-    db: &PvDatabase,
-    member: &MemberChannel,
-) -> Result<(), String> {
+pub(super) fn resolve_db_channel(db: &PvDatabase, member: &MemberChannel) -> Result<(), String> {
     let name = &member.def.channel[..];
     let invalid = || format!("Invalid PV: {}", String::from_utf8_lossy(name));
     if epics_base_rs::server::database::filters::db_channel_create(db, name).is_err() {
@@ -1433,12 +1430,8 @@ mod tests {
         );
         assert_eq!(m.value_filters.len(), 1);
         assert_eq!(m.property_filters.len(), 1);
-        resolve_db_channel(&db, &m)
-            .await
-            .expect("a parseable filter suffix is admitted");
-        resolve_db_channel(&db, &member("GRP:AI"))
-            .await
-            .expect("the unfiltered member still resolves");
+        resolve_db_channel(&db, &m).expect("a parseable filter suffix is admitted");
+        resolve_db_channel(&db, &member("GRP:AI")).expect("the unfiltered member still resolves");
     }
 
     /// The errlog lines `f` produced.
@@ -1589,7 +1582,7 @@ mod tests {
         assert!(m.value_filters.is_empty(), "no chain is served");
         let mut err = None;
         let lines = errlog_of(async {
-            err = resolve_db_channel(&db, &m).await.err();
+            err = resolve_db_channel(&db, &m).err();
         })
         .await;
         assert_eq!(err.as_deref(), Some(r#"Invalid PV: Y.VAL{"bad":{}}"#));

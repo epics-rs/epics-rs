@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::runtime::log::{StagedLine, write_whole};
+use crate::runtime::stdio;
 use crate::server::database::PvDatabase;
 
 /// Argument type for a command parameter.
@@ -292,33 +294,13 @@ pub struct CommandContext {
     /// [`CommandContext::new`] creates a fresh unobserved cell for
     /// standalone shells that administer no server.
     acf: crate::server::access_security::AcfCell,
-    /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
-    ///
-    /// C's `epicsSetThreadStdout` (`iocsh.cpp:417`), which `startRedirect`
-    /// swaps for the duration of one command line.
-    output: std::cell::RefCell<Box<dyn std::io::Write>>,
-    /// Diagnostic writer — defaults to stderr, redirected by `2>` / `2>>`.
-    ///
-    /// C's `epicsSetThreadStderr` (`iocsh.cpp:422`). It is a SEPARATE cell
-    /// from `output` for the same reason C keeps a separate FILE*: a `2>`
-    /// redirect must leave stdout alone, so `dbl 2>/dev/null` still prints its
-    /// listing. Every shell diagnostic goes through [`Self::eprintln`]; a bare
-    /// `eprintln!` would bypass the swap and is what made `2>` inert.
-    error: std::cell::RefCell<Box<dyn std::io::Write>>,
     /// C's raw `stdout`/`stderr`: what a C file that does not include
     /// `epicsStdio.h` writes — `dbAccess.c`, `dbLexRoutines.c`,
     /// `dbLoadTemplate.y` among them. No iocsh redirect swaps these
     /// (measured: `dbLoadRecords nosuch.db 2> f` leaves `f` empty), so they
-    /// are cells of their own rather than [`Self::output`]/[`Self::error`].
+    /// are not the thread's streams of [`crate::runtime::stdio`].
     console_out: std::cell::RefCell<Box<dyn std::io::Write>>,
     console_err: std::cell::RefCell<Box<dyn std::io::Write>>,
-    /// Input reader — defaults to stdin, redirected by `<`.
-    ///
-    /// C's `epicsSetThreadStdin` (`iocsh.cpp:412`). No built-in command reads
-    /// it today; it exists so the `<` redirect performs C's swap rather than
-    /// being silently dropped, and so a command that needs input has the same
-    /// seam its C counterpart reads.
-    input: std::cell::RefCell<Box<dyn std::io::BufRead>>,
     /// The owning shell's live command table, weakly held.
     ///
     /// C needs no such field: its command table IS the registry every other
@@ -362,11 +344,8 @@ impl CommandContext {
             db,
             bridge,
             acf,
-            output: std::cell::RefCell::new(Box::new(std::io::stdout())),
-            error: std::cell::RefCell::new(Box::new(std::io::stderr())),
             console_out: std::cell::RefCell::new(Box::new(std::io::stdout())),
-            console_err: std::cell::RefCell::new(Box::new(std::io::stderr())),
-            input: std::cell::RefCell::new(Box::new(std::io::BufReader::new(std::io::stdin()))),
+            console_err: std::cell::RefCell::new(Box::new(crate::runtime::log::StagedStderr)),
             commands: std::cell::RefCell::new(std::sync::Weak::new()),
         }
     }
@@ -413,10 +392,9 @@ impl CommandContext {
         &self.bridge
     }
 
-    /// Print a line to the current output (stdout or redirected file).
+    /// Print a line to the thread's stdout, which a `>` redirect sets.
     pub fn println(&self, msg: &str) {
-        let mut out = self.output.borrow_mut();
-        let _ = writeln!(out, "{msg}");
+        stdio::stdout_whole(format_args!("{msg}\n"));
     }
 
     /// Print raw BYTES plus a newline to the current output.
@@ -426,38 +404,57 @@ impl CommandContext {
     /// emits the single byte 0xFF. Routing that through [`Self::println`] would
     /// force it through a Rust `str` and replace it.
     pub fn println_bytes(&self, bytes: &[u8]) {
-        let mut out = self.output.borrow_mut();
-        let _ = out.write_all(bytes);
-        let _ = out.write_all(b"\n");
+        let mut line = StagedLine::default();
+        line.push_bytes(bytes);
+        line.push_bytes(b"\n");
+        stdio::stdout_bytes(line.bytes());
     }
 
     /// Print raw BYTES to the current output, as C's `printf("%s")` does.
     pub fn print_bytes(&self, bytes: &[u8]) {
-        let _ = self.output.borrow_mut().write_all(bytes);
+        stdio::stdout_bytes(bytes);
     }
 
     /// Print a formatted string to the current output.
     pub fn print_fmt(&self, args: std::fmt::Arguments<'_>) {
-        let mut out = self.output.borrow_mut();
-        let _ = out.write_fmt(args);
-        let _ = writeln!(out);
+        stdio::stdout_whole(format_args!("{args}\n"));
     }
 
-    /// Print a line to the current DIAGNOSTIC stream (stderr, or the file a
-    /// `2>` redirect installed) — C `fprintf(epicsGetThreadStderr(), ...)`.
+    /// Print a line to the thread's stderr, which a `2>` redirect sets —
+    /// C `fprintf(stderr, ...)` under `epicsStdio.h`.
     pub fn eprintln(&self, msg: &str) {
-        let mut err = self.error.borrow_mut();
-        let _ = writeln!(err, "{msg}");
+        let _ = stdio::with_stderr(|err| write_whole(err, format_args!("{msg}\n")));
     }
 
     /// A line on C's raw `stdout`, which no iocsh redirect swaps.
     pub fn console_println(&self, msg: &str) {
-        let _ = writeln!(self.console_out.borrow_mut(), "{msg}");
+        let _ = write_whole(
+            &mut **self.console_out.borrow_mut(),
+            format_args!("{msg}\n"),
+        );
+    }
+
+    /// Raw BYTES plus a newline on C's raw `stdout`.
+    pub fn console_println_bytes(&self, bytes: &[u8]) {
+        let mut out = self.console_out.borrow_mut();
+        let _ = out.write_all(bytes);
+        let _ = out.write_all(b"\n");
     }
 
     /// A line on C's raw `stderr`, which no iocsh redirect swaps.
     pub fn console_eprintln(&self, msg: &str) {
-        let _ = writeln!(self.console_err.borrow_mut(), "{msg}");
+        let _ = write_whole(
+            &mut **self.console_err.borrow_mut(),
+            format_args!("{msg}\n"),
+        );
+    }
+
+    /// Exchange the console cells with `other`'s. Called twice around a
+    /// shell's line, it lends that shell what a test captured on this one;
+    /// the thread's own streams need no lending.
+    pub(crate) fn swap_streams(&self, other: &CommandContext) {
+        self.console_out.swap(&other.console_out);
+        self.console_err.swap(&other.console_err);
     }
 
     /// Fail the line as C's iocsh fails a command that threw
@@ -468,12 +465,10 @@ impl CommandContext {
         CommandOutcome::Failed
     }
 
-    /// Read one line from the current INPUT stream (stdin, or the file a `<`
-    /// redirect installed) — C `fgets(..., epicsGetThreadStdin())`. `Ok(0)`
-    /// is end of input.
+    /// Read one line from the thread's stdin, which a `<` redirect sets —
+    /// C `fgets(..., stdin)` under `epicsStdio.h`. `Ok(0)` is end of input.
     pub fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
-        let mut input = self.input.borrow_mut();
-        input.read_line(buf)
+        stdio::with_stdin(|input| input.read_line(buf))
     }
 
     /// Swap both console cells for the length of `f`, so a test can read
@@ -495,46 +490,24 @@ impl CommandContext {
         result
     }
 
-    /// Temporarily redirect the DIAGNOSTIC stream, run a closure, then
-    /// restore — C `startRedirect`/`stopRedirect` for fd 2.
+    /// [`stdio::redirect_stderr`], for tests that hold a context.
+    #[cfg(test)]
     pub(crate) fn with_error<W: std::io::Write + 'static, R>(
         &self,
         writer: W,
         f: impl FnOnce() -> R,
     ) -> R {
-        let prev = self.error.replace(Box::new(writer));
-        let result = f();
-        let _ = self.error.borrow_mut().flush();
-        self.error.replace(prev);
-        result
+        stdio::redirect_stderr(writer, f)
     }
 
-    /// Temporarily redirect the INPUT stream, run a closure, then restore —
-    /// C `startRedirect`/`stopRedirect` for fd 0.
-    pub(crate) fn with_input<R: std::io::Read + 'static, T>(
-        &self,
-        reader: R,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let prev = self
-            .input
-            .replace(Box::new(std::io::BufReader::new(reader)));
-        let result = f();
-        self.input.replace(prev);
-        result
-    }
-
-    /// Temporarily redirect output to a writer, run a closure, then restore.
+    /// [`stdio::redirect_stdout`], for tests that hold a context.
+    #[cfg(test)]
     pub(crate) fn with_output<W: std::io::Write + 'static, R>(
         &self,
         writer: W,
         f: impl FnOnce() -> R,
     ) -> R {
-        let prev = self.output.replace(Box::new(writer));
-        let result = f();
-        let _ = self.output.borrow_mut().flush();
-        self.output.replace(prev);
-        result
+        stdio::redirect_stdout(writer, f)
     }
 
     /// Run an async future from the blocking REPL thread.
@@ -1109,6 +1082,60 @@ pub(crate) fn parse_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `write` a sink received, as its own entry.
+    #[derive(Clone, Default)]
+    struct Writes(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Each line reaches its stream in one `write`, at any length, a deliberate
+    /// deviation from C's chunked `fprintf`: the stream may be stderr or a
+    /// redirect file, where a second writer's line would otherwise land
+    /// between the text and its newline.
+    #[test]
+    fn every_context_line_is_one_write() {
+        // RTEMS-EXEC-MODEL-ALLOW(1): the runtime is built here only to capture
+        // a `BlockingBridge`; the writers under test run synchronously, so the
+        // test passes in the exec-backend suite.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+        let (o, e, co, ce) = (
+            Writes::default(),
+            Writes::default(),
+            Writes::default(),
+            Writes::default(),
+        );
+        ctx.with_console(co.clone(), ce.clone(), || {
+            ctx.with_error(e.clone(), || {
+                ctx.with_output(o.clone(), || {
+                    ctx.println("a line");
+                    ctx.println_bytes(b"\xffbytes");
+                    ctx.print_fmt(format_args!("{} {}", "two", "pieces"));
+                    ctx.eprintln("a diagnostic");
+                    ctx.console_println("console out");
+                    ctx.console_eprintln("console err");
+                })
+            })
+        });
+        let got = |w: &Writes| w.0.lock().unwrap().clone();
+        assert_eq!(got(&o), [&b"a line\n"[..], b"\xffbytes\n", b"two pieces\n"]);
+        assert_eq!(got(&e), [b"a diagnostic\n"]);
+        assert_eq!(got(&co), [b"console out\n"]);
+        assert_eq!(got(&ce), [b"console err\n"]);
+    }
 
     // --- Legacy space-separated syntax ---
 

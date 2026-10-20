@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::calc::engine::cvt::fmt_f;
 use epics_base_rs::server::database::PvDatabase;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::alloc_origin;
 use crate::snl::vars::{
@@ -131,29 +131,6 @@ impl KohzuConfig {
             m_z: m_z.to_string(),
             geom: Geometry::from_i32(geom),
         }
-    }
-
-    /// Build config from a macro string like "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z".
-    pub fn from_macros(macro_str: &str) -> Self {
-        let mut p = String::new();
-        let mut m_theta = String::new();
-        let mut m_y = String::new();
-        let mut m_z = String::new();
-        let mut geom = 0i32;
-        for part in macro_str.split(',') {
-            let part = part.trim();
-            if let Some((k, v)) = part.split_once('=') {
-                match k.trim() {
-                    "P" => p = v.trim().to_string(),
-                    "M_THETA" => m_theta = v.trim().to_string(),
-                    "M_Y" => m_y = v.trim().to_string(),
-                    "M_Z" => m_z = v.trim().to_string(),
-                    "GEOM" => geom = v.trim().parse().unwrap_or(0),
-                    _ => {}
-                }
-            }
-        }
-        Self::new(&p, &m_theta, &m_y, &m_z, geom)
     }
 
     fn program(self) -> Program {
@@ -793,7 +770,7 @@ impl Kohzu {
                 if v.test_and_clear(Y_OFFSET) {
                     ctl_debug!(v, "kohzuCtl:waitForCmnd:yOffset_mon");
                     v.set(AUTO_MODE, 0.0).await;
-                    let msg = format!("y offset changed to {}", fmt_f(v.get(Y_OFFSET), 6));
+                    let msg = format!("y offset changed to {}", CFloat(v.get(Y_OFFSET)));
                     self.msg1(&msg).await;
                     self.msg2("Set to Manual Mode").await;
                     return Some(State::CalcMovements);
@@ -1135,7 +1112,7 @@ impl Kohzu {
                     ctl_debug!(
                         v,
                         "kohzuCtl:thetaMotStopped: ySpeed = {:.6}",
-                        v.get(SPEED[Y])
+                        CFloat(v.get(SPEED[Y]))
                     );
                     self.caused_move = false;
                     return Some(State::WaitForCmndEnter);

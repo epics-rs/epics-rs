@@ -461,7 +461,7 @@ async fn run_from_config(
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "pva-gateway-rs: cannot read config '{}': {e}",
                 path.display()
             );
@@ -471,19 +471,19 @@ async fn run_from_config(
     let cfg = match parse_config(&text) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pva-gateway-rs: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: {e}");
             return ExitCode::FAILURE;
         }
     };
     if cfg.version == 0 {
-        eprintln!("Warning: config file missing \"version\" key. Assuming 1");
+        epics_base_rs::stderr_println!("Warning: config file missing \"version\" key. Assuming 1");
     }
     if let Err(e) = validate(&cfg) {
-        eprintln!("pva-gateway-rs: {e}");
+        epics_base_rs::stderr_println!("pva-gateway-rs: {e}");
         return ExitCode::FAILURE;
     }
     if check_only {
-        eprintln!("Config file OK");
+        epics_base_rs::stderr_println!("Config file OK");
         return ExitCode::SUCCESS;
     }
 
@@ -499,17 +499,17 @@ async fn run_from_config(
     ) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("pva-gateway-rs: failed to start: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: failed to start: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "pva-gateway-rs: {} upstream client(s), {} downstream server(s) (Ctrl-C to stop)",
         gw.upstream_count(),
         gw.downstream_count()
     );
     if let Err(e) = tokio::signal::ctrl_c().await {
-        eprintln!("pva-gateway-rs: signal wait failed: {e}");
+        epics_base_rs::stderr_println!("pva-gateway-rs: signal wait failed: {e}");
     }
     gw.stop_all();
     ExitCode::SUCCESS
@@ -628,7 +628,7 @@ async fn main() -> ExitCode {
         .await;
     }
     if args.check_config {
-        eprintln!("pva-gateway-rs: --check-config requires a <CONFIG> file");
+        epics_base_rs::stderr_println!("pva-gateway-rs: --check-config requires a <CONFIG> file");
         return ExitCode::FAILURE;
     }
 
@@ -640,7 +640,7 @@ async fn main() -> ExitCode {
     let gateway = match PvaGateway::start(&reactor, cfg) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("pva-gateway-rs: failed to start: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: failed to start: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -652,15 +652,16 @@ async fn main() -> ExitCode {
     }
 
     let report = gateway.report();
-    eprintln!(
+    epics_base_rs::stderr_println!(
         "pva-gateway-rs listening tcp/{} udp/{} (Ctrl-C to stop)",
-        report.tcp_port, report.udp_port
+        report.tcp_port,
+        report.udp_port
     );
 
     match gateway.run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pva-gateway-rs: stopped with error: {e}");
+            epics_base_rs::stderr_println!("pva-gateway-rs: stopped with error: {e}");
             ExitCode::FAILURE
         }
     }

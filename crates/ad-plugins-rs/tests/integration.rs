@@ -720,11 +720,11 @@ fn test_process_then_file_tiff_pipeline() {
     tiff_proc.ctrl.lock().file_base.set_mode(NDFileMode::Single);
 
     // Use the writer directly for this test
-    use ad_core_rs::plugin::file_base::NDFileWriter;
+    use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
     use ad_plugins_rs::file_tiff::TiffWriter;
     let mut writer = TiffWriter::new();
     writer
-        .open_file(&path, NDFileMode::Single, &proc_result.output_arrays[0])
+        .open_file(&path, NDFileOpenMode::WRITE, &proc_result.output_arrays[0])
         .unwrap();
     writer.write_file(&proc_result.output_arrays[0]).unwrap();
     writer.close_file().unwrap();

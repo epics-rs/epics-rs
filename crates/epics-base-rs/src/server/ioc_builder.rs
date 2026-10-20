@@ -114,7 +114,7 @@ impl db_loader::InstallHost for BuilderInstall<'_> {
     }
 
     fn warn(&self, line: &str) {
-        eprintln!("{line}");
+        crate::stderr_println!("{line}");
     }
 }
 
@@ -464,7 +464,7 @@ impl IocBuilder {
             .build_through(
                 || {
                     crate::server::ioc_app::BuildSequence::begin_mode(mode, |line| {
-                        println!("{line}")
+                        crate::epics_println!("{line}")
                     })
                 },
                 LinkInit::Build,
@@ -572,12 +572,12 @@ impl IocBuilder {
                 .await
                 .is_ok(),
                 None => {
-                    eprintln!("{ERL_ERROR}: Can't open file '{}'", load.source);
+                    crate::stderr_println!("{ERL_ERROR}: Can't open file '{}'", load.source);
                     false
                 }
             };
             if !installed {
-                eprintln!("{ERL_ERROR}: Failed to load '{}'", load.source);
+                crate::stderr_println!("{ERL_ERROR}: Failed to load '{}'", load.source);
                 if !self.boot_past_failed_loads {
                     for unread in loads {
                         if let Some(mut text) = unread.text {
@@ -626,7 +626,7 @@ impl IocBuilder {
         // `build` leaves the links to its caller. Link status is FINAL when
         // `build` returns, as it is when C's `iocInit` returns.
         crate::server::ioc_app::init_database(&db, matches!(link_init, LinkInit::Build), &|line| {
-            eprintln!("{line}")
+            crate::stderr_println!("{line}")
         })
         .await;
         begun.reach(InitHookState::AfterInitDatabase);

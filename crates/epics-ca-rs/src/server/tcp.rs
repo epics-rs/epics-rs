@@ -1534,11 +1534,17 @@ pub(crate) fn announce_tcp_port(configured: u16, bound: u16) {
         // line 5. Captured from the compiled `softIoc` with its configured TCP
         // port held by another process.
         let w = epics_base_rs::runtime::log::erl_warning();
-        eprintln!("cas {w}: Configured TCP port was unavailable.");
-        eprintln!("cas {w}: Using dynamically assigned TCP port {bound},");
-        eprintln!("cas {w}: but now two or more servers share the same UDP port.");
-        eprintln!("cas {w}: Depending on your IP kernel this server may not be");
-        eprintln!("cas {w}: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)");
+        epics_libcom_rs::stderr_println!("cas {w}: Configured TCP port was unavailable.");
+        epics_libcom_rs::stderr_println!("cas {w}: Using dynamically assigned TCP port {bound},");
+        epics_libcom_rs::stderr_println!(
+            "cas {w}: but now two or more servers share the same UDP port."
+        );
+        epics_libcom_rs::stderr_println!(
+            "cas {w}: Depending on your IP kernel this server may not be"
+        );
+        epics_libcom_rs::stderr_println!(
+            "cas {w}: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)"
+        );
     }
     // C `caservertask.c:594`: `epicsEnvSet("RSRV_SERVER_PORT", buf)`,
     // unconditional — the variable always names the port the server ended up
@@ -3456,6 +3462,7 @@ pub(crate) async fn dispatch_message(
             // first, then the count limits).
             // C's `dbChannel` order whatever the JSON order: the pre chain,
             // then the post chain on a `$` channel's char image.
+            // `Err` is a request type `dbGet` refuses (`S_db_badDbrtype`).
             let snapshot = prepare_read(
                 &entry.target,
                 entry.filter_chain(),
@@ -3473,16 +3480,21 @@ pub(crate) async fn dispatch_message(
             // parameters into the exact wire frame as a pure, socket-free
             // computation; the connection loop's outbox owner is the only
             // code that touches the socket. Emit by pushing the bytes.
-            match build_read_reply(
-                writer.pool(),
-                requested_type,
-                requested_count,
-                is_notify,
-                &snapshot,
-                entry.cid,
-                ioid,
-                state.client_minor_version(),
-            ) {
+            let reply = snapshot
+                .map_err(|_| ReadReplyError::GetFail)
+                .and_then(|snapshot| {
+                    build_read_reply(
+                        writer.pool(),
+                        requested_type,
+                        requested_count,
+                        is_notify,
+                        &snapshot,
+                        entry.cid,
+                        ioid,
+                        state.client_minor_version(),
+                    )
+                });
+            match reply {
                 Ok(frame) => writer.push(frame),
                 Err(ReadReplyError::BadType) => {
                     // C `read_action` (camessage.c:616-620) checks
@@ -4801,7 +4813,7 @@ pub(crate) async fn serve_write_head(
                 "dbr-type-not-puttable",
             ),
             PutPlan::Write { value: new_value } => {
-                let result = epics_base_rs::server::database::channel_io::put(
+                let put = epics_base_rs::server::database::channel_io::put(
                     db,
                     &entry.target,
                     entry.long_string_mode,
@@ -4812,6 +4824,11 @@ pub(crate) async fn serve_write_head(
                         host: state.hostname.as_bytes().to_vec(),
                         peer: state.peer.clone(),
                     },
+                );
+                let result = crate::server::current_client::attached(
+                    &state.username,
+                    state.hostname.as_bytes(),
+                    put,
                 )
                 .await;
                 let (completion, result) = PutRefused::outcome(result);
@@ -5338,7 +5355,12 @@ pub(crate) async fn register_subscription(
     // the post, the post chain as each event is read (`dbEvent.c:901,923`,
     // `:984-985`).
     let (pre_chain, post_chain) = entry.filter_chain().split();
-    let stage = super::DeliveryStage::new(post_chain, long_string_mode, entry.field_element_count);
+    let stage = super::DeliveryStage::new(
+        post_chain,
+        long_string_mode,
+        entry.field_element_count,
+        requested_type,
+    );
     // Captured with them and for the same reason: the blocking driver's event
     // thread addresses its retirement frame by the CLIENT's cid, and the
     // `entry` borrow is released before the hand-off is built.
@@ -7122,8 +7144,12 @@ mod delivery_reads_options {
             let mut chain = FilterChain::new();
             chain.push(Arc::new(TimestampFilter::with_mode(mode)));
             let mut m = monitor(&db, field(&db), DBR_CTRL_DOUBLE);
-            m.stage =
-                super::super::DeliveryStage::new(chain, super::super::LongStringMode::Plain, 1);
+            m.stage = super::super::DeliveryStage::new(
+                chain,
+                super::super::LongStringMode::Plain,
+                1,
+                DBR_CTRL_DOUBLE,
+            );
             let got = deliver(&m, posted(&db, 1.5, 0, 0)).await;
             assert_eq!(got.precision(), Some(prec), "{mode:?}");
             let display = got.display.as_ref().unwrap();
@@ -7807,7 +7833,7 @@ fn pcas_log_bad_id(
         hdr.actual_postsize(),
         hdr.available
     );
-    let _ = std::io::stderr().write_all(&request);
+    let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(&request);
     send_ca_error(
         writer,
         hdr,
@@ -10146,7 +10172,7 @@ mod non_graceful_disconnect_teardown_tests {
         }
         let get_fail = vec![0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 152, 0, 0, 0, 7];
         assert_eq!(next_event_add(&mut client).await, get_fail);
-        let pv = db.find_pv("gf:simple").await.expect("simple pv");
+        let pv = db.find_pv("gf:simple").expect("simple pv");
         pv.set(EpicsValue::String("def".into()));
         assert_eq!(next_event_add(&mut client).await, get_fail);
         pv.set(EpicsValue::String("1.5".into()));
@@ -13107,7 +13133,7 @@ mod destroyed_channel_teardown_tests {
         db.add_pv("BR3:LATEADD", EpicsValue::Double(1.0))
             .await
             .expect("add_pv");
-        let pv = db.find_pv("BR3:LATEADD").await.expect("just added");
+        let pv = db.find_pv("BR3:LATEADD").expect("just added");
 
         let user = Arc::new(EventUser::new());
         let mask = (EventMask::VALUE | EventMask::LOG).bits();
@@ -13234,7 +13260,7 @@ mod destroyed_channel_teardown_tests {
                 db.add_pv(&name, EpicsValue::Double(1.0))
                     .await
                     .expect("add_pv");
-                let pv = db.find_pv(&name).await.expect("just added");
+                let pv = db.find_pv(&name).expect("just added");
                 let reader = pv
                     .add_subscriber_on(
                         &user,
@@ -13297,7 +13323,7 @@ mod destroyed_channel_teardown_tests {
         db.add_pv("BATCH:EXIT", EpicsValue::Double(1.0))
             .await
             .expect("add_pv");
-        let pv = db.find_pv("BATCH:EXIT").await.expect("just added");
+        let pv = db.find_pv("BATCH:EXIT").expect("just added");
         let user = Arc::new(EventUser::new());
         let reader = pv
             .add_subscriber_on(
@@ -13712,7 +13738,7 @@ mod cancel_confirmation_ordering_tests {
         db.add_pv("cancel:mon", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let pv = db.find_pv("cancel:mon").await.expect("pv present");
+        let pv = db.find_pv("cancel:mon").expect("pv present");
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
 
@@ -13838,7 +13864,7 @@ mod cancel_confirmation_ordering_tests {
         db.add_pv("overflow:mon", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let pv = db.find_pv("overflow:mon").await.expect("pv present");
+        let pv = db.find_pv("overflow:mon").expect("pv present");
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
 
@@ -14256,6 +14282,212 @@ mod string_as_enum_getfail_tests {
 
 #[cfg(tokio_backend)]
 #[cfg(test)]
+mod link_field_read_tests {
+    //! `dbGet` reads a link field through `getLinkValue` and an attribute
+    //! through `getAttrValue` (`dbAccess.c:817-895,944-952`), whatever the
+    //! text: `DBR_STRING` and `DBR_CHAR` take the text, a link's `DBR_DOUBLE`
+    //! is NaN, every other type is `S_db_badDbrtype`. softIoc
+    //! R7.0.10-146-g8f5015b66 with AO, `AI.INP "AO"`, `AK.INP "5"`:
+    //! `caget -d DBR_DOUBLE AI.INP` and `AK.INP` read nan, `-d DBR_FLOAT
+    //! AK.INP` fails, `-d DBR_CHAR AI.INP` and `AI.RTYP` read 0, `-# 12 -d
+    //! DBR_DOUBLE AI.INP$` reads `nan 0 0 ...`, `-# 12 -d DBR_LONG AI.INP$`
+    //! fails; a DBR_DOUBLE monitor of AI.INP posts nan.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::types::{DBR_DOUBLE, DBR_STRING};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const DBR_FLOAT: u16 = 2;
+    const DBR_CHAR: u16 = 4;
+    const DBR_LONG: u16 = 5;
+
+    fn request(cmmd: u16, sid: u32, ioid: u32, data_type: u16, count: u32, body: &[u8]) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = data_type;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(body.len(), count, crate::protocol::CA_MINOR_VERSION)
+            .unwrap();
+        let mut frame = h.to_bytes_extended().to_vec();
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// EVENT_ADD body: three zero deadbands, mask DBE_VALUE | DBE_ALARM.
+    const EVENT_ADD_BODY: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0];
+
+    async fn next_frame(
+        client: &mut tokio::io::DuplexStream,
+        acc: &mut Vec<u8>,
+    ) -> (CaHeader, Vec<u8>) {
+        loop {
+            if acc.len() >= CaHeader::SIZE {
+                let (hdr, hdr_size) = CaHeader::from_bytes_extended(acc).unwrap();
+                let len = hdr_size + hdr.actual_postsize();
+                if acc.len() >= len {
+                    let payload = acc[hdr_size..len].to_vec();
+                    acc.drain(..len);
+                    return (hdr, payload);
+                }
+            }
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                .await
+                .expect("reply within 3 s")
+                .unwrap();
+            assert!(n > 0, "server closed the circuit");
+            acc.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    fn double(payload: &[u8], i: usize) -> f64 {
+        f64::from_be_bytes(payload[8 * i..8 * i + 8].try_into().unwrap())
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_link_or_attribute_reads_as_get_link_value() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ao, "AO") { field(VAL, "2") }
+record(ai, "AI") { field(INP, "AO") }
+record(ai, "AK") { field(INP, "5") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (mut client, server_io) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:55361".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        client.write_all(&version_frame()).await.unwrap();
+        let mut sids = Vec::new();
+        for (cid, name) in [(1, "AI.INP"), (2, "AK.INP"), (3, "AI.INP$"), (4, "AI.RTYP")] {
+            client
+                .write_all(&create_chan_frame(cid, name))
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+            sids.push(read_create_chan_sid(&mut client, Duration::from_secs(3)).await);
+        }
+        let [inp, konst, dollar, rtyp] = sids[..] else {
+            unreachable!()
+        };
+        let mut acc = Vec::new();
+        let mut read = async |sid, data_type, count| {
+            client
+                .write_all(&request(
+                    CA_PROTO_READ_NOTIFY,
+                    sid,
+                    9,
+                    data_type,
+                    count,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            (hdr.cid, payload)
+        };
+
+        let (status, payload) = read(inp, DBR_DOUBLE, 1).await;
+        assert!(
+            status == ECA_NORMAL && double(&payload, 0).is_nan(),
+            "AI.INP DBR_DOUBLE"
+        );
+        let (status, payload) = read(konst, DBR_DOUBLE, 1).await;
+        assert!(
+            status == ECA_NORMAL && double(&payload, 0).is_nan(),
+            "AK.INP DBR_DOUBLE"
+        );
+        assert_eq!(
+            read(konst, DBR_FLOAT, 1).await,
+            (ECA_GETFAIL, vec![0; 8]),
+            "AK.INP DBR_FLOAT"
+        );
+        assert_eq!(
+            read(inp, DBR_CHAR, 1).await,
+            (ECA_NORMAL, vec![0; 8]),
+            "AI.INP DBR_CHAR"
+        );
+        assert_eq!(
+            read(rtyp, DBR_CHAR, 1).await,
+            (ECA_NORMAL, vec![0; 8]),
+            "AI.RTYP DBR_CHAR"
+        );
+
+        let (status, payload) = read(dollar, DBR_STRING, 12).await;
+        let mut text = b"AO NPP NMS".to_vec();
+        text.resize(12 * 40, 0);
+        assert_eq!((status, payload), (ECA_NORMAL, text), "AI.INP$ DBR_STRING");
+        let (status, payload) = read(dollar, DBR_DOUBLE, 12).await;
+        assert!(
+            status == ECA_NORMAL && double(&payload, 0).is_nan(),
+            "AI.INP$ DBR_DOUBLE"
+        );
+        assert_eq!(&payload[8..], &[0; 88][..], "AI.INP$ DBR_DOUBLE pad");
+        assert_eq!(
+            read(dollar, DBR_LONG, 12).await,
+            (ECA_GETFAIL, vec![0; 48]),
+            "AI.INP$ DBR_LONG"
+        );
+
+        for (sub, data_type) in [(20, DBR_DOUBLE), (21, DBR_LONG)] {
+            client
+                .write_all(&request(
+                    CA_PROTO_EVENT_ADD,
+                    inp,
+                    sub,
+                    data_type,
+                    1,
+                    &EVENT_ADD_BODY,
+                ))
+                .await
+                .unwrap();
+            let (hdr, payload) = next_frame(&mut client, &mut acc).await;
+            assert_eq!((hdr.cmmd, hdr.available), (CA_PROTO_EVENT_ADD, sub));
+            match data_type {
+                DBR_DOUBLE => assert!(
+                    hdr.cid == ECA_NORMAL && double(&payload, 0).is_nan(),
+                    "DBR_DOUBLE monitor"
+                ),
+                _ => assert_eq!(
+                    (hdr.cid, payload),
+                    (ECA_GETFAIL, vec![0; 8]),
+                    "DBR_LONG monitor"
+                ),
+            }
+        }
+        handle.abort();
+    }
+}
+
+#[cfg(tokio_backend)]
+#[cfg(test)]
 mod scalar_string_without_nul_tests {
     //! The six raw-socket rows of softIoc 8f5015b66 (qa's long-string pins):
     //! a DBR_STRING count-1 put whose 40-byte body holds no NUL, then an
@@ -14556,8 +14788,8 @@ mod circuit_event_order_tests {
             "initial values"
         );
 
-        let a = db.find_pv("ORD:a").await.expect("added");
-        let b = db.find_pv("ORD:b").await.expect("added");
+        let a = db.find_pv("ORD:a").expect("added");
+        let b = db.find_pv("ORD:b").expect("added");
         a.set(EpicsValue::Double(1.0));
         b.set(EpicsValue::Double(1.0));
         a.set(EpicsValue::Double(2.0));

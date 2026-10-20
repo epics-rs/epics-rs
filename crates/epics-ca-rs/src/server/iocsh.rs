@@ -351,6 +351,7 @@ pub fn register_ca_db_server() {
                 out(&line);
             }
         })),
+        client: Some(crate::server::current_client::client_initiating_current_thread),
     });
 }
 

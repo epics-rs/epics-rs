@@ -224,17 +224,20 @@ impl MotorRecord {
         println!("{}:tdir = {}", self.trace.record(), self.stat.tdir);
     }
 
-    /// C syncTargetPosition (4414-4458). A failed RDBL read leaves the
-    /// readbacks as they were and syncs the targets to them anyway.
+    /// C syncTargetPosition (4414-4458): the readback chain re-derived
+    /// (with no initcall gate on RDBL), then the targets synced to it. A
+    /// failed RDBL read leaves the readbacks as they were and syncs the
+    /// targets to them anyway. DIFF and RDIF wait for the next callback.
     pub(crate) fn sync_target_position(&mut self) {
-        if !self.conv.ueip && self.conv.urip && self.conv.rdbl_error {
+        if !self.derive_readback(self.conv.urip) {
             println!(
                 "{}: syncTargetPosition: error reading RDBL link.",
                 self.trace.record()
             );
         }
-        self.sync_positions();
+        self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
         self.mark(m::RRBV | m::DRBV | m::RBV);
+        self.sync_targets();
     }
 
     /// Set a pending event for the next process() call.
@@ -537,9 +540,9 @@ impl MotorRecord {
     /// Fire the readback output link (RLNK) with the current RBV.
     ///
     /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
-    /// unconditionally just before `process_exit` on every process pass, so a
-    /// record wired through RLNK re-processes whenever the motor record does.
-    /// We mirror that by emitting a `WriteDbLink` on every process cycle,
+    /// just before `process_exit` on every pass that does not jump there, so
+    /// a record wired through RLNK re-processes whenever the motor record
+    /// does. We mirror that by emitting a `WriteDbLink` on every such cycle,
     /// including the move-start (DMOV 1→0) pass: C fires
     /// `dbPutLink` before `monitor()` (motorRecord.cc:1507) and before the
     /// `recGblFwdLink` gate (motorRecord.cc:1509), so it runs even while the
@@ -628,7 +631,9 @@ impl Record for MotorRecord {
         // it put-notify completion, waits for DMOV (should_fire_forward_link).
         self.internal.monitor_due = true;
         let mut outcome = ProcessOutcome::complete();
-        self.push_readback_link_write(&mut outcome.actions);
+        if !effects.process_exit {
+            self.push_readback_link_write(&mut outcome.actions);
+        }
         Ok(outcome)
     }
 
@@ -694,8 +699,8 @@ impl Record for MotorRecord {
     /// this cycle — the analogue of C inspecting
     /// `RTN_SUCCESS(dbGetLink(&pmr->rdbl, ...))` in `process_motor_info`
     /// (motorRecord.cc:3687-3698). A failed RDBL read latches
-    /// `rdbl_error`; the completion/planner paths stop an in-flight
-    /// motion and refuse new ones while it is set.
+    /// `rdbl_error`; while it is set, process_motor_info stops an
+    /// in-flight motion and the planner refuses new ones.
     ///
     /// The report is C's status, so every RDBL form C calls successful is
     /// present in it — an empty link and a constant one included
@@ -1491,6 +1496,7 @@ mod tests {
     #[test]
     fn test_flnk_fires_on_motion_completion_transition() {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         // Enter a move: DMOV goes true→false.
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));

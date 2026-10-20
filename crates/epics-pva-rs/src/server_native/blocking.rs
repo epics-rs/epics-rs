@@ -185,6 +185,7 @@ use super::search_engine::{
 #[cfg(not(epics_embedded_target))]
 use super::search_engine::{SearchListeners, ServerInterfaces, local_v4_addrs};
 use super::serv_iface::ServListeners;
+use super::shared_pv::SharedSource;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
@@ -669,6 +670,7 @@ pub(super) fn serve_connection_blocking(
 pub struct BlockingPvaServer {
     listeners: ServListeners,
     source: DynSource,
+    builtin: Arc<SharedSource>,
     config: PvaServerConfig,
     peers: Arc<PeerRegistry>,
     channel_invalidator: ChannelInvalidator,
@@ -733,13 +735,20 @@ impl BlockingPvaServer {
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        Self::from_listeners(ServListeners::bind(addr, &config)?, source, config)
+        Self::from_listeners(
+            ServListeners::bind(addr, &config)?,
+            source,
+            Arc::new(SharedSource::new()),
+            config,
+        )
     }
 
-    /// [`bind`](Self::bind) on listeners bound already.
+    /// [`bind`](Self::bind) on listeners bound already, serving the bound
+    /// `__builtin` store.
     pub(crate) fn from_listeners(
         listeners: ServListeners,
         source: DynSource,
+        builtin: Arc<SharedSource>,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
         // One GUID per server, stamped here for the same reason the hosted
@@ -765,8 +774,9 @@ impl BlockingPvaServer {
         // `PvaServer::start` performs — this driver used to bind the user
         // source directly, which left it with no server meta-channel and made
         // `pvxlist`/`pvlist-rs` fail against an otherwise healthy server.
-        let source = crate::server_native::server_info::compose_with_server_info(source)
-            .map_err(io::Error::other)?;
+        let source =
+            crate::server_native::server_info::compose_with_server_info(source, builtin.clone())
+                .map_err(io::Error::other)?;
         // Same wiring the hosted single-listener path does at
         // `accept.rs:69-70`: the source needs the handle to force-disconnect
         // downstream channels out of band. Applied to the COMPOSITE, as
@@ -785,6 +795,7 @@ impl BlockingPvaServer {
         Ok(Self {
             listeners,
             source,
+            builtin,
             config,
             peers: PeerRegistry::new(),
             channel_invalidator,
@@ -824,6 +835,11 @@ impl BlockingPvaServer {
     /// The served source, `__server` composed in.
     pub fn source(&self) -> &DynSource {
         &self.source
+    }
+
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`.
+    pub fn builtin(&self) -> &Arc<SharedSource> {
+        &self.builtin
     }
 
     /// Connections currently being served.
@@ -2666,7 +2682,7 @@ pub(super) mod tests {
     struct GatedSource(tokio::sync::watch::Sender<bool>);
 
     impl crate::server_native::ChannelSource for GatedSource {
-        async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+        fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
             Vec::new()
         }
         async fn has_pv(&self, _: &[u8]) -> bool {

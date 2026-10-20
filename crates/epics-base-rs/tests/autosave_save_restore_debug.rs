@@ -32,7 +32,9 @@ async fn child_debug() {
         .startup_script(script.to_str().unwrap())
         .run(|config| async move {
             let mgr = config.autosave_manager.unwrap();
-            sleep(Duration::from_secs(2)).await;
+            // The script's lines after iocInit run, and queue their ops.
+            epics_base_rs::server::db_server::announce_serving("probe");
+            sleep(Duration::from_secs(3)).await;
             mgr.shutdown();
             Ok(())
         })
@@ -40,9 +42,16 @@ async fn child_debug() {
         .unwrap();
 }
 
-/// The child's stdout lines that start `save_restore` or `manual_save`,
-/// `dir` written `DIR` and a pointer written `ADDR`.
+/// The child's stdout lines that start `save_restore` or `manual_save`.
 fn traces(level: i32) -> Vec<String> {
+    stdout_lines(level)
+        .into_iter()
+        .filter(|l| l.starts_with("save_restore") || l.starts_with("manual_save"))
+        .collect()
+}
+
+/// The child's stdout, `dir` written `DIR` and a pointer written `ADDR`.
+fn stdout_lines(level: i32) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     std::fs::create_dir_all(d.join("req")).unwrap();
@@ -62,6 +71,7 @@ fn traces(level: i32) -> Vec<String> {
          fdbrestore(\"s.sav\")\n\
          create_monitor_set(\"s.req\", 5, \"P=B\")\n\
          remove_data_set(\"s.req\")\n\
+         epicsThreadSleep(1.5)\n\
          create_monitor_set(\"s.req\", 5, \"P=B\")\n",
         d = d.display()
     );
@@ -84,7 +94,6 @@ fn traces(level: i32) -> Vec<String> {
     };
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|l| l.starts_with("save_restore") || l.starts_with("manual_save"))
         .map(|l| clean(l, d))
         .collect()
 }
@@ -131,12 +140,46 @@ fn debug_5_adds_the_list_and_restore_traces() {
         "save_restore:concatenate_paths: dest='DIR/sav/s.sav'",
         "save_restore:request_manual_restore: entry",
         "save_restore:do_manual_restore: entry for file 's.sav'",
-        "save_restore:do_manual_restore: PVname='A'",
     ] {
         assert!(has(&lines, line), "{line}: {lines:#?}");
     }
     assert!(
         !lines.iter().any(|l| l.contains("connect_list: channel")),
+        "{lines:#?}"
+    );
+    // `s.sav` is the list's last save file, so C restores the fetched
+    // values and reads no file.
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("do_manual_restore: PVname=")),
+        "{lines:#?}"
+    );
+}
+
+/// C's task prints `save_restoreShow(1)` before its last line when Debug is
+/// set (save_restore.c:1263-1266); the shutdown flag is already up, so no
+/// member is listed.
+#[test]
+fn the_task_shows_its_lists_as_it_exits() {
+    let lines = stdout_lines(2);
+    let begin = lines.iter().rposition(|l| l == "BEGIN save_restoreShow");
+    let end = lines.iter().rposition(|l| l == "END save_restoreShow");
+    let (Some(begin), Some(end)) = (begin, end) else {
+        panic!("{lines:#?}");
+    };
+    assert_eq!(lines[end + 1], "save_restore: exiting", "{lines:#?}");
+    let show = &lines[begin..end];
+    assert!(show.contains(&"  Debug level: 2".to_string()), "{show:#?}");
+    assert!(show.contains(&"  s.req: ".to_string()), "{show:#?}");
+    assert!(!show.iter().any(|l| l.starts_with('\t')), "{show:#?}");
+}
+
+#[test]
+fn debug_0_exits_without_the_show() {
+    let lines = stdout_lines(0);
+    assert!(
+        !lines.iter().any(|l| l.contains("save_restoreShow")),
         "{lines:#?}"
     );
 }

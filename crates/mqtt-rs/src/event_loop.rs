@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,9 +11,9 @@ use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use rumqttc::{
-    AsyncClient, ClientError, ConnectionError, Event, Incoming, MqttOptions, Outgoing,
-    PubAckReason, PubCompReason, PublishNoticeError, PublishOptions, PublishResult, SubAck,
-    SubscribeNoticeError, SubscribeReasonCode,
+    AsyncClient, ClientError, ConnectionError, Event, Incoming, MqttOptions, Outgoing, Packet,
+    PubAckReason, PubCompReason, PubRecReason, PublishNoticeError, PublishOptions, PublishResult,
+    SubAck, SubscribeNoticeError, SubscribeReasonCode,
 };
 use socket2::{Domain, Socket, Type};
 use tokio::sync::{Notify, mpsc};
@@ -84,9 +84,8 @@ pub async fn mqtt_event_loop(
     // paho's `connectTimeout` in C's v5 connect options (MQTTAsync.h:1394).
     mqttoptions.set_connect_timeout(Duration::from_secs(30));
 
-    // Unbounded, as paho's command queue is: the ConnAck arm queues one
-    // SUBSCRIBE per bound topic from the task that drains the channel, so a
-    // bound refused every topic past it.
+    // Unbounded: `Commands` hands with `try_`, also from the task that drains
+    // the channel, and the exit hands everything still waiting at once.
     let (client, mut eventloop) = AsyncClient::builder(mqttoptions).unbounded().build();
 
     // `EventLoop::poll()` is not cancel-safe (rumqttc internal iterators can be
@@ -95,12 +94,8 @@ pub async fn mqtt_event_loop(
     // forwarded on a dedicated task, and the main loop only awaits `poll()`.
     let (acks, ack_rx) = mpsc::unbounded_channel();
     tokio::spawn(ack_task(ack_rx, port_handle.clone()));
-    tokio::spawn(publish_task(
-        client.clone(),
-        publish_rx,
-        acks.clone(),
-        port_handle.clone(),
-    ));
+    let commands = Commands::new(client.clone(), acks.clone(), port_handle.clone());
+    tokio::spawn(publish_task(commands.clone(), publish_rx));
 
     // MQ4 shutdown. C's `~MqttClient` calls `disconnect()`
     // (mqttClient.cpp:37-41), which sends a DISCONNECT and waits for the packet
@@ -130,10 +125,12 @@ pub async fn mqtt_event_loop(
         let flag = shutting_down.clone();
         let dc = client.clone();
         let abort = abort.clone();
+        let commands = commands.clone();
         tokio::spawn(async move {
             shutdown.notified().await;
             flag.store(true, Ordering::Release);
             abort.notify_one();
+            commands.close();
             let _ = dc.disconnect_now().await;
         });
     }
@@ -183,6 +180,7 @@ pub async fn mqtt_event_loop(
                     );
                     mark_connected(&port_handle, connected_param, &connected).await;
                     session = Session::Up;
+                    commands.session_up(None);
                 }
                 // v5 Publish.topic is raw bytes; a declared topic_map key (the
                 // asyn drvInfo) is UTF-8 text, so a non-UTF-8 topic can never
@@ -201,7 +199,7 @@ pub async fn mqtt_event_loop(
                     ),
                 }
             }
-            Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+            Ok(Event::Incoming(Incoming::ConnAck(connack))) => {
                 mark_connected(&port_handle, connected_param, &connected).await;
                 backoff.connected();
                 if session == Session::Spent {
@@ -212,6 +210,15 @@ pub async fn mqtt_event_loop(
                     );
                 }
                 session = Session::Up;
+                // paho's `maxInflightMessages`: 65535 in C's v5 connect options
+                // (MQTTAsync.h:1394), lowered to the broker's Receive Maximum
+                // (MQTTAsyncUtils.c:2199-2206).
+                commands.session_up(Some(
+                    connack
+                        .properties
+                        .and_then(|p| p.receive_max)
+                        .unwrap_or(u16::MAX),
+                ));
                 asyn_print(
                     &port_handle,
                     TraceMask::IO_DRIVER,
@@ -227,8 +234,23 @@ pub async fn mqtt_event_loop(
                     &port_handle.interrupts().subscribed_bindings(),
                 );
                 for topic in sub_topics {
-                    subscribe(&client, &acks, &port_handle, topic, config.qos.into());
+                    commands.push(Command::Subscribe {
+                        topic,
+                        qos: config.qos.into(),
+                    });
                 }
+            }
+            Ok(Event::Outgoing(Outgoing::Publish(pkid))) => commands.written(pkid != 0),
+            Ok(Event::Outgoing(Outgoing::Subscribe(_))) => commands.written(false),
+            // rumqttc's `inflight -= 1` (state.rs:1805, :1853, :1924).
+            Ok(Event::Incoming(Incoming::PubAck(_) | Incoming::PubComp(_))) => commands.acked(),
+            Ok(Event::Incoming(Incoming::PubRec(rec)))
+                if !matches!(
+                    rec.reason,
+                    PubRecReason::Success | PubRecReason::NoMatchingSubscribers
+                ) =>
+            {
+                commands.acked()
             }
             Ok(Event::Incoming(Incoming::PingResp)) => {
                 if session != Session::Up {
@@ -237,6 +259,7 @@ pub async fn mqtt_event_loop(
                     );
                     mark_connected(&port_handle, connected_param, &connected).await;
                     session = Session::Up;
+                    commands.session_up(None);
                 }
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
@@ -245,7 +268,9 @@ pub async fn mqtt_event_loop(
             }
             Err(e) => {
                 // rumqttc ends the connection on every error. paho fails what
-                // the session owed before `connectionLost` reports the loss.
+                // the session owed before `connectionLost` reports the loss,
+                // and keeps what it had not yet written.
+                commands.session_down();
                 end_session(&acks).await;
                 // A shutdown with the session already down: C sends nothing at
                 // all (`if (client_.is_connected())`, mqttClient.cpp:52), so
@@ -260,24 +285,23 @@ pub async fn mqtt_event_loop(
                     backoff.failed(Instant::now())
                 };
                 // C reports the loss of a live session from `onDisconnectCb`
-                // (drvMqtt.cpp:219-220) and a failed attempt of the initHook
-                // connect from `onFailCb` (drvMqtt.cpp:234-235). The rumqttc
-                // error is kept: its variant tells a network failure from a
-                // state error.
+                // (drvMqtt.cpp:219-220), with no cause, and a failed attempt of
+                // the initHook connect from `onFailCb` (drvMqtt.cpp:234-235).
                 match session {
                     Session::Up => {
                         asyn_print(
                             &port_handle,
                             TraceMask::ERROR,
                             format_args!(
-                                "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})\n"
+                                "MqttDriver::onDisconnectCb: Connection lost. Reconnecting...\n"
                             ),
                         );
                         session = Session::Spent;
                     }
                     Session::Booting => {
-                        print_fail(&port_handle, &e.to_string());
-                        if !dispatch_failure(&e) {
+                        let failure = ConnectFailure::of(&e);
+                        print_fail(&port_handle, failure.text());
+                        if failure != ConnectFailure::Dispatch {
                             session = Session::Spent;
                         }
                     }
@@ -444,34 +468,241 @@ fn print_fail(port_handle: &PortHandle, e: &str) {
     asyn_print(
         port_handle,
         TraceMask::ERROR,
-        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'\n"),
+        // paho's `errorMsg` ends in '\n' (mqttClient.cpp:167).
+        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}\n'\n"),
     );
 }
 
-/// Queue one SUBSCRIBE and hand its notice to [`ack_task`].
-/// `try_`: this runs on the task that drives `poll()`, which is what drains
-/// the request channel.
-fn subscribe(
-    client: &AsyncClient,
-    acks: &mpsc::UnboundedSender<AckRequest>,
-    port_handle: &PortHandle,
-    topic: String,
-    qos: rumqttc::QoS,
-) {
-    match client.try_subscribe_tracked(topic.as_str(), qos) {
-        Ok(notice) => {
-            let _ = acks.send(AckRequest::Owe(Owed {
-                ack: Box::pin(async move { subscribe_line(&notice.wait_async().await) }),
-                success: format!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'\n"),
-            }));
+/// One SUBSCRIBE or PUBLISH the IOC asked for.
+enum Command {
+    Subscribe { topic: String, qos: rumqttc::QoS },
+    Publish(PublishRequest),
+}
+
+impl Command {
+    fn flow_controlled(&self) -> bool {
+        match self {
+            Self::Subscribe { .. } => true,
+            Self::Publish(p) => p.qos != crate::config::QoS::AtMostOnce,
         }
-        Err(e) => {
-            let e = match e {
-                ClientError::InvalidRequest(_) => format!("invalid topic filter {topic}"),
-                e => e.to_string(),
+    }
+}
+
+/// paho's `MQTTAsync_commands` for this client. paho writes a command only
+/// with the session up and keeps an unwritten one over a loss for the next
+/// session (MQTTAsyncUtils.c:1248-1250); only what it wrote fails with the
+/// session (:1902-1938). rumqttc fails every request it holds when a clean
+/// session starts, so it is handed one command at a time: the next goes once
+/// rumqttc yields the last one's `Outgoing` event, and the rest wait here.
+#[derive(Clone)]
+struct Commands(Arc<CommandsInner>);
+
+struct CommandsInner {
+    client: AsyncClient,
+    acks: mpsc::UnboundedSender<AckRequest>,
+    port_handle: PortHandle,
+    queue: std::sync::Mutex<CommandQueue>,
+}
+
+struct CommandQueue {
+    waiting: VecDeque<Command>,
+    /// The handed command rumqttc has not written yet, by its number.
+    held: Option<u64>,
+    handed: u64,
+    /// QoS 1/2 publishes written and not yet acked: paho's `outboundMsgs`.
+    inflight: u16,
+    /// paho's `maxInflightMessages`.
+    window: u16,
+    up: bool,
+    /// The driver is going: what waits is handed at once, or fails.
+    closing: bool,
+}
+
+impl Commands {
+    fn new(
+        client: AsyncClient,
+        acks: mpsc::UnboundedSender<AckRequest>,
+        port_handle: PortHandle,
+    ) -> Self {
+        Self(Arc::new(CommandsInner {
+            client,
+            acks,
+            port_handle,
+            queue: std::sync::Mutex::new(CommandQueue {
+                waiting: VecDeque::new(),
+                held: None,
+                handed: 0,
+                inflight: 0,
+                window: u16::MAX,
+                up: false,
+                closing: false,
+            }),
+        }))
+    }
+
+    fn push(&self, command: Command) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.waiting.push_back(command);
+        self.feed(&mut queue);
+    }
+
+    /// rumqttc wrote the held command, a QoS 1/2 publish if `inflight`.
+    fn written(&self, inflight: bool) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.held = None;
+        if inflight {
+            queue.inflight += 1;
+        }
+        self.feed(&mut queue);
+    }
+
+    /// The broker ended a QoS 1/2 publish's flow.
+    fn acked(&self) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.inflight = queue.inflight.saturating_sub(1);
+        self.feed(&mut queue);
+    }
+
+    /// rumqttc refused command `n` without writing it, so no `Outgoing` event
+    /// will release it.
+    fn refused(&self, n: u64) {
+        let mut queue = self.0.queue.lock().unwrap();
+        if queue.held == Some(n) {
+            queue.held = None;
+            self.feed(&mut queue);
+        }
+    }
+
+    /// A session is up, with the broker's window if a ConnAck brought it.
+    fn session_up(&self, window: Option<u16>) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.up = true;
+        if let Some(window) = window {
+            queue.window = window;
+        }
+        self.feed(&mut queue);
+    }
+
+    /// The held command ends with the session; its ack is owed to
+    /// [`ack_task`], which fails it. What waits stays for the next session.
+    fn session_down(&self) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.up = false;
+        queue.held = None;
+        queue.inflight = 0;
+    }
+
+    /// `~MqttClient`: paho sends what it queued ahead of the DISCONNECT
+    /// (MQTTAsyncUtils.c:803-830) and fails what it never could
+    /// (`MQTTAsync_freeCommands`, :1950-1990).
+    fn close(&self) {
+        let mut queue = self.0.queue.lock().unwrap();
+        queue.closing = true;
+        self.feed(&mut queue);
+    }
+
+    /// Hand the head of the queue on while rumqttc can write it at once.
+    /// paho's flow control holds a QoS 1/2 PUBLISH or a SUBSCRIBE at the head
+    /// while the window is full (MQTTAsyncUtils.c:1252-1262); rumqttc's
+    /// holds the publish alone, unwritten, where the loss would fail it.
+    fn feed(&self, queue: &mut CommandQueue) {
+        while queue.closing || (queue.up && queue.held.is_none()) {
+            let Some(head) = queue.waiting.front() else {
+                return;
             };
-            print_fail(port_handle, &e);
+            if !queue.closing && head.flow_controlled() && queue.inflight >= queue.window {
+                return;
+            }
+            let Some(command) = queue.waiting.pop_front() else {
+                return;
+            };
+            if !queue.up {
+                print_fail(&self.0.port_handle, "");
+                continue;
+            }
+            queue.handed += 1;
+            if self.hand(command, queue.handed) {
+                queue.held = Some(queue.handed);
+            }
         }
+    }
+
+    /// Hand `command` to rumqttc as number `n` and its notice to
+    /// [`ack_task`]. `try_`: the event loop task feeds too, and it is what
+    /// drains the request channel.
+    fn hand(&self, command: Command, n: u64) -> bool {
+        let CommandsInner {
+            client,
+            acks,
+            port_handle,
+            ..
+        } = &*self.0;
+        let commands = Arc::downgrade(&self.0);
+        let refused = move || {
+            if let Some(inner) = commands.upgrade() {
+                Commands(inner).refused(n);
+            }
+        };
+        let owed = match command {
+            Command::Subscribe { topic, qos } => {
+                match client.try_subscribe_tracked(topic.as_str(), qos) {
+                    Ok(notice) => Owed {
+                        ack: Box::pin(async move {
+                            let result = notice.wait_async().await;
+                            if matches!(result, Err(SubscribeNoticeError::BrokerOnlySessionResume))
+                            {
+                                refused();
+                            }
+                            subscribe_line(&result)
+                        }),
+                        success: format!(
+                            "MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'\n"
+                        ),
+                    },
+                    Err(e) => {
+                        let e = match e {
+                            ClientError::InvalidRequest(_) => {
+                                format!("invalid topic filter {topic}")
+                            }
+                            e => e.to_string(),
+                        };
+                        print_fail(port_handle, &e);
+                        return false;
+                    }
+                }
+            }
+            Command::Publish(PublishRequest {
+                topic,
+                payload,
+                qos,
+                retained,
+            }) => {
+                let options = PublishOptions::new(qos.into()).retain(retained);
+                // The owned `Vec<u8>` carries raw non-UTF-8 octet bytes through.
+                match client.try_publish_tracked(topic.as_str(), payload, options) {
+                    Ok(notice) => Owed {
+                        ack: Box::pin(async move {
+                            let result = notice.wait_async().await;
+                            if matches!(
+                                result,
+                                Err(PublishNoticeError::RetainNotSupported
+                                    | PublishNoticeError::BrokerOnlySessionResume)
+                            ) {
+                                refused();
+                            }
+                            publish_line(&result)
+                        }),
+                        success: format!("MqttDriver::onPublishCb: Published to topic '{topic}'\n"),
+                    },
+                    Err(e) => {
+                        print_fail(port_handle, &e.to_string());
+                        return false;
+                    }
+                }
+            }
+        };
+        let _ = acks.send(AckRequest::Owe(owed));
+        true
     }
 }
 
@@ -491,28 +722,71 @@ enum Session {
     Spent,
 }
 
-/// A connect failure paho meets while it dispatches the CONNECT, before the
-/// TCP connect is in flight: the address lookup, `socket()`, or a
-/// non-blocking `connect()` that fails at once (Socket.c:1194-1279).
-#[derive(Debug)]
-struct DispatchFailure(io::Error);
+/// How paho reports a failed initHook connect through `onFailure5`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectFailure {
+    /// Met while `MQTTAsync_processCommand` dispatches the CONNECT: no
+    /// message, and the token stays for the retry (MQTTAsyncUtils.c:1574-1626).
+    Dispatch,
+    /// Met by `nextOrClose`, which nulls the token (:1685-1712), with the
+    /// message of the site that called it.
+    Closed(&'static str),
+}
 
-impl std::fmt::Display for DispatchFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+impl ConnectFailure {
+    fn of(e: &ConnectionError) -> Self {
+        Self::Closed(match e {
+            ConnectionError::Io(io) => {
+                match io.get_ref().and_then(|e| e.downcast_ref::<TcpFailure>()) {
+                    Some(TcpFailure::Dispatch(_)) => return Self::Dispatch,
+                    // `MQTTAsync_connecting`'s `SO_ERROR` (:3055-3063, :3051).
+                    Some(TcpFailure::Completion(_)) => "TCP/TLS connect failure",
+                    None => "TCP connect completion failure",
+                }
+            }
+            ConnectionError::Timeout(_) => "TCP connect timeout",
+            ConnectionError::ConnectionRefused(_) => "CONNACK return code",
+            ConnectionError::NotConnAck(p) if matches!(**p, Packet::Disconnect(_)) => {
+                "Received disconnect"
+            }
+            // What the CONNACK wait read was no CONNACK (:3095-3099).
+            _ => "TCP connect completion failure",
+        })
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Dispatch => "",
+            Self::Closed(message) => message,
+        }
     }
 }
 
-impl std::error::Error for DispatchFailure {}
-
-fn dispatch_failure(e: &ConnectionError) -> bool {
-    matches!(e, ConnectionError::Io(e) if e.get_ref().is_some_and(|e| e.is::<DispatchFailure>()))
+/// Where [`paho_connect`]'s TCP connect failed.
+#[derive(Debug)]
+enum TcpFailure {
+    /// Before the connect is in flight: the address lookup, `socket()`, or a
+    /// non-blocking `connect()` that fails at once (Socket.c:1194-1279).
+    Dispatch(io::Error),
+    /// The in-flight connect's completion.
+    Completion(io::Error),
 }
+
+impl std::fmt::Display for TcpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dispatch(e) | Self::Completion(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TcpFailure {}
 
 /// paho's `Socket_new`: the first IPv4 address, else the last one, and one
 /// non-blocking `connect()` (Socket.c:1194-1279).
 async fn paho_connect(host: String) -> io::Result<tokio::net::TcpStream> {
-    let dispatch = |e: io::Error| io::Error::new(e.kind(), DispatchFailure(e));
+    let dispatch = |e: io::Error| io::Error::new(e.kind(), TcpFailure::Dispatch(e));
+    let completion = |e: io::Error| io::Error::new(e.kind(), TcpFailure::Completion(e));
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(host)
         .await
         .map_err(dispatch)?
@@ -530,10 +804,10 @@ async fn paho_connect(host: String) -> io::Result<tokio::net::TcpStream> {
     {
         return Err(dispatch(e));
     }
-    let stream = tokio::net::TcpStream::from_std(socket.into())?;
-    stream.writable().await?;
-    match stream.take_error()? {
-        Some(e) => Err(e),
+    let stream = tokio::net::TcpStream::from_std(socket.into()).map_err(completion)?;
+    stream.writable().await.map_err(completion)?;
+    match stream.take_error().map_err(completion)? {
+        Some(e) => Err(completion(e)),
         None => Ok(stream),
     }
 }
@@ -632,38 +906,12 @@ async fn mark_connected(port_handle: &PortHandle, connected_param: usize, connec
         .await;
 }
 
-/// Forward publish requests from EPICS writes into rumqttc's command channel.
-/// Runs on its own task so the main event-loop task can own `poll()`
-/// exclusively without cancel-safety hazards.
-async fn publish_task(
-    client: AsyncClient,
-    mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
-    acks: mpsc::UnboundedSender<AckRequest>,
-    port_handle: PortHandle,
-) {
+/// Queue the publish requests of EPICS writes as [`Commands`]. Runs on its
+/// own task so the main event-loop task can own `poll()` exclusively without
+/// cancel-safety hazards.
+async fn publish_task(commands: Commands, mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>) {
     while let Some(req) = publish_rx.recv().await {
-        let PublishRequest {
-            topic,
-            payload,
-            qos,
-            retained,
-        } = req;
-        let options = PublishOptions::new(qos.into()).retain(retained);
-        // v5 publish wants `P: Into<Bytes>`; the owned `Vec<u8>` payload
-        // satisfies it directly (no borrow held across the await), carrying raw
-        // non-UTF-8 octet bytes through unchanged.
-        match client
-            .publish_tracked(topic.as_str(), payload, options)
-            .await
-        {
-            Ok(notice) => {
-                let _ = acks.send(AckRequest::Owe(Owed {
-                    ack: Box::pin(async move { publish_line(&notice.wait_async().await) }),
-                    success: format!("MqttDriver::onPublishCb: Published to topic '{topic}'\n"),
-                }));
-            }
-            Err(e) => print_fail(&port_handle, &e.to_string()),
-        }
+        commands.push(Command::Publish(req));
     }
 }
 
@@ -928,7 +1176,7 @@ async fn handle_incoming_message(
     if !batch_updates.is_empty()
         && let Err(e) = port_handle.set_params_and_notify(0, batch_updates).await
     {
-        eprintln!("set_params_and_notify error (mqtt payload): {e}");
+        epics_libcom_rs::stderr_println!("set_params_and_notify error (mqtt payload): {e}");
     }
 }
 
@@ -1381,7 +1629,7 @@ mod tests {
     const CONNACK_ARM_DONE: &str = "onConnectCb: Connected to broker";
 
     /// An event loop for a broker at `addr`, its port tracing ERROR and
-    /// IO_DRIVER into `file`, started.
+    /// IO_DRIVER into `file`, started, and the driver's publish channel.
     fn spawn_traced_loop(
         port: &str,
         addr: SocketAddr,
@@ -1389,6 +1637,7 @@ mod tests {
     ) -> (
         asyn_rs::runtime::port::PortRuntimeHandle,
         tokio::task::JoinHandle<()>,
+        mpsc::UnboundedSender<PublishRequest>,
     ) {
         use asyn_rs::runtime::config::RuntimeConfig;
         use asyn_rs::services::PortServices;
@@ -1407,7 +1656,7 @@ mod tests {
             port,
             &config,
             Vec::new(),
-            publish_tx,
+            publish_tx.clone(),
             connected.clone(),
         );
         let topic_map = driver.topic_map();
@@ -1450,7 +1699,7 @@ mod tests {
             .await;
         });
         start.notify_one();
-        (runtime, ev)
+        (runtime, ev, publish_tx)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1484,7 +1733,7 @@ mod tests {
                 std::fs::read_to_string(path).unwrap()
             );
         }
-        let (runtime, ev) = spawn_traced_loop("MQEDGE", addr, file);
+        let (runtime, ev, _) = spawn_traced_loop("MQEDGE", addr, file);
 
         // The first failed attempt is reported, the retries are not.
         wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
@@ -1536,6 +1785,26 @@ mod tests {
         );
         assert_eq!(n("Connection lost"), 1, "{text}");
         assert_eq!(n("Operation error"), 1, "{text}");
+        // C names no cause (drvMqtt.cpp:219-220).
+        assert!(
+            text.lines().any(
+                |l| l.ends_with("MqttDriver::onDisconnectCb: Connection lost. Reconnecting...")
+            ),
+            "{text}"
+        );
+        // paho's error text ends in '\n' (mqttClient.cpp:167), so C's closing
+        // quote opens the next line.
+        let fail = text
+            .lines()
+            .position(|l| l.contains("onFailCb: MQTT Operation error: 'Error: "))
+            .unwrap();
+        assert!(
+            text.lines().nth(fail).unwrap().ends_with(
+                "MqttDriver::onFailCb: MQTT Operation error: 'Error: TCP/TLS connect failure"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.lines().nth(fail + 1), Some("'"), "{text}");
 
         runtime.shutdown();
         assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
@@ -1602,7 +1871,7 @@ mod tests {
         let addr = port.addr;
         let (reader, writer) = std::io::pipe().unwrap();
         let mut filler = writer.try_clone().unwrap();
-        let (runtime, ev) =
+        let (runtime, ev, _) =
             spawn_traced_loop("MQHOLD", addr, std::os::fd::OwnedFd::from(writer).into());
 
         // The refused boot connect spends the token, so the ConnAck after the
@@ -1637,6 +1906,56 @@ mod tests {
             .await
             .expect("event loop did not exit")
             .unwrap();
+    }
+
+    /// One failure per site that hands paho's connect token its message.
+    #[tokio::test]
+    async fn a_boot_connect_failure_carries_paho_s_message() {
+        let tcp = |f: fn(io::Error) -> TcpFailure| {
+            let e = io::Error::from(io::ErrorKind::ConnectionRefused);
+            ConnectionError::Io(io::Error::new(e.kind(), f(e)))
+        };
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let disconnect = rumqttc::Disconnect {
+            reason_code: rumqttc::DisconnectReasonCode::NormalDisconnection,
+            properties: None,
+        };
+        let cases = [
+            (tcp(TcpFailure::Dispatch), ""),
+            (tcp(TcpFailure::Completion), "TCP/TLS connect failure"),
+            (
+                ConnectionError::Io(io::ErrorKind::ConnectionReset.into()),
+                "TCP connect completion failure",
+            ),
+            (
+                ConnectionError::MqttState(rumqttc::StateError::ConnectionAborted),
+                "TCP connect completion failure",
+            ),
+            (ConnectionError::Timeout(elapsed), "TCP connect timeout"),
+            (
+                ConnectionError::ConnectionRefused(rumqttc::ConnectReturnCode::NotAuthorized),
+                "CONNACK return code",
+            ),
+            (
+                ConnectionError::NotConnAck(Box::new(Packet::Disconnect(disconnect))),
+                "Received disconnect",
+            ),
+            (
+                ConnectionError::NotConnAck(Box::new(Packet::PingResp)),
+                "TCP connect completion failure",
+            ),
+        ];
+        for (e, text) in cases {
+            let failure = ConnectFailure::of(&e);
+            assert_eq!(failure.text(), text, "{e:?}");
+            assert_eq!(
+                failure == ConnectFailure::Dispatch,
+                text.is_empty(),
+                "{e:?}"
+            );
+        }
     }
 
     /// A connect that fails while paho dispatches it keeps the token's
@@ -1970,7 +2289,7 @@ mod tests {
 
         let log = || std::fs::read_to_string(&path).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !log().contains("MqttDriver::onFailCb: MQTT Operation error: 'Error: '") {
+            while !log().contains("MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'") {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -2153,7 +2472,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
 
         const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
-        const FAIL: &str = "MqttDriver::onFailCb: MQTT Operation error: 'Error: '";
+        const FAIL: &str = "MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = MqttConfig {
@@ -2401,6 +2720,87 @@ mod tests {
             .await
             .expect("event loop did not exit")
             .unwrap();
+    }
+
+    /// With Receive Maximum 1 and `a` unacked, `b` and `c` wait unwritten.
+    /// The loss fails `a` alone; paho sends `b` and `c` in the next session
+    /// (MQTTAsyncUtils.c:1248-1262, :1902-1938).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loss_keeps_the_publishes_not_yet_written() {
+        use tokio::io::AsyncWriteExt;
+
+        // CONNACK with one property: Receive Maximum (0x21) = 1.
+        const CONNACK: [u8; 8] = [0x20, 0x06, 0x00, 0x00, 0x03, 0x21, 0x00, 0x01];
+        const FAIL: &str = "MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'";
+        let port = BrokerPort::new();
+        let path = std::env::temp_dir().join(format!("mqkeep-{}.log", std::process::id()));
+        let (runtime, ev, publish) =
+            spawn_traced_loop("MQKEEP", port.addr, std::fs::File::create(&path).unwrap());
+        let log = || std::fs::read_to_string(&path).unwrap();
+        /// The topic of a PUBLISH, and its PUBACK.
+        async fn read_publish(sock: &mut tokio::net::TcpStream) -> (String, [u8; 4]) {
+            let (kind, body) = tokio::time::timeout(Duration::from_secs(10), read_packet(sock))
+                .await
+                .expect("no PUBLISH")
+                .unwrap();
+            assert_eq!(kind, 3, "PUBLISH");
+            let len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+            let topic = String::from_utf8(body[2..2 + len].to_vec()).unwrap();
+            (topic, [0x40, 0x02, body[2 + len], body[3 + len]])
+        }
+
+        let listener = port.listen();
+        let mut sock = accept_connect(&listener).await;
+        sock.write_all(&CONNACK).await.unwrap();
+        for topic in ["dev/a", "dev/b", "dev/c"] {
+            publish
+                .send(PublishRequest {
+                    topic: topic.into(),
+                    payload: b"1".to_vec(),
+                    qos: crate::config::QoS::AtLeastOnce,
+                    retained: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(read_publish(&mut sock).await.0, "dev/a");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), read_packet(&mut sock))
+                .await
+                .is_err(),
+            "a second PUBLISH inside Receive Maximum 1"
+        );
+        drop((listener, sock));
+
+        let listener = port.listen();
+        let mut sock = accept_connect(&listener).await;
+        sock.write_all(&CONNACK).await.unwrap();
+        for topic in ["dev/b", "dev/c"] {
+            let (sent, puback) = read_publish(&mut sock).await;
+            assert_eq!(sent, topic);
+            sock.write_all(&puback).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !log().contains("Published to topic 'dev/c'") {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("dev/c not acked in:\n{}", log()));
+
+        let text = log();
+        assert_eq!(text.matches(FAIL).count(), 1, "{text}");
+        assert!(
+            text.find(FAIL).unwrap() < text.find("Connection lost").unwrap(),
+            "{text}"
+        );
+        assert!(text.contains("Published to topic 'dev/b'"), "{text}");
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     /// C's exit disconnect does not wait for an unacknowledged QoS 1 flow:
@@ -2715,7 +3115,7 @@ mod tests {
         let log = || std::fs::read_to_string(&path).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !(log().contains("MqttDriver::onPublishCb: Published to topic 'dev/b'")
-                && log().contains("MqttDriver::onFailCb: MQTT Operation error: 'Error: '"))
+                && log().contains("MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'"))
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

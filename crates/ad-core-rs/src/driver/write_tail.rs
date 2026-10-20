@@ -19,6 +19,7 @@ use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, param_list};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// The list an override's own set and callbacks use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,15 +42,6 @@ pub struct WriteTail {
     pub error: &'static str,
     pub done: &'static str,
     pub list: OwnList,
-}
-
-/// C's `%f`.
-struct CFloat(f64);
-
-impl Display for CFloat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.6}", self.0)
-    }
 }
 
 impl WriteTail {
@@ -286,11 +278,21 @@ mod tests {
             tail.write_float64(&mut d, &mut user, 1.5, |_, _, s| s)
                 .is_err()
         );
+        assert!(
+            tail.write_float64(&mut d, &mut user, -f64::NAN, |_, _, s| s)
+                .is_err()
+        );
         let text = std::fs::read_to_string(&log).unwrap();
         let _ = std::fs::remove_file(&log);
         assert!(
             text.contains(&format!(
                 "drv:writeFloat64 error, status=8 function={int}, value=1.500000"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "drv:writeFloat64 error, status=8 function={int}, value=-nan\n"
             )),
             "{text}"
         );

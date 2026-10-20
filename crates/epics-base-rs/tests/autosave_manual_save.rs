@@ -41,11 +41,13 @@ fn outputs_of(dir: &Path, line: &str, with_set: bool) -> (Vec<String>, Vec<Strin
     let stdout = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.strip_prefix(prefix.as_str()).unwrap_or(l).to_owned())
+        // The task's first pass connects the list (save_restore.c:1308).
         .filter(|l| {
             !(l.is_empty()
                 || l == "ok"
                 || l.starts_with("running ")
-                || l.starts_with("test result"))
+                || l.starts_with("test result")
+                || l.ends_with(" PV's connected"))
         })
         .collect();
     let errlog = String::from_utf8_lossy(&out.stderr)
@@ -67,7 +69,7 @@ fn child_manual_save() {
     let db = Arc::new(PvDatabase::new());
     let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
     holder.lock().unwrap().save_file_path = Some(dir.clone());
-    rt.block_on(async {
+    let mgr = rt.block_on(async {
         db.add_record("A", Box::new(AoRecord::new(1.5)))
             .await
             .unwrap();
@@ -82,16 +84,20 @@ fn child_manual_save() {
                         request_pvs: Vec::new(),
                         backup: BackupConfig::default(),
                         macros: Default::default(),
-                        macro_string: String::new(),
+                        macro_string: None,
                         search_paths: vec![dir.clone()],
                     },
                     SaveStrategy::Manual,
                 )
                 .build()
                 .await;
-            holder.lock().unwrap().manager = Some(Arc::new(mgr));
+            let mgr = Arc::new(mgr);
+            holder.lock().unwrap().manager = Some(mgr.clone());
+            return Some(mgr);
         }
+        None
     });
+    let _task = mgr.clone().map(|m| m.start(db.clone()));
     let line = std::env::var(LINE).unwrap();
     let bridge = {
         let _guard = rt.enter();
@@ -109,27 +115,48 @@ fn child_manual_save() {
     })
     .join()
     .unwrap();
+    if let Some(mgr) = mgr {
+        rt.block_on(mgr.ops_served());
+    }
     epics_base_rs::runtime::log::errlog_flush();
 }
 
-/// The set's own `.sav` and `.savB` written as any save writes them
-/// (:2045-2047), and verified clean, which at verbose -1 prints nothing.
-/// C reports -1 here, "Couldn't make backup ''", because its "" name takes
-/// the configName path (:714, :2112-2124); that defect is not kept.
+/// C sends the nameless save's name as "" (save_restore.c:714), so
+/// write_save_file takes its configName path: no `.savB` check, a dated
+/// copy of an existing `.sav` (:2081-2092), then myFileCopy to that
+/// copy's name (:2112-2124). The first save has no copy, so its "" fails
+/// and the callback gets -1; later ones copy to the dated file and get 0.
 #[test]
-fn the_set_of_the_request_file_is_saved_and_verified() {
+fn the_set_of_the_request_file_is_saved_as_c_names_it() {
     let dir = tempfile::tempdir().unwrap();
-    let out = output_of(dir.path(), "manual_save(\"s.req\")", true);
-    let savb = format!(
-        "save_restore:write_save_file: Backup file ({}) bad or not found.  Writing a new one. [",
-        dir.path().join("s.savB").display()
+    let out = output_of(
+        dir.path(),
+        "manual_save(\"s.req\");manual_save(\"s.req\");manual_save(\"s.req\")",
+        true,
     );
-    assert_eq!(out.len(), 2, "{out:?}");
-    assert!(out[0].starts_with(&savb), "{out:?}");
-    assert_eq!(out[1], "save_restore:defaultCallback:status=0");
+    assert_eq!(out.len(), 5, "{out:?}");
+    assert!(
+        out[0].starts_with("save_restore:write_save_file - Couldn't make backup '' ["),
+        "{out:?}"
+    );
+    assert_eq!(out[1], "save_restore: write_save_file() failed for s.sav");
+    assert_eq!(
+        out[2..],
+        [
+            "save_restore:defaultCallback:status=-1",
+            "save_restore:defaultCallback:status=0",
+            "save_restore:defaultCallback:status=0",
+        ]
+    );
     let sav = std::fs::read_to_string(dir.path().join("s.sav")).unwrap();
     assert!(sav.lines().any(|l| l.starts_with("A ")), "{sav}");
-    assert!(dir.path().join("s.savB").exists());
+    assert!(!dir.path().join("s.savB").exists());
+    let dated = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("s.sav_"))
+        .count();
+    assert!(dated >= 1, "no dated copy");
 }
 
 /// No list has that request file: status -1 and no verify (:1213-1229).
@@ -153,6 +180,23 @@ fn the_refusals_are_cs() {
     assert_eq!(
         output_of(dir.path(), "manual_save(\"s.req\")", false),
         ["manual_save: message queue not initialized (no restore set has been created?)"]
+    );
+}
+
+/// With no `create_*_set` there is no queue: C's NULL opMsgQueue, which
+/// every sender but manual_save sends to and crashes on (save_restore.c:2874,
+/// :2847). Nothing runs in the shell instead.
+#[test]
+fn an_op_before_any_set_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("s.sav"), "# h\nA 3\n<END>\n").unwrap();
+    assert_eq!(
+        output_of(
+            dir.path(),
+            "asVerify(\"s.sav\", 0, \"\");fdbrestore(\"s.sav\")",
+            false
+        ),
+        ["save_restore:fdbrestore:entry"]
     );
 }
 

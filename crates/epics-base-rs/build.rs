@@ -86,10 +86,10 @@ fn main() {
 /// and [`build_timestamp`] is pure arithmetic that cannot fail. That is the
 /// invariant, and `misc_commands.rs` asserts it again at compile time.
 ///
-/// Cargo re-runs this script when a file in this package changes, where C's
-/// `FORCE` rule regenerates `epicsVCS.h` on every make, so a commit that
-/// touches nothing here leaves the previous stamp until this crate is built
-/// again.
+/// C's `FORCE` rule regenerates `epicsVCS.h` on every make. Here the script
+/// re-runs when this package's files change or this checkout's `HEAD` moves
+/// ([`head_paths`]), so the stamp names the commit built; an edit outside
+/// this package leaves `-dirty` off until one of those moves.
 ///
 /// The one place this reads differently from C: C leaves the date's tail
 /// unset on the no-VCS arm (`$cv` is never assigned there), so its own
@@ -100,6 +100,29 @@ fn stamp_vcs_version() {
     let (version, date) = from_git().unwrap_or_else(build_timestamp);
     println!("cargo::rustc-env=EPICS_VCS_VERSION={version}");
     println!("cargo::rustc-env=EPICS_VCS_VERSION_DATE={date}");
+    // A `rerun-if-changed` ends Cargo's own watch on the package, so the
+    // package is named too.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("set by Cargo");
+    println!("cargo::rerun-if-changed={manifest}");
+    for path in head_paths(std::path::Path::new(&manifest)) {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
+}
+
+/// What a commit, checkout, merge or reset of this checkout rewrites: its
+/// `HEAD`, the `logs/HEAD` reflog and the loose ref `HEAD` names. Not the
+/// shared `refs/` directory or `packed-refs`, which every other worktree's
+/// commits touch. Only paths that exist: Cargo re-runs a script on every
+/// build for one that does not.
+fn head_paths(manifest: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut names = vec!["HEAD".to_string(), "logs/HEAD".to_string()];
+    names.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    names
+        .iter()
+        .filter_map(|name| git(&["rev-parse", "--git-path", name]))
+        .map(|path| manifest.join(path))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 /// The Git arm. `None` when git is absent, the checkout is not one (a

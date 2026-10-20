@@ -222,7 +222,7 @@ fn monitored_pvs(db: &PvDatabase, user: &Arc<EventUser>, k: u32) -> Vec<MonitorD
             block_on_sync(db.add_pv(&name, EpicsValue::Double(1.0)))
                 .unwrap()
                 .expect("add_pv");
-            let pv = block_on_sync(db.find_pv(&name)).unwrap().expect("added");
+            let pv = db.find_pv(&name).expect("added");
             let reader = pv
                 .add_subscriber_on(
                     user,

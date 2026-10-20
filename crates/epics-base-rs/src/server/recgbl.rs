@@ -1044,7 +1044,7 @@ impl PutReport {
                         ));
                     }
                     Some(ReportTail::PostfixReturns { routine, number }) => {
-                        println!("{routine} returns: {number}");
+                        crate::epics_println!("{routine} returns: {number}");
                     }
                     None => {}
                 }

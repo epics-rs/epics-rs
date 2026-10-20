@@ -78,13 +78,21 @@ struct Removals(std::sync::Mutex<Vec<(String, String, String)>>);
 
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for Removals {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: epics_base_rs::server::database::LinkRef<'_>) -> bool {
         false
     }
-    async fn get_value(&self, _name: &[u8]) -> Option<epics_base_rs::types::EpicsValue> {
+    async fn get_value(
+        &self,
+        _name: epics_base_rs::server::database::LinkRef<'_>,
+    ) -> Option<epics_base_rs::types::EpicsValue> {
         None
     }
-    fn remove_link(&self, holder: epics_base_rs::server::database::LinkHolder<'_>, name: &[u8]) {
+    fn remove_link(
+        &self,
+        holder: epics_base_rs::server::database::LinkHolder<'_>,
+        link: epics_base_rs::server::database::LinkRef<'_>,
+    ) {
+        let name = link.name;
         self.0.lock().unwrap().push((
             String::from_utf8_lossy(holder.record).into_owned(),
             holder.field.to_string(),

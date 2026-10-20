@@ -27,6 +27,9 @@ impl AsynMotor for Stuck {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -39,16 +42,17 @@ impl AsynMotor for Stuck {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.polls += 1;
         if self.polls > 1 {
             std::thread::sleep(Duration::from_millis(300));
         }
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: 7.0,
             moving: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 

@@ -212,25 +212,25 @@ pub trait OctetInterpose: Send + Sync {
     /// :401-403). [`EosSet`] is that fall-through made explicit, so
     /// [`crate::port::PortDriver::set_input_eos`]'s default can be the Fail
     /// stub without having to guess whether a layer above it answered first.
-    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+    fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> EosSet {
         EosSet::NotTaken
     }
 
     /// Notify the layer of an output end-of-string change (see
     /// [`Self::set_input_eos`]). Default: not taken.
-    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+    fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> EosSet {
         EosSet::NotTaken
     }
 
     /// The input terminator this layer holds for the device, or `None` when
     /// C's `getInputEos` would delegate to the layer below
     /// (asynInterposeEos.c:319-321) — the read twin of [`EosSet::NotTaken`].
-    fn input_eos(&self, _addr: i32) -> Option<&[u8]> {
+    fn input_eos(&self, _user: &AsynUser) -> Option<&[u8]> {
         None
     }
 
     /// The output twin of [`Self::input_eos`].
-    fn output_eos(&self, _addr: i32) -> Option<&[u8]> {
+    fn output_eos(&self, _user: &AsynUser) -> Option<&[u8]> {
         None
     }
 
@@ -364,22 +364,22 @@ impl OctetInterposeStack {
     /// Returns what the chain did with it — C's chain either terminates in a
     /// layer that stores the value, refuses the length, or falls through to
     /// the driver's method.
-    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+    pub fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> EosSet {
         let mut answer = EosSet::NotTaken;
-        if let Some(chain) = self.chain_mut(addr) {
+        if let Some(chain) = self.chain_mut(user.addr) {
             for layer in chain {
-                answer = answer.merge(layer.set_input_eos(addr, eos));
+                answer = answer.merge(layer.set_input_eos(user, eos));
             }
         }
         answer
     }
 
     /// Forward an output EOS change (see [`Self::set_input_eos`]).
-    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+    pub fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> EosSet {
         let mut answer = EosSet::NotTaken;
-        if let Some(chain) = self.chain_mut(addr) {
+        if let Some(chain) = self.chain_mut(user.addr) {
             for layer in chain {
-                answer = answer.merge(layer.set_output_eos(addr, eos));
+                answer = answer.merge(layer.set_output_eos(user, eos));
             }
         }
         answer
@@ -388,20 +388,20 @@ impl OctetInterposeStack {
     /// The input terminator the addressed device's chain answers with: the
     /// outermost layer that holds one, `None` when every layer delegates to
     /// the driver.
-    pub fn input_eos(&self, addr: i32) -> Option<Vec<u8>> {
-        let chain = self.chain(addr)?;
+    pub fn input_eos(&self, user: &AsynUser) -> Option<Vec<u8>> {
+        let chain = self.chain(user.addr)?;
         chain
             .iter()
-            .find_map(|l| l.input_eos(addr))
+            .find_map(|l| l.input_eos(user))
             .map(<[u8]>::to_vec)
     }
 
     /// The output twin of [`Self::input_eos`].
-    pub fn output_eos(&self, addr: i32) -> Option<Vec<u8>> {
-        let chain = self.chain(addr)?;
+    pub fn output_eos(&self, user: &AsynUser) -> Option<Vec<u8>> {
+        let chain = self.chain(user.addr)?;
         chain
             .iter()
-            .find_map(|l| l.output_eos(addr))
+            .find_map(|l| l.output_eos(user))
             .map(<[u8]>::to_vec)
     }
 

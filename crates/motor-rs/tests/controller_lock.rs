@@ -35,6 +35,9 @@ impl AsynMotor for Cached {
         self.hw.moving.store(true, Ordering::SeqCst);
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -47,15 +50,16 @@ impl AsynMotor for Cached {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let cached = self.hw.cache_moving.load(Ordering::SeqCst);
         let hw = self.hw.moving.load(Ordering::SeqCst);
         self.seen.lock().unwrap().push((!cached, hw));
-        Ok(MotorStatus {
+        *status = MotorStatus {
             done: !cached,
             moving: cached,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 

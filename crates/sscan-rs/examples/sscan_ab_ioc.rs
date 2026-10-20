@@ -46,7 +46,7 @@ async fn main() -> CaResult<()> {
         None,
     )
     .await?;
-    eprintln!("[ioc] serving {db_file} on CA port {port}");
+    epics_base_rs::stderr_println!("[ioc] serving {db_file} on CA port {port}");
     server.run().await
 }
 

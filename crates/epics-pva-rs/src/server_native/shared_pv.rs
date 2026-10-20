@@ -32,7 +32,8 @@ use epics_base_rs::types::RecordName;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use super::source::MonitorStream;
+use super::source::{Marks, MonitorStream, MonitorUpdate, SourceRead};
+use crate::proto::BitSet;
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use crate::server_native::source::{ChannelInvalidator, OpError};
 
@@ -415,8 +416,70 @@ impl<T> MonitorRing<T> {
 enum PvState {
     /// Not opened (or closed): no descriptor or value exists.
     Closed,
-    /// Opened: both the declared type and the most recent value are present.
-    Open { desc: FieldDesc, value: PvField },
+    /// Opened: the declared type, the most recent value, and the fields of
+    /// it that `open()` and the posts since have assigned — pvxs
+    /// `impl->current`'s marks, which a GET and a monitor's first update
+    /// frame (`sharedpv.cpp:209-212`, `:286`). Wire bit numbering of
+    /// `desc`; the root bit means every field.
+    Open {
+        desc: FieldDesc,
+        value: PvField,
+        marks: BitSet,
+    },
+}
+
+/// The marks of a wholly-assigned value: the root bit.
+fn every_field() -> BitSet {
+    let mut marks = BitSet::new();
+    marks.set(0);
+    marks
+}
+
+/// `marks` as the server frames them: `None` for every field.
+fn marked_paths(desc: &FieldDesc, marks: &BitSet) -> Option<Vec<String>> {
+    (!marks.get(0)).then(|| crate::pvdata::encode::changed_bitset_paths(desc, marks))
+}
+
+/// A monitor subscriber, in the form it subscribed for.
+enum Subscriber {
+    /// [`SharedPV::subscribe`]: whole values; a `PvField` carries no marks.
+    Value(MonitorOutbox),
+    /// [`SharedPV::subscribe_seeded`]: each post with the fields it assigned,
+    /// as pvxs queues the posted `Value` itself (`sharedpv.cpp:447-452`).
+    Marked(MonitorOutbox<MonitorUpdate>),
+}
+
+impl Subscriber {
+    /// `false` once the reader is gone.
+    fn post(&self, value: &PvField, marked: Option<&Marks>) -> bool {
+        match self {
+            Self::Value(tx) => tx.post(value.clone(), false),
+            Self::Marked(tx) => tx.post(
+                MonitorUpdate {
+                    value: value.clone().into(),
+                    marked: marked.cloned(),
+                    type_changed: false,
+                    overrun: Vec::new(),
+                },
+                false,
+            ),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Value(tx) => tx.is_closed(),
+            Self::Marked(tx) => tx.is_closed(),
+        }
+    }
+}
+
+/// Queue a post of `value`, which assigned `marked` (`None`: all of it), on
+/// every subscriber, dropping those whose reader is gone. A full queue
+/// squashes its tail (pvxs `servermon.cpp:283-286`).
+fn deliver(subscribers: &mut Vec<Subscriber>, value: &PvField, marked: Option<Vec<String>>) {
+    let marked = marked.map(|m| Marks::Shared(m.into()));
+    subscribers.retain(|s| s.post(value, marked.as_ref()));
 }
 
 /// Per-PV state stored inside [`SharedPV`].
@@ -425,7 +488,7 @@ struct Inner {
     /// open-state (pvxs `impl->current`).
     state: PvState,
     /// Open subscribers. Each slot holds a MonitorOutbox for squash-to-tail delivery.
-    subscribers: Vec<MonitorOutbox>,
+    subscribers: Vec<Subscriber>,
     /// Optional flow-control watermark: monitor stream sends MORE
     /// only when its outbox depth crosses below `low_watermark`.
     /// Currently advisory; preserved here for op_monitor to consult.
@@ -570,7 +633,28 @@ impl SharedPV {
     /// "open ⟺ a descriptor+value exist" holds by construction: a second
     /// `open()` cannot swap the descriptor out from under monitor
     /// operations that captured the old introspection at subscribe time.
+    ///
+    /// `initial` counts as wholly assigned; [`Self::open_value`] opens on a
+    /// value with the marks it carries.
     pub fn open(&self, desc: FieldDesc, initial: PvField) -> crate::error::PvaResult<()> {
+        self.open_marked(desc, initial, every_field())
+    }
+
+    /// [`Self::open`] on a value that keeps its marks, as pvxs `open()` keeps
+    /// `initial`'s (`sharedpv.cpp:378`): only the marked fields reach a GET
+    /// or a monitor's first update until a post assigns more. A value from
+    /// `Value::create_from` marks nothing, as pvxs `TypeDef::create()`.
+    pub fn open_value(&self, initial: crate::pvdata::Value) -> crate::error::PvaResult<()> {
+        let (desc, value, marks) = initial.into_parts();
+        self.open_marked(desc, value, marks)
+    }
+
+    fn open_marked(
+        &self,
+        desc: FieldDesc,
+        initial: PvField,
+        marks: BitSet,
+    ) -> crate::error::PvaResult<()> {
         let mut g = self.inner.lock();
         if matches!(g.state, PvState::Open { .. }) {
             return Err(crate::error::PvaError::Protocol(
@@ -591,6 +675,7 @@ impl SharedPV {
         g.state = PvState::Open {
             desc,
             value: initial,
+            marks,
         };
         drop(g);
         // Release every op parked on the closed PV. pvxs moves `pending`
@@ -722,7 +807,12 @@ impl SharedPV {
     pub fn try_post_checked(&self, value: PvField) -> crate::error::PvaResult<usize> {
         let mut g = self.inner.lock();
         let inner = &mut *g;
-        let PvState::Open { desc, value: cur } = &mut inner.state else {
+        let PvState::Open {
+            desc,
+            value: cur,
+            marks,
+        } = &mut inner.state
+        else {
             return Err(crate::error::PvaError::Protocol(
                 "SharedPV not open".to_string(),
             ));
@@ -732,9 +822,9 @@ impl SharedPV {
                 "SharedPV::try_post: value does not fit opened descriptor ({e})"
             )));
         }
-        *cur = value.clone();
-        // pvxs servermon.cpp:283-286: normal post squashes tail when queue full.
-        inner.subscribers.retain(|tx| tx.post(value.clone(), false));
+        deliver(&mut inner.subscribers, &value, None);
+        *cur = value;
+        *marks = every_field();
         Ok(inner.subscribers.len())
     }
 
@@ -748,6 +838,8 @@ impl SharedPV {
     /// `delta` is neither read nor checked, and `delta` is borrowed, so a
     /// producer that keeps its value pays no clone. `marks` uses the wire
     /// bit numbering of the opened descriptor. Nothing changes on `Err`.
+    /// `marks` joins the stored value's marks, and a monitor gets this post
+    /// with `marks` alone, as pvxs queues `val` (`sharedpv.cpp:447-452`).
     /// Returns the live subscriber count, like `try_post_checked`.
     pub fn post_delta(
         &self,
@@ -756,7 +848,12 @@ impl SharedPV {
     ) -> crate::error::PvaResult<usize> {
         let mut g = self.inner.lock();
         let inner = &mut *g;
-        let PvState::Open { desc, value: cur } = &mut inner.state else {
+        let PvState::Open {
+            desc,
+            value: cur,
+            marks: assigned,
+        } = &mut inner.state
+        else {
             return Err(crate::error::PvaError::Protocol(
                 "SharedPV not open".to_string(),
             ));
@@ -766,7 +863,8 @@ impl SharedPV {
                 "SharedPV::post_delta: delta does not fit opened descriptor ({e})"
             ))
         })?;
-        inner.subscribers.retain(|tx| tx.post(cur.clone(), false));
+        assigned.union_with(marks);
+        deliver(&mut inner.subscribers, cur, marked_paths(desc, marks));
         Ok(inner.subscribers.len())
     }
 
@@ -775,7 +873,7 @@ impl SharedPV {
     /// clone). `None` while closed. `f` must not touch this PV.
     pub fn with_current<R>(&self, f: impl FnOnce(&FieldDesc, &PvField) -> R) -> Option<R> {
         match &self.inner.lock().state {
-            PvState::Open { desc, value } => Some(f(desc, value)),
+            PvState::Open { desc, value, .. } => Some(f(desc, value)),
             PvState::Closed => None,
         }
     }
@@ -801,7 +899,7 @@ impl SharedPV {
         let initial = value.clone();
         let (outbox, inbox) = make_monitor_queue(limit);
         outbox.post(initial, false);
-        g.subscribers.push(outbox);
+        g.subscribers.push(Subscriber::Value(outbox));
         Some(inbox)
     }
 
@@ -812,17 +910,35 @@ impl SharedPV {
     /// [`Self::subscribe`]: the returned `inbox` carries only
     /// post-registration events, and the caller emits `initial` itself
     /// (the server does this via [`crate::server_native::source::SubscriptionSeed`]).
-    /// Returns `None` only when the PV is not open. `initial` is the
-    /// current value (always `Some` here, since the PV is open).
-    pub fn subscribe_seeded(&self, limit: usize) -> Option<(Option<PvField>, MonitorInbox)> {
+    /// Returns `None` only when the PV is not open. The seed is
+    /// [`Self::read`]'s, and each queued update carries the marks of its
+    /// post, as pvxs's `connectSub(current.clone())` and posted `val`.
+    pub fn subscribe_seeded(
+        &self,
+        limit: usize,
+    ) -> Option<(SourceRead, MonitorRing<MonitorUpdate>)> {
         let mut g = self.inner.lock();
-        let PvState::Open { value, .. } = &g.state else {
+        let initial = Self::read_open(&g.state)?;
+        let (outbox, inbox) = make_monitor_queue(limit);
+        g.subscribers.push(Subscriber::Marked(outbox));
+        Some((initial, inbox))
+    }
+
+    /// The current value with the fields assigned into it (None while
+    /// closed): what a GET frames, pvxs `onGet`'s `current.clone()`
+    /// (`sharedpv.cpp:209-212`).
+    pub fn read(&self) -> Option<SourceRead> {
+        Self::read_open(&self.inner.lock().state)
+    }
+
+    fn read_open(state: &PvState) -> Option<SourceRead> {
+        let PvState::Open { desc, value, marks } = state else {
             return None;
         };
-        let initial = value.clone();
-        let (outbox, inbox) = make_monitor_queue(limit);
-        g.subscribers.push(outbox);
-        Some((Some(initial), inbox))
+        Some(SourceRead {
+            value: value.clone(),
+            marked: marked_paths(desc, marks),
+        })
     }
 
     /// Apply a PUT. When [`Self::on_put`] has been set, the user
@@ -920,6 +1036,7 @@ impl SharedPV {
                     let PvState::Open {
                         desc: opened,
                         value: prior,
+                        marks,
                     } = &mut inner.state
                     else {
                         return Err("SharedPV not open".into());
@@ -932,8 +1049,10 @@ impl SharedPV {
                     // before posting (`sharedpv.cpp:113-121`). Do that here,
                     // in the mailbox owner, so the stored+posted value
                     // carries a fresh timestamp when the client PUT left it
-                    // unset. A client-marked timeStamp is preserved.
-                    Self::fill_mailbox_timestamp(desc, changed, &mut merged);
+                    // unset. A client-marked timeStamp is preserved. The
+                    // post assigns what the client marked plus the stamp.
+                    let mut posted = changed.clone();
+                    Self::fill_mailbox_timestamp(desc, &mut posted, &mut merged);
                     // descriptor enforcement for the store path: the
                     // merged value must fit the opened descriptor, not a
                     // stale peer-cached `desc` (pvxs `sharedpv.cpp:417-431`).
@@ -946,10 +1065,9 @@ impl SharedPV {
                     // close-race fix. pvxs servermon.cpp:283-286:
                     // squash-to-tail for a normal post; retain drops
                     // receivers that have closed.
-                    *prior = merged.clone();
-                    inner
-                        .subscribers
-                        .retain(|tx| tx.post(merged.clone(), false));
+                    deliver(&mut inner.subscribers, &merged, marked_paths(desc, &posted));
+                    *prior = merged;
+                    marks.union_with(&posted);
                     return Ok(());
                 }
                 PutPolicy::Custom(handler) => {
@@ -979,16 +1097,13 @@ impl SharedPV {
     /// `desc` / `changed` use the wire bit numbering (pvData §5.4); the
     /// "marked" test covers `[ts_bit, ts_bit + total_bits)` — the field's
     /// own bit plus every descendant — matching pvxs `isMarked(true,
-    /// true)`. Child leaves are rewritten in place, preserving their
+    /// true)`. A stamped leaf is marked in `changed`, as pvxs's assignment
+    /// marks it. Child leaves are rewritten in place, preserving their
     /// declared integer type so the merged value still fits the opened
     /// descriptor. Mailbox-only: a custom `on_put` handler owns its own
     /// timestamp policy, exactly as pvxs installs this fill only in
     /// `buildMailbox` (a full-value `post`/[`Self::put`] is not stamped).
-    fn fill_mailbox_timestamp(
-        desc: &FieldDesc,
-        changed: &crate::proto::BitSet,
-        value: &mut PvField,
-    ) {
+    fn fill_mailbox_timestamp(desc: &FieldDesc, changed: &mut BitSet, value: &mut PvField) {
         use crate::pvdata::ScalarValue;
         // Locate the top-level `timeStamp` field and its bit offset
         // (root is bit 0; the first child is bit 1, then depth-first).
@@ -1045,6 +1160,16 @@ impl SharedPV {
         }
         if let Some(PvField::Scalar(s)) = ts.get_field_mut("nanoseconds") {
             stamp_int(s, dur.subsec_nanos() as i64);
+        }
+        let FieldDesc::Structure { fields, .. } = ts_desc else {
+            return;
+        };
+        let mut bit = ts_bit + 1;
+        for (name, child) in fields {
+            if name == "secondsPastEpoch" || name == "nanoseconds" {
+                changed.set(bit);
+            }
+            bit += child.total_bits();
         }
     }
 
@@ -1225,7 +1350,7 @@ impl SharedPV {
     /// [`Self::detach_channel`] (pvxs keeps `subscribers` and
     /// `impl->channels` separate, sharedpv.cpp:252-296).
     pub fn prune_subscribers(&self) {
-        self.inner.lock().subscribers.retain(|tx| !tx.is_closed());
+        self.inner.lock().subscribers.retain(|s| !s.is_closed());
     }
 
     /// Set the low watermark hint (advisory).
@@ -1481,9 +1606,17 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let names: Vec<RecordName> = self.pvs.lock().keys().cloned().collect();
-        async move { names }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.pvs.lock().keys().cloned().collect()
+    }
+
+    /// pvxs `StaticSource::Impl::show` (`src/sharedpv.cpp:538-547`).
+    fn show(&self) -> super::source::SourceShow {
+        super::source::SourceShow {
+            kind: "StaticProvider",
+            names: self.list_pvs(),
+            nested: false,
+        }
     }
 
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
@@ -1520,6 +1653,21 @@ impl super::source::ChannelSource for SharedSource {
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move { pv.and_then(|p| p.current()) }
+    }
+
+    /// Frames the fields the PV's value has had assigned ([`SharedPV::read`]).
+    fn read_checked(
+        &self,
+        checked: super::source::AccessChecked,
+        ctx: super::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<SourceRead>> + Send {
+        let _ = ctx;
+        let pv = if checked.allows_read() {
+            self.pvs.lock().get(checked.pv_name()).cloned()
+        } else {
+            None
+        };
+        async move { pv.and_then(|p| p.read()) }
     }
 
     fn put_value(
@@ -1628,12 +1776,8 @@ impl super::source::ChannelSource for SharedSource {
         async move {
             let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(queue_limit))?;
             Some(super::source::SubscriptionSeed {
-                // A SharedPV's stored Value is wholly assigned by `open()` /
-                // `post()`, so it declares no leaf subset — the server frames
-                // every leaf the request selected, as pvxs does for a
-                // fully-marked `Value`.
-                initial: initial.map(super::source::SourceRead::from),
-                updates: super::source::plain_monitor_updates(MonitorStream::Ring(inbox)),
+                initial: Some(initial),
+                updates: MonitorStream::Ring(inbox),
                 on_start: None,
             })
         }
@@ -2820,6 +2964,47 @@ mod tests {
         }
     }
 
+    /// pvxs `SharedPV::post` throws before `current.assign`
+    /// (`sharedpv.cpp:417-431`): a refused post leaves the last value served
+    /// and reaches no subscriber.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_post_keeps_the_value_and_reaches_no_subscriber() {
+        use super::super::source::ChannelSource;
+        let pv = SharedPV::build_readonly();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(1))
+            .unwrap();
+        let src = SharedSource::new();
+        src.add("TEST:NTS", pv.clone());
+        let mut rx = pv.subscribe(8).expect("subscribe");
+        assert_eq!(rx.try_recv(), Ok(nt_scalar_int_value(1)));
+        let mut bad = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+        bad.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.0))));
+        pv.try_post_checked(PvField::Structure(bad))
+            .expect_err("a value off the descriptor is refused");
+        assert_eq!(
+            src.get_value(b"TEST:NTS").await,
+            Some(nt_scalar_int_value(1))
+        );
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A PV is keyed by its name bytes: a Latin-1 name is served as added,
+    /// and its lossy UTF-8 rendering names nothing.
+    #[epics_macros_rs::epics_test]
+    async fn a_pv_with_a_latin1_name_is_served_by_its_bytes() {
+        use super::super::source::ChannelSource;
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(7))
+            .unwrap();
+        let src = SharedSource::new();
+        src.add(RecordName::from(&b"TEMP:\xb0C"[..]), pv);
+        assert!(src.has_pv(b"TEMP:\xb0C").await);
+        assert!(src.get_value(b"TEMP:\xb0C").await.is_some());
+        assert!(!src.has_pv("TEMP:\u{fffd}C".as_bytes()).await);
+        assert_eq!(src.list_pvs(), vec![RecordName::from(&b"TEMP:\xb0C"[..])]);
+    }
+
     /// A built-in `SharedSource`
     /// PV registry mutation must advance the beacon-change counter, the
     /// Rust analog of pvxs `Server::addPV` / `removePV` bumping
@@ -2867,11 +3052,11 @@ mod tests {
         // remove+re-add "b" within one interval. list_pvs() is identical
         // before and after, but the counter advances (net +2).
         src.add("b", SharedPV::new());
-        let before: Vec<RecordName> = src.list_pvs().await;
+        let before: Vec<RecordName> = src.list_pvs();
         let v3 = src.beacon_change();
         assert!(src.remove("b").is_some());
         src.add("b", SharedPV::new());
-        let after: Vec<RecordName> = src.list_pvs().await;
+        let after: Vec<RecordName> = src.list_pvs();
         let v4 = src.beacon_change();
         assert_eq!(
             before, after,
@@ -2932,5 +3117,111 @@ mod tests {
         assert!(pv.post_delta(&marks, &bad).is_err());
         assert_eq!(pv.current().unwrap(), nt_scalar_ts_value(2, 100, 7));
         assert!(inbox.try_recv().is_err(), "a refused post reaches nobody");
+    }
+
+    fn bits(of: &[usize]) -> crate::proto::BitSet {
+        let mut b = crate::proto::BitSet::new();
+        for &i in of {
+            b.set(i);
+        }
+        b
+    }
+
+    fn paths(of: &[&str]) -> Option<Vec<String>> {
+        Some(of.iter().map(|p| p.to_string()).collect())
+    }
+
+    fn update_marks(u: MonitorUpdate) -> Option<Vec<String>> {
+        u.marked.map(|m| m.to_vec())
+    }
+
+    /// pvxs `current` keeps the marks of `open()` and of every post since
+    /// (`sharedpv.cpp:378`, `:442`), and a GET or a monitor's first update
+    /// frames them; each monitor update carries its own post's marks only.
+    #[test]
+    fn reads_frame_what_open_and_the_posts_assigned() {
+        let pv = SharedPV::new();
+        pv.open_value(crate::pvdata::Value::create_from(nt_scalar_ts_desc()))
+            .unwrap();
+        assert_eq!(pv.read().unwrap().marked, paths(&[]));
+        let (seed, mut rx) = pv.subscribe_seeded(4).unwrap();
+        assert_eq!(seed.marked, paths(&[]));
+
+        pv.post_delta(&bits(&[1]), &nt_scalar_ts_value(5, 0, 0))
+            .unwrap();
+        assert_eq!(pv.read().unwrap().marked, paths(&["value"]));
+        assert_eq!(update_marks(rx.try_recv().unwrap()), paths(&["value"]));
+
+        pv.post_delta(&bits(&[3]), &nt_scalar_ts_value(0, 9, 0))
+            .unwrap();
+        assert_eq!(
+            pv.read().unwrap().marked,
+            paths(&["value", "timeStamp.secondsPastEpoch"])
+        );
+        assert_eq!(
+            update_marks(rx.try_recv().unwrap()),
+            paths(&["timeStamp.secondsPastEpoch"])
+        );
+
+        pv.try_post_checked(nt_scalar_ts_value(6, 1, 1)).unwrap();
+        assert_eq!(pv.read().unwrap().marked, None);
+        assert_eq!(update_marks(rx.try_recv().unwrap()), None);
+
+        // `open()` assigns every field.
+        let whole = SharedPV::new();
+        whole
+            .open(nt_scalar_ts_desc(), nt_scalar_ts_value(0, 0, 0))
+            .unwrap();
+        assert_eq!(whole.read().unwrap().marked, None);
+    }
+
+    /// A full queue folds a post into its tail with `assign`
+    /// (`servermon.cpp:283-286`): the tail keeps both posts' marks.
+    #[test]
+    fn a_squashed_update_keeps_the_marks_of_both_posts() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_ts_desc(), nt_scalar_ts_value(0, 0, 0))
+            .unwrap();
+        let (_, mut rx) = pv.subscribe_seeded(1).unwrap();
+        pv.post_delta(&bits(&[1]), &nt_scalar_ts_value(5, 0, 0))
+            .unwrap();
+        pv.post_delta(&bits(&[3]), &nt_scalar_ts_value(0, 9, 0))
+            .unwrap();
+        let u = rx.try_recv().unwrap();
+        assert_eq!(*u.value, nt_scalar_ts_value(5, 9, 0));
+        assert_eq!(
+            update_marks(u),
+            paths(&["value", "timeStamp.secondsPastEpoch"])
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A mailbox PUT posts the client's value (`sharedpv.cpp:116-140`): what
+    /// it marked, plus the two timeStamp leaves the server stamps when the
+    /// client marked none.
+    #[test]
+    fn a_mailbox_put_posts_what_the_client_marked_and_the_stamp() {
+        let desc = nt_scalar_ts_desc();
+        let pv = SharedPV::build_mailbox();
+        pv.open_value(crate::pvdata::Value::create_from(desc.clone()))
+            .unwrap();
+        let (_, mut rx) = pv.subscribe_seeded(4).unwrap();
+        let stamped = paths(&[
+            "value",
+            "timeStamp.secondsPastEpoch",
+            "timeStamp.nanoseconds",
+        ]);
+
+        pv.put_delta(&desc, &bits(&[1]), nt_scalar_ts_value(11, 0, 0))
+            .unwrap();
+        assert_eq!(update_marks(rx.try_recv().unwrap()), stamped);
+        assert_eq!(pv.read().unwrap().marked, stamped);
+
+        pv.put_delta(&desc, &bits(&[1, 3]), nt_scalar_ts_value(12, 5, 0))
+            .unwrap();
+        assert_eq!(
+            update_marks(rx.try_recv().unwrap()),
+            paths(&["value", "timeStamp.secondsPastEpoch"])
+        );
     }
 }

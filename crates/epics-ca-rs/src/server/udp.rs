@@ -447,7 +447,7 @@ fn bind_single_responder(
         {
             let found = broadcast_of(bind_ip);
             if let Some(w) = missing_broadcast_warning(bind_ip, tcp_port, found) {
-                eprint!("{w}");
+                epics_libcom_rs::stderr_print!("{w}");
             }
             let with_primary = [own, &[bind_ip]].concat();
             match found.map(|bcast_ip| {
@@ -473,7 +473,10 @@ fn bind_single_responder(
                 // 2026-10-14 the start returns the error instead.
                 Some((_, Err(e))) => {
                     if let epics_base_rs::error::CaError::Io(io) = &e {
-                        eprintln!("{}", try_bind_error_line("UDP Socket bcast", io));
+                        epics_libcom_rs::stderr_println!(
+                            "{}",
+                            try_bind_error_line("UDP Socket bcast", io)
+                        );
                     }
                     return Err(e);
                 }

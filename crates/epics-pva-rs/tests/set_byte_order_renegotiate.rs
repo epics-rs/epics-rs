@@ -37,7 +37,7 @@ use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 struct EmptySource;
 
 impl ChannelSource for EmptySource {
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         Vec::new()
     }
     async fn has_pv(&self, _: &[u8]) -> bool {

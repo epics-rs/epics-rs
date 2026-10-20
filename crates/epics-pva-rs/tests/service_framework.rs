@@ -419,7 +419,7 @@ async fn add_rpc_service_rejects_colliding_registration() {
         );
     }
     assert_eq!(
-        source.list_pvs().await.len(),
+        source.list_pvs().len(),
         7,
         "no extra PVs from the rejected call"
     );
@@ -436,7 +436,7 @@ async fn add_rpc_service_rejects_colliding_registration() {
 /// surface the server's data-phase status instead.
 struct FailAtDataSource;
 impl ChannelSource for FailAtDataSource {
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["dut".into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
@@ -510,7 +510,7 @@ async fn bfr13_client_get_surfaces_data_phase_error() {
 /// is expected.
 struct PanicSource;
 impl ChannelSource for PanicSource {
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["boom".into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {

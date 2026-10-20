@@ -267,10 +267,8 @@ async fn an_epoch_over_two_members_of_one_set_takes_it_once() {
 // second link between records already together changes nothing; removing ONE
 // of two links does NOT split, which is C's `goto nosplit` (`dbLock.c:826`);
 // and removing the LAST one does, handing the split-off side a set back off
-// the free list — id 3 returns, and `Free lockSets` drops to 0.
-//
-// The listing ORDER differs and is allowed to: C appends to `lockSetsActive`,
-// so the reused set prints last; this port lists by id.
+// the free list — id 3 returns, and `Free lockSets` drops to 0. `makeSet`
+// appends to `lockSetsActive` (`dbLock.c:95`), so that set prints last.
 
 /// Creating a DB link at runtime merges the two records' sets, and the set the
 /// merge empties goes on the free list rather than vanishing.
@@ -358,9 +356,10 @@ async fn removing_the_last_link_splits_and_reuses_a_freed_set() {
         members,
         vec![
             vec!["L:A".to_string()],
-            vec!["L:B".to_string()],
-            vec!["L:C".to_string()]
-        ]
+            vec!["L:C".to_string()],
+            vec!["L:B".to_string()]
+        ],
+        "C lists the set makeSet took back off the free list last"
     );
     assert_eq!(free, 0, "C: Free lockSets: 0 — makeSet took the spare back");
     assert_eq!(db.lock_set_of("L:A").unwrap().id, a_id, "L:A keeps its set");
@@ -680,9 +679,6 @@ record(calc, "S:D") { field(INPA, "S:C") field(CALC, "1") }
 
 #[epics_macros_rs::epics_test]
 async fn lock_set_members_are_listed_in_c_merge_order() {
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|n| n.to_string()).collect()
-    }
     let db = ioc(MERGE_ORDER_DB).await;
     let members = |r: &str| db.lock_set_of(r).expect("a set").members;
 
@@ -706,13 +702,200 @@ async fn lock_set_members_are_listed_in_c_merge_order() {
     dbpf(&db, "L:A", "INPB", "L:C").await;
     assert_eq!(members("L:A"), names(&["L:B", "L:A", "L:C", "L:D", "L:E"]));
 
-    // The side that keeps the set keeps C's order. The split-off side is C's
-    // breadth-first walk from the old target over links and `bklnk`
-    // (`dbLock.c:717-773`), which this port has no ordered `bklnk` to
-    // reproduce, so only its grouping is pinned.
+    // The side that leaves is C's breadth-first walk from the old target,
+    // each record's own links before the ones naming it (`dbLock.c:717-773`).
     dbpf(&db, "S:A", "INPA", "0").await;
     assert_eq!(members("S:A"), names(&["S:A"]));
-    let mut split_off = members("S:B");
-    split_off.sort();
-    assert_eq!(split_off, names(&["S:B", "S:C", "S:D"]));
+    assert_eq!(members("S:B"), names(&["S:B", "S:C", "S:D"]));
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|n| n.to_string()).collect()
+}
+
+/// `(id, members)` of every active set, in the order `dblsr` lists them.
+fn listing(db: &PvDatabase) -> Vec<(u64, Vec<String>)> {
+    db.lock_set_report()
+        .active
+        .iter()
+        .map(|s| (s.id, s.members.iter().map(|m| m.to_string()).collect()))
+        .collect()
+}
+
+/// A split walks each record's `bklnk` in the order the links were added
+/// (`dbDbLink.c:106`, `:121`), so a link written at runtime is walked after
+/// every link `iocInit` opened, whatever the two source records' load order.
+///
+/// GROUND TRUTH — the C `softIoc` on `BACKLINK_DB`, headers and mutex rows
+/// elided:
+///
+/// ```text
+/// epics> dblsr("*",1)                    Active 2 / Free 2
+/// Lock Set 3 1 members 1 refs / B:E
+/// Lock Set 5 3 members 3 refs / B:L B:K B:O
+/// epics> dbpf("B:E.INPA","B:O")          Active 1 / Free 3
+/// Lock Set 3 4 members 4 refs / B:E B:L B:K B:O
+/// epics> dbpf("B:K.INPA","0")            Active 2 / Free 2
+/// Lock Set 3 1 members 1 refs / B:K
+/// Lock Set 4 3 members 3 refs / B:O B:L B:E
+/// ```
+const BACKLINK_DB: &str = r#"
+record(calc, "B:K") { field(INPA, "B:O") field(CALC, "1") }
+record(calc, "B:E") { field(CALC, "1") }
+record(calc, "B:O") { field(CALC, "1") }
+record(calc, "B:L") { field(INPA, "B:O") field(CALC, "1") }
+"#;
+
+#[epics_macros_rs::epics_test]
+async fn a_split_walks_back_links_in_the_order_they_were_added() {
+    let db = ioc(BACKLINK_DB).await;
+    dbpf(&db, "B:E", "INPA", "B:O").await;
+    assert_eq!(
+        listing(&db),
+        vec![(3, names(&["B:E", "B:L", "B:K", "B:O"]))]
+    );
+
+    dbpf(&db, "B:K", "INPA", "0").await;
+
+    assert_eq!(
+        listing(&db),
+        vec![(3, names(&["B:K"])), (4, names(&["B:O", "B:L", "B:E"])),],
+        "B:E's link was added after B:L's, so C walks it last"
+    );
+    assert_eq!(db.lock_set_report().free, 2);
+}
+
+/// A retarget is `dbPutFieldLink`'s two steps, the split from the old target
+/// and then the merge with the new one (`dbAccess.c:1170`, `:1208`). When the
+/// new target is on the side the split took away, the merge appends that
+/// side back in its breadth-first order, and the set `makeSet` handed it goes
+/// to the tail of the free list — which decides the id the next split gets.
+///
+/// GROUND TRUTH — the C `softIoc` on `RETARGET_DB`, headers and mutex rows
+/// elided:
+///
+/// ```text
+/// epics> dblsr("*",1)                    Active 2 / Free 2
+/// Lock Set 3 3 members 3 refs / P:K P:Y P:O
+/// Lock Set 5 1 members 1 refs / P:Z
+/// epics> dbpf("P:K.INPA","P:Y")          Active 2 / Free 2
+/// Lock Set 3 3 members 3 refs / P:K P:O P:Y
+/// Lock Set 5 1 members 1 refs / P:Z
+/// epics> dbpf("P:Z.INPA","P:K")          Active 1 / Free 3
+/// Lock Set 5 4 members 4 refs / P:Z P:K P:O P:Y
+/// epics> dbpf("P:Z.INPA","0")            Active 2 / Free 2
+/// Lock Set 5 1 members 1 refs / P:Z
+/// Lock Set 2 3 members 3 refs / P:K P:Y P:O
+/// ```
+const RETARGET_DB: &str = r#"
+record(calc, "P:Y") { field(INPA, "P:O") field(CALC, "1") }
+record(calc, "P:K") { field(INPA, "P:O") field(CALC, "1") }
+record(calc, "P:O") { field(CALC, "1") }
+record(calc, "P:Z") { field(CALC, "1") }
+"#;
+
+#[epics_macros_rs::epics_test]
+async fn a_retarget_splits_from_the_old_target_before_it_merges() {
+    let db = ioc(RETARGET_DB).await;
+    assert_eq!(
+        listing(&db),
+        vec![(3, names(&["P:K", "P:Y", "P:O"])), (5, names(&["P:Z"]))]
+    );
+
+    dbpf(&db, "P:K", "INPA", "P:Y").await;
+    assert_eq!(
+        listing(&db),
+        vec![(3, names(&["P:K", "P:O", "P:Y"])), (5, names(&["P:Z"]))],
+        "the split took P:O P:Y away and the merge appended them back"
+    );
+    assert_eq!(db.lock_set_report().free, 2);
+
+    dbpf(&db, "P:Z", "INPA", "P:K").await;
+    assert_eq!(
+        listing(&db),
+        vec![(5, names(&["P:Z", "P:K", "P:O", "P:Y"]))]
+    );
+    assert_eq!(db.lock_set_report().free, 3);
+
+    dbpf(&db, "P:Z", "INPA", "0").await;
+    assert_eq!(
+        listing(&db),
+        vec![(5, names(&["P:Z"])), (2, names(&["P:K", "P:Y", "P:O"]))],
+        "set 4 went back on the free list behind set 2, so the split gets 2"
+    );
+    assert_eq!(db.lock_set_report().free, 2);
+}
+
+/// The two other ends of a link put's pair: a rewrite to the SAME target,
+/// whose split side the merge folds straight back (so it moves to the end of
+/// the list, and the set `makeSet` lent it goes to the tail of the free list),
+/// and a retarget onto a record the split leaves behind (so the merge is
+/// `dbLockSetMerge`'s `A==B` no-op and the split side keeps its new set).
+///
+/// GROUND TRUTH — the C `softIoc` on `PAIR_ENDS_DB`, headers and mutex rows
+/// elided:
+///
+/// ```text
+/// epics> dblsr("*",1)                    Active 3 / Free 3
+/// Lock Set 2 / Q:K Q:O Q:X    Lock Set 5 / Q:F Q:G    Lock Set 7 / Q:H
+/// epics> dbpf("Q:K.INPA","Q:O")          Active 3 / Free 3
+/// Lock Set 2 / Q:K Q:X Q:O    Lock Set 5 / Q:F Q:G    Lock Set 7 / Q:H
+/// epics> dbpf("Q:K.INPA","Q:X")          Active 4 / Free 2
+/// Lock Set 2 / Q:K Q:X    Lock Set 5 / Q:F Q:G    Lock Set 7 / Q:H
+/// Lock Set 4 / Q:O
+/// epics> dbpf("Q:H.INPA","Q:F")          Active 3 / Free 3
+/// Lock Set 2 / Q:K Q:X    Lock Set 7 / Q:H Q:F Q:G    Lock Set 4 / Q:O
+/// epics> dbpf("Q:H.INPA","0")            Active 4 / Free 2
+/// Lock Set 2 / Q:K Q:X    Lock Set 7 / Q:H    Lock Set 4 / Q:O
+/// Lock Set 6 / Q:F Q:G
+/// ```
+const PAIR_ENDS_DB: &str = r#"
+record(calc, "Q:K") { field(INPA, "Q:O") field(INPB, "Q:X") field(CALC, "1") }
+record(calc, "Q:O") { field(CALC, "1") }
+record(calc, "Q:X") { field(CALC, "1") }
+record(calc, "Q:F") { field(INPA, "Q:G") field(CALC, "1") }
+record(calc, "Q:G") { field(CALC, "1") }
+record(calc, "Q:H") { field(CALC, "1") }
+"#;
+
+#[epics_macros_rs::epics_test]
+async fn a_rewrite_to_the_same_target_still_splits_and_merges() {
+    let db = ioc(PAIR_ENDS_DB).await;
+
+    dbpf(&db, "Q:K", "INPA", "Q:O").await;
+    assert_eq!(
+        listing(&db),
+        vec![
+            (2, names(&["Q:K", "Q:X", "Q:O"])),
+            (5, names(&["Q:F", "Q:G"])),
+            (7, names(&["Q:H"])),
+        ]
+    );
+    assert_eq!(db.lock_set_report().free, 3);
+
+    dbpf(&db, "Q:K", "INPA", "Q:X").await;
+    assert_eq!(
+        listing(&db),
+        vec![
+            (2, names(&["Q:K", "Q:X"])),
+            (5, names(&["Q:F", "Q:G"])),
+            (7, names(&["Q:H"])),
+            (4, names(&["Q:O"])),
+        ],
+        "the same-target rewrite sent set 3 behind 4, so this split gets 4"
+    );
+    assert_eq!(db.lock_set_report().free, 2);
+
+    dbpf(&db, "Q:H", "INPA", "Q:F").await;
+    dbpf(&db, "Q:H", "INPA", "0").await;
+    assert_eq!(
+        listing(&db),
+        vec![
+            (2, names(&["Q:K", "Q:X"])),
+            (7, names(&["Q:H"])),
+            (4, names(&["Q:O"])),
+            (6, names(&["Q:F", "Q:G"])),
+        ]
+    );
+    assert_eq!(db.lock_set_report().free, 2);
 }

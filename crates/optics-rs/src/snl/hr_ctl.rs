@@ -10,6 +10,7 @@
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::alloc_origin;
 use crate::snl::kohzu_ctl::HC;
@@ -550,9 +551,10 @@ impl Hr {
                     };
                     ctl_debug!(
                         v,
-                        "hrCtl:initSequence: opMode={}, Geom={}, phi2={phi2:.6}",
+                        "hrCtl:initSequence: opMode={}, Geom={}, phi2={:.6}",
                         v.get(OP_MODE) as i32,
-                        v.get(GEOM) as i32
+                        v.get(GEOM) as i32,
+                        CFloat(phi2)
                     );
                     v.set(PHI2, phi2).await;
                     v.set(THETA2, theta2).await;
@@ -1121,12 +1123,12 @@ impl Hr {
         let (mut theta1_hi, mut theta1_lo) = (phi1_hi, phi1_lo);
         if theta1_hi > theta_max {
             theta1_hi = theta_max;
-            self.msg2(&format!("Theta1HiLim clipped at {theta_max:.3}"))
+            self.msg2(&format!("Theta1HiLim clipped at {:.3}", CFloat(theta_max)))
                 .await;
         }
         if theta1_lo < theta_min {
             theta1_lo = theta_min;
-            self.msg2(&format!("Theta1LoLim clipped at {theta_min:.3}"))
+            self.msg2(&format!("Theta1LoLim clipped at {:.3}", CFloat(theta_min)))
                 .await;
         }
         let v = &mut self.v;
@@ -1154,12 +1156,12 @@ impl Hr {
         };
         if theta2_hi > theta_max {
             theta2_hi = theta_max;
-            self.msg2(&format!("Theta2HiLim clipped at {theta_max:.3}"))
+            self.msg2(&format!("Theta2HiLim clipped at {:.3}", CFloat(theta_max)))
                 .await;
         }
         if theta2_lo < theta_min {
             theta2_lo = theta_min;
-            self.msg2(&format!("Theta2LoLim clipped at {theta_min:.3}"))
+            self.msg2(&format!("Theta2LoLim clipped at {:.3}", CFloat(theta_min)))
                 .await;
         }
         let v = &mut self.v;
@@ -1209,9 +1211,10 @@ impl Hr {
                 );
                 ctl_debug!(
                     v,
-                    "hrCtl:thChanged: opMode={}, Geom={}, theta2={theta2:.6}",
+                    "hrCtl:thChanged: opMode={}, Geom={}, theta2={:.6}",
                     op_mode as i32,
-                    v.get(GEOM) as i32
+                    v.get(GEOM) as i32,
+                    CFloat(theta2)
                 );
             }
         } else {
@@ -1239,7 +1242,7 @@ impl Hr {
                 "hrCtl:thChanged: opMode={}, Geom={}, phi2={:.6}",
                 op_mode as i32,
                 v.get(GEOM) as i32,
-                v.get(PHI2)
+                CFloat(v.get(PHI2))
             );
             v.put(PHI2).await;
         }

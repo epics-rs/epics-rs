@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::server::iocsh::registry::*;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::builder::MotorBuilder;
 use crate::sim_motor::SimMotor;
@@ -120,9 +121,9 @@ impl SimMotorHolder {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(poll_cmd_tx);
-                println!(
-                    "simMotorCreate: port={port} limits=[{low_limit}, {high_limit}] poll={poll_ms}ms"
-                );
+                // motorSimCreateController prints nothing; motorSimConfigAxis
+                // prints this (motorSimDriver.cpp:502-503).
+                println!("motorSimDriver:motorSimConfigAxis: configuring controller {port} axis 0");
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -250,7 +251,10 @@ fn poll_period_command(
                     Some(0),
                     0,
                     asyn_rs::trace::TraceMask::FLOW,
-                    format_args!("{function}: Setting {which} poll period to {secs:.6}\n"),
+                    format_args!(
+                        "{function}: Setting {which} poll period to {:.6}\n",
+                        CFloat(secs)
+                    ),
                 );
             // A negative period would have C's poller spin; it waits on the
             // wakeup alone here, as a zero period does.

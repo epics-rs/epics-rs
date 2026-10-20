@@ -116,6 +116,11 @@ fn expected_refusals() -> Vec<String> {
         .collect()
 }
 
+/// The manager the first `create_*_set` started.
+fn manager(holder: &Mutex<AutosaveStartupConfig>) -> Arc<AutosaveManager> {
+    holder.lock().unwrap().manager.clone().expect("started")
+}
+
 fn assert_one_set_with_every_method(mgr: &AutosaveManager) {
     let sets = mgr.sets();
     assert_eq!(sets.len(), 1, "one request file, one list");
@@ -135,9 +140,7 @@ async fn methods_named_before_ioc_init_join_one_set() {
     let holder = holder(&dir);
     let db = db().await;
     create_all(&holder, &db);
-    assert_eq!(holder.lock().unwrap().sets.len(), 1);
-    let builder = holder.lock().unwrap().into_builder();
-    assert_one_set_with_every_method(&builder.build().await);
+    assert_one_set_with_every_method(&manager(&holder));
 }
 
 #[epics_macros_rs::epics_test]
@@ -149,12 +152,11 @@ async fn methods_named_after_ioc_init_join_the_running_set() {
     let mgr = Arc::new(builder.build().await);
     holder.lock().unwrap().manager = Some(mgr.clone());
     create_all(&holder, &db);
-    assert!(holder.lock().unwrap().sets.is_empty());
     assert_one_set_with_every_method(&mgr);
 }
 
 #[epics_macros_rs::epics_test]
-async fn a_method_twice_before_ioc_init_is_refused_with_cs_line() {
+async fn a_method_twice_is_refused_with_cs_line() {
     let dir = tempfile::tempdir().unwrap();
     let holder = holder(&dir);
     let db = db().await;
@@ -163,23 +165,7 @@ async fn a_method_twice_before_ioc_init_is_refused_with_cs_line() {
     assert!(refusals(&heard).is_empty());
     create_all(&holder, &db);
     assert_eq!(refusals(&heard), expected_refusals());
-    let builder = holder.lock().unwrap().into_builder();
-    assert_one_set_with_every_method(&builder.build().await);
-}
-
-#[epics_macros_rs::epics_test]
-async fn a_method_twice_after_ioc_init_is_refused_with_cs_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let holder = holder(&dir);
-    let db = db().await;
-    let heard = heard();
-    create_all(&holder, &db);
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = Arc::new(builder.build().await);
-    holder.lock().unwrap().manager = Some(mgr.clone());
-    create_all(&holder, &db);
-    assert_eq!(refusals(&heard), expected_refusals());
-    assert_one_set_with_every_method(&mgr);
+    assert_one_set_with_every_method(&manager(&holder));
 }
 
 #[epics_macros_rs::epics_test]
@@ -194,8 +180,7 @@ async fn different_request_files_are_different_sets() {
         &["settings.req", "P=IOC:"],
     );
     run(&holder, &db, "create_manual_set", &["other.req", ""]);
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = builder.build().await;
+    let mgr = manager(&holder);
     assert_eq!(mgr.set_names(), vec!["settings.req", "other.req"]);
 }
 
@@ -243,11 +228,7 @@ async fn a_method_added_to_a_running_set_starts_its_task() {
         "create_manual_set",
         &["settings.req", "P=IOC:"],
     );
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = Arc::new(builder.build().await);
-    let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-    let _task = mgr.clone().start(&reactor, db.clone());
-    holder.lock().unwrap().manager = Some(mgr.clone());
+    let mgr = manager(&holder);
     run(
         &holder,
         &db,

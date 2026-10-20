@@ -73,6 +73,18 @@ fn width_flags_and_precision_are_snprintfs() {
     assert_eq!(pf("PRINTF(\"%.0f\", 3.5)"), "4");
 }
 
+/// glibc prints a NaN's sign bit, and `#` puts `%e`'s point before the
+/// exponent.
+#[test]
+fn a_negative_nan_and_the_alternate_exponent_are_glibcs() {
+    assert_eq!(pf("PRINTF(\"%f\", -NAN)"), "-nan");
+    assert_eq!(pf("PRINTF(\"%E\", -NAN)"), "-NAN");
+    assert_eq!(pf("PRINTF(\"%G\", -NAN)"), "-NAN");
+    assert_eq!(pf("PRINTF(\"%#g\", -NAN)"), "-nan");
+    assert_eq!(pf("PRINTF(\"%5.1f\", -NAN)"), " -nan");
+    assert_eq!(pf("PRINTF(\"%#.0e\", 1.5)"), "2.e+00");
+}
+
 /// The integer conversions take `l = myNINT(d)` — rounded half away from zero —
 /// and snprintf then reads an INT out of it, so `%x`/`%u` are 32-bit.
 #[test]

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{
-    LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkSet, PvDatabase,
+    LinkForward, LinkForwardRefused, LinkHolder, LinkOpen, LinkPutOp, LinkRef, LinkSet, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -21,7 +21,8 @@ struct Opens {
 
 #[async_trait::async_trait]
 impl LinkSet for Opens {
-    fn open_link(&self, _: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
+    fn open_link(&self, _: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
+        let name = link.name;
         self.opened
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());
@@ -31,22 +32,23 @@ impl LinkSet for Opens {
             LinkOpen::Lset
         }
     }
-    fn forward_handle(&self, name: &[u8]) -> Box<dyn LinkForward> {
+    fn forward_handle(&self, link: LinkRef<'_>) -> Box<dyn LinkForward> {
+        let name = link.name;
         self.forwards
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());
         Box::new(Down)
     }
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         false
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Err("down".into())
     }
 }

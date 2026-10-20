@@ -61,7 +61,7 @@ async fn boot(rbv: [f64; 4]) -> Arc<PvDatabase> {
             .rbv = rbv;
     }
     BlockingBridge::capture().spawn(ml_mono_ctl::run(
-        MlMonoConfig::new("M:", "th", "th2", "y", "z", 35.0, 0),
+        MlMonoConfig::new("M:", "th", "th2", "y", "z", 35.0),
         db,
     ));
     ioc

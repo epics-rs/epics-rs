@@ -1079,7 +1079,7 @@ impl CallbackPool {
     /// `cbRun`, or C's warning when the bands are already armed.
     pub fn init(&self) {
         if !self.arm() {
-            eprintln!("Warning: callbackInit called again before callbackCleanup");
+            crate::stderr_println!("Warning: callbackInit called again before callbackCleanup");
         }
     }
 
@@ -1128,7 +1128,7 @@ impl CallbackPool {
     /// to `cbInit`, the only way the bands are armed again.
     pub fn cleanup(&self) {
         if !self.transition_all(band_state::STOPPED, band_state::INIT) {
-            eprintln!("callbackCleanup() but not stopped");
+            crate::stderr_println!("callbackCleanup() but not stopped");
         }
     }
 

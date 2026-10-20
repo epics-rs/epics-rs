@@ -878,9 +878,10 @@ impl SseqRecord {
     /// `waiting` for a put that was never issued strands the barrier on a
     /// completion that can never arrive, and lets the rest of the sequence run
     /// where C stops it. The status is available here because the gate is a
-    /// cached-state probe (`AsyncDbHandle::put_link_admitted`); the put itself
-    /// still has to be deferred, since it re-enters the database from inside
-    /// this record's own process cycle.
+    /// cached-state probe read with this cycle's target
+    /// ([`OutTarget::put_admitted`]); the put itself still has to be deferred,
+    /// since it re-enters the database from inside this record's own process
+    /// cycle.
     ///
     /// Called ONLY with the buffer [`Self::fire_current_step`] already decided
     /// on — C raises `waiting` inside the `dbCaPutLinkCallback` branch of a
@@ -902,13 +903,7 @@ impl SseqRecord {
         value: EpicsValue,
         live: &mut Vec<ProcessAction>,
     ) -> bool {
-        let admitted = match &self.async_ctx {
-            Some((_, handle)) => handle.put_link_admitted(&self.steps[i].lnk),
-            // No database to refuse it — the spawn below is skipped too, so
-            // the step completes as an issued put with nothing behind it.
-            None => true,
-        };
-        if !admitted {
+        if !self.steps[i].lnk_target.put_admitted {
             self.abort = 1;
             live.push(ProcessAction::PutInLinkStage {
                 field: "ABORT",
@@ -934,13 +929,9 @@ impl SseqRecord {
             let name = name.clone();
             let handle = handle.clone();
             let wake = wake.clone();
-            let link = self.steps[i].lnk.clone();
             let prio = self.callback_priority;
             crate::runtime::task::spawn_background(prio, async move {
-                if let Some(rx) = handle
-                    .put_link_notify(&name, LNK_FIELDS[i], &link, value)
-                    .await
-                {
+                if let Some(rx) = handle.put_link_notify(&name, LNK_FIELDS[i], value).await {
                     // `Err` means the put vanished without firing — treat it as
                     // completion so the step is never stranded.
                     let _ = rx.await;

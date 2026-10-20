@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{CaLinkInit, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{CaLinkInit, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -35,15 +35,16 @@ struct InitLset {
 
 #[async_trait::async_trait]
 impl LinkSet for InitLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         false
     }
 
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
 
-    async fn connect_link(&self, name: &[u8], init: Option<CaLinkInit>) {
+    async fn connect_link(&self, link: LinkRef<'_>, init: Option<CaLinkInit>) {
+        let name = link.name;
         let name = String::from_utf8_lossy(name).into_owned();
         self.opens.lock().push((name, init.is_some()));
         if let Some(init) = init

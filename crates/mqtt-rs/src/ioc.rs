@@ -203,18 +203,13 @@ impl CommandHandler for MqttConfigHandler {
             w.field("OSV", "NO_ALARM");
             w.end();
             // A bad `connPvName` (a space, `.`, `$`, `\'` or `"` — rejected by
-            // db_loader::validate_name) used to be discarded here and the
-            // success line printed anyway, so the IOC booted reporting a
-            // Connected PV that `dbl` never listed. The failure is carried to
-            // the end of the command instead of returned here, so the port
-            // this call already registered still gets its init hook and its
-            // event loop.
-            match crate::db_gen::load_generated_db("mqttDriverConfigure", &db_str, ctx) {
-                Ok(()) => println!("mqttDriverConfigure: connected PV = {pv_name}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    conn_pv_error = Some(e);
-                }
+            // db_loader::validate_name) is carried to the end of the command
+            // instead of returned here, so the port this call already
+            // registered still gets its init hook and its event loop. C's
+            // command is silent on success (drvMqtt.cpp:737-739); `dbl` lists
+            // the PV.
+            if let Err(e) = crate::db_gen::load_generated_db("mqttDriverConfigure", &db_str, ctx) {
+                conn_pv_error = Some(e);
             }
         }
 

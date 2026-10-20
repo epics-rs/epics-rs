@@ -10,8 +10,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
-use epics_base_rs::server::database::{LinkForward, LinkSet, PvDatabase};
-use epics_base_rs::server::record::{JlinkValue, pvajson_identity_key};
+use epics_base_rs::server::database::{LinkForward, LinkRef, LinkSet, PvDatabase};
+use epics_base_rs::server::record::{JlinkValue, OpenLatch, pvajson_identity_key};
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 
 struct Counting;
@@ -62,7 +62,7 @@ fn allocs(mut calls: impl FnMut()) -> usize {
 }
 
 /// Every per-link call a cycle makes on a link that never connects.
-fn unconnected_calls(lset: &dyn LinkSet, name: &[u8], forward: &dyn LinkForward) {
+fn unconnected_calls(lset: &dyn LinkSet, name: LinkRef<'_>, forward: &dyn LinkForward) {
     assert!(!lset.is_connected(name));
     assert!(lset.get_cached_value(name).is_none());
     let _ = lset.put_admission(name);
@@ -71,6 +71,7 @@ fn unconnected_calls(lset: &dyn LinkSet, name: &[u8], forward: &dyn LinkForward)
     assert!(lset.alarm_status(name).is_none());
     assert!(lset.remote_alarm(name).is_none());
     assert!(lset.time_stamp(name).is_none());
+    let _ = lset.read_time_stamp(name);
     assert!(lset.link_metadata(name).is_none());
     let _ = forward.scan_forward();
 }
@@ -111,11 +112,14 @@ fn unconnected_pva_link_lset_calls_allocate_nothing() {
                 for name in [
                     "pva://T:NONE",
                     "pva://T:NONE?sevr=MS&field=value",
+                    "pva://T:NONE?time=true",
                     json.as_str(),
                 ] {
-                    resolver.connect_link(name.as_bytes(), None).await;
-                    let forward = resolver.forward_handle(name.as_bytes());
-                    let n = allocs(|| unconnected_calls(&resolver, name.as_bytes(), &*forward));
+                    let open = OpenLatch::default();
+                    let link = LinkRef::new(name.as_bytes(), &open);
+                    resolver.connect_link(link, None).await;
+                    let forward = resolver.forward_handle(link);
+                    let n = allocs(|| unconnected_calls(&resolver, link, &*forward));
                     assert_eq!(n, 0, "{name}");
                 }
             });

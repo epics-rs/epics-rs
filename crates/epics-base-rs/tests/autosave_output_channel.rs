@@ -64,7 +64,7 @@ fn set_config(dir: &std::path::Path) -> SaveSetConfig {
         request_pvs: vec!["T:C.CALC".into()],
         backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -74,7 +74,7 @@ fn set_config(dir: &std::path::Path) -> SaveSetConfig {
 async fn a_failed_boot_restore_is_on_the_errlog() {
     let log = capture_errlog();
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("s.sav"), "# h\nT:A 1\n").unwrap();
+    std::fs::write(dir.path().join("s.sav"), "# R1.9\nT:A 1\n").unwrap();
     IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
@@ -132,14 +132,16 @@ async fn a_listing_is_the_shells_and_an_error_the_errlogs() {
             .build()
             .await,
     );
+    let _task = mgr.clone().start(db.clone());
     let out = dir.path().join("out.txt");
     let line = format!("save_restoreShow > {}", out.display());
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    let shell_mgr = mgr.clone();
     std::thread::spawn(move || {
         epics_base_rs::runtime::task::set_thread_ok_to_block(true);
         let shell = IocShell::new(db, bridge);
         let mut cfg = AutosaveStartupConfig::new();
-        cfg.manager = Some(mgr);
+        cfg.manager = Some(shell_mgr);
         let holder = Arc::new(Mutex::new(cfg));
         for cmd in AutosaveStartupConfig::register_startup_commands(holder) {
             shell.register(cmd);
@@ -149,6 +151,8 @@ async fn a_listing_is_the_shells_and_an_error_the_errlogs() {
     })
     .join()
     .unwrap();
+    mgr.ops_served().await;
+    mgr.shutdown();
     let listed = std::fs::read_to_string(&out).unwrap();
     assert!(listed.contains("\n  s: \n"), "{listed:?}");
     assert!(

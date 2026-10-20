@@ -143,6 +143,7 @@ use crate::ntshape::{NT_ENUM, NtShape};
 use crate::pvatool::{PvaEvent, PvaTools};
 use crate::report::{Counts, StaleRow};
 use crate::surface::{Coverage, Surface, ValStatus, drives_val, val_status};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// The scan rate of the [`Drive::Scanned`] reproducer.
 ///
@@ -483,7 +484,7 @@ impl MonReport {
             "  cases measured on BOTH sides: {}/{} = {:.1}%",
             cov.measured,
             cov.enumerated,
-            cov.percent()
+            CFloat(cov.percent())
         );
         let _ = writeln!(s, "  cases that errored (NOT coverage): {}\n", cov.errored);
 
@@ -623,7 +624,7 @@ pub fn probe(
         // A skip is loud and says WHICH rule excluded the type, so a shrunken
         // denominator can never be mistaken for a measured-clean one.
         if let Some(why) = val_status(surface, rt).why() {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "[{}/{}] pva monitor: {rt} — EXCLUDED: {why}",
                 i + 1,
                 record_types.len()
@@ -631,13 +632,13 @@ pub fn probe(
             continue;
         }
         if !scan_is_measurable(rt) {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "[{}/{}] pva monitor: {rt} — passive only (own scanning posts undriven events)",
                 i + 1,
                 record_types.len()
             );
         }
-        eprintln!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
+        epics_base_rs::stderr_println!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
         // `Drivable` was just proven, so VAL exists in the surface.
         let val_dbf = surface
             .fields_of(rt)
@@ -647,7 +648,7 @@ pub fn probe(
             .dbf;
         let (cases, self_posting) = probe_type(tools, workdir, rt, val_dbf, allowlist);
         if let Some(sp) = self_posting {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "[{}/{}] pva monitor: {rt} — scanned reproducer withdrawn: the reference posted \
                  {} undriven event(s) in {}ms",
                 i + 1,

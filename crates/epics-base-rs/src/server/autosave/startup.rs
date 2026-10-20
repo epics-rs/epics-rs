@@ -11,39 +11,13 @@ use crate::server::iocsh::registry::{
 };
 
 use super::backup::BackupConfig;
-use super::error::AutosaveError;
 use super::macros::MacroContext;
-use super::manager::{AutosaveBuilder, AutosaveManager};
-use super::request::concatenate_paths;
-use super::save_set::{
-    ListStatus, ManualSource, SaveMethods, SaveSetConfig, SaveStrategy, SrStatus, do_manual_restore,
+use super::manager::{
+    AutosaveBuilder, AutosaveManager, OpQueue, SaveTaskHandle, TaskOp, default_callback,
 };
+use super::request::concatenate_paths;
+use super::save_set::{ListStatus, ManualSource, SaveSetConfig, SaveStrategy, SrStatus};
 use super::settings::SrSettings;
-use super::verify;
-
-/// One request file's set from st.cmd, before `iocInit`: C's `chlist`,
-/// which each `create_*_set` naming the file gives one more method
-/// (`create_data_set`, save_restore.c:2367-2392). The first call's macros
-/// are the set's.
-#[derive(Debug, Clone)]
-pub struct SetDef {
-    pub filename: String,
-    pub macros: String,
-    pub methods: SaveMethods,
-}
-
-impl SetDef {
-    /// The set the first `create_*_set` naming `filename` makes.
-    pub fn new(filename: String, macros: String, method: SaveStrategy) -> Self {
-        let mut methods = SaveMethods::default();
-        let _ = methods.add(method.creating_list());
-        Self {
-            filename,
-            macros,
-            methods,
-        }
-    }
-}
 
 /// A `create_*_set` period argument. C keeps the `int` raw on a method
 /// added to a list, and a timer delay below zero expires at once, as
@@ -139,33 +113,36 @@ pub struct BootRestore {
 }
 
 /// C `manual_save`'s refusals (save_restore.c:702-726), printed: the
-/// manager to queue the save to, when there is one. `save_file`,
-/// `callback` and `puser` are its other arguments as its trace prints them.
-pub(super) fn manual_save_manager(
+/// queue to send the save to, when it is open. `save_file`, `callback` and
+/// `puser` are its other arguments as its trace prints them.
+pub(super) fn manual_save_queue(
     holder: &Mutex<AutosaveStartupConfig>,
     request_file: &str,
     save_file: &str,
     callback: &str,
     puser: &str,
-) -> Option<Arc<AutosaveManager>> {
+) -> Option<Arc<OpQueue>> {
     // OP_MSG_FILENAME_SIZE 100
     if request_file.is_empty() || request_file.len() >= 99 {
-        println!("manual_save: bad filename");
+        crate::epics_println!("manual_save: bad filename");
         return None;
     }
-    let (manager, debug) = {
+    let (ops, debug) = {
         let cfg = holder.lock().unwrap();
-        (cfg.manager.clone(), cfg.settings.debug())
+        (cfg.op_queue(), cfg.settings.debug())
     };
     if debug != 0 {
-        println!(
+        crate::epics_println!(
             "manual_save: request_file='{request_file}', save_file='{save_file}', callbackFunction={callback}, puserPvt={puser}"
         );
     }
-    if manager.is_none() {
-        println!("manual_save: message queue not initialized (no restore set has been created?)");
+    if !ops.is_open() {
+        crate::epics_println!(
+            "manual_save: message queue not initialized (no restore set has been created?)"
+        );
+        return None;
     }
-    manager
+    Some(ops)
 }
 
 /// The `op_msg` checks `remove_data_set` and the `reload_*_set`s make
@@ -187,7 +164,7 @@ fn op_msg_ok(func: &str, filename: &str, macrostring: &str) -> bool {
 }
 
 /// C `create_data_set`'s entry trace (save_restore.c:2329-2332).
-fn trace_create(settings: &SrSettings, filename: &str, method: &SaveStrategy) {
+pub(super) fn trace_create(settings: &SrSettings, filename: &str, method: &SaveStrategy) {
     if settings.debug() <= 1 {
         return;
     }
@@ -197,46 +174,27 @@ fn trace_create(settings: &SrSettings, filename: &str, method: &SaveStrategy) {
         SaveStrategy::OnChange { min_interval } => (0, "NONE", min_interval.as_secs()),
         SaveStrategy::Manual => (0, "NONE", 0),
     };
-    println!(
+    crate::epics_println!(
         "save_restore:create_data_set: file '{filename}', method {:x}, period {period}, trig_chan '{trigger}', mon_period {mon_period}",
         method.method_bit()
     );
 }
 
-/// The save task's `op_Reload*` (save_restore.c:1170-1199): the list of
-/// `filename` removed and made again with `method`, `None` being a
+/// The `reload_*_set`s' send (save_restore.c:2730-2805): the list of
+/// `filename` made again with `method`, `None` being a
 /// `create_triggered_set` refusal.
 fn reload_set(
     holder: &Mutex<AutosaveStartupConfig>,
-    ctx: &CommandContext,
     filename: &str,
     macros: &str,
     method: Option<SaveStrategy>,
 ) {
-    let Some(manager) = holder.lock().unwrap().manager.clone() else {
-        return;
-    };
-    let mut status = manager.take_list(filename);
-    if status == 0 {
-        status = match method {
-            Some(method) => {
-                trace_create(&holder.lock().unwrap().settings, filename, &method);
-                let cfg = holder.lock().unwrap().set_config(filename, macros);
-                match ctx.block_on(manager.create_data_set(cfg, method)) {
-                    Ok(()) => 0,
-                    Err(_) => -1,
-                }
-            }
-            None => {
-                crate::runtime::log::errlog_vprintf(format_args!(
-                    "save_restore:create_triggered_set: Error: trigger-channel name is required.\n"
-                ));
-                -1
-            }
-        };
-    }
-    let outcome = if status == 0 { "Succeeded" } else { "Failed" };
-    manager.note_recent(format!("Reload '{filename}' {outcome}"));
+    let cfg = holder.lock().unwrap();
+    cfg.send(TaskOp::Reload {
+        filename: filename.to_string(),
+        config: cfg.set_config(filename, Some(macros)),
+        method,
+    });
 }
 
 /// C `request_manual_restore`'s refusals (save_restore.c:2829-2837),
@@ -247,7 +205,7 @@ pub(super) fn manual_restore_request_ok(
     settings: &SrSettings,
 ) -> bool {
     if settings.debug() >= 5 {
-        println!("save_restore:request_manual_restore: entry");
+        crate::epics_println!("save_restore:request_manual_restore: entry");
     }
     if filename.is_empty() || filename.len() >= 99 {
         crate::runtime::log::errlog_vprintf(format_args!(
@@ -264,60 +222,23 @@ pub(super) fn manual_restore_request_ok(
     true
 }
 
-/// The save task's `op_RestoreFromSaveFile` and `op_RestoreFromAsciiFile`
-/// (save_restore.c:1137-1159): an ASCII file that restored is then
-/// `asVerify`ed, and that is the status.
-pub(super) async fn run_manual_restore(
-    manager: Option<Arc<AutosaveManager>>,
-    settings: &SrSettings,
-    db: &PvDatabase,
-    path: &Path,
-    filename: &str,
-    from: ManualSource,
-    macrostring: &str,
-) -> i32 {
-    let debug = settings.debug();
-    if debug != 0 {
-        println!("save_restore task: calling do_manual_restore('{filename}')");
-    }
-    let status = match manager {
-        Some(mgr) => {
-            mgr.manual_restore(db, path, filename, from, macrostring)
-                .await
-        }
-        None => do_manual_restore(db, filename, path, from, macrostring, settings).await,
-    };
-    if debug > 1 {
-        println!("save_restore: manual restore status={status} (0==success)");
-    }
-    if status == 0 && from == ManualSource::AsciiFile {
-        if !Path::new(filename).is_absolute() {
-            super::request::concatenated(&path.to_string_lossy(), settings);
-        }
-        return verify::do_as_verify(db, path, -1, None).await;
-    }
-    status
-}
-
 /// Startup configuration collected from st.cmd autosave commands.
 ///
-/// Populated during Phase 1 (st.cmd execution) via iocsh commands,
-/// then consumed during Phase 2 (iocInit) to build the AutosaveManager.
+/// Populated by the iocsh commands; the first `create_*_set` builds the
+/// AutosaveManager from it and starts the save task.
 #[derive(Debug, Default)]
 pub struct AutosaveStartupConfig {
     pub request_file_paths: Vec<PathBuf>,
     pub save_file_path: Option<PathBuf>,
     pub status_prefix: Option<String>,
-    /// The sets the `create_*_set` commands made before `iocInit`, one per
-    /// request file, in creation order.
-    pub sets: Vec<SetDef>,
     pub pass0_restores: Vec<RestoreDef>,
     pub pass1_restores: Vec<RestoreDef>,
-    /// The manager `iocInit` built from this config. Set by `iocInit`;
-    /// from then on the `create_*_set` commands add their set to it
-    /// instead of to `sets`, which C's `create_data_set` does at
-    /// any time (`save_restore.c`).
+    /// The manager the first `create_*_set` built, before or after
+    /// `iocInit`, as C's `save_restore_init` (save_restore.c:2335-2351);
+    /// every `create_*_set` adds its set to it.
     pub manager: Option<Arc<AutosaveManager>>,
+    /// The manager's task, which the IOC stops and waits for when it ends.
+    task: Option<SaveTaskHandle>,
     /// C `save_restore.c`'s globals: the `save_restoreSet_*` commands write
     /// them, the save task and the restores read them.
     pub settings: Arc<SrSettings>,
@@ -328,6 +249,8 @@ pub struct AutosaveStartupConfig {
     /// C `save_restoreNFSHostName`, `save_restoreNFSHostAddr` and
     /// `save_restoreNFSMntPoint` (nfs_utils.c:9-11).
     pub nfs: super::nfs::NfsHost,
+    /// C `opMsgQueue`, which the manager takes when it is built.
+    ops: Arc<OpQueue>,
 }
 
 impl AutosaveStartupConfig {
@@ -335,14 +258,34 @@ impl AutosaveStartupConfig {
         Self::default()
     }
 
-    /// Resolve a save file path from a request filename.
+    /// C `opMsgQueue`: the manager's once there is one, else the one it
+    /// will take.
+    pub(super) fn op_queue(&self) -> Arc<OpQueue> {
+        match &self.manager {
+            Some(manager) => manager.op_queue().clone(),
+            None => self.ops.clone(),
+        }
+    }
+
+    /// `epicsMessageQueueSend(opMsgQueue, ...)`. C's queue is NULL until
+    /// the first `create_*_set`, and only `manual_save` checks it
+    /// (:723-726); the others send to NULL and crash (:2658, :2746, :2766,
+    /// :2786, :2805, :2849, :2874; the oracle's `fdbrestore` before any set
+    /// segfaults), a C defect, so here the op is dropped.
+    pub(super) fn send(&self, op: TaskOp) {
+        self.op_queue().send(op);
+    }
+
+    /// Resolve a save file path from a request filename: C cuts the name
+    /// at its last '.' and appends ".sav" (save_restore.c:2451-2455).
     pub fn resolve_save_file(&self, filename: &str) -> PathBuf {
-        let base = filename.trim_end_matches(".req");
-        let sav_name = if base.ends_with(".sav") {
-            base.to_string()
-        } else {
-            format!("{base}.sav")
-        };
+        // A name with no '.' runs C's search down to index 0 and truncates
+        // the whole name, leaving ".sav" (save_restore.c:2452-2454), a C
+        // defect: the name is kept. So is a name of FN_LEN (80) or more,
+        // which C cuts to 79 bytes (:2420, :2445) and whose ".sav" can
+        // overrun `save_file` (:2455).
+        let base = filename.rfind('.').map_or(filename, |i| &filename[..i]);
+        let sav_name = format!("{base}.sav");
         match &self.save_file_path {
             Some(dir) => dir.join(&sav_name),
             None => PathBuf::from(&sav_name),
@@ -359,7 +302,7 @@ impl AutosaveStartupConfig {
     }
 
     /// The set a request file describes, named by the file as C's lists are.
-    pub fn set_config(&self, filename: &str, macros: &str) -> SaveSetConfig {
+    pub fn set_config(&self, filename: &str, macros: Option<&str>) -> SaveSetConfig {
         // The NAME, not a pre-resolved path.
         // `SaveSet::load_entries` hands it to
         // `load_request_file_with_search_paths`, which searches
@@ -373,11 +316,10 @@ impl AutosaveStartupConfig {
         // its first tick.
         let request_file = Some(PathBuf::from(filename));
         let save_path = self.resolve_save_file(filename);
-        let macro_string = macros.to_string();
-        let macros = if macros.is_empty() {
-            HashMap::new()
-        } else {
-            MacroContext::parse_inline(macros)
+        let macro_string = macros.map(str::to_string);
+        let macros = match macros {
+            Some(macros) if !macros.is_empty() => MacroContext::parse_inline(macros),
+            _ => HashMap::new(),
         };
         SaveSetConfig {
             name: filename.to_string(),
@@ -424,7 +366,12 @@ impl AutosaveStartupConfig {
     }
 
     /// C `save_restoreShow(verbose)` (save_restore.c:2492-2583).
-    pub fn save_restore_show(&self, ctx: &CommandContext, verbose: i32) {
+    pub fn save_restore_show(
+        &self,
+        db: &PvDatabase,
+        out: &dyn Fn(std::fmt::Arguments<'_>),
+        verbose: i32,
+    ) {
         let settings = &self.settings;
         let get = |v: &std::sync::atomic::AtomicI32| v.load(Ordering::Relaxed);
         let yes = |b: bool| if b { "YES" } else { "NO" };
@@ -432,57 +379,57 @@ impl AutosaveStartupConfig {
             || ListStatus::new(SrStatus::Init, ""),
             |manager| manager.sr_status(),
         );
-        ctx.print_fmt(format_args!("BEGIN save_restoreShow"));
-        ctx.print_fmt(format_args!(
+        out(format_args!("BEGIN save_restoreShow"));
+        out(format_args!(
             "  Current date-time (yymmdd-hhmmss): [{}] ",
             super::backup::date_str()
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Status: '{}' - '{}'",
             status.code.label(),
             status.text
         ));
-        ctx.print_fmt(format_args!("  Debug level: {}", get(&settings.debug)));
+        out(format_args!("  Debug level: {}", get(&settings.debug)));
         #[cfg(unix)]
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  File permissions: 0{:o}",
             settings.file_permissions.load(Ordering::Relaxed)
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Save/restore incomplete save sets? {}",
             yes(settings.incomplete_sets_ok())
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Write dated backup files? {}",
             yes(settings.dated_backup_files())
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Number of sequence files to maintain: {}",
             get(&settings.num_seq_files)
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Time interval between sequence files: {} seconds",
             get(&settings.seq_period_in_seconds)
         ));
-        ctx.print_fmt(format_args!(
+        out(format_args!(
             "  Time interval between .sav-file write failure and retry: {} seconds",
             get(&settings.retry_seconds)
         ));
         if self.nfs.managed() {
-            self.nfs.show(ctx, settings);
+            self.nfs.show(out, settings);
         }
-        ctx.print_fmt(format_args!("  I/O errors: {}", get(&settings.io_errors)));
-        ctx.print_fmt(format_args!("  request file path list:"));
+        out(format_args!("  I/O errors: {}", settings.io_errors()));
+        out(format_args!("  request file path list:"));
         for path in &self.request_file_paths {
             // `set_requestfile_path` ends each with '/' (:2608).
             let mut path = path.display().to_string();
             if !path.ends_with('/') {
                 path.push('/');
             }
-            ctx.print_fmt(format_args!("    '{path}'"));
+            out(format_args!("    '{path}'"));
         }
-        ctx.print_fmt(format_args!("  save file path:"));
-        ctx.print_fmt(format_args!(
+        out(format_args!("  save file path:"));
+        out(format_args!(
             "    '{}'",
             self.save_file_path
                 .as_deref()
@@ -490,23 +437,23 @@ impl AutosaveStartupConfig {
                 .unwrap_or_default()
         ));
         match &self.manager {
-            Some(manager) => manager.show_lists(ctx.db(), ctx, verbose),
-            None => ctx.print_fmt(format_args!(
+            Some(manager) => manager.show_lists(db, out, verbose),
+            None => out(format_args!(
                 "  The save_restore task apparently is not running."
             )),
         }
-        ctx.print_fmt(format_args!("reboot-restore status:"));
-        self.dbrestore_show(ctx);
-        ctx.print_fmt(format_args!("END save_restoreShow"));
+        out(format_args!("reboot-restore status:"));
+        self.dbrestore_show(out);
+        out(format_args!("END save_restoreShow"));
     }
 
     /// C `dbrestoreShow` (dbrestore.c:147-168).
-    pub fn dbrestore_show(&self, ctx: &CommandContext) {
-        ctx.print_fmt(format_args!(
+    pub fn dbrestore_show(&self, out: &dyn Fn(std::fmt::Arguments<'_>)) {
+        out(format_args!(
             "  '     filename     ' -  status  - 'message' - 'macro string'"
         ));
         for (pass, list) in [(0, &self.pass0_restores), (1, &self.pass1_restores)] {
-            ctx.print_fmt(format_args!("  pass {pass}:"));
+            out(format_args!("  pass {pass}:"));
             for item in list {
                 let status = item.status.lock().unwrap();
                 let (code, text) = (status.code.label(), &status.text);
@@ -516,20 +463,21 @@ impl AutosaveStartupConfig {
                     } else {
                         &item.macros
                     };
-                    ctx.print_fmt(format_args!(
+                    out(format_args!(
                         "  '{}' - {code} - '{text}' - '{macros}'",
                         item.filename
                     ));
                 } else {
-                    ctx.print_fmt(format_args!("  '{}' - {code} - '{text}'", item.filename));
+                    out(format_args!("  '{}' - {code} - '{text}'", item.filename));
                 }
             }
         }
     }
 
-    /// Build an AutosaveBuilder from the collected configuration.
+    /// The builder of the manager the first `create_*_set` starts.
     pub fn into_builder(&self) -> AutosaveBuilder {
         let mut builder = AutosaveBuilder::new()
+            .op_queue(self.ops.clone())
             .settings(self.settings.clone())
             .reboot_statuses(
                 self.pass0_restores
@@ -543,65 +491,72 @@ impl AutosaveStartupConfig {
             builder = builder.status_prefix(prefix);
         }
 
-        for def in &self.sets {
-            for method in def.methods.iter() {
-                builder =
-                    builder.add_set(self.set_config(&def.filename, &def.macros), method.clone());
-            }
-        }
-
         builder
     }
 
+    /// The save task, for the IOC to stop and wait for when it ends.
+    pub(crate) fn take_task(&mut self) -> Option<SaveTaskHandle> {
+        self.task.take()
+    }
+
     /// C `create_data_set` for a `create_*_set` command: `method` joins the
-    /// set built from `filename`, or makes it. After `iocInit` the set is
-    /// the running manager's, as C's live list is; before, it is kept for
-    /// `into_builder`. A method the set already has is refused on the error
-    /// log only, as C's iocsh wrappers ignore the status.
+    /// set built from `filename`, or makes it, in the running manager. A
+    /// method the set already has is refused on the error log only, as C's
+    /// iocsh wrappers ignore the status.
     fn create_data_set(
-        holder: &Mutex<Self>,
+        holder: &Arc<Mutex<Self>>,
         ctx: &CommandContext,
         filename: String,
-        macros: String,
+        macros: Option<String>,
         method: SaveStrategy,
     ) -> Result<CommandOutcome, String> {
-        trace_create(&holder.lock().unwrap().settings, &filename, &method);
-        // save_restore.c:2357-2362
-        if filename.is_empty() {
-            return Ok(CommandOutcome::Continue);
-        }
-        let (mgr, cfg) = {
-            let mut cfg = holder.lock().unwrap();
-            match cfg.manager.clone() {
-                Some(mgr) => {
-                    let set = cfg.set_config(&filename, &macros);
-                    (mgr, set)
-                }
-                None => {
-                    match cfg.sets.iter_mut().find(|d| d.filename == filename) {
-                        Some(def) => {
-                            if let Err(bit) = def.methods.add(method) {
-                                let refusal = AutosaveError::AlreadyInMode {
-                                    request_file: filename,
-                                    bit,
-                                };
-                                crate::runtime::log::errlog_vprintf(format_args!("{refusal}\n"));
-                            }
-                        }
-                        None => cfg.sets.push(SetDef::new(filename, macros, method)),
-                    }
-                    return Ok(CommandOutcome::Continue);
-                }
+        let builder = {
+            let cfg = holder.lock().unwrap();
+            trace_create(&cfg.settings, &filename, &method);
+            match cfg.manager {
+                Some(_) => None,
+                None => Some(cfg.into_builder()),
             }
         };
-        // Already reported; C's iocsh wrappers ignore the status.
-        let _ = ctx.block_on(mgr.create_data_set(cfg, method));
+        // `save_restore_init` (save_restore.c:2335-2351), before the name
+        // is looked at: the queue, then the task, which serves it at once
+        // whether or not `iocInit` has run.
+        let (mgr, new) = match builder {
+            Some(builder) => {
+                let mgr = Arc::new(ctx.block_on(builder.build()));
+                mgr.op_queue().open();
+                mgr.attach_startup(holder);
+                (mgr, true)
+            }
+            None => (holder.lock().unwrap().manager.clone().unwrap(), false),
+        };
+        // save_restore.c:2357-2362. The set is the manager's before its
+        // task starts, so the task's first pass connects it, as C's does
+        // while its new thread is still making its CA context.
+        if !filename.is_empty() {
+            let set = holder
+                .lock()
+                .unwrap()
+                .set_config(&filename, macros.as_deref());
+            // Already reported; C's iocsh wrappers ignore the status.
+            let _ = ctx.block_on(mgr.create_data_set(set, method));
+        }
+        if new {
+            // C leaves `save_restore_init` clear when the task could not
+            // be made, so the next call tries again; the line is printed.
+            if let Some(task) = mgr.clone().start(ctx.db().clone()) {
+                let mut cfg = holder.lock().unwrap();
+                cfg.manager = Some(mgr);
+                cfg.task = Some(task);
+            }
+        }
         Ok(CommandOutcome::Continue)
     }
 
     /// Register the autosave iocsh commands that populate this config.
     pub fn register_startup_commands(holder: Arc<Mutex<Self>>) -> Vec<CommandDef> {
         let mut commands = Vec::new();
+        super::settings::register_dbd_variables(&holder.lock().unwrap().settings);
 
         // set_requestfile_path(path, subpath)
         {
@@ -666,10 +621,7 @@ impl AutosaveStartupConfig {
                     if full_path.is_empty() {
                         return Ok(CommandOutcome::Continue);
                     }
-                    let full_path = PathBuf::from(full_path);
-                    // Creating the directory is an rs extension; C prints nothing here.
-                    let _ = std::fs::create_dir_all(&full_path);
-                    h.lock().unwrap().save_file_path = Some(full_path);
+                    h.lock().unwrap().save_file_path = Some(PathBuf::from(full_path));
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -713,8 +665,8 @@ impl AutosaveStartupConfig {
                         _ => period_arg(0),
                     };
                     let macros = match args.get(2) {
-                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                        _ => String::new(),
+                        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
+                        _ => None,
                     };
                     Self::create_data_set(&h, ctx, filename, macros, method(period))
                 },
@@ -767,8 +719,8 @@ impl AutosaveStartupConfig {
                         _ => String::new(),
                     };
                     let macros = match args.get(2) {
-                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                        _ => String::new(),
+                        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
+                        _ => None,
                     };
                     Self::create_data_set(
                         &h,
@@ -803,8 +755,8 @@ impl AutosaveStartupConfig {
                         _ => String::new(),
                     };
                     let macros = match args.get(1) {
-                        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                        _ => String::new(),
+                        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
+                        _ => None,
                     };
                     Self::create_data_set(&h, ctx, filename, macros, SaveStrategy::Manual)
                 },
@@ -899,26 +851,13 @@ impl AutosaveStartupConfig {
                     if !manual_restore_request_ok(&filename, "", &settings) {
                         return Ok(CommandOutcome::Continue);
                     }
-                    let (path, mgr, settings) = {
-                        let cfg = h.lock().unwrap();
-                        (
-                            cfg.save_dir_file(&filename),
-                            cfg.manager.clone(),
-                            cfg.settings.clone(),
-                        )
-                    };
-                    let db = ctx.db().clone();
-                    ctx.block_on(async move {
-                        run_manual_restore(
-                            mgr,
-                            &settings,
-                            &db,
-                            &path,
-                            &filename,
-                            ManualSource::SaveFile,
-                            "",
-                        )
-                        .await
+                    let cfg = h.lock().unwrap();
+                    cfg.send(TaskOp::Restore {
+                        path: cfg.save_dir_file(&filename),
+                        filename,
+                        from: ManualSource::SaveFile,
+                        macrostring: String::new(),
+                        callback: default_callback(),
                     });
                     Ok(CommandOutcome::Continue)
                 },
@@ -941,7 +880,7 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let text = |i: usize| match args.get(i) {
                         Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
                         _ => Ok(String::new()),
@@ -951,29 +890,15 @@ impl AutosaveStartupConfig {
                     if !manual_restore_request_ok(&filename, &macrostring, &settings) {
                         return Ok(CommandOutcome::Continue);
                     }
-                    let (path, mgr, settings) = {
-                        let cfg = h.lock().unwrap();
-                        (
-                            cfg.save_dir_file(&filename),
-                            cfg.manager.clone(),
-                            cfg.settings.clone(),
-                        )
-                    };
-                    let db = ctx.db().clone();
-                    let status = ctx.block_on(async move {
-                        run_manual_restore(
-                            mgr,
-                            &settings,
-                            &db,
-                            &path,
-                            &filename,
-                            ManualSource::AsciiFile,
-                            &macrostring,
-                        )
-                        .await
-                    });
+                    let cfg = h.lock().unwrap();
                     // No callback from the shell: C's `defaultCallback`.
-                    println!("save_restore:defaultCallback:status={status}");
+                    cfg.send(TaskOp::Restore {
+                        path: cfg.save_dir_file(&filename),
+                        filename,
+                        from: ManualSource::AsciiFile,
+                        macrostring,
+                        callback: default_callback(),
+                    });
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -999,7 +924,7 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let text = |i: usize| match args.get(i) {
                         Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
                         _ => Ok(String::new()),
@@ -1013,7 +938,7 @@ impl AutosaveStartupConfig {
                     let settings = h.lock().unwrap().settings.clone();
                     let debug = settings.debug();
                     if debug >= 5 {
-                        println!("save_restore:request_asVerify: entry");
+                        crate::epics_println!("save_restore:request_asVerify: entry");
                     }
                     // `request_asVerify` (save_restore.c:2859-2862).
                     if filename.is_empty() || filename.len() >= 99 {
@@ -1022,19 +947,13 @@ impl AutosaveStartupConfig {
                         ));
                         return Ok(CommandOutcome::Continue);
                     }
-                    // op_asVerify (:1239-1247): the restore file is not under
-                    // the save path.
-                    if debug != 0 {
-                        println!("save_restore task: calling do_asVerify('{filename}')");
-                    }
-                    let path = h.lock().unwrap().save_dir_file(&filename);
-                    if !Path::new(&filename).is_absolute() {
-                        super::request::concatenated(&path.to_string_lossy(), &settings);
-                    }
-                    let db = ctx.db().clone();
-                    ctx.block_on(async move {
-                        let restore = (!restore.is_empty()).then(|| PathBuf::from(restore));
-                        verify::do_as_verify(&db, &path, verbose, restore.as_deref()).await
+                    // The restore file is not under the save path (:1239-1247).
+                    let cfg = h.lock().unwrap();
+                    cfg.send(TaskOp::AsVerify {
+                        path: cfg.save_dir_file(&filename),
+                        filename,
+                        verbose,
+                        restore: (!restore.is_empty()).then(|| PathBuf::from(restore)),
                     });
                     Ok(CommandOutcome::Continue)
                 },
@@ -1052,22 +971,22 @@ impl AutosaveStartupConfig {
                     arg_type: ArgType::String,
                 }],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let request_file = match args.first() {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    let Some(manager) =
-                        manual_save_manager(&h, &request_file, "(null)", "(nil)", "(nil)")
+                    let Some(ops) =
+                        manual_save_queue(&h, &request_file, "(null)", "(nil)", "(nil)")
                     else {
                         return Ok(CommandOutcome::Continue);
                     };
-                    let path = h.lock().unwrap().save_dir_file("");
-                    let db = ctx.db().clone();
-                    let status = ctx.block_on(async move {
-                        manager.save_file_op(&db, &request_file, "", &path).await
+                    ops.send(TaskOp::Save {
+                        request_file,
+                        filename: String::new(),
+                        path: h.lock().unwrap().save_dir_file(""),
+                        callback: default_callback(),
                     });
-                    println!("save_restore:defaultCallback:status={status}");
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -1088,10 +1007,8 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                         _ => String::new(),
                     };
-                    if op_msg_ok("remove_data_set", &filename, "")
-                        && let Some(manager) = h.lock().unwrap().manager.clone()
-                    {
-                        manager.remove_data_set(&filename);
+                    if op_msg_ok("remove_data_set", &filename, "") {
+                        h.lock().unwrap().send(TaskOp::Remove { filename });
                     }
                     Ok(CommandOutcome::Continue)
                 },
@@ -1125,7 +1042,7 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let text = |i: usize| match args.get(i) {
                         Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
                         _ => Ok(String::new()),
@@ -1136,13 +1053,7 @@ impl AutosaveStartupConfig {
                         _ => 0,
                     };
                     if op_msg_ok(name, &filename, &macros) {
-                        reload_set(
-                            &h,
-                            ctx,
-                            &filename,
-                            &macros,
-                            Some(method(period_arg(period))),
-                        );
+                        reload_set(&h, &filename, &macros, Some(method(period_arg(period))));
                     }
                     Ok(CommandOutcome::Continue)
                 },
@@ -1170,7 +1081,7 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let text = |i: usize| match args.get(i) {
                         Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
                         _ => Ok(String::new()),
@@ -1181,7 +1092,7 @@ impl AutosaveStartupConfig {
                         let trigger: String = trigger.chars().take(79).collect();
                         let method =
                             is_valid_first_pv_char(&trigger).then(|| triggered_method(trigger));
-                        reload_set(&h, ctx, &filename, &macros, method);
+                        reload_set(&h, &filename, &macros, method);
                     }
                     Ok(CommandOutcome::Continue)
                 },
@@ -1204,14 +1115,14 @@ impl AutosaveStartupConfig {
                     },
                 ],
                 "",
-                move |args: &[ArgValue], ctx: &CommandContext| {
+                move |args: &[ArgValue], _ctx: &CommandContext| {
                     let text = |i: usize| match args.get(i) {
                         Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
                         _ => Ok(String::new()),
                     };
                     let (filename, macros) = (text(0)?, text(1)?);
                     if op_msg_ok("reload_manual_set", &filename, &macros) {
-                        reload_set(&h, ctx, &filename, &macros, Some(SaveStrategy::Manual));
+                        reload_set(&h, &filename, &macros, Some(SaveStrategy::Manual));
                     }
                     Ok(CommandOutcome::Continue)
                 },
@@ -1233,7 +1144,9 @@ impl AutosaveStartupConfig {
                         Some(ArgValue::Int(v)) => *v as i32,
                         _ => 0,
                     };
-                    h.lock().unwrap().save_restore_show(ctx, verbose);
+                    h.lock()
+                        .unwrap()
+                        .save_restore_show(ctx.db(), &|a| ctx.print_fmt(a), verbose);
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -1247,7 +1160,7 @@ impl AutosaveStartupConfig {
                 vec![],
                 "",
                 move |_args: &[ArgValue], ctx: &CommandContext| {
-                    h.lock().unwrap().dbrestore_show(ctx);
+                    h.lock().unwrap().dbrestore_show(&|a| ctx.print_fmt(a));
                     Ok(CommandOutcome::Continue)
                 },
             ));
@@ -1401,9 +1314,9 @@ impl AutosaveStartupConfig {
             ));
         }
 
-        // The save_restoreSet_* setters of C's globals (save_restore.c:453-491,
+        // The setters of C's globals (save_restore.c:453-491, 2636,
         // 3870-3987), an absent argument being iocsh's 0.
-        let setters: [(&'static str, &'static str, fn(&SrSettings, i32)); 11] = [
+        let setters: [(&'static str, &'static str, fn(&SrSettings, i32)); 12] = [
             ("save_restoreSet_Debug", "level", SrSettings::set_debug),
             (
                 "save_restoreSet_NumSeqFiles",
@@ -1454,6 +1367,11 @@ impl AutosaveStartupConfig {
                 "save_restoreSet_periodicDatedBackups",
                 "periodMinutes",
                 SrSettings::set_periodic_dated_backups,
+            ),
+            (
+                "set_saveTask_priority",
+                "priority",
+                SrSettings::set_task_priority,
             ),
         ];
         for (name, arg, set) in setters {
@@ -1523,26 +1441,60 @@ mod tests {
         cfg.save_file_path = Some(dir.path().to_path_buf());
     }
 
+    /// The sets the commands made in the manager the first one started.
+    fn sets_of(holder: &Mutex<AutosaveStartupConfig>) -> Vec<String> {
+        let h = holder.lock().unwrap();
+        h.manager
+            .as_ref()
+            .map(|m| m.set_names())
+            .unwrap_or_default()
+    }
+
+    /// The C oracle IOC's save files for these request files: s.sav,
+    /// x.sav.sav and sub.sav; "foo" gives C's ".sav", a defect not copied.
+    #[test]
+    fn the_save_file_is_the_request_file_cut_at_its_last_dot() {
+        let cfg = AutosaveStartupConfig::new();
+        for (req, sav) in [
+            ("s.req", "s.sav"),
+            ("s.txt", "s.sav"),
+            ("x.sav.req", "x.sav.sav"),
+            ("sub.d/q", "sub.sav"),
+            ("foo", "foo.sav"),
+        ] {
+            assert_eq!(cfg.resolve_save_file(req), PathBuf::from(sav), "{req}");
+        }
+        // Past C's FN_LEN the name is kept whole.
+        let long = "n".repeat(100);
+        assert_eq!(
+            cfg.resolve_save_file(&format!("{long}.req")),
+            PathBuf::from(format!("{long}.sav"))
+        );
+    }
+
     #[test]
     fn triggered_set_maps_to_triggered_strategy() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = AutosaveStartupConfig::new();
         with_request_file(&mut cfg, &dir);
-        cfg.sets.push(SetDef::new(
-            "settings.req".to_string(),
-            String::new(),
-            triggered_method("IOC:saveTrigger".to_string()),
-        ));
-
-        let builder = cfg.into_builder();
-        // The builder owns the configs; rebuild to inspect the set.
-        // `AutosaveBuilder` does not expose its set list, so verify
-        // through a constructed `SaveSetConfig` shape instead by
-        // re-running the mapping logic the public path uses.
-        // Direct check: `into_builder` is the public mapping; assert
-        // the strategy via a SaveSet built from it.
+        let holder = Arc::new(Mutex::new(cfg));
+        let cmds = AutosaveStartupConfig::register_startup_commands(holder.clone());
+        let cmd = cmds
+            .iter()
+            .find(|c| c.name == "create_triggered_set")
+            .expect("registered");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mgr = rt.block_on(builder.build());
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(Arc::new(crate::server::database::PvDatabase::new()), bridge);
+        let args = [
+            ArgValue::String("settings.req".into()),
+            ArgValue::String("IOC:saveTrigger".into()),
+        ];
+        assert!(cmd.handler.call(&args, &ctx).is_ok());
+        let mgr = holder.lock().unwrap().manager.clone().unwrap();
         let sets = mgr.sets();
         assert_eq!(sets.len(), 1, "one triggered set expected");
         match &sets[0].0.methods()[..] {
@@ -1559,7 +1511,10 @@ mod tests {
     /// interpret.
     #[test]
     fn create_triggered_set_refuses_a_missing_trigger_channel() {
-        let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AutosaveStartupConfig::new();
+        with_request_file(&mut cfg, &dir);
+        let holder = Arc::new(Mutex::new(cfg));
         let cmds = AutosaveStartupConfig::register_startup_commands(holder.clone());
         let cmd = cmds
             .iter()
@@ -1589,7 +1544,7 @@ mod tests {
             );
         }
         assert!(
-            holder.lock().unwrap().sets.is_empty(),
+            sets_of(&holder).is_empty(),
             "a refused call must leave no set behind"
         );
     }
@@ -1598,7 +1553,12 @@ mod tests {
     /// fail (`save_restore.c:2357-2362`).
     #[test]
     fn create_period_sets_take_missing_arguments_as_c() {
-        let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.req"), "IOC:setpoint\n").unwrap();
+        let mut cfg = AutosaveStartupConfig::new();
+        cfg.request_file_paths.push(dir.path().to_path_buf());
+        cfg.save_file_path = Some(dir.path().to_path_buf());
+        let holder = Arc::new(Mutex::new(cfg));
         let cmds = AutosaveStartupConfig::register_startup_commands(holder.clone());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let bridge = {
@@ -1624,8 +1584,6 @@ mod tests {
                 );
             }
         }
-        let h = holder.lock().unwrap();
-        assert_eq!(h.sets.len(), 1, "{:?}", h.sets);
-        assert_eq!(h.sets[0].filename, "s.req");
+        assert_eq!(sets_of(&holder), ["s.req"]);
     }
 }

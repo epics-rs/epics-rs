@@ -9,9 +9,10 @@ use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
@@ -148,8 +149,8 @@ fn attribute_tag_string(attr: &NDAttribute) -> String {
         NDAttrValue::UInt32(v) => format!("{}", v),
         NDAttrValue::UInt64(v) => format!("{}", v),
         // C++ uses "%f" which is 6 fractional digits.
-        NDAttrValue::Float32(v) => format!("{:.6}", v),
-        NDAttrValue::Float64(v) => format!("{:.6}", v),
+        NDAttrValue::Float32(v) => format!("{:.6}", CFloat(f64::from(*v))),
+        NDAttrValue::Float64(v) => format!("{:.6}", CFloat(*v)),
         NDAttrValue::String(s) => s.clone(),
         NDAttrValue::Undefined => String::new(),
     };
@@ -425,7 +426,13 @@ impl TiffWriter {
 }
 
 impl NDFileWriter for TiffWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
+        // C reads but does not append (NDFileTIFF.cpp:102).
+        if mode.contains(NDFileOpenMode::APPEND) {
+            return Err(ADError::UnsupportedConversion(
+                "NDFileTIFF cannot append".into(),
+            ));
+        }
         self.current_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -706,6 +713,7 @@ impl NDPluginProcess for TiffFileProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::plugin::file_base::NDFileMode;
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF
     // decoder (the `tiff` crate), not with our own reader.
     use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
@@ -714,6 +722,23 @@ mod tests {
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tiff::decoder::Decoder;
+
+    /// C++'s `%f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+    #[test]
+    fn a_float_attribute_tag_prints_a_nan_as_c_does() {
+        let tag = |value| {
+            attribute_tag_string(&NDAttribute::new_static(
+                "A",
+                "",
+                NDAttrSource::Driver,
+                value,
+            ))
+        };
+        assert_eq!(tag(NDAttrValue::Float64(f64::NAN)), "A:nan");
+        assert_eq!(tag(NDAttrValue::Float64(-f64::NAN)), "A:-nan");
+        assert_eq!(tag(NDAttrValue::Float32(f32::NAN)), "A:nan");
+        assert_eq!(tag(NDAttrValue::Float32(-f32::NAN)), "A:-nan");
+    }
     use tiff::tags::Tag;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1422,7 +1447,7 @@ mod tests {
         let path = temp_path("tiff_3d_no_colormode");
         let mut writer = TiffWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -1451,7 +1476,7 @@ mod tests {
         let path = temp_path("tiff_3d_rgb1");
         let mut writer = TiffWriter::new();
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
@@ -1476,7 +1501,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1500,7 +1527,9 @@ mod tests {
             NDDataType::UInt16,
         );
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1525,7 +1554,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
@@ -1554,7 +1585,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
         let read_back = writer.read_file().unwrap();
@@ -1584,7 +1617,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1653,7 +1688,9 @@ mod tests {
         arr.timestamp.sec = 1_000_000;
         arr.timestamp.nsec = 500;
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1706,7 +1743,9 @@ mod tests {
             NDAttrValue::String("test frame".into()),
         ));
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1747,7 +1786,7 @@ mod tests {
 
         let path = temp_path("tiff_attr_fmt");
         let mut writer = TiffWriter::new();
-        writer.open_file(&path, NDFileMode::Single, &a).unwrap();
+        writer.open_file(&path, NDFileOpenMode::WRITE, &a).unwrap();
         writer.write_file(&Arc::new(a)).unwrap();
         writer.close_file().unwrap();
 
@@ -1783,7 +1822,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         // Previously a hard error; must now succeed.
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
@@ -1865,7 +1906,9 @@ mod tests {
     fn write_tiff(prefix: &str, array: &NDArray) -> PathBuf {
         let path = temp_path(prefix);
         let mut writer = TiffWriter::new();
-        writer.open_file(&path, NDFileMode::Single, array).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, array)
+            .unwrap();
         writer.write_file(&Arc::new(array.clone())).unwrap();
         writer.close_file().unwrap();
         path
@@ -2005,7 +2048,7 @@ mod tests {
         writer
             .open_file(
                 &path,
-                NDFileMode::Single,
+                NDFileOpenMode::WRITE,
                 &NDArray::new(vec![], NDDataType::UInt8),
             )
             .unwrap();

@@ -32,7 +32,7 @@ async fn the_script_after_iocinit_runs_with_the_task_saving() {
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(d.join("st.cmd").to_str().unwrap())
         .run(move |_| async move {
-            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::server::db_server::announce_serving("probe");
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let text = std::fs::read_to_string(&sav).unwrap_or_default();

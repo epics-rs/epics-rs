@@ -384,7 +384,7 @@ record(epid, "TEST:PID") {
                 request_pvs: vec![],
                 backup: BackupConfig { enable_savb: false },
                 macros: HashMap::new(),
-                macro_string: String::new(),
+                macro_string: None,
                 search_paths: vec![],
             },
             SaveStrategy::Manual,

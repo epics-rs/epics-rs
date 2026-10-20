@@ -138,7 +138,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mini_ioc <st.cmd>");
+        epics_libcom_rs::stderr_println!("Usage: mini_ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -338,8 +338,17 @@ async fn main() -> CaResult<()> {
     // bundle is atomic per-cycle, the CA stream is per-record.
     // ========================================================================
     {
+        use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
         let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));
-        factory.register_pva_bundle("mini:wf:bundle", "wf");
+        // At iocInit, once the registrar has bound the pvxs server.
+        let bundle = factory.clone();
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AtBeginning
+                && let Err(e) = bundle.register_pva_bundle("mini:wf:bundle", "wf")
+            {
+                epics_libcom_rs::stderr_println!("mini:wf:bundle: {e}");
+            }
+        }));
         app =
             app.register_device_support("waveform", &MINI_RANDOM_WAVEFORM, move || factory.make());
     }

@@ -51,8 +51,16 @@ async fn a_set_created_before_ioc_init_saves_only_on_request() {
         .await
         .unwrap();
 
+    // C's empty filename starts the task and makes no set (save_restore.c:
+    // 2335-2362).
     run(cmds.clone(), db.clone(), vec![ArgValue::String("".into())]);
-    assert!(holder.lock().unwrap().sets.is_empty());
+    let mgr = holder
+        .lock()
+        .unwrap()
+        .manager
+        .clone()
+        .expect("task started");
+    assert!(mgr.set_names().is_empty());
     run(
         cmds,
         db.clone(),
@@ -62,8 +70,6 @@ async fn a_set_created_before_ioc_init_saves_only_on_request() {
         ],
     );
 
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = builder.build().await;
     let sets = mgr.sets();
     assert_eq!(sets.len(), 1);
     let set = &sets[0].0;
@@ -96,7 +102,6 @@ async fn a_set_created_after_ioc_init_joins_the_running_manager() {
             ArgValue::String("P=IOC:".into()),
         ],
     );
-    assert!(holder.lock().unwrap().sets.is_empty());
     let (set, _) = mgr.find_set_by_request_file("settings.req").unwrap();
     assert!(matches!(set.methods()[..], [SaveStrategy::Manual]));
 }

@@ -190,6 +190,19 @@ pub enum AsynError {
         message: String,
     },
 
+    /// A read that failed with its value: C `asynPortDriver::read*` returning
+    /// the `setParamStatus` failure of a parameter it still copied out
+    /// (asynPortDriver.cpp:307-309), `message` its `errorMessage`
+    /// (:1982-1985). C's callers keep that value as they see fit — device
+    /// support only for the alarm, asynRecord in its input field — so it
+    /// travels here, [`AsynError::failed_read`], not beside a success.
+    #[error("{message}")]
+    FailedRead {
+        status: AsynStatus,
+        message: String,
+        read: Box<crate::request::RequestResult>,
+    },
+
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch {
         expected: &'static str,
@@ -243,7 +256,9 @@ impl AsynError {
     /// `asynStatusToEpicsAlarm` default branch (asynEpicsUtils.c:234-266).
     pub fn status(&self) -> AsynStatus {
         match self {
-            AsynError::Status { status, .. } | AsynError::QueueRefused { status, .. } => *status,
+            AsynError::Status { status, .. }
+            | AsynError::QueueRefused { status, .. }
+            | AsynError::FailedRead { status, .. } => *status,
             AsynError::PartialWrite { source, .. }
             | AsynError::OctetStep { source, .. }
             | AsynError::ParamAccess { source, .. } => source.status(),
@@ -404,6 +419,14 @@ impl AsynError {
         AsynError::ParamAccess {
             source: Box::new(self),
             message,
+        }
+    }
+
+    /// The read an [`AsynError::FailedRead`] still made, its value and alarm.
+    pub fn failed_read(&self) -> Option<&crate::request::RequestResult> {
+        match self {
+            AsynError::FailedRead { read, .. } => Some(read),
+            _ => None,
         }
     }
 

@@ -44,6 +44,7 @@ pub mod offload;
 #[cfg(unix)]
 pub mod readiness;
 pub mod socket;
+pub mod stdio;
 pub mod stdlib;
 pub mod supervise;
 pub mod sync;

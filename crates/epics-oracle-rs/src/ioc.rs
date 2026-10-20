@@ -1422,7 +1422,7 @@ fn retry_pair<T>(
             Err(e) if e.retryable => {
                 // Say so on stderr: a silent retry would let a host that needs
                 // three tries every time look as healthy as one that needs none.
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "  {protocol} pair boot attempt {n}/{BOOT_ATTEMPTS} failed, \
                      retrying on fresh ports: {e}"
                 );

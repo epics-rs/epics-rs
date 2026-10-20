@@ -19,6 +19,7 @@
 //! is no fd 2 on Windows, and `libc` is a `cfg(unix)` dependency of this crate.
 
 #![cfg(unix)]
+#![allow(clippy::disallowed_methods, reason = "tests may take stderr()")]
 
 use std::io::Write;
 use std::os::fd::AsRawFd;

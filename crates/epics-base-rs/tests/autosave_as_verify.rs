@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
+use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -17,6 +18,10 @@ use epics_base_rs::types::EpicsValue;
 
 const CHILD: &str = "AUTOSAVE_AS_VERIFY_DIR";
 const LINE: &str = "AUTOSAVE_AS_VERIFY_LINE";
+/// Set: the child prints [`RETURNED`] once the shell line has returned.
+const TASK: &str = "AUTOSAVE_AS_VERIFY_TASK";
+/// What the child prints once the shell line has returned.
+const RETURNED: &str = "-- shell line returned --";
 
 const SAV: &str =
     "# h\nA 1.5\nB 3\nA.DESC d\nA.PREC 2\nA.SCAN 0\nX 1\n#C.VAL Search Issued\n<END>\n";
@@ -24,13 +29,19 @@ const SAV: &str =
 /// The child's stdout for the shell line `line` run on `dir`, with `dir`
 /// written `DIR` and the test harness's own lines dropped.
 fn output_of(dir: &Path, line: &str) -> Vec<String> {
+    run_child(dir, line, false)
+}
+
+fn run_child(dir: &Path, line: &str, task: bool) -> Vec<String> {
     let name = "child_as_verify";
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD, dir)
-        .env(LINE, line.replace("DIR", &dir.display().to_string()))
-        .output()
-        .unwrap();
+        .env(LINE, line.replace("DIR", &dir.display().to_string()));
+    if task {
+        cmd.env(TASK, "1");
+    }
+    let out = cmd.output().unwrap();
     assert!(out.status.success(), "{out:?}");
     let prefix = format!("test {name} ... ");
     let dir = dir.display().to_string();
@@ -47,8 +58,9 @@ fn output_of(dir: &Path, line: &str) -> Vec<String> {
         .collect()
 }
 
-/// `$LINE` run in an iocsh with the autosave startup commands, the save path
-/// `$CHILD`, `A` = 1.5 with DESC "d" and `B` = 2, in the child only.
+/// `$LINE` run in an iocsh with the autosave startup commands and a running
+/// save task, the save path `$CHILD`, `A` = 1.5 with DESC "d" and `B` = 2,
+/// in the child only.
 #[test]
 fn child_as_verify() {
     let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
@@ -69,6 +81,9 @@ fn child_as_verify() {
             .unwrap();
     });
     let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
+    let mgr = Arc::new(rt.block_on(AutosaveBuilder::new().build()));
+    holder.lock().unwrap().manager = Some(mgr.clone());
+    let _task = mgr.clone().start(db.clone());
     holder.lock().unwrap().save_file_path = Some(dir);
     let bridge = {
         let _guard = rt.enter();
@@ -80,10 +95,58 @@ fn child_as_verify() {
         for cmd in AutosaveStartupConfig::register_startup_commands(holder) {
             shell.register(cmd);
         }
-        shell.execute_line(&line).unwrap();
+        for line in line.split(';') {
+            shell.execute_line(line).unwrap();
+        }
+        if std::env::var_os(TASK).is_some() {
+            println!("{RETURNED}");
+        }
     })
     .join()
     .unwrap();
+    rt.block_on(mgr.ops_served());
+}
+
+/// With a save task, asVerify is its op (save_restore.c:2874, :1239-1248):
+/// the shell line returns first, as C's prompt comes back before the
+/// task's lines.
+#[test]
+fn the_save_task_verifies_after_the_shell_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("s.sav"), SAV).unwrap();
+    let lines = run_child(dir.path(), "asVerify(\"s.sav\", 0, \"\")", true);
+    assert_eq!(
+        lines,
+        [
+            RETURNED,
+            "    PVname saved_value live_value",
+            "    =============================",
+            "*** B                         3.000000                  2.000000",
+            "*** A.PREC                   '2'                       '0'",
+            "asVerify: *** 'X' not connected.  Saved value='1'",
+            "2 PVs differed.  (5 PVs checked; 2 PVs not connected)",
+        ]
+    );
+}
+
+/// Every op is the task's, in the order sent (save_restore.c:1131): the
+/// verify sent first sees B before the restore sent after it.
+#[test]
+fn a_verify_sent_before_a_restore_is_served_first() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("v.sav"), "# h\nB 3\n<END>\n").unwrap();
+    for _ in 0..10 {
+        let lines = run_child(
+            dir.path(),
+            "asVerify(\"v.sav\", 0, \"\");fdbrestore(\"v.sav\")",
+            true,
+        );
+        assert_eq!(
+            lines.iter().rev().find(|l| l.contains("differed")).unwrap(),
+            "1 PV differed.  (1 PV checked; 0 PVs not connected)",
+            "{lines:?}"
+        );
+    }
 }
 
 /// verbose 1: every PV's line, the not-connected one in file order, and the

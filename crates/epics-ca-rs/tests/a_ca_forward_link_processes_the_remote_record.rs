@@ -63,6 +63,8 @@ impl Ioc {
                 }
             });
         }
+        // Only the readers send, so a child that exits ends the wait at once.
+        drop(tx);
         let mut boot = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while let Ok(line) = lines.recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -174,18 +176,29 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
 
 /// One run with `a_port` as the target IOC's CA port, `None` when either IOC's
 /// console says its number belonged to somebody else. B's port comes from a
-/// dropped probe too; it is judged where the forwards are awaited, so a B
-/// that lost it earlier fails the run instead of retrying.
+/// dropped probe too, so B has its own search: a B that lost its number
+/// draws another while A stays up.
 fn forward_links_on(tgt: &std::path::Path, src: &std::path::Path, a_port: u16) -> Option<()> {
     let mut a = Ioc::start(tgt, a_port, "127.0.0.1")?;
-    let b_port = loop {
+    let pick = || loop {
         let p = named_port::free_for_tcp_and_udp();
         if p != a_port {
             break p;
         }
     };
-    let mut b = Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"))
-        .unwrap_or_else(|| panic!("B lost its port {b_port} before iocRun"));
+    // B's first number is held here, so every run takes the retry that a
+    // steal under a parallel suite forces.
+    let mut held = None;
+    let (mut b, b_port) = named_port::on_a_named_port_from(pick, |b_port| {
+        held.get_or_insert_with(|| {
+            std::net::UdpSocket::bind(("127.0.0.1", b_port)).expect("hold B's first port")
+        });
+        Some((
+            Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"))?,
+            b_port,
+        ))
+    });
+    drop(held);
     // softIoc's iocInit, for LNK2 and LNK4; ERL_WARNING is uncoloured on a
     // pipe.
     let warning = "WARNING: Forward-link uses Channel Access without pointing to PROC field";

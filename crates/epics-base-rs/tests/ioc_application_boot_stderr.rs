@@ -5,6 +5,7 @@
 //! Unix only: what is asserted is the process console.
 
 #![cfg(unix)]
+#![allow(clippy::disallowed_methods, reason = "tests may take stderr()")]
 
 use std::io::Write;
 use std::os::fd::AsRawFd;

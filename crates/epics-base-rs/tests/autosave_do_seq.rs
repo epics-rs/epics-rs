@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_file::read_save_file;
@@ -25,9 +25,11 @@ fn config(dir: &Path) -> SaveSetConfig {
         save_path: dir.join("s.sav"),
         request_file: None,
         request_pvs: vec!["TEMP".into()],
-        backup: BackupConfig { enable_savb: false },
+        // C's do_backups, without which the task writes no sequence file
+        // (save_restore.c:1008).
+        backup: BackupConfig { enable_savb: true },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -124,10 +126,11 @@ async fn the_first_slot_is_the_missing_or_oldest_one() {
     assert_eq!(set2.recent().unwrap().1, "Wrote 's.sav2'");
 }
 
-/// A copy that cannot be made is written from the PVs instead
+/// A copy that cannot be made is written instead from the values the last
+/// save fetched, which C's channels hold; nothing is fetched
 /// (save_restore.c:2192-2207).
 #[epics_macros_rs::epics_test]
-async fn a_failed_copy_writes_the_slot_from_the_pvs() {
+async fn a_failed_copy_writes_the_slot_from_the_last_fetch() {
     let dir = tempfile::tempdir().unwrap();
     let db = db().await;
     let set = set(dir.path()).await;
@@ -138,8 +141,23 @@ async fn a_failed_copy_writes_the_slot_from_the_pvs() {
     std::fs::write(tmp.join("x"), "").unwrap();
     put(&db, 7.0).await;
     set.do_seq(&db).await;
-    assert_eq!(value(&dir.path().join("s.sav0")).await, 7.0);
+    assert_eq!(value(&dir.path().join("s.sav0")).await, 1.0);
     assert_eq!(set.recent().unwrap().1, "Wrote 's.sav0'");
+}
+
+/// A `.sav` gone by the time of `do_seq` is written again from the last
+/// fetch, as C's `write_save_file` writes its channels (:2181-2183).
+#[epics_macros_rs::epics_test]
+async fn a_missing_sav_is_written_from_the_last_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db().await;
+    let set = set(dir.path()).await;
+    set.save_once(&db).await.unwrap();
+    std::fs::remove_file(dir.path().join("s.sav")).unwrap();
+    put(&db, 7.0).await;
+    set.do_seq(&db).await;
+    assert_eq!(value(&dir.path().join("s.sav")).await, 1.0);
+    assert_eq!(value(&dir.path().join("s.sav0")).await, 1.0);
 }
 
 /// A slot that can be neither copied nor written keeps its number for the
@@ -176,7 +194,7 @@ async fn the_task_writes_the_first_sequence_file_after_the_period() {
             .build()
             .await,
     );
-    let task = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let task = mgr.clone().start(db.clone());
     mgr.manual_save("s", &db).await.unwrap();
     let slot0 = dir.path().join("s.sav0");
     sleep(Duration::from_secs(9)).await;
@@ -194,8 +212,10 @@ async fn the_task_writes_the_first_sequence_file_after_the_period() {
 }
 
 /// C sets `last_save_file` on every `write_save_file` that wrote its file
-/// (save_restore.c:2110), a configMenu save under `configName` too, and
-/// that is what lets the task's `do_seq` run (:1009).
+/// (save_restore.c:2110), a save under a `configName` too, and that is what
+/// lets the task's `do_seq` run (:1009). With no `cfg.sav` before, the
+/// copy after the write fails that save as a WARN (:2112-2124), which
+/// still lets it run.
 #[epics_macros_rs::epics_test]
 async fn a_config_menu_save_lets_the_sequence_file_be_written() {
     let dir = tempfile::tempdir().unwrap();
@@ -207,11 +227,11 @@ async fn a_config_menu_save_lets_the_sequence_file_be_written() {
             .build()
             .await,
     );
-    let task = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let task = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
-    set.save_to(set.collect_entries(&db), &dir.path().join("cfg.sav"))
-        .await
-        .unwrap();
+    let _ = set
+        .save_to(set.get_channel_values(&db), &dir.path().join("cfg.sav"))
+        .await;
     let slot0 = dir.path().join("s.sav0");
     for _ in 0..170 {
         if slot0.exists() {

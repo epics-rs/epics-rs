@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AfterGate, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue, PvString};
@@ -134,9 +135,9 @@ async fn an_out_put_runs_special_once_and_its_work_once_after_the_gate() {
 
     db.put_many_locked(&["P"], 2, |puts| {
         let p = puts.record(0).unwrap();
-        puts.put_record_field_from_ca_no_notify(p, "OUT", out("G"))
+        puts.put_record_field_from_ca_no_notify(p, "OUT", out("G"), PutSplit::DbPutField)
             .unwrap();
-        puts.put_record_field_from_ca_no_notify(p, "OUT", out("H"))
+        puts.put_record_field_from_ca_no_notify(p, "OUT", out("H"), PutSplit::DbPutField)
             .unwrap();
         assert_eq!(counts(), (6, 4), "the work waits for the gate");
     });

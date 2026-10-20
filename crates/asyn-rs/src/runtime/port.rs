@@ -149,7 +149,7 @@ fn stop_port_actor(
                 // teardown did NOT run, and it happens on the way out of a
                 // process where a `tracing` subscriber may already be gone —
                 // on the embedded targets there was never one to begin with.
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "asyn: port '{port_name}' did not stop within {limit:?}; its driver's \
                      teardown has not run"
                 );
@@ -485,7 +485,7 @@ fn port_thread_unavailable(port_name: &str, err: &std::io::Error) -> AsynError {
 pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
     // C prints this before it throws, ahead of anything the process says next.
     crate::manager::report_port_driver_register_failure(port_name);
-    eprintln!(
+    epics_libcom_rs::stderr_println!(
         "FATAL: the IOC could not create the runtime for asyn port '{port_name}': {err}. \
          Continuing would leave records bound to a port whose actor thread does not \
          exist — every request queued to it would wait forever — so the process is \

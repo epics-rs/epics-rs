@@ -1359,27 +1359,18 @@ fn render_spec(spec: &Spec, val: &StackValue) -> Vec<u8> {
             let l = i64::from(my_nint(val.to_double()));
             return pad(render_int(spec, l), spec.width, spec.minus, spec.zero);
         }
-        b'e' | b'E' => cvt::fmt_e(
+        b'e' | b'E' | b'f' | b'g' | b'G' => cvt::format_float_conv(
+            spec.conv,
             val.to_double(),
             spec.precision.unwrap_or(6),
-            spec.conv == b'E',
-        ),
-        b'f' => cvt::fmt_f(val.to_double(), spec.precision.unwrap_or(6)),
-        b'g' | b'G' => cvt::fmt_g(
-            val.to_double(),
-            spec.precision.unwrap_or(6),
-            spec.conv == b'G',
             spec.alt,
         ),
         _ => unreachable!("parse_spec only returns C's conversion characters"),
     };
-    // Float: the sign flags, the `#` decimal point, then the padding. C does not
-    // zero-pad a non-finite value.
+    // Float: the sign flags, then the padding. C does not zero-pad a non-finite
+    // value.
     let d = val.to_double();
     let mut body = body;
-    if spec.alt && !body.contains('.') && d.is_finite() {
-        body.push('.');
-    }
     if d.is_sign_positive() && !body.starts_with('+') {
         if spec.plus {
             body.insert(0, '+');
@@ -1880,7 +1871,7 @@ pub fn epilogue(code: &[u8], top: &StackValue, precision: i16) -> ScalcResult {
             // while the record's PREC is a `short`, so C reinterprets a negative
             // PREC as a huge unsigned one — which the function then clamps to 17
             // and renders in %e. Not clamped to 0; this cast is that conversion.
-            ScalcString::from_c(super::cvt::cvt_double_to_string(val, precision as u16))
+            ScalcString::from_c(crate::types::cvt_double_to_string(val, precision as u16))
         };
         ScalcResult {
             val,

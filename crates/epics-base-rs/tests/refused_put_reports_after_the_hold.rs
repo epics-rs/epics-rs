@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -97,13 +98,13 @@ async fn nothing_is_printed_under_the_hold() {
         let c = puts.record(0).unwrap();
         let s = puts.record(1).unwrap();
         let b = puts.record(2).unwrap();
-        puts.put_record_field_from_ca_no_notify(c, "CALC", text("A+"))
+        puts.put_record_field_from_ca_no_notify(c, "CALC", text("A+"), PutSplit::DbPutField)
             .expect_err("special() refuses");
         puts.put_pv(s, "INAM", text("x"))
             .expect_err("the SPC_NOMOD gate refuses");
         puts.put_pv(c, "INPA", EpicsValue::Double(1.0))
             .expect_err("the link-field gate refuses");
-        puts.put_record_field_from_ca_no_notify(b, "VAL", text("Bogus"))
+        puts.put_record_field_from_ca_no_notify(b, "VAL", text("Bogus"), PutSplit::DbPutField)
             .expect_err("putStringEnum refuses");
         assert_eq!(heard(), Vec::<String>::new());
     });

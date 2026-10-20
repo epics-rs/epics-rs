@@ -497,7 +497,7 @@ pub(crate) fn print_default_exception(exc: &CaException) {
 
     if let Some(block) = render_default_exception(exc, &exception_timestamp()) {
         // One `write_all`: two exceptions racing must not interleave mid-block.
-        let _ = std::io::stderr().write_all(&block);
+        let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(&block);
     }
 }
 

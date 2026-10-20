@@ -110,7 +110,10 @@ async fn main() {
             match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
-                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    epics_libcom_rs::stderr_println!(
+                        "error: invalid pvRequest {:?}: {e}",
+                        args.request
+                    );
                     std::process::exit(1);
                 }
             }
@@ -197,14 +200,14 @@ async fn main() {
                     print!("{output}");
                 }
                 MonitorEvent::Connected { peer } => {
-                    eprintln!("{pv_name} Connected to {peer}");
+                    epics_libcom_rs::stderr_println!("{pv_name} Connected to {peer}");
                 }
                 MonitorEvent::Disconnected => {
-                    eprintln!("{pv_name} Disconnected");
+                    epics_libcom_rs::stderr_println!("{pv_name} Disconnected");
                 }
                 MonitorEvent::Finished => {
                     if verbose {
-                        eprintln!("{pv_name} Finished");
+                        epics_libcom_rs::stderr_println!("{pv_name} Finished");
                     }
                 }
             };
@@ -221,7 +224,7 @@ async fn main() {
                 .await;
 
             if let Err(e) = result {
-                eprintln!("{pv_name}: {e}");
+                epics_libcom_rs::stderr_println!("{pv_name}: {e}");
             }
         });
         handles.push(handle);

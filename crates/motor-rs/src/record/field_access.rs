@@ -1074,8 +1074,8 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         // Sync — write-only trigger. C: `82c26005` (2010-04). Only fires on
-        // non-zero put; VAL/DVAL/RVAL get reseeded from RBV/DRBV/RRBV in
-        // command_planner::sync_positions().
+        // non-zero put; the readback chain and VAL/DVAL/RVAL are reseeded
+        // in sync_target_position().
         "SYNC" => match value {
             EpicsValue::Short(v) => {
                 // C `pmr->sync` is the field value itself — it holds the
@@ -1873,11 +1873,6 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 /// after `dbLoadRecords` has applied every `field()` as a raw struct
 /// write. A nonzero loaded UREV wins over a loaded MRES; SREV is clamped
 /// sane first so both derivations divide by the final value.
-///
-/// The Rust default MRES is 1.0 where the dbd leaves it 0.0: the C
-/// `mres == 0 → 1.0` arm (3917-3921) makes both starting points converge,
-/// and the UREV-wins arm overwrites MRES regardless. Only that arm's
-/// M_MRES tells them apart, in the MMAP of a record whose dset init failed.
 pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
     // C 3905-3909: SREV (steps/revolution) must be sane.
     if rec.conv.srev <= 0 {

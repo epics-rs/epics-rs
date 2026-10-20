@@ -1,10 +1,32 @@
 use super::*;
 
+/// How a callback pass leaves C process()'s stopped block (1345-1459).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockExit {
+    /// `goto process_exit` (1379, 1453): do_work does not run.
+    ProcessExit,
+    /// Into do_work, after maybeRetry ran.
+    Retried,
+    /// Into do_work.
+    DoWork,
+}
+
 impl MotorRecord {
     /// Check if motion has completed and handle post-motion pipeline.
     pub fn check_completion(&mut self) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
+        // C enter_do_work gate (1487-1492): a stop flagged on this callback
+        // (RDBL 3687-3697, LVIO 1475-1484) is consumed by do_work's top
+        // block after the stopped block, or stays latent past process_exit.
+        if self.callback_pass(&mut effects) == BlockExit::ProcessExit {
+            effects.process_exit = true;
+        } else {
+            self.take_latent_stop(&mut effects);
+        }
+        effects
+    }
 
+    fn callback_pass(&mut self, effects: &mut ProcessEffects) -> BlockExit {
         // C `do_work` (motorRecord.cc:1973) calls `enforceMinRetryDeadband`
         // before any retry evaluation, so C's `maybeRetry`
         // (`fabs(diff) >= rdbd`, line 1049) always compares against an
@@ -16,29 +38,10 @@ impl MotorRecord {
         // intervening field-write pass.
         self.enforce_min_retry_deadband();
 
-        // C: db5da2f0 — if the external URIP readback is in error while a
-        // motion is in progress, stop the axis immediately. New moves are
-        // already blocked at plan_motion.
-        if self.conv.urip
-            && self.conv.rdbl_error
-            && self.stat.phase != MotionPhase::Idle
-            && !self.stat.mip.contains(MipFlags::STOP)
-        {
-            // C 3692-3694: the failed-RDBL stop also releases every
-            // latched motion button, so the halted axis is not
-            // re-commanded by a jog/home still held high. Its `stop = 1`
-            // is consumed by do_work's stop block, which replaces MIP with
-            // MIP_STOP and arms pp like a commanded stop (1874-1907).
-            self.clear_buttons();
-            self.mark(m::STOP);
-            self.stop_axis(&mut effects);
-            return effects;
-        }
-
         // C 1366-1380 precedes the pp test, the retry test and the delay
         // handling of every stopped callback.
-        if self.stat.movn == 0 && self.ls_error_update(&mut effects) {
-            return effects;
+        if self.stat.movn == 0 && self.ls_error_update(effects) {
+            return BlockExit::ProcessExit;
         }
 
         // C process (1301/1345) branches the callback on MOVN, not on
@@ -70,21 +73,16 @@ impl MotorRecord {
                 self.mark(m::MIP);
                 self.internal.pp = 0;
                 effects.commands.push(MotorCommand::stop_axis());
-                return effects;
+                return BlockExit::DoWork;
             }
             // C enter_do_work (1463-1484) re-evaluates LVIO on every
             // process pass; for an in-flight motion the poll is the pass
             // where RBV changes. A rising violation outside SET mode
             // stops the axis and releases the buttons in the same pass
             // (1475-1484 sets stop=1, the do_work top block consumes it).
-            if self.recompute_lvio_during_motion() {
-                // C 1480-1481 sets stop and the do_work top block clears it.
-                self.mark(m::STOP);
-                self.stop_axis(&mut effects);
-                return effects;
-            }
+            self.recompute_lvio_during_motion();
             // Still moving — poll loop is already active.
-            return effects;
+            return BlockExit::DoWork;
         }
 
         // A record waiting out DLY ran its pp block before the delay
@@ -97,8 +95,7 @@ impl MotorRecord {
             .mip
             .intersects(MipFlags::DELAY_REQ | MipFlags::DELAY_ACK)
         {
-            self.retry_test(&mut effects);
-            return effects;
+            return self.retry_test(effects);
         }
 
         if self.stat.mip.contains(MipFlags::STOP) {
@@ -148,7 +145,7 @@ impl MotorRecord {
                             .extend(home.after_speeds(SpeedWrites::MOVE));
                     }
                 }
-                return effects;
+                return BlockExit::DoWork;
             }
             // Plain stop. C discriminates by pp (motorRecord.cc:1382-1402):
             // a commanded stop (or interrupted jog/home/backlash, all of
@@ -158,8 +155,7 @@ impl MotorRecord {
             if pp && self.stat.mip.contains(MipFlags::JOG_STOP) {
                 // A queued jog released while its stop was in flight
                 // (mip = STOP|JOG_STOP, C 2153-2154).
-                self.postprocess_jog_stop(&mut effects);
-                return effects;
+                return self.postprocess_jog_stop(effects);
             }
             if pp {
                 self.postprocess_sync();
@@ -174,8 +170,7 @@ impl MotorRecord {
             // postProcess: maybeRetry runs against DVAL with the lasts
             // untouched, and under Pause its do_work returns at 2237, so a
             // retry or a write parked during the stop waits for Go.
-            self.retry_test(&mut effects);
-            return effects;
+            return self.retry_test(effects);
         }
 
         match self.stat.phase {
@@ -184,27 +179,26 @@ impl MotorRecord {
                     // C: the backlash move armed pp (2523), so a target
                     // parked during the first leg is replayed (1384-1397).
                     if std::mem::take(&mut self.internal.pp) != 0
-                        && self.replay_overtaken_target(&mut effects)
+                        && self.replay_overtaken_target(effects)
                     {
-                        return effects;
+                        return BlockExit::DoWork;
                     }
-                    self.start_backlash_final(&mut effects);
+                    self.start_backlash_final(effects);
+                    BlockExit::DoWork
                 } else {
-                    self.retry_test(&mut effects);
+                    self.retry_test(effects)
                 }
             }
             MotionPhase::BacklashFinal => {
                 // The final leg armed pp too (C 975).
                 if std::mem::take(&mut self.internal.pp) != 0
-                    && self.replay_overtaken_target(&mut effects)
+                    && self.replay_overtaken_target(effects)
                 {
-                    return effects;
+                    return BlockExit::DoWork;
                 }
-                self.retry_test(&mut effects);
+                self.retry_test(effects)
             }
-            MotionPhase::Retry | MotionPhase::DelayWait => {
-                self.retry_test(&mut effects);
-            }
+            MotionPhase::Retry | MotionPhase::DelayWait => self.retry_test(effects),
             MotionPhase::Jog | MotionPhase::JogStopping => {
                 // C 1357-1364 (9c8a8e8c, PR #56): the driver reported done
                 // while the record still thinks it is jogging (no commanded
@@ -224,8 +218,8 @@ impl MotorRecord {
                     // is dropped by the sync below, like C postProcess.
                     self.stat.mip = MipFlags::empty();
                     self.mark(m::MIP);
-                    if self.replay_overtaken_target(&mut effects) {
-                        return effects;
+                    if self.replay_overtaken_target(effects) {
+                        return BlockExit::DoWork;
                     }
                     // C: with mip collapsed to MIP_DONE, postProcess
                     // matches none of its re-fire branches — the backlash
@@ -233,20 +227,20 @@ impl MotorRecord {
                     // so a controller self-stop syncs WITHOUT a jog
                     // backlash move.
                     self.postprocess_sync();
-                    self.retry_test(&mut effects);
-                    return effects;
+                    return self.retry_test(effects);
                 }
-                self.postprocess_jog_stop(&mut effects);
+                self.postprocess_jog_stop(effects)
             }
             MotionPhase::JogBacklash => {
                 if self.internal.backlash_pending {
                     // BL1 complete -> start BL2 (final approach)
-                    self.start_jog_backlash_final(&mut effects);
+                    self.start_jog_backlash_final(effects);
+                    BlockExit::DoWork
                 } else {
                     // C: MIP_JOG_BL2 passes the replay gate (1385) — a
                     // VAL written during the jog backlash re-fires here.
-                    if self.replay_overtaken_target(&mut effects) {
-                        return effects;
+                    if self.replay_overtaken_target(effects) {
+                        return BlockExit::DoWork;
                     }
                     // BL2 complete: postProcess keeps the drive fields
                     // (826-829) and saves them as the lasts (1031-1033);
@@ -257,7 +251,7 @@ impl MotorRecord {
                     self.internal.lval = self.pos.val;
                     self.internal.ldvl = self.pos.dval;
                     self.internal.lrvl = self.pos.rval;
-                    self.retry_test(&mut effects);
+                    self.retry_test(effects)
                 }
             }
             MotionPhase::Homing => {
@@ -283,15 +277,15 @@ impl MotorRecord {
                 // it instead of syncing it away. The button clear above
                 // doubles as C's VAL-HOMF-VAL infinite-home-loop guard
                 // (1389-1393).
-                if self.replay_overtaken_target(&mut effects) {
-                    return effects;
+                if self.replay_overtaken_target(effects) {
+                    return BlockExit::DoWork;
                 }
                 // Sync positions after homing; postProcess drops the
                 // direction bit, leaving MIP_DONE (897-904).
                 self.postprocess_sync();
                 self.stat.mip.remove(MipFlags::HOMF | MipFlags::HOMR);
                 self.mark(m::MIP);
-                self.retry_test(&mut effects);
+                self.retry_test(effects)
             }
             MotionPhase::Idle => {
                 // Every branch here is C's stopped callback (1345), keyed
@@ -315,8 +309,8 @@ impl MotorRecord {
                     //
                     // C 1384-1399: a target written before the pp pass is
                     // replayed, not synced away.
-                    if self.replay_overtaken_target(&mut effects) {
-                        return effects;
+                    if self.replay_overtaken_target(effects) {
+                        return BlockExit::DoWork;
                     }
                     self.postprocess_sync();
                 }
@@ -326,18 +320,18 @@ impl MotorRecord {
                 // dispatch). The collection below then runs the move-block
                 // set test, which replays a second redefinition written
                 // during the load.
-                let evaluated = self.retry_test(&mut effects);
+                let exit = self.retry_test(effects);
                 if self.stat.phase != MotionPhase::Idle {
-                    return effects;
+                    return exit;
                 }
-                if pp && !evaluated {
+                if pp && exit != BlockExit::Retried {
                     // This early-return quiesces the axis without
                     // finalize_motion and dispatches nothing, deferring a
                     // held button to a later pass. pp is now cleared, so
                     // the next forced poll falls through to
                     // dispatch_latent_collection and resumes it.
-                    self.request_poll_for_held_button(&mut effects);
-                    return effects;
+                    self.request_poll_for_held_button(effects);
+                    return BlockExit::DoWork;
                 }
                 // C do_work gate (motorRecord.cc:1487-1492): a
                 // done-record callback falls into do_work through the
@@ -349,11 +343,10 @@ impl MotorRecord {
                 // clears. CALLBACK_DATA pass — the implicit GET_INFO
                 // (C 2546) stays off; the pp completion return above
                 // skips one pass and the next poll lands here.
-                self.dispatch_latent_collection(&mut effects, false);
+                self.dispatch_latent_collection(effects, false);
+                BlockExit::DoWork
             }
         }
-
-        effects
     }
 
     /// Finalize motion: set Idle, DMOV=true.
@@ -466,6 +459,15 @@ impl MotorRecord {
         // C 1395 leaves MIP unmarked; do_work's dispatch marks it (2462).
         self.stat.mip = MipFlags::empty();
         self.set_phase(MotionPhase::Idle);
+        if self.ctrl.stop != 0 {
+            // do_work's top block takes the stop at MIP_DONE (1874-1888):
+            // no move, DMOV TRUE from 1351, and pp still TRUE, so the
+            // target stays parked for the next callback.
+            self.internal.backlash_pending = false;
+            self.set_dmov(true);
+            self.internal.pp = 1;
+            return true;
+        }
         // The replayed do_work's collection (2187-2235) derives DVAL.
         if !self.collect_drive_fields() {
             self.plan_absolute_move(effects);
@@ -478,10 +480,10 @@ impl MotorRecord {
     /// the live readback against the soft limits widened by one second of
     /// jog travel (RBV > HLM - JVEL / RBV < LLM + JVEL) or an inverted
     /// dial pair; a home search disables the check; every other state
-    /// preserves the latched value. Returns true on a rising violation
-    /// outside SET mode (`!set && !igset`, 1478) — C sets stop = 1 and
-    /// clear_buttons() (1480-1482); the caller routes that through
-    /// stop_axis, whose in-motion branch clears the same four buttons.
+    /// preserves the latched value. A rising violation outside SET mode
+    /// (`!set && !igset`, 1478) sets stop = 1 (1480-1481) for
+    /// take_latent_stop, whose stop_axis in-motion branch is C's
+    /// clear_buttons() (1482). Returns whether it did.
     pub(super) fn recompute_lvio_during_motion(&mut self) -> bool {
         let old_lvio = self.limits.lvio;
         if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
@@ -502,7 +504,13 @@ impl MotorRecord {
         if self.limits.lvio != old_lvio {
             self.mark(m::LVIO);
         }
-        self.limits.lvio != 0 && old_lvio == 0 && !self.conv.set && self.conv.igset == 0
+        let rising =
+            self.limits.lvio != 0 && old_lvio == 0 && !self.conv.set && self.conv.igset == 0;
+        if rising {
+            self.ctrl.stop = 1;
+            self.mark(m::STOP);
+        }
+        rising
     }
 
     /// Set motion phase.
@@ -513,9 +521,8 @@ impl MotorRecord {
     /// C process() retry test (motorRecord.cc:1405-1456), the single owner
     /// of a stopped callback's choice between DONE, maybeRetry and the DLY
     /// watchdog. Every stopped callback that dispatches no new leg calls it
-    /// after its pp block, with MIP as postProcess leaves it. Returns
-    /// whether maybeRetry ran.
-    fn retry_test(&mut self, effects: &mut ProcessEffects) -> bool {
+    /// after its pp block, with MIP as postProcess leaves it.
+    fn retry_test(&mut self, effects: &mut ProcessEffects) -> BlockExit {
         // C 1349-1352 set DMOV TRUE and mark it only when it was FALSE;
         // that mark is the watchdog's arming edge (1441).
         let dmov_edge = self.stat.dmov == 0;
@@ -533,7 +540,7 @@ impl MotorRecord {
                     .remove(MipFlags::DELAY_REQ | MipFlags::DELAY_ACK);
                 self.mark(m::MIP);
                 self.evaluate_position_error(effects);
-                return true;
+                return BlockExit::Retried;
             }
         } else if dmov_edge {
             if !mip.contains(MipFlags::DELAY_REQ) {
@@ -544,7 +551,7 @@ impl MotorRecord {
                 ));
             }
             self.set_phase(MotionPhase::DelayWait);
-            return false;
+            return BlockExit::ProcessExit;
         }
         // Nothing more runs: DMOV is TRUE from 1351, and a MIP left
         // without that edge (an idle Pause's MIP_STOP under DLY) stays.
@@ -553,7 +560,7 @@ impl MotorRecord {
         } else if dmov_edge {
             self.set_dmov(true);
         }
-        false
+        BlockExit::DoWork
     }
 
     /// C "Do another update after LS error" (motorRecord.cc:1366-1380): a
@@ -715,16 +722,17 @@ impl MotorRecord {
     /// DVAL<-DRBV first so the backlash base is the jog-end position,
     /// then the MIP_JOG_STOP branch (908-958) corrects when |BDST| >=
     /// |MRES|; otherwise MIP_STOP clears (1030) and the motion ends.
-    fn postprocess_jog_stop(&mut self, effects: &mut ProcessEffects) {
+    fn postprocess_jog_stop(&mut self, effects: &mut ProcessEffects) -> BlockExit {
         self.internal.pp = 0;
         self.postprocess_sync();
         if self.needs_jog_backlash() {
             self.start_jog_backlash(effects);
+            BlockExit::DoWork
         } else {
             // C postProcess 959-960, 1030.
             self.stat.mip.remove(MipFlags::JOG_STOP | MipFlags::STOP);
             self.mark(m::MIP);
-            self.retry_test(effects);
+            self.retry_test(effects)
         }
     }
 

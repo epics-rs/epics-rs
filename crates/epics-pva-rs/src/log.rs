@@ -133,7 +133,10 @@ pub fn install_cli_logging(debug: bool) {
     let (filter, handle) = init_filter();
     let installed = tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| epics_libcom_rs::runtime::log::StagedStderr),
+        )
         .try_init()
         .is_ok();
     if !installed {

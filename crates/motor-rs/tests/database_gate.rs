@@ -11,6 +11,16 @@ use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::flags::*;
 
+/// The status `motor` writes polled from the default.
+fn polled(
+    motor: &mut (impl asyn_rs::interfaces::motor::AsynMotor + ?Sized),
+    user: &asyn_rs::user::AsynUser,
+) -> asyn_rs::interfaces::motor::MotorStatus {
+    let mut status = asyn_rs::interfaces::motor::MotorStatus::default();
+    motor.poll(user, &mut status).unwrap();
+    status
+}
+
 fn make_record(state: motor_rs::device_state::SharedDeviceState) -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.set_device_state(state);
@@ -192,12 +202,13 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
-            Ok(MotorStatus {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -210,6 +221,16 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
             let n = self.moves.fetch_add(1, Ordering::SeqCst);
             // 0.05 EGU short at MRES 0.001.
             self.position = if n == 0 { position - 50.0 } else { position };
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -258,11 +279,10 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // The poller's startup poll fills the cache init reads.
     state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
         seq: 1,
-        status: asyn_rs::interfaces::motor::AsynMotor::poll(
+        status: polled(
             &mut *motor.lock().unwrap(),
             &asyn_rs::user::AsynUser::new(0),
-        )
-        .unwrap(),
+        ),
     });
     let mut dev = MotorDeviceSupport::new(
         Default::default(),
@@ -289,7 +309,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // the poller's first post.
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 2,
-        status: motor.lock().unwrap().poll(&user).unwrap(),
+        status: polled(&mut *motor.lock().unwrap(), &user),
     });
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
@@ -307,7 +327,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // Completion callback pass: diff = 0.05 >= RDBD -> maybeRetry arms and
     // re-dispatches ON THIS PASS. The write must reach the driver.
     let stamp = |seq: u64| {
-        let status = motor.lock().unwrap().poll(&user).unwrap();
+        let status = polled(&mut *motor.lock().unwrap(), &user);
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
     stamp(3);
@@ -365,12 +385,13 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
-            Ok(MotorStatus {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -382,6 +403,16 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
         ) -> Result<(), AsynError> {
             self.moves.fetch_add(1, Ordering::SeqCst);
             self.position = position;
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -431,11 +462,10 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
     // The poller's startup poll fills the cache init reads.
     state.lock().unwrap().latest_status = Some(motor_rs::device_state::StampedStatus {
         seq: 1,
-        status: asyn_rs::interfaces::motor::AsynMotor::poll(
+        status: polled(
             &mut *motor.lock().unwrap(),
             &asyn_rs::user::AsynUser::new(0),
-        )
-        .unwrap(),
+        ),
     });
     let mut dev = MotorDeviceSupport::new(
         Default::default(),
@@ -470,7 +500,7 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
     );
 
     let stamp = |seq: u64| {
-        let status = motor.lock().unwrap().poll(&user).unwrap();
+        let status = polled(&mut *motor.lock().unwrap(), &user);
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
 

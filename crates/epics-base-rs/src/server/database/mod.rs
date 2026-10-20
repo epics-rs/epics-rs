@@ -29,13 +29,18 @@ pub use ca_client::{
     PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;
-pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode, RestoreTarget};
-pub(crate) use field_io::{PutSrc, render_for_string_target};
+pub use field_io::{
+    HeldPuts, HeldRecord, LockedRecord, ProcessMode, PutSplit, RestoreTarget, UnheldLinkPut,
+};
+pub(crate) use field_io::{
+    PutSrc, db_access_debug_putf, render_for_string_target, set_db_access_debug_putf,
+};
+pub use link_put_queue::CpWorker;
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
-    LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkSet, LinkSetRegistry,
-    PutAdmission, RemoteAlarm, link_put_convert,
+    LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet,
+    LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert,
 };
 #[cfg(test)]
 pub(crate) use links::ExternalDone;
@@ -44,8 +49,9 @@ pub(crate) use links::{
     posts_software_event, reads_sell, resolves_subroutine_from_link,
 };
 pub use processing::{
-    AsyncDbHandle, AsyncToken, CaLinkInit, DeviceDone, DeviceDoneSource, ExternalCpProcess,
-    InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
+    AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
+    FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
+    ProcessCallback, TokenWatch,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
 #[cfg(feature = "test-hooks")]
@@ -102,36 +108,58 @@ impl RecordLoad {
 /// "TEMP.EGU" → ("TEMP", "EGU")
 /// "TEMP"     → ("TEMP", "VAL")
 ///
-/// The split is on the LAST `.`, where C `dbFindRecordPart`
-/// (`dbChannel.c:180-200`) takes the FIRST one via `strchr`. That difference
-/// is unobservable, and it is the record-name grammar that makes it so: C
-/// `dbRecordNameValidate` (`dbLexRoutines.c:1085-1119`) aborts the load with
-/// `yyerrorAbort` on a `.` anywhere in a record or alias name, and the port
-/// refuses the same names, so the base half can never itself contain a dot
-/// and the two splits can only differ on a name that no IOC can hold.
-///
-/// Measured, not reasoned: a `.db` naming records `OTHER:PV` and `A.B` is
-/// refused at load by both, so the `A.B.C` case cannot be built at all. The
-/// one shape that does load — `OTHER:PV` present, a link reading
-/// `OTHER:PV.1:X` — hangs C's `iocInit` (reproduced three times on softIoc
-/// R7.0.10-146, always at "Starting iocInit"), while the port loads and
-/// alarms; that is an upstream defect the port has no path to.
-///
-/// This is the channel-name half of the rule. Link text is split by
-/// [`crate::server::record::DbLink`], which follows C exactly and cuts at the
-/// first `.` before requiring the remainder to be a field identifier.
+/// The record half is [`DbNameParts`]' record part, to the first `.` as C
+/// `dbFindRecordPart` (`dbChannel.c:180-200`) has it; the field half is the
+/// rest unread, for the caller's own field lookup. A last-`.` split tore a
+/// filter such as `{"d":1.5}` apart, so a name like `REC.VAL{"d":1.5}`
+/// found no record.
 ///
 /// The record half is bytes, as `dbNameToAddr` hashes it. Every field name is
 /// an ASCII identifier, so a field part that is not UTF-8 names none and is
 /// given back as U+FFFD, which no field lookup matches.
 pub fn parse_pv_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> (&[u8], &str) {
     let name = name.as_ref();
-    match name.iter().rposition(|&b| b == b'.') {
-        Some(dot) => (
-            &name[..dot],
-            std::str::from_utf8(&name[dot + 1..]).unwrap_or("\u{fffd}"),
-        ),
+    let record = DbNameParts::of(name).record;
+    match name.get(record.len() + 1..) {
+        Some(rest) => (record, std::str::from_utf8(rest).unwrap_or("\u{fffd}")),
         None => (name, "VAL"),
+    }
+}
+
+/// C `dbNameToAddr`'s reading of a name (`dbAccess.c:666-683`): the record
+/// part runs to the first `.` (`dbFindRecordPart`), the field part is the C
+/// identifier after it, empty meaning `VAL` (`dbFindFieldPart`), and the one
+/// modifier read is the single character after that, so `LSI.VAL$x` and
+/// `LSI.$` are both `VAL$` and an undotted `LSI$` is a record name.
+pub struct DbNameParts<'a> {
+    pub record: &'a [u8],
+    pub field: &'a str,
+    pub tail: &'a [u8],
+}
+
+impl<'a> DbNameParts<'a> {
+    pub fn of(pname: &'a [u8]) -> Self {
+        let Some(dot) = pname.iter().position(|&c| c == b'.') else {
+            return Self {
+                record: pname,
+                field: "",
+                tail: b"",
+            };
+        };
+        let (record, rest) = (&pname[..dot], &pname[dot + 1..]);
+        let len = match rest.first() {
+            Some(&c) if c == b'_' || c.is_ascii_alphabetic() => rest
+                .iter()
+                .position(|&c| c != b'_' && !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len()),
+            _ => 0,
+        };
+        Self {
+            record,
+            // An identifier: ASCII by the scan above.
+            field: std::str::from_utf8(&rest[..len]).unwrap_or_default(),
+            tail: &rest[len..],
+        }
     }
 }
 
@@ -420,11 +448,13 @@ pub struct CpTarget {
     pub passive_only: bool,
 }
 
-/// What one CP/CPP link watches: the channel it names, and CPP's gate.
+/// What one CP/CPP link watches: the channel it names, CPP's gate, and
+/// the link, whose own channel's events process its holder.
 #[derive(Clone, Debug)]
 pub(crate) struct CpSource {
     pub(crate) record: RecordName,
     pub(crate) passive_only: bool,
+    pub(crate) link: LinkSerial,
 }
 
 /// The CP/CPP edges, each owned by the link that makes it: C gives every
@@ -437,8 +467,12 @@ pub(crate) struct CpRegistry {
     by_source: HashMap<RecordName, Vec<CpTarget>>,
     /// (holder, link field) → that link's edge.
     by_link: HashMap<(RecordName, String), CpSource>,
-    /// The connect pass has run: from here a relink connects its own link.
-    connected: bool,
+    /// The link's serial → its holder: what the link's own channel processes
+    /// (`dbCa.c:958-962`).
+    by_serial: HashMap<LinkSerial, CpTarget>,
+    /// iocInit's link pass has run: from here a relink adds its own link,
+    /// as C `dbAddLink` does once `initDatabase` has run.
+    links_initialized: bool,
 }
 
 impl CpRegistry {
@@ -446,16 +480,21 @@ impl CpRegistry {
         self.by_source.get(source)
     }
 
+    /// The holder `link`'s events process, while `link` is a CP/CPP link.
+    pub(crate) fn link_target(&self, link: LinkSerial) -> Option<&CpTarget> {
+        self.by_serial.get(&link)
+    }
+
     pub(crate) fn sources(&self) -> impl Iterator<Item = &RecordName> {
         self.by_source.keys()
     }
 
-    pub(crate) fn connected(&self) -> bool {
-        self.connected
+    pub(crate) fn links_initialized(&self) -> bool {
+        self.links_initialized
     }
 
-    pub(crate) fn mark_connected(&mut self) {
-        self.connected = true;
+    pub(crate) fn mark_links_initialized(&mut self) {
+        self.links_initialized = true;
     }
 
     /// The one writer: the link `field` of `holder` now carries `edge`, or
@@ -463,6 +502,7 @@ impl CpRegistry {
     pub(crate) fn set_link(&mut self, holder: &[u8], field: &str, edge: Option<CpSource>) {
         let key = (RecordName::from(holder), field.to_string());
         if let Some(old) = self.by_link.remove(&key) {
+            self.by_serial.remove(&old.link);
             if let Some(edges) = self.by_source.get_mut(&old.record) {
                 let is_old =
                     |t: &CpTarget| *t.record == *holder && t.passive_only == old.passive_only;
@@ -482,7 +522,8 @@ impl CpRegistry {
             self.by_source
                 .entry(edge.record.clone())
                 .or_default()
-                .push(target);
+                .push(target.clone());
+            self.by_serial.insert(edge.link, target);
             self.by_link.insert(key, edge);
         }
     }
@@ -496,6 +537,9 @@ impl CpRegistry {
         self.by_source.retain(|_, edges| !edges.is_empty());
         self.by_link
             .retain(|(holder, _), edge| **holder != *name && *edge.record != *name);
+        let by_link = &self.by_link;
+        self.by_serial
+            .retain(|serial, _| by_link.values().any(|edge| edge.link == *serial));
     }
 }
 
@@ -656,6 +700,24 @@ pub struct DbNode {
     pub name: RecordName,
     /// The record an alias node stands for, or `None` for a record node.
     pub alias_of: Option<RecordName>,
+}
+
+/// C `afterIocRunning.c`'s `cmdList` and `initEndFlag` (`:36-37`) as one
+/// value: lines queue until the first `initHookAfterIocRunning` has run them,
+/// and never after.
+enum AfterIocRunning {
+    Queuing(std::collections::VecDeque<Vec<u8>>),
+    Ran,
+}
+
+/// Why [`PvDatabase::queue_after_ioc_running`] did not queue a line, in C
+/// `afterIocRunningFunc`'s order of asking (`afterIocRunning.c:75-86`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterIocRunningRefusal {
+    /// The queue has already run (`initEndFlag`).
+    AfterIocInit,
+    /// No command, or an empty one.
+    Empty,
 }
 
 struct PvDatabaseInner {
@@ -827,11 +889,8 @@ struct PvDatabaseInner {
     empty_link_assignments: std::sync::Mutex<HashMap<RecordName, Vec<String>>>,
     /// Claimed by the one [`PvDatabase::db_init_record_links`] pass.
     links_prepared: std::sync::atomic::AtomicBool,
-    /// Lines queued by the iocsh `afterIocRunning <command>` directive
-    /// (epics-base PR #558). Drained by the IOC application after PINI
-    /// completes, then re-executed through a fresh IocShell so the
-    /// commands run with the database in its post-init state.
-    after_ioc_running: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The iocsh `afterIocRunning` queue; see [`AfterIocRunning`].
+    after_ioc_running: std::sync::Mutex<AfterIocRunning>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
     ///
     /// Whole-value replace: the only writer stores a complete new value, so
@@ -1546,7 +1605,9 @@ impl PvDatabase {
                     record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                     empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
                     links_prepared: std::sync::atomic::AtomicBool::new(false),
-                    after_ioc_running: std::sync::Mutex::new(Vec::new()),
+                    after_ioc_running: std::sync::Mutex::new(AfterIocRunning::Queuing(
+                        std::collections::VecDeque::new(),
+                    )),
                     scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
                     pini_done: std::sync::atomic::AtomicBool::new(false),
                     pini_notify: tokio::sync::Notify::new(),
@@ -1748,7 +1809,7 @@ impl PvDatabase {
     /// longer a wiring pass: the bind happens at each record's creation.
     #[cfg(test)]
     pub(crate) async fn records_with_device_support(&self) -> usize {
-        let names = self.all_record_names().await;
+        let names = self.all_record_names();
         names
             .iter()
             .filter_map(|name| self.get_record(name))
@@ -2069,6 +2130,21 @@ impl PvDatabase {
         out
     }
 
+    /// The parse each link field of `inst` holds, for a field with text: the
+    /// one an lset is addressed through ([`LinkRef`]).
+    pub(crate) fn installed_links(
+        inst: &RecordInstance,
+    ) -> Vec<(String, Arc<crate::server::record::ParsedLink>)> {
+        Self::link_field_texts(inst)
+            .into_iter()
+            .filter(|(_, raw, _)| !raw.is_empty())
+            .filter_map(|(field, _, _)| {
+                let link = inst.stored_link_shared(&field)?.clone();
+                Some((field, link))
+            })
+            .collect()
+    }
+
     /// Enumerate every link-shaped field on `record_name`. Returns
     /// `(field_name, link_string, parsed)` tuples for fields whose
     /// raw value parses as a non-trivial link via
@@ -2107,30 +2183,35 @@ impl PvDatabase {
             Some(r) => r,
             None => return Vec::new(),
         };
-        // The texts leave the hold before any is parsed.
-        let (texts, unbound) = {
+        // The texts leave the hold before any is parsed. An external link
+        // the record holds is reported as held: the parse is the `caLink`,
+        // and a copy of the text would be another link to its lset.
+        let (texts, held) = {
             let inst = rec.read();
             let texts = Self::link_field_texts(&inst);
-            let unbound: Vec<_> = texts
+            let held: Vec<_> = texts
                 .iter()
                 .map(|(field, _, _)| {
                     inst.stored_link(field)
-                        .filter(|l| matches!(l, crate::server::record::ParsedLink::Removed(_)))
+                        .filter(|l| {
+                            l.external().is_some()
+                                || matches!(l, crate::server::record::ParsedLink::Removed(_))
+                        })
                         .cloned()
                 })
                 .collect();
-            (texts, unbound)
+            (texts, held)
         };
         let (mut out, ftypes): (
             Vec<(String, PvString, crate::server::record::ParsedLink)>,
             Vec<_>,
         ) = texts
             .into_iter()
-            .zip(unbound)
+            .zip(held)
             .filter(|((_, raw, _), _)| !raw.is_empty())
-            .map(|((field, raw, ftype), unbound)| {
+            .map(|((field, raw, ftype), held)| {
                 let parsed = crate::server::record::parse_link_field(&raw, ftype);
-                ((field, raw, parsed), (ftype, unbound))
+                ((field, raw, parsed), (ftype, held))
             })
             .filter(|((_, _, parsed), _)| {
                 !matches!(parsed, crate::server::record::ParsedLink::None)
@@ -2141,17 +2222,19 @@ impl PvDatabase {
         // guard: the locality query reads the database's record map, and
         // this is the only place that would otherwise hold an instance lock
         // across it.
-        for (entry, (ftype, unbound)) in out.iter_mut().zip(ftypes) {
+        for (entry, (ftype, held)) in out.iter_mut().zip(ftypes) {
             entry.2 = self.db_init_link_locality(
                 std::mem::replace(&mut entry.2, crate::server::record::ParsedLink::None),
                 ftype,
             );
-            // Only an external link: a removed local link keeps its parse
-            // here, which the lock-set walk reads.
-            if let Some(unbound) = unbound
-                && entry.2.external().is_some()
+            // A held external link stays external, as C decides locality
+            // once (`dbLink.c:96-100`); a removed one replaces only an
+            // external view, since a removed local link keeps its parse here
+            // for the lock-set walk.
+            if let Some(held) = held
+                && (held.external().is_some() || entry.2.external().is_some())
             {
-                entry.2 = unbound;
+                entry.2 = held;
             }
         }
         out
@@ -2183,10 +2266,9 @@ impl PvDatabase {
         link: crate::server::record::ExternalRef<'_>,
     ) -> Option<EpicsValue> {
         // Try lsets first: the scheme's one lset, `ca` for a bare name.
-        let name = link.name;
-        let (scheme, body) = Self::split_external_link_name(name);
+        let (scheme, lref) = Self::external_link_ref(link);
         if let Some(v) =
-            link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(body))
+            link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(lref))
         {
             return Some(v);
         }
@@ -2209,6 +2291,15 @@ impl PvDatabase {
         } else {
             ("ca", name.strip_prefix(b"ca://").unwrap_or(name))
         }
+    }
+
+    /// `link` as the one lset its scheme names addresses it
+    /// ([`Self::split_external_link_name`]).
+    pub(crate) fn external_link_ref(
+        link: crate::server::record::ExternalRef<'_>,
+    ) -> (&'static str, LinkRef<'_>) {
+        let (scheme, body) = Self::split_external_link_name(link.name);
+        (scheme, LinkRef::new(body, link.open))
     }
 
     /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
@@ -2242,14 +2333,9 @@ impl PvDatabase {
             return 0;
         };
         let (scheme, body) = Self::split_external_link_name(link_name.as_ref());
-        self.inner.link_puts.coalesced_for(
-            rec.index(),
-            field,
-            &link_put_queue::Channel {
-                scheme,
-                name: body.into(),
-            },
-        )
+        self.inner
+            .link_puts
+            .coalesced_for(rec.index(), field, scheme, body)
     }
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
@@ -2274,6 +2360,15 @@ impl PvDatabase {
             started.wait();
         }
         true
+    }
+
+    /// Run a link's [`ExternalCpProcess::run_worker`] on the `dbCaLink`
+    /// thread, where C `dbCaTask` runs `CA_DBPROCESS` (`dbCa.c:1314-1321`).
+    pub fn spawn_cp_worker(
+        &self,
+        worker: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> CpWorker {
+        self.inner.link_puts.spawn_cp_worker(worker)
     }
 
     /// C `dbCaLinkInitIsolated`'s half beyond [`Self::ca_link_init`]: a CA
@@ -2309,7 +2404,7 @@ impl PvDatabase {
         &self,
         link: crate::server::record::ExternalRef<'_>,
     ) -> bool {
-        if link.open.is_some_and(|open| open.is_set()) {
+        if link.open.is_set() || link.open.is_removed() {
             return false;
         }
         let (scheme, body) = Self::split_external_link_name(link.name);
@@ -2340,15 +2435,10 @@ impl PvDatabase {
                 .json_suffix
                 .is_none_or(|json| filters::try_parse_filter_chain(&json).is_ok());
         let staged = self.inner.link_puts.stage_open(
-            link_put_queue::Channel {
-                scheme,
-                name: body.into(),
-            },
+            link_put_queue::Channel::new(scheme, body, link.open),
             || local_ca.then(|| self.inner.ca_run.register()).flatten(),
         );
-        if let Some(open) = link.open {
-            open.set();
-        }
+        link.open.set();
         staged
     }
 
@@ -2584,6 +2674,16 @@ impl PvDatabase {
         matches!(*self.inner.init_phase.lock().unwrap(), DbInitPhase::Running)
     }
 
+    /// Is a load under way that `iocInit` has not yet finished? A CA client
+    /// in the IOC cannot connect to the IOC's own records then, because the
+    /// server is not up; a database built without a load never waits.
+    pub fn ioc_init_pending(&self) -> bool {
+        matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Loading(_) | DbInitPhase::Initialising(_)
+        )
+    }
+
     /// Schedule a record's link-status classification — the port's
     /// `init_record` tail (C `checkLinks`).
     ///
@@ -2720,7 +2820,7 @@ impl PvDatabase {
         // owner still does, because a `dbLoadRecords` AFTER `iocInit` opens
         // its links then too — agrees on every value but left the registry
         // empty until a link was touched.
-        self.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+        self.drain_deferred_record_inits(&|line| crate::stderr_println!("{line}"));
         self.ca_link_init();
         // The pass is done and every link's text is final, so the phase becomes
         // terminal here — and what the pass queued joins the load's own
@@ -3009,7 +3109,9 @@ impl PvDatabase {
                     LinkBacking::none(),
                 )),
                 Some(link_field) => std::ops::ControlFlow::Continue(
-                    inst.link_text(&link_field).map(|text| (link_field, text)),
+                    inst.stored_link_shared(&link_field)
+                        .cloned()
+                        .map(|link| (link_field, link)),
                 ),
             }
         })? {
@@ -3021,8 +3123,7 @@ impl PvDatabase {
         //    an unresolvable target, or one the visited guard refused — leaves
         //    the map empty, which serves each slot's C seed.
         let mut resolved = HashMap::new();
-        if let Some((link_field, text)) = link {
-            let parsed = crate::server::record::parse_link_v2(&text);
+        if let Some((link_field, parsed)) = link {
             if let Some(meta) = self.link_metadata_through(&parsed, visited, policy) {
                 resolved.insert(link_field, meta);
             }
@@ -3394,7 +3495,7 @@ impl PvDatabase {
         drop(gate);
         drop(relink);
         self.init_owed_records(vec![(name.clone(), rec_arc.clone())], &|line| {
-            eprintln!("{line}")
+            crate::stderr_println!("{line}")
         });
         // A record added after `iocInit` initialises its own forward links;
         // one added before is swept by the barrier.
@@ -3454,10 +3555,11 @@ impl PvDatabase {
                     resolver.as_deref(),
                 );
                 instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-                let reached = instance.run_init_pass0(&name.to_str_lossy());
+                let (reached, owed) = instance.run_init_pass0(&name.to_str_lossy());
+                let guard = self.pay_device_init(&rec_arc, guard, owed, &name.to_str_lossy(), err);
                 // The load has moved the type selectors since the cell was
                 // built, and an `add_record` below may ask this record's `$`.
-                rec_arc.settle_addr_facts(instance);
+                rec_arc.settle_addr_facts(&guard);
                 drop(guard);
                 (name, rec_arc, reached)
             })
@@ -3524,10 +3626,11 @@ impl PvDatabase {
         let mut init_reads = reached.then(|| self.read_init_links(rec_arc));
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
-            let instance = &mut *guard;
             if let Some(reads) = &mut init_reads {
-                instance.run_init_pass1(&name.to_str_lossy(), reads, err);
+                let owed = guard.run_init_pass1(&name.to_str_lossy(), reads, err);
+                guard = self.pay_device_init(rec_arc, guard, owed, &name.to_str_lossy(), err);
             }
+            let instance = &mut *guard;
             super::database::processing::seed_constant_links(instance);
             rec_arc.settle_addr_facts(instance);
             (
@@ -3552,6 +3655,34 @@ impl PvDatabase {
         self.rec_gbl_init_constant_links(rec_arc);
     }
 
+    /// Run the dset init an init pass left owed with `guard`'s borrow let go
+    /// and the record lent through an [`InitHold`], as a cycle lends it
+    /// around `read_begin`, then the rest of that pass; hand the borrow back.
+    /// With nothing owed, `guard` is returned as it is.
+    pub(crate) fn pay_device_init<'r>(
+        &self,
+        rec: &'r Arc<RecordCell>,
+        guard: crate::server::record::RecordMut<'r>,
+        owed: Option<crate::server::device_support::OwedDeviceInit>,
+        name: &str,
+        err: &dyn Fn(&str),
+    ) -> crate::server::record::RecordMut<'r> {
+        let Some(mut owed) = owed else {
+            return guard;
+        };
+        drop(guard);
+        {
+            let _init = InitPass::enter();
+            let outcome = owed.init_held(&mut InitHold::new(self, rec));
+            let gate = FrameGate::of_instance(self, rec);
+            let frame = gate.frame(rec);
+            let mut instance = frame.write();
+            owed.finish(&mut instance, outcome, name, err);
+            field_io::emit_cycle_posts(&mut instance);
+        }
+        rec.write()
+    }
+
     /// The answers to `rec_arc`'s [`Record::init_link_reads`], read with no
     /// lock of its own held, so a link to the record itself reads it too.
     ///
@@ -3567,23 +3698,19 @@ impl PvDatabase {
                 .init_link_reads()
                 .iter()
                 .map(|&(field, read_as)| {
-                    // A link bound with no lset reads as one; any other is
-                    // read from its text.
-                    let unbound = instance
-                        .stored_link_shared(field)
-                        .filter(|link| {
-                            matches!(***link, crate::server::record::ParsedLink::Removed(_))
-                        })
-                        .cloned();
-                    (field, instance.link_text(field), read_as, unbound)
+                    // The link the record holds; a field that is not one of
+                    // its links is read from its text.
+                    let held = instance.stored_link_shared(field).cloned();
+                    let text = held.is_none().then(|| instance.link_text(field)).flatten();
+                    (field, text, read_as, held)
                 })
                 .collect()
         };
         crate::server::record::InitLinkReads::new(
             links
                 .into_iter()
-                .map(|(field, text, read_as, unbound)| {
-                    let read = match unbound {
+                .map(|(field, text, read_as, held)| {
+                    let read = match held {
                         Some(link) => self.read_link_at_init(rec_arc, &link, read_as),
                         None => self.read_link_at_init(
                             rec_arc,
@@ -3878,22 +4005,37 @@ impl PvDatabase {
             .map(|node| node.target.clone())
     }
 
-    /// Queue an iocsh command line for post-PINI execution.
-    /// Mirrors epics-base PR #558 — `afterIocRunning <command>` lets
-    /// the startup script schedule actions that run after iocInit
-    /// completes (when the record set is fully wired up).
-    pub fn queue_after_ioc_running(&self, line: impl Into<Vec<u8>>) {
-        self.inner
-            .after_ioc_running
-            .lock()
-            .unwrap()
-            .push(line.into());
+    /// Queue an `afterIocRunning` line for the `iocRun` that ends `iocInit`.
+    pub fn queue_after_ioc_running(
+        &self,
+        line: impl Into<Vec<u8>>,
+    ) -> Result<(), AfterIocRunningRefusal> {
+        match &mut *self.inner.after_ioc_running.lock().unwrap() {
+            AfterIocRunning::Ran => Err(AfterIocRunningRefusal::AfterIocInit),
+            AfterIocRunning::Queuing(queue) => {
+                let line = line.into();
+                if line.is_empty() {
+                    return Err(AfterIocRunningRefusal::Empty);
+                }
+                queue.push_back(line);
+                Ok(())
+            }
+        }
     }
 
-    /// Drain the post-PINI iocsh command queue. Called by
-    /// `IocApplication::run` after PINI processing.
-    pub fn take_after_ioc_running(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.inner.after_ioc_running.lock().unwrap())
+    /// C `afterIocRunningHook` (`afterIocRunning.c:46-55`): each queued line
+    /// to `run` in order — a line one of them queues as well — then the queue
+    /// closed, as `initEndFlag = 1` closes it.
+    pub fn drain_after_ioc_running(&self, mut run: impl FnMut(Vec<u8>)) {
+        loop {
+            let next = match &mut *self.inner.after_ioc_running.lock().unwrap() {
+                AfterIocRunning::Queuing(queue) => queue.pop_front(),
+                AfterIocRunning::Ran => None,
+            };
+            let Some(line) = next else { break };
+            run(line);
+        }
+        *self.inner.after_ioc_running.lock().unwrap() = AfterIocRunning::Ran;
     }
 
     /// C `dbDbInitLink`'s `dbChannelCreate` succeeding (`dbDbLink.c:94`): a
@@ -3938,18 +4080,21 @@ impl PvDatabase {
         rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
     }
 
-    /// Synchronous existence check without resolver, taking no record lock,
-    /// so an lset's [`LinkSet::open_link`] may ask it under a put's hold.
-    ///
-    /// C `dbChannelTest` (`dbChannel.c:331-342`): the record name up to the
-    /// first `.`, then the field name's identifier prefix
-    /// (`dbStaticLib.c:1800-1802`); what follows is not read, so
-    /// `R.VAL$garbage` is found and refused at create.
+    /// Synchronous existence check without resolver, taking no record lock:
+    /// a simple PV, or a channel [`Self::channel_test`] finds.
     pub fn has_name_no_resolve(&self, name: &[u8]) -> bool {
         // A filtered simple PV (`SP.{"arr":...}`) answers by its base name.
-        if self.simple_pv_named(&filters::split_channel_name(name).record_path) {
-            return true;
-        }
+        self.simple_pv_named(&filters::split_channel_name(name).record_path)
+            || self.channel_test(name)
+    }
+
+    /// C `dbChannelTest` (`dbChannel.c:331-342`), records and aliases only,
+    /// taking no record lock so an lset's [`LinkSet::open_link`] may ask it
+    /// under a put's hold: the record name up to the first `.`, then the
+    /// field name's identifier prefix (`dbStaticLib.c:1800-1802`); what
+    /// follows is not read, so `R.VAL$garbage` is found and refused at
+    /// create.
+    pub fn channel_test(&self, name: &[u8]) -> bool {
         let (base, rest) = match name.iter().position(|&b| b == b'.') {
             Some(dot) => (&name[..dot], &name[dot + 1..]),
             None => (name, &b""[..]),
@@ -4098,7 +4243,7 @@ impl PvDatabase {
     }
 
     /// Look up a simple PV by name (backward-compatible).
-    pub async fn find_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
+    pub fn find_pv(&self, name: impl AsRef<[u8]>) -> Option<Arc<ProcessVariable>> {
         self.inner.simple_pvs.lock().get(name.as_ref()).cloned()
     }
 
@@ -4194,7 +4339,7 @@ impl PvDatabase {
     /// scan-index's secondary sort key), so this ordering and the scan lists'
     /// ordering are the same fact, not two. A record cannot be missing one: it
     /// is a field of its cell, set where the cell is built.
-    pub async fn all_record_names(&self) -> Vec<RecordName> {
+    pub fn all_record_names(&self) -> Vec<RecordName> {
         // One map, one guard: the sequence travels with the record, so the
         // snapshot and the sort key come from the same read and there is no
         // second structure to order a lock against.
@@ -4216,7 +4361,6 @@ impl PvDatabase {
     pub(crate) async fn iterate_record_names(&self) -> Vec<RecordName> {
         let mut names: Vec<(&'static str, RecordName)> = self
             .all_record_names()
-            .await
             .into_iter()
             .filter_map(|name| {
                 let record_type = self.get_record(&name)?.read().record.record_type();
@@ -4307,7 +4451,7 @@ impl PvDatabase {
     }
 
     /// Get all simple PV names.
-    pub async fn all_simple_pv_names(&self) -> Vec<RecordName> {
+    pub fn all_simple_pv_names(&self) -> Vec<RecordName> {
         self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
@@ -4624,14 +4768,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: link_set::LinkRef<'_>) -> bool {
             crate::runtime::task::Instant::now() >= self.connect_at
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: link_set::LinkRef<'_>) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: link_set::LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
         fn link_names(&self) -> Vec<crate::types::RecordName> {
             self.names.iter().map(|n| n.as_str().into()).collect()

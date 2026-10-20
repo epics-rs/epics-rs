@@ -78,20 +78,22 @@ fn emit(f: &mut fmt::Formatter<'_>, x: f64, conv: Conv) -> fmt::Result {
         ""
     };
     let upper = matches!(conv, Conv::E { upper: true });
-    let body = if x.is_nan() {
-        if upper { "NAN" } else { "nan" }.to_string()
+    let mut body = Text::new();
+    if x.is_nan() {
+        body.write_str(if upper { "NAN" } else { "nan" })?;
     } else if x.is_infinite() {
-        if upper { "INF" } else { "inf" }.to_string()
+        body.write_str(if upper { "INF" } else { "inf" })?;
     } else {
         let a = x.abs();
         let alt = f.alternate();
         let p = f.precision().unwrap_or(DEFAULT_PRECISION);
         match conv {
-            Conv::F => fixed(a, p, alt),
-            Conv::E { upper } => exponential(a, p, alt, upper),
-            Conv::G => general(a, p, alt),
-        }
-    };
+            Conv::F => fixed(&mut body, a, p, alt),
+            Conv::E { upper } => exponential(&mut body, a, p, alt, upper),
+            Conv::G => general(&mut body, a, p, alt),
+        }?;
+    }
+    let body = body.as_str();
     let len = sign.len() + body.len();
     let pad = f.width().unwrap_or(0).saturating_sub(len);
     if pad == 0 {
@@ -108,47 +110,113 @@ fn emit(f: &mut fmt::Formatter<'_>, x: f64, conv: Conv) -> fmt::Result {
     }
 }
 
+/// A conversion's text, on the stack until a precision in the dozens
+/// outgrows it, so the put path's number-to-string allocates nothing.
+struct Text {
+    stack: [u8; 64],
+    len: usize,
+    heap: Option<String>,
+}
+
+impl Text {
+    fn new() -> Self {
+        Text {
+            stack: [0; 64],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match &self.heap {
+            Some(heap) => heap,
+            None => std::str::from_utf8(&self.stack[..self.len]).expect("only str is written"),
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match &mut self.heap {
+            Some(heap) => heap.truncate(len),
+            None => self.len = len,
+        }
+    }
+}
+
+impl fmt::Write for Text {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        if self.heap.is_none() && end <= self.stack.len() {
+            self.stack[self.len..end].copy_from_slice(s.as_bytes());
+            self.len = end;
+            return Ok(());
+        }
+        if self.heap.is_none() {
+            self.heap = Some(self.as_str().to_string());
+        }
+        self.heap.as_mut().expect("just set").push_str(s);
+        Ok(())
+    }
+}
+
 /// `%.pf` of a non-negative finite value. Rust's fixed-precision digits are
 /// exact and round half to even, as glibc's are.
-fn fixed(a: f64, p: usize, alt: bool) -> String {
-    let mut s = format!("{a:.p$}");
+fn fixed(out: &mut Text, a: f64, p: usize, alt: bool) -> fmt::Result {
+    write!(out, "{a:.p$}")?;
     if alt && p == 0 {
-        s.push('.');
+        out.write_char('.')?;
     }
-    s
+    Ok(())
 }
 
 /// `%.pe`: Rust's digits, C's exponent — signed and at least two digits.
-fn exponential(a: f64, p: usize, alt: bool, upper: bool) -> String {
-    let s = format!("{a:.p$e}");
-    let (mantissa, exp) = s.split_once('e').expect("LowerExp emits an exponent");
-    let exp: i32 = exp.parse().expect("LowerExp emits a decimal exponent");
-    c_exponent(mantissa, exp, alt && p == 0, upper)
+fn exponential(out: &mut Text, a: f64, p: usize, alt: bool, upper: bool) -> fmt::Result {
+    let mut sci = Text::new();
+    write!(sci, "{a:.p$e}")?;
+    let (mantissa, exp) = split_exponent(sci.as_str());
+    c_exponent(out, mantissa, exp, alt && p == 0, upper)
 }
 
-fn c_exponent(mantissa: &str, exp: i32, add_point: bool, upper: bool) -> String {
+fn split_exponent(sci: &str) -> (&str, i32) {
+    let (mantissa, exp) = sci.split_once('e').expect("LowerExp emits an exponent");
+    (
+        mantissa,
+        exp.parse().expect("LowerExp emits a decimal exponent"),
+    )
+}
+
+fn c_exponent(
+    out: &mut Text,
+    mantissa: &str,
+    exp: i32,
+    add_point: bool,
+    upper: bool,
+) -> fmt::Result {
     let point = if add_point { "." } else { "" };
     let e = if upper { 'E' } else { 'e' };
     let es = if exp < 0 { '-' } else { '+' };
-    format!("{mantissa}{point}{e}{es}{:02}", exp.unsigned_abs())
+    write!(out, "{mantissa}{point}{e}{es}{:02}", exp.unsigned_abs())
 }
 
 /// `%.pg` (C99 7.19.6.1): with `P` the precision (0 counts as 1) and `X` the
 /// exponent `%e` would print at `P - 1`, `%f` at `P - 1 - X` when
 /// `P > X >= -4`, otherwise `%e` at `P - 1`; trailing zeros and a bare point
 /// go unless `#`.
-fn general(a: f64, p: usize, alt: bool) -> String {
+fn general(out: &mut Text, a: f64, p: usize, alt: bool) -> fmt::Result {
     let p = p.max(1);
-    let sci = format!("{a:.prec$e}", prec = p - 1);
-    let (mantissa, exp) = sci.split_once('e').expect("LowerExp emits an exponent");
-    let exp: i32 = exp.parse().expect("LowerExp emits a decimal exponent");
+    let mut sci = Text::new();
+    write!(sci, "{a:.prec$e}", prec = p - 1)?;
+    let (mantissa, exp) = split_exponent(sci.as_str());
     if exp >= -4 && exp < p as i32 {
-        let s = fixed(a, (p as i32 - 1 - exp) as usize, alt);
-        if alt { s } else { strip_zeros(&s).to_string() }
+        fixed(out, a, (p as i32 - 1 - exp) as usize, alt)?;
+        if !alt {
+            let kept = strip_zeros(out.as_str()).len();
+            out.truncate(kept);
+        }
+        Ok(())
     } else if alt {
-        c_exponent(mantissa, exp, p == 1, false)
+        c_exponent(out, mantissa, exp, p == 1, false)
     } else {
-        c_exponent(strip_zeros(mantissa), exp, false, false)
+        c_exponent(out, strip_zeros(mantissa), exp, false, false)
     }
 }
 
@@ -262,6 +330,24 @@ mod glibc {
                         c(&format!("%#{ps}g"), x),
                         "%#{ps}g {x:e}"
                     );
+                }
+            }
+        }
+    }
+
+    /// Past the 64 bytes `Text` keeps on the stack.
+    #[test]
+    fn long_conversions_match_glibc() {
+        for x in values() {
+            for p in [40usize, 70, 100] {
+                let cases = [
+                    (format!("{:.p$}", CFloat(x)), format!("%.{p}f")),
+                    (format!("{:.p$e}", CFloat(x)), format!("%.{p}e")),
+                    (format!("{:.p$}", CFloat(x).g()), format!("%.{p}g")),
+                    (format!("{:#.p$}", CFloat(x).g()), format!("%#.{p}g")),
+                ];
+                for (got, spec) in cases {
+                    assert_eq!(got, c(&spec, x), "{spec} {x:e}");
                 }
             }
         }

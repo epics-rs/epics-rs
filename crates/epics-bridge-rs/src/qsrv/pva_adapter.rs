@@ -1,12 +1,12 @@
 //! Adapter that exposes a [`BridgeProvider`] (qsrv) through the native
 //! [`epics_pva_rs::server_native::ChannelSource`] trait so that the native
 //! PVA server can serve EPICS records (single-record and group composite
-//! PVs) plus NTNDArray plugin PVs over pvAccess.
+//! PVs) over pvAccess.
 //!
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
-// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the exec-backend
 // suite.
 
 use epics_base_rs::types::RecordName;
@@ -17,154 +17,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc;
 
-use epics_pva_rs::pvdata::{
-    FieldDesc, PvField, PvStructure, ValueDescMismatch, value_matches_descriptor,
-};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
 use epics_pva_rs::server_native::source::OpError;
 
 use super::provider::{BridgeProvider, Channel, ClientCreds, PvaMonitor};
-
-/// Handle for a native PVA PV: latest snapshot + subscriber list +
-/// (optional) canonical introspection descriptor.
-///
-/// Registered via [`QsrvPvStore::register_pva_pv`] so the native PVA
-/// server can serve structure-shaped values produced directly by IOC code
-/// (for example NTNDArray or aggregate benchmark PVs). Snapshots and
-/// notifications use native [`PvField`] values.
-///
-/// `descriptor` lets the producer pass the authoritative wire shape,
-/// bypassing the lossy [`PvField::descriptor`] recovery for types it
-/// cannot reconstruct from the value alone (top-level `UnionArray`,
-/// `Union` with sibling variants, empty `ScalarArray`/`StructureArray`).
-/// When `None`, `get_introspection` falls back to value-derived recovery
-/// — sufficient for structure-rooted normative types where every field
-/// is exercised in the value.
-///
-/// The `latest` snapshot and `subscribers` list are private: the single
-/// way a value enters either is [`PvaPvHandle::post`], which validates
-/// against `descriptor` before storing or fanning out. This makes
-/// "the served value matches the advertised descriptor" hold by
-/// construction — the serving owner never needs a serve-time re-check —
-/// and reproduces pvxs `SharedPV::post`, which rejects a
-/// descriptor-mismatched value before it can become `current`.
-#[derive(Clone)]
-pub struct PvaPvHandle {
-    latest: Arc<parking_lot::Mutex<Option<PvField>>>,
-    subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
-    descriptor: Option<FieldDesc>,
-}
-
-impl PvaPvHandle {
-    /// Create an empty native PVA PV handle advertising `descriptor`.
-    ///
-    /// `latest` starts empty; the only way a value enters it is through
-    /// [`PvaPvHandle::post`], which validates against `descriptor` first.
-    /// Pass `Some(..)` when the producer knows the canonical wire shape
-    /// (e.g. `nt_nd_array_desc()` for NTNDArray, or a custom top-level
-    /// `UnionArray`); pass `None` for a descriptor-less diagnostic PV that
-    /// accepts any posted value and uses value-derived introspection
-    /// (lossy for some types — see [`PvField::descriptor`]).
-    pub fn new(descriptor: Option<FieldDesc>) -> Self {
-        Self {
-            latest: Arc::new(parking_lot::Mutex::new(None)),
-            subscribers: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            descriptor,
-        }
-    }
-
-    /// Validate a producer value against the canonical descriptor, then —
-    /// only on success — store it as the current snapshot and fan it out
-    /// to monitor subscribers. The single owner of every write to
-    /// `latest` and every subscriber notification.
-    ///
-    /// pvxs `SharedPV::post` (`src/sharedpv.cpp:417-431`) checks that the
-    /// posted value was built from the descriptor the PV was opened with
-    /// and throws *before* `impl->current.assign(val)` on a mismatch, so a
-    /// later `fetch()` still returns the last accepted value and monitors
-    /// never see the bad frame. This mirrors that contract: on a
-    /// descriptor mismatch the previous `latest` is left untouched and no
-    /// subscriber receives a frame. A descriptor-less PV (`None`) has no
-    /// canonical contract and accepts every post.
-    pub fn post(&self, value: PvField) -> Result<(), ValueDescMismatch> {
-        if let Some(desc) = &self.descriptor {
-            value_matches_descriptor(&value, desc)?;
-        }
-        // Accepted. Store the snapshot before fanning out, matching pvxs
-        // post order (`current.assign` then notify) so a concurrent GET
-        // can never observe an older value than a monitor frame.
-        *self.latest.lock() = Some(value.clone());
-        let mut subs = self.subscribers.lock();
-        // A bounded `try_send` fails for two reasons and they are NOT the
-        // same. `Closed` means the receiver is gone — reap the subscriber.
-        // `Full` means the subscriber is alive but has not drained yet;
-        // the frame is lost, the SUBSCRIPTION is not. Collapsing the two
-        // (`retain(|tx| tx.try_send(..).is_ok())`) silently unsubscribes a
-        // live monitor the first time its queue backs up, and it never
-        // receives another value. `SharedPV` already reaps on liveness
-        // alone (`shared_pv.rs`: `retain(|tx| !tx.is_closed())`, full queue
-        // → squash the tail, pvxs servermon.cpp:283-286); this is the same
-        // rule for the QSRV fan-out.
-        subs.retain(|tx| match tx.try_send(value.clone()) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        Ok(())
-    }
-
-    /// The current accepted snapshot, or `None` before the first accepted
-    /// post — the analog of pvxs `SharedPV::fetch()`. Already
-    /// descriptor-valid by construction (every write goes through
-    /// [`PvaPvHandle::post`]), so no serve-time re-check is needed.
-    pub fn current_value(&self) -> Option<PvField> {
-        self.latest.lock().clone()
-    }
-
-    /// Append a monitor subscriber (reaping any already-dropped ones) and
-    /// return its receiver. Frames arrive only via [`PvaPvHandle::post`],
-    /// so every delivered value already matches the canonical descriptor.
-    fn add_subscriber(&self) -> mpsc::Receiver<PvField> {
-        let (tx, rx) = mpsc::channel::<PvField>(64);
-        let mut subs = self.subscribers.lock();
-        subs.retain(|s| !s.is_closed());
-        subs.push(tx);
-        rx
-    }
-
-    /// Canonical introspection descriptor supplied at registration.
-    fn descriptor(&self) -> Option<&FieldDesc> {
-        self.descriptor.as_ref()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global PVA PV registry — IOC code stores handles here during startup,
-// the CA+PVA runner reads them at server startup.
-// ---------------------------------------------------------------------------
-
-static PVA_PV_REGISTRY: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<RecordName, PvaPvHandle>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// Register a native PVA PV before the CA+PVA runner starts.
-///
-/// The handle's `latest` snapshot can only have been written through
-/// [`PvaPvHandle::post`], which validates the value against the
-/// descriptor before storing it, so a stored value always matches the
-/// advertised wire shape by construction — there is no separate
-/// registration-time root-kind check to perform.
-pub fn register_pva_pv_global(pv_name: impl AsRef<[u8]>, handle: PvaPvHandle) {
-    PVA_PV_REGISTRY
-        .lock()
-        .unwrap()
-        .insert(RecordName::from(pv_name.as_ref()), handle);
-}
-
-/// Take all registered native PVA PVs. Called by `run_ca_pva_qsrv_ioc_app`'s
-/// runner to wire them into `QsrvPvStore`.
-pub fn take_registered_pva_pvs() -> std::collections::HashMap<RecordName, PvaPvHandle> {
-    std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
-}
 
 /// Convert a native-PVA [`epics_pva_rs::server_native::source::ChannelContext`] to a [`ClientCreds`] for
 /// `BridgeProvider::create_channel_with_creds`.
@@ -188,10 +44,9 @@ fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> Cl
 
 /// pvxs's `qsrvGroup` source, backed by a qsrv [`BridgeProvider`].
 ///
-/// Serves group composite PVs and native PVA PVs (NTNDArray from
-/// areaDetector) and nothing else: single records are `qsrvSingle`'s
-/// ([`epics_pva_rs::server::PvDatabaseSource`]), mounted ahead of this by
-/// [`QsrvMount::install_channel_sources`].
+/// Serves group composite PVs and nothing else: single records are
+/// `qsrvSingle`'s ([`epics_pva_rs::server::PvDatabaseSource`]), mounted
+/// ahead of this by [`QsrvMount::install_channel_sources`].
 pub struct QsrvPvStore {
     /// The executor the per-subscription forward tasks are spawned through.
     /// Handed in at construction because the `ChannelSource` methods below
@@ -199,17 +54,6 @@ pub struct QsrvPvStore {
     /// executor is entered, so the store cannot take the capability itself.
     reactor: epics_base_rs::runtime::task::Reactor,
     provider: Arc<BridgeProvider>,
-    /// Native PVA PVs (e.g., NTNDArray from NDPluginPva).
-    ///
-    /// [`parking_lot::RwLock`], matching [`PvaPvHandle`]'s own interior
-    /// state (`latest`, `subscribers`): every critical section here is a
-    /// name→handle `contains_key` / `get(..).cloned()` / `insert` with no
-    /// I/O in it, so the async lock this used to be bought nothing and cost
-    /// a PI-invisible wait on the serve path (L-B). The guard is `!Send`,
-    /// and every source method below returns `impl Future<..> + Send`, so
-    /// holding one across an `.await` is a
-    /// compile error rather than a review finding.
-    pva_pvs: Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
     /// Per-peer cache of resolved channels, keyed `(peer, pv name)`.
     /// A pvput client mints a fresh op per put, and every op used to
     /// re-run the full name→record/group resolution plus a fresh
@@ -287,28 +131,12 @@ impl QsrvPvStore {
         Self {
             reactor,
             provider,
-            pva_pvs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             channel_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
     pub fn provider(&self) -> &Arc<BridgeProvider> {
         &self.provider
-    }
-
-    /// Register a native PVA PV (e.g., NTNDArray from NDPluginPva).
-    ///
-    /// After registration, the PV is discoverable via `has_pv`, readable
-    /// via `get_value`, and subscribable via `subscribe`. The handle
-    /// carries its canonical descriptor (set at [`PvaPvHandle::new`]),
-    /// which gates every producer [`PvaPvHandle::post`] — so a registered
-    /// PV only ever serves descriptor-valid values, by construction.
-    /// Synchronous: the whole body is one `parking_lot` write guard over a
-    /// `HashMap::insert`, with nothing to await.
-    pub fn register_pva_pv(&self, pv_name: impl AsRef<[u8]>, handle: PvaPvHandle) {
-        self.pva_pvs
-            .write()
-            .insert(RecordName::from(pv_name.as_ref()), handle);
     }
 
     /// Legacy ctx-less channel path — used only by the default
@@ -348,23 +176,10 @@ impl QsrvPvStore {
     }
 }
 
-/// A read-authorized monitor resolved by [`open_monitor`] — either a
-/// native-PVA fan-in receiver (plain values, no `+trigger` graph) or a
-/// started DB/group monitor whose `poll()` carries the per-event marked
-/// set. Shared by the cooked `subscribe_checked` and the marked-aware
-/// `subscribe_checked_opts_marked` so the channel-creation logic lives once.
-enum OpenedMonitor {
-    /// Native PVA PV (NDPluginPva etc.): a `tx` was appended to the
-    /// handle's subscriber list; values fan out as plain `PvField`s.
-    Native(mpsc::Receiver<PvField>),
-    /// A started group monitor.
-    Db(Box<super::group::GroupMonitor>),
-}
-
 /// The leaves a QSRV read ASSIGNS into `value` — what the server frames as
 /// the GET reply's / monitor seed's changed-bitset (pvxs `to_wire_valid(R,
 /// value, &pvMask)`, `serverget.cpp:104`). `None` = "everything the request
-/// selected", for a natively-posted PVA PV whose snapshot is wholly assigned.
+/// selected", for a name that is no servable group.
 ///
 /// pvxs reads into a `cloneEmpty()`: `singleGet` (`singlesource.cpp:283`) and
 /// `getGroupField` (`groupsource.cpp:454-460`) both run `IOCSource::
@@ -385,14 +200,10 @@ enum OpenedMonitor {
 /// `getScalarValue`) and leaves `value.choices` to the property set.
 async fn read_marks(
     provider: &Arc<BridgeProvider>,
-    pva_pvs: &Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
     name: &[u8],
     value: &PvField,
 ) -> Option<Vec<String>> {
-    if pva_pvs.read().contains_key(name) {
-        return None;
-    }
-    let def = provider.servable_group(name).await?;
+    let def = provider.servable_group(name)?;
     let mut paths = vec!["record._options.atomic".to_string()];
     for m in def.channels.iter() {
         paths.extend(super::pvif::read_leaf_paths(
@@ -411,25 +222,17 @@ async fn read_marks(
 /// resolve a started monitor for a read-authorized PV.
 /// Factored out of `subscribe_checked` so `subscribe_checked_opts_marked`
 /// (which carries the `+trigger` marked set to the wire) reuses the
-/// exact same native-PVA / channel / DBE / queue-depth resolution.
+/// exact same channel / DBE / queue-depth resolution.
 async fn open_monitor(
     provider: Arc<BridgeProvider>,
-    pva_pvs: Arc<parking_lot::RwLock<HashMap<RecordName, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
     opts: epics_pva_rs::server_native::MonitorOptions,
-) -> Option<OpenedMonitor> {
+) -> Option<super::group::GroupMonitor> {
     if !checked.allows_read() {
         return None;
     }
     let name = checked.pv_name().clone();
-    if let Some(handle) = pva_pvs.read().get(&name).cloned() {
-        // Frames arrive only through `PvaPvHandle::post`, which validates
-        // against the canonical descriptor before fanout (pvxs
-        // `SharedPV::post`), so the monitor stream can never carry a
-        // descriptor-mismatched frame — no serve-time relay needed.
-        return Some(OpenedMonitor::Native(handle.add_subscriber()));
-    }
     let group = provider
         .create_group_channel_with_creds(name.as_bytes(), ctx_to_creds(&ctx))
         .await
@@ -461,7 +264,7 @@ async fn open_monitor(
         }
         return None;
     }
-    Some(OpenedMonitor::Db(Box::new(monitor)))
+    Some(monitor)
 }
 
 /// Spawn the forward task that drains a started DB/group monitor's
@@ -544,7 +347,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let pva_pvs = self.pva_pvs.clone();
         let provider = self.provider.clone();
         let cache = self.channel_cache.clone();
         async move {
@@ -552,15 +354,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return None;
             }
             let name = checked.pv_name().clone();
-            // Native PVA-pushed PVs (NDPluginPva) carry no per-record ACF
-            // — they are always readable. The snapshot is descriptor-valid
-            // by construction (every write went through
-            // `PvaPvHandle::post`), so serve it directly.
-            if let Some(handle) = pva_pvs.read().get(&name).cloned()
-                && let Some(value) = handle.current_value()
-            {
-                return Some(value);
-            }
             let channel = cached_channel(&provider, &cache, &name, &ctx).await.ok()?;
             // forward the decoded INIT pvRequest so QSRV group
             // GET honors `record._options` (e.g. `atomic`). The native
@@ -599,11 +392,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     ) -> impl std::future::Future<Output = Option<epics_pva_rs::server_native::source::SourceRead>> + Send
     {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         async move {
             let name = checked.pv_name().clone();
             let value = self.get_value_checked(checked, ctx).await?;
-            let marked = read_marks(&provider, &pva_pvs, &name, &value).await;
+            let marked = read_marks(&provider, &name, &value).await;
             Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
         }
     }
@@ -666,8 +458,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
                 None => crate::qsrv::channel::atomic_from_pv_request(&pv),
             };
-            channel
-                .put_with_options(&pv, opts, atomic_override, &ctx.log)
+            // pvxs `onPutGroup`'s `CurrentOp` spans the whole group put
+            // (`groupsource.cpp:591`).
+            let put = channel.put_with_options(&pv, opts, atomic_override, &ctx.log);
+            epics_pva_rs::server::current_op::attached(&ctx, put)
                 .await
                 .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
@@ -739,8 +533,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
                 None => crate::qsrv::channel::atomic_from_pv_request(&pv),
             };
-            channel
-                .put_with_options(&pv, opts, atomic_override, &ctx.log)
+            let put = channel.put_with_options(&pv, opts, atomic_override, &ctx.log);
+            epics_pva_rs::server::current_op::attached(&ctx, put)
                 .await
                 .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
@@ -752,7 +546,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let reactor = self.reactor.clone();
         async move {
             // Legacy cooked path: plain `PvField`s, no marked set. The
@@ -761,42 +554,36 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // No `MonitorOptions` on this legacy entry — nothing was
             // negotiated, so the source sees the per-op defaults (pvxs
             // `MonitorOp::limit = 4u`).
-            match open_monitor(
+            let mut monitor = open_monitor(
                 provider,
-                pva_pvs,
                 checked,
                 ctx,
                 epics_pva_rs::server_native::MonitorOptions::default(),
             )
-            .await?
-            {
-                OpenedMonitor::Native(rx) => Some(rx.into()),
-                OpenedMonitor::Db(mut monitor) => {
-                    let (tx, rx) = mpsc::channel::<PvField>(64);
-                    reactor.spawn(async move {
-                        loop {
-                            // See `spawn_db_monitor_updates`: park on poll()
-                            // but tear down on downstream drop so a quiet /
-                            // all-const monitor does not leak after cancel.
-                            tokio::select! {
-                                _ = tx.closed() => break,
-                                poll = monitor.poll() => {
-                                    let Some(poll) = poll else { break };
-                                    if tx
-                                        .send(PvField::Structure(poll.value))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
+            .await?;
+            let (tx, rx) = mpsc::channel::<PvField>(64);
+            reactor.spawn(async move {
+                loop {
+                    // See `spawn_db_monitor_updates`: park on poll()
+                    // but tear down on downstream drop so a quiet /
+                    // all-const monitor does not leak after cancel.
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        poll = monitor.poll() => {
+                            let Some(poll) = poll else { break };
+                            if tx
+                                .send(PvField::Structure(poll.value))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
                         }
-                        monitor.stop().await;
-                    });
-                    Some(rx.into())
+                    }
                 }
-            }
+                monitor.stop().await;
+            });
+            Some(rx.into())
         }
     }
 
@@ -805,8 +592,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// `+trigger` target set (`MonitorPoll::marked`) into the
     /// `MonitorUpdate` stream, so the server emits a wire changed-bitset
     /// matching the configured trigger graph instead of re-deriving a
-    /// full mask. A native-PVA PV has no trigger graph, so it stays on
-    /// the plain `marked: None` path.
+    /// full mask.
     ///
     /// `opts` (pipeline / queueSize / server-filter) is applied by the
     /// PVA server layer on this same stream — QSRV owns the records
@@ -820,17 +606,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         Output = Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>>,
     > + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let reactor = self.reactor.clone();
         async move {
-            match open_monitor(provider, pva_pvs, checked, ctx, opts).await? {
-                OpenedMonitor::Native(rx) => Some(
-                    epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
-                ),
-                OpenedMonitor::Db(monitor) => {
-                    Some(spawn_db_monitor_updates(&reactor, *monitor).into())
-                }
-            }
+            let monitor = open_monitor(provider, checked, ctx, opts).await?;
+            Some(spawn_db_monitor_updates(&reactor, monitor).into())
         }
     }
 
@@ -841,9 +620,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// the wire layer drives it on this op's MONITOR START/STOP edge, and
     /// the gate `db_event_disable`/`db_event_enable`s the backing
     /// `DbSubscription`s — pvxs `onStart(false)` parity
-    /// (`singlesource.cpp:151`, `groupsource.cpp`). Native-registered PVA
-    /// PVs and the seed for them have no suspendable upstream, so they
-    /// return `on_start: None`.
+    /// (`singlesource.cpp:151`, `groupsource.cpp`).
     fn subscribe_seeded(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -857,104 +634,86 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         >,
     > + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let provider_seed = self.provider.clone();
-        let pva_pvs_seed = self.pva_pvs.clone();
         async move {
-            let opened =
-                open_monitor(provider, pva_pvs, checked.clone(), ctx.clone(), opts).await?;
-            match opened {
-                OpenedMonitor::Native(rx) => {
-                    // Native-registered PVA PVs (NDPluginPva etc.) serve the
-                    // GET seed and monitor frames from one cached snapshot, so
-                    // their `record._options` already match — keep the GET seed.
-                    let initial = self.read_checked(checked, ctx).await;
-                    Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-                        initial,
-                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
-                        on_start: None,
-                    })
-                }
-                OpenedMonitor::Db(monitor) => {
-                    // START is pvxs `onStartSubscription`: an `enable()` per
-                    // member subscription, whose posts the drain holds until
-                    // each has delivered once (`groupsource.cpp:256-297`), so
-                    // the first update marks only what those events assign.
-                    // A group with no member subscription has nothing to wait
-                    // for and posts at once; that post is read here, through
-                    // the monitor-stamped `GroupMonitor::seed` so its
-                    // `record._options` match the update stream (`:401-405`).
-                    let mut monitor = monitor;
-                    let handles = std::sync::Arc::new(monitor.activation_handles());
-                    let initial = if handles.is_empty() {
-                        let name = checked.pv_name().clone();
-                        match monitor.seed().await.map(PvField::Structure) {
-                            Some(value) => {
-                                let mut marked =
-                                    read_marks(&provider_seed, &pva_pvs_seed, &name, &value).await;
-                                if let Some(paths) = marked.as_mut() {
-                                    paths.push("record._options.queueSize".to_string());
-                                }
-                                Some(epics_pva_rs::server_native::source::SourceRead {
-                                    value,
-                                    marked,
-                                })
-                            }
-                            None => self.read_checked(checked, ctx).await,
+            let mut monitor = open_monitor(provider, checked.clone(), ctx.clone(), opts).await?;
+            // START is pvxs `onStartSubscription`: an `enable()` per
+            // member subscription, whose posts the drain holds until
+            // each has delivered once (`groupsource.cpp:256-297`), so
+            // the first update marks only what those events assign.
+            // A group with no member subscription has nothing to wait
+            // for and posts at once; that post is read here, through
+            // the monitor-stamped `GroupMonitor::seed` so its
+            // `record._options` match the update stream (`:401-405`).
+            let handles = std::sync::Arc::new(monitor.activation_handles());
+            let initial = if handles.is_empty() {
+                let name = checked.pv_name().clone();
+                match monitor.seed().await.map(PvField::Structure) {
+                    Some(value) => {
+                        let mut marked = read_marks(&provider_seed, &name, &value).await;
+                        if let Some(paths) = marked.as_mut() {
+                            paths.push("record._options.queueSize".to_string());
                         }
-                    } else {
-                        None
-                    };
-                    // The source's drain posts into the monitor's ring, which
-                    // the op reads directly: no task per monitor. The gate
-                    // owns the monitor, so the op's teardown (which drops
-                    // the gate) cancels its subscriptions — pvxs's
-                    // subscription context owns both its `dbChannel`s and
-                    // its `onStart`.
-                    let updates = monitor.take_updates()?;
-                    let db = provider_seed.database().clone();
-                    let gate =
-                        epics_pva_rs::server_native::source::MonitorGate::new(move |active| {
-                            let _owner = &monitor;
-                            let handles = handles.clone();
-                            let db = db.clone();
-                            async move {
-                                for h in handles.iter() {
-                                    if active {
-                                        h.enable(&db).await;
-                                    } else {
-                                        h.set_active(false).await;
-                                    }
-                                }
-                            }
-                        });
-                    Some(epics_pva_rs::server_native::source::SubscriptionSeed {
-                        initial,
-                        updates: epics_pva_rs::server_native::source::MonitorStream::Ring(updates),
-                        on_start: Some(gate),
-                    })
+                        Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
+                    }
+                    None => self.read_checked(checked, ctx).await,
                 }
-            }
+            } else {
+                None
+            };
+            // The source's drain posts into the monitor's ring, which
+            // the op reads directly: no task per monitor. The gate
+            // owns the monitor, so the op's teardown (which drops
+            // the gate) cancels its subscriptions — pvxs's
+            // subscription context owns both its `dbChannel`s and
+            // its `onStart`.
+            let updates = monitor.take_updates()?;
+            let db = provider_seed.database().clone();
+            let gate = epics_pva_rs::server_native::source::MonitorGate::new(move |active| {
+                let _owner = &monitor;
+                let handles = handles.clone();
+                let db = db.clone();
+                async move {
+                    for h in handles.iter() {
+                        if active {
+                            h.enable(&db).await;
+                        } else {
+                            h.set_active(false).await;
+                        }
+                    }
+                }
+            });
+            Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+                initial,
+                updates: epics_pva_rs::server_native::source::MonitorStream::Ring(updates),
+                on_start: Some(gate),
+            })
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
-        async move {
-            let mut names: Vec<RecordName> = provider
+    fn list_pvs(&self) -> Vec<RecordName> {
+        let mut names: Vec<RecordName> = self
+            .provider
+            .group_list()
+            .into_iter()
+            .map(RecordName::from)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// pvxs `GroupSource::show` (`ioc/groupsource.cpp:152-157`): the group
+    /// names only (`:80-87`).
+    fn show(&self) -> epics_pva_rs::server_native::SourceShow {
+        epics_pva_rs::server_native::SourceShow {
+            kind: "IOC",
+            names: self
+                .provider
                 .group_list()
-                .await
                 .into_iter()
                 .map(RecordName::from)
-                .collect();
-            for key in pva_pvs.read().keys() {
-                if !names.contains(key) {
-                    names.push(key.clone());
-                }
-            }
-            names.sort();
-            names
+                .collect(),
+            nested: false,
         }
     }
 
@@ -963,28 +722,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// a field that is neither a string nor a link.
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let name = RecordName::from(name);
-        async move {
-            if pva_pvs.read().contains_key(&name) {
-                return true;
-            }
-            provider.group_claimed(name.as_bytes()).await
-        }
+        async move { provider.group_claimed(name.as_bytes()) }
     }
 
     /// pvxs `onSearch`: `dbChannelTest`, which resolves the record and field
     /// and ignores what follows them (`singlesource.cpp:466-473`).
     fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let name = RecordName::from(name);
-        async move {
-            if pva_pvs.read().contains_key(&name) {
-                return true;
-            }
-            provider.group_claimed(name.as_bytes()).await
-        }
+        async move { provider.group_claimed(name.as_bytes()) }
     }
 
     fn get_introspection(
@@ -992,23 +739,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         name: &[u8],
     ) -> impl std::future::Future<Output = Option<epics_pva_rs::pvdata::FieldDesc>> + Send {
         let name_owned = RecordName::from(name);
-        let pva_pvs = self.pva_pvs.clone();
         async move {
-            // Native-registered PVA PVs (NTNDArray etc.) live only in
-            // pva_pvs — the BridgeProvider has no record for them, so
-            // self.channel() would return None and the descriptor
-            // would be lost. Probe the PVA registry first.
-            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
-                // Prefer the canonical descriptor supplied at registration
-                // (wire-faithful for `UnionArray` and other types that
-                // `PvField::descriptor` cannot losslessly reconstruct).
-                if let Some(desc) = handle.descriptor().cloned() {
-                    return Some(desc);
-                }
-                if let Some(value) = handle.current_value() {
-                    return Some(value.descriptor());
-                }
-            }
             let channel = self.channel(&name_owned).await?;
             channel.get_field().await.ok()
         }
@@ -1016,13 +747,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let name_owned = RecordName::from(name);
-        let pva_pvs = self.pva_pvs.clone();
         async move {
-            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned()
-                && let Some(value) = handle.current_value()
-            {
-                return Some(value);
-            }
             let channel = self.channel(&name_owned).await?;
             let empty_request = PvStructure::new("");
             match channel.get(&empty_request).await {
@@ -1063,20 +788,13 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 
     fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let provider = self.provider.clone();
-        let pva_pvs = self.pva_pvs.clone();
         let name = RecordName::from(name);
         async move {
             // previously returned `true` for any existing PV via
             // channel_find, lying for read-only records (DISP=1) and
             // delaying the PUT refusal until the actual write attempt.
-            // Now consult provider.is_writable (DISP-aware), and treat
-            // PVA-plugin PVs (NTNDArray cache from NDPluginPva) as
-            // read-only — they're produced server-side, not driven by
-            // downstream PUTs.
-            if pva_pvs.read().contains_key(&name) {
-                return false;
-            }
-            provider.is_servable_group(name.as_bytes()).await
+            // Now consult provider.is_writable (DISP-aware).
+            provider.is_servable_group(name.as_bytes())
                 && provider.is_writable(name.as_bytes()).await
         }
     }
@@ -1086,16 +804,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name_owned = RecordName::from(name);
-        let pva_pvs = self.pva_pvs.clone();
         let reactor = self.reactor.clone();
         async move {
-            // Native-registered PVA PVs publish into their own subscriber
-            // list; `add_subscriber` appends a tx (reaping any already-
-            // dropped receivers) so the plugin's `post()` fans out into
-            // the PVA server.
-            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
-                return Some(handle.add_subscriber().into());
-            }
             let group = self.channel(&name_owned).await?;
             let mut monitor = group.create_monitor().await.ok()?;
             monitor.start().await.ok()?;
@@ -1128,7 +838,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 // CA + PVA dual-protocol runner for IocApplication
 // ---------------------------------------------------------------------------
 
-/// The pvxs `enable2()` decision: whether QSRV2 serving is enabled, plus
+/// The pvxs `enable2()` decision: whether QSRV2's iocsh commands register, plus
 /// the startup diagnostics pvxs prints synchronously (iochooks.cpp:401-448).
 struct Qsrv2Decision {
     enabled: bool,
@@ -1213,7 +923,7 @@ fn qsrv2_decision() -> &'static Qsrv2Decision {
         let enable = epics_base_rs::runtime::env::get_lossy("PVXS_QSRV_ENABLE");
         let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
         if let Some(e) = &decision.error {
-            eprintln!("{e}");
+            epics_base_rs::stderr_println!("{e}");
         }
         if let Some(i) = &decision.info {
             println!("{i}");
@@ -1227,21 +937,13 @@ fn qsrv2_decision() -> &'static Qsrv2Decision {
 // ---------------------------------------------------------------------------
 
 /// A built QSRV mount: the `ChannelSource` a PVA server answers QSRV
-/// channels from, plus the QSRV2 enable decision that produced it.
-///
-/// The decision is carried out of [`build_qsrv_mount`] rather than
-/// recomputed by the caller because the caller has more to gate on it than
-/// serving does — the host runner also gates the QSRV iocsh command set on
-/// it (pvxs registers those only inside `if(enableQ)`,
-/// iochooks.cpp:492-496).
+/// channels from.
 pub struct QsrvMount {
     /// The source to hand to the PVA server (`Arc<QsrvPvStore>` **is** a
     /// `DynSource`: the blanket `ChannelSourceObj` impl at
     /// `server_native/source.rs:2361` supplies object safety, so there is no
     /// adapter and no boxing here).
     pub store: Arc<QsrvPvStore>,
-    /// The cached pvxs `enable2()` decision (iochooks.cpp:401-448).
-    pub enabled: bool,
     /// The IOC's live ACF cell, so `qsrvSingle` gates on the same policy
     /// the bridge's `AcfAccessControl` adopts for groups.
     pub acf: epics_base_rs::server::access_security::AcfCell,
@@ -1292,15 +994,7 @@ pub async fn build_qsrv_mount(
     acf: epics_base_rs::server::access_security::AcfCell,
     group_files: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) -> QsrvMount {
-    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
-    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before standing
-    // up the database/group sources. When disabled, the source is still
-    // mounted and the PVA server still serves native PVA PVs, but the
-    // BridgeProvider answers "absent" for every DB/group channel — matching a
-    // pvxs IOC where enable2() returned false.
-    let enabled = qsrv2_decision().enabled;
-
-    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
 
     // Install the IOC-wide ACF cell on the QSRV bridge so PVA
     // single-record / group operations enforce the same policy the CA
@@ -1316,12 +1010,18 @@ pub async fn build_qsrv_mount(
         tracing::info!("qsrv: ACF installed on BridgeProvider");
     }
 
-    // ── QSRV group loading (pvxs `processGroups()` parity) ──
-    // Gated on the QSRV2 enable decision, matching pvxs only adding the group
-    // source when `enable2()` is true.
-    if enabled {
-        load_qsrv_groups(&provider, db, group_files).await;
-    }
+    // pvxs `processGroups()` runs whatever `enable2()` decided
+    // (iochooks.cpp:354-355); `group_files` are a command line's
+    // `dbLoadGroup` lines, which QSRV2 off leaves unregistered.
+    let group_files = if qsrv2_decision().enabled {
+        group_files
+    } else {
+        for _ in group_files {
+            epics_base_rs::stderr_println!("Command 'dbLoadGroup' not registered.");
+        }
+        &[]
+    };
+    load_qsrv_groups(&provider, db, group_files).await;
 
     QsrvMount {
         store: Arc::new(QsrvPvStore::new(
@@ -1329,88 +1029,43 @@ pub async fn build_qsrv_mount(
                 .expect("build_qsrv_mount is awaited on the IOC's reactor"),
             provider,
         )),
-        enabled,
         acf,
     }
 }
 
 impl QsrvMount {
-    /// Mount everything the QSRV2 enable decision turns on — all of it or
-    /// none of it.
-    ///
-    /// pvxs runs `single_enable(); group_enable(); pvalink_enable();` as
-    /// three statements inside ONE `if(enableQ)` (`ioc/iochooks.cpp:485-496`),
-    /// so a C IOC with `PVXS_QSRV_ENABLE=NO` serves no single record, no
-    /// group and resolves no `pva://` link. The two sources are that block,
-    /// on the type that already carries the decision; the resolver is
-    /// [`install_pvalink`], gated by the same `qsrv2_decision`, because it
-    /// must be in place at `dbCaLinkInit`, before the database these sources
-    /// serve has finished building.
-    ///
-    /// Registration uses pvxs's own source names and orders, "lower order
-    /// first": `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and
-    /// `qsrvGroup` at 1 (`ioc/groupsourcehooks.cpp:219`). A single record is
-    /// in the database under its own name and answers at order 0; a group PV
-    /// is not, so it falls through to the QSRV store at order 1.
+    /// pvxs's `addSingleSrc()` and `addGroupSrc()`, which run at
+    /// `initHookAfterIocBuilt` whatever `enable2()` decided
+    /// (`ioc/iochooks.cpp:367-372`): `qsrvSingle` at order 0
+    /// (`ioc/singlesourcehooks.cpp:159`) and `qsrvGroup` at 1
+    /// (`ioc/groupsourcehooks.cpp:219`), "lower order first". A single record
+    /// is in the database under its own name and answers at order 0; a group
+    /// PV is not, so it falls through to the QSRV store at order 1.
     ///
     /// Errors carry the [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource)
     /// rejection verbatim (a duplicate `(name, order)`); the caller decides
     /// whether that is fatal.
-    pub async fn install_sources(
-        &self,
-        db: &Arc<epics_base_rs::server::database::PvDatabase>,
-        composite: &epics_pva_rs::server_native::composite::CompositeSource,
-    ) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-        self.install_channel_sources(db, composite)
-    }
-
-    /// The two channel sources of [`Self::install_sources`] without the
-    /// pvalink resolver, for the tokio runners, which install pvalink at
-    /// `AfterCaLinkInit` through [`pvalink_link_set_install`].
-    ///
-    /// The store is mounted whatever the decision: with QSRV2 off its
-    /// provider answers absent for every record and group, and it still
-    /// serves the native PVA PVs an `NDPvaConfigure` registered.
     pub fn install_channel_sources(
         &self,
         db: &Arc<epics_base_rs::server::database::PvDatabase>,
         composite: &epics_pva_rs::server_native::composite::CompositeSource,
     ) -> Result<(), String> {
-        if self.enabled {
-            composite.add_source(
-                "qsrvSingle",
-                Arc::new(epics_pva_rs::server::PvDatabaseSource::new_with_acf(
-                    db.clone(),
-                    self.acf.clone(),
-                )),
-                0,
-            )?;
-        }
+        composite.add_source(
+            "qsrvSingle",
+            Arc::new(epics_pva_rs::server::PvDatabaseSource::new_with_acf(
+                db.clone(),
+                self.acf.clone(),
+            )),
+            0,
+        )?;
         composite.add_source("qsrvGroup", self.store.clone(), 1)
     }
-}
-
-/// pvxs `pvalink_enable()` under its `if(enableQ)`: the pvalink resolver on
-/// `db`, or `None` when QSRV2 is off. For a binary that keeps the resolver;
-/// [`pvalink_link_set_install`] is the same call for one that does not.
-#[cfg(feature = "pvalink")]
-pub async fn install_pvalink(
-    db: &Arc<epics_base_rs::server::database::PvDatabase>,
-) -> Option<crate::pvalink::PvaLinkResolver> {
-    if !qsrv2_decision().enabled {
-        return None;
-    }
-    Some(crate::pvalink::install_pvalink_resolver(db).await)
 }
 
 /// Async link-set installer for
 /// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`].
 ///
-/// Installs the `"pva"` link set (pvalink) on `db` and returns the
-/// `pvxr` / `dbpvxr` / `pvalink_enable` / `pvalink_disable` iocsh
+/// Installs the `"pva"` link set (pvalink) on `db` and returns its iocsh
 /// commands. `run_qsrv_ioc_app` registers it for every QSRV route; only a
 /// custom runner registers it itself. It is fired by
 /// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
@@ -1425,22 +1080,21 @@ pub async fn install_pvalink(
 /// links alone; pvxs pvalink never blocks iocInit. A `pva://` link that cannot connect therefore does not
 /// hold up PINI; it connects asynchronously in the background.
 ///
-/// QSRV2-gated (pvxs `iochooks.cpp:461-496`: `pvalink_enable()` runs
-/// only when `enable2()` is true) and feature-gated on `pvalink`. When
-/// QSRV2 is disabled or the feature is off this is an empty no-op
-/// installer — a database with no PVA links stays fully serviceable,
-/// and the shared PVA client is created lazily per link, so there is
-/// no init failure to abort the IOC on. The gate reads the shared
-/// `qsrv2_decision`, so this seam and `build_qsrv_mount` always agree on
-/// the same one decision.
+/// pvxs allocates and starts its link machinery whatever `enable2()`
+/// decided (`iochooks.cpp:338-341,367-369`); the decision gates only
+/// `pvalink_enable()`'s registrations (`iochooks.cpp:503-507`). With the
+/// `pvalink` feature off this is an empty no-op installer.
 pub async fn pvalink_link_set_install(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
     #[cfg(feature = "pvalink")]
     {
-        install_pvalink(&db)
-            .await
-            .map_or_else(Vec::new, crate::pvalink::register_pvalink_commands)
+        let resolver = crate::pvalink::install_pvalink_resolver(&db).await;
+        let mut commands = crate::pvalink::register_pvalink_commands(resolver.clone());
+        if qsrv2_decision().enabled {
+            commands.extend(crate::pvalink::pvalink_enable_commands(resolver));
+        }
+        commands
     }
     #[cfg(not(feature = "pvalink"))]
     {
@@ -1453,8 +1107,7 @@ pub async fn pvalink_link_set_install(
 ///
 /// Runs `app` through [`epics_base_rs::server::ioc_app::IocApplication::run`]: starts a CA
 /// server in the background, creates a `QsrvPvStore` wrapping the database,
-/// registers any native PVA PVs (NTNDArray from NDPluginPva), then runs the
-/// PVA server with an interactive iocsh shell.
+/// then runs the PVA server with an interactive iocsh shell.
 ///
 /// # Example
 ///
@@ -1513,8 +1166,15 @@ where
     Fut: std::future::Future<Output = epics_base_rs::error::CaResult<()>> + Send + 'static,
 {
     // pvxsBaseRegistrar's point: the decision and its INFO line come before
-    // the st.cmd, not at iocInit.
-    qsrv2_decision();
+    // the st.cmd, not at iocInit, and `group_enable()` registers
+    // `dbLoadGroup` there (iochooks.cpp:503-507).
+    let app = if qsrv2_decision().enabled {
+        app.register_startup_command(
+            epics_base_rs::server::ioc_app::db_load_group_startup_command(),
+        )
+    } else {
+        app
+    };
     // pvxs's `link("pva", "lsetPVX")` (`ioc/pvxs7x.dbd:2`) is in the `.dbd`
     // whether or not QSRV2 then enables pvalink, so `{pva:…}` loads either way.
     // Both link sets are installed here, the one place for every QSRV route:
@@ -1560,19 +1220,7 @@ async fn serve_ca_pva_qsrv(
     mount
         .install_channel_sources(&db, &composite)
         .map_err(CaError::InvalidValue)?;
-    let QsrvMount {
-        store,
-        enabled: qsrv2_on,
-        ..
-    } = mount;
-
-    // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
-    // Handles were stored in the global registry during st.cmd execution.
-    let pva_pvs = take_registered_pva_pvs();
-    for (pv_name, handle) in pva_pvs {
-        tracing::info!(pv = %pv_name, "registering native PVA PV");
-        store.register_pva_pv(&pv_name, handle);
-    }
+    let QsrvMount { store, .. } = mount;
 
     // ── External links (`calink` + `pvalink`) ──
     // Neither external link set is installed in this Phase-3 runner. Both
@@ -1590,27 +1238,19 @@ async fn serve_ca_pva_qsrv(
     // Only the `"ca"` set's local-target links are then held by `dbCaRun`'s
     // wait; `pva://` links connect in the background and never block
     // iocInit (pvxs parity — pvalink does not wait at init).
-    // The `caxr` / `dbcaxr` / `pvxr` / `dbpvxr` commands those installers
+    // The `dbcaxr` / `pvxr` / `dbpvxr` commands those installers
     // return are registered on the process's one command table at the hook
     // itself, so `config.shell_commands` no longer carries them and this list
     // holds only what THIS runner adds.
     let mut shell_commands = config.shell_commands;
 
-    // Register the QSRV runtime (interactive-shell) commands —
-    // `processGroups`, `qsrvStats`, `pvxsl`, `pvxgl`, `resetGroups` —
-    // bound to the SAME `BridgeProvider` the served store wraps, so a
-    // post-iocInit `processGroups` / `pvxgl` acts on the served groups
-    // rather than a throwaway provider (pvxs registers these from
-    // `group_enable()` / `singlesourcehooks.cpp`). `dbLoadGroup` is the
-    // base startup command (pvxs only permits it before iocInit), so it
-    // is intentionally absent from this runtime set.
-    //
-    // Gated on the SAME `qsrv2_on` decision that gates serving and group
-    // loading above: pvxs registers `single_enable()` / `group_enable()`
-    // commands only inside `if(enableQ)` (iochooks.cpp:492-496), so a
-    // QSRV2-disabled IOC must expose none of this QSRV control surface.
+    // The QSRV runtime (interactive-shell) commands, bound to the SAME
+    // `BridgeProvider` the served store wraps, so a post-iocInit
+    // `processGroups` / `pvxgl` acts on the served groups rather than a
+    // throwaway provider. `dbLoadGroup` is a startup command (pvxs only
+    // permits it before iocInit), registered by `run_qsrv_ioc_app`.
     shell_commands.extend(super::iocsh::register_qsrv_runtime_commands_if_enabled(
-        qsrv2_on,
+        qsrv2_decision().enabled,
         store.provider().clone(),
     ));
 
@@ -1683,7 +1323,7 @@ async fn load_qsrv_groups(
     use epics_base_rs::server::ioc_app::take_group_load_requests;
 
     // 1. DB info(Q:group) records (pvxs loadConfigFromDb).
-    for name in db.all_record_names().await {
+    for name in db.all_record_names() {
         let json = match db.get_record(&name) {
             Some(rec) => rec.read().get_info("Q:group").map(str::to_string),
             None => None,
@@ -1705,10 +1345,12 @@ async fn load_qsrv_groups(
             Ok(total) => {
                 tracing::debug!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
             }
-            Err(super::iocsh::GroupFileError::Open(line)) => eprintln!("{line}"),
+            Err(super::iocsh::GroupFileError::Open(line)) => {
+                epics_base_rs::stderr_println!("{line}")
+            }
             Err(super::iocsh::GroupFileError::Parse(what)) => {
                 // libstdc++'s verbose terminate handler framing pvxs's throw.
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "terminate called after throwing an instance of 'std::runtime_error'\n  what():  {what}"
                 );
                 std::process::abort();
@@ -1768,92 +1410,15 @@ mod tests {
         assert!(d.info.as_deref().unwrap().contains("ENABLED"));
     }
 
-    /// A QSRV2-disabled provider serves no DB-backed channel: channel_find
-    /// is false, create_channel errors, and channel_list is empty even
-    /// though the database holds a record. Mirrors a pvxs IOC where
-    /// enable2() returned false (no single/group source registered).
-    #[tokio::test]
-    async fn disabled_provider_serves_no_db_channel() {
-        use crate::qsrv::provider::ChannelProvider;
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_pv("TEST:Y", epics_base_rs::types::EpicsValue::Double(2.0))
-            .await
-            .unwrap();
-        let provider = Arc::new(BridgeProvider::new_with_serving(db, false));
-
-        assert!(
-            !provider.channel_find(b"TEST:Y").await,
-            "disabled provider must not find a DB record"
-        );
-        assert!(
-            provider.create_channel(b"TEST:Y").await.is_err(),
-            "disabled provider must refuse to create a DB channel"
-        );
-        assert!(
-            ChannelProvider::channel_list(provider.as_ref())
-                .await
-                .is_empty(),
-            "disabled provider lists no DB names"
-        );
-
-        // The store over a disabled provider hides the DB record but still
-        // serves a natively registered PVA PV (NDPluginPva equivalent).
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-        assert!(
-            !store.has_pv(b"TEST:Y").await,
-            "DB record hidden when disabled"
-        );
-
-        let handle = PvaPvHandle::new(None);
-        handle
-            .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
-            .expect("descriptor-less post accepted");
-        store.register_pva_pv("NATIVE:PV", handle);
-        assert!(
-            store.has_pv(b"NATIVE:PV").await,
-            "native PVA PV stays served even when QSRV2 DB serving is off"
-        );
-    }
-
-    /// A native PV is keyed by its name bytes: a Latin-1 name is served
-    /// as registered, and its lossy UTF-8 rendering names nothing.
-    #[tokio::test]
-    async fn a_native_pv_with_a_latin1_name_is_served_by_its_bytes() {
-        use epics_pva_rs::server_native::ChannelSource;
-        let db = Arc::new(epics_base_rs::server::database::PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new_with_serving(db, true));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-        let handle = PvaPvHandle::new(None);
-        handle
-            .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
-            .expect("descriptor-less post accepted");
-        store.register_pva_pv(b"TEMP:\xb0C", handle);
-        assert!(store.has_pv(b"TEMP:\xb0C").await);
-        assert!(store.get_value(b"TEMP:\xb0C").await.is_some());
-        assert!(!store.has_pv("TEMP:\u{fffd}C".as_bytes()).await);
-        assert_eq!(
-            store.list_pvs().await,
-            vec![RecordName::from(&b"TEMP:\xb0C"[..])]
-        );
-    }
-
-    // ── The QSRV2 mount gate (QsrvMount::install_sources) ──
-
-    async fn mount_with(
-        enabled: bool,
-    ) -> (Arc<epics_base_rs::server::database::PvDatabase>, QsrvMount) {
+    async fn mount() -> (Arc<epics_base_rs::server::database::PvDatabase>, QsrvMount) {
         use epics_base_rs::server::database::PvDatabase;
         let db = Arc::new(PvDatabase::new());
         db.add_pv("TEST:GATE", epics_base_rs::types::EpicsValue::Double(1.0))
             .await
             .unwrap();
-        let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
         let mount = QsrvMount {
             store: Arc::new(QsrvPvStore::new(crate::test_reactor(), provider)),
-            enabled,
             acf: epics_base_rs::server::access_security::new_acf_cell(None),
         };
         (db, mount)
@@ -1868,7 +1433,6 @@ mod tests {
         let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
         QsrvMount {
             store: Arc::new(QsrvPvStore::new(crate::test_reactor(), provider)),
-            enabled: true,
             acf: epics_base_rs::server::access_security::new_acf_cell(None),
         }
         .install_channel_sources(&db, &composite)
@@ -1876,63 +1440,14 @@ mod tests {
         composite
     }
 
-    /// QSRV2 off mounts NOTHING — not the group source, and not the
-    /// single-record source either.
-    ///
-    /// pvxs gates `single_enable()`, `group_enable()` and `pvalink_enable()`
-    /// inside one `if(enableQ)` (`ioc/iochooks.cpp:485-496`), so a C IOC with
-    /// `PVXS_QSRV_ENABLE=NO` answers no record over PVA at all. Gating only
-    /// the group half leaves an IOC that still serves every single record
-    /// while claiming the decision was honoured — visible only to a client.
-    #[tokio::test]
-    async fn qsrv2_disabled_mounts_no_source_at_all() {
-        let (db, mount) = mount_with(false).await;
-        let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
-
-        mount
-            .install_sources(&db, &composite)
-            .await
-            .expect("mounting nothing cannot fail");
-
-        assert!(
-            composite.list_source().is_empty(),
-            "QSRV2 is disabled, so neither qsrvSingle nor qsrvGroup may be \
-             registered; got {:?}",
-            composite.list_source()
-        );
-    }
-
-    /// QSRV2 on mounts both sources under pvxs's own names and orders —
-    /// `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and `qsrvGroup` at
-    /// 1 (`ioc/groupsourcehooks.cpp:219`), "lower order first", because the
-    /// order is what decides which source answers a name both could claim.
-    #[tokio::test]
-    async fn qsrv2_enabled_mounts_both_sources_at_the_pvxs_orders() {
-        let (db, mount) = mount_with(true).await;
-        let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
-
-        mount
-            .install_sources(&db, &composite)
-            .await
-            .expect("a fresh composite accepts both sources");
-
-        let mut got = composite.list_source();
-        got.sort_by_key(|(_, order)| *order);
-        assert_eq!(
-            got,
-            vec![("qsrvSingle".to_string(), 0), ("qsrvGroup".to_string(), 1)]
-        );
-    }
-
     /// The tokio runners' route: a record name is claimed at order 0 by
     /// `qsrvSingle`, which the composite consults first, and a group name
     /// only by `qsrvGroup` at order 1 (pvxs `singlesourcehooks.cpp:159`,
-    /// `groupsourcehooks.cpp:219`). With QSRV2 off only the store mounts,
-    /// so native PVA PVs keep serving while every record answers absent.
+    /// `groupsourcehooks.cpp:219`).
     #[tokio::test]
     async fn channel_sources_route_a_record_to_qsrv_single() {
         use epics_pva_rs::server_native::ChannelSource;
-        let (db, mount) = mount_with(true).await;
+        let (db, mount) = mount().await;
         let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
         mount
             .install_channel_sources(&db, &composite)
@@ -1944,12 +1459,6 @@ mod tests {
         let single = composite.get_source("qsrvSingle", 0).unwrap();
         assert!(single.has_pv(b"TEST:GATE").await);
         assert!(composite.has_pv(b"TEST:GATE").await);
-
-        let (db, mount) = mount_with(false).await;
-        let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
-        mount.install_channel_sources(&db, &composite).unwrap();
-        assert_eq!(composite.list_source(), vec![("qsrvGroup".to_string(), 1)]);
-        assert!(!composite.has_pv(b"TEST:GATE").await);
     }
 
     /// The store is pvxs's `qsrvGroup` and nothing more: a record is not a
@@ -1977,7 +1486,7 @@ mod tests {
         assert!(store.get_value(b"TEST:X").await.is_none());
         assert!(store.get_introspection(b"TEST:X").await.is_none());
         assert!(store.subscribe(b"TEST:X").await.is_none());
-        assert_eq!(store.list_pvs().await, vec!["G".to_string()]);
+        assert_eq!(store.list_pvs(), vec!["G".to_string()]);
         assert!(store.has_pv(b"G").await);
 
         let composite = qsrv_composite(provider);
@@ -2009,263 +1518,6 @@ mod tests {
         assert!(store.searchable(b"SI.VAL$").await);
         assert!(store.has_pv(b"SI.VAL$").await);
         assert!(!store.searchable(b"AI.NOSUCH$").await);
-    }
-
-    /// Top-level `UnionArray` PV: when the producer hands the canonical
-    /// descriptor through `register_pva_pv`, introspection returns the
-    /// full variants list — not the empty-variants degradation that
-    /// [`PvField::descriptor`] would produce on its own. Regression for
-    /// the lossy `UnionArray` recovery path documented on
-    /// `PvField::descriptor`.
-    #[tokio::test]
-    async fn get_introspection_uses_supplied_descriptor_for_union_array() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, UnionItem};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-
-        // Top-level UnionArray with two named variants. Only the first is
-        // exercised in the value below, so value-derived recovery would
-        // lose the `as_double` variant entirely.
-        let canonical = FieldDesc::UnionArray {
-            struct_id: String::new(),
-            variants: vec![
-                ("as_int".into(), FieldDesc::Scalar(ScalarType::Int)),
-                ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
-        };
-        let value = PvField::UnionArray(vec![Some(UnionItem {
-            selector: 0,
-            variant_name: "as_int".into(),
-            value: PvField::Scalar(ScalarValue::Int(7)),
-        })]);
-
-        let handle = PvaPvHandle::new(Some(canonical.clone()));
-        handle
-            .post(value)
-            .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:UARR", handle);
-
-        let got = store.get_introspection(b"TEST:UARR").await.unwrap();
-        assert_eq!(got, canonical, "supplied descriptor must round-trip");
-    }
-
-    /// When the producer omits the canonical descriptor, introspection
-    /// falls back to value-derived recovery — locking in the documented
-    /// lossy behavior so future refactors can't silently invert it.
-    #[tokio::test]
-    async fn get_introspection_falls_back_to_value_descriptor_when_unset() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, UnionItem};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-
-        let value = PvField::UnionArray(vec![Some(UnionItem {
-            selector: 0,
-            variant_name: "as_int".into(),
-            value: PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)),
-        })]);
-        let handle = PvaPvHandle::new(None);
-        handle.post(value).expect("descriptor-less post accepted");
-        store.register_pva_pv("TEST:UARR_LOSSY", handle);
-
-        let got = store.get_introspection(b"TEST:UARR_LOSSY").await.unwrap();
-        assert_eq!(
-            got,
-            FieldDesc::UnionArray {
-                struct_id: String::new(),
-                variants: Vec::new(),
-            },
-            "documented lossy recovery: variants list must be empty"
-        );
-    }
-
-    /// pvxs `SharedPV::post` (sharedpv.cpp:417-431) validates the posted
-    /// value against the descriptor the PV was opened with and throws
-    /// *before* `impl->current.assign(val)`, so a descriptor-mismatched
-    /// post leaves the last accepted value readable via `fetch()` and
-    /// never reaches monitors. `PvaPvHandle::post` is the single
-    /// validating write owner that reproduces this: a bad post returns
-    /// `Err`, leaves `latest` untouched, and fans out nothing — `latest`
-    /// can only ever hold a descriptor-valid value, by construction.
-    #[tokio::test]
-    async fn native_pva_bad_post_keeps_prior_value_and_skips_monitor() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-
-        // Canonical descriptor: NTScalar<Double>.
-        let desc = FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
-        };
-        let handle = PvaPvHandle::new(Some(desc));
-
-        // Subscribe before any post so the monitor observes the same post
-        // sequence the GET path sees (the clone shares `latest`/
-        // `subscribers`, so registering a clone keeps both views in sync).
-        let mut rx = handle.add_subscriber();
-
-        // A descriptor-matching post becomes current and is delivered.
-        let good = {
-            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-            s.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
-            PvField::Structure(s)
-        };
-        handle.post(good.clone()).expect("good post accepted");
-        store.register_pva_pv("TEST:NTS", handle.clone());
-
-        assert_eq!(
-            store.get_value(b"TEST:NTS").await,
-            Some(good.clone()),
-            "accepted value is served"
-        );
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(good.clone()),
-            "monitor receives the good frame"
-        );
-
-        // A descriptor-mismatched post (Int leaf under a Double
-        // descriptor: same root kind and struct_id, wrong scalar type) is
-        // rejected before it can touch `latest` or fan out.
-        let bad = {
-            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-            s.set("value", PvField::Scalar(ScalarValue::Int(3)));
-            PvField::Structure(s)
-        };
-        handle
-            .post(bad)
-            .expect_err("descriptor-mismatched post must be rejected");
-
-        // GET still returns the last *accepted* value — not None, not the
-        // bad value (pvxs `fetch()` after a thrown post).
-        assert_eq!(
-            store.get_value(b"TEST:NTS").await,
-            Some(good),
-            "rejected post must leave the prior accepted value readable"
-        );
-        // The monitor saw no frame for the rejected post.
-        assert!(
-            rx.try_recv().is_err(),
-            "rejected post must not reach monitor subscribers"
-        );
-    }
-
-    /// Boundaries of the fan-out reap predicate in [`PvaPvHandle::post`].
-    ///
-    /// A bounded `try_send` fails on `Full` AND on `Closed`. Only `Closed`
-    /// means the subscriber is dead. The boundaries, one case each:
-    ///
-    /// - queue below capacity  → delivered, subscriber retained
-    /// - queue exactly full    → frame dropped, subscriber RETAINED
-    /// - full, then drained    → later posts still arrive (the regression:
-    ///   the old `retain(|tx| tx.try_send(v).is_ok())` evicted the live
-    ///   subscriber at the moment it filled, so it never received again)
-    /// - receiver dropped      → subscriber reaped
-    #[tokio::test]
-    async fn native_pva_full_monitor_queue_drops_the_frame_not_the_subscriber() {
-        use epics_pva_rs::pvdata::{PvField, ScalarValue};
-
-        // Descriptor-less: this test is about the fan-out, not validation.
-        let handle = PvaPvHandle::new(None);
-        let mut rx = handle.add_subscriber();
-        let cap = 64; // `add_subscriber`'s channel capacity.
-        let v = |i: i32| PvField::Scalar(ScalarValue::Int(i));
-
-        // Boundary 1: below capacity — delivered, subscriber retained.
-        handle.post(v(0)).expect("post accepted");
-        assert_eq!(handle.subscribers.lock().len(), 1, "live sub retained");
-
-        // Boundary 2: fill to exactly capacity, then post past it. The
-        // overflow frames are lost; the SUBSCRIPTION must survive.
-        for i in 1..cap {
-            handle.post(v(i)).expect("post accepted");
-        }
-        for i in cap..(cap + 10) {
-            handle
-                .post(v(i))
-                .expect("post accepted even when the queue is full");
-        }
-        assert_eq!(
-            handle.subscribers.lock().len(),
-            1,
-            "a FULL queue is backpressure, not death: the subscriber must survive"
-        );
-
-        // Boundary 3: drain, then post again — a live subscriber that once
-        // filled must still receive. This is what the old predicate broke.
-        for i in 0..cap {
-            assert_eq!(
-                rx.try_recv().ok(),
-                Some(v(i)),
-                "the queued frames are the first {cap} posts, in order"
-            );
-        }
-        assert!(rx.try_recv().is_err(), "nothing beyond capacity was queued");
-        handle.post(v(999)).expect("post accepted");
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(v(999)),
-            "a subscriber that survived a full queue still receives after it drains"
-        );
-
-        // Boundary 4: receiver gone (Closed) — reap.
-        drop(rx);
-        handle.post(v(1000)).expect("post accepted");
-        assert!(
-            handle.subscribers.lock().is_empty(),
-            "a CLOSED receiver is the only condition that reaps a subscriber"
-        );
-    }
-
-    /// A descriptor-mismatched *first* post (no previously accepted value)
-    /// leaves the PV with no current value — matching pvxs before
-    /// `open()` / the first accepted post, where `fetch()` has nothing to
-    /// return. The bad frame must not be coerced into a fabricated
-    /// snapshot.
-    #[tokio::test]
-    async fn native_pva_bad_first_post_leaves_no_current_value() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(crate::test_reactor(), provider);
-
-        let desc = FieldDesc::Structure {
-            struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
-        };
-        let handle = PvaPvHandle::new(Some(desc));
-
-        // First post is descriptor-mismatched (Int leaf) → rejected.
-        let bad = {
-            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
-            s.set("value", PvField::Scalar(ScalarValue::Int(3)));
-            PvField::Structure(s)
-        };
-        handle
-            .post(bad)
-            .expect_err("descriptor-mismatched first post must be rejected");
-
-        store.register_pva_pv("TEST:NTS:EMPTY", handle);
-        assert_eq!(
-            store.get_value(b"TEST:NTS:EMPTY").await,
-            None,
-            "no accepted post yet: GET has no current value"
-        );
     }
 
     /// pvxs installs no `onRPC` for QSRV records (singlesource.cpp:427-460);
@@ -2404,67 +1656,6 @@ mod tests {
             Some(PvField::Scalar(ScalarValue::Int(v))) => assert_eq!(*v as i64, 2),
             other => panic!("group member `count` changed or missing: {other:?}"),
         }
-    }
-
-    #[cfg(tokio_backend)]
-    /// End-to-end wire test: a top-level `UnionArray` PV registered
-    /// with a canonical descriptor is served over real PVA, and the
-    /// client recovers the full variants list via `GET_FIELD`. Closes
-    /// the loop on the doc claim that wire-faithful round-tripping
-    /// now works — the previous unit tests only validated the
-    /// `ChannelSource` contract.
-    ///
-    /// The only test in this module that needs a PVA *client*
-    /// (`PvaServer::client_config` is behind `epics-pva-rs/client`), so it is
-    /// the only one gated on the full `qsrv` selection rather than
-    /// `qsrv-core`. Everything else here drives the `ChannelSource` surface
-    /// directly and runs in either.
-    #[cfg(feature = "qsrv")]
-    #[tokio::test]
-    async fn pva_server_serves_canonical_union_array_descriptor_over_wire() {
-        use std::time::Duration;
-
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, UnionItem};
-        #[cfg(tokio_backend)]
-        use epics_pva_rs::server_native::PvaServer;
-        use epics_pva_rs::server_native::PvaServerConfig;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = Arc::new(QsrvPvStore::new(crate::test_reactor(), provider));
-
-        let canonical = FieldDesc::UnionArray {
-            struct_id: String::new(),
-            variants: vec![
-                ("as_int".into(), FieldDesc::Scalar(ScalarType::Int)),
-                ("as_double".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
-        };
-        let value = PvField::UnionArray(vec![Some(UnionItem {
-            selector: 0,
-            variant_name: "as_int".into(),
-            value: PvField::Scalar(ScalarValue::Int(7)),
-        })]);
-        let handle = PvaPvHandle::new(Some(canonical.clone()));
-        handle
-            .post(value)
-            .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:WIRE:UARR", handle);
-
-        let server =
-            PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");
-        let client = server.client_config();
-
-        let got = tokio::time::timeout(Duration::from_secs(5), client.pvinfo("TEST:WIRE:UARR"))
-            .await
-            .expect("pvinfo timeout")
-            .expect("pvinfo failed");
-
-        assert_eq!(
-            got, canonical,
-            "client-side introspection must recover the producer's UnionArray variants over the wire"
-        );
     }
 
     /// softIocPVX 1.5.3 on `{"G2":{"a":{"+channel":"NOPE.VAL"}}}` prints
@@ -2663,7 +1854,6 @@ mod tests {
         let composite = epics_pva_rs::server_native::CompositeSource::new();
         QsrvMount {
             store: Arc::new(QsrvPvStore::new(crate::test_reactor(), provider)),
-            enabled: true,
             acf: epics_base_rs::server::access_security::new_acf_cell(None),
         }
         .install_channel_sources(&db, &composite)
@@ -3470,7 +2660,7 @@ mod tests {
         }
 
         // Runner single-owner build into the SERVED provider, before serving.
-        let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), true));
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
         // `&[]`: this case drives the base startup queue (the real
         // `dbLoadGroup` command ran above), which is the host route. The
         // caller-supplied list is the target's route and is exercised by

@@ -19,9 +19,10 @@
 //! scan-1: dbProcess of 'SC'
 //! ```
 //!
-//! The context before the colon is the thread's name. It is compared only for
-//! the scan thread: the port runs PINI on its `scan-owner` thread, not on the
-//! thread that called `iocInit`.
+//! The context before the colon is the thread's name. It is compared for the
+//! scan thread, the shell and a thread the port did not create, not for PINI:
+//! the port runs PINI on its `scan-owner` thread, not on the thread that
+//! called `iocInit`.
 
 use std::collections::HashMap;
 
@@ -47,7 +48,10 @@ fn trace_of(test: &str) -> Vec<String> {
         .unwrap()
         .lines()
         .filter(|l| l.contains(": dbProcess"))
-        .map(str::to_string)
+        .map(|l| {
+            l.trim_start_matches(&format!("test {test} ... "))
+                .to_string()
+        })
         .collect()
 }
 
@@ -191,6 +195,72 @@ record(calc, "E") { }
         .await
         .unwrap();
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+/// The context is `epicsThreadGetNameSelf`, the thread-list row: an
+/// interactive shell runs on the `_main_` thread (`run_on_main_thread`, as
+/// `CaServer::run_with_shell` does), and softIoc's `dbpf SH.PROC 1` prints
+/// `_main_: dbProcess of 'SH'`.
+#[epics_macros_rs::epics_test]
+async fn a_shell_dbpf_prints_the_main_thread_context() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("a_shell_dbpf_prints_the_main_thread_context");
+        assert_eq!(trace, ["_main_: dbProcess of 'SH'"]);
+        return;
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(calc, "SH") { field(TPRO, "1") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    epics_base_rs::runtime::task::run_on_main_thread(move || {
+        epics_base_rs::server::iocsh::IocShell::new(db, bridge).execute_line("dbpf SH.PROC 1")
+    })
+    .unwrap()
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+/// A thread the port did not create is named by C's `createImplicit`
+/// (`osdThread.c:705`) the first time it asks, so a `dbpf` from it prints
+/// `non-EPICS_<tid>: dbProcess of 'NE'`.
+#[epics_macros_rs::epics_test]
+async fn a_non_epics_thread_prints_its_implicit_name() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("a_non_epics_thread_prints_its_implicit_name");
+        assert_eq!(trace.len(), 1, "{trace:?}");
+        let (context, line) = trace[0].split_once(": ").unwrap();
+        assert_eq!(line, "dbProcess of 'NE'");
+        assert!(
+            context
+                .strip_prefix("non-EPICS_")
+                .is_some_and(|tid| tid.parse::<u64>().is_ok()),
+            "{context:?}"
+        );
+        return;
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(calc, "NE") { field(TPRO, "1") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    std::thread::spawn(move || {
+        epics_base_rs::server::iocsh::IocShell::new(db, bridge).execute_line("dbpf NE.PROC 1")
+    })
+    .join()
+    .unwrap()
+    .unwrap();
 }
 
 /// TPRO first set by a put, after the database loaded with none, traces the

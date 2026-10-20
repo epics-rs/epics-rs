@@ -402,12 +402,12 @@ mod tests {
         for (suffix, _) in CONTROL_FLAGS {
             let name = format!("gw:{suffix}");
             assert!(
-                db.find_pv(&name).await.is_some(),
+                db.find_pv(&name).is_some(),
                 "control PV {name} must be registered"
             );
         }
 
-        let pv = db.find_pv("gw:newAsFlag").await.unwrap();
+        let pv = db.find_pv("gw:newAsFlag").unwrap();
         // A zero write is inert (so the owner's reset never re-raises).
         fire(&pv, EpicsValue::Double(0.0)).await.unwrap();
         assert!(
@@ -449,7 +449,7 @@ mod tests {
         );
 
         // Drive report2Flag positive via its write hook.
-        let pv = db.find_pv("gw:report2Flag").await.unwrap();
+        let pv = db.find_pv("gw:report2Flag").unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
 
         // The owner resets the flag back to 0 after handling. The flag is
@@ -490,7 +490,7 @@ mod tests {
             shutdown.clone(),
         );
 
-        let pv = db.find_pv("gw:quitFlag").await.unwrap();
+        let pv = db.find_pv("gw:quitFlag").unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
 
         // shutdown must be notified within a bounded wait.

@@ -935,7 +935,7 @@ pub enum DbNotice {
 impl DbNotice {
     pub fn print(&self) {
         match self {
-            DbNotice::Stderr(text) => eprintln!("{text}"),
+            DbNotice::Stderr(text) => crate::stderr_println!("{text}"),
             DbNotice::Errlog(text) => crate::runtime::log::errlog_vprintf(format_args!("{text}\n")),
         }
     }
@@ -1267,9 +1267,9 @@ impl DbDiagnostic {
         if let Some(notice) = &self.notice {
             notice.print();
         }
-        eprintln!("{}", self.message);
+        crate::stderr_println!("{}", self.message);
         if let Some(suggestion) = &self.suggestion {
-            eprintln!("{suggestion}");
+            crate::stderr_println!("{suggestion}");
         }
     }
 
@@ -1421,7 +1421,7 @@ impl DbFaults {
             };
             match notice {
                 ReadNotice::Errlog(text) => crate::runtime::log::errlog_printf(&text),
-                ReadNotice::Stderr(text) => eprint!("{text}"),
+                ReadNotice::Stderr(text) => crate::stderr_print!("{text}"),
                 ReadNotice::Report(token, diagnostic) => {
                     let parked = self.park.replace((at, token));
                     self.render(diagnostic);
@@ -1521,7 +1521,7 @@ impl DbFaults {
         }
         self.stop_reading();
         if yyerror_null {
-            eprintln!("{message}");
+            crate::stderr_println!("{message}");
             self.yyerror(None);
         } else {
             self.yyerror(Some(&message));
@@ -1535,7 +1535,7 @@ impl DbFaults {
     pub(crate) fn abort_parse(&mut self, abort: &ParseAbort) {
         self.abort_as(&abort.error, abort.yyerror_null);
         if abort.stack_dirty {
-            eprintln!("{ERL_WARNING}: dbReadCOM: Parser stack dirty w/o error. 1");
+            crate::stderr_println!("{ERL_WARNING}: dbReadCOM: Parser stack dirty w/o error. 1");
         }
     }
 
@@ -1646,17 +1646,20 @@ impl DbFaults {
     /// of this port's invention, so the two arms cannot drift apart.
     fn yyerror(&mut self, str: Option<&str>) {
         if let Some(str) = str {
-            eprintln!("{ERL_ERROR}: {str}");
+            crate::stderr_println!("{ERL_ERROR}: {str}");
         }
         // C always has a position here — its lexer is still parked on
         // the line that failed. This port sometimes does not, and then
         // the bare `ERROR: ` is withheld WITH the position it exists to
         // introduce, rather than left dangling at the end of the stream.
         if let Some(context) = self.position_context() {
-            if str.is_none() {
-                eprint!("{ERL_ERROR}: ");
+            // C writes the bare `ERROR: ` and the position in two `fprintf`s
+            // (dbYacc.y:376-381); one write keeps another writer's line from
+            // landing between them, a deliberate deviation.
+            match str {
+                None => crate::stderr_print!("{ERL_ERROR}: {context}"),
+                Some(_) => crate::stderr_print!("{context}"),
             }
-            eprint!("{context}");
         }
     }
 
@@ -2000,7 +2003,10 @@ impl ParsedDb {
                 .rfind(|r| r.name == *target)
             {
                 Some(rec) => rec.aliases.push(file_alias.alias),
-                None => eprintln!("{}", unknown_alias_message(&file_alias.alias.name, target)),
+                None => crate::stderr_println!(
+                    "{}",
+                    unknown_alias_message(&file_alias.alias.name, target)
+                ),
             }
         }
         records
@@ -3505,6 +3511,16 @@ fn declared_store_of(record: &dyn Record, field: &str) -> Option<(FieldSlot, Dec
     record.declared_store(slot).map(|store| (slot, store))
 }
 
+/// Whether `record` stores `field` itself rather than leaving it to the
+/// dbCommon fallback: a type that classifies its declared fields says by the
+/// store it declares, an unclassified one by whether it serves the field.
+pub(crate) fn record_owns_field(record: &dyn Record, field: &str) -> bool {
+    match declared_store_of(record, field) {
+        Some((_, store)) => store != DeclaredStore::Spill,
+        None => record.implements_field(field),
+    }
+}
+
 /// Create a record from a type name.
 /// Checks the external factory registry first, then falls back to built-in types.
 ///
@@ -3945,10 +3961,7 @@ pub fn apply_fields<T: LoadTarget + ?Sized>(
         // A type that classifies its declared fields says which store each
         // one has; only an unclassified type is asked whether it serves it.
         let declared = declared_store_of(record, &upper_name);
-        let owned = match declared {
-            Some((_, store)) => store != DeclaredStore::Spill,
-            None => record.implements_field(&upper_name),
-        };
+        let owned = record_owns_field(record, &upper_name);
         // The DECLARATION, from the same owner every other consumer asks: the
         // `.dbd`-generated table first, the record's hand table only where the
         // `.dbd` does not reach. Reading it off `field_list()` alone left an
@@ -5005,7 +5018,7 @@ record(ai, "T") { field(LINR, "typeJdegC") }
             max_include_depth: 32,
         };
         let mut parsed = parse_db_opened_held(
-            &DbOpenedFile::taken_outright(&path),
+            &DbOpenedFile::taken_outright(&path).unwrap(),
             &HashMap::new(),
             &config,
         )
@@ -5027,6 +5040,37 @@ record(ai, "T") { field(LINR, "typeJdegC") }
             assert!(aborted.is_none(), "{parent:?}: {aborted:?}");
             assert_eq!(names, ["P", "CHILD"], "{parent:?}");
         }
+    }
+
+    /// `tokenSTRING` keeps `\"` raw (`dbLex.l:88-92`) and so does
+    /// `macEnvExpand`, so the file opened is `a\"b.template`. The `\` sends
+    /// C's `dbOpenFile` past the search path (`dbLexRoutines.c:174-175`),
+    /// hence the absolute name; `softIoc` R7.0.10 `dbl` lists `CHILD`, `P`.
+    #[cfg(unix)]
+    #[test]
+    fn an_include_name_keeps_an_escaped_quote_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("a\\\"b.template");
+        std::fs::write(&child, "record(ai, \"CHILD\") {}\n").unwrap();
+        let path = dir.path().join("p.db");
+        let parent = format!(
+            "include \"{}\"\nrecord(ai, \"P\") {{}}\n",
+            child.to_str().unwrap()
+        );
+        std::fs::write(&path, parent).unwrap();
+        let parsed = parse_db_opened_held(
+            &DbOpenedFile::taken_outright(&path).unwrap(),
+            &HashMap::new(),
+            &DbLoadConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            parsed.aborted.is_none(),
+            "{:?}",
+            parsed.aborted.map(|a| a.error)
+        );
+        let names: Vec<_> = parsed.records.iter().map(|r| r.name.to_string()).collect();
+        assert_eq!(names, ["CHILD", "P"]);
     }
 
     /// The argument is a token, so it may sit on the next line.

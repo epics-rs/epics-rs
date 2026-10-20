@@ -7,43 +7,24 @@
 //! `seqStart` startup command, the same shape
 //! `optics_rs::seq_runner::seq_start` is registered with.
 
-use std::collections::HashMap;
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features`, 222/222). The reactor its test obtains comes from the
+// test's own `Runtime::new`, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::iocsh::macro_defn_pairs;
-use epics_base_rs::server::snl::spawn_program;
+use epics_base_rs::server::snl::{SeqMacros, spawn_program};
 
-/// Split a `seq` macro string into definitions.
+/// Start a std-module SNL program by name, its macros parsed over the
+/// program's `program` parameters as `seq` does, so one left out takes the
+/// `.st`'s default. A macro with no value reads as "", what `seqMacEval`
+/// puts for its `{name}`.
 ///
-/// Through `macro_defn_pairs`, the port's owner of C's `macParseDefns`
-/// grammar (`macUtil.c`), so a quoted value with an embedded comma survives —
-/// a raw `split(',')` tears it. A name given with no `=` is a deletion in
-/// that grammar and is dropped here, since a program can only be started with
-/// definitions.
-pub fn parse_macros(input: &str) -> HashMap<String, String> {
-    macro_defn_pairs(input)
-        .into_iter()
-        .filter_map(|(name, value)| value.map(|v| (name, v)))
-        .collect()
-}
-
-fn require_macro(
-    macros: &HashMap<String, String>,
-    key: &str,
-    program: &str,
-) -> Result<String, String> {
-    macros
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("{program}: required macro '{key}' not specified"))
-}
-
-/// Start a std-module SNL program by name.
-///
-/// | Name | Macros | Program |
-/// |------|--------|---------|
-/// | `delayDo` | P, R | `delayDo.st` — wait out an active condition, then process `doSeq` |
-/// | `femto` | P, H, F, G1, G2, G3, NO | `femto.st` — Femto amplifier gain control |
+/// | Name | Program |
+/// |------|---------|
+/// | `delayDo` | `delayDo.st` — wait out an active condition, then process `doSeq` |
+/// | `femto` | `femto.st` — Femto amplifier gain control |
 ///
 /// Must be called with the runtime reachable — from st.cmd that means
 /// `CommandContext::bridge()`, because the shell runs on a blocking thread.
@@ -53,27 +34,26 @@ pub fn seq_start(
     bridge: &epics_base_rs::runtime::task::BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
-    let macros = parse_macros(macro_str);
-
     match program {
         "delayDo" => {
-            let config = crate::snl::delay_do::DelayDoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "R", program)?,
-            );
+            let m = SeqMacros::new("name=delayDo,P=xxx:,R=delayDo1", macro_str);
+            let v = |name| m.value(name).unwrap_or_default();
+            let config = crate::snl::delay_do::DelayDoConfig::new(v("P"), v("R"));
             spawn_program(bridge, db, "delayDo", move |db| {
                 crate::snl::delay_do::run(config, db)
             });
         }
         "femto" => {
+            let m = SeqMacros::new("name=femto,P=,H=,F=,G1=,G2=,G3=,NO=", macro_str);
+            let v = |name| m.value(name).unwrap_or_default();
             let config = crate::snl::femto::FemtoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "H", program)?,
-                &require_macro(&macros, "F", program)?,
-                &require_macro(&macros, "G1", program)?,
-                &require_macro(&macros, "G2", program)?,
-                &require_macro(&macros, "G3", program)?,
-                &require_macro(&macros, "NO", program)?,
+                v("P"),
+                v("H"),
+                v("F"),
+                v("G1"),
+                v("G2"),
+                v("G3"),
+                v("NO"),
             );
             spawn_program(bridge, db, "femto", move |db| {
                 crate::snl::femto::run(config, db)
@@ -83,4 +63,23 @@ pub fn seq_start(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `delayDo.st:1` and `femto.st:15` define every macro the programs
+    /// read, so `seq` starts them with none given.
+    #[test]
+    fn every_program_starts_on_its_program_defaults() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let db = PvDatabase::new();
+        assert_eq!(seq_start("delayDo", "", &bridge, &db), Ok(()));
+        assert_eq!(seq_start("femto", "", &bridge, &db), Ok(()));
+    }
 }

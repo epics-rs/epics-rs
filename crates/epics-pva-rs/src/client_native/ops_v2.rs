@@ -5052,7 +5052,9 @@ fn build_put_from_args(
                 if value_is_string {
                     bare.push(tok.clone());
                 } else {
-                    eprintln!("{fname} : Warning: no such field. Ignoring it.");
+                    epics_libcom_rs::stderr_println!(
+                        "{fname} : Warning: no such field. Ignoring it."
+                    );
                 }
             }
         }

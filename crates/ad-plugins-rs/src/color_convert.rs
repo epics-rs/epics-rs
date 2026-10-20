@@ -1065,21 +1065,21 @@ impl NDPluginProcess for ColorConvertProcessor {
             (config.target_mode, config.false_color, config.bayer_pattern)
         };
 
-        // C:584 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
+        // C:540 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
         // Every arm that does not convert (same mode, unsupported pair, or a shape the
         // arm rejects, e.g. Mono with `ndims != 2` at :84) leaves `pArrayOut` NULL and
-        // the untouched input is forwarded — with its own ColorMode, since
-        // `changedColorMode` stayed 0 (:589). A frame is never dropped. The
-        // plugin's attribute set goes on a copy, as C sets it on its copy.
-        let passthrough = || match self.plugin_attributes() {
-            None => ProcessResult::forward(array, vec![]),
-            Some(attributes) => match pool.alloc_copy(array) {
-                Ok(mut copy) => {
+        // a pool copy of the input goes on — with its own ColorMode, since
+        // `changedColorMode` stayed 0 (:545) — carrying the plugin's attribute set.
+        // A frame is never dropped: where C dereferences a failed copy, the input
+        // itself goes on.
+        let passthrough = || match pool.alloc_copy(array) {
+            Ok(mut copy) => {
+                if let Some(attributes) = self.plugin_attributes() {
                     copy.attributes.copy_from(&attributes);
-                    ProcessResult::arrays(vec![Arc::new(copy)])
                 }
-                Err(_) => ProcessResult::forward(array, vec![]),
-            },
+                ProcessResult::arrays(vec![Arc::new(copy)])
+            }
+            Err(_) => ProcessResult::forward(array, vec![]),
         };
 
         if src_mode == target {
@@ -1933,11 +1933,17 @@ mod tests {
 
         let arr = Arc::new(arr);
         let result = proc.process_array(&arr, &pool);
-        assert!(
-            Arc::ptr_eq(&result.output_arrays[0], &arr),
-            "same mode forwards the input itself"
-        );
         assert_eq!(result.output_arrays.len(), 1);
+        // C copies the unconverted input into its own pool (:540), which is
+        // the buffer an AC0 plugin keeps cached.
+        let out = &result.output_arrays[0];
+        assert!(!Arc::ptr_eq(out, &arr));
+        assert_eq!(out.pool_id(), pool.id());
+        assert_eq!(out.unique_id, 42);
+        let NDDataBuffer::U8(v) = &out.data else {
+            panic!("expected U8 buffer");
+        };
+        assert_eq!(v.as_slice(), (0..16).collect::<Vec<u8>>().as_slice());
     }
 
     fn set_color_mode_attr(arr: &mut NDArray, mode: NDColorMode) {

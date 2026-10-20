@@ -1,7 +1,9 @@
 //! C `doPeriodicDatedBackup` (save_restore.c:2218-2262) is the save task's:
 //! once the dated-backup period has passed since the task started
 //! (:800, :1016-1022), a pass writes `<save_file>_b_<yymmdd-hhmmss>` from
-//! the list's PVs, whether or not the list has saved.
+//! the values the list last fetched, its connect's when it has not saved. Each list that keeps
+//! backups has its own period: C's one task-wide clock (:1016-1022), which
+//! backs up only the first, is a defect not kept.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_file::read_save_file;
@@ -24,9 +26,9 @@ fn config(name: &str, save_path: &Path) -> SaveSetConfig {
         save_path: save_path.to_path_buf(),
         request_file: None,
         request_pvs: vec!["TEMP".into()],
-        backup: BackupConfig { enable_savb: false },
+        backup: BackupConfig { enable_savb: true },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -65,7 +67,7 @@ fn dated(dir: &Path, stem: &str) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// Both lists get theirs: C moves the one timer inside the per-list loop
+/// Both lists get theirs; C resets its one timer inside the per-list loop
 /// (:1020), so only its first list ever did.
 #[epics_macros_rs::epics_test]
 async fn every_list_gets_a_dated_backup_from_its_pvs() {
@@ -79,7 +81,7 @@ async fn every_list_gets_a_dated_backup_from_its_pvs() {
             .build()
             .await,
     );
-    let task = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let task = mgr.clone().start(db.clone());
     sleep(Duration::from_millis(500)).await;
     assert!(dated(dir.path(), "a").is_empty(), "inside the period");
     for _ in 0..40 {
@@ -104,6 +106,31 @@ async fn every_list_gets_a_dated_backup_from_its_pvs() {
     assert!(!dir.path().join("a.sav").exists(), "no save ran");
 }
 
+/// The backup is the values the list last fetched, not the PVs now: the C
+/// oracle's second dated backup of a manual set saved at A 8 is `A 8`
+/// after `dbpf A 9` (:2252, write_it's channels).
+#[epics_macros_rs::epics_test]
+async fn a_dated_backup_writes_the_last_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db().await;
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .add_set(config("a", &dir.path().join("a.sav")), SaveStrategy::Manual)
+            .build()
+            .await,
+    );
+    let set = mgr.sets()[0].0.clone();
+    set.save_once(&db).await.unwrap();
+    db.put_pv("TEMP", epics_base_rs::types::EpicsValue::Double(9.0))
+        .await
+        .unwrap();
+    set.do_periodic_dated_backup().await;
+    let files = dated(dir.path(), "a");
+    assert_eq!(files.len(), 1, "{files:?}");
+    let contents = read_save_file(&files[0]).await.unwrap().unwrap();
+    assert_eq!(contents.entries[0].value.parse::<f64>().unwrap(), 7.0);
+}
+
 /// :2253-2258.
 #[epics_macros_rs::epics_test]
 async fn a_dated_backup_that_cannot_be_written_fails_the_list() {
@@ -119,7 +146,7 @@ async fn a_dated_backup_that_cannot_be_written_fails_the_list() {
             .build()
             .await,
     );
-    let task = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+    let task = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
     for _ in 0..40 {
         if set.list_status().code == SrStatus::Fail {
@@ -134,4 +161,37 @@ async fn a_dated_backup_that_cannot_be_written_fails_the_list() {
         (status.code, status.text.as_str()),
         (SrStatus::Fail, "Can't write dated backup file")
     );
+}
+
+/// The period restarts at each dated backup (:1020): with a 2 s period,
+/// none follows the first within a second.
+#[epics_macros_rs::epics_test]
+async fn a_dated_backup_restarts_the_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db().await;
+    let settings = dated_every_second();
+    settings.dated_backup_period.store(2, Ordering::Relaxed);
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .settings(settings)
+            .add_set(config("a", &dir.path().join("a.sav")), SaveStrategy::Manual)
+            .build()
+            .await,
+    );
+    let task = mgr.clone().start(db.clone());
+    let mut first = Vec::new();
+    for _ in 0..60 {
+        first = dated(dir.path(), "a");
+        if !first.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(first.len(), 1, "{first:?}");
+    std::fs::remove_file(&first[0]).unwrap();
+    sleep(Duration::from_secs(1)).await;
+    let again = dated(dir.path(), "a");
+    mgr.shutdown();
+    drop(task);
+    assert!(again.is_empty(), "{again:?}");
 }

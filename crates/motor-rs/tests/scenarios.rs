@@ -9,6 +9,13 @@ use epics_base_rs::types::EpicsValue;
 
 use std::time::Duration;
 
+/// The status `motor` writes polled from the default.
+fn polled(motor: &mut (impl AsynMotor + ?Sized), user: &AsynUser) -> MotorStatus {
+    let mut status = MotorStatus::default();
+    motor.poll(user, &mut status).unwrap();
+    status
+}
+
 /// `make_record`'s motor resolution, EGU per step.
 const MRES: f64 = 0.001;
 
@@ -1306,7 +1313,7 @@ fn sim_motor_end_to_end() {
     let mut rec = make_record();
 
     // Initial readback
-    let status = motor.poll(&user).unwrap();
+    let status = polled(&mut motor, &user);
     rec.initial_readback(&status);
     assert_eq!(rec.pos.rbv, 0.0);
 
@@ -1329,10 +1336,10 @@ fn sim_motor_end_to_end() {
     }
 
     // Wait for completion: the ACCL ramp bounds the time, not VELO.
-    let mut status = motor.poll(&user).unwrap();
+    let mut status = polled(&mut motor, &user);
     for _ in 0..150 {
         std::thread::sleep(Duration::from_millis(20));
-        status = motor.poll(&user).unwrap();
+        status = polled(&mut motor, &user);
         if status.done {
             break;
         }
@@ -1600,7 +1607,7 @@ fn sim_motor_sequential_moves() {
         // Wait for SimMotor to reach target
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(20));
-            let status = motor.poll(&user).unwrap();
+            let status = polled(&mut motor, &user);
             rec.process_motor_info(&status);
             let _effects = rec.check_completion();
             if rec.stat.dmov != 0 {
@@ -1647,7 +1654,7 @@ fn rbv_updates_during_move() {
 
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         rbv_history.push(rec.pos.rbv);
         let _effects = rec.check_completion();
@@ -1706,7 +1713,7 @@ fn sim_motor_homing() {
     // Wait for move to complete (distance=5, velocity=10 → 0.5s)
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         let _ = rec.check_completion();
         if rec.stat.dmov != 0 {
@@ -1746,7 +1753,7 @@ fn sim_motor_homing() {
     // Wait for homing to complete
     for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(20));
-        let status = motor.poll(&user).unwrap();
+        let status = polled(&mut motor, &user);
         rec.process_motor_info(&status);
         let _ = rec.check_completion();
         if rec.stat.dmov != 0 {
@@ -2013,18 +2020,18 @@ fn sim_motor_rep_counts_motor_steps_whatever_eres() {
         let mut motor = SimMotor::new().with_position(3000.0);
         let mut rec = make_record();
         rec.conv.eres = eres;
-        let effects = rec.initial_readback(&motor.poll(&user).unwrap());
+        let effects = rec.initial_readback(&polled(&mut motor, &user));
         for cmd in &effects.commands {
             if let MotorCommand::InitEncoderRatio { ratio } = cmd {
                 motor.set_encoder_ratio(&user, *ratio).unwrap();
             }
         }
-        rec.process_motor_info(&motor.poll(&user).unwrap());
+        rec.process_motor_info(&polled(&mut motor, &user));
         assert_eq!(rec.pos.rep, 3000, "ERES {eres}");
 
         rec.put_field("ERES", EpicsValue::Double(eres * 2.0))
             .unwrap();
-        rec.process_motor_info(&motor.poll(&user).unwrap());
+        rec.process_motor_info(&polled(&mut motor, &user));
         assert_eq!(rec.pos.rep, 3000, "ERES {eres} then {}", eres * 2.0);
     }
 }

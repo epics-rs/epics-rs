@@ -1,0 +1,14 @@
+# A line printed with `eprint!` / `eprintln!`, or `write!` to `stderr()`,
+# reaches stderr as one `write` per format piece, so another thread's stdout
+# line can land inside it. Non-test code prints through `stderr_print!` /
+# `stderr_println!` or writes `StagedStderr` (epics-libcom-rs
+# `runtime::log`, the one module that takes the stderr handle), which stage
+# the line whole first. glibc writes an unbuffered `fprintf` in 128-byte
+# chunks, so one write at any length is a deliberate deviation from C.
+disallowed-macros = [
+    { path = "std::eprint", reason = "use stderr_print!: one write per line" },
+    { path = "std::eprintln", reason = "use stderr_println!: one write per line" },
+]
+disallowed-methods = [
+    { path = "std::io::stderr", reason = "use StagedStderr or stderr_println!: one write per line" },
+]

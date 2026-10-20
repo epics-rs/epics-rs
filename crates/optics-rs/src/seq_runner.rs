@@ -12,77 +12,218 @@
 //! seqStart("orient", "P=mini:,PM=mini:,mTTH=tth,mTH=th,mCHI=chi,mPHI=phi")
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs
-// --all-features`, 412/412). optics-rs became a census subject when its
+// --all-features`, 459/459). optics-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use std::collections::HashMap;
-
+use epics_base_rs::runtime::stdlib::{c_isspace, strtod};
+use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::spawn_program;
+use epics_base_rs::server::snl::{SeqMacros, spawn_program};
 
-/// Parse a macro string like `"P=mini:,M_THETA=dcm:theta"` into a HashMap.
-pub fn parse_macros(input: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for part in input.split(',') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            map.insert(k.trim().to_string(), v.trim().to_string());
+use crate::snl::filter_drive::FilterDriveConfig;
+use crate::snl::flex_combined_motion::FlexConfig;
+use crate::snl::hr_ctl::HrConfig;
+use crate::snl::io::IoConfig;
+use crate::snl::kohzu_ctl::KohzuConfig;
+use crate::snl::kohzu_ctl_soft::KohzuSoftConfig;
+use crate::snl::ml_mono_ctl::MlMonoConfig;
+use crate::snl::orient::OrientConfig;
+use crate::snl::pf4::Pf4Config;
+
+/// kohzuCtl's `geom = 1; if (*GEOM == '2') geom = 2;`.
+fn geom(s: &str) -> i32 {
+    if s.starts_with('2') { 2 } else { 1 }
+}
+
+/// C `sscanf(s, "%d", &n)` into a variable SNL zeroed: glibc's `strtol`
+/// stored through the `int`, or 0 when no digit converts.
+fn scan_int(s: &str) -> i32 {
+    let s = s.trim_start_matches(c_isspace);
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    let magnitude = digits[..end]
+        .bytes()
+        .fold(0i128, |n, d| (n * 10 + i128::from(d - b'0')).min(1 << 64));
+    let long = if negative { -magnitude } else { magnitude };
+    long.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
+}
+
+/// An optics program, configured from its macros as its `.st` reads them.
+enum Program {
+    KohzuCtl(KohzuConfig),
+    KohzuCtlSoft(KohzuSoftConfig),
+    HrCtl(HrConfig),
+    MlMonoCtl(MlMonoConfig),
+    Orient(OrientConfig),
+    FilterDrive(FilterDriveConfig),
+    Pf4(Pf4Config),
+    Io(IoConfig),
+    FlexCombinedMotion(FlexConfig),
+}
+
+impl Program {
+    /// Each arm's parameters are its `.st`'s `program` statement. A macro
+    /// with no value reads as "", what `seqMacEval` puts for its `{name}`.
+    fn new(program: &str, macro_def: &str) -> Result<Self, String> {
+        let macros = |params| SeqMacros::new(params, macro_def);
+        Ok(match program {
+            "kohzuCtl" => {
+                let m = macros("P=nda, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::KohzuCtl(KohzuConfig::new(
+                    v("P"),
+                    v("M_THETA"),
+                    v("M_Y"),
+                    v("M_Z"),
+                    geom(v("GEOM")),
+                ))
+            }
+            "kohzuCtl_soft" => {
+                let m = macros("P=xxx:, MONO=Kohzu1:, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::KohzuCtlSoft(KohzuSoftConfig::new(
+                    v("P"),
+                    v("MONO"),
+                    v("M_THETA"),
+                    v("M_Y"),
+                    v("M_Z"),
+                    geom(v("GEOM")),
+                ))
+            }
+            "hrCtl" => {
+                let m = macros("P=xxx:, N=1, M_PHI1=m9, M_PHI2=m10");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::HrCtl(HrConfig::new(v("P"), v("N"), v("M_PHI1"), v("M_PHI2")))
+            }
+            "ml_monoCtl" => {
+                let m =
+                    macros("P=xxx:, M_THETA=m9, M_THETA2=m12, M_Y=m10, M_Z=m11, Y_OFF=35, GEOM=1");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::MlMonoCtl(MlMonoConfig::new(
+                    v("P"),
+                    v("M_THETA"),
+                    v("M_THETA2"),
+                    v("M_Y"),
+                    v("M_Z"),
+                    strtod(v("Y_OFF").as_bytes()).value,
+                ))
+            }
+            "orient" => {
+                let m = macros("P=xxx:orient1:,PM=xxx:,mTTH=m9,mTH=m10,mCHI=m11,mPHI=m12");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::Orient(OrientConfig::new(
+                    v("P"),
+                    v("PM"),
+                    v("mTTH"),
+                    v("mTH"),
+                    v("mCHI"),
+                    v("mPHI"),
+                ))
+            }
+            "filterDrive" => {
+                let m = macros("NAME=filterDrive, P=TEST:, R=filter:, NUM_FILTERS=8");
+                let v = |name| m.value(name).unwrap_or_default();
+                let mut config = FilterDriveConfig::new(v("P"), v("R"), scan_int(v("NUM_FILTERS")));
+                config.name = v("NAME").to_string();
+                Self::FilterDrive(config)
+            }
+            "pf4" => {
+                let m = macros("name=pf4,P=,H=,B=,BP=,B1=,B2=,B3=,B4=,M=");
+                let v = |name| m.value(name).unwrap_or_default();
+                let mut config = Pf4Config::new(v("P"), v("H"), v("B"));
+                config.name = v("name").to_string();
+                config.mono = v("M").to_string();
+                config.bit_prefix = v("BP").to_string();
+                config.bits = ["B1", "B2", "B3", "B4"].map(|b| v(b).to_string());
+                Self::Pf4(config)
+            }
+            "Io" => {
+                let m = macros("P=7idd:Io:,MONO=7id:HHLM:energy_get,VSC=7idd:scaler1");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::Io(IoConfig::new(v("P"), v("MONO"), v("VSC")))
+            }
+            "flexCombinedMotion" => {
+                let m =
+                    macros("name=flexCombinedMotion,P=xxx:,M=m1,C=cap1,FM=pi:c0:m1,CM=nf:c0:m1");
+                let v = |name| m.value(name).unwrap_or_default();
+                Self::FlexCombinedMotion(FlexConfig::new(v("P"), v("M"), v("C"), v("FM"), v("CM")))
+            }
+            _ => {
+                return Err(format!(
+                    "unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"
+                ));
+            }
+        })
+    }
+
+    fn spawn(self, bridge: &BlockingBridge, db: &PvDatabase) {
+        match self {
+            Self::KohzuCtl(config) => spawn_program(bridge, db, "kohzuCtl", move |db| {
+                crate::snl::kohzu_ctl::run(config, db)
+            }),
+            Self::KohzuCtlSoft(config) => spawn_program(bridge, db, "kohzuCtl_soft", move |db| {
+                crate::snl::kohzu_ctl_soft::run(config, db)
+            }),
+            Self::HrCtl(config) => spawn_program(bridge, db, "hrCtl", move |db| {
+                crate::snl::hr_ctl::run(config, db)
+            }),
+            Self::MlMonoCtl(config) => spawn_program(bridge, db, "ml_monoCtl", move |db| {
+                crate::snl::ml_mono_ctl::run(config, db)
+            }),
+            Self::Orient(config) => spawn_program(bridge, db, "orient", move |db| {
+                crate::snl::orient::run(config, db)
+            }),
+            Self::FilterDrive(config) => spawn_program(bridge, db, "filterDrive", move |db| {
+                crate::snl::filter_drive::run(config, db)
+            }),
+            Self::Pf4(config) => spawn_program(bridge, db, "pf4", move |db| {
+                crate::snl::pf4::run(config, db)
+            }),
+            Self::Io(config) => {
+                bridge.spawn(async move {
+                    if let Err(e) = crate::snl::io::run(config).await {
+                        epics_base_rs::stderr_println!("Io error: {e}");
+                    }
+                });
+            }
+            Self::FlexCombinedMotion(config) => {
+                bridge.spawn(async move {
+                    if let Err(e) = crate::snl::flex_combined_motion::run(config).await {
+                        epics_base_rs::stderr_println!("flexCombinedMotion error: {e}");
+                    }
+                });
+            }
         }
     }
-    map
-}
-
-/// Helper to get a macro value or return an error.
-fn require_macro(
-    macros: &HashMap<String, String>,
-    key: &str,
-    program: &str,
-) -> Result<String, String> {
-    macros
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("{program}: required macro '{key}' not specified"))
-}
-
-/// Helper to get a macro value with a default.
-fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> String {
-    macros
-        .get(key)
-        .cloned()
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// C `sscanf(s, "%d", &n)` into a variable SNL zeroed: the leading integer,
-/// or 0.
-fn leading_int(s: &str) -> usize {
-    let s = s.trim_start();
-    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    s[..end].parse().unwrap_or(0)
 }
 
 /// Start an optics SNL program by name.
 ///
-/// This is the Rust equivalent of the C EPICS `seq &program, "macros"` command.
-/// Spawns a tokio task that runs the state machine asynchronously.
+/// This is the Rust equivalent of the C EPICS `seq &program, "macros"` command:
+/// the macros are parsed over the program's `program` parameters, so a macro
+/// left out takes the default its `.st` gives it.
 ///
-/// # Supported programs
-///
-/// | Name | Macros | Description |
-/// |------|--------|-------------|
-/// | `kohzuCtl` | P, M_THETA, M_Y, M_Z, GEOM(opt) | Kohzu double-crystal monochromator |
-/// | `kohzuCtl_soft` | P, MONO(opt) | Kohzu soft motor variant |
-/// | `hrCtl` | P, N(opt), M_PHI1, M_PHI2 | High-resolution analyzer |
-/// | `ml_monoCtl` | P, M_THETA, M_THETA2(opt), M_Y(opt), M_Z(opt), Y_OFF(opt) | Multi-layer monochromator |
-/// | `orient` | P, PM, mTTH, mTH, mCHI, mPHI | 4-circle diffractometer |
-/// | `filterDrive` | P, R | Automatic filter selection |
-/// | `pf4` | P, B, H(opt), M, BP, B1..B4, name(opt) | XIA PF4 filter bank |
-/// | `Io` | P, R | Ion chamber intensity |
-/// | `flexCombinedMotion` | P, CM, FM | Coarse+fine flexure stage |
+/// | Name | Description |
+/// |------|-------------|
+/// | `kohzuCtl` | Kohzu double-crystal monochromator |
+/// | `kohzuCtl_soft` | Kohzu soft motor variant |
+/// | `hrCtl` | High-resolution analyzer |
+/// | `ml_monoCtl` | Multi-layer monochromator |
+/// | `orient` | 4-circle diffractometer |
+/// | `filterDrive` | Automatic filter selection |
+/// | `pf4` | XIA PF4 filter bank |
+/// | `Io` | Ion chamber intensity |
+/// | `flexCombinedMotion` | Coarse+fine flexure stage |
 ///
 /// Returns `Ok(())` if the program was found and spawned, or `Err` with a message.
 ///
@@ -92,156 +233,150 @@ fn leading_int(s: &str) -> usize {
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    bridge: &epics_base_rs::runtime::task::BlockingBridge,
+    bridge: &BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
-    let macros = parse_macros(macro_str);
-
-    match program {
-        "kohzuCtl" => {
-            let config = crate::snl::kohzu_ctl::KohzuConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M_THETA", program)?,
-                &require_macro(&macros, "M_Y", program)?,
-                &require_macro(&macros, "M_Z", program)?,
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "kohzuCtl", move |db| {
-                crate::snl::kohzu_ctl::run(config, db)
-            });
-        }
-        "kohzuCtl_soft" => {
-            let config = crate::snl::kohzu_ctl_soft::KohzuSoftConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "MONO", ""),
-                &require_macro(&macros, "M_THETA", program)?,
-                &require_macro(&macros, "M_Y", program)?,
-                &require_macro(&macros, "M_Z", program)?,
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "kohzuCtl_soft", move |db| {
-                crate::snl::kohzu_ctl_soft::run(config, db)
-            });
-        }
-        "hrCtl" => {
-            let config = crate::snl::hr_ctl::HrConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "N", "1"),
-                &require_macro(&macros, "M_PHI1", program)?,
-                &require_macro(&macros, "M_PHI2", program)?,
-            );
-            spawn_program(bridge, db, "hrCtl", move |db| {
-                crate::snl::hr_ctl::run(config, db)
-            });
-        }
-        "ml_monoCtl" => {
-            let config = crate::snl::ml_mono_ctl::MlMonoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M_THETA", program)?,
-                &macro_or(&macros, "M_THETA2", ""),
-                &macro_or(&macros, "M_Y", ""),
-                &macro_or(&macros, "M_Z", ""),
-                macro_or(&macros, "Y_OFF", "35")
-                    .parse::<f64>()
-                    .unwrap_or(0.0),
-                macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
-            );
-            spawn_program(bridge, db, "ml_monoCtl", move |db| {
-                crate::snl::ml_mono_ctl::run(config, db)
-            });
-        }
-        "orient" => {
-            let config = crate::snl::orient::OrientConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "PM", program)?,
-                &require_macro(&macros, "mTTH", program)?,
-                &require_macro(&macros, "mTH", program)?,
-                &require_macro(&macros, "mCHI", program)?,
-                &require_macro(&macros, "mPHI", program)?,
-            );
-            spawn_program(bridge, db, "orient", move |db| {
-                crate::snl::orient::run(config, db)
-            });
-        }
-        "filterDrive" => {
-            let mut config = crate::snl::filter_drive::FilterDriveConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "R", program)?,
-                leading_int(&require_macro(&macros, "NUM_FILTERS", program)?),
-            );
-            // C prints `macValueGet("NAME")` with `%s`, NULL included.
-            config.name = macro_or(&macros, "NAME", "(null)");
-            spawn_program(bridge, db, "filterDrive", move |db| {
-                crate::snl::filter_drive::run(config, db)
-            });
-        }
-        "pf4" => {
-            let mut config = crate::snl::pf4::Pf4Config::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "H", ""),
-                &require_macro(&macros, "B", program)?,
-            );
-            config.name = macro_or(&macros, "name", "pf4");
-            config.mono = macro_or(&macros, "M", "");
-            config.bit_prefix = macro_or(&macros, "BP", "");
-            config.bits = ["B1", "B2", "B3", "B4"].map(|m| macro_or(&macros, m, ""));
-            spawn_program(bridge, db, "pf4", move |db| {
-                crate::snl::pf4::run(config, db)
-            });
-        }
-        "Io" => {
-            let config = crate::snl::io::IoConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &macro_or(&macros, "MONO", ""),
-                &macro_or(&macros, "VSC", ""),
-            );
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::io::run(config).await {
-                    eprintln!("Io error: {e}");
-                }
-            });
-        }
-        "flexCombinedMotion" => {
-            let config = crate::snl::flex_combined_motion::FlexConfig::new(
-                &require_macro(&macros, "P", program)?,
-                &require_macro(&macros, "M", program)?,
-                &macro_or(&macros, "CAP", ""),
-                &require_macro(&macros, "FM", program)?,
-                &require_macro(&macros, "CM", program)?,
-            );
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::flex_combined_motion::run(config).await {
-                    eprintln!("flexCombinedMotion error: {e}");
-                }
-            });
-        }
-        _ => {
-            return Err(format!(
-                "unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"
-            ));
-        }
-    }
-
+    Program::new(program, macro_str)?.spawn(bridge, db);
     println!("seq {program} started with macros: {macro_str}");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
 
+    use super::*;
+    use crate::snl::kohzu_ctl::Geometry;
+
+    /// With no macros at all, each program reads what its `.st`'s `program`
+    /// statement defines.
     #[test]
-    fn test_parse_macros() {
-        let m = parse_macros("P=mini:,M_THETA=dcm:theta, M_Y = dcm:y");
-        assert_eq!(m.get("P").unwrap(), "mini:");
-        assert_eq!(m.get("M_THETA").unwrap(), "dcm:theta");
-        assert_eq!(m.get("M_Y").unwrap(), "dcm:y");
+    fn every_program_configures_on_its_program_defaults() {
+        let Ok(Program::KohzuCtl(c)) = Program::new("kohzuCtl", "") else {
+            panic!("kohzuCtl")
+        };
+        assert_eq!(
+            [&c.prefix, &c.m_theta, &c.m_y, &c.m_z],
+            ["nda", "m9", "m10", "m11"]
+        );
+        assert_eq!(c.geom, Geometry::Standard);
+        let Ok(Program::KohzuCtlSoft(c)) = Program::new("kohzuCtl_soft", "") else {
+            panic!("kohzuCtl_soft")
+        };
+        assert_eq!(
+            [&c.prefix, &c.mono, &c.m_theta, &c.m_y, &c.m_z],
+            ["xxx:", "Kohzu1:", "m9", "m10", "m11"]
+        );
+        let Ok(Program::HrCtl(c)) = Program::new("hrCtl", "") else {
+            panic!("hrCtl")
+        };
+        assert_eq!(
+            [&c.prefix, &c.n, &c.m_phi1, &c.m_phi2],
+            ["xxx:", "1", "m9", "m10"]
+        );
+        let Ok(Program::MlMonoCtl(c)) = Program::new("ml_monoCtl", "") else {
+            panic!("ml_monoCtl")
+        };
+        assert_eq!(
+            [&c.prefix, &c.m_theta, &c.m_theta2, &c.m_y, &c.m_z],
+            ["xxx:", "m9", "m12", "m10", "m11"]
+        );
+        assert_eq!(c.y_offset, 35.0);
+        let Ok(Program::Orient(c)) = Program::new("orient", "") else {
+            panic!("orient")
+        };
+        assert_eq!(
+            [
+                &c.prefix,
+                &c.motor_prefix,
+                &c.motor_tth,
+                &c.motor_th,
+                &c.motor_chi,
+                &c.motor_phi
+            ],
+            [
+                "xxx:orient1:",
+                "xxx:",
+                "xxx:m9",
+                "xxx:m10",
+                "xxx:m11",
+                "xxx:m12"
+            ]
+        );
+        let Ok(Program::FilterDrive(c)) = Program::new("filterDrive", "") else {
+            panic!("filterDrive")
+        };
+        assert_eq!(
+            [&c.name, &c.prefix, &c.record],
+            ["filterDrive", "TEST:", "filter:"]
+        );
+        assert_eq!(c.num_filters, 8);
+        let Ok(Program::Pf4(c)) = Program::new("pf4", "") else {
+            panic!("pf4")
+        };
+        assert_eq!(c.name, "pf4");
+        assert_eq!(
+            [&c.prefix, &c.hardware, &c.bank, &c.mono, &c.bit_prefix],
+            ["", "", "", "", ""]
+        );
+        assert_eq!(c.bits, ["", "", "", ""]);
+        let Ok(Program::Io(c)) = Program::new("Io", "") else {
+            panic!("Io")
+        };
+        assert_eq!(
+            [&c.prefix, &c.mono_pv, &c.scaler_pv],
+            ["7idd:Io:", "7id:HHLM:energy_get", "7idd:scaler1"]
+        );
+        let Ok(Program::FlexCombinedMotion(c)) = Program::new("flexCombinedMotion", "") else {
+            panic!("flexCombinedMotion")
+        };
+        assert_eq!(
+            [&c.prefix, &c.motor, &c.cap, &c.fine_motor, &c.coarse_motor],
+            ["xxx:", "m1", "cap1", "pi:c0:m1", "nf:c0:m1"]
+        );
     }
 
+    /// A macro's text converted as the `.st` converts it: GEOM by its first
+    /// character (`kohzuCtl.st:560`), Y_OFF by `atof` (`ml_monoCtl.st:523`),
+    /// NUM_FILTERS by `%d` (`filterDrive.st:341`).
     #[test]
-    fn test_parse_macros_empty() {
-        let m = parse_macros("");
-        assert!(m.is_empty());
+    fn macro_text_converts_as_the_st_reads_it() {
+        let geom = |def| match Program::new("kohzuCtl", def) {
+            Ok(Program::KohzuCtl(c)) => c.geom,
+            _ => panic!("kohzuCtl"),
+        };
+        assert_eq!(geom("GEOM=2.0"), Geometry::Alternate);
+        assert_eq!(geom("GEOM=02"), Geometry::Standard);
+        assert_eq!(geom("GEOM="), Geometry::Standard);
+        let Ok(Program::KohzuCtlSoft(c)) = Program::new("kohzuCtl_soft", "GEOM=2nd") else {
+            panic!("kohzuCtl_soft")
+        };
+        assert_eq!(c.geom, Geometry::Alternate);
+        let y_off = |def| match Program::new("ml_monoCtl", def) {
+            Ok(Program::MlMonoCtl(c)) => c.y_offset,
+            _ => panic!("ml_monoCtl"),
+        };
+        assert_eq!(y_off("Y_OFF=40mm"), 40.0);
+        assert_eq!(y_off("Y_OFF= 4e1"), 40.0);
+        assert_eq!(y_off("Y_OFF=mm"), 35.0);
+        let filters = |def| match Program::new("filterDrive", def) {
+            Ok(Program::FilterDrive(c)) => c.num_filters,
+            _ => panic!("filterDrive"),
+        };
+        assert_eq!(filters("NUM_FILTERS=+4"), 4);
+        assert_eq!(filters("NUM_FILTERS=-1"), -1);
+        assert_eq!(filters("NUM_FILTERS= 3 blades"), 3);
+        assert_eq!(filters("NUM_FILTERS=x"), 0);
+    }
+
+    /// The capacitance sensor is `{P}{C}:pos` (`flexCombinedMotion.st:32`).
+    #[test]
+    fn flex_reads_its_sensor_from_c() {
+        let Ok(Program::FlexCombinedMotion(c)) = Program::new("flexCombinedMotion", "P=F:,C=cap9")
+        else {
+            panic!("flexCombinedMotion")
+        };
+        assert_eq!(c.pos_monitor_pv(), "F:cap9:pos");
     }
 
     #[test]
@@ -286,6 +421,29 @@ mod tests {
         panic!("NumFilters is {:?}", db.get_pv("F:f:NumFilters").unwrap());
     }
 
+    /// A negative count assigns no blade and is published as it is
+    /// (`filterDrive.st:344-367`).
+    #[epics_base_rs::epics_test]
+    async fn filter_drive_publishes_a_negative_num_filters() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "N:f:NumFilters",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await
+        .unwrap();
+        db.mark_pini_done();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("filterDrive", "P=N:,R=f:,NUM_FILTERS=-1", &bridge, &db).unwrap();
+        for _ in 0..300 {
+            if db.get_pv("N:f:NumFilters").unwrap().to_f64() == Some(-1.0) {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("NumFilters is {:?}", db.get_pv("N:f:NumFilters").unwrap());
+    }
+
     /// ml_monoCtl's y offset is the `Y_OFF` macro (`ml_monoCtl.st:587`),
     /// put by initSequence; with every motor readback at 0, chkMotorLimits
     /// then holds and nothing overwrites it.
@@ -308,6 +466,45 @@ mod tests {
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("yOffset is {:?}", db.get_pv("Y:ml_mono_yOffset").unwrap());
+    }
+
+    /// A motor macro the command line leaves out takes the program's default
+    /// (`ml_monoCtl.st:1`), which initSequence names in `{P}ml_monoTheta2Pv`.
+    #[epics_base_rs::epics_test]
+    async fn ml_mono_theta2_motor_defaults_to_m12() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "Y:ml_monoTheta2Pv",
+            Box::new(epics_base_rs::server::records::stringin::StringinRecord::new("")),
+        )
+        .await
+        .unwrap();
+        db.mark_pini_done();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("ml_monoCtl", "P=Y:,M_THETA=th", &bridge, &db).unwrap();
+        for _ in 0..300 {
+            if db.get_pv("Y:ml_monoTheta2Pv").unwrap().to_string() == "Y:m12" {
+                return;
+            }
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "theta2MotName is {:?}",
+            db.get_pv("Y:ml_monoTheta2Pv").unwrap()
+        );
+    }
+
+    /// `kohzuCtl.st:1` defines every macro the program reads, so `seq` starts
+    /// it on its prefix alone.
+    #[test]
+    fn kohzu_ctl_starts_on_its_program_defaults() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        let db = PvDatabase::new();
+        assert_eq!(seq_start("kohzuCtl", "P=T:", &bridge, &db), Ok(()));
     }
 
     /// The lattice records kohzuCtl reads on its way to `ready`, as

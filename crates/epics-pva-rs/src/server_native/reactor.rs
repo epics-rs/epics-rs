@@ -103,6 +103,7 @@ use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
 use super::search_engine::random_guid;
 use super::serv_iface::ServListeners;
+use super::shared_pv::SharedSource;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
 use crate::error::PvaResult;
@@ -280,6 +281,7 @@ impl Drop for ConnSlot {
 pub struct ReactorPvaServer {
     listeners: ServListeners,
     source: DynSource,
+    builtin: Arc<SharedSource>,
     config: PvaServerConfig,
     peers: Arc<PeerRegistry>,
     channel_invalidator: ChannelInvalidator,
@@ -308,13 +310,20 @@ impl ReactorPvaServer {
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        Self::from_listeners(ServListeners::bind(addr, &config)?, source, config)
+        Self::from_listeners(
+            ServListeners::bind(addr, &config)?,
+            source,
+            Arc::new(SharedSource::new()),
+            config,
+        )
     }
 
-    /// [`bind`](Self::bind) on listeners bound already.
+    /// [`bind`](Self::bind) on listeners bound already, serving the bound
+    /// `__builtin` store.
     pub(crate) fn from_listeners(
         listeners: ServListeners,
         source: DynSource,
+        builtin: Arc<SharedSource>,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
         // One GUID per server, stamped at construction so the UDP responder
@@ -325,8 +334,9 @@ impl ReactorPvaServer {
         config.guid = random_guid()?;
         // The bound port, after any fallback: `config` is the one record of it.
         config.tcp_port = listeners.port();
-        let source = crate::server_native::server_info::compose_with_server_info(source)
-            .map_err(io::Error::other)?;
+        let source =
+            crate::server_native::server_info::compose_with_server_info(source, builtin.clone())
+                .map_err(io::Error::other)?;
         let channel_invalidator = ChannelInvalidator::new();
         source.set_channel_invalidator(channel_invalidator.clone());
         // `PVASPOLL`: RTEMS truncates thread names at 16 bytes.
@@ -339,6 +349,7 @@ impl ReactorPvaServer {
         Ok(Self {
             listeners,
             source,
+            builtin,
             config,
             peers: PeerRegistry::new(),
             channel_invalidator,
@@ -395,6 +406,11 @@ impl ReactorPvaServer {
     /// The served source, `__server` composed in.
     pub fn source(&self) -> &DynSource {
         &self.source
+    }
+
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`.
+    pub fn builtin(&self) -> &Arc<SharedSource> {
+        &self.builtin
     }
 
     /// Connections currently being served — `ConnTable`'s count, which is

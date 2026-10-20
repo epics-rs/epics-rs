@@ -1243,17 +1243,26 @@ impl ChannelSource for PvDatabaseSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let db = self.db.clone();
-        async move {
-            let mut names = db.all_record_names().await;
-            names.extend(db.all_simple_pv_names().await);
-            // Aliases are independently addressable channel names —
-            // a PVA client doing channelList must see them so it can
-            // connect by alias. has_name and find_entry already
-            // resolve aliases on the server side.
-            names.extend(db.all_alias_names());
-            names
+    fn list_pvs(&self) -> Vec<RecordName> {
+        let mut names = self.db.all_record_names();
+        names.extend(self.db.all_simple_pv_names());
+        // Aliases are independently addressable channel names —
+        // a PVA client doing channelList must see them so it can
+        // connect by alias. has_name and find_entry already
+        // resolve aliases on the server side.
+        names.extend(self.db.all_alias_names());
+        names
+    }
+
+    /// pvxs `SingleSource::show` (`ioc/singlesource.cpp:480-485`): every
+    /// record node, aliases included (`:398-404`), and no simple PV.
+    fn show(&self) -> crate::server_native::source::SourceShow {
+        let mut names = self.db.all_record_names();
+        names.extend(self.db.all_alias_names());
+        crate::server_native::source::SourceShow {
+            kind: "IOC",
+            names,
+            nested: false,
         }
     }
 
@@ -2361,30 +2370,39 @@ async fn put_record(
         let value = rec.read().client_field_value(&cn.field);
         value.unwrap_or(EpicsValue::Long(0))
     };
-    match put {
-        RecordPut::Write(value) => {
-            let (epics, char_address) = record_put_value(rec, cn, &value)?;
-            trapped_put(checked, ctx, cn, rec, epics, |v| {
-                put_record_field(db, cn, (v, char_address), opts)
-            })
-            .await
+    let put = async move {
+        match put {
+            RecordPut::Write(value) => {
+                let (epics, char_address) = record_put_value(rec, cn, &value)?;
+                trapped_put(checked, ctx, cn, rec, epics, |v| {
+                    put_record_field(db, cn, (v, char_address), opts)
+                })
+                .await
+            }
+            RecordPut::PostProcess => {
+                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                    db.process_field_from_client(&cn.record, &cn.field, opts.process)
+                        .await
+                        .map_err(failed)
+                })
+                .await
+            }
+            RecordPut::Nothing => {
+                trapped_put(checked, ctx, cn, rec, current(), |_| async {
+                    db.notify_unwritten_from_client(&cn.record, &cn.field)
+                        .await
+                        .map_err(failed)
+                })
+                .await
+            }
         }
-        RecordPut::PostProcess => {
-            trapped_put(checked, ctx, cn, rec, current(), |_| async {
-                db.process_field_from_client(&cn.record, &cn.field, opts.process)
-                    .await
-                    .map_err(failed)
-            })
-            .await
-        }
-        RecordPut::Nothing => {
-            trapped_put(checked, ctx, cn, rec, current(), |_| async {
-                db.notify_unwritten_from_client(&cn.record, &cn.field)
-                    .await
-                    .map_err(failed)
-            })
-            .await
-        }
+    };
+    // pvxs's `CurrentOp` spans a put that does not wait
+    // (`singlesource.cpp:371`); a blocking one went to `dbProcessNotify`.
+    if opts.block {
+        put.await
+    } else {
+        super::current_op::attached(ctx, put).await
     }
 }
 
@@ -4194,7 +4212,6 @@ mod tests {
         rx.recv().await.expect("initial monitor snapshot");
 
         db.find_pv("SIMPLE:META")
-            .await
             .expect("the PV")
             .set_metadata(PvMetadata {
                 display: Some(DisplayInfo {

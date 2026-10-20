@@ -7,7 +7,7 @@ use std::sync::Arc;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use asyn_rs::port::InterfaceMask;
@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 pub struct NullWriter;
 
 impl NDFileWriter for NullWriter {
-    fn open_file(&mut self, _path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, _path: &Path, _mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
         Ok(())
     }
 

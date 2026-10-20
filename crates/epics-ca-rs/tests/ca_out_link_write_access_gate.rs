@@ -36,12 +36,12 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::server::database::{LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::record::{AlarmSeverity, LinkFieldType, LinkProcessPolicy, OpenLatch};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::CaLinkResolver;
@@ -51,6 +51,14 @@ use serial_test::serial;
 
 /// The remote PV every test here links to.
 const PV: &str = "SEC:HOLD";
+
+/// The link to [`PV`] a test opens on its resolver directly: an INLINK, so
+/// its value is monitored from the connect.
+fn link() -> LinkRef<'static> {
+    static OPEN: LazyLock<OpenLatch> =
+        LazyLock::new(|| OpenLatch::ca(LinkProcessPolicy::NoProcess, LinkFieldType::In));
+    LinkRef::new(PV.as_bytes(), &OPEN)
+}
 
 /// The value the server starts with — the OUT writes below all push
 /// something else, so "the write never landed" is observable.
@@ -116,6 +124,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
         .expect("CA client");
     client.set_host_name(host);
     let resolver = CaLinkResolver::with_client(Arc::new(client));
+    LinkSet::connect_link(&resolver, link(), None).await;
     assert!(
         resolver
             .wait_for_link_connected(PV, fact_budget::FACT_BUDGET)
@@ -128,10 +137,14 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
 
 /// The rights frame follows the create-channel reply, so poll rather than
 /// racing it. Returns the admission actually observed at the deadline.
-async fn admission_settling_to(resolver: &CaLinkResolver, want: PutAdmission) -> PutAdmission {
+async fn admission_settling_to(
+    resolver: &CaLinkResolver,
+    link: LinkRef<'_>,
+    want: PutAdmission,
+) -> PutAdmission {
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        let got = LinkSet::put_admission(resolver, PV.as_bytes());
+        let got = LinkSet::put_admission(resolver, link);
         if got == want || Instant::now() >= deadline {
             return got;
         }
@@ -183,22 +196,41 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
     (inst.common.stat, inst.common.sevr)
 }
 
-/// A database with the write-denied resolver mounted as the `ca` link set,
-/// held past the first refusal so the rights are known before any record
-/// processes.
+/// A database with the write-denied resolver mounted as the `ca` link set.
 async fn denied_db() -> (PvDatabase, CaLinkResolver) {
     let port = serve_acf_pv().await;
     let resolver = resolver_claiming(port, DENIED_HOST).await;
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
+    (db, resolver)
+}
+
+/// iocInit's `dbCaAddLink` pass opens `name`'s OUT link on its own channel,
+/// held until it is connected and past the first refusal, so the rights
+/// are known before the record processes.
+async fn open_out(db: &PvDatabase, resolver: &CaLinkResolver, name: &str) {
+    assert!(db.ca_link_init());
+    db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
+    assert!(
+        resolver
+            .wait_for_link_connected(PV, fact_budget::FACT_BUDGET)
+            .await,
+        "the record's link connects"
+    );
+    let out = db
+        .record_link_fields(name)
+        .into_iter()
+        .find_map(|(field, _, link)| (field == "OUT").then_some(link))
+        .expect("an OUT link");
     // Best-effort settle, deliberately NOT asserted: the rights frame
     // follows the create-channel reply within a millisecond or two, and the
     // claim these two tests make is about the RECORD. Asserting the gate
     // here would abort them before the record ever processed, leaving the
     // record-level half of the defect unpinned — which is how it survived.
     // `a_connected_but_write_denied_link_is_refused` asserts the gate.
-    let _ = admission_settling_to(&resolver, PutAdmission::Refused).await;
-    (db, resolver)
+    let out = LinkRef::new(PV.as_bytes(), out.external().unwrap().open);
+    let _ = admission_settling_to(resolver, out, PutAdmission::Refused).await;
 }
 
 /// Operand two, alone: connected, write denied. C's gate is a disjunction,
@@ -212,17 +244,17 @@ async fn a_connected_but_write_denied_link_is_refused() {
     let resolver = resolver_claiming(port, DENIED_HOST).await;
 
     assert_eq!(
-        admission_settling_to(&resolver, PutAdmission::Refused).await,
+        admission_settling_to(&resolver, link(), PutAdmission::Refused).await,
         PutAdmission::Refused,
         "C refuses on `!pca->hasWriteAccess` alone (dbCa.c:529-532)"
     );
     assert!(
-        LinkSet::is_connected(&resolver, PV.as_bytes()),
+        LinkSet::is_connected(&resolver, link()),
         "and it is refused while CONNECTED — the read half is untouched, \
          which is why testing `is_connected` alone admitted it"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV.as_bytes())
+        LinkSet::get_value(&resolver, link())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
@@ -293,7 +325,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
     // refused is refused by then, so settling on `Connected` is only
     // meaningful together with the write below actually landing.
     assert_eq!(
-        admission_settling_to(&resolver, PutAdmission::Connected).await,
+        admission_settling_to(&resolver, link(), PutAdmission::Connected).await,
         PutAdmission::Connected,
         "HAG(ops) grants WRITE to a client claiming that name"
     );
@@ -301,7 +333,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
     use epics_base_rs::server::database::LinkPutOp;
     LinkSet::put_value(
         &resolver,
-        PV.as_bytes(),
+        link(),
         EpicsValue::Double(42.0),
         LinkPutOp::Plain,
     )
@@ -310,7 +342,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
 
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if LinkSet::get_value(&resolver, PV.as_bytes())
+        if LinkSet::get_value(&resolver, link())
             .await
             .and_then(|v| v.to_f64())
             == Some(42.0)
@@ -333,6 +365,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
 async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
     let (db, resolver) = denied_db().await;
     add_ao(&db, "HOLD", 5.0, false).await;
+    open_out(&db, &resolver, "HOLD").await;
 
     process(&db, "HOLD").await;
     db.sync_external_link_puts().await;
@@ -348,7 +381,7 @@ async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
         "C refuses BEFORE addAction, so nothing is staged at all"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV.as_bytes())
+        LinkSet::get_value(&resolver, link())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
@@ -367,6 +400,7 @@ async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
 async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
     let (db, resolver) = denied_db().await;
     add_ao(&db, "HOLD:CB", 5.0, true).await;
+    open_out(&db, &resolver, "HOLD:CB").await;
 
     process(&db, "HOLD:CB").await;
     db.sync_external_link_puts().await;
@@ -383,7 +417,7 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
         "nothing staged, so no completion was ever owed"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV.as_bytes())
+        LinkSet::get_value(&resolver, link())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),

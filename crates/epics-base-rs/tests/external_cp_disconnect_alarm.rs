@@ -1,14 +1,16 @@
 //! A Passive CP holder of an external link goes LINK/INVALID when the
-//! link drops — C `dbCa.c`'s disconnect path, end to end.
+//! link drops — the pass C `dbCa.c`'s disconnect path asks for, end to end.
 //!
-//! C reference. `connectionCallback` (`dbCa.c:804-829`) clears
-//! `pca->isConnected` and, for a `pvlOptCP` link (or a `pvlOptCPP` link
-//! whose holder has `scan == 0`), sets `link_action |= CA_DBPROCESS`. The
-//! `dbCaTask` worker then runs `db_process(prec)` (`dbCa.c:1314-1321`). That
-//! process calls `dbGetLink` → `dbCaGetLink`, which returns `-1` with
+//! C reference. `connectionCallback` clears `pca->isConnected` and, for a
+//! `pvlOptCP` link (or a `pvlOptCPP` link whose holder has `scan == 0`),
+//! sets `link_action |= CA_DBPROCESS` (`dbCa.c:866-871`): the intent is a
+//! `db_process(prec)` whose `dbCaGetLink` returns `-1` with
 //! `pca->sevr = INVALID_ALARM; pca->stat = LINK_ALARM` because
-//! `!pca->isConnected` (`dbCa.c:430-434`), and the record commits
-//! LINK/INVALID.
+//! `!pca->isConnected` (`dbCa.c:430-434`), so the record commits
+//! LINK/INVALID. C defect, not copied: `dbCaTask` skips a link that is not
+//! `cs_conn` (`dbCa.c:1225`) before its `CA_DBPROCESS` arm
+//! (`dbCa.c:1314-1321`), so that pass never runs and softIoc's holder keeps
+//! its last value with no alarm.
 //!
 //! The half this file pins is the one a unit test on the resolver cannot
 //! see: that a dispatch on a link which has *stopped serving a value*
@@ -19,15 +21,22 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// One request taken by the link's worker, polled until it waits for the
+/// The process of `HOLDER`'s INP link, the one its worker processes for.
+fn holder_process(db: &PvDatabase) -> ExternalCpProcess {
+    let (_, _, inp) = db.record_link_fields("HOLDER").remove(0);
+    let inp = inp.external().unwrap();
+    ExternalCpProcess::new(LinkRef::new(inp.name, inp.open))
+}
+
 /// next: the only way a holder of an external CP link processes.
 fn process_holders(db: &PvDatabase) {
     use std::future::Future as _;
-    let process = ExternalCpProcess::new("UP:PV".to_string());
+    let process = holder_process(db);
     process.request();
     let worker = std::pin::pin!(process.run_worker(|| Some(db.clone())));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -64,19 +73,23 @@ impl SwitchableLset {
 
 #[async_trait::async_trait]
 impl LinkSet for SwitchableLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.servable()
     }
 
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.servable().then(|| self.cached.clone())
     }
 
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.servable().then(|| self.cached.clone())
     }
 
-    async fn connect_link(&self, _: &[u8], _: Option<epics_base_rs::server::database::CaLinkInit>) {
+    async fn connect_link(
+        &self,
+        _: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
     }
 }
 

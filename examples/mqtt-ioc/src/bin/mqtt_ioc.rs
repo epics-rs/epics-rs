@@ -30,7 +30,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mqtt_ioc <st.cmd>");
+        epics_base_rs::stderr_println!("Usage: mqtt_ioc <st.cmd>");
         std::process::exit(1);
     };
 

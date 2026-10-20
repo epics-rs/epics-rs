@@ -1470,6 +1470,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         let mgr_r = mgr.clone();
         out.push(CommandDef::new(
             "asynInterposeEosConfig",
+            // C's iocshArgs, and no usage text (asynInterposeEos.c:394-406).
             vec![
                 ArgDesc {
                     name: "portName",
@@ -1480,20 +1481,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     arg_type: ArgType::Int,
                 },
                 ArgDesc {
-                    name: "processIn",
+                    name: "processIn (0,1) => (no,yes)",
                     arg_type: ArgType::Int,
                 },
                 ArgDesc {
-                    name: "processOut",
+                    name: "processOut (0,1) => (no,yes)",
                     arg_type: ArgType::Int,
                 },
             ],
-            "asynInterposeEosConfig portName addr processIn processOut - install the EOS \
-             interpose (terminator handling) on the port",
+            "",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = arg_str(args, 0)?
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "portName required".to_string())?;
+                // An absent name is C's `strlen(NULL)` crash (:93), not copied.
+                let port = arg_str(args, 0)?.ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 let process_in = arg_int(args, 2).unwrap_or(0) != 0;
                 let process_out = arg_int(args, 3).unwrap_or(0) != 0;
@@ -1505,7 +1504,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                             ctx.println(&format!("{port} interposeInterface failed: {e}"));
                         }
                     }
-                    Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                    // C connects to the port before it interposes (:103-105).
+                    Err(_) => ctx.println(&format!("{port} connectDevice failed")),
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -2031,6 +2031,14 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             if no_auto_connect {
                 driver.base_mut().init_auto_connect(false);
             }
+            // C binds the listening socket on this thread before `registerPort`
+            // (:626), whatever `noAutoConnect` says: that governs only the
+            // server port's own autoConnect (:648).
+            if let Err(e) = driver.create_server_socket() {
+                ctx.println(&e.message());
+                ctx.println("drvAsynIPServerPortConfigure: Error in createServerSocket.");
+                return Ok(CommandOutcome::Continue);
+            }
 
             // The child ports C pre-creates at configure (:703-729) — device
             // support binds to `<parent>:<N>` before any client has connected.
@@ -2048,7 +2056,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 
             // C hands the server's priority to every child (:711-713).
             let priority = arg_int(args, 3).unwrap_or(0) as u32;
-            let Some(handle) = publish_configured_port(
+            if publish_configured_port(
                 Refusal::Line("drvAsynIPServerPortConfigure: Can't register myself."),
                 &port,
                 driver,
@@ -2056,25 +2064,11 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 0,
                 &services,
                 ctx,
-            ) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            // C binds the listening socket inside configure — `createServerSocket`
-            // at drvAsynIPServerPort.c:626, before `registerPort` and regardless
-            // of `noAutoConnect`, which governs only the *server* port's own
-            // autoConnect (:648); the child ports are created with
-            // `noAutoConnect = 1` unconditionally (:714, and the comment saying
-            // why at :710). So the server is listening when st.cmd moves to
-            // the next line, not when some record first pokes it.
-            if let Err(e) = handle.port_handle().connect_blocking() {
-                ctx.println(&format!(
-                    "drvAsynIPServerPortConfigure: cannot listen on {server_info}: {e}"
-                ));
-                crate::asyn_record::unregister_port(&port);
-                handle.shutdown();
+            )
+            .is_none()
+            {
                 return Ok(CommandOutcome::Continue);
             }
-            drop(handle);
 
             for child in children {
                 let name = child.base().port_name.clone();
@@ -2126,13 +2120,15 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynSerialPortConfigure",
+        // C's iocshArgs, and no usage text (drvAsynSerialPort.c:1145-1155,
+        // drvAsynSerialPortWin32.c:818-828).
         vec![
             ArgDesc {
-                name: "portName",
+                name: "port name",
                 arg_type: ArgType::String,
             },
             ArgDesc {
-                name: "ttyName",
+                name: "tty name",
                 arg_type: ArgType::String,
             },
             ArgDesc {
@@ -2140,7 +2136,7 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 arg_type: ArgType::Int,
             },
             ArgDesc {
-                name: "noAutoConnect",
+                name: "disable auto-connect",
                 arg_type: ArgType::Int,
             },
             ArgDesc {
@@ -2148,15 +2144,18 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                 arg_type: ArgType::Int,
             },
         ],
-        "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
-         - create a serial octet port",
+        "",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = arg_str(args, 0)?
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "portName required".to_string())?;
-            let tty = arg_str(args, 1)?
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "ttyName required".to_string())?;
+            // C tests only for an absent argument (drvAsynSerialPort.c:1046-1053);
+            // an empty one goes on to configure.
+            let Some(port) = arg_str(args, 0)? else {
+                ctx.println("Port name missing.");
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(tty) = arg_str(args, 1)? else {
+                ctx.println("TTY name missing.");
+                return Ok(CommandOutcome::Continue);
+            };
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
             let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
@@ -3285,6 +3284,78 @@ mod tests {
         );
     }
 
+    /// `help` prints a command's iocshArg names and its usage text
+    /// (iocsh.cpp:950-972); C registers these two with names of its own and no
+    /// usage (asynInterposeEos.c:394-406, drvAsynSerialPort.c:1145-1155).
+    #[test]
+    fn help_shows_c_argument_names_and_no_usage() {
+        let synopsis = |cmd: &CommandDef| {
+            (
+                cmd.args.iter().map(|a| a.name).collect::<Vec<_>>(),
+                cmd.usage.clone(),
+            )
+        };
+        let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+        let eos = cmds
+            .iter()
+            .find(|c| c.name == "asynInterposeEosConfig")
+            .expect("asynInterposeEosConfig must be registered");
+        assert_eq!(
+            synopsis(eos),
+            (
+                vec![
+                    "portName",
+                    "addr",
+                    "processIn (0,1) => (no,yes)",
+                    "processOut (0,1) => (no,yes)",
+                ],
+                String::new()
+            )
+        );
+        #[cfg(asyn_serial_backend)]
+        assert_eq!(
+            synopsis(&drv_asyn_serial_port_configure_command(PortServices::new())),
+            (
+                vec![
+                    "port name",
+                    "tty name",
+                    "priority",
+                    "disable auto-connect",
+                    "noProcessEos",
+                ],
+                String::new()
+            )
+        );
+    }
+
+    /// asynInterposeEos.c:103-105: a port `connectDevice` cannot find, an
+    /// empty name among them, prints C's line and the shell goes on.
+    #[test]
+    fn eos_config_on_an_unknown_port_prints_c_connect_device_line() {
+        const CHILD: &str = "ASYN_RS_EOS_CONFIG_UNKNOWN_CHILD";
+        const TEST: &str =
+            "iocsh::tests::eos_config_on_an_unknown_port_prints_c_connect_device_line";
+        if std::env::var_os(CHILD).is_some() {
+            let cmds = build_asyn_commands(Arc::new(PortManager::new()));
+            let cmd = cmds
+                .iter()
+                .find(|c| c.name == "asynInterposeEosConfig")
+                .expect("asynInterposeEosConfig must be registered");
+            println!("---begin");
+            call_configure(cmd, &[ArgValue::String("eos_no_such_port".into())]);
+            call_configure(cmd, &[ArgValue::String("".into())]);
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let begin = stdout.find("---begin\n").expect("marker") + "---begin\n".len();
+        let end = stdout.find("---end").expect("marker");
+        assert_eq!(
+            &stdout[begin..end],
+            "eos_no_such_port connectDevice failed\n connectDevice failed\n"
+        );
+    }
+
     /// R19-118 boundary: `asynInterposeEosConfig` installs the EOS layer from
     /// the shell, and its two flags each gate exactly one direction.
     ///
@@ -4152,7 +4223,17 @@ mod tests {
         )
         .unwrap();
         let dead = mgr.find_port_handle("tss_dead").unwrap();
-        assert!(dead.report_blocking(1).is_err());
+        // Submitted, so the report panics on the actor rather than here.
+        let report = crate::request::RequestOp::Report {
+            level: 1,
+            sync_locked: false,
+        };
+        assert!(
+            dead.try_submit(report, AsynUser::default())
+                .unwrap()
+                .wait_blocking(std::time::Duration::from_secs(5))
+                .is_err()
+        );
         assert_eq!(
             shell_output(
                 mgr,
@@ -4771,7 +4852,10 @@ mod tests {
                     iface: Some(crate::interfaces::InterfaceType::Octet),
                     ..Default::default()
                 },
-                move |_| sink.lock().unwrap().push(reader.input_eos(0)),
+                move |_| {
+                    let eos = reader.get_input_eos(&AsynUser::new(0)).unwrap();
+                    sink.lock().unwrap().push(eos)
+                },
             )
             .unwrap();
         (seen, sub)
@@ -4850,6 +4934,70 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [b"".to_vec(), b"\r\n".to_vec()]);
     }
 
+    /// C `getInputEos` called on its caller's thread (StreamDevice's
+    /// `connectToBus`, AsynDriverInterface.cc:450-457) answers without waiting
+    /// for the port and with the status the queued call gives: the driver's
+    /// refusal until an EOS layer is pushed, then the layer's terminator.
+    #[test]
+    fn get_input_eos_answers_as_the_driver_without_waiting_for_the_port() {
+        struct Plain {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Plain {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            Plain {
+                base: PortDriverBase::new(
+                    "geos_direct",
+                    1,
+                    PortFlags {
+                        can_block: true,
+                        ..PortFlags::default()
+                    },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let handle = mgr.find_port_handle("geos_direct").unwrap();
+        let direct = |h: &crate::port_handle::PortHandle| {
+            h.get_input_eos(&AsynUser::new(0)).map_err(|e| e.message())
+        };
+        let queued = |h: &crate::port_handle::PortHandle| {
+            h.get_input_eos_blocking(shell_eos_user(0))
+                .map_err(|e| e.message())
+        };
+        assert_eq!(
+            direct(&handle),
+            Err("geos_direct getInputEos not implemented".to_string())
+        );
+        assert_eq!(direct(&handle), queued(&handle));
+        handle.push_eos_interpose_blocking(-1, true, true).unwrap();
+        assert_eq!(direct(&handle), Ok(Vec::new()));
+        assert_eq!(direct(&handle), queued(&handle));
+        handle
+            .set_input_eos_blocking(shell_eos_user(0), b"\r\n")
+            .unwrap();
+        assert_eq!(direct(&handle), Ok(b"\r\n".to_vec()));
+
+        let hold = handle.hold_driver_blocking::<Plain>().unwrap();
+        let other = handle.clone();
+        let answer = std::thread::spawn(move || other.get_input_eos(&AsynUser::new(0)))
+            .join()
+            .unwrap();
+        assert_eq!(answer.unwrap(), b"\r\n", "answered while the port is held");
+        drop(hold);
+    }
+
     /// A device whose terminator is one register for all its addresses
     /// (Prologix's `++eos`): a set at one address is what every address reads.
     #[test]
@@ -4896,7 +5044,13 @@ mod tests {
             .set_input_eos_blocking(shell_eos_user(1), b"\n")
             .unwrap();
         for addr in [-1, 0, 1, 3] {
-            assert_eq!(handle.input_eos(addr), b"\n", "addr {addr}");
+            assert_eq!(
+                handle
+                    .get_input_eos(&AsynUser::new(0).with_addr(addr))
+                    .unwrap(),
+                b"\n",
+                "addr {addr}"
+            );
         }
     }
 
@@ -5314,6 +5468,93 @@ mod tests {
         );
     }
 
+    /// C binds the server socket in configure, before `registerPort`
+    /// (drvAsynIPServerPort.c:626): a busy address prints createServerSocket's
+    /// line and C's refusal and never reaches the port, and a `noAutoConnect`
+    /// server listens while its port stays disconnected.
+    #[test]
+    fn ip_server_configure_binds_before_it_registers() {
+        const CHILD: &str = "ASYN_RS_IP_SERVER_BIND_CHILD";
+        const TEST: &str = "iocsh::tests::ip_server_configure_binds_before_it_registers";
+        if std::env::var_os(CHILD).is_some() {
+            let srv = drv_asyn_ip_server_port_configure_command(PortServices::new());
+            let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let busy_info = format!("127.0.0.1:{}", busy.local_addr().unwrap().port());
+            println!("---busy");
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("busy_srv".into()),
+                    ArgValue::String(busy_info.into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!(
+                "---published {}",
+                crate::registry::get_port("busy_srv").is_some()
+            );
+            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let free_addr = free.local_addr().unwrap();
+            drop(free);
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("idle_srv".into()),
+                    ArgValue::String(free_addr.to_string().into()),
+                    ArgValue::Int(1),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            let idle = crate::registry::get_port("idle_srv").unwrap().handle;
+            println!("---connected {}", idle.is_connected_blocking(-1).unwrap());
+            println!(
+                "---listening {}",
+                std::net::TcpStream::connect(free_addr).is_ok()
+            );
+            // A refused duplicate gives back the socket it bound (C
+            // `ttyCleanup`, drvAsynIPServerPort.c:651-652).
+            let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let spare_addr = spare.local_addr().unwrap();
+            drop(spare);
+            call_configure(
+                &srv,
+                &[
+                    ArgValue::String("idle_srv".into()),
+                    ArgValue::String(spare_addr.to_string().into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!(
+                "---released {}",
+                std::net::TcpListener::bind(spare_addr).is_ok()
+            );
+            println!("---end");
+            return;
+        }
+        let (stdout, stderr) = run_child(TEST, CHILD);
+        let a = stdout.find("---busy\n").expect("busy") + "---busy\n".len();
+        let b = stdout.find("---published").expect("published");
+        let busy: Vec<&str> = stdout[a..b].lines().collect();
+        assert_eq!(busy.len(), 4, "{stdout}{stderr}");
+        assert!(
+            busy[2].starts_with("Error in binding 127.0.0.1:"),
+            "{stdout}"
+        );
+        assert_eq!(
+            busy[3],
+            "drvAsynIPServerPortConfigure: Error in createServerSocket."
+        );
+        assert!(stdout.contains("---published false\n"), "{stdout}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("error calling createSocket"),
+            "{stdout}{stderr}"
+        );
+        assert!(stdout.contains("---connected false\n"), "{stdout}");
+        assert!(stdout.contains("---listening true\n"), "{stdout}");
+        assert!(stdout.contains("---released true\n"), "{stdout}");
+    }
+
     /// drvAsynSerialPort.c:1106.
     #[cfg(asyn_serial_backend)]
     #[test]
@@ -5338,6 +5579,34 @@ mod tests {
                 .lines()
                 .any(|l| l == "drvAsynSerialPortConfigure: Can't register myself."),
             "{stdout}"
+        );
+    }
+
+    /// drvAsynSerialPort.c:1046-1053: an absent name prints C's line and the
+    /// command returns without creating a port, as a success to the shell.
+    #[cfg(asyn_serial_backend)]
+    #[test]
+    fn serial_configure_prints_c_missing_argument_lines() {
+        const CHILD: &str = "ASYN_RS_SERIAL_MISSING_CHILD";
+        const TEST: &str = "iocsh::tests::serial_configure_prints_c_missing_argument_lines";
+        if std::env::var_os(CHILD).is_some() {
+            let cmd = drv_asyn_serial_port_configure_command(PortServices::new());
+            println!("---begin");
+            call_configure(&cmd, &[ArgValue::Missing, ArgValue::Missing]);
+            call_configure(
+                &cmd,
+                &[ArgValue::String("serial_no_tty".into()), ArgValue::Missing],
+            );
+            assert!(crate::asyn_record::get_port("serial_no_tty").is_none());
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let begin = stdout.find("---begin\n").expect("marker") + "---begin\n".len();
+        let end = stdout.find("---end").expect("marker");
+        assert_eq!(
+            &stdout[begin..end],
+            "Port name missing.\nTTY name missing.\n"
         );
     }
 

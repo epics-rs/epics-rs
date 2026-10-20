@@ -17,8 +17,8 @@ pub use backup::BackupConfig;
 pub use error::{AutosaveError, AutosaveResult};
 pub use manager::{AutosaveBuilder, AutosaveManager};
 pub use save_set::{
-    RestoreMode, RestorePass, RestoreResult, SaveMethods, SaveSet, SaveSetConfig, SaveSetStatus,
-    SaveStrategy,
+    CaContext, RestoreMode, RestorePass, RestoreResult, SaveMethods, SaveSet, SaveSetConfig,
+    SaveSetStatus, SaveStrategy,
 };
 pub use startup::{AutosaveStartupConfig, BootRestore};
 
@@ -64,6 +64,10 @@ pub async fn reboot_restore(
         trace(format_args!(
             "Found filename '{filename}' in restoreFileList.\n"
         ));
+        // `concatenate_paths` unless the name is absolute (:819-823).
+        if !Path::new(filename).is_absolute() {
+            request::concatenated(&item.path.to_string_lossy(), &item.settings);
+        }
         // initHookAfterInitDevSup, initHookAfterInitDatabase (initHooks.h:84-85).
         let (state, when) = match pass {
             RestorePass::Zero => (6, "before"),

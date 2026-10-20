@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase,
+};
 use epics_base_rs::server::record::{AlarmSeverity, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -80,16 +82,22 @@ struct CaHoldLset(Arc<CaHoldState>);
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CaHoldLset {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
+        let name = link.name;
         let held = op == LinkPutOp::Async;
         self.0
             .puts
@@ -118,7 +126,7 @@ impl LinkSet for CaHoldLset {
         }
         Ok(())
     }
-    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         // Connected, DBF_DOUBLE scalar: the destination type sseq's
         // `processCallback` switch resolves (R16-1) so the step is put at all.
         Some(LinkMetadata {

@@ -1346,11 +1346,8 @@ mod tests {
         struct OneSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for OneSource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { vec!["MY:PV".into()] }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                vec!["MY:PV".into()]
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == b"MY:PV";
@@ -1473,11 +1470,8 @@ mod tests {
         struct EmptySource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for EmptySource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
@@ -1599,11 +1593,8 @@ mod tests {
         struct EmptySource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for EmptySource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
@@ -1698,11 +1689,8 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { vec!["MY:PV".into()] }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                vec!["MY:PV".into()]
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == b"MY:PV";
@@ -1798,11 +1786,8 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { vec!["MY:PV".into()] }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                vec!["MY:PV".into()]
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == b"MY:PV";
@@ -1915,8 +1900,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        let server_src =
-            ServerInfoSource::new(|| async { Vec::<epics_base_rs::types::RecordName>::new() });
+        let server_src = ServerInfoSource::new(Vec::<epics_base_rs::types::RecordName>::new);
 
         // Direct-connect path still resolves `server`.
         assert!(
@@ -2000,11 +1984,8 @@ mod tests {
         struct ScopedSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for ScopedSource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { vec!["MY:PV".into()] }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                vec!["MY:PV".into()]
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == b"MY:PV";
@@ -2094,11 +2075,8 @@ mod tests {
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
         impl ChannelSource for PresentSource {
-            fn list_pvs(
-                &self,
-            ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-            {
-                async { vec!["MY:PV".into()] }
+            fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+                vec!["MY:PV".into()]
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == b"MY:PV";

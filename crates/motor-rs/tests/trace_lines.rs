@@ -56,8 +56,10 @@ impl AsynMotor for Disconnected {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        refused().map(|()| MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        refused()?;
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -249,6 +251,35 @@ fn a_move_prints_the_raw_values_it_carries() {
             .collect::<Vec<_>>(),
         [
             "asynMotorController:writeFloat64: Set driver traceLinesMoveSteps, axis 0 move absolute to -500.000000, base velocity=10.000000, velocity=100.000000, acceleration=200.000000"
+        ]
+    );
+}
+
+/// C's `%f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+#[test]
+fn a_move_prints_a_nan_as_c_does() {
+    use asyn_rs::trace::TraceMask;
+
+    let port = "traceLinesMoveNan";
+    PortManager::global()
+        .trace_manager()
+        .set_trace_mask(Some(port), TraceMask::FLOW);
+    let lines = traced(
+        port,
+        &[MotorCommand::MoveAbsolute {
+            position: f64::NAN,
+            min_velocity: -f64::NAN,
+            velocity: 100.0,
+            acceleration: 200.0,
+        }],
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| &l[l.find("asynMotorController").unwrap()..])
+            .collect::<Vec<_>>(),
+        [
+            "asynMotorController:writeFloat64: Set driver traceLinesMoveNan, axis 0 move absolute to nan, base velocity=-nan, velocity=100.000000, acceleration=200.000000"
         ]
     );
 }
@@ -534,6 +565,9 @@ impl AsynMotor for UndefinedParam {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -549,8 +583,9 @@ impl AsynMotor for UndefinedParam {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -579,6 +614,9 @@ impl AsynMotor for Quiet {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -594,8 +632,9 @@ impl AsynMotor for Quiet {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -888,6 +927,9 @@ impl AsynMotor for FailsQuietly {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -900,8 +942,10 @@ impl AsynMotor for FailsQuietly {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM.succeeding()
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        refused().map(|()| MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        refused()?;
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 

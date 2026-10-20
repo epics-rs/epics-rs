@@ -41,6 +41,7 @@ async fn a_comma_inside_a_c_array_element_is_not_a_separator() {
             pv_name: "SR:WFS".into(),
             value: value_to_save_str(&value),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await
@@ -79,11 +80,13 @@ async fn every_element_survives_the_round_trip() {
                 let text = value_to_save_str(&value);
                 let parsed = parse_save_value(&text, &string_array(&[]))
                     .unwrap_or_else(|| panic!("{elems:?} did not parse from {text}"));
-                assert_eq!(
-                    elements_of(&parsed),
-                    elems.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    "round trip through {text}"
-                );
+                // One element is written as a scalar, and C reads an empty
+                // one back as no element (dbrestore.c:478-482).
+                let expected: Vec<String> = match elems.as_slice() {
+                    [""] => Vec::new(),
+                    _ => elems.iter().map(|s| s.to_string()).collect(),
+                };
+                assert_eq!(elements_of(&parsed), expected, "round trip through {text}");
             }
         }
     }
@@ -103,6 +106,7 @@ async fn every_element_survives_a_c_format_save_file() {
             pv_name: "SR:WFS".into(),
             value: value_to_save_str(&value),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await
@@ -116,17 +120,17 @@ async fn every_element_survives_a_c_format_save_file() {
     );
 }
 
-/// An empty array and an array of one empty element are different
-/// things and must stay different.
+/// C writes an empty array and an array of one empty element alike, as
+/// the scalar "" (save_restore.c:1853-1860), and reads that back as no
+/// element (dbrestore.c:478-482).
 #[epics_macros_rs::epics_test]
-async fn an_empty_array_is_not_an_array_holding_an_empty_element() {
-    let empty =
-        parse_save_value(&value_to_save_str(&string_array(&[])), &string_array(&[])).unwrap();
-    assert!(elements_of(&empty).is_empty());
-
-    let one =
-        parse_save_value(&value_to_save_str(&string_array(&[""])), &string_array(&[])).unwrap();
-    assert_eq!(elements_of(&one), vec![String::new()]);
+async fn an_empty_element_is_written_as_an_empty_array() {
+    for elems in [&[][..], &[""][..]] {
+        let text = value_to_save_str(&string_array(elems));
+        assert_eq!(text, "");
+        let parsed = parse_save_value(&text, &string_array(&[])).unwrap();
+        assert!(elements_of(&parsed).is_empty(), "{elems:?}");
+    }
 }
 
 /// A numeric array is written in C's form, and the `[..]` form of a file

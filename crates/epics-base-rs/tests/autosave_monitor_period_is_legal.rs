@@ -49,12 +49,8 @@ fn holder_with_req(dir: &tempfile::TempDir) -> Arc<Mutex<AutosaveStartupConfig>>
     Arc::new(Mutex::new(cfg))
 }
 
-fn build(
-    rt: &tokio::runtime::Runtime,
-    holder: &Arc<Mutex<AutosaveStartupConfig>>,
-) -> AutosaveManager {
-    let builder = holder.lock().unwrap().into_builder();
-    rt.block_on(builder.build())
+fn build(holder: &Arc<Mutex<AutosaveStartupConfig>>) -> Arc<AutosaveManager> {
+    holder.lock().unwrap().manager.clone().unwrap()
 }
 
 /// Run `create_monitor_set("settings.req", period)` through the real
@@ -77,7 +73,7 @@ fn monitor_interval(period: i64) -> Duration {
         )
         .expect("create_monitor_set must accept the period the shell parsed");
 
-    let mgr = build(&rt, &holder);
+    let mgr = build(&holder);
     match &mgr.sets()[0].0.methods()[..] {
         [SaveStrategy::OnChange { min_interval, .. }] => *min_interval,
         other => panic!("expected a monitored set, got {other:?}"),
@@ -139,7 +135,7 @@ fn the_triggered_loop_takes_no_period() {
         )
         .unwrap();
 
-    let mgr = build(&rt, &holder);
+    let mgr = build(&holder);
     let sets = mgr.sets();
     assert_eq!(sets.len(), 1, "one request file, one set");
 

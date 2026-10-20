@@ -96,21 +96,9 @@ fn cmd_ioc_run() -> CommandDef {
         "iocRun — Bring the IOC out of its initial quiescent state to the \
          running state.",
         |_args: &[ArgValue], ctx: &CommandContext| {
-            use crate::server::ioc_app::ShellTransition;
-            // Two ways to reach `iocRunning`, and C has both: out of
-            // `iocBuilt`, which is the IOC this `run` built and still owns,
-            // and out of `iocPaused`, which owns nothing because the build
-            // already happened. `Refused`/`NotOurs` is the second case — no
-            // built IOC to consume — so the plain transition is what runs,
-            // and it is also the only one a `CaServerBuilder` IOC has.
-            match crate::server::ioc_app::run_from_shell(ctx.bridge()) {
-                ShellTransition::Done => return Ok(CommandOutcome::Continue),
-                ShellTransition::Failed => return Ok(CommandOutcome::Failed),
-                ShellTransition::Refused | ShellTransition::NotOurs => {}
-            }
             // C `iocshSetError(iocRun())`: a non-zero status fails the
             // line, and `iocRun` has already printed its own diagnostic.
-            if crate::server::ioc_app::ioc_run() == 0 {
+            if crate::server::ioc_app::run_from_shell(ctx) {
                 Ok(CommandOutcome::Continue)
             } else {
                 Ok(CommandOutcome::Failed)
@@ -243,7 +231,7 @@ fn cmd_dlload() -> CommandDef {
             // C's line verbatim; the text after the colon is what
             // `epicsLoadError()` would carry, which here is a fixed
             // property of the binary rather than a per-call `dlerror`.
-            ctx.println(&format!(
+            ctx.console_println(&format!(
                 "epicsLoadLibrary failed: {name}: this IOC is statically \
                  linked and has no dynamic loader, and a shared library has \
                  no registrar path into its compile-time registries"
@@ -326,6 +314,7 @@ mod tests {
         ctx
     }
 
+    /// stdout as the operator sees it: the thread's and the raw one (dlload.c).
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> (String, bool) {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
@@ -334,8 +323,10 @@ mod tests {
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        let outcome = ctx.with_output(std::fs::File::create(&path).unwrap(), || {
-            cmd.handler.call(&args, ctx)
+        let out = std::fs::File::create(&path).unwrap();
+        let raw = out.try_clone().unwrap();
+        let outcome = ctx.with_console(raw, std::io::stderr(), || {
+            ctx.with_output(out, || cmd.handler.call(&args, ctx))
         });
         let failed = matches!(outcome, Ok(CommandOutcome::Failed));
         (std::fs::read_to_string(&path).unwrap(), failed)
@@ -422,6 +413,25 @@ mod tests {
         );
     }
 
+    /// The revision names the commit checked out when this crate was built,
+    /// as C's `FORCE`d `epicsVCS.h` does, even when the commit touched no
+    /// file of this package. Nothing to compare outside a git checkout.
+    #[test]
+    fn the_revision_names_the_checked_out_commit() {
+        let Ok(out) = std::process::Command::new("git")
+            .args(["describe", "--always", "--tags", "--abbrev=20"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let head = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(VCS_VERSION.trim_end_matches("-dirty"), head.trim());
+    }
+
     /// C declares one `iocshArgString`, and the whole string reaches the
     /// interpreter with its shell grammar intact.
     #[test]
@@ -446,5 +456,19 @@ mod tests {
         let (out, failed) = run(&ctx, "system", &["exit 3"]);
         assert!(failed, "a non-zero exit must fail the line");
         assert!(out.is_empty(), "C prints no diagnostic of its own: {out:?}");
+    }
+
+    /// dlload.c does not include `epicsStdio.h`, so its failure line stays on
+    /// the console under `dlload x > f` (`dlload.c:16`; no oracle IOC
+    /// registers the command).
+    #[test]
+    fn dlload_s_failure_line_stays_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        let (file, console) = shell.file_and_console("dlload myLibrary.so");
+        assert_eq!(file, "");
+        assert!(
+            console.starts_with("epicsLoadLibrary failed: myLibrary.so: "),
+            "{console}"
+        );
     }
 }

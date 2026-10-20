@@ -43,7 +43,7 @@ const BEAT: Duration = Duration::from_secs(15);
 struct EmptySource;
 
 impl ChannelSource for EmptySource {
-    async fn list_pvs(&self) -> Vec<RecordName> {
+    fn list_pvs(&self) -> Vec<RecordName> {
         Vec::new()
     }
     async fn has_pv(&self, _: &[u8]) -> bool {

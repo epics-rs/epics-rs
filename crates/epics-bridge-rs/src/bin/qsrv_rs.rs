@@ -84,7 +84,7 @@ fn exit(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qsrv-rs: {e}");
+            epics_base_rs::stderr_println!("qsrv-rs: {e}");
             ExitCode::FAILURE
         }
     }

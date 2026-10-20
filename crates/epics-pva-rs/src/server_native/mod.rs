@@ -104,10 +104,12 @@ pub use peers::{ChannelReport, MonitorReport, PeerEntry, PeerRegistry, PeerSnaps
 pub use report::{Liveness, LivenessGuard, ServerReport, ServerReportHandle};
 #[cfg(tokio_backend)]
 pub use runtime::{BoundPvaServer, PvaServer, run_pva_server};
-pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME};
+pub use server_info::{
+    BUILTIN_SOURCE_NAME, SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME,
+};
 pub use shared_pv::{AddPvError, MonitorOutbox, MonitorRing, SharedPV, SharedSource, SquashTail};
 pub use source::{
     ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, Marks,
     MonitorOptions, MonitorStream, MonitorUpdate, OpError, OpErrorKind, PostValue, RawMonitorEvent,
-    UpstreamMonitor, plain_monitor_updates,
+    RegistryEntry, SourceShow, UpstreamMonitor, plain_monitor_updates,
 };

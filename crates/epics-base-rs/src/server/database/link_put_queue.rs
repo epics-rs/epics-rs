@@ -55,8 +55,9 @@
 //! away from the record's advisory write gate.
 //!
 //! **Invariant.** *Every staged completion is resolved exactly once* —
-//! by the owner (with the lset's result), by a superseding put, or by the
-//! queue's teardown. A put the lset could not issue
+//! by the owner (with the lset's result), by a superseding put, by the
+//! link's removal ([`LinkPutQueue::remove_link`]), or by the queue's
+//! teardown. A put the lset could not issue
 //! ([`LinkPutDone::NotIssued`]) is dropped, never re-sent, and the owner
 //! resolves its completion then. [`PutCompletion`] enforces it by
 //! construction: its
@@ -68,16 +69,51 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Weak;
 
-use super::link_set::{DynLinkSet, LinkPutDone, LinkPutOp};
+use super::link_set::{DynLinkSet, LinkPutDone, LinkPutOp, LinkRef};
 use crate::types::EpicsValue;
 
 /// The channel an external link addresses: the scheme of the one lset it
-/// belongs to plus the name that lset is addressed with. The unit of an OPEN, because the lset
-/// keeps one connection per name.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// belongs to, the name that lset is addressed with, and the link itself.
+/// The unit of an OPEN, because C stages one `CA_CONNECT` per `caLink`
+/// (`dbCa.c:397-401`); equal by the link's serial.
+#[derive(Clone, Debug)]
 pub(crate) struct Channel {
     pub(crate) scheme: &'static str,
     pub(crate) name: crate::types::RecordName,
+    link: crate::server::record::OpenLatch,
+}
+
+impl Channel {
+    pub(crate) fn new(
+        scheme: &'static str,
+        name: &[u8],
+        link: &crate::server::record::OpenLatch,
+    ) -> Self {
+        Self {
+            scheme,
+            name: name.into(),
+            link: link.clone(),
+        }
+    }
+
+    /// The link as its lset is asked about it.
+    pub(crate) fn link_ref(&self) -> LinkRef<'_> {
+        LinkRef::new(&self.name, &self.link)
+    }
+}
+
+impl PartialEq for Channel {
+    fn eq(&self, other: &Self) -> bool {
+        self.link.serial() == other.link.serial()
+    }
+}
+
+impl Eq for Channel {}
+
+impl std::hash::Hash for Channel {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.link.serial().hash(state);
+    }
 }
 
 /// The link a put comes from: C's `DBLINK` and the `caLink` it holds.
@@ -244,6 +280,22 @@ impl StagedPut {
     }
 }
 
+/// What the owner sends of a [`StagedPut`]; its completion stays with the
+/// link ([`LinkState::InFlight`]).
+struct WireWrite {
+    value: EpicsValue,
+    op: LinkPutOp,
+}
+
+/// What the owner's write of one value came to.
+struct Written {
+    /// [`LinkPutDone::Inline`].
+    inline: bool,
+    result: Result<(), String>,
+    /// A `ca` put left unsent: `newOutNative` stays set.
+    unsent: bool,
+}
+
 impl PutCompletion {
     fn removed(self) {
         self.resolve(
@@ -261,10 +313,13 @@ enum LinkState {
     /// Staged and waiting for the owner. In the ready deque exactly once.
     Queued(StagedPut),
     /// The owner took the value; a network op is running. Not in the deque.
-    InFlight,
+    /// Holds the op's completion: C's `pca->putCallback`, which `putComplete`
+    /// takes when the server answers and `caLinkDec` takes when the link is
+    /// removed first (`dbCa.c:1056-1072`, `:184-197`).
+    InFlight(Option<PutCompletion>),
     /// A network op is running AND a newer value was staged behind it.
     /// Not in the deque; `finish` moves it back to `Queued` and enqueues.
-    InFlightRestaged(StagedPut),
+    InFlightRestaged(Option<PutCompletion>, StagedPut),
 }
 
 /// A `caLink`'s counters outlive its staged values: one per link field and
@@ -359,6 +414,9 @@ pub(crate) struct LinkPutQueue {
     state: std::sync::atomic::AtomicU8,
     /// The `dbCaLink` thread, joined by [`Self::shutdown`].
     owner: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Woken CP workers in wake order: `workList`'s links with a
+    /// `CA_DBPROCESS` (`dbCa.c:132-161`).
+    cp_ready: parking_lot::Mutex<VecDeque<Arc<CpSlot>>>,
     /// The reactor the network half of this queue needs, captured where one is
     /// known to exist — construction time, which for an IOC is inside
     /// `IocApplication::run` and for a test is inside its `#[tokio::test]`.
@@ -385,6 +443,7 @@ impl Default for LinkPutQueue {
             idle: tokio::sync::Notify::new(),
             state: std::sync::atomic::AtomicU8::new(owner_state::INIT),
             owner: parking_lot::Mutex::new(None),
+            cp_ready: parking_lot::Mutex::new(VecDeque::new()),
             reactor: crate::runtime::task::BlockingBridge::try_capture(),
         }
     }
@@ -479,13 +538,17 @@ impl LinkPutQueue {
                     inner.links.insert(key, LinkState::Queued(staged));
                     false
                 }
-                Some(LinkState::InFlight) => {
-                    inner.links.insert(key, LinkState::InFlightRestaged(staged));
+                Some(LinkState::InFlight(sent)) => {
+                    inner
+                        .links
+                        .insert(key, LinkState::InFlightRestaged(sent, staged));
                     false
                 }
-                Some(LinkState::InFlightRestaged(prev)) => {
+                Some(LinkState::InFlightRestaged(sent, prev)) => {
                     Self::supersede(&mut inner, &key, prev.completion);
-                    inner.links.insert(key, LinkState::InFlightRestaged(staged));
+                    inner
+                        .links
+                        .insert(key, LinkState::InFlightRestaged(sent, staged));
                     false
                 }
             }
@@ -519,7 +582,7 @@ impl LinkPutQueue {
     /// Mirrors `dbCaTask` popping `workList` and clearing `link_action`
     /// before doing the work (`dbCa.c:1115-1132`). A removed link's value is
     /// dropped instead (`dbCa.c:1200-1203`).
-    fn take_ready(&self) -> Option<(LinkKey, StagedPut)> {
+    fn take_ready(&self) -> Option<(LinkKey, WireWrite)> {
         let mut inner = self.inner.lock();
         let mut dropped = false;
         loop {
@@ -536,9 +599,15 @@ impl LinkPutQueue {
                     staged.removed();
                     dropped = true;
                 }
-                Some(LinkState::Queued(staged)) => {
-                    inner.links.insert(key.clone(), LinkState::InFlight);
-                    return Some((key, staged));
+                Some(LinkState::Queued(StagedPut {
+                    value,
+                    op,
+                    completion,
+                })) => {
+                    inner
+                        .links
+                        .insert(key.clone(), LinkState::InFlight(completion));
+                    return Some((key, WireWrite { value, op }));
                 }
                 // Only `Queued` is ever in the deque; restore anything else
                 // rather than silently dropping it.
@@ -550,50 +619,108 @@ impl LinkPutQueue {
         }
     }
 
-    /// Owner-only: the write for `key` finished, `unsent` if it was dropped.
+    /// Owner-only: the write for `key` finished as `written` says.
     /// `InFlight` → idle, keeping `unsent`; `InFlightRestaged` → `Queued`
     /// and back in the deque, which is how a put that landed mid-flight is
     /// not lost (C clears `link_action` before the wire write for the same
-    /// reason, `dbCa.c:1130`), superseding `unsent`.
-    fn finish(&self, key: LinkKey, unsent: bool) {
-        let (wake_work, wake_idle) = {
+    /// reason, `dbCa.c:1130`), superseding `unsent`. The write's completion
+    /// is resolved unless [`Self::remove_link`] took it.
+    fn finish(&self, key: LinkKey, written: Written) {
+        let (sent, wake_work, wake_idle) = {
             let mut inner = self.inner.lock();
             inner.completed += 1;
-            let wake_work = match inner.links.remove(&key) {
-                Some(LinkState::InFlight) => {
-                    if unsent && !key.link.install.removed() {
+            let (sent, wake_work) = match inner.links.remove(&key) {
+                Some(LinkState::InFlight(sent)) => {
+                    if written.unsent && !key.link.install.removed() {
                         inner.unsent.insert(site(&key), key.link.install.clone());
                     }
-                    false
+                    (sent, false)
                 }
-                None => false,
-                Some(LinkState::InFlightRestaged(staged)) => {
-                    if unsent {
+                None => (None, false),
+                Some(LinkState::InFlightRestaged(sent, staged)) => {
+                    if written.unsent {
                         Self::supersede(&mut inner, &key, None);
                     }
                     if key.link.install.removed() {
                         staged.removed();
-                        false
+                        (sent, false)
                     } else {
                         inner.links.insert(key.clone(), LinkState::Queued(staged));
                         inner.ready.push_back(key);
-                        true
+                        (sent, true)
                     }
                 }
                 // Cannot happen: only `finish` and `take_ready` move a key
                 // out of `InFlight*`, and both run on the owner path.
                 Some(other) => {
                     inner.links.insert(key, other);
-                    false
+                    (None, false)
                 }
             };
-            (wake_work, inner.is_idle())
+            (sent, wake_work, inner.is_idle())
         };
+        // A put callback dropped at `dbCa.c:1225` is left unanswered in C
+        // until `caLinkDec` completes it on a relink (`dbCa.c:184-197`), so a
+        // transient disconnect hangs the record PACT. That is a C defect, not
+        // copied: the callback completes now, as `caLinkDec` completes it.
+        if let Some(c) = sent {
+            c.resolve(written.inline, written.result);
+        }
         if wake_work {
             self.work.notify_one();
         }
         if wake_idle {
             self.idle.notify_waiters();
+        }
+    }
+
+    /// C `dbCaRemoveLink` (`dbCa.c:431-446`) of every link `field` of `rec`
+    /// had before `current`: its `CA_CLEAR_CHANNEL` reaches `caLinkDec`,
+    /// which calls the `putCallback` still waiting on the server
+    /// (`dbCa.c:184-197`), and the value staged behind it is never sent
+    /// (`dbCa.c:1200-1203`). The write in flight runs on, and its answer
+    /// completes nothing: `putComplete` finds `plink` cleared (`dbCa.c:1063`).
+    pub(crate) fn remove_link(
+        &self,
+        rec: Option<super::RecordIdx>,
+        field: &str,
+        current: &LinkInstall,
+    ) {
+        let mut sent = Vec::new();
+        let mut behind = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for (key, state) in inner.links.iter_mut() {
+                if key.link.rec != rec
+                    || !key.link.field.eq_ignore_ascii_case(field)
+                    || key.link.install == *current
+                {
+                    continue;
+                }
+                match std::mem::replace(state, LinkState::InFlight(None)) {
+                    LinkState::InFlight(c) => sent.extend(c),
+                    LinkState::InFlightRestaged(c, staged) => {
+                        sent.extend(c);
+                        behind.push(staged);
+                    }
+                    // `take_ready` drops it.
+                    queued @ LinkState::Queued(_) => *state = queued,
+                }
+            }
+        }
+        // `caLinkDec` runs on `dbCaTask`, so the record completes as an
+        // inline callback would.
+        for c in sent {
+            c.resolve(
+                true,
+                Err(
+                    "external link put dropped: the link was removed before it completed"
+                        .to_string(),
+                ),
+            );
+        }
+        for staged in behind {
+            staged.removed();
         }
     }
 
@@ -650,12 +777,17 @@ impl LinkPutQueue {
         }
     }
 
-    /// Owner-only: the open for `key` returned. `InFlight` → `Done`.
+    /// Owner-only: the open for `key` returned. `InFlight` → `Done`, or
+    /// forgotten for a link removed meanwhile.
     fn finish_open(&self, key: Channel) {
         let wake_idle = {
             let mut inner = self.inner.lock();
             inner.opened += 1;
-            inner.opens.insert(key, OpenState::Done);
+            if key.link.is_removed() {
+                inner.opens.remove(&key);
+            } else {
+                inner.opens.insert(key, OpenState::Done);
+            }
             inner.is_idle()
         };
         if wake_idle {
@@ -693,15 +825,39 @@ impl LinkPutQueue {
         &self,
         rec: Option<super::RecordIdx>,
         field: &str,
-        channel: &Channel,
+        scheme: &str,
+        name: &[u8],
     ) -> u64 {
         self.inner
             .lock()
             .coalesced
             .iter()
-            .find(|((r, f, c), _)| *r == rec && *f == field && c == channel)
-            .filter(|(_, (install, _))| !install.removed())
-            .map_or(0, |(_, (_, n))| *n)
+            .filter(|((r, f, c), (install, _))| {
+                *r == rec
+                    && *f == field
+                    && c.scheme == scheme
+                    && *c.name == *name
+                    && !install.removed()
+            })
+            .map(|(_, (_, n))| *n)
+            .sum()
+    }
+
+    /// C `dbCaRemoveLink`'s `CA_CLEAR_CHANNEL` (`dbCa.c:431-446`), which
+    /// `dbCaTask` services ahead of every other action on the link
+    /// (`dbCa.c:1200`): an open still queued is dropped, and what the queue
+    /// keeps per link is forgotten. An open in flight is forgotten when it
+    /// returns ([`Self::finish_open`]).
+    pub(crate) fn retire(&self, link: super::LinkSerial) {
+        let mut inner = self.inner.lock();
+        inner
+            .opens
+            .retain(|c, state| c.link.serial() != link || *state == OpenState::InFlight);
+        inner.ready_opens.retain(|(c, _)| c.link.serial() != link);
+        inner
+            .coalesced
+            .retain(|(_, _, c), _| c.link.serial() != link);
+        inner.unsent.retain(|(_, _, c), _| c.link.serial() != link);
     }
 
     /// Number of writes the owner has completed.
@@ -765,6 +921,28 @@ impl LinkPutQueue {
         Some(wait)
     }
 
+    /// Poll `worker` on the `dbCaLink` thread from now on: C `dbCaTask`
+    /// runs every link's `CA_DBPROCESS` (`dbCa.c:1314-1321`). It waits for
+    /// the owner to start, as a staged put does. Dropping the handle drops
+    /// the worker.
+    pub(crate) fn spawn_cp_worker(
+        self: &Arc<Self>,
+        worker: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> CpWorker {
+        let slot = Arc::new(CpSlot {
+            worker: parking_lot::Mutex::new(Some(Box::pin(worker))),
+            queued: std::sync::atomic::AtomicBool::new(false),
+            dropped: std::sync::atomic::AtomicBool::new(false),
+            queue: Arc::downgrade(self),
+        });
+        std::task::Wake::wake_by_ref(&slot);
+        CpWorker(slot)
+    }
+
+    fn take_ready_cp(&self) -> Option<Arc<CpSlot>> {
+        self.cp_ready.lock().pop_front()
+    }
+
     /// C `dbCaShutdown` (`dbCa.c:324-333`): tell the owner to exit once it
     /// has drained what is ready, and join it. Nothing to stop when no owner
     /// runs.
@@ -814,6 +992,7 @@ async fn owner_loop(
         None,
     );
     drop(started);
+    let ca_run = db.upgrade().map(|inner| inner.ca_run.clone());
     loop {
         // Register on the wake signal BEFORE draining, so a put staged
         // during the drain cannot be missed.
@@ -835,20 +1014,22 @@ async fn owner_loop(
                         let q2 = q.clone();
                         reactor.spawn(async move {
                             match lset {
-                                Some(lset) => lset.connect_link(&key.name, init).await,
-                                None => drop(init),
+                                Some(lset) if !key.link.is_removed() => {
+                                    lset.connect_link(key.link_ref(), init).await
+                                }
+                                _ => drop(init),
                             }
                             q2.finish_open(key);
                         });
                     }
-                    while let Some((key, staged)) = q.take_ready() {
+                    while let Some((key, write)) = q.take_ready() {
                         let Some(inner) = db.upgrade() else { return };
                         let lset = resolve_lset(&inner, key.channel.scheme);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
-                            let unsent = run_put(lset.as_ref(), &key, staged).await;
-                            q2.finish(key, unsent);
+                            let written = run_put(lset.as_ref(), &key, write).await;
+                            q2.finish(key, written);
                         });
                     }
                 }
@@ -863,10 +1044,19 @@ async fn owner_loop(
                     while let Some((key, _init)) = q.take_ready_open() {
                         q.finish_open(key);
                     }
-                    while let Some((key, staged)) = q.take_ready() {
-                        refuse_for_want_of_a_reactor(&key, staged);
-                        q.finish(key, false);
+                    while let Some((key, _)) = q.take_ready() {
+                        let written = refuse_for_want_of_a_reactor(&key);
+                        q.finish(key, written);
                     }
+                }
+            }
+            // `dbCaTask` is paused until `dbCaRun`, and a first event's
+            // `CA_DBPROCESS` is queued behind every link's monitor queued by
+            // then (`dbCa.c:1171-1173`, `:1209-1236`): the queue waits whole,
+            // in wake order.
+            if ca_run.as_ref().is_none_or(|gate| gate.serviced()) {
+                while let Some(slot) = q.take_ready_cp() {
+                    slot.poll();
                 }
             }
             // C `dbCaTask` leaves once its `workList` is empty and `dbCaCtl`
@@ -877,7 +1067,88 @@ async fn owner_loop(
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.
         }
-        notified.await;
+        match ca_run.as_ref().filter(|gate| !gate.serviced()) {
+            Some(gate) => {
+                let serviced = gate.monitors_serviced();
+                tokio::pin!(serviced);
+                std::future::poll_fn(|cx| {
+                    if notified.as_mut().poll(cx).is_ready()
+                        || serviced.as_mut().poll(cx).is_ready()
+                    {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await
+            }
+            None => notified.await,
+        }
+    }
+}
+
+type CpFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// One link's CP worker. Only the owner polls it, so it never runs on the
+/// thread that woke it.
+struct CpSlot {
+    /// Out of the slot while the owner polls it.
+    worker: parking_lot::Mutex<Option<CpFuture>>,
+    /// In `cp_ready`: `addAction`'s `link_action != 0` (`dbCa.c:135`).
+    queued: std::sync::atomic::AtomicBool,
+    dropped: std::sync::atomic::AtomicBool,
+    queue: Weak<LinkPutQueue>,
+}
+
+impl CpSlot {
+    fn poll(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        // Cleared first, so a wake during the poll queues it again.
+        self.queued.store(false, Ordering::SeqCst);
+        let Some(mut worker) = self.worker.lock().take() else {
+            return;
+        };
+        let waker = std::task::Waker::from(self.clone());
+        let done = worker
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_ready();
+        // Decided under the lock `CpWorker::drop` takes, so a drop during
+        // the poll cannot miss the worker.
+        let mut slot = self.worker.lock();
+        if !done && !self.dropped.load(Ordering::SeqCst) {
+            *slot = Some(worker);
+        }
+    }
+}
+
+impl std::task::Wake for CpSlot {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.queued.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some(queue) = self.queue.upgrade() {
+            queue.cp_ready.lock().push_back(self.clone());
+            queue.work.notify_one();
+        }
+    }
+}
+
+/// A link's CP worker on the `dbCaLink` thread
+/// (`LinkPutQueue::spawn_cp_worker`); dropping it drops the worker.
+pub struct CpWorker(Arc<CpSlot>);
+
+impl Drop for CpWorker {
+    fn drop(&mut self) {
+        self.0
+            .dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let worker = self.0.worker.lock().take();
+        drop(worker);
     }
 }
 
@@ -906,30 +1177,27 @@ pub(super) fn resolve_lset(inner: &super::PvDatabaseInner, scheme: &str) -> Opti
 /// (`dbCaTask`); epics-base R7.0.10) — and the completion is resolved so the
 /// put-notify chain unblocks with an error instead of waiting for a wire write
 /// that will never be attempted.
-fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
+fn refuse_for_want_of_a_reactor(key: &LinkKey) -> Written {
     let msg = format!(
         "external link put to '{}' refused: this database was built with no \
          tokio runtime, so no link set can reach the network",
         key.channel.name
     );
     crate::runtime::log::errlog_vprintf(format_args!("dbCa: {msg}\n"));
-    if let Some(c) = staged.completion {
-        c.resolve(false, Err(msg));
+    Written {
+        inline: false,
+        result: Err(msg),
+        unsent: false,
     }
 }
 
 /// Perform one dequeued write. The network suspension lives here — on the
-/// owner's spawned task, never on a record-processing thread. Returns
-/// whether a `ca` put was left unsent (`newOutNative`).
-async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) -> bool {
-    let StagedPut {
-        value,
-        op,
-        completion,
-    } = staged;
+/// owner's spawned task, never on a record-processing thread.
+async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> Written {
+    let WireWrite { value, op } = write;
     let (done, result) = match lset {
         Some(lset) => {
-            let (done, result) = lset.put_value_done(&key.channel.name, value, op).await;
+            let (done, result) = lset.put_value_done(key.channel.link_ref(), value, op).await;
             if result.is_ok() {
                 // Production drain of any retry-queued OUT writes
                 // on this lset now that a write has reached it (the
@@ -956,7 +1224,7 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) ->
     // that went down after staging says nothing: the task skips it with
     // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
     if let Err(e) = &result
-        && lset.is_some_and(|lset| lset.is_connected(&key.channel.name))
+        && lset.is_some_and(|lset| lset.is_connected(key.channel.link_ref()))
     {
         crate::runtime::log::errlog_vprintf(format_args!(
             "dbCa: external link put to '{}' failed: {e}\n",
@@ -967,15 +1235,12 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, staged: StagedPut) ->
         LinkPutOp::Async => done == LinkPutDone::NotIssued,
         LinkPutOp::Plain => result.is_err(),
     };
-    // A put callback dropped at `dbCa.c:1225` is left unanswered in C until
-    // `caLinkDec` completes it on a relink (`dbCa.c:184-197`), so a transient
-    // disconnect hangs the record PACT. That is a C defect, not copied: the
-    // callback completes now, as `caLinkDec` completes it.
-    if let Some(c) = completion {
-        c.resolve(done == LinkPutDone::Inline, result);
+    Written {
+        inline: done == LinkPutDone::Inline,
+        result,
+        // `newOutNative` is dbCa's: pvalink replays its own (`flush_puts`).
+        unsent: unsent && key.channel.scheme == "ca",
     }
-    // `newOutNative` is dbCa's: pvalink replays its own (`flush_puts`).
-    unsent && key.channel.scheme == "ca"
 }
 
 #[cfg(test)]
@@ -986,7 +1251,17 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     fn coalesced(q: &LinkPutQueue, k: &LinkKey) -> u64 {
-        q.coalesced_for(k.link.rec, k.link.field, &k.channel)
+        q.coalesced_for(k.link.rec, k.link.field, k.channel.scheme, &k.channel.name)
+    }
+
+    /// One link identity per name per test thread, so a key keeps one
+    /// channel across calls.
+    fn latch(name: &str) -> crate::server::record::OpenLatch {
+        thread_local! {
+            static LATCHES: std::cell::RefCell<HashMap<String, crate::server::record::OpenLatch>> =
+                Default::default();
+        }
+        LATCHES.with(|l| l.borrow_mut().entry(name.into()).or_default().clone())
     }
 
     /// One parse per test thread stands for every link field the tests name,
@@ -1006,15 +1281,21 @@ mod tests {
                 field: "OUT",
                 install: LinkInstall::Installed(Arc::downgrade(link)),
             },
-            channel: Channel {
-                scheme: "ca",
-                name: name.into(),
-            },
+            channel: Channel::new("ca", name.as_bytes(), &latch(name)),
         }
     }
 
     fn key(name: &str) -> LinkKey {
         key_on(name, &installed())
+    }
+
+    /// A write the lset answered, `unsent` or sent.
+    fn written(unsent: bool) -> Written {
+        Written {
+            inline: false,
+            result: Ok(()),
+            unsent,
+        }
     }
 
     /// Read a completion out of its receiver with no runtime at all.
@@ -1115,7 +1396,7 @@ mod tests {
         q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, _staged) = q.take_ready().expect("ready");
-        q.finish(k, false);
+        q.finish(k, written(false));
         assert!(q.is_idle(), "nothing pending on any link");
         assert_eq!(coalesced(&q, &key("A")), 1);
     }
@@ -1151,7 +1432,7 @@ mod tests {
             "still in flight — at most one write per link keeps write order"
         );
 
-        q.finish(k, false);
+        q.finish(k, written(false));
         let (_, second) = q.take_ready().expect("re-queued after finish");
         assert_eq!(second.value, EpicsValue::Long(9));
     }
@@ -1182,12 +1463,12 @@ mod tests {
         q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
         let (k, _) = q.take_ready().expect("ready");
         q.stage_put(key("A"), EpicsValue::Long(2), PutWaiter::None);
-        q.finish(k, true);
+        q.finish(k, written(true));
 
         assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, staged) = q.take_ready().expect("the newer put is queued");
         assert_eq!(staged.value, EpicsValue::Long(2));
-        q.finish(k, false);
+        q.finish(k, written(false));
         q.stage_put(key("A"), EpicsValue::Long(3), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1, "counted once");
     }
@@ -1201,7 +1482,7 @@ mod tests {
         let q = LinkPutQueue::default();
         q.stage_put(key("A"), EpicsValue::Long(1), PutWaiter::None);
         let (k, _) = q.take_ready().expect("ready");
-        q.finish(k, true);
+        q.finish(k, written(true));
         assert!(q.is_idle(), "a dropped put is not pending for dbCaSync");
         assert!(
             q.take_ready().is_none(),
@@ -1213,7 +1494,7 @@ mod tests {
         let (k, staged) = q.take_ready().expect("the newer put is queued");
         assert_eq!(staged.value, EpicsValue::Long(2));
 
-        q.finish(k, false);
+        q.finish(k, written(false));
         q.stage_put(key("A"), EpicsValue::Long(3), PutWaiter::None);
         assert_eq!(coalesced(&q, &key("A")), 1, "a sent put is not counted");
     }
@@ -1226,12 +1507,47 @@ mod tests {
         let old = Arc::new(crate::server::record::ParsedLink::None);
         q.stage_put(key_on("A", &old), EpicsValue::Long(1), PutWaiter::None);
         let (k, _) = q.take_ready().expect("ready");
-        q.finish(k, true);
+        q.finish(k, written(true));
         drop(old);
 
         let new = Arc::new(crate::server::record::ParsedLink::None);
         q.stage_put(key_on("A", &new), EpicsValue::Long(2), PutWaiter::None);
         assert_eq!(coalesced(&q, &key_on("A", &new)), 0);
+    }
+
+    /// Boundary: a relink while the old link's put callback waits on the
+    /// server. `caLinkDec` calls it then (`dbCa.c:184-197`), the value
+    /// staged behind it is never sent, and the server's late answer
+    /// completes nothing (`dbCa.c:1063`). Decided by the install, not by
+    /// whether the old parse is still alive; the new link's put is untouched.
+    #[test]
+    fn a_relink_completes_the_put_callback_in_flight() {
+        let q = LinkPutQueue::default();
+        let old = Arc::new(crate::server::record::ParsedLink::None);
+        let sent = q
+            .stage_put(key_on("A", &old), EpicsValue::Long(1), PutWaiter::Notify)
+            .expect("Async put yields a completion");
+        let (k, _) = q.take_ready().expect("ready");
+        let behind = q
+            .stage_put(key_on("A", &old), EpicsValue::Long(2), PutWaiter::Notify)
+            .expect("Async put yields a completion");
+        let new = Arc::new(crate::server::record::ParsedLink::None);
+        let next = q
+            .stage_put(key_on("A", &new), EpicsValue::Long(3), PutWaiter::Notify)
+            .expect("Async put yields a completion");
+
+        q.remove_link(None, "OUT", &LinkInstall::Installed(Arc::downgrade(&new)));
+        assert!(resolved(sent).unwrap_err().contains("before it completed"));
+        assert!(resolved(behind).unwrap_err().contains("removed"));
+
+        q.finish(k, written(false));
+        let (k, write) = q.take_ready().expect("the new link's put is sent");
+        assert_eq!(write.value, EpicsValue::Long(3));
+        assert!(q.take_ready().is_none(), "nothing of the old link is sent");
+        q.finish(k, written(false));
+        assert_eq!(resolved(next), Ok(()));
+        assert!(q.is_idle());
+        drop(old);
     }
 
     /// Boundary: tearing the queue down resolves every pending completion.
@@ -1273,7 +1589,7 @@ mod tests {
         assert!(!q.is_idle(), "staged but not run");
         let (k, _) = q.take_ready().expect("ready");
         assert!(!q.is_idle(), "in flight");
-        q.finish(k, false);
+        q.finish(k, written(false));
         assert!(q.is_idle());
         assert_eq!(q.completed_count(), 1);
     }
@@ -1322,7 +1638,7 @@ mod tests {
             .expect("Async put yields a completion");
         drop(old);
 
-        q.finish(k, false);
+        q.finish(k, written(false));
         assert!(q.take_ready().is_none(), "the restaged value is dropped");
         assert!(q.is_idle());
         assert!(resolved(rx).unwrap_err().contains("removed"));

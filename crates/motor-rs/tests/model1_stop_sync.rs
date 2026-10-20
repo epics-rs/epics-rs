@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
@@ -30,10 +30,30 @@ struct Card {
     moves: Arc<Mutex<Vec<f64>>>,
 }
 
+/// `motor_init` reads the card with the status function the task queries.
+impl Model1Motor for Card {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        self.poll(&AsynUser::default(), &mut status)
+            .expect("the card answers");
+        status
+    }
+}
+
 impl AsynMotor for Card {
     fn move_absolute(&mut self, _: &AsynUser, p: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         self.moves.lock().unwrap().push(p);
         self.busy = true;
+        Ok(())
+    }
+    fn move_relative(
+        &mut self,
+        _: &AsynUser,
+        _distance: f64,
+        _: f64,
+        _: f64,
+        _: f64,
+    ) -> AsynResult<()> {
         Ok(())
     }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
@@ -52,17 +72,18 @@ impl AsynMotor for Card {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         if self.busy && self.stopped {
             self.busy = false;
             self.position = 508.0;
         }
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: self.position,
             done: !self.busy,
             direction: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -73,7 +94,7 @@ async fn a_stop_of_a_move_with_a_still_readback_ends_at_the_stopped_position() {
     let moves = card.moves.clone();
     let AxisSetup {
         axis, poll_loop, ..
-    } = MotorBuilder::new(Arc::new(Mutex::new(card)))
+    } = MotorBuilder::model1(Arc::new(Mutex::new(card)))
         .trace_user(TraceUser::Model1 {
             device: MODEL1.choice,
             card: 0,

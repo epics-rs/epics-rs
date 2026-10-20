@@ -213,12 +213,14 @@ impl FlowCtrl {
 /// always followed by its wake.
 ///
 /// The queues it made non-empty — C's `firstEventFlag` — are chained through themselves
-/// (`QueInner::burst_next`), so a burst allocates nothing. A queue already
+/// (`QueInner::burst_next`), so a burst allocates nothing, and woken in the
+/// order they were chained: C signals each at its post. A queue already
 /// in another producer's burst stays there: that burst's drop wakes it, after
 /// this post.
 #[derive(Default)]
 pub struct PostBurst {
     head: Option<Pin<Arc<EvQue>>>,
+    tail: Option<Pin<Arc<EvQue>>>,
 }
 
 impl PostBurst {
@@ -226,8 +228,18 @@ impl PostBurst {
         Self::default()
     }
 
+    /// Chain `que`, which its post has just marked `in_burst`. Called with
+    /// no queue's lock held, so taking the tail's nests no lock.
+    fn push(&mut self, que: &Pin<Arc<EvQue>>) {
+        match self.tail.replace(que.clone()) {
+            Some(tail) => tail.lock().burst_next = Some(que.clone()),
+            None => self.head = Some(que.clone()),
+        }
+    }
+
     #[inline(never)]
     fn wake_chain(&mut self) {
+        self.tail = None;
         while let Some(que) = self.head.take() {
             self.head = {
                 let mut q = que.lock();
@@ -913,6 +925,7 @@ impl EvQue {
         let flow_on = self.flow.is_on();
         let q = &mut *guard;
         let ring_space = q.ring_space();
+        let mut chain = false;
         let Some(sub) = q.subs[usize::from(id.slot())]
             .as_mut()
             .filter(|s| s.id == id && s.gone == 0)
@@ -926,7 +939,7 @@ impl EvQue {
         }
         let npend = sub.npend;
         let last = q.ring[sub.last].as_mut().filter(|_| npend > 0);
-        match last {
+        let outcome = match last {
             // C's early-drop (`dbEvent.c:794-800`): the queued reference
             // reads the field at delivery, so the post adds nothing.
             Some(last) if log.value().is_ref() && last.log.value.is_ref() => {
@@ -964,11 +977,16 @@ impl EvQue {
                 let first_event = ring_space == q.size;
                 if first_event && !q.in_burst {
                     q.in_burst = true;
-                    q.burst_next = burst.head.replace(self.clone());
+                    chain = true;
                 }
                 PostOutcome::Appended { first_event }
             }
+        };
+        drop(guard);
+        if chain {
+            burst.push(self);
         }
+        outcome
     }
 
     /// C `event_read` (`dbEvent.c:932-1014`), reader half.
@@ -3752,6 +3770,35 @@ mod tests {
         assert_eq!(circuit_event(&user), (cap, 10));
         assert_eq!(circuit_event(&user), (cap, 11));
         assert!(circuit_now(&user).is_pending());
+    }
+
+    /// C signals a queue's `ppendsem` at its first event (`dbEvent.c:842-867`),
+    /// so the readers a burst made ready wake in post order.
+    #[test]
+    fn a_burst_wakes_its_queues_in_post_order() {
+        struct Woken(Arc<std::sync::Mutex<Vec<u32>>>, u32);
+        impl std::task::Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.lock().unwrap().push(self.1);
+            }
+        }
+        let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let users: Vec<_> = (0..3).map(|_| EventUser::new()).collect();
+        let mut held = Vec::new();
+        for (sid, user) in (1..).zip(&users) {
+            let (sink, mut reader) = attach(user, sid, LogKind::Val);
+            let waker = std::task::Waker::from(Arc::new(Woken(woken.clone(), sid)));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(reader.poll_recv(&mut cx).is_pending());
+            held.push((sink, reader));
+        }
+        {
+            let mut burst = PostBurst::new();
+            for (sink, _) in &held {
+                sink.post_in(&mut burst, ev(1));
+            }
+        }
+        assert_eq!(*woken.lock().unwrap(), [1, 2, 3]);
     }
 
     /// The posting path has nothing to hash: the queue holds no map. The

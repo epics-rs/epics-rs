@@ -1005,7 +1005,7 @@ impl CaServer {
         let ca_cmds = crate::server::iocsh::ca_server_commands();
 
         let server_clone = server.clone();
-        let generation = epics_base_rs::server::db_server::serving_generation();
+        let mark = epics_base_rs::server::db_server::serving_mark([crate::server::RSRV_SERVER]);
         // `run` drives `tokio::net` listeners, so it belongs on the tokio
         // runtime and nowhere else. `bridge.reactor()` used to place it, and
         // under `exec_backend` that is a callback band with no reactor at all:
@@ -1020,14 +1020,11 @@ impl CaServer {
             )
             .spawn(async move { server_clone.run().await });
         let ended =
-            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
-                .await;
+            epics_base_rs::server::db_server::serving_or_ended(&mark, &mut server_handle).await;
 
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
-            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
-            epics_base_rs::runtime::task::register_main_thread();
+        // C runs `iocsh()` on the thread `epicsThreadInit` listed as `_main_`
+        // (`osdThread.c:406-412`), after whatever `main` ran there first.
+        let shell_result = match epics_base_rs::runtime::task::run_on_main_thread(move || {
             // The shell administers this server's live policy cell so an
             // interactive `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
@@ -1035,11 +1032,11 @@ impl CaServer {
                 shell.register(cmd);
             }
             register_fn(&shell);
-            let result = shell.run_repl();
-            let _ = tx.send(result);
-        });
-
-        let shell_result = rx.await;
+            shell.run_main_prompt()
+        }) {
+            Ok(rx) => rx.await,
+            Err(e) => Ok(Err(format!("could not start the _main_ thread: {e}"))),
+        };
 
         if ended.is_none() {
             server_handle.abort();
@@ -1049,11 +1046,11 @@ impl CaServer {
         match shell_result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                eprintln!("shell error: {e}");
+                epics_libcom_rs::stderr_println!("shell error: {e}");
                 Err(CaError::InvalidValue(e))
             }
             Err(_) => {
-                eprintln!("shell thread dropped unexpectedly");
+                epics_libcom_rs::stderr_println!("shell thread dropped unexpectedly");
                 Err(CaError::InvalidValue("shell thread dropped".to_string()))
             }
         }
@@ -1192,7 +1189,7 @@ impl CaServer {
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             let mgr = mgr.clone();
             let db_save = self.db.clone();
-            mgr.start(&seam_reactor, db_save)
+            mgr.start(db_save)
         } else if let Some((cfg, method)) = self.autosave_config.clone() {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
@@ -1200,7 +1197,7 @@ impl CaServer {
             // there is nothing left here to abandon the autosave task for.
             let mgr = Arc::new(builder.build().await);
             let db_save = self.db.clone();
-            mgr.start(&seam_reactor, db_save)
+            mgr.start(db_save)
         } else {
             None
         };
@@ -1556,11 +1553,11 @@ impl CaServer {
             s.set_nonblocking(true)?;
             tokio::net::UdpSocket::from_std(s)
         })?;
-        epics_base_rs::server::db_server::announce_serving();
+        epics_base_rs::server::db_server::announce_serving(crate::server::RSRV_SERVER);
 
         let result = tokio::select! {
             r = udp_handle => {
-                eprintln!("UDP responder exited: {r:?}");
+                epics_libcom_rs::stderr_println!("UDP responder exited: {r:?}");
                 match r {
                     Ok(inner) => inner,
                     Err(e) => Err(CaError::Io(
@@ -1569,7 +1566,7 @@ impl CaServer {
                 }
             }
             r = tcp_handle => {
-                eprintln!("TCP listener exited: {r:?}");
+                epics_libcom_rs::stderr_println!("TCP listener exited: {r:?}");
                 match r {
                     Ok(inner) => inner,
                     Err(e) => Err(CaError::Io(

@@ -1,4 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the exec-backend suite.
 //! iocsh TAB completion — C `iocsh_attempt_completion` (`iocsh.cpp:502-603`).
 //!
 //! C installs one readline completion hook and dispatches on the
@@ -33,7 +32,6 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::{Context, Helper};
 
 use super::registry::{ArgType, CommandRegistry};
-use crate::runtime::task::BlockingBridge;
 use crate::server::database::PvDatabase;
 
 /// C `rl_completer_word_break_characters` for iocsh (`iocsh.cpp:636`).
@@ -152,20 +150,11 @@ fn complete_path(word: &str) -> Vec<String> {
 pub(crate) struct IocshCompleter {
     registry: Arc<RwLock<CommandRegistry>>,
     db: Arc<PvDatabase>,
-    bridge: BlockingBridge,
 }
 
 impl IocshCompleter {
-    pub(crate) fn new(
-        registry: Arc<RwLock<CommandRegistry>>,
-        db: Arc<PvDatabase>,
-        bridge: BlockingBridge,
-    ) -> Self {
-        Self {
-            registry,
-            db,
-            bridge,
-        }
+    pub(crate) fn new(registry: Arc<RwLock<CommandRegistry>>, db: Arc<PvDatabase>) -> Self {
+        Self { registry, db }
     }
 
     /// Every name `dbCompleteRecord` walks: `dbFirstRecord` /
@@ -174,7 +163,7 @@ impl IocshCompleter {
     fn record_names(&self) -> Vec<String> {
         // Completion matches the line's text, so a name that is not UTF-8
         // offers its lossy form.
-        let mut names = self.bridge.block_on(self.db.all_record_names());
+        let mut names = self.db.all_record_names();
         names.extend(self.db.all_alias_names());
         names.iter().map(|n| n.to_string()).collect()
     }
@@ -273,19 +262,9 @@ mod tests {
     }
 
     fn completer() -> IocshCompleter {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let bridge = {
-            let _guard = rt.enter();
-            BlockingBridge::capture()
-        };
-        std::mem::forget(rt);
         let mut registry = CommandRegistry::new();
         super::super::commands::register_builtins(&mut registry);
-        IocshCompleter::new(
-            Arc::new(RwLock::new(registry)),
-            Arc::new(PvDatabase::new()),
-            bridge,
-        )
+        IocshCompleter::new(Arc::new(RwLock::new(registry)), Arc::new(PvDatabase::new()))
     }
 
     /// The classification the completer dispatches on. Each entry is the

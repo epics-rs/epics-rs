@@ -368,7 +368,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
 /// NO_ALARM.
 #[epics_macros_rs::epics_test]
 async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -376,19 +376,19 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     struct AlarmingLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for AlarmingLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Double(12.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn alarm_severity(&self, _: &[u8]) -> Option<i32> {
+        fn alarm_severity(&self, _: LinkRef<'_>) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        fn alarm_message(&self, _: &[u8]) -> Option<Arc<str>> {
+        fn alarm_message(&self, _: LinkRef<'_>) -> Option<Arc<str>> {
             Some("remote major".into())
         }
     }
@@ -437,20 +437,20 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
 /// NOT raise any alarm on the owning record.
 #[epics_macros_rs::epics_test]
 async fn test_pva_link_no_alarm_when_lset_reports_none() {
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     use epics_base_rs::server::record::AlarmSeverity;
 
     struct QuietLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for QuietLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Double(5.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
         // alarm_severity defaults to None.
     }
@@ -504,21 +504,28 @@ struct CapturingLset {
 }
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for CapturingLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: epics_base_rs::server::database::LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(
+        &self,
+        _: epics_base_rs::server::database::LinkRef<'_>,
+    ) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(
+        &self,
+        link: epics_base_rs::server::database::LinkRef<'_>,
+    ) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
     async fn put_value(
         &self,
-        name: &[u8],
+        link: epics_base_rs::server::database::LinkRef<'_>,
         value: EpicsValue,
         op: epics_base_rs::server::database::LinkPutOp,
     ) -> Result<(), String> {
+        let name = link.name;
         self.writes
             .lock()
             .unwrap()
@@ -2077,20 +2084,21 @@ async fn test_sim_mode_output() {
 /// the INPUT twin of the OUT-link locality fallback.
 #[epics_macros_rs::epics_test]
 async fn test_sim_mode_input_nonlocal_db_siol() {
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     struct ValueCaLset(f64);
     #[epics_base_rs::async_trait]
     impl LinkSet for ValueCaLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            let name = link.name;
             // The bare non-local SIOL record name reaches the CA lset
             // via the read-locality fallback `resolve_external_pv`.
             (name == b"REMOTE:SIM").then_some(EpicsValue::Double(self.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
     }
 
@@ -2680,6 +2688,10 @@ impl epics_base_rs::server::device_support::DeviceSupport for ReadbackDevice {
     }
     fn output_callback_readback(&self) -> bool {
         true
+    }
+    // `outputCallbackCallback` clears UDF before `dbProcess` (devAsynInt32.c:631).
+    fn arm_readback_callback(&mut self) -> epics_base_rs::server::device_support::DeviceUdf {
+        epics_base_rs::server::device_support::DeviceUdf::Defined
     }
 }
 
@@ -7034,23 +7046,24 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     // the link's cached timestamp via dbGetTimeStampTag (recGbl.c:317),
     // exactly like a local-DB link. CA wire carries no userTag, so utag
     // stays 0.
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     struct TimeCaLset {
         secs: i64,
         nsec: i32,
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+            let name = link.name;
             // Only the source record name (with `.TIME` stripped) should
             // reach the lset, mirroring C `TSEL_modified` truncating the
             // pvname at `.TIME`.
@@ -7110,23 +7123,24 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     // CA link — `dbGetTimeStampTag` reads the remote `.TIME`. The pre-fix
     // Db arm did a local `get_record`, found nothing, and never adopted
     // the timestamp; the record kept its local processing time.
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     struct TimeCaLset {
         secs: i64,
         nsec: i32,
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+            let name = link.name;
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
             // fallback `external_link_time("ca://TSE_SRC")`.
@@ -8646,7 +8660,7 @@ async fn test_lnk_calc_parses_and_evaluates() {
 /// `calc_link_adopts_its_time_inputs_stamp.rs`, which owns that half.
 #[epics_macros_rs::epics_test]
 async fn test_lnk_calc_nonlocal_input_resolves_externally() {
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     use epics_base_rs::server::record::CalcLink;
     use epics_base_rs::server::records::ai::AiRecord;
 
@@ -8656,16 +8670,18 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for CalcCaLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            let name = link.name;
             (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+            let name = link.name;
             (name == b"REMOTE:A").then_some((self.secs, self.nsec, 0))
         }
     }
@@ -9442,7 +9458,7 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
 /// * MSS  → max severity AND remote STAT preserved (the cited gap)
 #[epics_macros_rs::epics_test]
 async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkRef, LinkSet};
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -9455,21 +9471,21 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for RawCaLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             Some(EpicsValue::Double(7.0))
         }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
+        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+            self.get_cached_value(link)
         }
-        fn alarm_severity(&self, _: &[u8]) -> Option<i32> {
+        fn alarm_severity(&self, _: LinkRef<'_>) -> Option<i32> {
             // Mirror the real CA resolver: only a non-zero severity is a
             // contribution worth returning.
             if self.sevr > 0 { Some(self.sevr) } else { None }
         }
-        fn alarm_status(&self, _: &[u8]) -> Option<i32> {
+        fn alarm_status(&self, _: LinkRef<'_>) -> Option<i32> {
             Some(self.stat)
         }
     }

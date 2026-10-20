@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
-use epics_base_rs::server::database::{LinkSet, ProcStack, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -53,10 +53,10 @@ struct Down;
 
 #[async_trait::async_trait]
 impl LinkSet for Down {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         false
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
 }

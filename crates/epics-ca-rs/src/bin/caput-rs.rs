@@ -7,6 +7,7 @@ use epics_ca_rs::cli::{
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::{self, CTool};
 use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
+use epics_libcom_rs::cfmt::CFloat;
 use std::time::SystemTime;
 
 /// `printf("%s\n", line)` with a name column that is the name's bytes.
@@ -181,7 +182,7 @@ Example: caput my_channel 1.2
   (puts 1.2 to my_channel)
 
 "#,
-        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        timeout = CFloat(epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS),
         max = epics_ca_rs::copt::CA_PRIORITY_MAX,
     )
 }
@@ -413,7 +414,7 @@ async fn main() {
     let native_type = match ch.native_field_type() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("error: {e}");
+            epics_libcom_rs::stderr_println!("error: {e}");
             std::process::exit(1);
         }
     };
@@ -426,11 +427,13 @@ async fn main() {
         match ch.get_with_metadata(DbrClass::Gr).await {
             Ok(snap) => snap.enums.map(|e| e.strings).unwrap_or_default(),
             Err(CaError::Timeout) => {
-                eprintln!("Read operation timed out: ENUM data was not read.");
+                epics_libcom_rs::stderr_println!(
+                    "Read operation timed out: ENUM data was not read."
+                );
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                epics_libcom_rs::stderr_println!("error: {e}");
                 std::process::exit(1);
             }
         }
@@ -531,7 +534,7 @@ async fn main() {
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{e}");
+            epics_libcom_rs::stderr_println!("{e}");
             std::process::exit(1);
         }
     };
@@ -549,7 +552,7 @@ async fn main() {
         // loop (`caput.c:186-188` then `:191`). `readback_stderr` is the only
         // source of it.
         if let Some(warning) = readback_stderr(&rb) {
-            eprintln!("{warning}");
+            epics_libcom_rs::stderr_println!("{warning}");
         }
         match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
             Some(line) => print_line(&line),
@@ -601,7 +604,7 @@ async fn main() {
         }
     };
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        epics_libcom_rs::stderr_println!("error: {e}");
         std::process::exit(1);
     }
 
@@ -624,7 +627,7 @@ async fn main() {
         long_mode,
     );
     if let Some(warning) = readback_stderr(&rb) {
-        eprintln!("{warning}");
+        epics_libcom_rs::stderr_println!("{warning}");
     }
     match readback_line(&rb, &name_col, sep, &fmt, terse, long_mode) {
         Some(line) => print_line(&line),
@@ -1030,7 +1033,7 @@ fn classify_enum_token(
 /// A menu NAME never reaches here: C only compares the numeric `dbuf[i]`.
 fn warn_if_enum_index_too_large(token: &str, index: f64, menu: &[epics_ca_rs::PvString]) {
     if index >= menu.len() as f64 {
-        eprintln!("Warning: enum index value '{token}' may be too large.");
+        epics_libcom_rs::stderr_println!("Warning: enum index value '{token}' may be too large.");
     }
 }
 

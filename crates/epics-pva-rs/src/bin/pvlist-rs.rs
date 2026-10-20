@@ -259,7 +259,7 @@ async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: boo
                 }
                 let names = channel_names(&resp_value);
                 if names.is_empty() && verbose {
-                    eprintln!("# {raw}: server returned no channels");
+                    epics_libcom_rs::stderr_println!("# {raw}: server returned no channels");
                 }
                 for name in names {
                     println!("{name}");
@@ -267,7 +267,7 @@ async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: boo
             }
         }
         Err(e) => {
-            eprintln!("pvlist-rs: from {raw}: {e}");
+            epics_libcom_rs::stderr_println!("pvlist-rs: from {raw}: {e}");
         }
     }
 }
@@ -366,14 +366,14 @@ async fn discover_mode(args: &Args) {
     let engine = match SearchEngine::spawn(&reactor, Vec::new(), Vec::new()).await {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("pvlist-rs: failed to spawn search engine: {e}");
+            epics_libcom_rs::stderr_println!("pvlist-rs: failed to spawn search engine: {e}");
             std::process::exit(1);
         }
     };
     let mut rx = match engine.discover().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("pvlist-rs: failed to subscribe to discovery: {e}");
+            epics_libcom_rs::stderr_println!("pvlist-rs: failed to subscribe to discovery: {e}");
             std::process::exit(1);
         }
     };
@@ -455,7 +455,7 @@ async fn main() {
 
     if args.servers.is_empty() {
         if args.info {
-            eprintln!("pvlist-rs: -i requires at least one server address");
+            epics_libcom_rs::stderr_println!("pvlist-rs: -i requires at least one server address");
             std::process::exit(2);
         }
         discover_mode(&args).await;
@@ -469,7 +469,7 @@ async fn main() {
         match parse_server_addr(raw, default_port) {
             Ok(addr) => addrs.push((raw.clone(), addr)),
             Err(e) => {
-                eprintln!("pvlist-rs: {e}");
+                epics_libcom_rs::stderr_println!("pvlist-rs: {e}");
                 std::process::exit(2);
             }
         }

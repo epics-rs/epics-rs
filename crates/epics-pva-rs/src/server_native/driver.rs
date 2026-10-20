@@ -83,6 +83,7 @@ use super::peers::PeerRegistry;
 #[cfg(unix)]
 use super::reactor::ReactorPvaServer;
 use super::serv_iface::ServListeners;
+use super::shared_pv::SharedSource;
 use super::source::DynSource;
 use crate::error::PvaResult;
 
@@ -127,6 +128,9 @@ pub trait PvaServerDriver: Send + Sync {
     /// lists.
     fn source(&self) -> &DynSource;
 
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`.
+    fn builtin(&self) -> &Arc<SharedSource>;
+
     /// This server's beacons, the auto destinations on the search port
     /// `udp_port`; run them on a thread of their own.
     fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender>;
@@ -167,6 +171,10 @@ impl PvaServerDriver for BlockingPvaServer {
 
     fn source(&self) -> &DynSource {
         BlockingPvaServer::source(self)
+    }
+
+    fn builtin(&self) -> &Arc<SharedSource> {
+        BlockingPvaServer::builtin(self)
     }
 
     fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender> {
@@ -210,6 +218,10 @@ impl PvaServerDriver for ReactorPvaServer {
 
     fn source(&self) -> &DynSource {
         ReactorPvaServer::source(self)
+    }
+
+    fn builtin(&self) -> &Arc<SharedSource> {
+        ReactorPvaServer::builtin(self)
     }
 
     fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender> {
@@ -278,16 +290,17 @@ pub(crate) fn from_listeners(
     kind: DriverKind,
     listeners: ServListeners,
     source: DynSource,
+    builtin: Arc<SharedSource>,
     config: PvaServerConfig,
 ) -> io::Result<Arc<dyn PvaServerDriver>> {
     Ok(match kind {
         DriverKind::Blocking => Arc::new(BlockingPvaServer::from_listeners(
-            listeners, source, config,
+            listeners, source, builtin, config,
         )?),
         #[cfg(unix)]
-        DriverKind::Reactor => {
-            Arc::new(ReactorPvaServer::from_listeners(listeners, source, config)?)
-        }
+        DriverKind::Reactor => Arc::new(ReactorPvaServer::from_listeners(
+            listeners, source, builtin, config,
+        )?),
     })
 }
 
@@ -361,7 +374,8 @@ mod tests {
             let listeners =
                 ServListeners::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), &config)
                     .expect("bind the listeners");
-            let server = from_listeners(kind, listeners, test_source(), config)
+            let builtin = Arc::new(SharedSource::new());
+            let server = from_listeners(kind, listeners, test_source(), builtin, config)
                 .unwrap_or_else(|e| panic!("{kind:?} binds: {e}"));
             assert_ne!(server.tcp_port(), 0, "{kind:?} reports its bound port");
             assert_eq!(

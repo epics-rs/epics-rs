@@ -21,6 +21,7 @@ use asyn_rs::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp,
 use asyn_rs::user::AsynUser;
 use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
 use epics_base_rs::runtime::time::thread_sleep_quantum;
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
 use crate::buffer::StreamBuffer;
@@ -61,30 +62,6 @@ impl IoAction {
 /// `toStr(asynStatus)`
 fn status_str(status: AsynStatus) -> &'static str {
     status.str_status()
-}
-
-/// C's `%g` of a timeout in seconds.
-fn fmt_g(v: f64) -> String {
-    if v == 0.0 {
-        return "0".into();
-    }
-    // Six significant digits, rounded once, decide the form as printf does.
-    let e = format!("{v:.5e}");
-    let (mantissa, exp) = e.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let trim = |s: String| {
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s
-        }
-    };
-    if !(-4..6).contains(&exp) {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{sign}{:02}", trim(mantissa.to_string()), exp.abs())
-    } else {
-        trim(format!("{v:.prec$}", prec = (5 - exp) as usize))
-    }
 }
 
 /// `ASYN_REASON_SIGNAL` (asynDriver.h:113), C's -1 as asyn-rs's reason.
@@ -302,14 +279,18 @@ impl Inner {
             return false;
         }
 
-        // Check if device knows EOS. C warns "No input EOS support." when
-        // getInputEos fails; asyn-rs's getInputEos cannot fail.
+        // Check if device knows EOS
         if self
             .client()
             .is_some_and(|c| c.get_in_terminator().is_some())
+            && handle
+                .get_input_eos(&AsynUser::new(0).with_addr(addr))
+                .is_err()
         {
-            let _ =
-                handle.submit_blocking(RequestOp::GetInputEos, AsynUser::new(0).with_addr(addr));
+            stream_error(&cmsg!(
+                self.client_name,
+                ": warning: No input EOS support.\n"
+            ));
         }
 
         // is it a GPIB interface ?
@@ -705,7 +686,7 @@ impl Inner {
                 format!(
                     "\", outputSize={}, written={written}) [timeout={} sec] = {} {message}{}\n",
                     output.len(),
-                    fmt_g(secs(write_timeout_ms)),
+                    CFloat(secs(write_timeout_ms)).g(),
                     status_str(status),
                     match (status, write_try) {
                         (AsynStatus::Success, _) => "",
@@ -733,7 +714,7 @@ impl Inner {
         let Some(client) = self.client() else {
             return;
         };
-        let timeout = fmt_g(secs(write_timeout_ms));
+        let timeout = CFloat(secs(write_timeout_ms)).g().to_string();
         match status {
             AsynStatus::Success => {
                 let rest = &output[written.min(output.len())..];
@@ -881,7 +862,7 @@ impl Inner {
             "AsynDriverInterface::readRequest {}: queueRequest(..., priority={priority}, \
              queueTimeout={} sec) = {} [async={async_}] {}\n",
             self.client_name,
-            fmt_g(queue_timeout_s),
+            CFloat(queue_timeout_s).g(),
             status_str(
                 status
                     .as_ref()
@@ -921,8 +902,7 @@ impl Inner {
         let streameoslen = streameos.as_ref().map_or(0, Vec::len);
         let mut deveos: &[u8] = streameos.as_deref().unwrap_or_default();
         let mut oldeos = None;
-        // streameos == None means: don't change eos. C keeps no old
-        // terminator when getInputEos fails; asyn-rs's cannot.
+        // streameos == None means: don't change eos
         if streameos.is_some()
             && let Ok(old) = port.call(&RequestOp::GetInputEos, self.user_on_port())
         {
@@ -1025,7 +1005,7 @@ impl Inner {
                          received={} bytes, eomReason={}, buffer=\"",
                         self.client_name,
                         io_action.to_str(),
-                        fmt_g(timeout),
+                        CFloat(timeout).g(),
                         status_str(status),
                         received,
                         eom_reason_str(eom_reason)
@@ -1108,7 +1088,7 @@ impl Inner {
                             "AsynDriverInterface::readHandler({}): \
                              no async input, retry in in {} seconds\n",
                             self.client_name,
-                            fmt_g(secs(reply_timeout_ms))
+                            CFloat(secs(reply_timeout_ms)).g()
                         ));
                         // start next poll after timer expires
                         if reply_timeout_ms != 0 {
@@ -1135,7 +1115,7 @@ impl Inner {
                              timeout [{} sec] after {} of {bytes_to_read} bytes \"",
                             self.client_name,
                             io_action.to_str(),
-                            fmt_g(timeout),
+                            CFloat(timeout).g(),
                             buffer.len()
                         ),
                         StreamBuffer::from_bytes(&buffer).expand(),
@@ -1399,17 +1379,19 @@ impl Inner {
                 if streameos.is_none() {
                     // Just handle eos as normal end condition.
                     eom_reason |= EomReason::END;
-                } else {
+                } else if let Ok(eos) = bound.port.get_input_eos(&self.user_on_port()) {
                     // We can't just append the terminator: first process
                     // the received data, then add the terminator.
-                    deveos = bound.port.input_eos(bound.addr);
+                    deveos = eos;
                     client.read_callback(StreamIoStatus::StreamIoSuccess, ReadInput::Bytes(buffer));
                     buffer = &deveos;
                 }
-            } else if streameos.is_none() {
+            } else if streameos.is_none()
+                && let Ok(eos) = bound.port.get_input_eos(&self.user_on_port())
+            {
                 // Terminator neither cut off nor set by stream: cut it off
                 // now.
-                deveos = bound.port.input_eos(bound.addr);
+                deveos = eos;
                 if let Some(rest) = buffer.strip_suffix(deveos.as_slice()) {
                     buffer = rest;
                     eom_reason |= EomReason::END;
@@ -1672,7 +1654,7 @@ impl Inner {
             && io_action == IoAction::None
             && let Some(client) = self.client()
         {
-            client.connect_callback(StreamIoStatus::StreamIoSuccess);
+            client.async_connect_callback(StreamIoStatus::StreamIoSuccess);
         }
     }
 }

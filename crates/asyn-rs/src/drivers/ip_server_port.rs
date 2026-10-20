@@ -1031,8 +1031,13 @@ impl DrvAsynIPServerPort {
         })
     }
 
-    /// Bind the listener socket and mark the port connected.
-    fn open_listener(&mut self) -> AsynResult<()> {
+    /// C `createServerSocket` (drvAsynIPServerPort.c:403-481): bind and
+    /// listen unless the socket is already open. Configure runs it before
+    /// the port is registered (:626), and every connect again (:490).
+    pub(crate) fn create_server_socket(&mut self) -> AsynResult<()> {
+        if self.socket_fd().is_some() {
+            return Ok(());
+        }
         if self.config.protocol == IpServerProtocol::Udp {
             return self.open_udp_listener();
         }
@@ -1049,7 +1054,6 @@ impl DrvAsynIPServerPort {
             })?;
         self.start_accept_loop(&listener)?;
         *self.listener.lock() = Some(listener);
-        self.base.set_connected(true);
         Ok(())
     }
 
@@ -1167,7 +1171,6 @@ impl DrvAsynIPServerPort {
 
         *self.udp_socket.lock() = Some(socket);
         *self.udp_thread.lock() = Some(handle);
-        self.base.set_connected(true);
         Ok(())
     }
 
@@ -1347,6 +1350,15 @@ impl DrvAsynIPServerPort {
     }
 }
 
+/// C `ttyCleanup` on a refusal after `createServerSocket` (:651-681): a
+/// server dropped without its actor's shutdown still stops its threads.
+impl Drop for DrvAsynIPServerPort {
+    fn drop(&mut self) {
+        self.stop_accept_loop();
+        self.stop_udp_worker();
+    }
+}
+
 impl PortDriver for DrvAsynIPServerPort {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -1374,7 +1386,7 @@ impl PortDriver for DrvAsynIPServerPort {
         if already_up {
             return Ok(());
         }
-        self.open_listener().inspect_err(|e| {
+        self.create_server_socket().inspect_err(|e| {
             user.print(
                 TraceMask::ERROR,
                 file!(),
@@ -1385,7 +1397,10 @@ impl PortDriver for DrvAsynIPServerPort {
                     e.message()
                 ),
             );
-        })
+        })?;
+        // C `exceptionConnect` (:496).
+        self.base.set_connected(true);
+        Ok(())
     }
 
     fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {

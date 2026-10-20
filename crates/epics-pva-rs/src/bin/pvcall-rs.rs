@@ -131,14 +131,14 @@ async fn main() {
     // pvcall.cpp:172-174 prints the pvput wording, `pvput -h` and all;
     // this is a transcription, not a copy-paste slip.
     let Some(pv_name) = args.pv_name else {
-        eprintln!("No pv name specified. ('pvput -h' for help.)");
+        epics_libcom_rs::stderr_println!("No pv name specified. ('pvput -h' for help.)");
         std::process::exit(1);
     };
 
     let parsed_args: Vec<(String, ScalarValue)> = match collect_args(&args.args) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("pvcall-rs: {e}");
+            epics_libcom_rs::stderr_println!("pvcall-rs: {e}");
             std::process::exit(2);
         }
     };
@@ -189,11 +189,11 @@ async fn main() {
         }
         // tools/call.cpp:151-153.
         Err(epics_pva_rs::error::PvaError::Timeout) => {
-            eprintln!("Timeout");
+            epics_libcom_rs::stderr_println!("Timeout");
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("pvcall-rs: RPC failed: {e}");
+            epics_libcom_rs::stderr_println!("pvcall-rs: RPC failed: {e}");
             std::process::exit(1);
         }
     }

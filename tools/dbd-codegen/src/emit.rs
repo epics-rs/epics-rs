@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::parse::{Device, Field, Menu, RecordType, Variable};
+use crate::parse::{Device, Field, Menu, RecordType, SPC_DBADDR, SPC_NOMOD, Variable, c_special};
 
 /// The `DBF_*` -> `DbFieldType` map, mirroring C `dbStaticLib`'s `dbfType`
 /// enum and `dbAccess.c`'s `mapDBFToDBR`:
@@ -85,7 +85,7 @@ pub fn dbf_to_code(dbf: &str) -> Result<&'static str, String> {
 /// from the record's `cvt_dbaddr`, so they are resolved from
 /// `dbd/cvt_dbaddr.types` instead of dropped.
 pub fn is_internal(f: &Field) -> bool {
-    f.dbf == "DBF_NOACCESS" && f.special.as_deref() != Some("SPC_DBADDR")
+    f.dbf == "DBF_NOACCESS" && f.special != SPC_DBADDR
 }
 
 /// The width of the C struct member an `extra("...")` declaration names.
@@ -183,7 +183,7 @@ pub struct CvtDbAddr {
     /// The `special` C leaves on the DBADDR. Usually still `SPC_DBADDR`, but
     /// `lsi`/`lso`/`asyn` raise `SPC_NOMOD` (making the field unwritable over
     /// CA — `rsrv/camessage.c:2545-2547`) or `SPC_MOD` inside `cvt_dbaddr` itself.
-    pub special: String,
+    pub special: i16,
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
     pub selector: Option<String>,
@@ -216,7 +216,8 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
         if dbf_to_rust(dbf).is_none() {
             return Err(format!("cvt_dbaddr.types:{}: unknown type `{dbf}`", n + 1));
         }
-        special_variant(spc).map_err(|e| format!("cvt_dbaddr.types:{}: {e}", n + 1))?;
+        let spc = c_special(spc)
+            .ok_or_else(|| format!("cvt_dbaddr.types:{}: invalid special `{spc}`", n + 1))?;
         if size != "-" && dbf != "DBF_STRING" {
             return Err(format!("cvt_dbaddr.types:{}: a size on a {dbf} row", n + 1));
         }
@@ -224,7 +225,7 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             (rec.to_string(), field.to_string()),
             CvtDbAddr {
                 dbf: dbf.to_string(),
-                special: spc.to_string(),
+                special: spc,
                 selector: (sel != "-").then(|| sel.to_string()),
                 size: (size != "-").then(|| size.to_string()),
             },
@@ -258,22 +259,24 @@ fn link_type_variant(link_type: &str) -> Result<&'static str, String> {
     })
 }
 
-/// The `SPC_*` token -> the `Special` variant emitted. `special.h` numbers
-/// them; the port names them.
-fn special_variant(spc: &str) -> Result<&'static str, String> {
-    Ok(match spc {
-        "SPC_NOMOD" => "NoMod",
-        "SPC_DBADDR" => "DbAddr",
-        "SPC_SCAN" => "Scan",
-        "SPC_ALARMACK" => "AlarmAck",
-        "SPC_AS" => "As",
-        "SPC_ATTRIBUTE" => "Attribute",
-        "SPC_MOD" => "Mod",
-        "SPC_RESET" => "Reset",
-        "SPC_LINCONV" => "LinConv",
-        "SPC_CALC" => "Calc",
-        other => return Err(format!("unknown special({other}) — extend special_variant")),
-    })
+/// C's `special` code -> the `Special` emitted: `Special::code` inverted,
+/// which this crate cannot call (`special.h:26-39`).
+fn special_variant(code: i16) -> String {
+    match code {
+        0 => "Special::None".to_string(),
+        1 => "Special::NoMod".to_string(),
+        2 => "Special::DbAddr".to_string(),
+        3 => "Special::Scan".to_string(),
+        5 => "Special::AlarmAck".to_string(),
+        6 => "Special::As".to_string(),
+        7 => "Special::Attribute".to_string(),
+        100 => "Special::Mod".to_string(),
+        101 => "Special::Reset".to_string(),
+        102 => "Special::LinConv".to_string(),
+        103 => "Special::Calc".to_string(),
+        104.. => format!("Special::Record({code})"),
+        _ => format!("Special::Global({code})"),
+    }
 }
 
 /// A menu's Rust const name: `menuSimm` -> `MENU_SIMM`, `calcoutOOPT` ->
@@ -364,13 +367,12 @@ fn field_dbf<'a>(
     f: &'a Field,
     cvt: &'a BTreeMap<(String, String), CvtDbAddr>,
     dbd_dir: &str,
-) -> Result<(&'a str, &'a str), String> {
-    let declared = f.special.as_deref().unwrap_or("");
-    if declared != "SPC_DBADDR" {
-        return Ok((&f.dbf, declared));
+) -> Result<(&'a str, i16), String> {
+    if f.special != SPC_DBADDR {
+        return Ok((&f.dbf, f.special));
     }
     cvt.get(&(record.to_string(), f.name.clone()))
-        .map(|c| (c.dbf.as_str(), c.special.as_str()))
+        .map(|c| (c.dbf.as_str(), c.special))
         .ok_or_else(|| {
             format!(
                 "{record}.{}: special(SPC_DBADDR) — its type and special come from the \
@@ -680,10 +682,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         )
         .unwrap();
         writeln!(out, "pub static {da_konst}: &[&str] = &[").unwrap();
-        for f in own
-            .iter()
-            .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
-        {
+        for f in own.iter().filter(|f| f.special == SPC_DBADDR) {
             writeln!(out, "    {},", rust_str(&f.name)).unwrap();
         }
         out.push_str("];\n\n");
@@ -733,7 +732,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         .flat_map(|r| {
             r.fields
                 .iter()
-                .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
+                .filter(|f| f.special == SPC_DBADDR)
                 .map(move |f| (r.name.clone(), f.name.clone()))
         })
         .collect();
@@ -1201,42 +1200,12 @@ fn emit_field(
         Some(_) => "UChar",
         None => dbf_to_rust(dbf).ok_or_else(|| format!("{record}.{}: unknown {dbf}", f.name))?,
     };
-    let variant = |token: &str| -> Result<String, String> {
-        Ok(if token.is_empty() {
-            "Special::None".to_string()
-        } else if let Ok(code) = token.parse::<i16>() {
-            // `special(111)`: C reads the number with `%hd`
-            // (`dbLexRoutines.c:631`), so a named number is that name.
-            match code {
-                0 => "Special::None".to_string(),
-                1 => "Special::NoMod".to_string(),
-                2 => "Special::DbAddr".to_string(),
-                3 => "Special::Scan".to_string(),
-                5 => "Special::AlarmAck".to_string(),
-                6 => "Special::As".to_string(),
-                7 => "Special::Attribute".to_string(),
-                100 => "Special::Mod".to_string(),
-                101 => "Special::Reset".to_string(),
-                102 => "Special::LinConv".to_string(),
-                103 => "Special::Calc".to_string(),
-                104.. => format!("Special::Record({code})"),
-                _ => {
-                    return Err(format!(
-                        "{record}.{}: special({code}) names no code",
-                        f.name
-                    ));
-                }
-            }
-        } else {
-            format!("Special::{}", special_variant(token)?)
-        })
-    };
-    let special = variant(spc)?;
+    let special = special_variant(spc);
     // `field_dbf` swapped in the `cvt_dbaddr` code for an SPC_DBADDR field, so
-    // `spc` above is what C's resolved `DBADDR` carries. The `.dbd`'s own token
+    // `spc` above is what C's resolved `DBADDR` carries. The `.dbd`'s own code
     // is a SECOND fact — it is what `pdbFldDes->special` keeps, and what every
     // reader of the declaration (the loader's field suggestion) must see.
-    let declared_special = variant(f.special.as_deref().unwrap_or(""))?;
+    let declared_special = special_variant(f.special);
     // C's `.dbd` default is ASL1 (`dbLexRoutines.c:570`); `asl(ASL0)` lowers it.
     let asl = match f.asl.as_deref() {
         Some("ASL0") => "Asl::Asl0",
@@ -1295,7 +1264,7 @@ fn emit_field(
     let declared_dbf = dbf_to_code(&f.dbf).map_err(|e| format!("{}: {e}", f.name))?;
     // `read_only` is `special(SPC_NOMOD)` — its own bit because it is the one
     // attribute the runtime put gate reads on every write.
-    let read_only = spc == "SPC_NOMOD";
+    let read_only = spc == SPC_NOMOD;
     writeln!(s, "    FieldDesc {{").unwrap();
     writeln!(s, "        name: {},", rust_str(&f.name)).unwrap();
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
@@ -1345,6 +1314,70 @@ fn emit_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `dbRecordtypeFieldItem` (`dbLexRoutines.c:624-636`) tries the nine
+    /// `pamapspcType` names, then `sscanf("%hd")`, then refuses. A number is
+    /// the same code as its name, so `special(1)` is read-only and
+    /// `special(2)` needs a `cvt_dbaddr` row. Expected codes are a C softIoc's
+    /// `dbDumpField` of the same declarations.
+    #[test]
+    fn special_is_read_as_db_lex_routines_reads_it() {
+        let fields = [
+            ("A", "0", "Special::None", false),
+            ("B", "1", "Special::NoMod", true),
+            ("C", "4", "Special::Global(4)", false),
+            ("D", "-1", "Special::Global(-1)", false),
+            ("E", "111x", "Special::Record(111)", false),
+            ("F", "\" 50\"", "Special::Global(50)", false),
+            ("G", "70000", "Special::Record(4464)", false),
+            ("H", "+8", "Special::Global(8)", false),
+            ("I", "99999999999999999999", "Special::Global(-1)", false),
+            ("J", "7", "Special::Attribute", false),
+            ("K", "103", "Special::Calc", false),
+        ];
+        let mut src = String::from("recordtype(xx) {\n");
+        for (name, spc, _, _) in fields {
+            src += &format!("field({name},DBF_SHORT) {{ special({spc}) }}\n");
+        }
+        src += "}\n";
+        let dbd = crate::parse::parse_str(&src, "xx.dbd", &[]).unwrap();
+        let (menus, cvt) = (BTreeMap::new(), BTreeMap::new());
+        for (f, (name, spc, want, read_only)) in dbd.records[0].fields.iter().zip(fields) {
+            let row = emit_field("xx", f, &menus, &cvt, "dbd").unwrap();
+            assert!(
+                row.contains(&format!("special: {want},")),
+                "{name} special({spc}):\n{row}"
+            );
+            assert!(
+                row.contains(&format!("declared_special: {want},")),
+                "{name}:\n{row}"
+            );
+            assert!(
+                row.contains(&format!("read_only: {read_only},")),
+                "{name}:\n{row}"
+            );
+        }
+
+        // `special(2)` is SPC_DBADDR by number too.
+        let dbd = crate::parse::parse_str(
+            "recordtype(xx) { field(VAL,DBF_SHORT) { special(2) } }",
+            "xx.dbd",
+            &[],
+        )
+        .unwrap();
+        let err = emit_field("xx", &dbd.records[0].fields[0], &menus, &cvt, "dbd").unwrap_err();
+        assert!(err.contains("cvt_dbaddr"), "{err}");
+
+        // `pamapspcType` has no SPC_ATTRIBUTE, and `%hd` needs a digit.
+        for spc in ["SPC_ATTRIBUTE", "abc", "-", "\"\""] {
+            let src = format!("recordtype(xx) {{ field(VAL,DBF_SHORT) {{ special({spc}) }} }}");
+            let err = crate::parse::parse_str(&src, "xx.dbd", &[]).unwrap_err();
+            assert!(
+                err.contains("Invalid 'special' value"),
+                "special({spc}): {err}"
+            );
+        }
+    }
 
     #[test]
     fn menu_const_names_follow_the_epics_convention() {

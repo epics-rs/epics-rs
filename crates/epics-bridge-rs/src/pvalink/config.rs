@@ -194,9 +194,8 @@ pub struct PvaLinkConfig {
     /// Without it, a Put on a disconnected link fails immediately.
     /// OUT only.
     pub retry: bool,
-    /// Require a *local* (same-IOC) channel. When true the link only
-    /// resolves PVs served by the local QSRV instance; remote PVs are
-    /// rejected. Mirrors pvxs `pvaLinkConfig::local`.
+    /// Require a channel of this IOC's database (`dbChannelTest`); any
+    /// other name is refused at open. Mirrors pvxs `pvaLinkConfig::local`.
     pub local: bool,
     /// Atomic multi-link processing. When true, `scan_on_update`
     /// processing for this link is grouped with other `atomic` links

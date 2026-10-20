@@ -185,7 +185,7 @@ mod demo_db {
         //
         // `RTEMS:CA:FAST` is the chain head — an external CP link, so the
         // link's `run_processor` task processes it when `run_monitor`
-        // requests it, on the client reactor's band worker. Its
+        // requests it, on the `dbCaLink` thread. Its
         // FLNK runs C1..C8: nine records processed inline per upstream
         // event, which is the shape §5.4 says is unbounded.
         "record(ai, \"RTEMS:CA:FAST\") {\n",
@@ -1139,7 +1139,7 @@ mod ioc {
         if let Some(why) =
             epics_base_rs::types::wall_clock_range_warning(std::time::SystemTime::now())
         {
-            eprintln!("epics-rs: {why}");
+            epics_libcom_rs::stderr_println!("epics-rs: {why}");
         }
 
         // (2) The database — every boot argument that was not an
@@ -1147,7 +1147,7 @@ mod ioc {
         let (ioc, resolver) = match load_database(&boot_args) {
             Ok(loaded) => loaded,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: iocInit failed: {e}");
+                epics_libcom_rs::stderr_println!("realtime-ca-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -1214,21 +1214,22 @@ mod ioc {
             }),
         ]);
         if let Err(e) = serve_status_pvs(db_for_status, status) {
-            eprintln!("realtime-ca-ioc: cannot register the status PVs: {e}");
+            epics_libcom_rs::stderr_println!(
+                "realtime-ca-ioc: cannot register the status PVs: {e}"
+            );
             return ExitCode::FAILURE;
         }
 
         // Listed after the status PVs are registered, so the console names
         // everything a client can reach rather than only what the `.db`
         // carried.
-        let mut names = block_on_sync(db_for_names.all_record_names())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let mut names = db_for_names.all_record_names();
         names.sort();
 
         let serving = match BlockingCaServing::start(port, port, db, acf, stats.clone()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: {e}");
+                epics_libcom_rs::stderr_println!("realtime-ca-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -1307,8 +1308,8 @@ mod ioc {
         //
         // (a) The band-occupancy tick. A `runtime::task::spawn` +
         //     `runtime::task::sleep` loop, which on this target IS a
-        //     `cbMedium` band task — the same band `run_monitor` and the
-        //     link's `run_processor` run on (§5.4). Each
+        //     `cbMedium` band task — the same band `run_monitor` runs on
+        //     (§5.4); the link's `run_processor` runs on `dbCaLink`. Each
         //     wake writes an incrementing count to `RTEMS:CA:TICK`, so a
         //     host `camonitor` on that record measures the band's timer
         //     jitter directly: `Instant` is 1-second-quantized on target
@@ -1404,7 +1405,9 @@ mod ioc {
                     }
                 }) {
                 Ok(_) => {}
-                Err(e) => eprintln!("C6 probe: cannot start the reporter thread: {e}"),
+                Err(e) => epics_libcom_rs::stderr_println!(
+                    "C6 probe: cannot start the reporter thread: {e}"
+                ),
             }
 
             // The write-deadline measurement, only when the rig named a peer
@@ -1423,7 +1426,9 @@ mod ioc {
                         c6_write_deadline_probe();
                     }) {
                     Ok(_) => {}
-                    Err(e) => eprintln!("C6 probe: cannot start the write-deadline probe: {e}"),
+                    Err(e) => epics_libcom_rs::stderr_println!(
+                        "C6 probe: cannot start the write-deadline probe: {e}"
+                    ),
                 }
             }
         }
@@ -1435,7 +1440,9 @@ mod ioc {
         match serving.join() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: name-search responder failed: {e}");
+                epics_libcom_rs::stderr_println!(
+                    "realtime-ca-ioc: name-search responder failed: {e}"
+                );
                 ExitCode::FAILURE
             }
         }

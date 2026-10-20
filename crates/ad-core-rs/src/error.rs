@@ -32,8 +32,9 @@ pub enum ADError {
     #[error("{message}")]
     Reported { lines: Vec<String>, message: String },
 
-    /// A write after which the writer closed its own file and C drops the
-    /// capture with no `closeFileBase` (NDFileHDF5.cpp:1519-1557).
+    /// A writer call after which C's writer has dropped the capture itself,
+    /// setting NDFileCapture and NDWriteFile to 0, and holds no open file, so
+    /// no `closeFileBase` follows (NDFileHDF5.cpp:192-203, :1519-1557).
     #[error("{0}")]
     Aborted(Box<ADError>),
 }

@@ -27,6 +27,11 @@
 //! `crates/epics-base-rs/envconfig/`, and its output is checked in, so neither
 //! the build nor CI depends on an EPICS installation.
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "single-threaded generator of epics-libcom-rs tables: no second writer, and it cannot depend on the crate it generates for"
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

@@ -39,7 +39,7 @@ pub struct PvaServerBuilder {
 /// (`ioc/iochooks.cpp:508-509`, pvxs 1.5.3).
 fn announce_server_failure(result: PvaResult<()>) -> CaResult<()> {
     if let Err(e) = &result {
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "Error in pvxsBaseRegistrar : {}",
             super::iocsh::pvxs_what(e)
         );
@@ -327,16 +327,14 @@ impl PvaServer {
         // Every `run*` entry point funnels through here, so this is the one
         // place the server needs the capability: the autosave tail is a
         // reactor-bound task and says so in `AutosaveManager::start`.
-        let reactor = epics_base_rs::runtime::task::Reactor::current()
-            .expect("the PVA server's run loop is awaited on an executor");
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
-            mgr.clone().start(&reactor, self.db.clone())
+            mgr.clone().start(self.db.clone())
         } else if let Some((cfg, method)) = self.autosave_config.clone() {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg, method);
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.
-            Arc::new(builder.build().await).start(&reactor, self.db.clone())
+            Arc::new(builder.build().await).start(self.db.clone())
         } else {
             None
         };
@@ -359,7 +357,7 @@ impl PvaServer {
             // having done. Every `run*` entry funnels through here, so it
             // is the one place the layer can say it, and `BuiltIoc::run`
             // holds the startup script's `iocInit` line until it has.
-            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::server::db_server::announce_serving(super::iocsh::PVXS_SERVER);
         };
         let result = async move {
             let bound = match registrar {
@@ -368,7 +366,7 @@ impl PvaServer {
                 // to start, so `iocRun` is not held for it, and the autosave
                 // task above lives until the runner ends.
                 Some(super::iocsh::PvxsServer(None)) => {
-                    epics_base_rs::server::db_server::announce_serving();
+                    epics_base_rs::server::db_server::announce_serving(super::iocsh::PVXS_SERVER);
                     std::future::pending().await
                 }
                 None => {
@@ -411,7 +409,7 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let generation = epics_base_rs::server::db_server::serving_generation();
+        let mark = epics_base_rs::server::db_server::serving_mark([super::iocsh::PVXS_SERVER]);
         let mut server_handle = bridge.reactor().spawn(async move {
             announce_server_failure(
                 server_clone
@@ -420,24 +418,21 @@ impl PvaServer {
             )
         });
         let ended =
-            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
-                .await;
+            epics_base_rs::server::db_server::serving_or_ended(&mark, &mut server_handle).await;
 
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
-            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
-            epics_base_rs::runtime::task::register_main_thread();
+        // C runs `iocsh()` on the thread `epicsThreadInit` listed as `_main_`
+        // (`osdThread.c:406-412`), after whatever `main` ran there first.
+        let shell_result = match epics_base_rs::runtime::task::run_on_main_thread(move || {
             // Administer this server's live policy cell so an interactive
             // `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
             shell.register(super::iocsh::pvxsr_command());
-            let result = shell.run_repl();
-            let _ = tx.send(result);
-        });
-
-        let shell_result = rx.await;
+            shell.run_main_prompt()
+        }) {
+            Ok(rx) => rx.await,
+            Err(e) => Ok(Err(format!("could not start the _main_ thread: {e}"))),
+        };
 
         if ended.is_none() {
             server_handle.abort();
@@ -447,11 +442,11 @@ impl PvaServer {
         match shell_result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                eprintln!("shell error: {e}");
+                epics_libcom_rs::stderr_println!("shell error: {e}");
                 Err(CaError::InvalidValue(e))
             }
             Err(_) => {
-                eprintln!("shell thread dropped unexpectedly");
+                epics_libcom_rs::stderr_println!("shell thread dropped unexpectedly");
                 Err(CaError::InvalidValue("shell thread dropped".to_string()))
             }
         }
@@ -473,29 +468,26 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let generation = epics_base_rs::server::db_server::serving_generation();
+        let mark = epics_base_rs::server::db_server::serving_mark([super::iocsh::PVXS_SERVER]);
         let mut server_handle = bridge.reactor().spawn(async move {
             announce_server_failure(server_clone.run_with_source_inner(source, None).await)
         });
         let ended =
-            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
-                .await;
+            epics_base_rs::server::db_server::serving_or_ended(&mark, &mut server_handle).await;
 
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
-            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
-            epics_base_rs::runtime::task::register_main_thread();
+        // C runs `iocsh()` on the thread `epicsThreadInit` listed as `_main_`
+        // (`osdThread.c:406-412`), after whatever `main` ran there first.
+        let shell_result = match epics_base_rs::runtime::task::run_on_main_thread(move || {
             // Same as `run_with_shell`: the shell administers this
             // server's live policy cell.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
             shell.register(super::iocsh::pvxsr_command());
-            let result = shell.run_repl();
-            let _ = tx.send(result);
-        });
-
-        let shell_result = rx.await;
+            shell.run_main_prompt()
+        }) {
+            Ok(rx) => rx.await,
+            Err(e) => Ok(Err(format!("could not start the _main_ thread: {e}"))),
+        };
 
         if ended.is_none() {
             server_handle.abort();
@@ -505,11 +497,11 @@ impl PvaServer {
         match shell_result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                eprintln!("shell error: {e}");
+                epics_libcom_rs::stderr_println!("shell error: {e}");
                 Err(CaError::InvalidValue(e))
             }
             Err(_) => {
-                eprintln!("shell thread dropped unexpectedly");
+                epics_libcom_rs::stderr_println!("shell thread dropped unexpectedly");
                 Err(CaError::InvalidValue("shell thread dropped".to_string()))
             }
         }

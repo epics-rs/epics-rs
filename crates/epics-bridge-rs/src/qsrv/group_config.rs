@@ -378,9 +378,10 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
                 .collect();
             for member in def.members {
                 if !seen.insert(member.field_name.clone()) {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}': ignoring duplicate mapping for field '{}'",
-                        def.name, member.field_name
+                        def.name,
+                        member.field_name
                     );
                     continue;
                 }
@@ -410,9 +411,10 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
             // `+atomic:false`.
             if def.atomic_is_set {
                 if existing_def.atomic_is_set && existing_def.atomic != def.atomic {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}' atomic setting inconsistent, using latest ({})",
-                        def.name, def.atomic
+                        def.name,
+                        def.atomic
                     );
                 }
                 existing_def.atomic = def.atomic;
@@ -626,9 +628,10 @@ fn raw_to_group_def(
         // (group.rs) and silently produced no runtime value AND no
         // descriptor member — a misconfigured group that loaded clean.
         if member.field_name.is_empty() && member.mapping != FieldMapping::Meta {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "warning: group '{}': only +type:\"meta\" can be mapped at struct top; ignoring empty-named field with mapping {:?}",
-                name, member.mapping
+                name,
+                member.mapping
             );
             continue;
         }
@@ -666,18 +669,22 @@ fn raw_to_group_def(
                     // every sibling group still load. Do NOT fail the
                     // whole config. The unknown ref is then filtered out
                     // at runtime in `value_event_mark`.
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "Error: group '{}': member '{}' defines trigger to nonexistent field '{}' (ignored)",
-                        name, member.field_name, target
+                        name,
+                        member.field_name,
+                        target
                     );
                     continue;
                 }
                 // A channel-less target (Structure/Const) is dropped too —
                 // pvxs ignores these (groupconfigprocessor.cpp:405-407).
                 if !channeled_names.contains(target.as_str()) {
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "warning: group '{}': trigger '{}' on member '{}' targets a field without a channel (ignored)",
-                        name, target, member.field_name
+                        name,
+                        target,
+                        member.field_name
                     );
                 }
             }
@@ -825,7 +832,7 @@ fn parse_member(
     let channel = match mapping {
         FieldMapping::Structure | FieldMapping::Const => {
             if obj.get("+channel").is_some() {
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "warning: field '{field_name}' has +type={:?}, ignoring +channel",
                     if mapping == FieldMapping::Structure {
                         "structure"

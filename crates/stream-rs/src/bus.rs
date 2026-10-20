@@ -111,6 +111,11 @@ pub trait Client: Send + Sync {
     }
     fn event_callback(&self, _status: StreamIoStatus) {}
     fn connect_callback(&self, _status: StreamIoStatus) {}
+    /// `connectCallback()` for a connect no request asked for
+    /// (AsynDriverInterface.cc:1283-1284), which belongs to no run.
+    fn async_connect_callback(&self, status: StreamIoStatus) {
+        self.connect_callback(status)
+    }
     fn disconnect_callback(&self, _status: StreamIoStatus) {}
     fn priority(&self) -> i64 {
         0

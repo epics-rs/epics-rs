@@ -260,7 +260,9 @@ async fn main() {
     // (`-p 0` or `EPICS_PVA_BROADCAST_PORT=0`) cannot be a meaningful
     // PVA broadcast/search port (mshim.cpp:70-72).
     if default_port == 0 {
-        eprintln!("mshim-rs: non-zero port number required (got -p/EPICS_PVA_BROADCAST_PORT 0)");
+        epics_libcom_rs::stderr_println!(
+            "mshim-rs: non-zero port number required (got -p/EPICS_PVA_BROADCAST_PORT 0)"
+        );
         std::process::exit(2);
     }
 
@@ -272,7 +274,7 @@ async fn main() {
     {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("mshim-rs: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: {e}");
             std::process::exit(2);
         }
     };
@@ -284,7 +286,7 @@ async fn main() {
     {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("mshim-rs: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: {e}");
             std::process::exit(2);
         }
     };
@@ -307,21 +309,21 @@ async fn main() {
     let send_socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mshim-rs: create send socket: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: create send socket: {e}");
             std::process::exit(1);
         }
     };
     if let Err(e) = send_socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())
     {
-        eprintln!("mshim-rs: bind send socket: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: bind send socket: {e}");
         std::process::exit(1);
     }
     if let Err(e) = send_socket.set_nonblocking(true) {
-        eprintln!("mshim-rs: send socket set_nonblocking: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: send socket set_nonblocking: {e}");
         std::process::exit(1);
     }
     if let Err(e) = send_socket.set_broadcast(true) {
-        eprintln!("mshim-rs: set_broadcast: {e}");
+        epics_libcom_rs::stderr_println!("mshim-rs: set_broadcast: {e}");
     }
     // mshim uses a single shared send socket. `IP_MULTICAST_TTL` /
     // `IP_MULTICAST_IF` are setsockopt state on that socket, so the
@@ -332,7 +334,7 @@ async fn main() {
     let send_sock = match UdpSocket::from_std(send_sock_std) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mshim-rs: send socket from_std: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: send socket from_std: {e}");
             std::process::exit(1);
         }
     };
@@ -347,12 +349,12 @@ async fn main() {
             // Without the snapshot every forwarded broadcast would be
             // misclassified as unicast, so this is fatal rather than an
             // empty set that silently changes the forwarding decision.
-            eprintln!("mshim-rs: interface enumeration: {e}");
+            epics_libcom_rs::stderr_println!("mshim-rs: interface enumeration: {e}");
             std::process::exit(1);
         }
     };
 
-    eprintln!(
+    epics_libcom_rs::stderr_println!(
         "mshim-rs: listening on {} endpoint(s), forwarding to {} target(s)",
         listen.len(),
         forward.len()
@@ -363,9 +365,14 @@ async fn main() {
             extras.push(format!("iface={i}"));
         }
         if extras.is_empty() {
-            eprintln!("  listen {}:{}", ep.ip, ep.port);
+            epics_libcom_rs::stderr_println!("  listen {}:{}", ep.ip, ep.port);
         } else {
-            eprintln!("  listen {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
+            epics_libcom_rs::stderr_println!(
+                "  listen {}:{} [{}]",
+                ep.ip,
+                ep.port,
+                extras.join(" ")
+            );
         }
     }
     for (ep, tgt) in forward.iter().zip(forward_targets.iter()) {
@@ -377,9 +384,14 @@ async fn main() {
             extras.push(format!("iface={i}"));
         }
         if extras.is_empty() {
-            eprintln!("  forward → {}:{}", ep.ip, ep.port);
+            epics_libcom_rs::stderr_println!("  forward → {}:{}", ep.ip, ep.port);
         } else {
-            eprintln!("  forward → {}:{} [{}]", ep.ip, ep.port, extras.join(" "));
+            epics_libcom_rs::stderr_println!(
+                "  forward → {}:{} [{}]",
+                ep.ip,
+                ep.port,
+                extras.join(" ")
+            );
         }
     }
 
@@ -388,7 +400,7 @@ async fn main() {
         let sock = match bind_listen(&ep) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mshim-rs: bind {}:{}: {e}", ep.ip, ep.port);
+                epics_libcom_rs::stderr_println!("mshim-rs: bind {}:{}: {e}", ep.ip, ep.port);
                 std::process::exit(1);
             }
         };
@@ -446,10 +458,13 @@ async fn main() {
                                 // (notably `IP_MULTICAST_IF`).
                                 let sref = SockRef::from(send_sock.as_ref());
                                 if let Err(e) = sref.set_multicast_ttl_v4(ttl) {
-                                    eprintln!("mshim-rs: set multicast ttl for {}: {e}", tgt.addr);
+                                    epics_libcom_rs::stderr_println!(
+                                        "mshim-rs: set multicast ttl for {}: {e}",
+                                        tgt.addr
+                                    );
                                 }
                                 if let Err(e) = sref.set_multicast_if_v4(&iface) {
-                                    eprintln!(
+                                    epics_libcom_rs::stderr_println!(
                                         "mshim-rs: set multicast iface for {}: {e}",
                                         tgt.addr
                                     );
@@ -459,12 +474,19 @@ async fn main() {
                             if let Err(e) = send_sock.send_to(&frame, tgt.addr).await
                                 && e.kind() != ErrorKind::WouldBlock
                             {
-                                eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
+                                epics_libcom_rs::stderr_println!(
+                                    "mshim-rs: forward to {}: {e}",
+                                    tgt.addr
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("mshim-rs: recv on {}:{}: {e}", ep.ip, ep.port);
+                        epics_libcom_rs::stderr_println!(
+                            "mshim-rs: recv on {}:{}: {e}",
+                            ep.ip,
+                            ep.port
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -477,7 +499,7 @@ async fn main() {
     tokio::select! {
         _ = futures_join_all(handles) => {}
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("mshim-rs: shutting down");
+            epics_libcom_rs::stderr_println!("mshim-rs: shutting down");
         }
     }
 }

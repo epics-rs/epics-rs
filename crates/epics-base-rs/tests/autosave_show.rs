@@ -85,7 +85,7 @@ fn child_show() {
     if std::env::var_os(NFS).is_none() {
         holder.lock().unwrap().save_file_path = Some(dir.clone());
     }
-    if let Some(save_dir) = std::env::var_os(SAVE_DIR) {
+    let mgr = std::env::var_os(SAVE_DIR).map(|save_dir| {
         rt.block_on(async {
             db.add_record("A", Box::new(AoRecord::new(1.5)))
                 .await
@@ -108,16 +108,20 @@ fn child_show() {
                         request_pvs: Vec::new(),
                         backup: BackupConfig { enable_savb: false },
                         macros: Default::default(),
-                        macro_string: "P=x".into(),
+                        macro_string: Some("P=x".into()),
                         search_paths: vec![dir.clone()],
                     },
                     SaveStrategy::Manual,
                 )
                 .build()
                 .await;
-            holder.lock().unwrap().manager = Some(Arc::new(mgr));
-        });
-    }
+            let mgr = Arc::new(mgr);
+            holder.lock().unwrap().manager = Some(mgr.clone());
+            mgr
+        })
+    });
+    let _task = mgr.clone().map(|m| m.start(db.clone()));
+    let handle = rt.handle().clone();
     let line = std::env::var(LINE).unwrap();
     let bridge = {
         let _guard = rt.enter();
@@ -139,6 +143,9 @@ fn child_show() {
                 Ok(CommandOutcome::Failed) => println!("FAILED"),
                 Ok(_) => {}
                 Err(e) => println!("ERR {e}"),
+            }
+            if let Some(mgr) = &mgr {
+                handle.block_on(mgr.ops_served());
             }
         }
     })
@@ -247,7 +254,7 @@ fn save_restore_show_lists_a_set() {
     };
     assert!(time(lines[4], "    Last save time  :"), "{lines:?}");
     assert!(time(lines[5], "    Last backup time:"), "{lines:?}");
-    let mut got = lines.clone();
+    let mut got: Vec<String> = lines.iter().map(|l| mask_chid(l)).collect();
     got.drain(4..6);
     assert_eq!(
         got[..16],
@@ -263,10 +270,10 @@ fn save_restore_show_lists_a_set() {
             "    save_state = 0x0",
             "    period: 4; trigger chan: ''; monitor period: 4",
             "    last saved file - ",
-            "    0 channels not connected (or ca_get failed)",
-            "\tA state:Conn (max:1 curr:1 elements)\t1.5   channel_connected = 1",
-            "\tB state:Conn (max:1 curr:1 elements)\tzero   channel_connected = 1\t0",
-            "\tX state:Never (max:0 curr:0 elements)\tSearch Issued   channel_connected = 0",
+            "    1 channel  not connected (or ca_get failed)",
+            "\tA chid:PTR state:Conn (max:1 curr:1 elements)\t1.5   channel_connected = 1",
+            "\tB chid:PTR state:Conn (max:1 curr:1 elements)\tzero   channel_connected = 1\t0",
+            "\tX chid:PTR state:Never (max:0 curr:0 elements)\tSearch Issued   channel_connected = 0",
             "reboot-restore status:",
         ]
     );
@@ -287,6 +294,42 @@ fn save_restore_show_names_the_last_saved_file() {
         "{out:?}"
     );
     assert!(out.contains(&"  I/O errors: 0".to_string()), "{out:?}");
+}
+
+/// Past `save_restoreRemountThreshold` (10) failed opens the managed file
+/// system shows as failed (save_restore.c:1987-1990), as the C oracle
+/// IOC's listing does after its eleventh.
+#[test]
+fn the_eleventh_failed_open_fails_the_nfs_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = |n: usize| vec!["manual_save(\"s.req\")"; n].join(";");
+    let out = run_child_nfs(
+        dir.path(),
+        &format!(
+            "set_savefile_path(\"{}\");save_restoreSet_NFSHost(\"h\", \"1.2.3.4\", \"\");\
+             {};save_restoreShow(0);{};save_restoreShow(0)",
+            dir.path().display(),
+            saves(10),
+            saves(1)
+        ),
+        Some("none"),
+        true,
+    );
+    let shown: Vec<&str> = out
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.starts_with("  NFS mount status") || l.starts_with("  I/O errors"))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "  NFS mount status: Ok",
+            "  I/O errors: 10",
+            "  NFS mount status: Failed",
+            "  I/O errors: 11",
+        ],
+        "{out:?}"
+    );
 }
 
 /// The C oracle IOC's lines with `save_restoreNFSRegister` run: the Linux
@@ -408,4 +451,15 @@ fn path_commands_join_as_c() {
             "  The save_restore task apparently is not running.",
         ]
     );
+}
+
+/// `line` with its `chid:0x...` address written `chid:PTR`.
+fn mask_chid(line: &str) -> String {
+    match line.find("chid:0x") {
+        Some(i) => {
+            let end = line[i + 5..].find(' ').map_or(line.len(), |e| i + 5 + e);
+            format!("{}chid:PTR{}", &line[..i], &line[end..])
+        }
+        None => line.to_string(),
+    }
 }

@@ -5,9 +5,13 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
+use epics_libcom_rs::runtime::log::{
+    StagedLine, StagedStderr, errlog_printf_bytes, errlog_vprintf,
+};
 
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 
@@ -253,11 +257,8 @@ pub enum TraceFile {
     Stdout,
     /// EPICS errlog sink. C asyn maps the trace file pointer `NULL`
     /// (`fd == 0`, the `<errlog>` token in asynRecord.c:456) to
-    /// `errlogPrintf`, which routes through the central error logger and
-    /// is async-signal safe. This port has no errlog ring buffer, so the
-    /// faithful console behaviour is stderr (errlog's default sink); the
-    /// distinct variant preserves the `<errlog>` routing decision so a
-    /// later errlog wiring need only change this arm.
+    /// `errlogPrintf`: every piece C prints is one errlog message, cut at
+    /// `maxMsgSize` and handed to errlog's listeners (`Printer`).
     Errlog,
     File(Arc<Mutex<std::fs::File>>),
 }
@@ -292,8 +293,9 @@ impl TraceFile {
     /// 3173), which carries control bytes and invalid UTF-8 through untouched.
     pub fn write_bytes(&self, line: &[u8]) {
         match self {
-            TraceFile::Stderr | TraceFile::Errlog => {
-                let _ = std::io::stderr().write_all(line);
+            TraceFile::Errlog => errlog_printf_bytes(&[line]),
+            TraceFile::Stderr => {
+                let _ = StagedStderr.write_all(line);
             }
             TraceFile::Stdout => {
                 let _ = std::io::stdout().write_all(line);
@@ -306,30 +308,83 @@ impl TraceFile {
         }
     }
 
-    /// Stream `body` into the sink under its lock, as C's `vfprintf(fp, ...)`
-    /// writes a trace print of any length: nothing is added, so a line ends
-    /// where the caller's format ends it. Staged in a stack buffer that
-    /// spills when full, so nothing is allocated.
-    fn write_streamed(&self, body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result) {
-        fn stream(
-            out: &mut dyn std::io::Write,
-            body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
-        ) {
-            let mut spill = TraceOut {
-                out,
-                buf: [0; 512],
-                len: 0,
-            };
-            let _ = body(&mut spill);
-            let _ = spill.flush();
-        }
+    /// One trace print, C's `traceVprintSource` / `traceVprintIOSource` from
+    /// the prefix on. A stream sink takes it under its lock, as C's `fprintf`s
+    /// into `fp` do: nothing is added, so a line ends where the caller's
+    /// format ends it. Staged whole and written once, so another writer's
+    /// line cannot land inside it; nothing is allocated below 1 KiB.
+    fn print(&self, f: impl FnOnce(&mut Printer<'_, '_>) -> std::fmt::Result) {
         match self {
-            TraceFile::Stderr | TraceFile::Errlog => stream(&mut std::io::stderr().lock(), body),
-            TraceFile::Stdout => stream(&mut std::io::stdout().lock(), body),
-            TraceFile::File(f) => {
-                if let Ok(mut f) = f.lock() {
-                    stream(&mut *f, body);
+            TraceFile::Errlog => {
+                let _ = f(&mut Printer::Errlog);
+            }
+            TraceFile::Stderr => stream(&mut StagedStderr, |o| f(&mut Printer::Stream(o))),
+            TraceFile::Stdout => stream(&mut std::io::stdout().lock(), |o| {
+                f(&mut Printer::Stream(o))
+            }),
+            TraceFile::File(file) => {
+                if let Ok(mut file) = file.lock() {
+                    stream(&mut *file, |o| f(&mut Printer::Stream(o)));
                 }
+            }
+        }
+    }
+}
+
+/// [`TraceFile::print`]'s print to one sink.
+fn stream(out: &mut dyn std::io::Write, body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result) {
+    let mut staged = TraceOut {
+        out,
+        line: StagedLine::default(),
+    };
+    let _ = body(&mut staged);
+    let _ = staged.out.write_all(staged.line.bytes());
+}
+
+/// Where the pieces of one trace print go. C prints each with its own
+/// `fprintf(fp, ...)`, which on a stream run together, or, for errlog
+/// (`fp == NULL`), its own `errlogPrintf`: one errlog message each
+/// (asynManager.c:2998-3058, :3104-3108, :3165-3221).
+enum Printer<'a, 'b> {
+    Stream(&'a mut TraceOut<'b>),
+    Errlog,
+}
+
+impl Printer<'_, '_> {
+    /// One C `fprintf` / `errlogPrintf` of text.
+    fn text(&mut self, args: std::fmt::Arguments<'_>) -> std::fmt::Result {
+        match self {
+            Printer::Stream(out) => std::fmt::Write::write_fmt(*out, args),
+            Printer::Errlog => {
+                errlog_vprintf(args);
+                Ok(())
+            }
+        }
+    }
+
+    /// One of device bytes, `parts` run together.
+    fn bytes(&mut self, parts: &[&[u8]]) -> std::fmt::Result {
+        match self {
+            Printer::Stream(out) => parts.iter().try_for_each(|p| out.write_bytes(p)),
+            Printer::Errlog => {
+                errlog_printf_bytes(parts);
+                Ok(())
+            }
+        }
+    }
+
+    /// The caller's message, C's `vfprintf` / `errlogVprintf`. errlog gets it
+    /// rendered, so `body` runs once and outside errlog's lock.
+    fn body(
+        &mut self,
+        body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        match self {
+            Printer::Stream(out) => body(out),
+            Printer::Errlog => {
+                let mut line = Vec::new();
+                stream(&mut line, body);
+                self.bytes(&[&line])
             }
         }
     }
@@ -337,31 +392,16 @@ impl TraceFile {
 
 /// The trace sink a print body writes into: text through [`std::fmt::Write`]
 /// (`write!`), and bytes as they are through [`Self::write_bytes`], as C's
-/// `fprintf` writes a `%s` of device bytes. Staged in a fixed buffer.
+/// `fprintf` writes a `%s` of device bytes. Staged whole for one write.
 pub struct TraceOut<'a> {
     out: &'a mut dyn std::io::Write,
-    buf: [u8; 512],
-    len: usize,
+    line: StagedLine,
 }
 
 impl TraceOut<'_> {
-    fn flush(&mut self) -> std::fmt::Result {
-        let n = std::mem::take(&mut self.len);
-        self.out
-            .write_all(&self.buf[..n])
-            .map_err(|_| std::fmt::Error)
-    }
-
     /// Write `s` untouched: invalid UTF-8 and control bytes included.
     pub fn write_bytes(&mut self, s: &[u8]) -> std::fmt::Result {
-        if self.len + s.len() > self.buf.len() {
-            self.flush()?;
-        }
-        if s.len() > self.buf.len() {
-            return self.out.write_all(s).map_err(|_| std::fmt::Error);
-        }
-        self.buf[self.len..self.len + s.len()].copy_from_slice(s);
-        self.len += s.len();
+        self.line.push_bytes(s);
         Ok(())
     }
 }
@@ -519,6 +559,10 @@ pub struct TraceManager {
     /// after construction (PortManager builds both objects, then wires
     /// the trace sink after).
     exception_sink: Mutex<Option<Arc<ExceptionManager>>>,
+    /// Every trace-mask bit any slot has held. It only grows, so a mask
+    /// outside it cannot print anywhere and the emitters return without the
+    /// `ports` lock, as C's `asynPrint` tests the mask without one.
+    masks_set: AtomicU32,
 }
 
 impl TraceManager {
@@ -527,7 +571,12 @@ impl TraceManager {
             global_config: Mutex::new(TraceConfig::default()),
             ports: Mutex::new(HashMap::new()),
             exception_sink: Mutex::new(None),
+            masks_set: AtomicU32::new(TraceConfig::default().trace_mask.bits()),
         }
+    }
+
+    fn may_trace(&self, mask: TraceMask) -> bool {
+        self.masks_set.load(Ordering::Relaxed) & mask.bits() != 0
     }
 
     /// Tell the manager a port exists and whether it is `ASYN_MULTIDEVICE` —
@@ -651,15 +700,19 @@ impl TraceManager {
             "is_enabled expects a single trace level, got {:?}",
             mask
         );
-        self.with_dp_common(port, None, |cfg| cfg.trace_mask.intersects(mask))
-            .unwrap_or(false)
+        self.may_trace(mask)
+            && self
+                .with_dp_common(port, None, |cfg| cfg.trace_mask.intersects(mask))
+                .unwrap_or(false)
     }
 
     /// Check if a trace level is enabled for a specific device address —
     /// the same `findDpCommon` resolution the emit path uses.
     pub fn is_enabled_device(&self, port: &str, addr: i32, mask: TraceMask) -> bool {
-        self.with_dp_common(port, Some(addr), |cfg| cfg.trace_mask.intersects(mask))
-            .unwrap_or(false)
+        self.may_trace(mask)
+            && self
+                .with_dp_common(port, Some(addr), |cfg| cfg.trace_mask.intersects(mask))
+                .unwrap_or(false)
     }
 
     /// Run `f` with the one `dpCommon` trace slot C's `findDpCommon`
@@ -801,6 +854,7 @@ impl TraceManager {
     /// names no device (`locateDevice`, :576) and this is the port-scoped
     /// write, exactly as it is in C.
     pub fn set_device_trace_mask(&self, port: &str, addr: i32, mask: TraceMask) {
+        self.masks_set.fetch_or(mask.bits(), Ordering::Relaxed);
         self.write_scoped(port, Some(addr), AsynException::TraceMask, |cfg| {
             cfg.trace_mask = mask
         });
@@ -811,17 +865,18 @@ impl TraceManager {
     /// Equivalent to [`Self::output_device`] with `addr = None` and the
     /// reason 0 that C's `pasynUserSelf` carries — a port's own diagnostic
     /// user is created by `createAsynUser(0,0)` and never assigned one.
+    #[track_caller]
     pub fn output(&self, port: &str, mask: TraceMask, msg: &str) {
         self.output_device(port, None, 0, mask, msg);
     }
 
-    /// Output a trace message, resolving config device → port → global.
-    /// C parity: `tracePrint` (asynManager.c:3063-3072) →
-    /// `traceVprint` resolves the `tracePvt` via `findTracePvt`, which
-    /// walks `pasynUser`'s device-pvt first when `pdevice != NULL`.
+    /// C `asynPrint` of `msg`, resolving config device → port → global
+    /// through `findTracePvt`, which walks `pasynUser`'s device-pvt first when
+    /// `pdevice != NULL`. The source is the caller's, as for [`Self::print`].
     ///
     /// `reason` is the user's `pasynUser->reason`, printed in the
-    /// `[port,addr,reason]` triple — see `format_prefix_addr`.
+    /// `[port,addr,reason]` triple — see `write_prefix`.
+    #[track_caller]
     pub fn output_device(
         &self,
         port: &str,
@@ -830,19 +885,8 @@ impl TraceManager {
         mask: TraceMask,
         msg: &str,
     ) {
-        self.with_dp_common_addr(port, addr, |cfg, addr| {
-            // C `traceVprintSource` re-tests the mask against the *effective*
-            // `ptracePvt` it just resolved (asynManager.c:3098), so the gate
-            // and the config are the same rung by construction.
-            if !cfg.trace_mask.intersects(mask) {
-                return;
-            }
-            // C `traceVprint` (asynManager.c:3085-3088) delegates to the
-            // source form with an empty file and line 0.
-            let prefix = format_prefix_addr(port, addr, reason, ("", 0), cfg);
-            let line = format!("{prefix}{msg}");
-            cfg.file.write_line(&line);
-        });
+        let caller = std::panic::Location::caller();
+        self.output_device_with_source(port, addr, reason, mask, caller.file(), caller.line(), msg);
     }
 
     /// C `asynPrint` of one line on the rung C's `findTracePvt` picks — `port:
@@ -850,7 +894,13 @@ impl TraceManager {
     /// (asynManager.c:548-553). C's `traceVprintSource` `fprintf`s straight
     /// into the trace file (asynManager.c:3090-3115) and allocates nothing, so
     /// a caller holding a record's lock does not either; see
-    /// `TraceFile::write_streamed`.
+    /// `TraceFile::print`.
+    ///
+    /// The SOURCE component names the caller, because C's `asynPrint` macro
+    /// passes `__FILE__`/`__LINE__` to `printSource` (asynDriver.h:296-306).
+    /// Only C's `pasynTrace->vprint` function prints `[:0]`; a port of one
+    /// says so with [`Self::print_source`] and `("", 0)`.
+    #[track_caller]
     pub fn print(
         &self,
         port: Option<&str>,
@@ -859,10 +909,18 @@ impl TraceManager {
         mask: TraceMask,
         args: std::fmt::Arguments<'_>,
     ) {
-        self.print_source(port, addr, reason, mask, ("", 0), args);
+        let caller = std::panic::Location::caller();
+        self.print_source(
+            port,
+            addr,
+            reason,
+            mask,
+            (caller.file(), caller.line()),
+            args,
+        );
     }
 
-    /// [`Self::print`] with the caller's `__FILE__`/`__LINE__`, which the
+    /// [`Self::print`] with an explicit `__FILE__`/`__LINE__`, which the
     /// `ASYN_TRACEINFO_SOURCE` prefix prints (asynManager.c:3090-3115).
     pub fn print_source(
         &self,
@@ -890,13 +948,16 @@ impl TraceManager {
         source: (&str, u32),
         body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
     ) {
+        if !self.may_trace(mask) {
+            return;
+        }
         let emit = |cfg: &TraceConfig, addr: Option<i32>| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
-            cfg.file.write_streamed(|out| {
-                write_prefix(out, port, addr, reason, source, cfg)?;
-                body(out)
+            cfg.file.print(|p| {
+                write_prefix(p, port, addr, reason, source, cfg)?;
+                p.body(body)
             });
         };
         match port {
@@ -936,13 +997,17 @@ impl TraceManager {
         line: u32,
         msg: &str,
     ) {
+        if !self.may_trace(mask) {
+            return;
+        }
         self.with_dp_common_addr(port, addr, |cfg, addr| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
-            let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
-            let out = format!("{prefix}{msg}");
-            cfg.file.write_line(&out);
+            cfg.file.print(|p| {
+                write_prefix(p, Some(port), addr, reason, (file, line), cfg)?;
+                p.text(format_args!("{msg}"))
+            });
         });
     }
 
@@ -971,7 +1036,7 @@ impl TraceManager {
     ///
     /// `label` is C's `vfprintf(fp, pformat, pvar)` output, printed as given,
     /// and the *data section* follows it, one block per enabled
-    /// [`TraceIoMask`] bit (`append_io_data`).
+    /// [`TraceIoMask`] bit (`print_io_data`).
     #[allow(clippy::too_many_arguments)]
     pub fn output_device_io(
         &self,
@@ -984,14 +1049,18 @@ impl TraceManager {
         file: &str,
         line: u32,
     ) {
+        if !self.may_trace(mask) {
+            return;
+        }
         self.with_dp_common_addr(port, addr, |cfg, addr| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
-            let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
-            let mut out = format!("{prefix}{label}").into_bytes();
-            append_io_data(&mut out, data, cfg);
-            cfg.file.write_bytes(&out);
+            cfg.file.print(|p| {
+                write_prefix(p, Some(port), addr, reason, (file, line), cfg)?;
+                p.text(format_args!("{label}"))?;
+                print_io_data(p, data, cfg)
+            });
         });
     }
 
@@ -1001,6 +1070,7 @@ impl TraceManager {
     /// after the mutation, for either the per-port path or the
     /// "no pasynUser → global" path.
     pub fn set_trace_mask(&self, port: Option<&str>, mask: TraceMask) {
+        self.masks_set.fetch_or(mask.bits(), Ordering::Relaxed);
         match port {
             Some(name) => {
                 self.write_scoped(name, None, AsynException::TraceMask, |cfg| {
@@ -1268,30 +1338,19 @@ fn strip_path(file: &str) -> &str {
 /// triple, and `getAddr` (:2006) yields **-1** for a user that was never
 /// connected to a device, which is what `addr = None` means here.
 ///
-/// `(file, line)` is `("", 0)` for the entry points that carry no source —
-/// C's `traceVprint` (:3085-3088) and `traceVprintIO` (:3138-3143) call the
-/// `*Source` form with exactly that, so SOURCE-enabled output of a plain
-/// `asynPrint` prints `[:0] ` in C too, and does here.
+/// `(file, line)` is `("", 0)` only for a port of C's `vprint`/`printIO`
+/// functions: `traceVprint` (:3085-3088) and `traceVprintIO` (:3138-3143)
+/// call the `*Source` form with exactly that, so C prints `[:0] ` there. The
+/// `asynPrint`/`asynPrintIO` macros pass `__FILE__`/`__LINE__`
+/// (asynDriver.h:296-320).
 ///
 /// The mask itself is deliberately absent: C prints no severity token, and
 /// the `ERROR`/`FLOW`/`IO_DRIVER` label this used to append had no C source.
-fn format_prefix_addr(
-    port: &str,
-    addr: Option<i32>,
-    reason: i32,
-    source: (&str, u32),
-    cfg: &TraceConfig,
-) -> String {
-    let mut out = String::new();
-    let _ = write_prefix(&mut out, Some(port), addr, reason, source, cfg);
-    out
-}
-
-/// [`format_prefix_addr`] into `out`, allocating nothing of its own. `port:
-/// None` is a user on no port, for which C's `printPort` prints nothing
-/// (asynManager.c:3036-3038).
+///
+/// `port: None` is a user on no port, for which C's `printPort` prints
+/// nothing (asynManager.c:3036-3038). Allocates nothing of its own.
 fn write_prefix(
-    out: &mut impl std::fmt::Write,
+    out: &mut Printer<'_, '_>,
     port: Option<&str>,
     addr: Option<i32>,
     reason: i32,
@@ -1305,8 +1364,7 @@ fn write_prefix(
         // text in `String`s.
         use chrono::{Datelike, Timelike};
         let now = chrono::Local::now();
-        write!(
-            out,
+        out.text(format_args!(
             "{:04}/{:02}/{:02} {:02}:{:02}:{:02}.{:03} ",
             now.year(),
             now.month(),
@@ -1315,28 +1373,27 @@ fn write_prefix(
             now.minute(),
             now.second(),
             now.nanosecond() % 1_000_000_000 / 1_000_000
-        )?;
+        ))?;
     }
 
     if let (true, Some(port)) = (cfg.trace_info_mask.contains(TraceInfoMask::PORT), port) {
         let a = addr.unwrap_or(-1);
-        write!(out, "[{port},{a},{reason}] ")?;
+        out.text(format_args!("[{port},{a},{reason}] "))?;
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::SOURCE) {
         let (file, line) = source;
-        write!(out, "[{}:{}] ", strip_path(file), line)?;
+        out.text(format_args!("[{}:{}] ", strip_path(file), line))?;
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::THREAD) {
         // C `epicsThreadGetNameSelf()`.
         let name = epics_libcom_rs::runtime::task::thread_name_self();
-        write!(
-            out,
+        out.text(format_args!(
             "[{name},{:#x},{}] ",
             thread_token(),
             thread_epics_priority()
-        )?;
+        ))?;
     }
 
     Ok(())
@@ -1384,9 +1441,7 @@ fn thread_epics_priority() -> u32 {
 /// - HEX prints when `traceTruncateSize > 0` — including its trailing newline
 ///   on an empty payload.
 /// - A zero mask *or* a zero truncate size emits the bare newline of :3215-3221.
-fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
-    use std::fmt::Write as _;
-
+fn print_io_data(p: &mut Printer<'_, '_>, data: &[u8], cfg: &TraceConfig) -> std::fmt::Result {
     // C: `nBytes = (len < traceTruncateSize) ? len : traceTruncateSize` — a
     // truncate size of 0 yields no bytes, it does not mean "unlimited".
     let data = &data[..data.len().min(cfg.io_truncate_size)];
@@ -1408,33 +1463,30 @@ fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
             Some(nul) => &data[..nul],
             None => data,
         };
-        out.extend_from_slice(ascii);
-        out.push(b'\n');
+        p.bytes(&[ascii, b"\n"])?;
     }
 
     if mask.contains(TraceIoMask::ESCAPE) && !data.is_empty() {
         let escaped = format_escape(data, &cfg.file, cfg.trace_buffer_size);
-        out.extend_from_slice(escaped.as_bytes());
-        out.push(b'\n');
+        p.bytes(&[escaped.as_bytes(), b"\n"])?;
     }
 
     if mask.contains(TraceIoMask::HEX) && cfg.io_truncate_size > 0 {
         // C `"%2.2x "` per byte, a newline before every 20th byte (so the block
         // opens with one) and a newline after the last.
-        let mut hex = String::with_capacity(data.len() * 3 + data.len() / 20 + 2);
         for (i, b) in data.iter().enumerate() {
             if i % 20 == 0 {
-                hex.push('\n');
+                p.bytes(&[b"\n"])?;
             }
-            let _ = write!(hex, "{b:02x} ");
+            p.text(format_args!("{b:02x} "))?;
         }
-        hex.push('\n');
-        out.extend_from_slice(hex.as_bytes());
+        p.bytes(&[b"\n"])?;
     }
 
     if mask.is_empty() || cfg.io_truncate_size == 0 {
-        out.push(b'\n');
+        p.bytes(&[b"\n"])?;
     }
+    Ok(())
 }
 
 /// `ASYN_TRACEIO_ESCAPE`. Which of libCom's *two* escape entry points runs is a
@@ -1587,6 +1639,35 @@ macro_rules! asyn_trace_device_io {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A print past 512 bytes, in text pieces and raw device bytes, reaches
+    /// the sink in one `write`, so another thread's line cannot land inside
+    /// it. glibc writes an unbuffered `vfprintf` in 128-byte chunks: one
+    /// write at any length is a deliberate deviation from C.
+    #[test]
+    fn a_long_print_is_one_write() {
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Writes(Vec::new());
+        let long = "x".repeat(700);
+        stream(&mut sink, |out| {
+            std::fmt::Write::write_fmt(out, format_args!("{}:{}:", "port", 3))?;
+            out.write_bytes(b"\xff\x00")?;
+            std::fmt::Write::write_fmt(out, format_args!("{long}\n"))
+        });
+        let mut want = b"port:3:\xff\x00".to_vec();
+        want.extend_from_slice(long.as_bytes());
+        want.push(b'\n');
+        assert_eq!(sink.0, [want]);
+    }
 
     /// C `vfprintf`s a trace line into the file whole (asynManager.c:3106):
     /// a line far past the stack buffer, written both as one long piece and
@@ -1886,6 +1967,11 @@ mod tests {
         // other ports use global
         assert!(mgr.is_enabled("other", TraceMask::ERROR));
         assert!(!mgr.is_enabled("other", TraceMask::FLOW));
+    }
+
+    /// [`print_io_data`] on a stream sink.
+    fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
+        stream(out, |o| print_io_data(&mut Printer::Stream(o), data, cfg));
     }
 
     /// The data section C's `traceVprintIOSource` appends to one `asynPrintIO`
@@ -2420,6 +2506,35 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
     }
 
+    /// C's `asynPrint` is a macro that hands `__FILE__`/`__LINE__` to
+    /// `printSource` (asynDriver.h:296-306), so a SOURCE prefix names the
+    /// call site, not `[:0]`.
+    #[test]
+    fn a_plain_print_names_its_caller() {
+        let mgr = TraceManager::new();
+        mgr.register_port("p", false);
+        mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::SOURCE);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_caller.txt");
+        let file = std::fs::File::create(&temp).unwrap();
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
+
+        let at = line!() + 1;
+        mgr.print(Some("p"), None, 0, TraceMask::ERROR, format_args!("a\n"));
+        mgr.output("p", TraceMask::ERROR, "b\n");
+        mgr.output_device("p", None, 0, TraceMask::ERROR, "c\n");
+        let log = std::fs::read_to_string(&temp).unwrap();
+        assert_eq!(
+            log,
+            format!(
+                "[trace.rs:{at}] a\n[trace.rs:{}] b\n[trace.rs:{}] c\n",
+                at + 1,
+                at + 2
+            )
+        );
+    }
+
     #[test]
     fn output_device_io_uses_device_truncate() {
         // C parity: per-device traceTruncateSize takes priority — the
@@ -2855,5 +2970,20 @@ mod tests {
         mgr.set_trace_mask(Some("P"), TraceMask::ERROR | TraceMask::FLOW);
 
         assert_eq!(*observed.lock().unwrap(), vec![1, 2, -1]);
+    }
+
+    #[test]
+    fn every_mask_mutator_opens_the_lock_free_gate() {
+        let mgr = TraceManager::new();
+        mgr.register_port("G", true);
+        assert!(!mgr.is_enabled_device("G", 1, TraceMask::IO_DEVICE));
+        mgr.set_device_trace_mask("G", 1, TraceMask::IO_DEVICE);
+        assert!(mgr.is_enabled_device("G", 1, TraceMask::IO_DEVICE));
+        mgr.set_trace_mask(Some("G"), TraceMask::IO_DRIVER);
+        assert!(mgr.is_enabled_device("G", 1, TraceMask::IO_DRIVER));
+        // The gate stays open for a bit no slot holds now; the slot decides.
+        assert!(!mgr.is_enabled_device("G", 1, TraceMask::IO_DEVICE));
+        mgr.set_trace_mask(None, TraceMask::FLOW);
+        assert!(mgr.may_trace(TraceMask::FLOW));
     }
 }

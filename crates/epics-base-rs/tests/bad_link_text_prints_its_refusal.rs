@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -85,8 +86,13 @@ async fn a_put_of_an_unknown_json_link_type_prints_the_line_after_the_gate() {
 
     db.put_many_locked(&["X"], 1, |puts| {
         let x = puts.record(0).unwrap();
-        puts.put_record_field_from_ca_no_notify(x, "SDIS", text(r#"{"zz":1}"#))
-            .expect_err("C refuses the parse");
+        puts.put_record_field_from_ca_no_notify(
+            x,
+            "SDIS",
+            text(r#"{"zz":1}"#),
+            PutSplit::DbPutField,
+        )
+        .expect_err("C refuses the parse");
         assert_eq!(
             heard(),
             Vec::<String>::new(),

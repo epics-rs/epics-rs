@@ -16,6 +16,7 @@ pub mod blocking;
 pub mod blocking_serving;
 #[cfg(tokio_backend)]
 pub mod ca_server;
+pub(crate) mod current_client;
 #[cfg(test)]
 mod delivery_alloc_tests;
 pub(crate) mod frame;
@@ -198,7 +199,7 @@ pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
     )?;
     iocsh::register_ca_db_server();
     epics_base_rs::server::db_server::db_run_servers();
-    epics_base_rs::server::db_server::announce_serving();
+    epics_base_rs::server::db_server::announce_serving(RSRV_SERVER);
     let result = config.run_shell(iocsh::ca_server_commands()).await;
     serving.shutdown();
     result
@@ -248,7 +249,7 @@ impl RsrvServing {
                 .spawn(async move {
                     let result = server.run().await;
                     if let Err(e) = &result {
-                        eprintln!("CA server error: {e}");
+                        epics_libcom_rs::stderr_println!("CA server error: {e}");
                     }
                     result
                 });
@@ -262,7 +263,7 @@ impl RsrvServing {
             let serving = serve_blocking(servers, port, tcp_port, db, acf)?;
             iocsh::register_ca_db_server();
             epics_base_rs::server::db_server::db_run_servers();
-            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::server::db_server::announce_serving(RSRV_SERVER);
             Ok(Self { serving })
         }
     }

@@ -57,7 +57,6 @@ fn spawn_qsrv(provider: Arc<BridgeProvider>) -> (PvaServer, SocketAddr) {
     let composite = epics_pva_rs::server_native::CompositeSource::new();
     QsrvMount {
         store: Arc::new(store),
-        enabled: true,
         acf: epics_base_rs::server::access_security::new_acf_cell(None),
     }
     .install_channel_sources(&db, &composite)

@@ -305,8 +305,14 @@ fn registered_dset(name: &str) -> Option<(&'static str, &'static DevSup)> {
 }
 
 /// The choice whose support serves `dtyp` on `record_type`: `dtyp` itself,
-/// unless a loaded `device()` line gave an existing dset a new choice.
+/// unless a loaded `device()` line gave an existing dset a new choice. An
+/// empty DTYP is menu index 0, the first row's choice, as C's
+/// `dbDTYPtoDevSup` takes `ellNth(&devList, dtyp+1)` (`dbAccess.c:1052-1054`).
 pub(crate) fn served_choice<'a>(record_type: &str, dtyp: &'a str) -> &'a str {
+    let dtyp = match dtyp {
+        "" => dev_sup_of(record_type, "").map_or("", |row| row.choice),
+        dtyp => dtyp,
+    };
     loaded()
         .and_then(|loaded| loaded.get(record_type))
         .and_then(|rows| rows.iter().find(|r| r.row.choice == dtyp))

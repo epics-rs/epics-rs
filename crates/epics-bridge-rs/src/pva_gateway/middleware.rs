@@ -77,8 +77,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
         self.inner.access()
     }
-    async fn list_pvs(&self) -> Vec<RecordName> {
-        self.inner.list_pvs().await
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.inner.list_pvs()
     }
     async fn has_pv(&self, name: &[u8]) -> bool {
         self.inner.has_pv(name).await
@@ -539,10 +539,10 @@ impl<S: ChannelSource> Layer<S> for AclLayer {
 }
 
 impl<S: ChannelSource> ChannelSource for Acl<S> {
-    async fn list_pvs(&self) -> Vec<RecordName> {
+    fn list_pvs(&self) -> Vec<RecordName> {
         // Filter the underlying list so introspection sweeps don't
         // leak the names of denied PVs.
-        let mut names = self.inner.list_pvs().await;
+        let mut names = self.inner.list_pvs();
         names.retain(|n| self.config.allowed(n));
         names
     }
@@ -1189,8 +1189,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
         self.inner.access()
     }
-    async fn list_pvs(&self) -> Vec<RecordName> {
-        self.inner.list_pvs().await
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.inner.list_pvs()
     }
     async fn has_pv(&self, name: &[u8]) -> bool {
         self.inner.has_pv(name).await
@@ -1954,7 +1954,7 @@ mod tests {
         /// Advertises every name — so only the ACL's own gate can deny.
         struct AdvertisesEverything;
         impl ChannelSource for AdvertisesEverything {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["SECRET:KEY".into(), "PUBLIC:PV".into()]
             }
             async fn has_pv(&self, _name: &[u8]) -> bool {
@@ -1997,9 +1997,7 @@ mod tests {
             "a denied PV must not be TCP-circuit search-advertised either"
         );
         assert!(
-            !acl.list_pvs()
-                .await
-                .contains(&RecordName::from("SECRET:KEY")),
+            !acl.list_pvs().contains(&RecordName::from("SECRET:KEY")),
             "the sibling advertisement surface must stay filtered"
         );
 
@@ -2061,7 +2059,7 @@ mod tests {
     }
 
     impl ChannelSource for RecordingSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
         async fn has_pv(&self, _name: &[u8]) -> bool {
@@ -2292,7 +2290,7 @@ mod tests {
         checked_intro_account: Arc<std::sync::Mutex<Option<String>>>,
     }
     impl ChannelSource for ExistenceRecordingSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
         async fn has_pv(&self, _name: &[u8]) -> bool {
@@ -2389,7 +2387,7 @@ mod tests {
     /// callbacks — the same wrapper-severs-override defect family as FR-8.
     struct WatermarkSource;
     impl ChannelSource for WatermarkSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
         async fn has_pv(&self, _name: &[u8]) -> bool {
@@ -2440,7 +2438,7 @@ mod tests {
         closed: Arc<AtomicBool>,
     }
     impl ChannelSource for ReportInfoSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
         async fn has_pv(&self, _name: &[u8]) -> bool {
@@ -2581,7 +2579,7 @@ mod tests {
     }
 
     impl ChannelSource for OptsRecordingSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
         async fn has_pv(&self, _name: &[u8]) -> bool {

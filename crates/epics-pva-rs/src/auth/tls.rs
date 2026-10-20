@@ -167,7 +167,7 @@ fn ssl_key_log() -> Option<Arc<dyn rustls::KeyLog>> {
     KEYLOG
         .get_or_init(|| match std::env::var_os("SSLKEYLOGFILE") {
             Some(path) if !path.is_empty() => {
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "NOTICE: debug logging TLS SECRETS to SSLKEYLOGFILE={}",
                     path.to_string_lossy()
                 );
@@ -387,14 +387,12 @@ fn load_keychain(path: &Path, password: Option<&OsStr>) -> Result<Keychain, TlsC
     if is_pem(&bytes) {
         load_pem_keychain(path, &bytes)
     } else {
-        let raw = password.unwrap_or_default().as_encoded_bytes();
-        let text = utf82uni_text(raw);
-        let text = text.as_deref();
-        load_pkcs12_keychain(path, &bytes, Pkcs12Password { raw, text })
+        load_pkcs12_keychain(path, &bytes, password)
     }
 }
 
 /// A PKCS#12 password in the two forms OpenSSL 3 reads it in.
+#[cfg(feature = "pkcs12")]
 #[derive(Clone, Copy)]
 struct Pkcs12Password<'a> {
     /// The bytes PBES2 hands PBKDF2 (`PKCS5_v2_PBKDF2_keyivgen`).
@@ -404,6 +402,7 @@ struct Pkcs12Password<'a> {
     text: Option<&'a str>,
 }
 
+#[cfg(feature = "pkcs12")]
 impl Pkcs12Password<'_> {
     /// The BMPString text, or the error OpenSSL's KDF returns without one.
     fn text(&self, path: &Path) -> Result<&str, TlsConfigError> {
@@ -421,6 +420,7 @@ impl Pkcs12Password<'_> {
 /// (`OPENSSL_asc2uni`). `UTF8_getc` decodes any F0-F7 lead with three
 /// continuation bytes, and above U+10FFFF `utf82uni` returns NULL instead
 /// of falling back.
+#[cfg(feature = "pkcs12")]
 fn utf82uni_text(bytes: &[u8]) -> Option<String> {
     let e = match std::str::from_utf8(bytes) {
         Ok(text) => return Some(text.to_owned()),
@@ -491,9 +491,16 @@ fn load_pem_keychain(path: &Path, bytes: &[u8]) -> Result<Keychain, TlsConfigErr
 fn load_pkcs12_keychain(
     path: &Path,
     bytes: &[u8],
-    pkcs12_password: Pkcs12Password<'_>,
+    password: Option<&OsStr>,
 ) -> Result<Keychain, TlsConfigError> {
     use p12::SafeBagKind;
+
+    let raw = password.unwrap_or_default().as_encoded_bytes();
+    let text = utf82uni_text(raw);
+    let pkcs12_password = Pkcs12Password {
+        raw,
+        text: text.as_deref(),
+    };
 
     // Route by the keychain MAC digest algorithm. The `p12` crate
     // hard-`assert_eq!`s the MAC digest against SHA-1 and *panics* on
@@ -1241,7 +1248,7 @@ mod load_pkcs12_pbes2 {
 fn load_pkcs12_keychain(
     path: &Path,
     _bytes: &[u8],
-    _password: Pkcs12Password<'_>,
+    _password: Option<&OsStr>,
 ) -> Result<Keychain, TlsConfigError> {
     Err(TlsConfigError::Pkcs12Disabled(path.to_path_buf()))
 }

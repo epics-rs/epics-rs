@@ -70,7 +70,7 @@ pub enum EnvDoubleError {
 pub fn env_double(name: &str) -> Result<f64, EnvDoubleError> {
     let raw = env_raw(name).ok_or(EnvDoubleError::Unset)?;
     epics_parse_double(&raw).map_err(|e| {
-        eprintln!("Unable to find a real number in {name}={raw}");
+        epics_libcom_rs::stderr_println!("Unable to find a real number in {name}={raw}");
         EnvDoubleError::Invalid(e)
     })
 }

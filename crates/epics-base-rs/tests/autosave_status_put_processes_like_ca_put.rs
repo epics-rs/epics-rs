@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
@@ -76,7 +76,7 @@ fn set_config(save_path: PathBuf) -> SaveSetConfig {
         request_pvs: vec!["T:SR_status".into()],
         backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -140,13 +140,7 @@ async fn three_heartbeats_toggle_the_bo_as_ca_put_does() {
             .build()
             .await,
     );
-    let handle = mgr
-        .clone()
-        .start(
-            &Reactor::current().expect("the test driver enters an executor"),
-            db.clone(),
-        )
-        .unwrap();
+    let handle = mgr.clone().start(db.clone()).unwrap();
 
     let mut beats = Vec::new();
     for _ in 0..3 {
@@ -203,6 +197,7 @@ async fn a_manual_restore_processes_as_ca_put_does() {
             pv_name: "T:SR_status".into(),
             value: "2".into(),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await

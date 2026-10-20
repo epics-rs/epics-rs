@@ -78,7 +78,7 @@ pub fn env_default_timeout() -> f64 {
         return DEFAULT_CLI_TIMEOUT_SECS;
     };
     let Some(secs) = crate::copt::scan_double(&raw) else {
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "'{raw}' is not a valid timeout value (from 'EPICS_CLI_TIMEOUT' in the \
              environment) - ignored. (use '-h' for help.)"
         );
@@ -169,9 +169,10 @@ impl ConnectPvsFailure {
     /// C's `fprintf(stderr, ...)` of the names' bytes, then `return 1`.
     pub fn exit(&self) -> ! {
         use std::io::Write as _;
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(&self.message);
-        let _ = err.write_all(b"\n");
+        let mut line = epics_libcom_rs::runtime::log::StagedLine::default();
+        line.push_bytes(&self.message);
+        line.push_bytes(b"\n");
+        let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(line.bytes());
         std::process::exit(1)
     }
 }

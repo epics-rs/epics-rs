@@ -54,11 +54,12 @@ impl AsynMotor for Axis {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus {
             done: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 

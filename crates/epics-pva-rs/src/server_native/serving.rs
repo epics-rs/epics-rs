@@ -21,6 +21,7 @@ use super::driver::{self, BeaconSender, DriverKind, PvaServerDriver};
 use super::report::{Liveness, LivenessGuard, Running, ServerReportHandle, pvxs_config_text};
 use super::search_engine::ServerInterfaces;
 use super::serv_iface::ServListeners;
+use super::shared_pv::SharedSource;
 use super::source::DynSource;
 use crate::error::{PvaError, PvaResult};
 use tokio::sync::mpsc;
@@ -111,6 +112,9 @@ pub struct PvaSockets {
     udp_port: u16,
     /// [`pvxs_config_text`] of the bound server.
     pvxs_config: Arc<str>,
+    /// The `__builtin` store, created with the sockets as pvxs's constructor
+    /// creates it (`server.cpp:542`).
+    builtin: Arc<SharedSource>,
 }
 
 impl PvaSockets {
@@ -147,6 +151,7 @@ impl PvaSockets {
             search,
             udp_port,
             pvxs_config,
+            builtin: Arc::new(SharedSource::new()),
         })
     }
 
@@ -172,8 +177,14 @@ impl PvaSockets {
         self.listeners.port()
     }
 
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`, which
+    /// take PVs before `start` too.
+    pub fn builtin(&self) -> &Arc<SharedSource> {
+        &self.builtin
+    }
+
     /// The report of a server that has not started: pvxs's `Stopped`, with
-    /// no sources and no peers.
+    /// only the internal sources and no peers.
     pub fn report_handle(&self) -> ServerReportHandle {
         ServerReportHandle {
             bound_tcp_port: self.bound_tcp_port(),
@@ -184,6 +195,7 @@ impl PvaSockets {
             beacon_period_secs: self.config.beacon_period.as_secs(),
             pvxs_config: self.pvxs_config.clone(),
             peers: super::peers::PeerRegistry::new(),
+            builtin: self.builtin.clone(),
             running: None,
         }
     }
@@ -204,11 +216,12 @@ impl BoundPva {
             search,
             udp_port,
             pvxs_config,
+            builtin,
         } = sockets;
         let ignore_addrs = config.ignore_addrs.len();
         let beacon_period_secs = config.beacon_period.as_secs();
-        let server =
-            driver::from_listeners(kind, listeners, source, config).map_err(ServeError::Server)?;
+        let server = driver::from_listeners(kind, listeners, source, builtin, config)
+            .map_err(ServeError::Server)?;
         let beacons = server.beacon_sender(udp_port).map_err(ServeError::Beacon)?;
         Ok(Self {
             server,
@@ -274,6 +287,7 @@ impl BoundPva {
             beacon_period_secs: self.beacon_period_secs,
             pvxs_config: self.pvxs_config,
             peers: self.server.peers().clone(),
+            builtin: self.server.builtin().clone(),
             running: Some(Running {
                 source: self.server.source().clone(),
                 tcp_alive,
@@ -558,7 +572,11 @@ mod tests {
         // The composition the driver serves, not the source it was handed.
         assert_eq!(
             handle.source_list(),
-            [("__server".to_owned(), -1), ("__user".to_owned(), 0)]
+            [
+                ("__builtin".to_owned(), -1),
+                ("__server".to_owned(), -1),
+                ("__user".to_owned(), 0)
+            ]
         );
     }
 

@@ -22,6 +22,7 @@
 //! socket dies. An in-process `call_at_exits()` could not test this — the race
 //! being tested *is* the process ending.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "ioc")]
 
 use std::io::{Read, Write};

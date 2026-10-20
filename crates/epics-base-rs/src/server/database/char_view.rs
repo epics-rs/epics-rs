@@ -49,36 +49,83 @@ pub(crate) fn field_addr_types(fd: &FieldDesc, value: Option<&EpicsValue>) -> (D
     (field_type, field_type.dbr_code())
 }
 
+/// Which of `dbGet`'s routes reads `inst.field` (`dbAccess.c:944-952`), or
+/// `None` where the record has no such field.
+pub fn read_route(inst: &RecordInstance, field: &str) -> Option<CharSource> {
+    route_at(inst, field, inst.field_desc(field))
+}
+
+/// [`read_route`] with `desc` = [`RecordInstance::field_desc`]`(field)`.
+fn route_at(inst: &RecordInstance, field: &str, desc: Option<&FieldDesc>) -> Option<CharSource> {
+    match desc {
+        Some(desc) if crate::types::link_class_of(desc).is_some() => Some(CharSource::Link),
+        Some(_) => Some(CharSource::Field),
+        // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
+        None => matches!(inst.get_virtual_field(field)?, EpicsValue::String(_))
+            .then_some(CharSource::Attribute),
+    }
+}
+
+/// The byte width of one element of `code`, as C's `dbFldDes.size` carries
+/// it — `sizeof(prec->field)`, stamped per field by the `GEN_SIZE_OFFSET`
+/// block of the generated `xxxRecord.h`, except for `DBF_STRING` where it is
+/// the `.dbd` `size(N)` attribute (`dbLexRoutines.c:663`, required non-zero
+/// at `:755`).
+///
+/// `None` where the C number is a fact about a C struct this port does not
+/// have: the three link types are `sizeof(DBLINK)` — measured as **80** on
+/// `softIoc` linux-x86_64, and platform-dependent. Printing a width for those
+/// would be inventing an ABI, so `dba` prints `(none)` instead.
+///
+/// A `DBF_NOACCESS` row reaches the last arm only when `field_addr_types` left
+/// the declaration standing, i.e. when no `cvt_dbaddr` re-typed it — and those
+/// are exactly the rows the generator carries a width for, taken from the C
+/// type its `extra(...)` names. `dbCommon.TIME` is the case in hand: C prints
+/// `Field Size: 8`, `sizeof(epicsTimeStamp)`. A width of zero still means the
+/// port has no number, so it keeps `(none)`.
+pub(crate) fn c_field_size(code: DbfCode, declared_size: u16) -> Option<u16> {
+    Some(match code {
+        DbfCode::String => declared_size,
+        DbfCode::NoAccess if declared_size > 0 => declared_size,
+        DbfCode::Char | DbfCode::UChar => 1,
+        // `epicsEnum16` for all three (`epicsTypes.h`).
+        DbfCode::Short | DbfCode::UShort | DbfCode::Enum | DbfCode::Menu | DbfCode::Device => 2,
+        DbfCode::Long | DbfCode::ULong | DbfCode::Float => 4,
+        DbfCode::Double | DbfCode::Int64 | DbfCode::UInt64 => 8,
+        DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink | DbfCode::NoAccess => return None,
+    })
+}
+
 /// The view of `inst.field` with `$`, or `None` where C refuses the modifier.
 /// It holds the resolved value and the counts only, so a caller under the
 /// record's lock pays one field read; the character image is built from it
 /// after the lock is gone.
 pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
-    let Some(desc) = inst.field_desc(field) else {
-        // `dbGetAttributePart`'s synthesised `DBF_STRING` descriptor.
-        return match inst.get_virtual_field(field)? {
-            text @ EpicsValue::String(_) => Some(CharView {
+    let desc = inst.field_desc(field);
+    let desc = match route_at(inst, field, desc)? {
+        CharSource::Attribute => {
+            return Some(CharView {
                 source: CharSource::Attribute,
-                value: Some(text),
+                value: inst.get_virtual_field(field),
                 count: MAX_STRING_SIZE,
                 no_elements: MAX_STRING_SIZE,
                 field_type: DbfCode::Char,
                 truncate: false,
-            }),
-            _ => None,
-        };
+            });
+        }
+        CharSource::Link => {
+            return Some(CharView {
+                source: CharSource::Link,
+                value: inst.resolve_field(field),
+                count: PVLINK_STRINGSZ,
+                no_elements: PVLINK_STRINGSZ,
+                field_type: desc?.declared_dbf,
+                truncate: false,
+            });
+        }
+        CharSource::Field => desc?,
     };
     let value = inst.resolve_field(field);
-    if crate::types::link_class_of(desc).is_some() {
-        return Some(CharView {
-            source: CharSource::Link,
-            value,
-            count: PVLINK_STRINGSZ,
-            no_elements: PVLINK_STRINGSZ,
-            field_type: desc.declared_dbf,
-            truncate: false,
-        });
-    }
     if field_addr_types(desc, value.as_ref()).0 != DbfCode::String {
         return None;
     }
@@ -153,6 +200,90 @@ pub enum CharSource {
     Attribute,
 }
 
+impl CharSource {
+    /// The text `dbGet` reads in place of converting the field, `None` for
+    /// [`CharSource::Field`].
+    pub fn text_route(self) -> Option<TextRoute> {
+        match self {
+            CharSource::Field => None,
+            CharSource::Link => Some(TextRoute::Link),
+            CharSource::Attribute => Some(TextRoute::Attribute),
+        }
+    }
+}
+
+/// A field `dbGet` reads as text whatever the request type, through
+/// `getLinkValue` or `getAttrValue` (`dbAccess.c:817-895`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRoute {
+    Link,
+    Attribute,
+}
+
+impl TextRoute {
+    /// The read made for a `target` request, `None` for `S_db_badDbrtype`.
+    pub fn read(self, target: crate::types::DbFieldType) -> Option<TextRead> {
+        use crate::types::DbFieldType as T;
+        match (self, target) {
+            (_, T::String) => Some(TextRead::String),
+            // "Needed for dbCa links" (`dbAccess.c:838-841`).
+            (TextRoute::Link, T::Double) => Some(TextRead::Nan),
+            (_, T::Char | T::UChar) => Some(TextRead::Chars(target)),
+            _ => None,
+        }
+    }
+}
+
+/// One request type [`TextRoute::read`] accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRead {
+    /// `DBR_STRING`: the text in `MAX_STRING_SIZE` with its NUL, one element.
+    String,
+    /// A link's `DBR_DOUBLE`: one NaN.
+    Nan,
+    /// `DBR_CHAR` / `DBR_UCHAR`: the text in `nRequest` chars with its NUL,
+    /// `strlen + 1` elements.
+    Chars(crate::types::DbFieldType),
+}
+
+impl TextRead {
+    /// The elements read of `text` for a request of `n_req`.
+    pub fn get(self, text: &[u8], n_req: usize) -> EpicsValue {
+        let upto = |max: usize| -> Vec<u8> {
+            let end = text.len().min(max);
+            let mut t: Vec<u8> = text[..end]
+                .iter()
+                .copied()
+                .take_while(|&c| c != 0)
+                .collect();
+            t.push(0);
+            t
+        };
+        match self {
+            TextRead::String => {
+                let mut t = upto(MAX_STRING_SIZE - 1);
+                t.pop();
+                EpicsValue::String(crate::types::PvString::from_bytes(t))
+            }
+            TextRead::Nan => EpicsValue::Double(f64::NAN),
+            // `dbGet` returns before the read for `nRequest == 0`.
+            TextRead::Chars(target) if n_req == 0 => char_elements(target, &[]),
+            TextRead::Chars(target) => char_elements(target, &upto(n_req - 1)),
+        }
+    }
+}
+
+/// The characters `value` holds: a string's, a char array's, the first
+/// element of a string array's.
+pub(crate) fn text_of(value: &EpicsValue) -> &[u8] {
+    match value {
+        EpicsValue::String(s) => s.as_bytes(),
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => b,
+        EpicsValue::StringArray(v) => v.first().map_or(&[], |s| s.as_bytes()),
+        _ => &[],
+    }
+}
+
 /// C's `DBADDR` after the `$` modifier (`dbAccess.c:682-701`) and what
 /// `dbGet` / `dbPut` do with it.
 pub struct CharView {
@@ -189,14 +320,12 @@ impl CharView {
     /// The characters `pfield` holds, zero-padded to `no_elements`; a link's
     /// or attribute's text.
     pub fn bytes(&self) -> Vec<u8> {
-        let mut bytes = match &self.value {
-            Some(EpicsValue::String(s)) => s.as_bytes().to_vec(),
-            Some(EpicsValue::CharArray(b) | EpicsValue::UCharArray(b)) => b.to_vec(),
-            Some(EpicsValue::StringArray(v)) => {
-                v.first().map(|s| s.as_bytes().to_vec()).unwrap_or_default()
-            }
-            _ => Vec::new(),
-        };
+        let mut bytes = self
+            .value
+            .as_ref()
+            .map(text_of)
+            .unwrap_or_default()
+            .to_vec();
         if self.source == CharSource::Field {
             bytes.resize(self.no_elements, 0);
         }
@@ -219,36 +348,17 @@ impl CharView {
             return Some(char_elements(target, &[]));
         }
         let bytes = self.bytes();
-        let text = |max: usize| -> Vec<u8> {
-            let end = bytes.len().min(max);
-            let mut t: Vec<u8> = bytes[..end]
-                .iter()
-                .copied()
-                .take_while(|&c| c != 0)
-                .collect();
-            t.push(0);
-            t
-        };
-        match (self.source, target) {
-            (CharSource::Field, _) => {
-                let n = field_count(self.count, n_req).min(bytes.len());
-                let mut b = bytes[..n].to_vec();
-                if self.count != 1 && target == T::Char && self.truncate && n > 0 {
-                    b[n - 1] = 0;
-                    let len = b.iter().position(|&c| c == 0).unwrap_or(n);
-                    b.truncate(len + 1);
-                }
-                Some(char_elements(target, &b))
-            }
-            (_, T::String) => {
-                let mut t = text(MAX_STRING_SIZE - 1);
-                t.pop();
-                Some(EpicsValue::String(crate::types::PvString::from_bytes(t)))
-            }
-            (CharSource::Link, T::Double) => Some(EpicsValue::Double(f64::NAN)),
-            (_, T::Char | T::UChar) => Some(char_elements(target, &text(n_req - 1))),
-            _ => None,
+        if let Some(route) = self.source.text_route() {
+            return Some(route.read(target)?.get(&bytes, n_req));
         }
+        let n = field_count(self.count, n_req).min(bytes.len());
+        let mut b = bytes[..n].to_vec();
+        if self.count != 1 && target == T::Char && self.truncate && n > 0 {
+            b[n - 1] = 0;
+            let len = b.iter().position(|&c| c == 0).unwrap_or(n);
+            b.truncate(len + 1);
+        }
+        Some(char_elements(target, &b))
     }
 
     /// [`Self::get`]`(DBR_CHAR, count)` — every element of the view, as a
@@ -260,12 +370,7 @@ impl CharView {
         if count == 0 {
             return EpicsValue::CharArray(Vec::new().into());
         }
-        let src: &[u8] = match &self.value {
-            Some(EpicsValue::String(s)) => s.as_bytes(),
-            Some(EpicsValue::CharArray(b) | EpicsValue::UCharArray(b)) => b,
-            Some(EpicsValue::StringArray(v)) => v.first().map_or(&[], |s| s.as_bytes()),
-            _ => &[],
-        };
+        let src: &[u8] = self.value.as_ref().map_or(&[], text_of);
         // Text up to the first NUL within `max` bytes, then the NUL.
         let text = |max: usize| -> crate::types::SharedArray<u8> {
             let end = src.len().min(max);
@@ -626,6 +731,11 @@ impl DollarView {
     /// `getScalarValue` for a final count of 1.
     pub fn scalar(self) -> bool {
         self.final_elements == 1
+    }
+
+    /// Which of `dbGet`'s routes reads the field.
+    pub fn source(self) -> CharSource {
+        self.source
     }
 
     /// The field log's image of the field's value — read, or posted: a

@@ -99,7 +99,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Receive error: {e}");
+                epics_base_rs::stderr_println!("Receive error: {e}");
                 break;
             }
         }
@@ -138,7 +138,7 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Receive error: {e}");
+                epics_base_rs::stderr_println!("Receive error: {e}");
                 break;
             }
         }

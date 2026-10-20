@@ -140,7 +140,7 @@ async fn child_ioc() {
         .port(0)
         .run(|_config| async move {
             // As a server's `rsrv_run` would: iocInit waits for it.
-            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::server::db_server::announce_serving("probe");
             // Waits on a waker someone holds, as a server's socket does; the
             // exec backend cancels a task nothing can wake.
             let (keep, never) = epics_base_rs::runtime::sync::oneshot::channel::<()>();

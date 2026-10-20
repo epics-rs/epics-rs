@@ -754,16 +754,6 @@ pub struct BridgeProvider {
     /// cache) detect that group name→definition bindings may have
     /// changed and re-resolve, without re-checking the map per op.
     group_generation: std::sync::atomic::AtomicU64,
-    /// QSRV2 serving gate. pvxs adds the single-record and group sources
-    /// to the PVA server only when `enable2()` returns true
-    /// (`ioc/iochooks.cpp:461-496`, gated by `PVXS_QSRV_ENABLE` /
-    /// `EPICS_IOC_IGNORE_SERVERS=qsrv2`). When `false`, every database /
-    /// group resolution entry point answers "absent" so no DB-backed PVA
-    /// channel is served — matching a pvxs IOC that loaded QSRV2 but had
-    /// it disabled. Native PVA PVs (NDPluginPva) are owned by
-    /// `QsrvPvStore`, not here, so they remain served (pvxs serves those
-    /// through a separate `SharedPV`, ungated by `enable2()`).
-    enabled: bool,
 }
 
 /// One `dbLoadGroup(filename, macros)` registration: its source identity
@@ -820,14 +810,6 @@ impl AccessControl for LiveAccessProxy {
 
 impl BridgeProvider {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        Self::new_with_serving(db, true)
-    }
-
-    /// Construct a provider whose QSRV2 database/group serving is gated by
-    /// `enabled`. The runner passes the result of the pvxs-compatible
-    /// `enable2()` decision; `new` defaults to `true` (serving on) for the
-    /// common in-process and test paths.
-    pub fn new_with_serving(db: Arc<PvDatabase>, enabled: bool) -> Self {
         Self {
             db,
             group_pump: super::group_pump::GroupPump::new(),
@@ -838,7 +820,6 @@ impl BridgeProvider {
             base_group_defs: parking_lot::RwLock::new(Vec::new()),
             group_files: parking_lot::RwLock::new(Vec::new()),
             group_generation: std::sync::atomic::AtomicU64::new(0),
-            enabled,
         }
     }
 
@@ -854,14 +835,12 @@ impl BridgeProvider {
         // the record path below so its `.DISP` governs writability — pvxs
         // serves such a name only as the record (defineGroups,
         // ioc/groupconfigprocessor.cpp:170-181), never the group.
-        if self.is_servable_group(name).await {
+        if self.is_servable_group(name) {
             return true;
         }
         let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
         let Some(rec_arc) = self.db.get_record(&cn.record) else {
-            // PVA-plugin PVs (NTNDArray) aren't records — caller
-            // (qsrv pva_adapter) should consult its own pva_pvs map.
-            // Default false here so unknown names refuse PUT upfront.
+            // Not a record: refuse PUT upfront.
             return false;
         };
         let inst = rec_arc.read();
@@ -1114,7 +1093,7 @@ impl BridgeProvider {
             }
             // The same admission test `group_serve` applies, so the count
             // this reports and the groups it builds are one set.
-            refusals.push((def.name.clone(), self.judge_group(&def).await));
+            refusals.push((def.name.clone(), self.judge_group(&def)));
         }
         // Every group's first-pass line, then every group's second-pass line.
         for pass in 0..2 {
@@ -1122,7 +1101,7 @@ impl BridgeProvider {
                 .iter()
                 .filter_map(|(n, e)| Some((n, e[pass].as_ref()?)))
             {
-                eprintln!("{name}: Error Group not created: {err}");
+                epics_base_rs::stderr_println!("{name}: Error Group not created: {err}");
                 tracing::debug!(group = %name, error = %err, "group not created");
             }
         }
@@ -1133,9 +1112,9 @@ impl BridgeProvider {
     }
 
     /// Run `createGroups` on `def` and record the verdict.
-    async fn judge_group(&self, def: &GroupPvDef) -> [Option<String>; 2] {
+    fn judge_group(&self, def: &GroupPvDef) -> [Option<String>; 2] {
         let generation = self.group_generation();
-        let verdict = self.group_creation_errors(def).await;
+        let verdict = self.group_creation_errors(def);
         self.group_verdicts
             .write()
             .insert(def.name.clone(), (generation, verdict.clone()));
@@ -1144,13 +1123,13 @@ impl BridgeProvider {
 
     /// The recorded verdict on `def`, judging it first if this generation
     /// has not.
-    async fn group_verdict(&self, def: &GroupPvDef) -> [Option<String>; 2] {
+    fn group_verdict(&self, def: &GroupPvDef) -> [Option<String>; 2] {
         let generation = self.group_generation();
         match self.group_verdicts.read().get(&def.name) {
             Some((g, verdict)) if *g == generation => return verdict.clone(),
             _ => {}
         }
-        self.judge_group(def).await
+        self.judge_group(def)
     }
 
     /// The `e.what()` of each of `createGroups`' two passes that refuses
@@ -1165,12 +1144,12 @@ impl BridgeProvider {
     /// (groupconfigprocessor.cpp:453-465) — one line. This is the port's
     /// single creation gate: the same answer feeds the `processGroups`
     /// report and [`Self::group_serve`].
-    async fn group_creation_errors(&self, def: &GroupPvDef) -> [Option<String>; 2] {
+    fn group_creation_errors(&self, def: &GroupPvDef) -> [Option<String>; 2] {
         // Channel-less members (Structure / Const / Proc mappings) never
         // bind a dbChannel — pvxs skips them (`if(!def.channel.empty())`).
         let bound = || def.channels.iter().filter(|m| m.has_channel());
         for member in bound() {
-            if let Err(e) = super::channel::resolve_db_channel(&self.db, member).await {
+            if let Err(e) = super::channel::resolve_db_channel(&self.db, member) {
                 return [
                     Some(e),
                     Some(format!(
@@ -1217,23 +1196,10 @@ impl BridgeProvider {
 
     /// Whether `name` is registered as a QSRV group composite PV.
     ///
-    /// Synchronous, lock-cheap (one `parking_lot::RwLock` read). Used
-    /// by the pvalink `local=true` locality check so a link to a
-    /// QSRV group PV hosted by this IOC is accepted as local rather
-    /// than wrongly rejected with `NotLocal`. Mirrors the group arm
-    /// of [`ChannelProvider::channel_find`].
+    /// Synchronous, lock-cheap (one `parking_lot::RwLock` read). Mirrors
+    /// the group arm of [`ChannelProvider::channel_find`].
     pub fn has_group_pv(&self, name: &str) -> bool {
         self.groups.read().contains_key(name)
-    }
-
-    /// Whether this provider hosts `name` as any channel — a QSRV
-    /// group composite PV *or* a single-record / simple PV in the
-    /// backing database. This is the same name set
-    /// [`ChannelProvider::channel_find`] resolves, exposed as an
-    /// inherent method so the pvalink `local=true` locality check can
-    /// query it without depending on the `ChannelProvider` trait.
-    pub async fn hosts_pv(&self, name: &[u8]) -> bool {
-        self.channel_find(name).await
     }
 
     /// True iff a backing record, alias, or simple PV named `name`
@@ -1245,8 +1211,8 @@ impl BridgeProvider {
     /// search resolver (no upstream gateway subscription) — a name
     /// only conflicts when it is *locally* a record, exactly as
     /// `dbChannelTest` tests the local database.
-    async fn record_exists(&self, name: &[u8]) -> bool {
-        self.db.get_record(name).is_some() || self.db.find_pv(name).await.is_some()
+    fn record_exists(&self, name: &[u8]) -> bool {
+        self.db.get_record(name).is_some() || self.db.find_pv(name).is_some()
     }
 
     /// What `name` is on the serve path, as pvxs's `groupMap` sees it.
@@ -1257,7 +1223,7 @@ impl BridgeProvider {
     /// stays there: `GroupSource` still answers its search and create
     /// (ioc/groupsource.cpp:108-138) and every operation then fails for want
     /// of a prototype.
-    pub(crate) async fn group_serve(&self, name: &[u8]) -> GroupServe {
+    pub(crate) fn group_serve(&self, name: &[u8]) -> GroupServe {
         // Group names come from JSON, so a non-UTF-8 name names no group.
         let def = std::str::from_utf8(name)
             .ok()
@@ -1265,9 +1231,9 @@ impl BridgeProvider {
         let Some(def) = def else {
             return GroupServe::Absent;
         };
-        if self.record_exists(name).await {
+        if self.record_exists(name) {
             GroupServe::Shadowed
-        } else if self.group_verdict(&def).await != [None, None] {
+        } else if self.group_verdict(&def) != [None, None] {
             GroupServe::NotCreated
         } else {
             GroupServe::Created(def)
@@ -1275,17 +1241,17 @@ impl BridgeProvider {
     }
 
     /// The definition of a [`GroupServe::Created`] group.
-    pub(crate) async fn servable_group(&self, name: &[u8]) -> Option<GroupPvDef> {
-        match self.group_serve(name).await {
+    pub(crate) fn servable_group(&self, name: &[u8]) -> Option<GroupPvDef> {
+        match self.group_serve(name) {
             GroupServe::Created(def) => Some(def),
             _ => None,
         }
     }
 
     /// `name` answers search and create as a group, built or not.
-    async fn claims_group(&self, name: &[u8]) -> bool {
+    fn claims_group(&self, name: &[u8]) -> bool {
         matches!(
-            self.group_serve(name).await,
+            self.group_serve(name),
             GroupServe::Created(_) | GroupServe::NotCreated
         )
     }
@@ -1300,10 +1266,10 @@ impl BridgeProvider {
     /// only the find/list/create serve path. Avoids cloning the
     /// `GroupPvDef` when only the existence answer is needed (e.g. the
     /// `is_writable` / `PROCESS` admission checks).
-    pub(crate) async fn is_servable_group(&self, name: &[u8]) -> bool {
+    pub(crate) fn is_servable_group(&self, name: &[u8]) -> bool {
         // Defined in terms of the gate itself, so the bool answer and the
         // definition answer can never disagree about what is served.
-        self.servable_group(name).await.is_some()
+        self.servable_group(name).is_some()
     }
 
     /// Drop every registered group definition. Mirrors pvxs
@@ -1411,13 +1377,9 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_find(&self, name: &[u8]) -> bool {
-        // QSRV2 disabled: no DB-backed or group channel is served.
-        if !self.enabled {
-            return false;
-        }
         // A group name shadowed by a record falls through to the database,
         // so the record is what answers. See `group_serve`.
-        if self.claims_group(name).await {
+        if self.claims_group(name) {
             return true;
         }
         // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
@@ -1440,17 +1402,13 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_list(&self) -> Vec<RecordName> {
-        // QSRV2 disabled: advertise no DB record / alias / group names.
-        if !self.enabled {
-            return Vec::new();
-        }
-        let mut names = self.db.all_record_names().await;
+        let mut names = self.db.all_record_names();
         // PR #336 aliases are independently addressable channel
         // names — a PVA client running channelList expects them so
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names());
-        names.extend(self.group_list().await.into_iter().map(RecordName::from));
+        names.extend(self.group_list().into_iter().map(RecordName::from));
         names.sort();
         names
     }
@@ -1466,22 +1424,19 @@ impl ChannelProvider for BridgeProvider {
 impl BridgeProvider {
     /// pvxs `GroupSource::onSearch`: `name` is a group this provider claims,
     /// built or not. A record of the same name shadows it.
-    pub async fn group_claimed(&self, name: &[u8]) -> bool {
-        self.enabled && self.claims_group(name).await
+    pub fn group_claimed(&self, name: &[u8]) -> bool {
+        self.claims_group(name)
     }
 
     /// pvxs `GroupSource::onList`: the claimed group names, sorted. A name
     /// shadowed by a record is the record's (pvxs `defineGroups`
     /// ioc/groupconfigprocessor.cpp:177); a group `createGroups` refused is
     /// still listed (see `group_serve`).
-    pub async fn group_list(&self) -> Vec<String> {
-        if !self.enabled {
-            return Vec::new();
-        }
+    pub fn group_list(&self) -> Vec<String> {
         let keys: Vec<String> = self.groups.read().keys().cloned().collect();
         let mut names = Vec::new();
         for k in keys {
-            if self.claims_group(k.as_bytes()).await {
+            if self.claims_group(k.as_bytes()) {
                 names.push(k);
             }
         }
@@ -1495,12 +1450,7 @@ impl BridgeProvider {
         name: &[u8],
         creds: ClientCreds,
     ) -> BridgeResult<GroupChannel> {
-        if !self.enabled {
-            return Err(BridgeError::ChannelNotFound(
-                String::from_utf8_lossy(name).into_owned(),
-            ));
-        }
-        let def = self.servable_group(name).await.ok_or_else(|| {
+        let def = self.servable_group(name).ok_or_else(|| {
             BridgeError::ChannelNotFound(String::from_utf8_lossy(name).into_owned())
         })?;
         Ok(self.group_channel(def, creds))
@@ -1515,10 +1465,7 @@ impl BridgeProvider {
     /// Whether [`Self::create_channel_with_creds`] would build `name`, asked
     /// of the same constructor without serving a client.
     pub async fn channel_creatable(&self, name: &[u8]) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        if self.claims_group(name).await {
+        if self.claims_group(name) {
             return true;
         }
         let parsed = epics_base_rs::server::database::filters::parse_channel_name(name);
@@ -1560,19 +1507,10 @@ impl BridgeProvider {
         name: &[u8],
         creds: ClientCreds,
     ) -> BridgeResult<AnyChannel> {
-        // QSRV2 disabled: refuse to construct any DB-backed / group
-        // channel. Mirrors pvxs not registering the single/group sources
-        // (iochooks.cpp:461-496).
-        if !self.enabled {
-            return Err(BridgeError::ChannelNotFound(
-                String::from_utf8_lossy(name).into_owned(),
-            ));
-        }
-
         // Check group PVs first — but a group name that collides with
         // a real record is ignored (the record wins), matching pvxs
         // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
-        match self.group_serve(name).await {
+        match self.group_serve(name) {
             GroupServe::Created(def) => {
                 return Ok(AnyChannel::Group(self.group_channel(def, creds)));
             }
@@ -1955,11 +1893,11 @@ mod tests {
 
         // The single shadow gate.
         assert!(
-            !provider.is_servable_group(b"SH:rec").await,
+            !provider.is_servable_group(b"SH:rec"),
             "shadowed name is not a servable group"
         );
         assert!(
-            provider.is_servable_group(b"SH:grp").await,
+            provider.is_servable_group(b"SH:grp"),
             "non-colliding group is servable"
         );
 

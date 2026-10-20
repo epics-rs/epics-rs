@@ -56,7 +56,7 @@ async fn boot_softioc(n_pvs: usize) -> (tokio::task::JoinHandle<()>, u16) {
     let port = server.udp_port();
     let handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
-            eprintln!("CA benchmark server exited: {e}");
+            epics_libcom_rs::stderr_println!("CA benchmark server exited: {e}");
         }
     });
     (handle, port)

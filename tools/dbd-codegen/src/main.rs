@@ -28,6 +28,11 @@
 //! target owns a vendored `.dbd` directory and gets a table generated into
 //! itself, under the same drift gate.
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "single-threaded offline generator: no second writer to interleave with"
+)]
+
 mod breaktable;
 mod emit;
 mod parse;
@@ -354,9 +359,7 @@ fn generate(
     };
     let internal = own().filter(|f| emit::is_dropped_internal(f)).count();
     let emitted = own().filter(|f| !emit::is_dropped_internal(f)).count();
-    let dbaddr = own()
-        .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
-        .count();
+    let dbaddr = own().filter(|f| f.special == parse::SPC_DBADDR).count();
     eprintln!(
         "dbd-codegen: {}: {} record types, {emitted} own fields emitted \
          ({dbaddr} typed from cvt_dbaddr.types), {internal} DBF_NOACCESS internals \

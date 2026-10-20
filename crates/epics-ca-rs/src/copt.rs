@@ -98,6 +98,7 @@
 use std::io::Write as _;
 
 use crate::cli::IntStyle;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// C's "last occurrence wins" for a value-taking option: the getopt loop
 /// overwrites its variable on each pass, so the final assignment is the one
@@ -444,14 +445,15 @@ impl<'m> Scan<'m> {
             out.push('\n');
         }
         if !out.is_empty() {
-            let _ = std::io::stderr().write_all(out.as_bytes());
+            let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(out.as_bytes());
         }
 
         match terminal {
             None => {
                 if let Some(diagnostic) = self.error {
                     // C's `case '?'` / `case ':'`: the one line, then `return 1`.
-                    let _ = std::io::stderr().write_all(diagnostic.as_bytes());
+                    let _ = epics_libcom_rs::runtime::log::StagedStderr
+                        .write_all(diagnostic.as_bytes());
                     std::process::exit(1)
                 }
             }
@@ -462,7 +464,7 @@ impl<'m> Scan<'m> {
             Some((_, Terminal::Usage(status))) => {
                 // C's `usage()` writes to stderr whatever brought it here —
                 // `-h`, or the `default:` arm's exit-1 path.
-                let _ = std::io::stderr().write_all(usage.as_bytes());
+                let _ = epics_libcom_rs::runtime::log::StagedStderr.write_all(usage.as_bytes());
                 std::process::exit(status)
             }
         }
@@ -661,6 +663,7 @@ impl Scan<'_> {
                     format!(
                         "'{a}' is not a valid timeout value - ignored, using '{t:.1}'. \
                          ('{tool} -h' for help.)",
+                        t = CFloat(t),
                         tool = self.tool.0
                     ),
                 ),
@@ -918,7 +921,8 @@ impl CTool {
     /// `cainfo.c:202-205`, plus the getopt `'?'`/`':'` cases). No C CA tool
     /// exits 2, and none dumps its usage block on an error.
     pub fn usage_error(self, what: &str) -> ! {
-        let _ = std::io::stderr().write_all(self.diagnostic(what).as_bytes());
+        let _ =
+            epics_libcom_rs::runtime::log::StagedStderr.write_all(self.diagnostic(what).as_bytes());
         std::process::exit(1)
     }
 
@@ -1001,7 +1005,8 @@ impl CTool {
         // something the walk cannot see standing at an option's position —
         // a positional it will not take, say. Neither has anything to warn
         // about first.
-        let _ = std::io::stderr().write_all(self.usage_diagnostic(&cmd, error).as_bytes());
+        let _ = epics_libcom_rs::runtime::log::StagedStderr
+            .write_all(self.usage_diagnostic(&cmd, error).as_bytes());
         std::process::exit(1)
     }
 
@@ -1539,6 +1544,21 @@ mod tests {
                 "'abc' is not a valid array element count - ignored. ('caget -h' for help.)",
             ]
         );
+    }
+
+    /// C echoes the surviving timeout with `%.1f`: a `-w nan` that scanned
+    /// shows as `nan`, or `-nan` with the sign bit set.
+    #[test]
+    fn a_nan_timeout_is_echoed_as_c_prints_it() {
+        for (w, shown) in [("nan", "nan"), ("-nan", "-nan")] {
+            assert_eq!(
+                warnings_of(&["caget", &format!("-w{w}"), "-w", "qq"]),
+                [format!(
+                    "'qq' is not a valid timeout value - ignored, using '{shown}'. \
+                     ('caget -h' for help.)"
+                )]
+            );
+        }
     }
 
     /// R13-26, the other half: `-h`/`-V` end C's loop where they stand, so an

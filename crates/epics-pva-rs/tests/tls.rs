@@ -82,13 +82,13 @@ fn make_leaf(
 
 #[derive(Clone)]
 struct StaticSource {
-    inner: Arc<Mutex<std::collections::HashMap<RecordName, PvField>>>,
+    inner: Arc<parking_lot::Mutex<std::collections::HashMap<RecordName, PvField>>>,
 }
 
 impl StaticSource {
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            inner: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
     async fn put(&self, name: &str, value: f64) {
@@ -97,7 +97,6 @@ impl StaticSource {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(value))));
         self.inner
             .lock()
-            .await
             .insert(RecordName::from(name), PvField::Structure(s));
     }
 }
@@ -110,14 +109,13 @@ fn nt_scalar_desc() -> FieldDesc {
 }
 
 impl ChannelSource for StaticSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let inner = self.inner.clone();
-        async move { inner.lock().await.keys().cloned().collect::<Vec<_>>() }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.inner.lock().keys().cloned().collect::<Vec<_>>()
     }
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
         let n = RecordName::from(name);
-        async move { inner.lock().await.contains_key(&n) }
+        async move { inner.lock().contains_key(&n) }
     }
     fn get_introspection(
         &self,
@@ -126,7 +124,7 @@ impl ChannelSource for StaticSource {
         let inner = self.inner.clone();
         let n = RecordName::from(name);
         async move {
-            if inner.lock().await.contains_key(&n) {
+            if inner.lock().contains_key(&n) {
                 Some(nt_scalar_desc())
             } else {
                 None
@@ -136,7 +134,7 @@ impl ChannelSource for StaticSource {
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
         let n = RecordName::from(name);
-        async move { inner.lock().await.get(&n).cloned() }
+        async move { inner.lock().get(&n).cloned() }
     }
     fn put_value(
         &self,

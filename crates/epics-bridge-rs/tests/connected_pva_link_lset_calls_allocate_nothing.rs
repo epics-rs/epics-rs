@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{JlinkValue, pvajson_identity_key};
+use epics_base_rs::server::record::{JlinkValue, OpenLatch, pvajson_identity_key};
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
@@ -69,7 +69,7 @@ fn allocs(mut calls: impl FnMut()) -> usize {
 }
 
 /// Every per-link call a cycle makes on a connected link, by name.
-const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, &[u8]))] = &[
+const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, LinkRef<'_>))] = &[
     ("is_connected", |l, n| assert!(l.is_connected(n))),
     ("get_cached_value", |l, n| {
         assert!(l.get_cached_value(n).is_some())
@@ -91,6 +91,9 @@ const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, &[u8]))] = &[
     }),
     ("time_stamp", |l, n| {
         let _ = l.time_stamp(n);
+    }),
+    ("read_time_stamp", |l, n| {
+        let _ = l.read_time_stamp(n);
     }),
     ("link_metadata", |l, n| {
         assert!(l.link_metadata(n).is_some())
@@ -154,20 +157,23 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                 for name in [
                     "pva://T:A",
                     "pva://T:A?sevr=MS&field=value",
+                    "pva://T:A?time=true",
                     json.as_str(),
                     "pva://T:H?sevr=MS",
                 ] {
-                    resolver.connect_link(name.as_bytes(), None).await;
+                    let open = OpenLatch::default();
+                    let link = LinkRef::new(name.as_bytes(), &open);
+                    resolver.connect_link(link, None).await;
                     let deadline = Instant::now() + Duration::from_secs(20);
-                    while !(resolver.is_connected(name.as_bytes())
-                        && resolver.get_cached_value(name.as_bytes()).is_some())
+                    while !(resolver.is_connected(link)
+                        && resolver.get_cached_value(link).is_some())
                     {
                         assert!(Instant::now() < deadline, "{name} never connected");
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     let counts: Vec<(&str, usize)> = CONNECTED_CALLS
                         .iter()
-                        .map(|(call, f)| (*call, allocs(|| f(&resolver, name.as_bytes()))))
+                        .map(|(call, f)| (*call, allocs(|| f(&resolver, link))))
                         // The trait hands a remote message back as an owned
                         // `String`; that copy is the caller's.
                         .filter(|(call, _)| {

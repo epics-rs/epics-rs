@@ -17,6 +17,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::cfmt::CFloat;
 
 // --- Constants (matching original testAsynPortDriver) ---
 
@@ -209,7 +210,7 @@ impl ScopeSimulator {
         self.volts_per_div_choices = ALL_VOLTS_PER_DIV_SELECTIONS
             .iter()
             .map(|&v| EnumEntry {
-                string: format!("{:.2}", v as f64 / gain),
+                string: format!("{:.2}", CFloat(v as f64 / gain)),
                 value: (v as f64 / gain * 1000.0 + 0.5) as i32,
                 severity: 0,
             })
@@ -287,7 +288,9 @@ impl PortDriver for ScopeSimulator {
                     line!(),
                     format_args!(
                         "testAsynPortDriver:writeFloat64: warning, update time too small, \
-                         changed from {value:.6} to {MIN_UPDATE_TIME:.6}\n"
+                         changed from {:.6} to {:.6}\n",
+                        CFloat(value),
+                        CFloat(MIN_UPDATE_TIME)
                     ),
                 );
                 self.base

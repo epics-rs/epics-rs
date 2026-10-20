@@ -18,6 +18,7 @@ use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::cfmt::CFloat;
 
 const PROG_BAR_VERSION: f64 = 2.3;
 /// Seconds between progress updates.
@@ -124,36 +125,6 @@ fn c_int(v: f64) -> i32 {
         i32::MIN
     } else {
         v as i32
-    }
-}
-
-/// printf's `%g`: six significant digits, trailing zeros dropped, exponent
-/// form below 1e-4 or from 1e6.
-fn fmt_g(v: f64) -> String {
-    if v.is_nan() {
-        return if v.is_sign_negative() { "-nan" } else { "nan" }.into();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf" } else { "inf" }.into();
-    }
-    if v == 0.0 {
-        return if v.is_sign_negative() { "-0" } else { "0" }.into();
-    }
-    let sci = format!("{v:.5e}");
-    let (mantissa, exp) = sci.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let trim = |s: &str| {
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    if !(-4..6).contains(&exp) {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{sign}{:02}", trim(mantissa), exp.abs())
-    } else {
-        trim(&format!("{v:.*}", (5 - exp) as usize))
     }
 }
 
@@ -671,7 +642,7 @@ async fn progress_when(
                 v.npts_n[2],
                 v.cpt_n[3],
                 v.npts_n[3],
-                fmt_g(v.fraction_done)
+                CFloat(v.fraction_done).g()
             );
             m.debug(4, 241, || msg).await;
             // NaN passes through as it does C's if/else chain.
@@ -1018,22 +989,6 @@ mod tests {
             format_time_str(at(2), true, now),
             "14:00:00  (Wed) Mar 11, 2026"
         );
-    }
-
-    #[test]
-    fn fmt_g_is_printf_g() {
-        assert_eq!(fmt_g(0.0), "0");
-        assert_eq!(fmt_g(0.5), "0.5");
-        assert_eq!(fmt_g(1.0 / 3.0), "0.333333");
-        assert_eq!(fmt_g(2.0 / 3.0), "0.666667");
-        assert_eq!(fmt_g(1.0), "1");
-        assert_eq!(fmt_g(0.0001), "0.0001");
-        assert_eq!(fmt_g(0.00001234), "1.234e-05");
-        assert_eq!(fmt_g(123456.0), "123456");
-        assert_eq!(fmt_g(1234567.0), "1.23457e+06");
-        assert_eq!(fmt_g(999999.5), "1e+06");
-        assert_eq!(fmt_g(f64::INFINITY), "inf");
-        assert_eq!(fmt_g(f64::NAN), "nan");
     }
 
     #[test]

@@ -12,14 +12,19 @@
 //! # Locking
 //!
 //! C's bus, timer and `exec` callbacks take only the stream's mutex and
-//! write the record unlocked. Here the record is taken first, everywhere:
-//! an entry into the core from another thread passes the gate, which takes
-//! the record with [`AsyncDbHandle::with_instance`] and lends it to the
-//! hooks for the entry's run. A device support call into the stream
-//! already holds the record and lends it the same way; a bus answering
-//! inline, on the thread that holds the core, finds it lent. While
-//! `initRecord` waits for its `@init` run, holding the record as iocInit
-//! hands it over, it runs the entries itself.
+//! write the record unlocked. Here the record is held first, everywhere:
+//! an entry into the core from another thread passes the gate, which holds
+//! the record with [`AsyncDbHandle::with_held`] and lends the
+//! [`HeldInstance`] to the hooks for the entry's run. The dset calls are
+//! lent it by the framework ([`DeviceSupport::lends_held`]) and lend it the
+//! same way; a bus answering inline, on the thread that holds the core,
+//! finds it lent. While `initRecord` waits for its `@init` run, it runs the
+//! entries itself. A `%(record.FIELD)` input's `dbPut`, `dbPutField` and
+//! `dbProcess` go through the hold, as C makes them from inside the
+//! callback, and answer at once: the records a protocol's formats name
+//! join the record's lock set before the hold that installs it
+//! ([`InitHold::set_lock_partners`]), so the hold covers them and no entry
+//! takes a second set.
 
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
@@ -34,7 +39,8 @@ use epics_base_rs::runtime::task::{
     CallbackPriority, request_cell, sleep_background, spawn_background,
 };
 use epics_base_rs::server::database::{
-    AsyncDbHandle, DeviceDone, DeviceDoneSource, ProcessCallback,
+    AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
+    ProcessCallback, UnheldLinkPut,
 };
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
@@ -46,22 +52,27 @@ use epics_base_rs::server::recgbl::alarm_status::{
     CALC_ALARM, COMM_ALARM, NO_ALARM, READ_ALARM, TIMEOUT_ALARM, UDF_ALARM, WRITE_ALARM,
 };
 use epics_base_rs::server::recgbl::{
-    AlarmResetResult, EventMask, alarm_condition_string, rec_gbl_set_sevr,
+    AlarmResetResult, EventMask, alarm_condition_string, get_time_stamp, rec_gbl_set_sevr,
 };
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, HwLink, ParsedLink, Record, ScanType, parse_link_v2,
+    AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, ParsedLink, Record,
+    ScanType, parse_link_v2,
 };
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::{Condvar, Mutex};
 
 use crate::StreamBuffer;
 use crate::bus::{OwnedReadInput, StreamIoStatus};
 use crate::core::{
-    ABORTED, ACCEPT_INPUT, Entry, INIT_RUN, ProtocolResult, SCAN_TRIED, StartMode, StreamCore,
-    StreamCoreHooks, StreamCoreLock,
+    ABORTED, ACCEPT_INPUT, Dispatch, Entry, INIT_RUN, Parsed, ProtocolResult, RunId, SCAN_TRIED,
+    StartMode, StreamCore, StreamCoreHooks, StreamCoreLock, ValueMatch,
 };
 use crate::error::{STREAM_ERROR, stream_debug_print, stream_error};
-use crate::format::{DOUBLE_FORMAT, ENUM_FORMAT, SIGNED_FORMAT, StreamFormat, UNSIGNED_FORMAT};
+use crate::format::{
+    DOUBLE_FORMAT, ENUM_FORMAT, PSEUDO_FORMAT, SIGNED_FORMAT, STRING_FORMAT, StreamFormat,
+    UNSIGNED_FORMAT,
+};
 use crate::{cmsg, debug, protocol};
 
 /// devStream.h's return values.
@@ -73,6 +84,9 @@ pub const DO_NOT_CONVERT: i64 = 2;
 pub const S_DEV_BAD_INIT_RET: i64 = (514 << 16) | 11;
 /// devLib.h `S_dev_noDevice`
 pub const S_DEV_NO_DEVICE: i64 = (503 << 16) | 18;
+
+/// `MAX_STRING_SIZE`: a DBF_STRING element's bytes.
+const MAX_STRING_SIZE: usize = 40;
 
 /// More flags: 0x00FFFFFF used by StreamCore
 const VALUE_RECEIVED: u64 = 0x0200000;
@@ -328,13 +342,8 @@ pub trait StreamRecordType: Send + Sync + 'static {
 
     /// The dset's I/O entry: `streamRead` / `streamWrite`, unless the record
     /// type wraps it.
-    fn read_write(
-        &self,
-        stream: &Stream,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
-    ) -> i64 {
-        stream.read_write(record, common)
+    fn read_write(&self, stream: &Stream, held: &HeldInstance<'_>) -> i64 {
+        stream.read_write(held)
     }
 }
 
@@ -344,32 +353,54 @@ pub trait StreamRecordType: Send + Sync + 'static {
 struct RecordSlot(Mutex<Option<Lent>>);
 
 struct Lent {
-    record: NonNull<dyn Record>,
-    common: NonNull<CommonFields>,
+    record: LentRecord,
     thread: ThreadId,
 }
 
+/// How the record is lent: held, so a `%(record.FIELD)` input puts and
+/// processes through the hold, or borrowed by `scanDelete`'s
+/// `get_ioint_info`, which the framework calls under the borrow and whose
+/// abort scans nothing.
+enum LentRecord {
+    Held(NonNull<HeldInstance<'static>>),
+    Borrowed {
+        record: NonNull<dyn Record>,
+        common: NonNull<CommonFields>,
+    },
+}
+
 // SAFETY: a `Lent` is dereferenced only on the thread that lent it (see
-// `RecordSlot::with`). Each `lend` takes `&mut` of the record, so the
-// record lock is held: the slot holds one thread's entries at a time.
+// `RecordSlot::take`). Each lend holds the record, so the slot holds one
+// thread's entries at a time.
 unsafe impl Send for Lent {}
 
 impl RecordSlot {
-    /// Run `f` with `record` and `common` lent to it.
-    fn lend<R>(
+    /// Run `f` with the record `held` lent to it.
+    fn lend<R>(&self, held: &HeldInstance<'_>, f: impl FnOnce() -> R) -> R {
+        // Only the lifetime changes; see `put`.
+        let held = NonNull::from(held).cast::<HeldInstance<'static>>();
+        self.put(LentRecord::Held(held), f)
+    }
+
+    /// [`Self::lend`] for a record `scanDelete` borrows.
+    fn lend_borrowed<R>(
         &self,
         record: &mut dyn Record,
         common: &mut CommonFields,
         f: impl FnOnce() -> R,
     ) -> R {
         let record: NonNull<dyn Record + '_> = NonNull::from(record);
-        // SAFETY: only the trait object's lifetime bound changes. The
-        // pointer is handed out by `with`, on this thread, until `f`
-        // returns, while the borrow it came from is held by this call.
+        // SAFETY: only the trait object's lifetime bound changes; see `put`.
         let record: NonNull<dyn Record> = unsafe { std::mem::transmute(record) };
+        let common = NonNull::from(common);
+        self.put(LentRecord::Borrowed { record, common }, f)
+    }
+
+    /// The pointers are handed out by `take`, on this thread, until `f`
+    /// returns, while the hold or borrow they came from is the caller's.
+    fn put<R>(&self, record: LentRecord, f: impl FnOnce() -> R) -> R {
         let lent = Lent {
             record,
-            common: NonNull::from(common),
             thread: std::thread::current().id(),
         };
         let previous = self.0.lock().replace(lent);
@@ -389,10 +420,11 @@ impl RecordSlot {
         f()
     }
 
-    /// The lent record, on the thread that lent it; `None` elsewhere, or
-    /// while it is out to a `with` further up this thread's stack.
-    fn with<R>(&self, f: impl FnOnce(&mut dyn Record, &mut CommonFields) -> R) -> Option<R> {
-        let mut lent = {
+    /// The lent record taken out of the slot for `f`, on the thread that
+    /// lent it; `None` elsewhere, or while it is out to a `take` further up
+    /// this thread's stack.
+    fn take<R>(&self, f: impl FnOnce(&mut LentRecord) -> R) -> Option<R> {
+        let lent = {
             let mut slot = self.0.lock();
             match slot.as_ref() {
                 Some(l) if l.thread == std::thread::current().id() => slot.take()?,
@@ -405,21 +437,40 @@ impl RecordSlot {
                 *self.0.0.lock() = self.1.take();
             }
         }
-        // SAFETY: see `lend`; taken out of the slot, so no second `with`
-        // hands out the same borrow while this one is out.
-        let (record, common) = unsafe { (lent.record.as_mut(), lent.common.as_mut()) };
-        let _put_back = PutBack(self, None);
-        let r = f(record, common);
-        drop(_put_back);
-        *self.0.lock() = Some(lent);
-        Some(r)
+        let mut back = PutBack(self, Some(lent));
+        let lent = back.1.as_mut().expect("taken above");
+        Some(f(&mut lent.record))
+    }
+
+    /// The record and its `dbCommon`.
+    fn with<R>(&self, f: impl FnOnce(&mut dyn Record, &mut CommonFields) -> R) -> Option<R> {
+        self.take(|lent| match lent {
+            // SAFETY: see `put`; taken out of the slot, so no second `take`
+            // hands out the same lend while this one is out.
+            LentRecord::Held(held) => unsafe { held.as_ref() }.with(f),
+            LentRecord::Borrowed { record, common } => unsafe {
+                f(record.as_mut(), common.as_mut())
+            },
+        })
+    }
+
+    /// The hold, for a `%(record.FIELD)` input's puts and processes; `None`
+    /// for a borrowed record.
+    fn held<R>(&self, f: impl FnOnce(&HeldInstance<'_>) -> R) -> Option<R> {
+        self.take(|lent| match lent {
+            // SAFETY: as in `with`.
+            LentRecord::Held(held) => Some(f(unsafe { held.as_ref() })),
+            LentRecord::Borrowed { .. } => None,
+        })
+        .flatten()
     }
 }
 
 /// An [`Entry`] the `@init` waiter runs for the thread that sent it.
 struct Job {
+    run: RunId,
     entry: OwnedEntry,
-    reply: mpsc::Sender<isize>,
+    reply: mpsc::Sender<Dispatch>,
 }
 
 enum OwnedEntry {
@@ -431,6 +482,7 @@ enum OwnedEntry {
     Disconnect(StreamIoStatus),
     Timer,
     Exec(StreamIoStatus),
+    LinkPut(i32),
 }
 
 impl OwnedEntry {
@@ -444,6 +496,7 @@ impl OwnedEntry {
             Entry::Disconnect(s) => Self::Disconnect(s),
             Entry::Timer => Self::Timer,
             Entry::Exec(s) => Self::Exec(s),
+            Entry::LinkPut(s) => Self::LinkPut(s),
         }
     }
 
@@ -457,6 +510,7 @@ impl OwnedEntry {
             Self::Disconnect(s) => Entry::Disconnect(*s),
             Self::Timer => Entry::Timer,
             Self::Exec(s) => Entry::Exec(*s),
+            Self::LinkPut(s) => Entry::LinkPut(*s),
         }
     }
 }
@@ -488,39 +542,102 @@ struct Shared {
     /// `initDone`, set by the finish of an `@init` run.
     init_done: Mutex<bool>,
     init_signal: Condvar,
+    /// Taken for a whole `streamInitRecord`, outside its holds: the lock
+    /// partners [`Stream::install`] declares are those of the protocol it
+    /// replaces and the one it installs, which another init would change.
+    init_pass: Mutex<()>,
     /// The process callbacks requested, and how many of those requests a
     /// run has started after: `streamReload` waits for the second.
     process_requested: AtomicU64,
     process_served: Mutex<u64>,
     process_signal: Condvar,
+    /// What the [`Self::with_held`] holding the record owes once it lets
+    /// go, `None` while none holds it: a process callback request then goes
+    /// out at once.
+    owed: Mutex<Option<Owed>>,
     /// The `db_post_events` calls of the record's `readData`, for whoever
     /// holds the record to post before it lets go.
     posts: Mutex<Vec<DevicePost>>,
 }
 
 impl Shared {
-    /// [`AsyncDbHandle::with_instance`], the posts `f` made delivered after
-    /// the record is let go: the bus, timer and `exec` callbacks this takes
+    /// [`AsyncDbHandle::with_held`], the posts `f` made delivered after
+    /// the record is let go: the bus, timer and `exec` callbacks this holds
     /// the record for run unlocked in C.
-    fn with_instance<R>(
+    fn with_held<R>(
         &self,
         db: &AsyncDbHandle,
-        f: impl FnOnce(&mut dyn Record, &mut CommonFields) -> R,
+        f: impl FnOnce(&HeldInstance<'_>) -> R,
     ) -> Option<R> {
-        let (r, posts) = db.with_instance(&self.name, |record, common| {
-            let r = f(record, common);
-            (r, std::mem::take(&mut *self.posts.lock()))
+        let (r, posts, owed) = db.with_held(&self.name, |held| {
+            let owed = OwedScope::open(self);
+            let r = f(held);
+            (r, std::mem::take(&mut *self.posts.lock()), owed.close())
         })?;
         db.post_events(&self.name, posts);
+        // matchValue's dbPutField to a link field, made holding neither the
+        // record nor the core: its status takes the suspended run on
+        for (put, run) in owed.link_puts {
+            let status = db
+                .put_unheld(put)
+                .map_or_else(|status| status.get(), |()| 0);
+            if let Some(lock) = self.lock.get().and_then(Weak::upgrade) {
+                lock.link_put_callback(run, status);
+            }
+        }
+        // C's callback requests processCallback after its `dbPutField`s and
+        // posts, which this hold makes once it lets the record go.
+        if let Some(request) = owed.process {
+            self.issue_process(request);
+        }
         Some(r)
     }
 
+    /// `callbackRequest(&processCallback)`, once no [`Self::with_held`]
+    /// holds the record.
+    fn request_process(&self) {
+        let request = self.process_requested.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut owed = self.owed.lock();
+        match &mut *owed {
+            Some(owed) => owed.process = Some(request),
+            None => {
+                drop(owed);
+                self.issue_process(request);
+            }
+        }
+    }
+
+    /// Owe `put` to the [`Self::with_held`] holding the record, for `run`
+    /// to go on with its status; `false` with none holding it.
+    fn owe_link_put(&self, put: UnheldLinkPut, run: RunId) -> bool {
+        match &mut *self.owed.lock() {
+            Some(owed) => {
+                owed.link_puts.push((put, run));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn issue_process(&self, request: u64) {
+        let prio = CallbackPriority::from_record_prio(self.prio.load(Ordering::Relaxed));
+        let queued = self
+            .process_callback
+            .get()
+            .is_some_and(|cell| request_cell(prio, cell).is_ok());
+        if !queued {
+            // refused: no run will come for it
+            self.served(request);
+        }
+    }
+
     /// The gate: the record, then the core.
-    fn enter(&self, lock: &StreamCoreLock<StreamHooks>, entry: Entry<'_>) -> isize {
+    fn enter(&self, lock: &StreamCoreLock<StreamHooks>, run: RunId, entry: Entry<'_>) -> Dispatch {
         let waiter = self.init_waiter.lock().clone();
         if let Some(waiter) = waiter {
             let (reply, answer) = mpsc::channel();
             let job = Job {
+                run,
                 entry: OwnedEntry::of(entry),
                 reply,
             };
@@ -532,12 +649,12 @@ impl Shared {
             // the wait ended before it took this one: the record is free
         }
         let Some(db) = self.db.get() else {
-            return lock.dispatch(entry);
+            return lock.dispatch(run, entry);
         };
-        self.with_instance(db, |record, common| {
-            self.slot.lend(record, common, || lock.dispatch(entry))
+        self.with_held(db, |held| {
+            self.slot.lend(held, || lock.dispatch(run, entry))
         })
-        .unwrap_or(0)
+        .unwrap_or(Dispatch::Done(0))
     }
 
     /// Every process callback requested up to `request` has run.
@@ -557,12 +674,12 @@ impl Shared {
         }
     }
 
-    /// Run `f` with the record taken and lent, given its SCAN; `None` when
+    /// Run `f` with the record held and lent, given its SCAN; `None` when
     /// the stream has no database or the record is gone.
     fn held<R>(&self, f: impl FnOnce(ScanType) -> R) -> Option<R> {
-        self.with_instance(self.db.get()?, |record, common| {
-            let scan = common.scan;
-            self.slot.lend(record, common, || f(scan))
+        self.with_held(self.db.get()?, |held| {
+            let scan = held.with(|_, common| common.scan);
+            self.slot.lend(held, || f(scan))
         })
     }
 
@@ -657,6 +774,69 @@ impl Shared {
     }
 }
 
+/// What a [`Shared::with_held`] owes once it lets the record go.
+#[derive(Default)]
+struct Owed {
+    /// The last process callback request's number.
+    process: Option<u64>,
+    /// matchValue's link field puts, each with the run waiting for it.
+    link_puts: Vec<(UnheldLinkPut, RunId)>,
+}
+
+/// What a [`Shared::with_held`] comes to owe, opened and closed under its
+/// hold: the record's set is what keeps two holds from sharing
+/// [`Shared::owed`].
+struct OwedScope<'a> {
+    shared: &'a Shared,
+    outer: Option<Option<Owed>>,
+}
+
+impl<'a> OwedScope<'a> {
+    fn open(shared: &'a Shared) -> Self {
+        let outer = shared.owed.lock().replace(Owed::default());
+        Self {
+            shared,
+            outer: Some(outer),
+        }
+    }
+
+    /// What to do once the hold lets go: nothing when a `with_held` further
+    /// out takes it.
+    fn close(mut self) -> Owed {
+        self.restore().unwrap_or_default()
+    }
+
+    fn restore(&mut self) -> Option<Owed> {
+        let outer = self.outer.take()?;
+        let mut owed = self.shared.owed.lock();
+        let mine = std::mem::replace(&mut *owed, outer).unwrap_or_default();
+        match &mut *owed {
+            Some(outer) => {
+                if mine.process.is_some() {
+                    outer.process = mine.process;
+                }
+                outer.link_puts.extend(mine.link_puts);
+                None
+            }
+            None => Some(mine),
+        }
+    }
+}
+
+impl Drop for OwedScope<'_> {
+    /// Unwinding out of the hold: the request goes out under it, and a link
+    /// put, which must not be made there, is not made.
+    fn drop(&mut self) {
+        if let Some(Owed {
+            process: Some(request),
+            ..
+        }) = self.restore()
+        {
+            self.shared.issue_process(request);
+        }
+    }
+}
+
 /// Where the protocol a `process` pass starts stands.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Run {
@@ -726,9 +906,7 @@ impl CallbackBody for RecordProcess {
             if let (Some(stream), Some(db), Some(record_type)) =
                 (stream, shared.db.get(), shared.record_type.get())
             {
-                shared.with_instance(db, |record, common| {
-                    record_type.read_write(&stream, record, common);
-                });
+                shared.with_held(db, |held| record_type.read_write(&stream, held));
             }
             // C's rset->process completes the write before the "done" line.
             done.complete_now();
@@ -777,9 +955,440 @@ impl StreamHooks {
     fn with_record<R>(&self, f: impl FnOnce(&mut dyn Record, &mut CommonFields) -> R) -> Option<R> {
         self.shared.slot.with(f)
     }
+
+    /// `Stream::formatValue`'s `%([record.]field)` half: the value from that
+    /// field of this or another record.
+    fn format_field(&self, core: &StreamCore<Self>, format: &StreamFormat, addr: &DbAddr) -> bool {
+        let Some(db) = self.shared.db.get() else {
+            return false;
+        };
+        let own = addr.record.as_bytes() == self.shared.name.as_bytes();
+        let record = addr.record.to_str_lossy();
+        let field = addr.field.as_str();
+
+        // Handle time stamps special. %T converter takes double.
+        if field == "TIME" {
+            if format.type_ != DOUBLE_FORMAT {
+                stream_error(&cmsg!(
+                    core.name(),
+                    b": can only read double values from TIME field\n"
+                ));
+                return false;
+            }
+            let time = if own {
+                // if getting time from own record, update timestamp first
+                self.with_record(|_, common| {
+                    if let Some(time) = get_time_stamp(common.tse(), common.time) {
+                        common.time = time;
+                    }
+                    common.time
+                })
+            } else {
+                db.with_instance(addr.record.as_bytes(), |_, common| common.time)
+            };
+            let Some(time) = time else {
+                return false;
+            };
+            // the EPICS epoch (1990) is C's, the unix one (1970) is WallTime's
+            let time = time.unix_secs() as f64 + time.subsec_nanos() as f64 * 1e-9;
+            debug!(format!(
+                "Stream::formatValue({}): read {:.6} from TIME field\n",
+                core.name(),
+                CFloat(time)
+            ));
+            return core.print_value_double(format, time);
+        }
+
+        // C reaches this in its print loop, after a dbGet whose type it reads
+        // past the end of dbfMapping
+        if format.type_ == PSEUDO_FORMAT {
+            stream_error(&cmsg!(
+                core.name(),
+                b": %(FIELD) syntax not allowed with pseudo formats\n"
+            ));
+            return false;
+        }
+
+        // print (U)CHAR arrays as string
+        let char_string = format.type_ == STRING_FORMAT
+            && matches!(
+                addr.field_type,
+                Some(DbFieldType::Char | DbFieldType::UChar)
+            );
+        let dbr = match format.type_ {
+            _ if char_string => DbFieldType::Char,
+            UNSIGNED_FORMAT => DbFieldType::ULong,
+            SIGNED_FORMAT => DbFieldType::Long,
+            ENUM_FORMAT => DbFieldType::Enum,
+            DOUBLE_FORMAT => DbFieldType::Double,
+            _ => DbFieldType::String,
+        };
+        let name = [addr.record.as_bytes(), b".", field.as_bytes()].concat();
+        let nelem = addr.no_elements as usize;
+        let snap = if own {
+            let own = self.shared.name.as_bytes();
+            self.with_record(|rec, _| db.db_get(&name, dbr, nelem, Some((own, &*rec))))
+                .flatten()
+        } else {
+            db.db_get(&name, dbr, nelem, None)
+        };
+        let Some(snap) = snap else {
+            stream_error(&cmsg!(format!(
+                "{}: dbGet({record}.{field}, {}) failed\n",
+                core.name(),
+                Dbf::of(format.type_).name()
+            )));
+            return false;
+        };
+        debug!(format!(
+            "Stream::formatValue({}): got {} elements\n",
+            core.name(),
+            snap.value.count()
+        ));
+
+        // terminate CHAR array as string
+        if char_string {
+            let bytes = match &snap.value {
+                EpicsValue::CharArray(a) | EpicsValue::UCharArray(a) => a.to_vec(),
+                EpicsValue::Char(b) | EpicsValue::UChar(b) => vec![*b],
+                _ => Vec::new(),
+            };
+            let end = bytes.len().min(nelem.saturating_sub(1));
+            return core.print_value_string(format, &bytes[..end]);
+        }
+        match &snap.value {
+            EpicsValue::ULong(v) => core.print_value_long(format, *v as i64),
+            EpicsValue::ULongArray(a) => a.iter().all(|&v| core.print_value_long(format, v as i64)),
+            EpicsValue::Long(v) => core.print_value_long(format, *v as i64),
+            EpicsValue::LongArray(a) => a.iter().all(|&v| core.print_value_long(format, v as i64)),
+            EpicsValue::Enum(v) => core.print_value_long(format, *v as i64),
+            EpicsValue::EnumArray(a) => a.iter().all(|&v| core.print_value_long(format, v as i64)),
+            EpicsValue::Double(v) => core.print_value_double(format, *v),
+            EpicsValue::DoubleArray(a) => a.iter().all(|&v| core.print_value_double(format, v)),
+            EpicsValue::String(v) => core.print_value_string(format, v.as_bytes()),
+            EpicsValue::StringArray(a) => a
+                .iter()
+                .all(|v| core.print_value_string(format, v.as_bytes())),
+            _ => false,
+        }
+    }
+
+    /// `Stream::matchValue`'s `%([record.]field)` half: up to NELM values
+    /// scanned and put to that field, with `dbPut` into this record or
+    /// during `@init` and `dbPutField` into another record. It consumes
+    /// the input itself.
+    fn match_field(
+        &self,
+        core: &StreamCore<Self>,
+        format: &StreamFormat,
+        addr: &DbAddr,
+    ) -> ValueMatch<PutShown> {
+        let Some(db) = self.shared.db.get() else {
+            return ValueMatch::Failed;
+        };
+        let name = core.name();
+        let own = addr.record.as_bytes() == self.shared.name.as_bytes();
+        let record = addr.record.to_str_lossy();
+        let field = addr.field.as_str();
+        let nelem = addr.no_elements as usize;
+        let char_array = matches!(
+            addr.field_type,
+            Some(DbFieldType::Char | DbFieldType::UChar)
+        );
+        let init_run = !db.interrupt_accept();
+
+        let mut longs = Vec::new();
+        let mut doubles = Vec::new();
+        let mut strings = Vec::new();
+        let mut chars = Vec::new();
+        let (mut lval, mut dval) = (0i64, 0f64);
+        let mut nord = 0;
+        let mut consumed = 0;
+        while nord < nelem {
+            consumed = match format.type_ {
+                UNSIGNED_FORMAT | SIGNED_FORMAT | ENUM_FORMAT => {
+                    let consumed = core.scan_value_long(format, &mut lval);
+                    if consumed >= 0 {
+                        longs.push(lval);
+                    }
+                    debug!(format!(
+                        "Stream::matchValue({name}): {record}.{field}[{nord}] = {lval}\n"
+                    ));
+                    consumed
+                }
+                DOUBLE_FORMAT => {
+                    let consumed = core.scan_value_double(format, &mut dval);
+                    if consumed >= 0 {
+                        doubles.push(dval);
+                    }
+                    debug!(format!(
+                        "Stream::matchValue({name}): {record}.{field}[{nord}] = {}\n",
+                        alt_g(dval)
+                    ));
+                    consumed
+                }
+                STRING_FORMAT if char_array => {
+                    // string to char array
+                    chars = vec![0; nelem];
+                    let mut size = nelem;
+                    let consumed = core.scan_value_string(format, &mut chars, &mut size);
+                    chars.truncate(size);
+                    consumed
+                }
+                STRING_FORMAT => {
+                    let mut buffer = [0; MAX_STRING_SIZE];
+                    let mut size = MAX_STRING_SIZE;
+                    let consumed = core.scan_value_string(format, &mut buffer, &mut size);
+                    let end = buffer.iter().position(|&b| b == 0).unwrap_or(size);
+                    if consumed >= 0 {
+                        strings.push(PvString::from(&buffer[..end]));
+                    }
+                    consumed
+                }
+                _ => {
+                    stream_error(&cmsg!(format!(
+                        "INTERNAL ERROR: Stream::matchValue {name}: Illegal format type\n"
+                    )));
+                    return ValueMatch::Failed;
+                }
+            };
+            // C's `nord = nelem` for a char array (StreamEpics.cc:1344) comes
+            // before this test, so a failed scan never reaches the `if
+            // (!nord)` scan error, writes the buffer and matches: a C
+            // defect, not copied
+            if consumed < 0 {
+                break;
+            }
+            core.consumed_input
+                .set(core.consumed_input.get() + consumed as usize);
+            nord = if format.type_ == STRING_FORMAT && char_array {
+                // this shortcuts the loop
+                nelem
+            } else {
+                nord + 1
+            };
+        }
+        if nord == 0 {
+            // scan error: set other record to alarm status
+            if !own {
+                db.with_instance(addr.record.as_bytes(), |_, common| {
+                    rec_gbl_set_sevr(common, CALC_ALARM, AlarmSeverity::Invalid);
+                });
+                if !init_run {
+                    // process other record to send alarm monitor
+                    self.shared
+                        .slot
+                        .held(|held| held.db_process(addr.record.as_bytes()));
+                }
+            }
+            return ValueMatch::Failed;
+        }
+        if field == "TIME" {
+            if format.type_ != DOUBLE_FORMAT {
+                stream_error(&cmsg!(
+                    name,
+                    b": can only write double values to TIME field\n"
+                ));
+                return ValueMatch::Failed;
+            }
+            // convert from Unix epoch (1 Jan 1970) to EPICS epoch (1 Jan 1990)
+            let epics = dval - 631152000.0;
+            let sec = epics as i64;
+            // rounding: we don't have 9 digits precision
+            // in a double of today's number of seconds
+            let nsec = ((epics - sec as f64) * 1e6) as i64 * 1000;
+            let time = WallTime::from_unix((sec + 631152000) as u64, nsec as u32);
+            debug!(format!(
+                "Stream::matchValue({name}): writing {sec}.{nsec} to {record}.TIME field\n"
+            ));
+            let set = |_: &mut dyn Record, common: &mut CommonFields| {
+                common.time = time;
+                common.set_tse(EPICS_TIME_EVENT_DEVICE_TIME);
+            };
+            let written = if own {
+                self.with_record(set)
+            } else {
+                db.with_instance(addr.record.as_bytes(), set)
+            };
+            return match written {
+                Some(()) => ValueMatch::Matched,
+                None => ValueMatch::Failed,
+            };
+        }
+        // the failed line's "%.*s": the buffer to the last scan's count
+        let string = match format.type_ {
+            STRING_FORMAT if char_array => {
+                // write strings to [U]CHAR arrays
+                nord = chars.len();
+                shown_at(&chars, consumed).to_vec()
+            }
+            STRING_FORMAT => shown_at(strings[0].as_bytes(), consumed).to_vec(),
+            _ => Vec::new(),
+        };
+        let value = match format.type_ {
+            STRING_FORMAT if char_array => EpicsValue::CharArray(chars.into()),
+            // nord elements: one is the field's scalar, more an array
+            UNSIGNED_FORMAT => match longs[..] {
+                [v] => EpicsValue::ULong(v as u32),
+                _ => EpicsValue::ULongArray(
+                    longs.iter().map(|&v| v as u32).collect::<Vec<_>>().into(),
+                ),
+            },
+            SIGNED_FORMAT => match longs[..] {
+                [v] => EpicsValue::Long(v as i32),
+                _ => EpicsValue::LongArray(
+                    longs.iter().map(|&v| v as i32).collect::<Vec<_>>().into(),
+                ),
+            },
+            ENUM_FORMAT => match longs[..] {
+                [v] => EpicsValue::Enum(v as u16),
+                _ => EpicsValue::EnumArray(
+                    longs.iter().map(|&v| v as u16).collect::<Vec<_>>().into(),
+                ),
+            },
+            DOUBLE_FORMAT => match doubles[..] {
+                [v] => EpicsValue::Double(v),
+                _ => EpicsValue::DoubleArray(doubles.into()),
+            },
+            _ => match strings.len() {
+                1 => EpicsValue::String(strings.pop().unwrap()),
+                _ => EpicsValue::StringArray(strings.into()),
+            },
+        };
+        let dbf = if format.type_ == STRING_FORMAT && char_array {
+            Dbf::Char
+        } else {
+            Dbf::of(format.type_)
+        };
+        let shown = match &value {
+            EpicsValue::CharArray(a) => {
+                String::from_utf8_lossy(a.split(|&b| b == 0).next().unwrap_or(&[])).into_owned()
+            }
+            _ => value.to_string(),
+        };
+        let put = PutShown {
+            putfunc: if own || init_run {
+                "dbPut"
+            } else {
+                "dbPutField"
+            },
+            record: addr.record.clone(),
+            field: field.to_owned(),
+            dbf,
+            shown,
+            lval,
+            dval,
+            string,
+            nord,
+        };
+        let status = if own || init_run {
+            // write into own record, thus don't process it
+            // in @init we must not process other record
+            let status = self.shared.slot.held(|held| held.db_put(addr, value));
+            if init_run && !own {
+                // clean error status of other record in @init
+                db.with_instance(addr.record.as_bytes(), |_, common| {
+                    common.udf = 0;
+                    common.sevr = AlarmSeverity::NoAlarm;
+                    common.stat = NO_ALARM;
+                });
+            }
+            status
+        } else {
+            // write into other record, thus process it
+            match self.shared.slot.held(|held| held.db_put_field(addr, value)) {
+                Some(FieldPut::Done(status)) => Some(status),
+                // the hold makes it once it lets go, the run suspended here
+                Some(FieldPut::Unheld(link_put)) => {
+                    if self.shared.owe_link_put(link_put, core.run_id()) {
+                        return ValueMatch::Put(put);
+                    }
+                    None
+                }
+                None => None,
+            }
+        };
+        let status = match status {
+            Some(Ok(())) => 0,
+            Some(Err(status)) => status.get(),
+            // no hold lent to put through
+            None => -1,
+        };
+        if self.put_done(core, &put, status) {
+            ValueMatch::Matched
+        } else {
+            ValueMatch::Failed
+        }
+    }
+
+    /// matchValue after its put of `status`: whether the value matched.
+    fn put_done(&self, core: &StreamCore<Self>, put: &PutShown, status: i32) -> bool {
+        let name = core.name();
+        debug!(format!(
+            "Stream::matchValue({name}): {}({}.{}, {}, {}) status=0x{:x}\n",
+            put.putfunc,
+            put.record.to_str_lossy(),
+            put.field,
+            put.dbf.name(),
+            put.shown,
+            status as u32
+        ));
+        if status != 0 {
+            core.flags.set(core.flags.get() & !SCAN_TRIED);
+            stream_error(&put.failed(name));
+            return false;
+        }
+        true
+    }
+}
+
+/// matchValue's put, as its debug and failed lines show it
+/// (StreamEpics.cc:1440-1475).
+pub struct PutShown {
+    putfunc: &'static str,
+    record: RecordName,
+    field: String,
+    dbf: Dbf,
+    /// The value, as the debug line has it.
+    shown: String,
+    lval: i64,
+    dval: f64,
+    /// The scan buffer, as [`shown_at`] the last scan's `consumed`.
+    string: Vec<u8>,
+    nord: usize,
+}
+
+impl PutShown {
+    /// `"%s: %s(%s.%s, %s, <value>, %zu) failed\n"`, the value as `%li`,
+    /// `%#g` or `"%.*s"`.
+    fn failed(&self, name: &str) -> Vec<u8> {
+        let head = format!(
+            "{name}: {}({}.{}, {}, ",
+            self.putfunc,
+            self.record.to_str_lossy(),
+            self.field,
+            self.dbf.name()
+        );
+        let tail = format!(", {}) failed\n", self.nord);
+        match self.dbf {
+            Dbf::Ulong | Dbf::Long | Dbf::Enum => cmsg!(head, self.lval.to_string(), tail),
+            Dbf::Double => cmsg!(head, alt_g(self.dval), tail),
+            Dbf::String | Dbf::Char => cmsg!(head, b"\"", self.string, b"\"", tail),
+        }
+    }
+}
+
+/// C's `"%.*s"` of `buffer` at the precision `consumed`: to its first NUL,
+/// and past no more than `consumed` bytes unless that is negative.
+fn shown_at(buffer: &[u8], consumed: isize) -> &[u8] {
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    &buffer[..usize::try_from(consumed).map_or(end, |c| end.min(c))]
 }
 
 impl StreamCoreHooks for StreamHooks {
+    type FieldAddress = DbAddr;
+    type LinkPut = PutShown;
+
     fn input_hook(&self, core: &StreamCore<Self>, input: &[u8]) {
         if self.with_record(|_, c| c.tpro).unwrap_or(0) > 1 {
             let msg = cmsg!(
@@ -860,15 +1469,7 @@ impl StreamCoreHooks for StreamHooks {
             self.run.set(Run::FinishedInline);
         } else if (pact || io_intr) && !TERMINATING.load(Ordering::Acquire) {
             // process record in callback thread to break possible recursion
-            if let Some(cell) = self.shared.process_callback.get() {
-                let prio =
-                    CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
-                let request = self.shared.process_requested.fetch_add(1, Ordering::AcqRel) + 1;
-                if request_cell(prio, cell).is_err() {
-                    // refused: no run will come for it
-                    self.shared.served(request);
-                }
-            }
+            self.shared.request_process();
         }
     }
 
@@ -876,7 +1477,7 @@ impl StreamCoreHooks for StreamHooks {
         debug!(format!(
             "Stream::startTimer(stream={}, timeout={timeout_ms}) = {:.6} seconds\n",
             core.name(),
-            timeout_ms as f64 * 0.001
+            CFloat(timeout_ms as f64 * 0.001)
         ));
         let start = self.shared.timer_start.fetch_add(1, Ordering::AcqRel) + 1;
         let Some(lock) = self.shared.lock.get().cloned() else {
@@ -899,15 +1500,20 @@ impl StreamCoreHooks for StreamHooks {
         &self,
         core: &StreamCore<Self>,
         format: &StreamFormat,
-        fieldaddress: Option<&[u8]>,
+        fieldaddress: Option<&DbAddr>,
     ) -> bool {
         // C's line has no closing parenthesis
         debug!(format!(
             "Stream::formatValue({}, format=%{}, fieldaddr={}\n",
             core.name(),
             format.conv as char,
-            c_ptr(fieldaddress.map(|a| a.as_ptr().cast()))
+            c_ptr(fieldaddress.map(|a| std::ptr::from_ref(a).cast()))
         ));
+        if let Some(address) = fieldaddress {
+            // Format like "%([record.]field)..." has requested to get value
+            // from field of this or other record.
+            return self.format_field(core, format, address);
+        }
         let fmt = Format {
             type_: Dbf::of(format.type_),
             priv_: format,
@@ -940,8 +1546,13 @@ impl StreamCoreHooks for StreamHooks {
         &self,
         core: &StreamCore<Self>,
         format: &StreamFormat,
-        _fieldaddress: Option<&[u8]>,
-    ) -> bool {
+        fieldaddress: Option<&DbAddr>,
+    ) -> ValueMatch<PutShown> {
+        if let Some(address) = fieldaddress {
+            // Format like "%([record.]field)..." has requested to put value
+            // to field of this or other record.
+            return self.match_field(core, format, address);
+        }
         let fmt = Format {
             type_: Dbf::of(format.type_),
             priv_: format,
@@ -949,7 +1560,7 @@ impl StreamCoreHooks for StreamHooks {
         // no fieldaddress (the "normal" case)
         let Some(read_data) = self.read_data.get() else {
             stream_error(&cmsg!(core.name(), b": No readData() function provided\n"));
-            return false;
+            return ValueMatch::Failed;
         };
         self.current_value_length.set(0);
         let io = StreamIo { core };
@@ -979,7 +1590,7 @@ impl StreamCoreHooks for StreamHooks {
                 ));
                 core.flags.set(core.flags.get() & !SCAN_TRIED);
             }
-            return false;
+            return ValueMatch::Failed;
         }
         core.flags.set(core.flags.get() | VALUE_RECEIVED);
         core.consumed_input
@@ -989,16 +1600,29 @@ impl StreamCoreHooks for StreamHooks {
             core.name(),
             self.current_value_length.get()
         ));
-        true
+        ValueMatch::Matched
     }
 
-    fn get_field_address(
-        &self,
-        _core: &StreamCore<Self>,
-        _fieldname: &[u8],
-        _address: &mut StreamBuffer,
-    ) -> bool {
-        false
+    fn link_put_done(&self, core: &StreamCore<Self>, put: PutShown, status: i32) -> bool {
+        self.put_done(core, &put, status)
+    }
+
+    fn get_field_address(&self, _core: &StreamCore<Self>, fieldname: &[u8]) -> Option<DbAddr> {
+        let db = self.shared.db.get()?;
+        let own = self.shared.name.as_bytes();
+        let resolve = |name: &[u8]| {
+            self.with_record(|record, _| db.name_to_dbaddr(name, Some((own, &*record))))
+                .unwrap_or_else(|| db.name_to_dbaddr(name, None))
+        };
+        if fieldname.contains(&b'.') {
+            // record.FIELD (access to other record)
+            resolve(fieldname)
+        } else {
+            // FIELD in this record or VAL in other record
+            resolve(&[own, b".", fieldname].concat())
+                .filter(|addr| addr.field.as_bytes() == fieldname)
+                .or_else(|| resolve(&[fieldname, b".VAL"].concat()))
+        }
     }
 
     fn priority(&self, _core: &StreamCore<Self>) -> i64 {
@@ -1097,7 +1721,9 @@ fn drv_init() {
         match std::env::var("STREAM_PROTOCOL_PATH") {
             Ok(path) => protocol::set_path(Some(&path)),
             Err(_) => {
-                eprintln!("drvStreamInit: Warning! STREAM_PROTOCOL_PATH not set.");
+                epics_base_rs::stderr_println!(
+                    "drvStreamInit: Warning! STREAM_PROTOCOL_PATH not set."
+                );
             }
         }
         debug!(format!(
@@ -1342,9 +1968,11 @@ impl Stream {
             timer_start: AtomicU64::new(0),
             init_done: Mutex::new(false),
             init_signal: Condvar::new(),
+            init_pass: Mutex::new(()),
             process_requested: AtomicU64::new(0),
             process_served: Mutex::new(0),
             process_signal: Condvar::new(),
+            owed: Mutex::new(None),
             posts: Mutex::new(Vec::new()),
         });
         if let Some(db) = db {
@@ -1365,7 +1993,7 @@ impl Stream {
                 initialized: Cell::new(false),
                 run: Cell::new(Run::Idle),
             },
-            Box::new(move |lock, entry| gate_shared.enter(lock, entry)),
+            Box::new(move |lock, run, entry| gate_shared.enter(lock, run, entry)),
         );
         let _ = shared.lock.set(Arc::downgrade(&lock));
         streams().lock().push(Arc::downgrade(&lock));
@@ -1378,13 +2006,15 @@ impl Stream {
     }
 
     /// `streamInitRecord(record, ioLink, readData, writeData)` from its
-    /// link checks on.
-    fn init_record(
+    /// link checks to `initRecord`'s protocol parse, in the hold that ran
+    /// the record type's `initRecord` and stopped the running protocol: the
+    /// protocol parsed and whether it compiled, which [`Self::install`]
+    /// makes the record's, or the status to return.
+    fn stage(
         &self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
+        held: &HeldInstance<'_>,
         args: &StreamInitArgs,
-    ) -> i64 {
+    ) -> Result<(Parsed<DbAddr>, bool), i64> {
         let name = self.name();
         {
             let core = self.lock.lock();
@@ -1400,7 +2030,7 @@ impl Stream {
                     "{name}: Wrong I/O link type {}\n",
                     other.db_link_type().c_name()
                 )));
-                return S_DEV_BAD_INIT_RET;
+                return Err(S_DEV_BAD_INIT_RET);
             }
         };
         let link = link.as_str();
@@ -1409,12 +2039,58 @@ impl Stream {
                 name,
                 b": Empty I/O link. Forgot the leading '@' or confused INP with OUT or link is too long ?\n"
             ));
-            return S_DEV_BAD_INIT_RET;
+            return Err(S_DEV_BAD_INIT_RET);
         }
         // (re)initialize bus and protocol
         debug!(format!("streamInitRecord({name}): calling initRecord\n"));
         *self.lock.lock().hooks.link.borrow_mut() = link.to_string();
-        let status = self.shared.slot.lend(record, common, || self.init(link));
+        self.shared
+            .slot
+            .lend(held, || self.init_protocol(link))
+            .map_err(|status| self.init_done(status))
+    }
+
+    /// `streamInitRecord` from `initRecord`'s protocol parse on, the record
+    /// let go between holds. The records `parsed`'s formats name join the
+    /// record's lock set before it can run, beside those of the protocol it
+    /// replaces; one hold stops a run of that one, installs `parsed` and
+    /// starts it if it `compiled`; then the replaced protocol's records
+    /// leave the set.
+    fn install(&self, hold: &mut InitHold<'_>, parsed: Parsed<DbAddr>, compiled: bool) -> i64 {
+        let own = self.name().as_bytes();
+        let targets = |parsed: &Parsed<DbAddr>| -> Vec<RecordName> {
+            parsed
+                .field_addresses()
+                .filter(|addr| addr.record.as_bytes() != own)
+                .map(|addr| addr.record.clone())
+                .collect()
+        };
+        let new = targets(&parsed);
+        let old = targets(&self.lock.lock().installed());
+        hold.set_lock_partners(old.into_iter().chain(new.iter().cloned()));
+        let status = hold.held(|held| {
+            self.shared.slot.lend(held, || {
+                let core = self.lock.lock();
+                if core.running() {
+                    // a process between the holds started the old protocol
+                    core.finish_protocol(ProtocolResult::Abort);
+                }
+                core.install(parsed);
+                drop(core);
+                if compiled {
+                    self.init_start()
+                } else {
+                    S_DEV_NO_DEVICE
+                }
+            })
+        });
+        hold.set_lock_partners(new);
+        self.init_done(status)
+    }
+
+    /// `streamInitRecord`'s end, with the status `initRecord` returned.
+    fn init_done(&self, status: i64) -> i64 {
+        let name = self.name();
         if status != OK && status != DO_NOT_CONVERT {
             stream_error(&cmsg!(name, b": Record initialization failed\n"));
         } else {
@@ -1427,8 +2103,11 @@ impl Stream {
         status
     }
 
-    /// `Stream::initRecord(linkstring)`, the record lent.
-    fn init(&self, linkstring: &str) -> i64 {
+    /// `Stream::initRecord(linkstring)` up to the protocol parse, the record
+    /// lent: the core's protocol as the parse wrote it, whose
+    /// `%(record.FIELD)` formats every entry puts to and processes holding
+    /// this record, and whether it compiled.
+    fn init_protocol(&self, linkstring: &str) -> Result<(Parsed<DbAddr>, bool), i64> {
         let name = self.name();
         debug!(format!(
             "Stream::initRecord {name}: parse link string \"{linkstring}\"\n"
@@ -1440,15 +2119,15 @@ impl Stream {
         ));
         if link.filename.is_empty() {
             stream_error(&cmsg!(name, b": Missing protocol file name\n"));
-            return S_DEV_BAD_INIT_RET;
+            return Err(S_DEV_BAD_INIT_RET);
         }
         if link.protocol.is_empty() {
             stream_error(&cmsg!(name, b": Missing protocol name\n"));
-            return S_DEV_BAD_INIT_RET;
+            return Err(S_DEV_BAD_INIT_RET);
         }
         if link.busname.is_empty() {
             stream_error(&cmsg!(name, b": Missing bus name\n"));
-            return S_DEV_BAD_INIT_RET;
+            return Err(S_DEV_BAD_INIT_RET);
         }
 
         // attach to bus interface
@@ -1464,7 +2143,7 @@ impl Stream {
                 "{name}: Can't attach to bus {} {}\n",
                 link.busname, link.addr
             )));
-            return S_DEV_NO_DEVICE;
+            return Err(S_DEV_NO_DEVICE);
         }
 
         // parse protocol file
@@ -1472,15 +2151,19 @@ impl Stream {
             "Stream::initRecord {name}: parse(\"{}\", \"{}\")\n",
             link.filename, link.protocol
         ));
-        if !self
-            .lock
-            .lock()
-            .parse(link.filename, link.protocol.as_bytes())
-        {
+        let core = self.lock.lock();
+        let mut parsed = core.installed();
+        let compiled = core.parse(&mut parsed, link.filename, link.protocol.as_bytes());
+        drop(core);
+        if !compiled {
             stream_error(&cmsg!(name, b": Protocol parse error\n"));
-            return S_DEV_NO_DEVICE;
         }
+        Ok((parsed, compiled))
+    }
 
+    /// `Stream::initRecord` from the parsed protocol on, the record lent.
+    fn init_start(&self) -> i64 {
+        let name = self.name();
         // record is ready to use
         let reload = {
             let core = self.lock.lock();
@@ -1523,7 +2206,9 @@ impl Stream {
         debug!(format!("Stream::initRecord {name}: waiting for initDone\n"));
         while !*self.shared.init_done.lock() {
             let Ok(job) = jobs.recv() else { break };
-            let _ = job.reply.send(self.lock.dispatch(job.entry.entry()));
+            let _ = job
+                .reply
+                .send(self.lock.dispatch(job.run, job.entry.entry()));
         }
         self.end_init_wait(&jobs);
         debug!(format!("Stream::initRecord {name}: initDone\n"));
@@ -1551,21 +2236,23 @@ impl Stream {
     fn end_init_wait(&self, jobs: &mpsc::Receiver<Job>) {
         *self.shared.init_waiter.lock() = None;
         while let Ok(job) = jobs.try_recv() {
-            let _ = job.reply.send(self.lock.dispatch(job.entry.entry()));
+            let _ = job
+                .reply
+                .send(self.lock.dispatch(job.run, job.entry.entry()));
         }
     }
 
     /// `streamReadWrite(record)`, the dset's I/O entry.
-    pub fn read_write(&self, record: &mut dyn Record, common: &mut CommonFields) -> i64 {
+    pub fn read_write(&self, held: &HeldInstance<'_>) -> i64 {
         if self.lock.lock().hooks.status.get() == ERROR {
-            rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid);
+            held.with(|_, common| rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid));
             return ERROR;
         }
-        if self
+        let processed = self
             .shared
             .slot
-            .lend(record, common, || self.shared.process(&self.lock))
-        {
+            .lend(held, || self.shared.process(&self.lock));
+        if processed {
             self.lock.lock().hooks.convert.get()
         } else {
             ERROR
@@ -1578,13 +2265,13 @@ impl Stream {
     }
 
     /// `streamInitRecord`'s start for a record that has its stream.
-    fn stop_running_protocol(&self, record: &mut dyn Record, common: &mut CommonFields) {
+    fn stop_running_protocol(&self, held: &HeldInstance<'_>) {
         // stop any running protocol
         debug!(format!(
             "streamInitRecord({}): stop running protocol\n",
             self.name()
         ));
-        self.shared.slot.lend(record, common, || {
+        self.shared.slot.lend(held, || {
             self.lock.lock().finish_protocol(ProtocolResult::Abort)
         });
     }
@@ -1602,22 +2289,32 @@ impl Stream {
     fn reinit_record(&self, db: &AsyncDbHandle) -> Option<i64> {
         let name = self.name();
         let record_type = self.shared.record_type.get()?;
-        let args = db.with_instance(name, |record, common| {
-            let args = record_type.init_record(record, common);
-            debug!(format!(
-                "streamInitRecord({name}): SEVR={}\n",
-                common.sevr as i32
-            ));
-            self.stop_running_protocol(record, common);
-            args
+        let _pass = self.shared.init_pass.lock();
+        let status = db.with_init_hold(name, |hold| {
+            let (args, staged) = hold.held(|held| {
+                let args = held.with(|record, common| {
+                    let args = record_type.init_record(record, common);
+                    debug!(format!(
+                        "streamInitRecord({name}): SEVR={}\n",
+                        common.sevr as i32
+                    ));
+                    args
+                });
+                self.stop_running_protocol(held);
+                let staged = self.stage(held, &args);
+                (args, staged)
+            });
+            // C races here: streamReload (StreamEpics.cc:193) runs init_record
+            // unlocked against recordProcessCallback's dbScanLock (:1052); rs
+            // fixes the order C showed in every run, callback first.
+            self.shared.wait_process_callbacks();
+            args.status(staged.map_or_else(
+                |status| status,
+                |(parsed, compiled)| self.install(hold, parsed, compiled),
+            ))
         })?;
-        // C races here: streamReload (StreamEpics.cc:193) runs init_record
-        // unlocked against recordProcessCallback's dbScanLock (:1052); rs
-        // fixes the order C showed in every run, callback first.
-        self.shared.wait_process_callbacks();
-        db.with_instance(name, |record, common| {
-            args.status(self.init_record(record, common, &args))
-        })
+        db.post_events(name, std::mem::take(&mut *self.shared.posts.lock()));
+        Some(status)
     }
 
     /// The link text after the `@`, as `ioLink->value.instio.string`.
@@ -1709,7 +2406,7 @@ pub fn stream_set_logfile(filename: Option<&str>, _: &mut dyn std::io::Write) ->
             // strerror's text, without Rust's " (os error N)"
             let text = e.to_string();
             let text = text.rfind(" (os error ").map_or(&*text, |at| &text[..at]);
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "Opening file {} failed: {text}",
                 filename.unwrap_or_default()
             );
@@ -1805,20 +2502,33 @@ impl StreamDevice {
         self.stream.as_ref()
     }
 
+    /// `streamGetIointInfo(cmd, record, ppvt)` up to its `cmd` switch: the
+    /// record's stream, if it has one.
+    fn ioint_stream(&self, cmd: IoIntrCmd) -> Option<&Stream> {
+        let stream = self.stream.as_ref();
+        let ioscanpvt = stream.filter(|s| s.lock.lock().hooks.initialized.get());
+        debug!(format!(
+            "streamGetIointInfo({},cmd={}): stream={}, ioscanpvt={}\n",
+            self.name,
+            cmd as i32,
+            c_ptr(stream.map(|s| Arc::as_ptr(&s.shared).cast::<()>())),
+            c_ptr(ioscanpvt.map(|s| Arc::as_ptr(&s.lock).cast::<()>()))
+        ));
+        if stream.is_none() {
+            stream_error(b"streamGetIointInfo called without stream instance\n");
+        }
+        stream
+    }
+
     /// The pass's call of the dset's I/O entry. A protocol it started ends
     /// the pass; the completion gets the record's `done`.
-    fn read_write(
-        &mut self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
-        done: &DeviceDoneSource<'_>,
-    ) -> bool {
+    fn read_write(&mut self, held: &HeldInstance<'_>, done: &DeviceDoneSource<'_>) -> bool {
         let Some(stream) = self.stream.as_ref() else {
-            rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid);
+            held.with(|_, common| rec_gbl_set_sevr(common, UDF_ALARM, AlarmSeverity::Invalid));
             self.status = ERROR;
             return false;
         };
-        self.status = self.record_type.read_write(stream, record, common);
+        self.status = self.record_type.read_write(stream, held);
         let started = stream.active();
         if started {
             *stream.shared.device_done.lock() = Some(done.device_done());
@@ -1841,46 +2551,61 @@ impl DeviceSupport for StreamDevice {
         self.name = name.to_string();
     }
 
-    fn init_common(
-        &mut self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
-    ) -> CaResult<DeviceInitOutcome> {
-        let args = self.record_type.init_record(record, common);
+    /// A `%(record.FIELD)` input puts and processes from inside `init`,
+    /// the I/O entry and `scanAdd`, as C's `matchValue` does with its
+    /// record locked.
+    fn lends_held(&self) -> bool {
+        true
+    }
+
+    fn init_held(&mut self, hold: &mut InitHold<'_>) -> CaResult<DeviceInitOutcome> {
         let name = self.name.clone();
-        debug!(format!(
-            "streamInitRecord({name}): SEVR={}\n",
-            common.sevr as i32
-        ));
-        if self.stream.is_none() {
-            // initialize the first time
-            debug!(format!(
-                "streamInitRecord({name}): create new Stream object\n"
-            ));
-            self.stream = Some(Stream::new(
-                &name,
-                common.prio,
-                self.db.clone(),
-                self.record_type.clone(),
-            ));
-        } else if let Some(stream) = self.stream.as_ref() {
-            stream.stop_running_protocol(record, common);
-        }
-        let stream = self.stream.as_ref().expect("created above");
-        match args.status(stream.init_record(record, common, &args)) {
+        // made before the hold, so that a streamReload finding it waits for
+        // its init_pass
+        let created = self.stream.is_none();
+        let stream = self.stream.get_or_insert_with(|| {
+            Stream::new(&name, 0, self.db.clone(), self.record_type.clone())
+        });
+        let _pass = stream.shared.init_pass.lock();
+        let record_type = &self.record_type;
+        let (args, staged) = hold.held(|held| {
+            let (args, prio) = held.with(|record, common| {
+                let args = record_type.init_record(record, common);
+                debug!(format!(
+                    "streamInitRecord({name}): SEVR={}\n",
+                    common.sevr as i32
+                ));
+                (args, common.prio)
+            });
+            if created {
+                // initialize the first time
+                debug!(format!(
+                    "streamInitRecord({name}): create new Stream object\n"
+                ));
+                stream.shared.prio.store(prio, Ordering::Relaxed);
+            } else {
+                stream.stop_running_protocol(held);
+            }
+            let staged = stream.stage(held, &args);
+            (args, staged)
+        });
+        let status = staged.map_or_else(
+            |status| status,
+            |(parsed, compiled)| stream.install(hold, parsed, compiled),
+        );
+        match args.status(status) {
             OK => Ok(DeviceInitOutcome::ok()),
             DO_NOT_CONVERT => Ok(DeviceInitOutcome::DoNotConvert(Default::default())),
             status => Err(init_error(status)),
         }
     }
 
-    fn read_begin_common(
+    fn read_begin_held(
         &mut self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
+        held: &HeldInstance<'_>,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        Ok(if self.read_write(record, common, done) {
+        Ok(if self.read_write(held, done) {
             ReadStart::Pending
         } else {
             ReadStart::Synchronous
@@ -1900,16 +2625,15 @@ impl DeviceSupport for StreamDevice {
         })
     }
 
-    fn write_begin_common(
+    fn write_begin_held(
         &mut self,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
+        held: &HeldInstance<'_>,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         // A failure's alarm is the stream's, raised in the pass, so it is
         // Completed, never the framework's write failure: C's record raises
         // nothing for the dset's ERROR.
-        Ok(if self.read_write(record, common, done) {
+        Ok(if self.read_write(held, done) {
             WriteStart::Pending
         } else {
             WriteStart::Completed
@@ -1920,52 +2644,56 @@ impl DeviceSupport for StreamDevice {
         unreachable!("write_begin_common never asks for the write")
     }
 
-    /// `streamGetIointInfo(cmd, record, ppvt)`
+    /// `streamGetIointInfo`'s `cmd` 1, as `scanDelete` calls it, under the
+    /// borrow; `scanAdd`'s is [`Self::get_ioint_info_add_held`].
     fn get_ioint_info(
         &mut self,
         record: &mut dyn Record,
         common: &mut CommonFields,
         cmd: IoIntrCmd,
     ) -> bool {
-        let name = self.name.as_str();
-        let stream = self.stream.as_ref();
-        let ioscanpvt = stream.filter(|s| s.lock.lock().hooks.initialized.get());
-        debug!(format!(
-            "streamGetIointInfo({name},cmd={}): stream={}, ioscanpvt={}\n",
-            cmd as i32,
-            c_ptr(stream.map(|s| Arc::as_ptr(&s.shared).cast::<()>())),
-            c_ptr(ioscanpvt.map(|s| Arc::as_ptr(&s.lock).cast::<()>()))
-        ));
-        let Some(stream) = stream else {
-            stream_error(b"streamGetIointInfo called without stream instance\n");
+        let Some(stream) = self.ioint_stream(cmd) else {
             return false;
         };
         match cmd {
-            IoIntrCmd::Add => {
-                if !self
-                    .db
-                    .as_ref()
-                    .is_some_and(AsyncDbHandle::interrupt_accept)
-                {
-                    // We will start polling later in initHook.
-                    debug!(format!("streamGetIointInfo({name}): start later...\n"));
-                    return true;
-                }
-                debug!(format!("streamGetIointInfo({name}): start protocol\n"));
-                // SCAN has been set to "I/O Intr"
-                if !stream.shared.slot.lend(record, common, || {
-                    stream.lock.start_protocol(StartMode::StartAsync)
-                }) {
-                    stream_error(&cmsg!(name, b": Can't start \"I/O Intr\" protocol\n"));
-                }
-            }
+            IoIntrCmd::Add => unreachable!("scanAdd lends the record to get_ioint_info_add_held"),
             IoIntrCmd::Delete => {
                 // SCAN is no longer "I/O Intr"
-                debug!(format!("streamGetIointInfo({name}): abort protocol\n"));
-                stream.shared.slot.lend(record, common, || {
+                debug!(format!(
+                    "streamGetIointInfo({}): abort protocol\n",
+                    self.name
+                ));
+                stream.shared.slot.lend_borrowed(record, common, || {
                     stream.lock.lock().finish_protocol(ProtocolResult::Abort)
                 });
             }
+        }
+        true
+    }
+
+    /// `streamGetIointInfo`'s `cmd` 0, as `scanAdd` calls it.
+    fn get_ioint_info_add_held(&mut self, held: &HeldInstance<'_>) -> bool {
+        let Some(stream) = self.ioint_stream(IoIntrCmd::Add) else {
+            return false;
+        };
+        let name = self.name.as_str();
+        if !self
+            .db
+            .as_ref()
+            .is_some_and(AsyncDbHandle::interrupt_accept)
+        {
+            // We will start polling later in initHook.
+            debug!(format!("streamGetIointInfo({name}): start later...\n"));
+            return true;
+        }
+        debug!(format!("streamGetIointInfo({name}): start protocol\n"));
+        // SCAN has been set to "I/O Intr"
+        let started = stream
+            .shared
+            .slot
+            .lend(held, || stream.lock.start_protocol(StartMode::StartAsync));
+        if !started {
+            stream_error(&cmsg!(name, b": Can't start \"I/O Intr\" protocol\n"));
         }
         true
     }
@@ -2001,10 +2729,41 @@ impl DeviceSupport for StreamDevice {
     }
 }
 
+/// C's `%#g`.
+fn alt_g(value: f64) -> String {
+    let mut out = StreamBuffer::new();
+    crate::cprintf::print_double(&mut out, b"%#g", value);
+    String::from_utf8_lossy(out.bytes()).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use epics_base_rs::server::records::ai::AiRecord;
+
+    struct NoRecordType;
+
+    impl StreamRecordType for NoRecordType {
+        fn init_record(&self, _: &mut dyn Record, _: &mut CommonFields) -> StreamInitArgs {
+            unreachable!("never initialized")
+        }
+
+        fn is_output(&self) -> bool {
+            false
+        }
+    }
+
+    /// A protocol finish inside a hold nested in another of the same record
+    /// owes its request to the outer one, issued once that lets go.
+    #[test]
+    fn a_nested_holds_process_request_goes_to_the_outer_hold() {
+        let stream = Stream::new("nested", 0, None, Arc::new(NoRecordType));
+        let outer = OwedScope::open(&stream.shared);
+        let inner = OwedScope::open(&stream.shared);
+        stream.shared.request_process();
+        assert_eq!(inner.close().process, None, "issued under the outer hold");
+        assert_eq!(outer.close().process, Some(1));
+    }
 
     #[test]
     #[should_panic(expected = "a record lent on two threads at once")]
@@ -2012,9 +2771,9 @@ mod tests {
         let slot = RecordSlot::default();
         let (mut a, mut b) = (AiRecord::default(), AiRecord::default());
         let (mut ca, mut cb) = (CommonFields::default(), CommonFields::default());
-        slot.lend(&mut a, &mut ca, || {
+        slot.lend_borrowed(&mut a, &mut ca, || {
             std::thread::scope(|s| {
-                let lent = s.spawn(|| slot.lend(&mut b, &mut cb, || ()));
+                let lent = s.spawn(|| slot.lend_borrowed(&mut b, &mut cb, || ()));
                 if let Err(panic) = lent.join() {
                     std::panic::resume_unwind(panic);
                 }

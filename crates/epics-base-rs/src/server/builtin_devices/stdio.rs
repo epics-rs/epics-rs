@@ -49,7 +49,7 @@ impl StdioStream {
     fn print_line(self, line: &str) {
         match self {
             StdioStream::Stdout => println!("{line}"),
-            StdioStream::Stderr => eprintln!("{line}"),
+            StdioStream::Stderr => crate::stderr_println!("{line}"),
             StdioStream::Errlog => errlog_vprintf(format_args!("{line}\n")),
         }
     }

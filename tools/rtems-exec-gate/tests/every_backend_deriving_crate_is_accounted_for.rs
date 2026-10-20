@@ -161,11 +161,25 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-bridge-rs", "tests/pva_local_link_unfulfilled.rs"),
     (
         "epics-bridge-rs",
+        "tests/pvalink_channel_closes_with_its_last_link.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/pvalink_cp_scan_of_an_active_record_traces.rs",
+    ),
+    ("epics-bridge-rs", "tests/pvalink_read_stamps_the_reader.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/pvalink_reopened_cp_channel_scans.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/qsrv_put_fails_on_the_process_status.rs",
     ),
     ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
     ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
+    ("epics-bridge-rs", "tests/tpro_names_the_pva_client.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),
     ("epics-ca-rs", "src/server/ca_server.rs"),
@@ -180,6 +194,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/a_put_to_an_unopened_remote_link_is_refused.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_string_put_to_an_enum_link_goes_as_dbr_string.rs",
     ),
     (
@@ -189,6 +207,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/access_rights_spc_nomod.rs"),
     ("epics-ca-rs", "tests/acf_host_identity.rs"),
     ("epics-ca-rs", "tests/acf_hot_reload.rs"),
+    ("epics-ca-rs", "tests/an_out_ca_link_sends_no_event_add.rs"),
     ("epics-ca-rs", "tests/asg_inp_change_reevaluates_access.rs"),
     ("epics-ca-rs", "tests/beacon_ramp_connect.rs"),
     ("epics-ca-rs", "tests/ca_char_put_is_unsigned.rs"),
@@ -223,11 +242,13 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/cli_dbr_type_race.rs"),
     ("epics-ca-rs", "tests/cli_monitor_separator.rs"),
     ("epics-ca-rs", "tests/cli_value_format.rs"),
+    ("epics-ca-rs", "tests/cp_process_runs_on_dbcalink.rs"),
     ("epics-ca-rs", "tests/dbput_ca_link_target.rs"),
     ("epics-ca-rs", "tests/differential_libca.rs"),
     ("epics-ca-rs", "tests/discovery_dns_update.rs"),
     ("epics-ca-rs", "tests/discovery_mdns.rs"),
     ("epics-ca-rs", "tests/dollar_long_string_record.rs"),
+    ("epics-ca-rs", "tests/each_ca_link_opens_its_own_channel.rs"),
     ("epics-ca-rs", "tests/long_string_dollar_monitor_counts.rs"),
     ("epics-ca-rs", "tests/long_string_plain_monitor_counts.rs"),
     ("epics-ca-rs", "tests/lsi_val_reads_past_len_to_its_nul.rs"),
@@ -278,6 +299,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/the_ca_servers_set_tcp_nodelay_on_the_accepted_socket.rs",
     ),
     ("epics-ca-rs", "tests/tls_end_to_end.rs"),
+    ("epics-ca-rs", "tests/tpro_names_the_ca_client.rs"),
     (
         "epics-ca-rs",
         "tests/zero_length_array_write_is_not_a_short_frame.rs",

@@ -20,8 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, TaskHandle, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
+use epics_base_rs::server::autosave::manager::SaveTaskHandle;
 use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager};
 use epics_base_rs::server::autosave::save_set::{ManualSource, SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::database::PvDatabase;
@@ -46,7 +47,7 @@ record(ao, "T:SAVED") { }
 struct Rig {
     db: Arc<PvDatabase>,
     mgr: Arc<AutosaveManager>,
-    handle: Option<TaskHandle<()>>,
+    handle: Option<SaveTaskHandle>,
     status: EventReader,
     recently: EventReader,
 }
@@ -84,7 +85,7 @@ impl Rig {
                         request_pvs: vec!["T:SAVED".into()],
                         backup: BackupConfig { enable_savb: false },
                         macros: HashMap::new(),
-                        macro_string: String::new(),
+                        macro_string: None,
                         search_paths: Vec::new(),
                     },
                     SaveStrategy::Manual,
@@ -92,7 +93,7 @@ impl Rig {
                 .build()
                 .await,
         );
-        let handle = mgr.clone().start(&Reactor::current().unwrap(), db.clone());
+        let handle = mgr.clone().start(db.clone());
         Self {
             db,
             mgr,

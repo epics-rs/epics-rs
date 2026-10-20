@@ -1,0 +1,53 @@
+Terminator = LF;
+ReplyTimeout = 500;
+
+# getFieldAddress: record.FIELD, a field of this record, VAL of another
+dotted { out "%(src.VAL)d"; }
+own { out "%(PREC)d"; }
+bare { out "%(src).1f"; }
+
+# formatValue: dbGet of the field, a CHAR array printed as one string
+own_egu { out "%(EGU)s"; }
+chars { out "%(w)s"; }
+
+# matchValue: dbPutField into another record, dbPut into this one or in @init
+put_other { out "Q1"; in "%(t.VAL)d"; }
+put_own { out "Q2"; in "%(EGU)s"; }
+put_chars { out "Q3"; in "%(w2)s"; }
+put_bad { out "Q4"; in "%(t.VAL)d"; }
+put_init { @init { out "Q5"; in "%(t2.VAL)d"; } out "N"; }
+put_time { out "Q6"; in "%(t3.TIME)f"; }
+get_time { out "%(t3.TIME).1f"; }
+
+# matchValue through the record's hold: each put answers before the
+# protocol goes on
+put_then_print { out "H1"; in "%(t.VAL)d"; out "%(cnt)d"; }
+put_refused { out "H2"; in "%(dd.VAL)d"; }
+put_own_desc { out "H3"; in "%(DESC)s"; }
+put_loop { out "H4"; in "%(tl.VAL)d"; }
+put_init_held { @init { out "H5"; in "%(DESC)s %(ti.VAL)d"; } out "N"; }
+intr_put { in "%(t.VAL)d"; out "%(cnt)d"; }
+intr_bad_init { @init { out "H6"; in "%d"; } in "%(t.VAL)d"; out "%(cnt)d"; }
+put_link { out "H7"; in "%(lk.OUT)s"; }
+
+# matchValue's put into a link field, made holding neither the record nor
+# the core: the run waits for its status, then goes on
+put_link_mm { out "H8"; in "%(lk.OUT)s"; @mismatch { out "MM"; } }
+put_link_on { out "H9"; in "%(lk.OUT)s %(t.VAL)d"; out "after"; }
+put_links { out "HB"; in "%(lk.OUT)s %(lk2.OUT)s"; out "after"; }
+intr_link { in "%(lk.OUT)s"; out "after"; }
+# names tb, whose lock set joins its record's
+names_tb { out "%(tb.VAL)d"; }
+
+# a failed put's line: the scan buffer as "%.*s" at the last scan's consumed
+fail_s3 { out "F1"; in "%(ws.VAL)s"; }
+fail_s2 { out "F2"; in "%(ws.VAL)s"; }
+fail_sep { Separator = ","; out "F3"; in "%(ws.VAL)s"; }
+fail_ch { out "F4"; in "%(wc.VAL).1/(?=(abc))/"; }
+fail_lk { out "F5"; in "%(lk.OUT).1/(?=(@instio))/"; }
+
+# two records redirecting into each other from their bus threads, each
+# entry long enough to overlap the other's
+cross_x { out "CX"; in "%(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s %(cy.DESC)s"; }
+cross_y { out "CY"; in "%(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s %(cx.DESC)s"; }
+intr_feed { in "%d %(it.VAL)d"; }

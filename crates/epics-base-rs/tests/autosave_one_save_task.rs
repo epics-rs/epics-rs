@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy, SrStatus};
@@ -33,7 +33,7 @@ async fn a_manager_started_twice_saves_its_list_once() {
                     request_pvs: vec!["TEMP".into()],
                     backup: BackupConfig::default(),
                     macros: HashMap::new(),
-                    macro_string: String::new(),
+                    macro_string: None,
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::OnChange {
@@ -43,9 +43,8 @@ async fn a_manager_started_twice_saves_its_list_once() {
             .build()
             .await,
     );
-    let reactor = Reactor::current().unwrap();
-    let first = mgr.clone().start(&reactor, db.clone());
-    let second = mgr.clone().start(&reactor, db.clone());
+    let first = mgr.clone().start(db.clone());
+    let second = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
     for _ in 0..150 {
         if set.stats().save_count.load(Ordering::Relaxed) > 0 {

@@ -18,7 +18,7 @@ record(ao, "L") { field(OUT, "A") }
 "#;
 
 const SAV: &str = "# autosave R5.10\tAutomatically generated - DO NOT MODIFY - 181018-120000\n\
-                   A.VAL 1.5\nW.VAL @array@ { \"1\" \"2\" }\nL.OUT $(X) NPP\nL.DESC $(X)\n<END>\n";
+                   A.VAL 1.5\n#W @array@ { \"9\" }\nW.VAL @array@ { \"1\" \"2\" }\nL.OUT $(X) NPP\nL.DESC $(X)\n<END>\n";
 
 /// Both boot passes of `$CHILD/s.sav` with macros `X=B`, the pass-0 one
 /// writing the undated boot backup, in the child only.
@@ -109,6 +109,8 @@ fn debug_1_traces_the_files_and_arrays() {
     expected.extend([
         "../dbrestore.c:reboot_restore *** restoring from 'DIR/s.sav' at initHookState 6 (before record/device init) ***",
         header,
+        "../dbrestore.c:SR_array_restore :entry: PV = '#W'",
+        "../dbrestore.c:SR_array_restore Gobbled unused array data.",
         "../dbrestore.c:SR_array_restore :entry: PV = 'W.VAL'",
         "../dbrestore.c:SR_array_restore p_data = (nil), p_data_size = 0",
         "../dbrestore.c:SR_array_restore No array write in pass 0.",
@@ -119,6 +121,8 @@ fn debug_1_traces_the_files_and_arrays() {
     expected.extend([
         "../dbrestore.c:reboot_restore *** restoring from 'DIR/s.sav' at initHookState 7 (after record/device init) ***",
         header,
+        "../dbrestore.c:SR_array_restore :entry: PV = '#W'",
+        "../dbrestore.c:SR_array_restore Gobbled unused array data.",
         "../dbrestore.c:SR_array_restore :entry: PV = 'W.VAL'",
         "../dbrestore.c:SR_array_restore p_data = (nil), p_data_size = 0",
         "../dbrestore.c:SR_array_restore Writing array to database",
@@ -131,6 +135,7 @@ fn debug_1_traces_the_files_and_arrays() {
 fn debug_5_adds_the_per_line_traces() {
     let (stdout, errlog) = traces(5);
     let check = [
+        "save_restore:concatenate_paths: dest='DIR/s.sav'",
         "checkFile: entry",
         "checkFile: version=5.100000",
         "checkFile: files ends with '<END>'",
@@ -139,7 +144,7 @@ fn debug_5_adds_the_per_line_traces() {
         "- ----             ------           -----",
         "  X                B                B",
     ];
-    assert_eq!(stdout[..7], check, "{stdout:#?}");
+    assert_eq!(stdout[..8], check, "{stdout:#?}");
     assert!(stdout.contains(&"reboot_restore: buffer='L.OUT $(X) NPP".to_string()));
     assert!(stdout.contains(&"                         ebuffer='L.OUT B NPP".to_string()));
     for line in [

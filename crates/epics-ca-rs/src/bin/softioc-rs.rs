@@ -800,9 +800,9 @@ fn report_argv_error(e: clap::Error) -> std::process::ExitCode {
     } else {
         "option requires an argument"
     };
-    eprintln!("{arg0}: {what} -- '{}'", blamed_option(&e));
+    epics_libcom_rs::stderr_println!("{arg0}: {what} -- '{}'", blamed_option(&e));
     print!("{}", usage());
-    eprintln!("Unknown argument: -?");
+    epics_libcom_rs::stderr_println!("Unknown argument: -?");
     std::process::ExitCode::from(2)
 }
 
@@ -1110,7 +1110,7 @@ impl Failure {
             print!("{}", usage());
         }
         if let Some(line) = self.rendered() {
-            eprintln!("{line}");
+            epics_libcom_rs::stderr_println!("{line}");
         }
         std::process::ExitCode::from(self.status())
     }
@@ -1221,7 +1221,9 @@ impl ServerOptions {
                 if let Some((k, v)) = kv.split_once('=') {
                     mdns_txt.push((k.to_string(), v.to_string()));
                 } else {
-                    eprintln!("warning: --mdns-txt expects KEY=VALUE, got {kv:?}; skipping");
+                    epics_libcom_rs::stderr_println!(
+                        "warning: --mdns-txt expects KEY=VALUE, got {kv:?}; skipping"
+                    );
                 }
             }
         }

@@ -1,10 +1,10 @@
 use super::lsi::LongStringVal;
+use crate::calc::engine::cvt::format_float_conv;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     FieldDeclaration, InputLinkRequest, LinkReadAs, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
-use epics_libcom_rs::cfmt::CFloat;
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
@@ -683,26 +683,6 @@ fn pad_tail(out: &mut Vec<u8>, start: usize, width: usize, left_align: bool, zer
     };
     for _ in 0..fill {
         out.insert(at, ch);
-    }
-}
-
-/// C `%e %E %f %F %g %G`, `#` included, through `cfmt::CFloat`. The
-/// upper-case conversions differ from the lower only in letter case
-/// (`E`, `INF`, `NAN`), and CFloat's output has no other letters.
-fn format_float_conv(conv: u8, val: f64, prec: usize, alt_form: bool) -> String {
-    let x = CFloat(val);
-    let s = match (conv.to_ascii_lowercase(), alt_form) {
-        (b'e', false) => format!("{x:.prec$e}"),
-        (b'e', true) => format!("{x:#.prec$e}"),
-        (b'g', false) => format!("{:.prec$}", x.g()),
-        (b'g', true) => format!("{:#.prec$}", x.g()),
-        (_, false) => format!("{x:.prec$}"),
-        (_, true) => format!("{x:#.prec$}"),
-    };
-    if conv.is_ascii_uppercase() {
-        s.to_ascii_uppercase()
-    } else {
-        s
     }
 }
 

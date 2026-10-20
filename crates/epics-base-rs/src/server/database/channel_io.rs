@@ -87,6 +87,9 @@ pub enum LongStringMode {
     /// so the CHAR-array carrier is decoded to a scalar string before
     /// encoding.
     NativeString,
+    /// Plain access to a link or an attribute, which `dbGet` reads as text
+    /// for every request type (`dbAccess.c:944-952`).
+    Text(crate::server::database::char_view::TextRoute),
 }
 
 /// An open database channel: C's `dbChannel` after `dbChannelOpen`.
@@ -283,6 +286,11 @@ pub async fn channel_create(
                                     view,
                                 },
                             )
+                        } else if let Some(route) =
+                            crate::server::database::char_view::read_route(&instance, &field)
+                                .and_then(|source| source.text_route())
+                        {
+                            (v.dbr_type(), 1, LongStringMode::Text(route))
                         } else if instance.record.field_is_long_string(&field) {
                             // Long-string *record* field (lsi/lso VAL &
                             // OVAL, printf VAL). C `cvt_dbaddr` presents

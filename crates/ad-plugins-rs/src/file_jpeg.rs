@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
@@ -35,7 +35,9 @@ impl JpegWriter {
 }
 
 impl NDFileWriter for JpegWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
+        // NDFileJPEG.cpp:34-37
+        mode.refuse_read_or_append("NDFileJPEG")?;
         let dt = array.data.data_type();
         if dt != NDDataType::UInt8 && dt != NDDataType::Int8 {
             return Err(ADError::UnsupportedConversion(
@@ -124,42 +126,11 @@ impl NDFileWriter for JpegWriter {
         Ok(())
     }
 
+    /// C `readFile` returns asynError (NDFileJPEG.cpp:194-198).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let file_data = std::fs::read(path)?;
-        let mut decoder = jpeg_decoder::Decoder::new(&file_data[..]);
-        let pixels = decoder
-            .decode()
-            .map_err(|e| ADError::UnsupportedConversion(format!("JPEG decode error: {}", e)))?;
-        let info = decoder.info().unwrap();
-
-        let (width, height) = (info.width as usize, info.height as usize);
-
-        let dims = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => {
-                vec![NDDimension::new(width), NDDimension::new(height)]
-            }
-            jpeg_decoder::PixelFormat::RGB24 => {
-                vec![
-                    NDDimension::new(3),
-                    NDDimension::new(width),
-                    NDDimension::new(height),
-                ]
-            }
-            _ => {
-                return Err(ADError::UnsupportedConversion(
-                    "unsupported JPEG pixel format".into(),
-                ));
-            }
-        };
-
-        let mut arr = NDArray::new(dims, NDDataType::UInt8);
-        arr.data = NDDataBuffer::U8(pixels);
-        Ok(arr)
+        Err(ADError::UnsupportedConversion(
+            "NDFileJPEG cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -299,6 +270,28 @@ mod tests {
         ))
     }
 
+    /// C `openFile` refuses NDFileModeRead (NDFileJPEG.cpp:34), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("jpeg_read_refused");
+        let mut writer = JpegWriter::new(90);
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = JpegFileProcessor::new(90);
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// R8-75, JPEG writer: same defect as the cited TIFF site. C defaults
     /// `colorMode` to Mono (NDFileJPEG.cpp:29), overwrites it only from the
     /// attribute (:52-53), and each 3-D branch requires the attribute (:61, :67,
@@ -322,7 +315,7 @@ mod tests {
         let path = temp_path("jpeg_3d_no_colormode");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         let err = writer.write_file(&Arc::new(arr)).unwrap_err();
         assert!(
@@ -344,7 +337,7 @@ mod tests {
         let path = temp_path("jpeg_1d");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         assert!(matches!(
             writer.write_file(&Arc::new(arr)).unwrap_err(),
@@ -363,7 +356,7 @@ mod tests {
         let path = temp_path("jpeg_3d_rgb1");
         let mut writer = JpegWriter::new(90);
         writer
-            .open_file(&path, NDFileMode::Single, &arr)
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
             .expect("open");
         writer
             .write_file(&Arc::new(arr))
@@ -387,7 +380,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -410,7 +405,7 @@ mod tests {
             NDDataType::UInt16,
         );
 
-        let result = writer.open_file(&path, NDFileMode::Single, &arr);
+        let result = writer.open_file(&path, NDFileOpenMode::WRITE, &arr);
         assert!(result.is_err());
     }
 
@@ -431,14 +426,14 @@ mod tests {
 
         let mut writer_high = JpegWriter::new(95);
         writer_high
-            .open_file(&path_high, NDFileMode::Single, &arr)
+            .open_file(&path_high, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         writer_high.write_file(&Arc::new(arr.clone())).unwrap();
         writer_high.close_file().unwrap();
 
         let mut writer_low = JpegWriter::new(10);
         writer_low
-            .open_file(&path_low, NDFileMode::Single, &arr)
+            .open_file(&path_low, NDFileOpenMode::WRITE, &arr)
             .unwrap();
         writer_low.write_file(&Arc::new(arr)).unwrap();
         writer_low.close_file().unwrap();
@@ -533,27 +528,35 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-
-        let read_back = writer.read_file().unwrap();
-        assert_eq!(read_back.data.data_type(), NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref v) = read_back.data {
-            // With uniform input at max quality, decoded values should be close
-            for &px in v.iter() {
-                assert!(
-                    (px as i16 - 128).unsigned_abs() < 5,
-                    "pixel {} too far from 128",
-                    px
-                );
-            }
-        }
-
         writer.close_file().unwrap();
+
+        let (info, pixels) = decode(&path);
+        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::L8);
+        // With uniform input at max quality, decoded values should be close
+        for &px in pixels.iter() {
+            assert!(
+                (px as i16 - 128).unsigned_abs() < 5,
+                "pixel {} too far from 128",
+                px
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
-    /// Write an RGB-mode array to JPEG and return the decoded array's dims.
+    /// The file as an independent decoder reads it.
+    fn decode(path: &Path) -> (jpeg_decoder::ImageInfo, Vec<u8>) {
+        let bytes = std::fs::read(path).unwrap();
+        let mut decoder = jpeg_decoder::Decoder::new(&bytes[..]);
+        let pixels = decoder.decode().unwrap();
+        (decoder.info().unwrap(), pixels)
+    }
+
+    /// Write an RGB-mode array to JPEG and return the decoded
+    /// `[components, width, height]`.
     fn jpeg_roundtrip_dims(prefix: &str, mode: NDColorMode, dims: Vec<usize>) -> Vec<usize> {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
         let path = temp_path(prefix);
@@ -575,12 +578,19 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
-        let read_back = writer.read_file().unwrap();
         writer.close_file().unwrap();
+        let (info, _) = decode(&path);
         std::fs::remove_file(&path).ok();
-        read_back.dims.iter().map(|d| d.size).collect()
+        let components = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L8 => 1,
+            jpeg_decoder::PixelFormat::RGB24 => 3,
+            other => panic!("unexpected {other:?}"),
+        };
+        vec![components, info.width as usize, info.height as usize]
     }
 
     #[test]
@@ -588,8 +598,8 @@ mod tests {
         // RGB2 [x=5, c=3, y=4]: C writes width=5, height=4, 3 JCS_RGB
         // components (NDFileJPEG.cpp:67-78). The Rust converts to RGB1 first;
         // before the fix the stale ColorMode=RGB2 attribute made info() read
-        // the RGB1 dims as width=3, color=5 -> a 3x4 grayscale JPEG. Decoded
-        // dims must be RGB24 [3, 5, 4], not grayscale [3, 4].
+        // the RGB1 dims as width=3, color=5 -> a 3x4 grayscale JPEG. The
+        // file must be RGB24 5x4, not grayscale 3x4.
         let dims = jpeg_roundtrip_dims("jpeg_rgb2", NDColorMode::RGB2, vec![5, 3, 4]);
         assert_eq!(dims, vec![3, 5, 4]);
     }
@@ -597,7 +607,7 @@ mod tests {
     #[test]
     fn test_adp12_rgb3_jpeg_written_as_rgb_not_grayscale() {
         // RGB3 [x=5, y=4, c=3]: C writes width=5, height=4, 3 components
-        // (NDFileJPEG.cpp:72-78). Decoded dims must be RGB24 [3, 5, 4].
+        // (NDFileJPEG.cpp:72-78). The file must be RGB24 5x4.
         let dims = jpeg_roundtrip_dims("jpeg_rgb3", NDColorMode::RGB3, vec![5, 4, 3]);
         assert_eq!(dims, vec![3, 5, 4]);
     }

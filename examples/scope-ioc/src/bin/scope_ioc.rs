@@ -21,6 +21,7 @@ use scope_ioc::driver::*;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 // ========== DriverHolder + Command Handlers ==========
 
@@ -143,14 +144,14 @@ impl CommandHandler for ReportHandler {
         println!("ScopeSimulator Report");
         println!("  Run:            {}", if run != 0 { "Yes" } else { "No" });
         println!("  MaxPoints:      {max_pts}");
-        println!("  UpdateTime:     {update_t:.3} s");
-        println!("  VoltsPerDiv:    {vpd:.3} V");
-        println!("  TimePerDiv:     {tpd:.4} s");
-        println!("  VoltOffset:     {offset:.3} V");
-        println!("  NoiseAmplitude: {noise:.3} V");
-        println!("  MinValue:       {min_v:.4}");
-        println!("  MaxValue:       {max_v:.4}");
-        println!("  MeanValue:      {mean_v:.4}");
+        println!("  UpdateTime:     {:.3} s", CFloat(update_t));
+        println!("  VoltsPerDiv:    {:.3} V", CFloat(vpd));
+        println!("  TimePerDiv:     {:.4} s", CFloat(tpd));
+        println!("  VoltOffset:     {:.3} V", CFloat(offset));
+        println!("  NoiseAmplitude: {:.3} V", CFloat(noise));
+        println!("  MinValue:       {:.4}", CFloat(min_v));
+        println!("  MaxValue:       {:.4}", CFloat(max_v));
+        println!("  MeanValue:      {:.4}", CFloat(mean_v));
 
         Ok(CommandOutcome::Continue)
     }
@@ -168,7 +169,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: scope_ioc <st.cmd>");
+        epics_base_rs::stderr_println!("Usage: scope_ioc <st.cmd>");
         std::process::exit(1);
     };
 

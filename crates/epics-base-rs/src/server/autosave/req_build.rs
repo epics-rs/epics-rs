@@ -38,7 +38,7 @@ pub fn make_autosave_file_from_db_info(
         ));
         return;
     };
-    let mut text = String::new();
+    let mut text = Vec::new();
     for name in record_names_type_major(ctx) {
         let Some(rec) = ctx.db().get_record(&name) else {
             continue;
@@ -48,31 +48,37 @@ pub fn make_autosave_file_from_db_info(
             continue;
         };
         for field in info.split_ascii_whitespace() {
-            let field = &field[..field.len().min(MAX_FIELD_SIZE - 1)];
+            // C's byte cut can split a character; such a name is no field
+            // and is printed with the split bytes.
+            let field = &field.as_bytes()[..field.len().min(MAX_FIELD_SIZE - 1)];
             // C sets `long_string` on the first `$` field and never clears
             // it, so every later non-string field of the walk was refused
             // as not found; here it is the field's own `$`.
-            let (real, long_string) = match field.strip_suffix('$') {
+            let (real, long_string) = match field.strip_suffix(b"$") {
                 Some(real) => (real, true),
                 None => (field, false),
             };
-            let found = rec.field_desc(real).is_some_and(|desc| {
+            let desc = std::str::from_utf8(real)
+                .ok()
+                .and_then(|real| rec.field_desc(real));
+            let found = desc.is_some_and(|desc| {
                 !long_string
                     || matches!(
                         desc.declared_dbf,
                         DbfCode::String | DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink
                     )
             });
+            let line = [name.as_bytes(), b".", field].concat();
             if found {
-                text.push_str(&format!("{name}.{field}\n"));
+                text.extend_from_slice(&line);
+                text.push(b'\n');
             } else {
-                ctx.print_fmt(format_args!(
-                    "makeAutosaveFileFromDbInfo: {name}.{field} not found"
-                ));
+                let msg = [b"makeAutosaveFileFromDbInfo: ", &line[..], b" not found"];
+                ctx.println_bytes(&msg.concat());
             }
         }
     }
-    let _ = out.write_all(text.as_bytes());
+    let _ = out.write_all(&text);
 }
 
 /// C `makeAutosaveFiles()` (dbrestore.c:1739-1743).
@@ -153,7 +159,7 @@ pub fn autosave_build(
         })));
     }
     if filename.is_empty() {
-        println!("autosaveBuild: bad filename");
+        crate::epics_println!("autosaveBuild: bad filename");
         return -1;
     }
     let debug = h.settings.debug();
@@ -164,7 +170,7 @@ pub fn autosave_build(
         file_found = true;
         if req_file_suffix.is_none_or(|s| s.starts_with('*') || s == item.suffix) {
             if debug != 0 {
-                println!(
+                crate::epics_println!(
                     "autosaveBuild: {state} filename '{filename}' and suffix '{}'.",
                     item.suffix
                 );
@@ -179,7 +185,7 @@ pub fn autosave_build(
         return 0;
     }
     let Some(suffix) = req_file_suffix.filter(|s| !s.is_empty()) else {
-        println!("autosaveBuild: bad suffix");
+        crate::epics_println!("autosaveBuild: bad suffix");
         return -1;
     };
     if !file_found {
@@ -191,7 +197,7 @@ pub fn autosave_build(
         enabled: on,
     });
     if debug != 0 {
-        println!(
+        crate::epics_println!(
             "autosaveBuild: initialized and {state} filename '{filename}' and suffix '{suffix}'."
         );
     }
@@ -224,7 +230,7 @@ fn my_db_load_records_hook(
     if debug >= 5 {
         // C prints its static `macroString`, the previous load's expanded
         // subs; this load's own are printed here.
-        println!("myDbLoadRecordsHook: dbFileName='{db_file_name}'; subs='{macro_}'");
+        crate::epics_println!("myDbLoadRecordsHook: dbFileName='{db_file_name}'; subs='{macro_}'");
     }
     if let Some(previous) = previous {
         previous(&db_file_name, macro_);
@@ -242,7 +248,9 @@ fn my_db_load_records_hook(
         .iter()
         .find_map(|ext| base.find(ext))
     else {
-        println!("myDbLoadRecordsHook: Can't make request-file name from '{db_file_name}'");
+        crate::epics_println!(
+            "myDbLoadRecordsHook: Can't make request-file name from '{db_file_name}'"
+        );
         return;
     };
     let base = &base[..end];
@@ -265,7 +273,7 @@ fn my_db_load_records_hook(
             continue;
         }
         if debug >= 5 {
-            println!("myDbLoadRecordsHook: found '{request_file_name}'");
+            crate::epics_println!("myDbLoadRecordsHook: found '{request_file_name}'");
         }
         // The row's own definitions expanded among themselves, e.g.
         // "N=1,M=m$(N)" (dbrestore.c:1656-1667).
@@ -285,7 +293,7 @@ fn my_db_load_records_hook(
         if cmd.len() < MAXSTRING {
             append_to_file(&filename, &cmd);
         } else {
-            println!(
+            crate::epics_println!(
                 "myDbLoadRecordsHook: Can't include {request_file_name}; requestFileCmd is too long (n = {}, MAXSTRING = {MAXSTRING})",
                 cmd.len()
             );

@@ -16,6 +16,7 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::device_support::{ReadStart, WriteStart};
 use epics_base_rs::server::record::{CommonFields, DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
@@ -400,9 +401,10 @@ pub struct AsynDeviceSupport {
     octet_cmd: Option<Vec<u8>>,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
-    /// C devAsynOctet's `isOutput`: the one initCommon that reads
+    /// C's `isOutput`: the record writes, so its interrupt client is
+    /// `interruptCallbackOutput`, and on devAsynOctet it reads
     /// `info(asyn:INITIAL_READBACK)` (devAsynOctet.c:357).
-    octet_output: bool,
+    output: bool,
     /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
     /// When set on an output record, the adapter activates the
     /// driver-callback path even when `SCAN != "I/O Intr"` so the
@@ -463,6 +465,9 @@ pub struct AsynDeviceSupport {
     /// **only** sent on a fresh-entry add (not on overflow
     /// overwrite) so the dbScan queue does not flood.
     interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
+    /// `info("asyn:FIFO")` as C's `atoi` reads it; `None` keeps the dset's
+    /// default ([`Self::settle_ring`]).
+    fifo_tag: Option<usize>,
     /// The `interruptAccept` the ring/average callbacks drop on.
     gate: Arc<RecordGate>,
     /// The C dset whose lines this record prints; settled at `init`, once
@@ -482,12 +487,10 @@ pub struct AsynDeviceSupport {
     /// record's own put leaves the FIFO desynced and the final driver value
     /// (e.g. AD `Acquire` returning to 0) is never popped.
     output_callback_pending: bool,
-    /// The record's `scanIoRequest`: every ring callback, and the one a
-    /// queued write deferred ([`InterruptFifo::end_processing`]), wakes it.
-    /// One channel for the record's life, as C's `ioScanPvt` is, so a client
-    /// `get_ioint_info` registers again reaches the pump iocInit spawned.
-    scan_io_tx: tokio::sync::mpsc::Sender<()>,
-    /// The receiving end of `scan_io_tx`, until `io_intr_receiver` takes it.
+    /// The record's `scanIoRequest`, rung by [`InterruptFifo::ring`], until
+    /// `io_intr_receiver` takes it. One channel for the record's life, as C's
+    /// `ioScanPvt` is, so a client `get_ioint_info` registers again reaches
+    /// the pump iocInit spawned.
     scan_io_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     /// True once the `asynFloat64` ai path has written VAL at least once.
     /// The SMOO filter primes on the first read (C `processAi` skips
@@ -683,6 +686,7 @@ impl TimeSeriesState {
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
+#[derive(Clone)]
 struct CachedInterrupt {
     value: crate::param::ParamValue,
     timestamp: SystemTime,
@@ -724,87 +728,297 @@ impl RecordGate {
     }
 }
 
-/// Per-record ring buffer for I/O Intr callbacks. Mirrors C
-/// `devAsynInt32.c::ringBuffer` + `ringSize` + `ringBufferOverflows`.
+/// Per-record store of I/O Intr callbacks: C's `ringBuffer` + `ringSize` +
+/// `ringBufferOverflows`, or with `ringSize` 0 the latest-value slot.
 struct InterruptFifo {
-    entries: std::collections::VecDeque<CachedInterrupt>,
-    /// Maximum entries (`asyn:FIFO` info-tag, default
-    /// `DEFAULT_RING_BUFFER_SIZE`).
-    ring_size: usize,
-    /// Running count of drop-oldest overwrites since the last
-    /// successful pop. Logged + reset by `pop_callback_value`.
+    store: CallbackStore,
+    /// C `ringBufferOverflows`: drop-oldest overwrites since the last pop,
+    /// which hands them over in its `Delivery`.
     overflows: u64,
-    /// C `asyncProcessingActive`: a queued write holds the record PACT.
+    /// C `asyncProcessingActive`: a queued write holds the record PACT, and
+    /// the callbacks it collects are rung for when it ends.
     processing_async: bool,
-    /// C `numDeferredOutputCallbacks`: callbacks that arrived meanwhile,
-    /// each owed one record process after the cycle ends.
-    deferred: u32,
+    /// The record's process requests. A doorbell that carries no count:
+    /// [`Self::waiting`] is what the record is owed, and [`Self::ring`] keeps
+    /// that many outstanding as far as the channel holds.
+    bell: tokio::sync::mpsc::Sender<()>,
+    /// Requests rung and not yet answered: the queued ones, and the one the
+    /// pump has taken for the pass it is running ([`Self::outstanding`]). A
+    /// pop and the end of a pump pass answer it ([`Self::answered`]).
+    rung: usize,
+}
+
+enum CallbackStore {
+    /// C `ringSize > 0`: every callback not yet processed, oldest first.
+    Ring {
+        entries: std::collections::VecDeque<CachedInterrupt>,
+        size: usize,
+    },
+    /// C `ringSize == 0` (devAsynOctet.c:490-521, devAsynXXXArray.cpp:412-428):
+    /// a good callback's value goes straight into the record, and every
+    /// callback counts `gotValue` and asks for a process, which reads
+    /// whatever the record holds by then.
+    Latest {
+        /// The last good value, with the last callback's status, alarm and
+        /// time (C `result`). Replaced in place: a callback allocates
+        /// nothing, the value being an `Arc`.
+        last: Option<CachedInterrupt>,
+        /// `last.value` came from a good callback: C copies none other.
+        good: bool,
+        /// The callbacks owed a process: C `gotValue`'s `scanIoRequest`s.
+        owed: u32,
+        /// The callbacks before `interruptAccept` no process has taken: C
+        /// `gotValue`'s other half ([`InterruptFifo::hold`]).
+        held: u32,
+        /// A pass has run on `last` since it landed. C resets `result.status`
+        /// after a failed pass (devAsynOctet.c:821, devAsynXXXArray.cpp:339),
+        /// so the slot's later passes succeed, keeping the alarm the first
+        /// one mapped into `result` (devAsynOctet.c:806-809).
+        spent: bool,
+    },
+}
+
+/// What a process takes from the store, and whether it writes the value:
+/// a ring entry's only if it is good (C `processAi`), the latest slot's
+/// whenever one good callback has landed, as C's record already holds it.
+struct Delivery {
+    entry: CachedInterrupt,
+    store: bool,
+    /// The ring overflows this pop reports and clears (C `getCallbackValue`).
+    overflows: u64,
+    /// More than one callback landed since the latest slot's last take: C
+    /// `gotValue` after the decrement, the "multiple interrupt callbacks" case.
+    backlog: bool,
+    /// An earlier pass already reported this latest-slot entry's status.
+    spent: bool,
 }
 
 /// C `DEFAULT_RING_BUFFER_SIZE` at `devAsynInt32.c:63`.
 const DEFAULT_RING_BUFFER_SIZE: usize = 10;
 
+impl CallbackStore {
+    fn sized(size: usize) -> Self {
+        if size == 0 {
+            Self::Latest {
+                last: None,
+                good: false,
+                owed: 0,
+                held: 0,
+                spent: false,
+            }
+        } else {
+            Self::Ring {
+                entries: std::collections::VecDeque::with_capacity(size),
+                size,
+            }
+        }
+    }
+}
+
 impl InterruptFifo {
-    fn new() -> Self {
+    fn new(bell: tokio::sync::mpsc::Sender<()>) -> Self {
         Self {
-            entries: std::collections::VecDeque::with_capacity(DEFAULT_RING_BUFFER_SIZE),
-            ring_size: DEFAULT_RING_BUFFER_SIZE,
+            store: CallbackStore::sized(DEFAULT_RING_BUFFER_SIZE),
             overflows: 0,
             processing_async: false,
-            deferred: 0,
+            bell,
+            rung: 0,
         }
     }
 
-    /// A fresh entry's wakeup: now, or — inside a queued write — owed to
-    /// the end of that cycle (`devAsynInt32.c:607-613`).
-    fn wake_or_defer(&mut self) -> bool {
-        if self.processing_async {
-            self.deferred += 1;
-            false
-        } else {
-            true
+    /// C `createRingBuffer`: the store `size` asks for, empty.
+    fn resize(&mut self, size: usize) {
+        self.store = CallbackStore::sized(size);
+    }
+
+    fn is_latest(&self) -> bool {
+        matches!(self.store, CallbackStore::Latest { .. })
+    }
+
+    /// C `ringSize`.
+    fn size(&self) -> usize {
+        match self.store {
+            CallbackStore::Ring { size, .. } => size,
+            CallbackStore::Latest { .. } => 0,
         }
     }
 
-    /// The bottom of C's `processXxx` (`devAsynInt32.c:1013-1018`): the
-    /// cycle is over, and one deferred callback, if any, is requested.
-    fn end_processing(&mut self) -> bool {
-        self.processing_async = false;
-        if self.deferred > 0 {
-            self.deferred -= 1;
-            true
-        } else {
-            false
+    /// The callbacks still owed a process: ring entries, or C `gotValue`.
+    fn waiting(&self) -> usize {
+        match &self.store {
+            CallbackStore::Ring { entries, .. } => entries.len(),
+            CallbackStore::Latest { owed, .. } => *owed as usize,
         }
     }
 
-    /// Producer-side: push a fresh interrupt entry, dropping the
-    /// oldest if full. Returns `true` if this push corresponds to a
-    /// *new* entry (and therefore the caller should schedule a record
-    /// process); `false` on overflow (no scanIoRequest in C parity).
+    /// C `getCallbackValue`'s test, or ringSize 0's `gotValue`: the next
+    /// process takes a callback's value rather than reading the driver.
+    fn unread(&self) -> bool {
+        match &self.store {
+            CallbackStore::Ring { entries, .. } => !entries.is_empty(),
+            CallbackStore::Latest { owed, held, .. } => *owed > 0 || *held > 0,
+        }
+    }
+
+    /// C's `scanIoRequest` per callback (devAsynInt32.c:574,
+    /// devAsynOctet.c:518): one more process request while fewer are
+    /// outstanding than callbacks are owed. Called after every callback and every pop, so
+    /// a burst past the channel's capacity is still processed once per
+    /// callback. Inside a queued write nothing rings until it ends
+    /// (`devAsynInt32.c:607-613`).
+    fn ring(&mut self) {
+        if !self.processing_async
+            && self.outstanding() < self.waiting()
+            && self.bell.try_send(()).is_ok()
+        {
+            self.rung += 1;
+        }
+    }
+
+    /// The requests in the channel.
+    fn queued(&self) -> usize {
+        self.bell.max_capacity() - self.bell.capacity()
+    }
+
+    /// The requests still to process the record: the queued ones and the
+    /// one the pump has taken, which C's overflow does not request again
+    /// (devAsynInt32.c:565-572). The pump runs one pass at a time, so a
+    /// request it dropped without a pass (record off I/O Intr, IOC paused)
+    /// counts as that one until the next pop or pass end.
+    fn outstanding(&self) -> usize {
+        self.rung.min(self.queued() + 1)
+    }
+
+    /// The taken request is answered, by a pop or by the end of a pump pass
+    /// that popped nothing; only the queued ones are left.
+    fn answered(&mut self) {
+        self.rung = self.queued();
+    }
+
+    /// The bottom of C's `processXxx` (`devAsynInt32.c:1013-1018`): a queued
+    /// write's hold ends, and a callback it collected is requested. Any other
+    /// cycle rings nothing here: one that popped rang in `pop`, and one that
+    /// bailed on PACT (dbAccess.c:537) lost its request. Its entry is rung for
+    /// at the next callback or pop; C requested it once (devAsynInt32.c:574,
+    /// devAsynOctet.c:518) and stays one process behind for good, not copied.
+    fn end_processing(&mut self) {
+        if std::mem::take(&mut self.processing_async) {
+            self.ring();
+        }
+    }
+
+    /// devAsynOctet's ringSize-0 callback before `interruptAccept`: C copies
+    /// the value (devAsynOctet.c:490-509) but its `scanIoRequest` does nothing
+    /// before `scanRun` (dbScan.c:621), so no process is owed for it; the next
+    /// process, PINI included, takes the value as C's `gotValue` has it do.
+    /// A ring keeps nothing it does not owe.
+    fn hold(&mut self, entry: CachedInterrupt) {
+        if let CallbackStore::Latest { held, .. } = &mut self.store {
+            *held = held.saturating_add(1);
+            self.land(entry);
+        }
+    }
+
+    /// The latest slot takes a callback: C copies a good value into the
+    /// record and every status into `result` (devAsynOctet.c:490-510).
+    fn land(&mut self, entry: CachedInterrupt) {
+        let CallbackStore::Latest {
+            last, good, spent, ..
+        } = &mut self.store
+        else {
+            return;
+        };
+        *spent = false;
+        match last {
+            Some(last) if entry.aux_status != crate::error::AsynStatus::Success => {
+                last.timestamp = entry.timestamp;
+                last.alarm_status = entry.alarm_status;
+                last.alarm_severity = entry.alarm_severity;
+                last.aux_status = entry.aux_status;
+            }
+            slot => {
+                *good = entry.aux_status == crate::error::AsynStatus::Success;
+                *slot = Some(entry);
+            }
+        }
+    }
+
+    /// Producer-side: store a callback. Returns `true` when the record
+    /// should be asked to process: a fresh ring entry, or any latest-slot
+    /// callback; `false` on a ring overflow (no scanIoRequest in C parity).
     fn push_with_overflow(&mut self, entry: CachedInterrupt) -> bool {
-        if self.entries.len() >= self.ring_size {
-            self.entries.pop_front();
-            self.overflows += 1;
-            self.entries.push_back(entry);
-            false
-        } else {
-            self.entries.push_back(entry);
-            true
+        match &mut self.store {
+            CallbackStore::Ring { entries, size } => {
+                let fresh = entries.len() < *size;
+                if !fresh {
+                    entries.pop_front();
+                    self.overflows += 1;
+                }
+                entries.push_back(entry);
+                fresh
+            }
+            CallbackStore::Latest { owed, .. } => {
+                *owed = owed.saturating_add(1);
+                self.land(entry);
+                true
+            }
         }
     }
 
-    /// Consumer-side: pop the oldest entry. Returns `None` when
-    /// empty. The `overflows` counter is reset by the caller via
-    /// `take_overflows` so the trace warning fires once per drain
-    /// (C `getCallbackValue` behaviour).
-    fn pop(&mut self) -> Option<CachedInterrupt> {
-        self.entries.pop_front()
+    /// Consumer-side: the oldest ring entry, or one `gotValue` of the latest
+    /// slot, and a request for the next one still owed. `None` when nothing
+    /// is waiting.
+    fn pop(&mut self) -> Option<Delivery> {
+        let delivery = match &mut self.store {
+            CallbackStore::Ring { entries, .. } => entries.pop_front().map(|entry| Delivery {
+                store: entry.aux_status == crate::error::AsynStatus::Success,
+                entry,
+                overflows: std::mem::take(&mut self.overflows),
+                backlog: false,
+                spent: false,
+            }),
+            // A take clears the callbacks held before the gate with it. C's
+            // `gotValue` keeps them (devAsynOctet.c:506), ahead for good, so
+            // its later processes skip their driver read and warn; not copied.
+            CallbackStore::Latest {
+                last,
+                good,
+                owed,
+                held,
+                spent,
+            } if *owed > 0 || *held > 0 => {
+                let backlog = owed.saturating_add(*held) > 1;
+                *owed = owed.saturating_sub(1);
+                *held = 0;
+                let delivery = last.clone().map(|entry| Delivery {
+                    entry,
+                    store: *good,
+                    overflows: 0,
+                    backlog,
+                    spent: *spent,
+                });
+                *spent = true;
+                delivery
+            }
+            CallbackStore::Latest { .. } => None,
+        };
+        // Counting the taken request past its pop would leave the last owed
+        // callback unrung.
+        if delivery.is_some() {
+            self.answered();
+        }
+        self.ring();
+        delivery
     }
 
-    /// Read and clear the overflow counter for a single warning emit.
-    fn take_overflows(&mut self) -> u64 {
-        std::mem::take(&mut self.overflows)
+    /// C `outputCallbackCallback` for a callback whose `dbProcess` did not
+    /// process: a ring entry is popped and dropped, `gotValue` is left
+    /// (devAsynOctet.c:587-589).
+    fn discard(&mut self) -> Option<Delivery> {
+        match self.store {
+            CallbackStore::Ring { .. } => self.pop(),
+            CallbackStore::Latest { .. } => None,
+        }
     }
 }
 
@@ -819,10 +1033,7 @@ impl AsynDeviceSupport {
     /// The bottom of C's `processXxx`: the cycle is over, and a callback
     /// it deferred is requested now (`devAsynInt32.c:1013-1018`).
     fn end_processing(&self) {
-        let wake = self.interrupt_fifo.lock().unwrap().end_processing();
-        if wake {
-            let _ = self.scan_io_tx.try_send(());
-        }
+        self.interrupt_fifo.lock().unwrap().end_processing();
     }
 
     /// Create from a [`PortHandle`].
@@ -832,7 +1043,7 @@ impl AsynDeviceSupport {
             bound: std::sync::OnceLock::new(),
             port: handle.interrupts().clone(),
         });
-        let (scan_io_tx, scan_io_rx) = tokio::sync::mpsc::channel(16);
+        let (bell, scan_io_rx) = tokio::sync::mpsc::channel(16);
         Self {
             gate,
             dset: Dset::of("", iface_type),
@@ -860,7 +1071,7 @@ impl AsynDeviceSupport {
             record_name: String::new(),
             io_intr_scan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             initial_readback: false,
-            octet_output: false,
+            output: false,
             asyn_readback: false,
             write_only: false,
             octet_binary: false,
@@ -870,9 +1081,9 @@ impl AsynDeviceSupport {
             time_series_sub: None,
             time_series_wake: None,
             interrupt_sub: None,
-            scan_io_tx,
             scan_io_rx: Some(scan_io_rx),
-            interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
+            interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new(bell))),
+            fifo_tag: None,
             output_callback_pending: false,
             smoo_primed: false,
             enum_shape: None,
@@ -1033,7 +1244,7 @@ impl AsynDeviceSupport {
     }
 
     /// The record's input interrupt client: every callback lands in the ring
-    /// and wakes `scan_io_tx`, C's `scanIoRequest`.
+    /// and rings for its process, C's `scanIoRequest`.
     fn subscribe_input(&mut self) -> AsynResult<()> {
         // C parity: a UInt32Digital record registers its @asynMask as the
         // interrupt mask (devAsynUInt32Digital.c:293/343); the driver fires
@@ -1066,18 +1277,25 @@ impl AsynDeviceSupport {
         };
 
         // Every callback lands in the ring, inline in the driver's notify()
-        // like C's interruptCallbackInput; the mpsc<()> is only the
-        // scanIoRequest wakeup that setup_io_intr() consumes.
-        let tx = self.scan_io_tx.clone();
+        // like C's interruptCallbackInput, and the ring rings the
+        // scanIoRequest doorbell that setup_io_intr() consumes.
         let fifo = self.interrupt_fifo.clone();
         let gate = self.gate.clone();
+        let trace = self.handle.user_trace();
+        let (addr, reason) = (self.addr, self.reason as i32);
+        let (record, driver) = (self.record_name.clone(), self.dset.driver());
+        let scalar = self.dset.is_scalar();
+        let octet = self.dset == Dset::Octet;
+        let ring = self.interrupt_fifo.lock().unwrap().size();
+        let callback = if self.output {
+            "interruptCallbackOutput"
+        } else {
+            "interruptCallbackInput"
+        };
         let sub = self
             .handle
             .interrupts()
             .register_sync_callback(filter, move |iv| {
-                if !gate.open() {
-                    return;
-                }
                 // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
@@ -1095,6 +1313,38 @@ impl AsynDeviceSupport {
                     }
                     other => other.clone(),
                 };
+                // Printed before the interruptAccept test, as C does
+                // (devAsynInt32.c:541-543, :592-594; devAsynOctet.c:485-488,
+                // devAsynXXXArray.cpp:402-405).
+                let io = crate::trace::TraceMask::IO_DEVICE;
+                if scalar {
+                    trace.print(
+                        addr,
+                        reason,
+                        io,
+                        file!(),
+                        line!(),
+                        format_args!(
+                            "{record} {driver}::{callback} new value={}\n",
+                            Scalar::delivered(&value)
+                        ),
+                    );
+                } else if trace.manager.is_enabled_device(&trace.port, addr, io) {
+                    let (len, data) = callback_data(&value, iv.octet_counts_nul());
+                    trace.manager.output_device_io(
+                        &trace.port,
+                        Some(addr),
+                        reason,
+                        io,
+                        &data,
+                        &format!(
+                            "{record} {driver}::interruptCallback ringSize={ring}, len={len}, callback data:"
+                        ),
+                        file!(),
+                        line!(),
+                    );
+                }
+                let open = gate.open();
                 let entry = CachedInterrupt {
                     value,
                     timestamp: iv.timestamp,
@@ -1110,22 +1360,15 @@ impl AsynDeviceSupport {
                     aux_status: iv.aux_status,
                     octet_nul: iv.octet_counts_nul(),
                 };
-                // C parity (devAsynInt32.c:564-576):
-                //   - On overflow (ring full), drop oldest +
-                //     overflows++ and DO NOT call scanIoRequest.
-                //     The already-pending process will pick up the
-                //     newer tail; a duplicate request would just
-                //     flood dbScan.
-                //   - On normal add, request the record to process.
-                let wake = {
-                    let mut g = fifo.lock().unwrap();
-                    g.push_with_overflow(entry) && g.wake_or_defer()
-                };
-                // try_send: inline in the driver's notify(), so it must not
-                // block; a full wakeup channel means a process is already
-                // pending and will drain the ring.
-                if wake {
-                    let _ = tx.try_send(());
+                // C parity (devAsynInt32.c:564-576): an overflow drops the
+                // oldest entry, leaving what is owed unchanged; a fresh entry
+                // is owed one more process.
+                let mut g = fifo.lock().unwrap();
+                if open {
+                    g.push_with_overflow(entry);
+                    g.ring();
+                } else if octet {
+                    g.hold(entry);
                 }
             });
         self.interrupt_sub = Some(sub?);
@@ -1170,28 +1413,38 @@ impl AsynDeviceSupport {
         // (devAsynInt32.c:705-707, devAsynFloat64.c:516-518) — once any sample
         // is non-success the period stays a transport error (asynSuccess == 0,
         // so the OR is sticky).
-        let tx = self.scan_io_tx.clone();
         let fifo = self.interrupt_fifo.clone();
         let gate = self.gate.clone();
         let io_intr_scan = self.io_intr_scan.clone();
+        let trace = self.handle.user_trace();
+        let (addr, reason) = (self.addr, self.reason as i32);
+        let (record, driver) = (self.record_name.clone(), self.dset.driver());
         let sub = self
             .handle
             .interrupts()
             .register_sync_callback(filter, move |iv| {
                 use std::sync::atomic::Ordering;
+                let (shown, s) = match iv.value {
+                    crate::param::ParamValue::Int32(v) => {
+                        let v = int32_mask.map_or(v, |m| m.apply(v));
+                        (Scalar::Int(v as i64), v as f64)
+                    }
+                    crate::param::ParamValue::Float64(v) => (Scalar::Float(v), v),
+                    _ => return,
+                };
+                // Before the interruptAccept test (devAsynInt32.c:660-663,
+                // devAsynFloat64.c:474-477).
+                trace.print(
+                    addr,
+                    reason,
+                    crate::trace::TraceMask::IO_DEVICE,
+                    file!(),
+                    line!(),
+                    format_args!("{record} {driver}::interruptCallbackAverage new value={shown}\n"),
+                );
                 if !gate.open() {
                     return;
                 }
-                let sample = match &iv.value {
-                    crate::param::ParamValue::Int32(v) => {
-                        Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
-                    }
-                    crate::param::ParamValue::Float64(v) => Some(*v),
-                    _ => None,
-                };
-                let Some(s) = sample else {
-                    return;
-                };
                 // C: numAverage++; sum += value (devAsynInt32.c:665-666).
                 acc.averager.push(s);
                 if !io_intr_scan.load(Ordering::Relaxed) {
@@ -1234,17 +1487,9 @@ impl AsynDeviceSupport {
                 // C: ring full → evict oldest + overflow, NO
                 // scanIoRequest; fresh add → scanIoRequest
                 // (devAsynInt32.c:688-701).
-                let was_fresh = {
-                    let mut g = fifo.lock().unwrap();
-                    g.push_with_overflow(entry)
-                };
-                // try_send: the callback runs inline in the driver
-                // notify() and must not block; a full wakeup channel
-                // means a process is already pending and will drain the
-                // ring (C does not re-request when one is pending).
-                if was_fresh {
-                    let _ = tx.try_send(());
-                }
+                let mut g = fifo.lock().unwrap();
+                g.push_with_overflow(entry);
+                g.ring();
             });
         self.average_callback_sub = Some(sub?);
         Ok(())
@@ -1330,7 +1575,7 @@ impl AsynDeviceSupport {
     /// whether the record is still on I/O Intr (devAsynInt32.c:768-790), so an
     /// entry left when SCAN moved off it is the next process's value.
     fn callback_value_waiting(&self) -> bool {
-        !self.interrupt_fifo.lock().unwrap().entries.is_empty()
+        self.interrupt_fifo.lock().unwrap().unread()
     }
 
     /// The result a queued read left for the re-entered pass, or one the queue
@@ -1407,23 +1652,31 @@ impl AsynDeviceSupport {
         self.initial_readback = on;
     }
 
-    /// Override the I/O Intr ring buffer size. The framework
-    /// auto-parses `info("asyn:FIFO", "<n>")` via
-    /// [`Self::apply_record_info`]; this manual setter exists for
-    /// callers outside the IocApplication wiring. C parity:
-    /// `devAsynInt32.c::createRingBuffer` at line 354-365 — sets
-    /// `pPvt->ringSize` to `atoi(info)` or `DEFAULT_RING_BUFFER_SIZE`
-    /// when the info tag is absent.
+    /// Override the I/O Intr ring buffer size, as `info("asyn:FIFO", "<n>")`
+    /// does through [`Self::apply_record_info`]; 0 is C's latest-value slot.
+    /// Callbacks already stored are dropped.
     pub fn set_fifo_size(&mut self, n: usize) {
-        let mut g = self.interrupt_fifo.lock().unwrap();
-        g.ring_size = n.max(1);
-        // Drop any over-capacity entries already buffered so the new
-        // limit takes effect immediately. Counts the truncation as
-        // overflows so the trace warning fires.
-        while g.entries.len() > g.ring_size {
-            g.entries.pop_front();
-            g.overflows = g.overflows.saturating_add(1);
-        }
+        self.fifo_tag = Some(n);
+        self.settle_ring();
+    }
+
+    /// C `createRingBuffer`'s `ringSize`: `asyn:FIFO`, else the dset's
+    /// `DEFAULT_RING_BUFFER_SIZE` — 10 in the scalar files
+    /// (devAsynInt32.c:63), 0 in devAsynOctet (:73) and devAsynXXXArray
+    /// (:43), and 1 on an `asyn:READBACK` octet output (devAsynOctet.c:342).
+    ///
+    /// Two C defects are not copied. A scalar ring of 0 overflows on every
+    /// callback and never scans (devAsynInt32.c:565-571); here it is the
+    /// latest-value slot. devAsynXXXArray allocates `ringSize` elements
+    /// where the others allocate `ringSize+1` (devAsynXXXArray.cpp:214), so
+    /// it holds one value fewer than asked and none at 1; here it holds N.
+    fn settle_ring(&self) {
+        let size = self.fifo_tag.unwrap_or(match self.dset {
+            Dset::Octet if self.output && self.asyn_readback => 1,
+            Dset::Octet | Dset::Array => 0,
+            _ => DEFAULT_RING_BUFFER_SIZE,
+        });
+        self.interrupt_fifo.lock().unwrap().resize(size);
     }
 
     /// Set the driver info string (used for `drv_user_create` during init).
@@ -1493,6 +1746,24 @@ fn compute_mask_shift(mask: u32) -> u32 {
 /// which only treats `"0"` / non-numeric as falsey. Our parse is a
 /// strict superset for the documented `"1"` / `"0"` values and
 /// additionally accepts the human-friendly `"Y"` / `"true"` forms.
+/// C `atoi`: leading white space, a sign, then decimal digits up to the
+/// first other byte; no digits is 0.
+fn c_atoi(s: &str) -> i64 {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let v = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0i64, |v, c| {
+            v.saturating_mul(10).saturating_add(i64::from(c - b'0'))
+        });
+    if neg { -v } else { v }
+}
+
 fn parse_info_bool(raw: &str) -> bool {
     let v = raw.trim();
     !v.is_empty()
@@ -1952,6 +2223,58 @@ impl<'a> Sent<'a> {
     }
 }
 
+/// The element count and the bytes of an octet or array callback, as C's
+/// `interruptCallback` hands them to `asynPrintIO`: a parameter callback's
+/// octet counts its NUL (asynPortDriver.cpp:817), and an array's elements are
+/// in memory order.
+fn callback_data(value: &crate::param::ParamValue, octet_nul: bool) -> (usize, Vec<u8>) {
+    use crate::param::ParamValue as V;
+    fn elems<T: Copy, const N: usize>(a: &[T], bytes: fn(T) -> [u8; N]) -> (usize, Vec<u8>) {
+        (a.len(), ne_bytes(a, bytes))
+    }
+    match value {
+        V::Octet(b) => {
+            let mut data = b.to_vec();
+            if octet_nul {
+                data.push(0);
+            }
+            (data.len(), data)
+        }
+        V::Int8Array(a) => elems(a, i8::to_ne_bytes),
+        V::Int16Array(a) => elems(a, i16::to_ne_bytes),
+        V::Int32Array(a) => elems(a, i32::to_ne_bytes),
+        V::Int64Array(a) => elems(a, i64::to_ne_bytes),
+        V::UInt64Array(a) => elems(a, u64::to_ne_bytes),
+        V::Float32Array(a) => elems(a, f32::to_ne_bytes),
+        V::Float64Array(a) => elems(a, f64::to_ne_bytes),
+        _ => (0, Vec::new()),
+    }
+}
+
+/// An array's elements as they sit in C memory.
+fn ne_bytes<T: Copy, const N: usize>(a: &[T], bytes: fn(T) -> [u8; N]) -> Vec<u8> {
+    a.iter().flat_map(|&x| bytes(x)).collect()
+}
+
+/// The first `n` elements of an array field, as C's `bptr` holds them.
+fn record_array_bytes(v: &EpicsValue, n: usize) -> Vec<u8> {
+    fn head<T: Copy, const N: usize>(a: &[T], n: usize, bytes: fn(T) -> [u8; N]) -> Vec<u8> {
+        ne_bytes(&a[..n.min(a.len())], bytes)
+    }
+    match v {
+        EpicsValue::CharArray(a) | EpicsValue::UCharArray(a) => head(a, n, u8::to_ne_bytes),
+        EpicsValue::ShortArray(a) => head(a, n, i16::to_ne_bytes),
+        EpicsValue::UShortArray(a) | EpicsValue::EnumArray(a) => head(a, n, u16::to_ne_bytes),
+        EpicsValue::LongArray(a) => head(a, n, i32::to_ne_bytes),
+        EpicsValue::ULongArray(a) => head(a, n, u32::to_ne_bytes),
+        EpicsValue::Int64Array(a) => head(a, n, i64::to_ne_bytes),
+        EpicsValue::UInt64Array(a) => head(a, n, u64::to_ne_bytes),
+        EpicsValue::FloatArray(a) => head(a, n, f32::to_ne_bytes),
+        EpicsValue::DoubleArray(a) => head(a, n, f64::to_ne_bytes),
+        _ => Vec::new(),
+    }
+}
+
 /// A scalar as C's `processCallback*` formats `pPvt->result.value`: `%d`,
 /// `%lld`, `%u`, and `%f` for asynFloat64.
 enum Scalar {
@@ -1968,6 +2291,19 @@ impl Scalar {
             Some(RequestOp::Int64Write { value }) => Self::Int(*value),
             Some(RequestOp::UInt32DigitalWrite { value, .. }) => Self::UInt(*value),
             Some(RequestOp::Float64Write { value }) => Self::Float(*value),
+            _ => Self::None,
+        }
+    }
+
+    /// A value an interrupt delivered, as `interruptCallback*` prints it.
+    fn delivered(v: &crate::param::ParamValue) -> Self {
+        use crate::param::ParamValue as V;
+        match *v {
+            V::Int32(v) => Self::Int(v as i64),
+            V::Int64(v) => Self::Int(v),
+            V::Enum { index, .. } => Self::Int(index as i64),
+            V::UInt32Digital(v) => Self::UInt(v),
+            V::Float64(v) => Self::Float(v),
             _ => Self::None,
         }
     }
@@ -1992,11 +2328,7 @@ impl std::fmt::Display for Scalar {
         match *self {
             Self::Int(v) => write!(f, "{v}"),
             Self::UInt(v) => write!(f, "{v}"),
-            Self::Float(v) if v.is_nan() => {
-                f.write_str(if v.is_sign_negative() { "-nan" } else { "nan" })
-            }
-            Self::Float(v) if v.is_infinite() => f.write_str(if v < 0.0 { "-inf" } else { "inf" }),
-            Self::Float(v) => write!(f, "{v:.6}"),
+            Self::Float(v) => write!(f, "{}", CFloat(v)),
             Self::None => Ok(()),
         }
     }
@@ -2065,14 +2397,10 @@ impl ProcessLine<'_> {
         // C prints `pasynUser->errorMessage`, the driver's own text.
         let failed = ran.map_or_else(Some, RequestResult::octet_error);
         let error_message = failed.map(AsynError::message_display);
-        let failure: Option<(AsynStatus, &dyn std::fmt::Display)> =
-            match (ran, failed, &error_message) {
-                (_, Some(e), Some(message)) => Some((e.status(), message)),
-                (Ok(r), _, _) if r.aux_status != AsynStatus::Success => {
-                    Some((r.aux_status, &r.message))
-                }
-                _ => None,
-            };
+        let failure: Option<(AsynStatus, &dyn std::fmt::Display)> = match (failed, &error_message) {
+            (Some(e), Some(message)) => Some((e.status(), message)),
+            _ => None,
+        };
         let mut last = last.0.lock();
         match (self.file, failure, ran) {
             (Dset::Octet, Some((_, message)), _) => {
@@ -2853,6 +3181,104 @@ impl AsynDeviceSupport {
             .print(self.addr, self.reason as i32, mask, file, line, args);
     }
 
+    /// The prints of C's ring pop (`getCallbackValue`, `getRingBufferValue`)
+    /// and of the latest slot's process (devAsynOctet.c:777-783,
+    /// devAsynXXXArray.cpp:302-309), for a delivery taken from the store.
+    fn popped(&self, d: &Delivery) {
+        use crate::trace::TraceMask;
+        let warning = TraceMask::WARNING;
+        let (record, driver) = (&self.record_name, self.dset.driver());
+        if d.overflows > 0 {
+            // devAsynXXXArray.cpp:378's functionName ends in a space.
+            let (func, kind) = match self.dset {
+                Dset::Octet => ("getRingBufferValue", "warning"),
+                Dset::Array => ("getRingBufferValue ", "error"),
+                _ => ("getCallbackValue", "warning"),
+            };
+            self.dev_print(
+                warning,
+                file!(),
+                line!(),
+                format_args!(
+                    "{record} {driver}::{func} {kind}, {} ring buffer overflows\n",
+                    d.overflows
+                ),
+            );
+        }
+        if self.dset.is_scalar() {
+            // devAsynUInt32Digital.c:619 prints its epicsUInt32 with %d.
+            let value = match Scalar::delivered(&d.entry.value) {
+                Scalar::UInt(u) => Scalar::Int(u as i32 as i64),
+                value => value,
+            };
+            self.dev_print(
+                TraceMask::IO_DEVICE,
+                file!(),
+                line!(),
+                format_args!("{record} {driver}::getCallbackValue from ringBuffer value={value}\n"),
+            );
+        }
+        let func = match self.dset {
+            Dset::Octet => "processCommon",
+            Dset::Array => "process,",
+            // C has no scalar latest slot: its ring of 0 never scans.
+            _ => return,
+        };
+        if d.backlog {
+            self.dev_print(
+                warning,
+                file!(),
+                line!(),
+                format_args!(
+                    "{record} {driver}::{func} warning: multiple interrupt callbacks between processing\n"
+                ),
+            );
+        }
+    }
+
+    /// What the record holds once a callback's process stored it, as C dumps
+    /// it at ASYN_TRACEIO_DEVICE: `strlen(pValue)` bytes for devAsynOctet
+    /// (devAsynOctet.c:799-803), `nord` elements for devAsynXXXArray
+    /// (devAsynXXXArray.cpp:321-324, whose functionName slot gets driverName).
+    fn print_callback_value(&self, record: &dyn Record) {
+        let io = crate::trace::TraceMask::IO_DEVICE;
+        let t = self.handle.user_trace();
+        if !t.manager.is_enabled_device(&t.port, self.addr, io) {
+            return;
+        }
+        let rec = &self.record_name;
+        let val = record.get_field("VAL");
+        let (data, label) = if self.dset == Dset::Octet {
+            let bytes = match &val {
+                Some(EpicsValue::String(s)) => s.as_bytes(),
+                Some(EpicsValue::CharArray(a) | EpicsValue::UCharArray(a)) => &a[..],
+                _ => &[],
+            };
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let label = format!("{rec} devAsynOctet::processCommon len={len},  data:");
+            (bytes[..len].to_vec(), label)
+        } else {
+            let nord = record
+                .get_field("NORD")
+                .and_then(|v| v.to_f64())
+                .map_or(0, |n| n.max(0.0) as usize);
+            let data = val.map_or_else(Vec::new, |v| record_array_bytes(&v, nord));
+            let label =
+                format!("{rec} devAsynXXXArray::devAsynXXXArray nord={nord}, pRecord_->bptr data:");
+            (data, label)
+        };
+        t.manager.output_device_io(
+            &t.port,
+            Some(self.addr),
+            self.reason as i32,
+            io,
+            &data,
+            &label,
+            file!(),
+            line!(),
+        );
+    }
+
     /// The C dset this record's DTYP bound. A time series keeps only its base
     /// interface, so the suffix is put back.
     /// C `registerInterruptUser(interruptCallback)` (devAsynXXXTimeSeries.h:
@@ -2890,8 +3316,8 @@ impl AsynDeviceSupport {
                     file!(),
                     line!(),
                     format_args!(
-                        "{record} {driver}::interruptCallback, value={:.6}, nord={nord}\n",
-                        TsBuf::sample(&iv.value)
+                        "{record} {driver}::interruptCallback, value={}, nord={nord}\n",
+                        CFloat(TsBuf::sample(&iv.value))
                     ),
                 );
                 // Not acquiring (C `if (pPvt->busy)` guard): nothing to do.
@@ -3069,7 +3495,7 @@ impl AsynDeviceSupport {
     /// queue leaves that status at success. The other devAsyn outputs leave
     /// UDF to the record.
     fn define_on_write(&self, common: &mut CommonFields, landed: bool) {
-        if self.octet_output && landed {
+        if self.output && self.dset == Dset::Octet && landed {
             common.udf = 0;
         }
     }
@@ -3345,6 +3771,7 @@ impl AsynDeviceSupport {
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         self.dset = self.bound_dset(record.record_type());
+        self.settle_ring();
         let ts_buf = match self.dset.check_ftvl(&self.record_name, record) {
             Ok(buf) => buf,
             Err(dead) => return Ok(dead),
@@ -3491,20 +3918,19 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
-        // (init paths for mbbi/mbbo/mbbiDirect/mbboDirect at lines 881,
-        // 925, 1010, 1054) sets:
+        // init* (bi/bo :668/:710, mbbi/mbbo/mbbiDirect/mbboDirect :880,
+        // :924, :1009, :1053) sets, whatever the mask, a 0 one too:
         //
         //     pr->mask = pPvt->mask;
-        //     pr->shft = computeShift(pPvt->mask);
+        //     pr->shft = computeShift(pPvt->mask);   /* mbb records only */
         //
         // so the record's standard RVAL→VAL conversion shifts the
         // masked bits down to bit 0. Without this, a link like
         // `@asynMask(port,0,0xFF00) BITS` reads RVAL with bits 8-15
         // set but the record's shft stays 0 and VAL ends up
-        // 65280-shaped instead of 0-255. Apply this regardless of
-        // mask value — a fully-set 0xFFFFFFFF mask shifts by 0
-        // (no-op) which is the correct contract for "every bit".
-        if self.iface_type == "asynUInt32Digital" && self.mask != 0 {
+        // 65280-shaped instead of 0-255. bi/bo have no SHFT, so that put
+        // is refused there.
+        if self.iface_type == "asynUInt32Digital" {
             let shft = compute_mask_shift(self.mask);
             let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
             let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
@@ -3645,38 +4071,34 @@ impl DeviceSupport for AsynDeviceSupport {
                     // (initAo devAsynInt32.c:955-959, initMbbo :1295-1299;
                     // initLo, which has no RVAL to convert, stores VAL under the
                     // same guard and returns INIT_OK either way, :1082-1086).
-                    // A non-success initial read leaves the .db default — the
-                    // init-time member of the aux_status value-store family
-                    // (process-time members gated in the ring/polled/average
-                    // paths).
-                    if result.aux_status == crate::error::AsynStatus::Success {
-                        if let Some(val) = self.result_to_value(&result) {
-                            // ao seeds VAL from the raw readback via its
-                            // `raw -> eng` inverse: C `initAo` sets `rval=value`
-                            // and returns INIT_OK so aoRecord runs the readback
-                            // convert (devAsynInt32.c:947-957). longout/mbbo
-                            // have no such inverse (VAL == raw / state-map) and
-                            // decline the hook (default `false`). An asynFloat64
-                            // ao seeds VAL with the forward ASLO/AOFF scaling
-                            // (C `initAo`, devAsynFloat64.c:628-630) via the
-                            // float64 readback hook.
-                            let seeded = match val {
-                                EpicsValue::Long(raw) => {
-                                    let rval = self.dset_rval(&*record, raw);
-                                    record.apply_raw_readback(rval)
-                                }
-                                EpicsValue::Double(raw) => record.apply_float64_readback(raw),
-                                _ => false,
-                            };
-                            // The seed lands as every read does, through
-                            // `store_read_value`: a DBF_STRING VAL is C's
-                            // `strcpy` of the reply, cut at the first NUL
-                            // (devAsynOctet.c:373-376).
-                            if !seeded {
-                                self.store_read_value(record, val);
+                    // A failed initial read, a parameter's status included, is
+                    // an `Err` and leaves the .db default.
+                    if let Some(val) = self.result_to_value(&result) {
+                        // ao seeds VAL from the raw readback via its
+                        // `raw -> eng` inverse: C `initAo` sets `rval=value`
+                        // and returns INIT_OK so aoRecord runs the readback
+                        // convert (devAsynInt32.c:947-957). longout/mbbo
+                        // have no such inverse (VAL == raw / state-map) and
+                        // decline the hook (default `false`). An asynFloat64
+                        // ao seeds VAL with the forward ASLO/AOFF scaling
+                        // (C `initAo`, devAsynFloat64.c:628-630) via the
+                        // float64 readback hook.
+                        let seeded = match val {
+                            EpicsValue::Long(raw) => {
+                                let rval = self.dset_rval(&*record, raw);
+                                record.apply_raw_readback(rval)
                             }
-                            read_back = true;
+                            EpicsValue::Double(raw) => record.apply_float64_readback(raw),
+                            _ => false,
+                        };
+                        // The seed lands as every read does, through
+                        // `store_read_value`: a DBF_STRING VAL is C's
+                        // `strcpy` of the reply, cut at the first NUL
+                        // (devAsynOctet.c:373-376).
+                        if !seeded {
+                            self.store_read_value(record, val);
                         }
+                        read_back = true;
                     }
                 }
             }
@@ -3853,22 +4275,22 @@ impl DeviceSupport for AsynDeviceSupport {
             // replaces the read's result. A refused queue is this same pass,
             // whose ring C already found empty.
             let refused = matches!(&ran, Some(Err(e)) if e.is_queue_refused());
-            let (entry, overflows) = if refused {
-                (None, 0)
+            let (entry, ring) = if refused {
+                (None, false)
             } else {
                 let mut fifo = self.interrupt_fifo.lock().unwrap();
-                (fifo.pop(), fifo.take_overflows())
+                (fifo.pop(), !fifo.is_latest())
             };
-            if overflows > 0 {
-                tracing::warn!(
-                    target: "asyn_rs::adapter",
-                    port = %self.handle.port_name(),
-                    record = %self.record_name,
-                    overflows = overflows,
-                    "ring buffer overflows (C asyn ASYN_TRACE_WARNING)"
-                );
+            if let Some(d) = &entry {
+                self.popped(d);
             }
-            if let Some(ci) = entry {
+            if let Some(Delivery {
+                entry: ci,
+                store,
+                spent,
+                ..
+            }) = entry
+            {
                 // C's negative-status default: nothing has been stored yet, so
                 // unless a store below lands a value this cycle sourced none
                 // (`return -1`) — a transport error, or a value this record's
@@ -3915,8 +4337,16 @@ impl DeviceSupport for AsynDeviceSupport {
                 // On a transport error keep the prior value (skip the store);
                 // `read_outcome` stays `failed()` so the record skips the
                 // RVAL→VAL convert, keeps its previous value and re-derives no
-                // UDF = C return -1.
-                if ci.aux_status == crate::error::AsynStatus::Success {
+                // UDF = C return -1. The latest slot's good value is stored
+                // under a failed status too: C copied it into the record at
+                // callback time (devAsynOctet.c:492-501). A spent entry's
+                // status was reset to success: `udf = 0; return 0`, under the
+                // same alarm. Its LEN/NORD come from the value stored: C takes
+                // them from the last callback's length, a failed one's too
+                // (:505, :776), so its reset pass (:817-820) can post a LEN
+                // that no longer describes VAL, a C defect not copied.
+                let good = ci.aux_status == crate::error::AsynStatus::Success || spent;
+                if store {
                     // Derive the value through THIS record's interface, the same
                     // way the polled path does (`result_to_value`): an array
                     // interrupt gets the per-interface `convert` (C fires all six
@@ -3926,7 +4356,14 @@ impl DeviceSupport for AsynDeviceSupport {
                         Ok(Some(val)) => {
                             let val = self.cap_octet_read_value(val);
                             let wrote_val = self.store_read_value(record, val);
-                            read_outcome = stored(wrote_val);
+                            if good {
+                                read_outcome = stored(wrote_val);
+                            }
+                            // C's ring-0 array copy is the callback's, and
+                            // dumps nothing.
+                            if self.dset == Dset::Array && ring {
+                                self.print_callback_value(record);
+                            }
                         }
                         Ok(None) => {}
                         // The driver fired a value this record's interface cannot
@@ -3944,6 +4381,11 @@ impl DeviceSupport for AsynDeviceSupport {
                             self.last_alarm_severity = severity;
                         }
                     }
+                } else if spent {
+                    read_outcome = stored(false);
+                }
+                if self.dset == Dset::Octet {
+                    self.print_callback_value(record);
                 }
                 // Whatever the store decided, or the `failed()` this started
                 // as when no store ran at all.
@@ -4084,32 +4526,41 @@ impl DeviceSupport for AsynDeviceSupport {
                                 DeviceReadOutcome::ok()
                             };
                         }
-                        let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
+                        // A parameter's status failed it in `readOctet`, which
+                        // set the parameter's alarm and time (asynPortDriver.cpp:
+                        // 2617-2619); a driver's failure carries neither.
+                        let (alarm_status, alarm_severity) = resolve_intr_alarm(
+                            (result.alarm_status, result.alarm_severity),
+                            e.status(),
+                            epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+                        );
                         self.last_alarm_status = alarm_status;
                         self.last_alarm_severity = alarm_severity;
+                        if let Some(ts) = result.timestamp {
+                            self.last_ts = Some(ts.into());
+                        }
                     } else {
-                        // Gate the value store on the device read status, mirroring
-                        // C processAi: `if (result.status == asynSuccess) { pr->rval
-                        // = value } else { return -1 }` keeps the prior value on a
-                        // non-success read (devAsynInt32.c:848-855). The alarm/time
-                        // are applied unconditionally (C maps the alarm and
-                        // recGblSetSevr's it before the status gate, :844-847) — same
-                        // store-only gate as the I/O Intr ring.
-                        if result.aux_status == AsynStatus::Success {
-                            if let Some(val) = self.result_to_value(&result) {
-                                let wrote_val = self.store_read_value(record, val);
-                                read_outcome = stored(wrote_val);
-                            } else if self.iface_type == "asynOctet" {
-                                // A write-read whose write came up short read
-                                // nothing, and processCommon still succeeds
-                                // (devAsynOctet.c:853-860, :816-818).
-                                read_outcome = stored(true);
-                            }
+                        if let Some(val) = self.result_to_value(&result) {
+                            let wrote_val = self.store_read_value(record, val);
+                            read_outcome = stored(wrote_val);
+                        } else if self.iface_type == "asynOctet" {
+                            // A write-read whose write came up short read
+                            // nothing, and processCommon still succeeds
+                            // (devAsynOctet.c:853-860, :816-818).
+                            read_outcome = stored(true);
                         }
                         self.last_alarm_status = result.alarm_status;
                         self.last_alarm_severity = result.alarm_severity;
                         self.last_ts = result.timestamp.map(Into::into);
                     }
+                }
+                // A read that failed with its value, a parameter's status: C
+                // processAi maps the alarm and sets the time before its status
+                // gate and stores nothing (devAsynInt32.c:844-855).
+                Err(AsynError::FailedRead { read, .. }) => {
+                    self.last_alarm_status = read.alarm_status;
+                    self.last_alarm_severity = read.alarm_severity;
+                    self.last_ts = read.timestamp.map(Into::into);
                 }
                 // `processCommon` succeeds, defining the record (devAsynOctet.c:816-818,
                 // devAsynXXXArray.cpp:334-336).
@@ -4203,21 +4654,16 @@ impl DeviceSupport for AsynDeviceSupport {
         // array dset reads at all.
         if let Some(raw) = info
             .get("asyn:INITIAL_READBACK")
-            .filter(|_| self.octet_output)
+            .filter(|_| self.output && self.dset == Dset::Octet)
         {
             self.set_initial_readback(parse_info_bool(raw));
         }
-        // C parity: `info("asyn:FIFO", "<n>")` at
-        // devAsynInt32.c:361-362 — `atoi(sizeString)` overrides
-        // DEFAULT_RING_BUFFER_SIZE (10). C uses raw `atoi`, which
-        // returns 0 for unparseable input; we mirror that by
-        // ignoring zero / negative values so the default isn't
-        // accidentally clobbered by a typo.
+        // `ringSize = atoi(sizeString)` (devAsynInt32.c:361-362): text that
+        // is no number is 0. A negative size crashes C (a NULL or negative
+        // ring); the default stands.
         if let Some(raw) = info.get("asyn:FIFO") {
-            if let Ok(n) = raw.trim().parse::<i64>() {
-                if n > 0 {
-                    self.set_fifo_size(n as usize);
-                }
+            if let Ok(n) = usize::try_from(c_atoi(raw)) {
+                self.fifo_tag = Some(n);
             }
         }
     }
@@ -4275,7 +4721,11 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn async_write_completed_common(&mut self, common: &mut CommonFields) {
+    fn async_write_completed_common(
+        &mut self,
+        _record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) {
         let wrote = self.device_job.write_alarm.lock().unwrap_or(Ok((0, 0)));
         self.define_on_write(common, wrote.is_ok());
         (self.last_alarm_status, self.last_alarm_severity) = self.output_alarm(wrote);
@@ -4461,7 +4911,7 @@ impl DeviceSupport for AsynDeviceSupport {
         self.asyn_readback || self.average.is_some() || self.time_series.is_some()
     }
 
-    fn arm_readback_callback(&mut self) {
+    fn arm_readback_callback(&mut self) -> DeviceUdf {
         // C `devAsynInt32.c::outputCallbackCallback` sets
         // `newOutputCallbackValue = 1` immediately before `dbProcess`. Only
         // the output-readback path (asyn:READBACK, PRs #60 / #208) carries
@@ -4470,10 +4920,17 @@ impl DeviceSupport for AsynDeviceSupport {
         // fallback, so they are left unarmed and `reconcile` is a no-op there.
         if self.asyn_readback {
             self.output_callback_pending = true;
+            // ...and `pr->udf = 0` with it (devAsynInt32.c:631 and its twins),
+            // so a failed readback raises WRITE_ALARM, not UDF_ALARM.
+            return DeviceUdf::Defined;
         }
+        DeviceUdf::Untouched
     }
 
     fn reconcile_readback_callback(&mut self) {
+        // The pump's pass is over (`process_record_readback` is its only
+        // caller), and with it the request it ran on.
+        self.interrupt_fifo.lock().unwrap().answered();
         // C `outputCallbackCallback` after `dbProcess`:
         //   if (pPvt->newOutputCallbackValue != 0) { getCallbackValue(pPvt);
         //       pPvt->newOutputCallbackValue = 0; }
@@ -4484,8 +4941,9 @@ impl DeviceSupport for AsynDeviceSupport {
         // entry. `read()` already cleared the flag on the cycles that did
         // process, so this only fires on a genuine bail.
         if self.output_callback_pending {
-            if let Ok(mut fifo) = self.interrupt_fifo.lock() {
-                let _ = fifo.pop();
+            let dropped = self.interrupt_fifo.lock().unwrap().discard();
+            if let Some(d) = &dropped {
+                self.popped(d);
             }
             self.output_callback_pending = false;
         } else {
@@ -5101,7 +5559,7 @@ pub fn universal_asyn_factory(
         adapter.time_series = Some(Arc::new(TimeSeriesState::new()));
     }
 
-    adapter.octet_output = is_output && dset == Dset::Octet;
+    adapter.output = is_output;
     if is_output {
         if output_via_inp {
             // An output DTYP bound through INP sits on a waveform, an input
@@ -6824,11 +7282,7 @@ mod tests {
     ) -> AsynDeviceSupport {
         let mut driver = TestPort::new();
         driver.base.params.set_int32(0, 0, value).unwrap();
-        driver
-            .base
-            .params
-            .set_param_status(0, 0, status, 0, 0)
-            .unwrap();
+        driver.base.params.set_status(0, 0, status).unwrap();
         let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
@@ -7446,7 +7900,7 @@ mod tests {
         fifo: &Arc<std::sync::Mutex<InterruptFifo>>,
     ) -> crate::param::ParamValue {
         for _ in 0..200 {
-            if let Some(entry) = fifo.lock().unwrap().pop() {
+            if let Some(entry) = fifo.lock().unwrap().pop().map(|d| d.entry) {
                 return entry.value;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -7700,12 +8154,12 @@ mod tests {
         };
 
         fire(1);
-        assert!(fifo.lock().unwrap().entries.is_empty(), "closed: no push");
+        assert!(fifo.lock().unwrap().waiting() == 0, "closed: no push");
         assert!(rx.try_recv().is_err(), "closed: no wakeup");
 
         gate.set(true);
         fire(2);
-        assert_eq!(fifo.lock().unwrap().entries.len(), 1, "open: one entry");
+        assert_eq!(fifo.lock().unwrap().waiting(), 1, "open: one entry");
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err(), "open: one wakeup");
     }
@@ -7749,8 +8203,8 @@ mod tests {
             uint32_changed_mask: 0x01,
             ..Default::default()
         });
-        assert!(fifo_a.lock().unwrap().entries.is_empty(), "A is closed");
-        assert_eq!(fifo_b.lock().unwrap().entries.len(), 1, "B is open");
+        assert!(fifo_a.lock().unwrap().waiting() == 0, "A is closed");
+        assert_eq!(fifo_b.lock().unwrap().waiting(), 1, "B is open");
     }
 
     /// C `interruptCallbackInput` (devAsynInt32.c:564-576): every callback
@@ -7785,7 +8239,7 @@ mod tests {
         // The callback is inline in notify(): the ring is complete on return.
         let ringed: Vec<u32> = {
             let mut g = fifo.lock().unwrap();
-            std::iter::from_fn(|| g.pop())
+            std::iter::from_fn(|| g.pop().map(|d| d.entry))
                 .map(|e| match e.value {
                     crate::param::ParamValue::UInt32Digital(v) => v,
                     other => panic!("expected UInt32Digital, got {other:?}"),
@@ -7797,7 +8251,7 @@ mod tests {
             vec![1, 2, 3],
             "every callback before the record reads is in the ring, oldest first"
         );
-        assert_eq!(fifo.lock().unwrap().take_overflows(), 0);
+        assert_eq!(fifo.lock().unwrap().overflows, 0);
         // One scanIoRequest per fresh add (C: no request only on overflow).
         for _ in 0..3 {
             rx.try_recv()
@@ -7844,7 +8298,7 @@ mod tests {
                     octet_nul: false,
                 });
         }
-        let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().entries.len();
+        let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().waiting();
 
         // asyn:READBACK output adapter; init so reason_set is true (read pops).
         let mut ads = make_adapter(ScanType::Passive);
@@ -8586,7 +9040,7 @@ mod tests {
         let entry = {
             let mut got = None;
             for _ in 0..200 {
-                if let Some(e) = fifo.lock().unwrap().pop() {
+                if let Some(e) = fifo.lock().unwrap().pop().map(|d| d.entry) {
                     got = Some(e);
                     break;
                 }
@@ -9057,34 +9511,34 @@ mod tests {
     #[test]
     fn fifo_default_size_matches_c_constant() {
         // C devAsynInt32.c:63 → DEFAULT_RING_BUFFER_SIZE = 10.
-        let f = InterruptFifo::new();
-        assert_eq!(f.ring_size, 10);
-        assert!(f.entries.is_empty());
+        let f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
+        assert!(matches!(f.store, CallbackStore::Ring { size: 10, .. }));
+        assert_eq!(f.waiting(), 0);
         assert_eq!(f.overflows, 0);
     }
 
     #[test]
     fn fifo_push_pop_fifo_order() {
-        let mut f = InterruptFifo::new();
+        let mut f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
         assert!(f.push_with_overflow(intr_entry(1, 1)));
         assert!(f.push_with_overflow(intr_entry(2, 2)));
         assert!(f.push_with_overflow(intr_entry(3, 3)));
-        let popped: Vec<_> = std::iter::from_fn(|| f.pop())
+        let popped: Vec<_> = std::iter::from_fn(|| f.pop().map(|d| d.entry))
             .map(|c| match c.value {
                 crate::param::ParamValue::Int32(v) => v,
                 _ => panic!(),
             })
             .collect();
         assert_eq!(popped, vec![1, 2, 3], "FIFO order, not LIFO");
-        assert_eq!(f.take_overflows(), 0);
+        assert_eq!(f.overflows, 0);
     }
 
     #[test]
     fn fifo_overflow_drops_oldest_and_counts() {
         // C parity: devAsynInt32.c:565-571 — when ringHead wraps onto
         // ringTail, advance ringTail (drop oldest) + overflows++.
-        let mut f = InterruptFifo::new();
-        f.ring_size = 3;
+        let mut f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
+        f.resize(3);
         assert!(f.push_with_overflow(intr_entry(1, 1)));
         assert!(f.push_with_overflow(intr_entry(2, 2)));
         assert!(f.push_with_overflow(intr_entry(3, 3)));
@@ -9093,7 +9547,7 @@ mod tests {
         assert!(!f.push_with_overflow(intr_entry(5, 5)));
         assert_eq!(f.overflows, 2);
         // Buffer now holds [3, 4, 5] — oldest two dropped.
-        let popped: Vec<_> = std::iter::from_fn(|| f.pop())
+        let popped: Vec<_> = std::iter::from_fn(|| f.pop().map(|d| d.entry))
             .map(|c| match c.value {
                 crate::param::ParamValue::Int32(v) => v,
                 _ => panic!(),
@@ -9103,57 +9557,945 @@ mod tests {
     }
 
     #[test]
-    fn fifo_take_overflows_resets() {
-        let mut f = InterruptFifo::new();
-        f.ring_size = 1;
+    fn fifo_pop_reports_and_clears_overflows() {
+        let mut f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
+        f.resize(1);
         f.push_with_overflow(intr_entry(1, 1));
         f.push_with_overflow(intr_entry(2, 2)); // overflow
         f.push_with_overflow(intr_entry(3, 3)); // overflow
-        assert_eq!(f.take_overflows(), 2);
-        // Second call must return 0 — counter was reset.
-        assert_eq!(f.take_overflows(), 0);
+        assert_eq!(f.pop().map(|d| d.overflows), Some(2));
+        f.push_with_overflow(intr_entry(4, 4));
+        assert_eq!(f.pop().map(|d| d.overflows), Some(0), "the pop cleared it");
     }
 
     #[test]
-    fn set_fifo_size_truncates_existing_entries() {
-        let mut ads = make_adapter(ScanType::IoIntr);
-        {
-            let mut g = ads.interrupt_fifo.lock().unwrap();
-            g.ring_size = 10;
-            g.push_with_overflow(intr_entry(1, 1));
-            g.push_with_overflow(intr_entry(2, 2));
-            g.push_with_overflow(intr_entry(3, 3));
-            g.push_with_overflow(intr_entry(4, 4));
-        }
-        // Shrink — must drop the 2 oldest and count them as overflows.
+    fn set_fifo_size_before_init_wins_over_the_dset_default() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
         ads.set_fifo_size(2);
+        ads.init(&mut StringinRecord::new("")).unwrap();
         let g = ads.interrupt_fifo.lock().unwrap();
-        assert_eq!(g.entries.len(), 2);
-        assert_eq!(g.overflows, 2);
+        assert!(matches!(g.store, CallbackStore::Ring { size: 2, .. }));
     }
 
     #[test]
-    fn apply_record_info_parses_asyn_fifo() {
+    fn apply_record_info_parses_asyn_fifo_as_atoi() {
         let mut ads = make_adapter(ScanType::IoIntr);
-        let mut info = std::collections::HashMap::new();
-        info.insert("asyn:FIFO".to_string(), "32".to_string());
-        ads.apply_record_info(&info);
-        assert_eq!(ads.interrupt_fifo.lock().unwrap().ring_size, 32);
+        for (raw, tag) in [
+            ("32", Some(32)),
+            (" +7x", Some(7)),
+            ("garbage", Some(0)),
+            ("0", Some(0)),
+            ("-3", Some(0)),
+        ] {
+            let info =
+                std::collections::HashMap::from([("asyn:FIFO".to_string(), raw.to_string())]);
+            ads.apply_record_info(&info);
+            assert_eq!(ads.fifo_tag, tag, "{raw:?}; a negative one leaves the last");
+        }
+    }
 
-        // C atoi("garbage") = 0 → keep default (we additionally
-        // require n > 0).
-        info.insert("asyn:FIFO".to_string(), "garbage".to_string());
-        ads.apply_record_info(&info);
-        assert_eq!(
-            ads.interrupt_fifo.lock().unwrap().ring_size,
-            32,
-            "non-numeric must not clobber size"
+    /// Fire `values` at the record's parameter as one burst. The callbacks run
+    /// inline in `notify`, so all of them land before the record reads.
+    fn burst(ads: &AsynDeviceSupport, values: &[crate::param::ParamValue]) {
+        let (reason, interrupts) = (ads.reason, ads.handle.interrupts());
+        for value in values {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: value.clone(),
+                timestamp: SystemTime::UNIX_EPOCH,
+                uint32_changed_mask: u32::MAX,
+                ..Default::default()
+            });
+        }
+    }
+
+    fn octets(texts: &[&str]) -> Vec<crate::param::ParamValue> {
+        texts
+            .iter()
+            .map(|t| crate::param::ParamValue::Octet(t.as_bytes().into()))
+            .collect()
+    }
+
+    fn int32s(values: impl IntoIterator<Item = i32>) -> Vec<crate::param::ParamValue> {
+        values
+            .into_iter()
+            .map(crate::param::ParamValue::Int32)
+            .collect()
+    }
+
+    /// The scanIoRequests waiting on the record's pump.
+    fn wakes(rx: &mut tokio::sync::mpsc::Receiver<()>) -> usize {
+        std::iter::from_fn(|| rx.try_recv().ok()).count()
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(4): checked, not waived — ran and passed under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
+    /// devAsynOctet and devAsynXXXArray keep no ring by default
+    /// (DEFAULT_RING_BUFFER_SIZE 0, devAsynOctet.c:73, devAsynXXXArray.cpp:43):
+    /// each callback overwrites the record's value and asks for a process, so
+    /// every process after a burst reads its last value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ring_0_reads_the_last_value_of_a_burst() {
+        use epics_base_rs::server::records::{stringin::StringinRecord, waveform::WaveformRecord};
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a", "b", "c"]));
+        assert_eq!(wakes(&mut rx), 3, "a scanIoRequest per callback");
+        for _ in 0..3 {
+            ads.read(&mut si).unwrap();
+            assert_eq!(si.val(), Some(EpicsValue::String("c".into())));
+        }
+        assert!(
+            !ads.callback_value_waiting(),
+            "three processes, three callbacks"
         );
 
-        // Negative / zero is rejected too.
-        info.insert("asyn:FIFO".to_string(), "0".to_string());
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynInt32Array");
+        ads.bind_interrupt_gate(&gate);
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut wf).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut wf).expect("io intr receiver");
+        let arrays: Vec<_> = (1..=3)
+            .map(|v| crate::param::ParamValue::Int32Array(vec![v; 2].into()))
+            .collect();
+        burst(&ads, &arrays);
+        assert_eq!(wakes(&mut rx), 3, "a scanIoRequest per callback");
+        ads.read(&mut wf).unwrap();
+        assert_eq!(wf.val(), Some(EpicsValue::LongArray(vec![3, 3].into())));
+    }
+
+    /// A ring of N holds the N newest callbacks, oldest first, and asks for a
+    /// process per fresh entry only: the scalar default of 10
+    /// (devAsynInt32.c:63), and `asyn:FIFO` on an array.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ring_n_reads_the_n_newest_of_a_burst() {
+        use epics_base_rs::server::records::{longin::LonginRecord, waveform::WaveformRecord};
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s(1..=12));
+        assert_eq!(wakes(&mut rx), 10, "no scanIoRequest on an overflow");
+        let read: Vec<_> = (0..10)
+            .map(|_| {
+                ads.read(&mut li).unwrap();
+                li.val()
+            })
+            .collect();
+        let newest: Vec<_> = (3..=12).map(|v| Some(EpicsValue::Long(v))).collect();
+        assert_eq!(read, newest);
+        assert!(!ads.callback_value_waiting());
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynInt32Array");
+        let info = std::collections::HashMap::from([("asyn:FIFO".to_string(), "3".to_string())]);
         ads.apply_record_info(&info);
-        assert_eq!(ads.interrupt_fifo.lock().unwrap().ring_size, 32);
+        ads.bind_interrupt_gate(&gate);
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut wf).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut wf).expect("io intr receiver");
+        let arrays: Vec<_> = (1..=5)
+            .map(|v| crate::param::ParamValue::Int32Array(vec![v].into()))
+            .collect();
+        burst(&ads, &arrays);
+        assert_eq!(wakes(&mut rx), 3, "no scanIoRequest on an overflow");
+        for v in 3..=5 {
+            ads.read(&mut wf).unwrap();
+            assert_eq!(wf.val(), Some(EpicsValue::LongArray(vec![v].into())));
+        }
+        assert!(!ads.callback_value_waiting());
+    }
+
+    /// `asyn:FIFO` is read with `atoi` (devAsynInt32.c:361-362,
+    /// devAsynOctet.c:403-404): "2abc" rings 2 on a stringin, and "0" turns a
+    /// longin's ring of 10 into the latest-value slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn asyn_fifo_sizes_the_ring_as_atoi_reads_it() {
+        use epics_base_rs::server::records::{longin::LonginRecord, stringin::StringinRecord};
+        let gate = open_gate();
+        let tag =
+            |n: &str| std::collections::HashMap::from([("asyn:FIFO".to_string(), n.to_string())]);
+
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.apply_record_info(&tag("2abc"));
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a", "b", "c", "d"]));
+        assert_eq!(wakes(&mut rx), 2);
+        for s in ["c", "d"] {
+            ads.read(&mut si).unwrap();
+            assert_eq!(si.val(), Some(EpicsValue::String(s.into())));
+        }
+        assert!(!ads.callback_value_waiting());
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.apply_record_info(&tag("0"));
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s(1..=4));
+        assert_eq!(wakes(&mut rx), 4);
+        for _ in 0..4 {
+            ads.read(&mut li).unwrap();
+            assert_eq!(li.val(), Some(EpicsValue::Long(4)));
+        }
+        assert!(!ads.callback_value_waiting());
+    }
+
+    /// An `asyn:READBACK` octet output rings 1 by default (devAsynOctet.c:342):
+    /// a burst asks for one readback, which reads the burst's last value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_readback_octet_output_rings_one() {
+        use epics_base_rs::server::records::stringout::StringoutRecord;
+        let gate = open_gate();
+        let mut ads = octet_param_adapter(b"", ScanType::Passive);
+        ads.output = true;
+        let info =
+            std::collections::HashMap::from([("asyn:READBACK".to_string(), "1".to_string())]);
+        ads.apply_record_info(&info);
+        ads.bind_interrupt_gate(&gate);
+        let mut so = StringoutRecord::new("");
+        ads.init(&mut so).unwrap();
+        let mut rx = ads.io_intr_receiver().expect("readback receiver");
+        burst(&ads, &octets(&["a", "b", "c"]));
+        assert_eq!(wakes(&mut rx), 1, "no request on an overflow");
+        ads.read(&mut so).unwrap();
+        assert_eq!(so.val(), Some(EpicsValue::String("c".into())));
+        assert!(!ads.callback_value_waiting());
+    }
+
+    /// The latest-value slot replaces its value in place: past the first
+    /// callback, a burst allocates nothing (the values are `Arc`s the driver
+    /// built).
+    #[test]
+    fn a_ring_0_burst_allocates_nothing() {
+        epics_libcom_rs::runtime::task::test_ioc_thread(|| {
+            use crate::asyn_record::errs_alloc_tests::thread_allocs;
+            use epics_base_rs::server::records::stringin::StringinRecord;
+            let gate = open_gate();
+            let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+            ads.bind_interrupt_gate(&gate);
+            let mut si = StringinRecord::new("");
+            ads.init(&mut si).unwrap();
+            let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+            let values = octets(&["a", "b", "c", "d"]);
+            burst(&ads, &values[..1]);
+            let before = thread_allocs();
+            burst(&ads, &values[1..]);
+            let allocs = thread_allocs() - before;
+            assert_eq!(allocs, 0, "a ring 0 callback allocates nothing");
+            assert_eq!(wakes(&mut rx), 4);
+        });
+    }
+
+    /// Routes the port's `mask` trace to a file, whose path it returns.
+    fn trace_log(
+        ads: &AsynDeviceSupport,
+        mask: crate::trace::TraceMask,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("trace dir");
+        let path = dir.path().join("warn.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let (trace, port) = (ads.handle.user_trace().manager, ads.handle.port_name());
+        trace.register_port(port, false);
+        trace.set_trace_file(
+            Some(port),
+            crate::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some(port), mask);
+        (dir, path)
+    }
+
+    fn lines_with(path: &std::path::Path, text: &str) -> usize {
+        let log = std::fs::read_to_string(path).unwrap();
+        log.lines().filter(|l| l.ends_with(text)).count()
+    }
+
+    /// The pop that drains an overflowed ring prints and clears C's count
+    /// (devAsynInt32.c:775-780, devAsynOctet.c:463-468,
+    /// devAsynXXXArray.cpp:383-388), the readback discard's pop included
+    /// (devAsynOctet.c:587-589); a latest-slot process with callbacks still
+    /// waiting warns (devAsynOctet.c:779-783, devAsynXXXArray.cpp:302-309).
+    #[test]
+    fn ring_pops_print_c_s_overflow_and_backlog_warnings() {
+        use epics_base_rs::server::records::{
+            bo::BoRecord, longin::LonginRecord, stringin::StringinRecord, waveform::WaveformRecord,
+        };
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+        let fifo =
+            |n: &str| std::collections::HashMap::from([("asyn:FIFO".to_string(), n.to_string())]);
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s(1..=12));
+        ads.read(&mut li).unwrap();
+        ads.read(&mut li).unwrap();
+        let overflow = "TEST:REC devAsynInt32::getCallbackValue warning, 2 ring buffer overflows";
+        assert_eq!(lines_with(&log, overflow), 1, "printed once, then cleared");
+
+        let mut ads = make_adapter(ScanType::Passive);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        let mut bo = BoRecord::new(0);
+        ads.init(&mut bo).unwrap();
+        ads.set_asyn_readback(true);
+        for v in 1..=11 {
+            let mut fifo = ads.interrupt_fifo.lock().unwrap();
+            fifo.push_with_overflow(intr_entry(v, 0));
+        }
+        ads.arm_readback_callback();
+        ads.reconcile_readback_callback();
+        let overflow = "TEST:REC devAsynInt32::getCallbackValue warning, 1 ring buffer overflows";
+        assert_eq!(lines_with(&log, overflow), 1, "the discard pops as C does");
+
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        ads.apply_record_info(&fifo("2"));
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a", "b", "c", "d"]));
+        ads.read(&mut si).unwrap();
+        let overflow = "TEST:FW devAsynOctet::getRingBufferValue warning, 2 ring buffer overflows";
+        assert_eq!(lines_with(&log, overflow), 1);
+
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a", "b", "c"]));
+        for _ in 0..3 {
+            ads.read(&mut si).unwrap();
+        }
+        let backlog = "TEST:FW devAsynOctet::processCommon warning: multiple interrupt callbacks between processing";
+        assert_eq!(
+            lines_with(&log, backlog),
+            2,
+            "not on the process that drains it"
+        );
+
+        let arrays = |n: i32| -> Vec<_> {
+            (1..=n)
+                .map(|v| crate::param::ParamValue::Int32Array(vec![v].into()))
+                .collect()
+        };
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        ads.set_iface_type("asynInt32Array");
+        ads.apply_record_info(&fifo("3"));
+        ads.bind_interrupt_gate(&gate);
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut wf).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut wf).expect("io intr receiver");
+        burst(&ads, &arrays(5));
+        ads.read(&mut wf).unwrap();
+        let overflow =
+            "TEST:REC devAsynXXXArray::getRingBufferValue  error, 2 ring buffer overflows";
+        assert_eq!(lines_with(&log, overflow), 1);
+
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, crate::trace::TraceMask::WARNING);
+        ads.set_iface_type("asynInt32Array");
+        ads.bind_interrupt_gate(&gate);
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut wf).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut wf).expect("io intr receiver");
+        burst(&ads, &arrays(2));
+        ads.read(&mut wf).unwrap();
+        let backlog = "TEST:REC devAsynXXXArray::process, warning: multiple interrupt callbacks between processing";
+        assert_eq!(lines_with(&log, backlog), 1);
+    }
+
+    /// C's scalar ring pop prints the value it took at ASYN_TRACEIO_DEVICE
+    /// (devAsynInt32.c:782-785, devAsynFloat64.c:538-540, devAsynInt64.c:
+    /// 611-613, devAsynUInt32Digital.c:618-620), the readback discard's pop
+    /// included.
+    #[test]
+    fn a_scalar_ring_pop_prints_its_value() {
+        use crate::param::ParamValue as V;
+        use crate::trace::TraceMask;
+        use epics_base_rs::server::records::{ai::AiRecord, bo::BoRecord, longin::LonginRecord};
+        let gate = open_gate();
+        let popped = |iface: &str, value: V, rec: &mut dyn Record| {
+            let mut ads = if iface == "asynUInt32Digital" {
+                make_uint32_io_intr_adapter(u32::MAX)
+            } else {
+                make_adapter(ScanType::IoIntr)
+            };
+            ads.set_iface_type(iface);
+            let (dir, log) = trace_log(&ads, TraceMask::IO_DEVICE);
+            ads.bind_interrupt_gate(&gate);
+            ads.init(rec).unwrap();
+            let _rx = join_io_intr(&mut ads, rec).expect("io intr receiver");
+            burst(&ads, &[value]);
+            ads.read(rec).unwrap();
+            let text = std::fs::read_to_string(&log).unwrap();
+            drop(dir);
+            text
+        };
+        for (iface, value, line) in [
+            (
+                "asynInt32",
+                V::Int32(-7),
+                "TEST:REC devAsynInt32::getCallbackValue from ringBuffer value=-7",
+            ),
+            (
+                "asynFloat64",
+                V::Float64(2.5),
+                "TEST:REC devAsynFloat64::getCallbackValue from ringBuffer value=2.500000",
+            ),
+            (
+                "asynInt64",
+                V::Int64(-5),
+                "TEST:REC devAsynInt64::getCallbackValue from ringBuffer value=-5",
+            ),
+            (
+                "asynUInt32Digital",
+                V::UInt32Digital(u32::MAX),
+                "TEST:U32 devAsynUInt32Digital::getCallbackValue from ringBuffer value=-1",
+            ),
+        ] {
+            let text = if iface == "asynFloat64" {
+                popped(iface, value, &mut AiRecord::new(0.0))
+            } else {
+                popped(iface, value, &mut LonginRecord::new(0))
+            };
+            assert!(
+                text.lines().any(|l| l.ends_with(line)),
+                "{iface}: missing {line:?} in\n{text}"
+            );
+        }
+
+        let mut ads = make_adapter(ScanType::Passive);
+        let (_dir, log) = trace_log(&ads, TraceMask::IO_DEVICE);
+        let mut bo = BoRecord::new(0);
+        ads.init(&mut bo).unwrap();
+        ads.set_asyn_readback(true);
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(1, 0));
+        ads.arm_readback_callback();
+        ads.reconcile_readback_callback();
+        let line = "TEST:REC devAsynInt32::getCallbackValue from ringBuffer value=1";
+        assert_eq!(lines_with(&log, line), 1, "the discard pops as C does");
+    }
+
+    /// A callback's process dumps what the record then holds at
+    /// ASYN_TRACEIO_DEVICE: devAsynOctet on every one (devAsynOctet.c:799-803),
+    /// devAsynXXXArray only on a ring pop (devAsynXXXArray.cpp:321-324).
+    #[test]
+    fn a_callback_process_dumps_the_record_value() {
+        use crate::trace::{TraceIoMask, TraceMask};
+        use epics_base_rs::server::records::{stringin::StringinRecord, waveform::WaveformRecord};
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        let (_dir, log) = trace_log(&ads, TraceMask::IO_DEVICE);
+        let trace = ads.handle.user_trace().manager;
+        trace.set_trace_io_mask(Some(ads.handle.port_name()), TraceIoMask::ASCII);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["abc"]));
+        ads.read(&mut si).unwrap();
+        let dump = "TEST:FW devAsynOctet::processCommon len=3,  data:abc";
+        assert_eq!(lines_with(&log, dump), 1);
+
+        for (fifo, dumps) in [("2", 1), ("0", 0)] {
+            let mut ads = make_adapter(ScanType::IoIntr);
+            let (_dir, log) = trace_log(&ads, TraceMask::IO_DEVICE);
+            let trace = ads.handle.user_trace().manager;
+            trace.set_trace_io_mask(Some(ads.handle.port_name()), TraceIoMask::HEX);
+            ads.set_iface_type("asynInt32Array");
+            let info =
+                std::collections::HashMap::from([("asyn:FIFO".to_string(), fifo.to_string())]);
+            ads.apply_record_info(&info);
+            ads.bind_interrupt_gate(&gate);
+            let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+            ads.init(&mut wf).unwrap();
+            let _rx = join_io_intr(&mut ads, &mut wf).expect("io intr receiver");
+            burst(
+                &ads,
+                &[crate::param::ParamValue::Int32Array(vec![1, 2].into())],
+            );
+            ads.read(&mut wf).unwrap();
+            let hex: String = [1i32, 2]
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .map(|b| format!("{b:02x} "))
+                .collect();
+            let dump = format!(
+                "TEST:REC devAsynXXXArray::devAsynXXXArray nord=2, pRecord_->bptr data:\n{hex}\n"
+            );
+            let text = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                text.matches(&dump).count(),
+                dumps,
+                "asyn:FIFO {fifo}:\n{text}"
+            );
+        }
+    }
+
+    /// iocInit's I/O Intr pump: one process per doorbell until none is left.
+    /// Returns what each process read.
+    fn pump(
+        ads: &mut AsynDeviceSupport,
+        rx: &mut tokio::sync::mpsc::Receiver<()>,
+        rec: &mut dyn Record,
+    ) -> Vec<EpicsValue> {
+        let mut read = Vec::new();
+        while rx.try_recv().is_ok() {
+            ads.arm_readback_callback();
+            ads.read(rec).unwrap();
+            ads.reconcile_readback_callback();
+            read.extend(rec.get_field("VAL"));
+            assert!(read.len() <= 100, "the doorbell never stops");
+        }
+        read
+    }
+
+    /// C scanIoRequests every fresh callback (devAsynOctet.c:506-519,
+    /// devAsynInt32.c:564-576), one process each. The store owns that count;
+    /// the 16-slot wake channel is a doorbell rung again after every pop
+    /// while callbacks are owed, so a burst past 16 is still processed once
+    /// per callback and leaves nothing owed.
+    #[test]
+    fn a_burst_is_processed_once_per_owed_callback() {
+        use epics_base_rs::server::records::{longin::LonginRecord, stringin::StringinRecord};
+        let gate = open_gate();
+        let fifo =
+            |n: &str| std::collections::HashMap::from([("asyn:FIFO".to_string(), n.to_string())]);
+
+        for n in [1, 15, 16, 17, 40] {
+            let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+            ads.bind_interrupt_gate(&gate);
+            let mut si = StringinRecord::new("");
+            ads.init(&mut si).unwrap();
+            let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+            let texts: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            burst(&ads, &octets(&refs));
+            let last = EpicsValue::String(format!("v{}", n - 1).into());
+            assert_eq!(
+                pump(&mut ads, &mut rx, &mut si),
+                vec![last; n],
+                "ring 0, burst {n}"
+            );
+            assert!(!ads.callback_value_waiting(), "ring 0, burst {n}");
+            assert!(rx.try_recv().is_err(), "ring 0, burst {n}");
+        }
+
+        for (size, n, first) in [
+            ("40", 1, 1),
+            ("40", 15, 1),
+            ("40", 16, 1),
+            ("40", 17, 1),
+            ("40", 40, 1),
+            ("10", 40, 31),
+        ] {
+            let mut ads = make_adapter(ScanType::IoIntr);
+            ads.apply_record_info(&fifo(size));
+            ads.bind_interrupt_gate(&gate);
+            let mut li = LonginRecord::new(0);
+            ads.init(&mut li).unwrap();
+            let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+            burst(&ads, &int32s(1..=n));
+            let newest: Vec<_> = (first..=n).map(EpicsValue::Long).collect();
+            assert_eq!(
+                pump(&mut ads, &mut rx, &mut li),
+                newest,
+                "FIFO {size}, burst {n}"
+            );
+            assert!(!ads.callback_value_waiting(), "FIFO {size}, burst {n}");
+        }
+    }
+
+    /// devAsynOctet's ringSize 0 keeps a callback that comes before
+    /// `interruptAccept` (devAsynOctet.c:490-509), but its `scanIoRequest`
+    /// does nothing then (dbScan.c:621): it is owed no process, and the first
+    /// callback after the gate opens is processed once, taking the held ones
+    /// with it.
+    #[test]
+    fn a_ring_0_callback_before_the_gate_owes_no_process() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        let gate = InterruptGate::new();
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a", "b", "c"]));
+        assert!(rx.try_recv().is_err(), "closed: no request");
+        assert!(ads.callback_value_waiting(), "closed: the value is unread");
+        gate.set(true);
+        burst(&ads, &octets(&["d"]));
+        let d = EpicsValue::String("d".into());
+        assert_eq!(pump(&mut ads, &mut rx, &mut si), vec![d]);
+        assert!(!ads.callback_value_waiting());
+    }
+
+    /// PINI runs before `interruptAccept` (iocInit.c:196, dbScan.c:218) and
+    /// takes a value a callback left before it, as C's `gotValue` test does
+    /// (devAsynOctet.c:752), rather than reading the driver; the next process
+    /// reads the driver.
+    #[test]
+    fn pini_takes_a_ring_0_value_held_before_the_gate() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        let gate = InterruptGate::new();
+        let mut ads = octet_param_adapter(b"driver", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["held"]));
+        ads.read(&mut si).unwrap();
+        assert_eq!(si.val(), Some(EpicsValue::String("held".into())), "PINI");
+        ads.read(&mut si).unwrap();
+        assert_eq!(si.val(), Some(EpicsValue::String("driver".into())));
+        assert!(rx.try_recv().is_err(), "nothing was owed a process");
+    }
+
+    /// Callbacks held before the gate count toward C's "multiple interrupt
+    /// callbacks" warning on the take that clears them, and only that one.
+    #[test]
+    fn a_take_counts_held_callbacks_once() {
+        let mut f = InterruptFifo::new(tokio::sync::mpsc::channel(16).0);
+        f.resize(0);
+        f.hold(intr_entry(1, 1));
+        assert_eq!(f.pop().map(|d| d.backlog), Some(false), "one held");
+        f.hold(intr_entry(2, 2));
+        f.hold(intr_entry(3, 3));
+        assert_eq!(f.pop().map(|d| d.backlog), Some(true), "two held");
+        assert!(f.pop().is_none());
+        f.hold(intr_entry(4, 4));
+        f.push_with_overflow(intr_entry(5, 5));
+        assert_eq!(f.pop().map(|d| d.backlog), Some(true), "held + owed");
+        assert!(f.pop().is_none(), "C's gotValue stays one ahead here");
+    }
+
+    /// An overflow requests nothing (devAsynInt32.c:565-572), also while the
+    /// pump holds a request it has not processed yet: requests 1 and 2, passes
+    /// popping 2 and 3, and no third (a driver read, devAsynInt32.c:1045-1047).
+    #[test]
+    fn review_overflow_while_a_request_is_in_flight_requests_nothing() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let info = std::collections::HashMap::from([("asyn:FIFO".to_string(), "2".to_string())]);
+        ads.apply_record_info(&info);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s([1, 2]));
+        assert!(rx.try_recv().is_ok(), "the scan thread takes request 1");
+        burst(&ads, &int32s([3]));
+        ads.arm_readback_callback();
+        ads.read(&mut li).unwrap();
+        ads.reconcile_readback_callback();
+        let mut read = vec![li.get_field("VAL").unwrap()];
+        read.extend(pump(&mut ads, &mut rx, &mut li));
+        assert_eq!(read, vec![EpicsValue::Long(2), EpicsValue::Long(3)]);
+    }
+
+    /// A ring-0 callback landing while the pump holds a request is owed its
+    /// own pass (devAsynOctet.c:518): the held pass and the next both read it.
+    #[test]
+    fn a_ring_0_callback_while_a_request_is_in_flight_is_processed() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        let gate = open_gate();
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        burst(&ads, &octets(&["a"]));
+        assert!(rx.try_recv().is_ok(), "the pump takes request a");
+        burst(&ads, &octets(&["b"]));
+        ads.arm_readback_callback();
+        ads.read(&mut si).unwrap();
+        ads.reconcile_readback_callback();
+        let mut read = vec![si.get_field("VAL").unwrap()];
+        read.extend(pump(&mut ads, &mut rx, &mut si));
+        assert_eq!(read, vec![EpicsValue::String("b".into()); 2]);
+    }
+
+    /// A process outside the pump (PROC, a periodic scan) pops the entry a
+    /// request was rung for; the request's pass then finds the ring empty and
+    /// reads the driver, as C's does (devAsynInt32.c:836-841), and the next
+    /// callback is requested again.
+    #[test]
+    fn a_pop_outside_the_pump_leaves_its_request_to_read_the_driver() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        // Before the record's interrupt client exists, so no callback lands.
+        ads.handle.write_int32_blocking(ads.reason, 0, 5).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s([7]));
+        ads.read(&mut li).unwrap();
+        assert_eq!(li.get_field("VAL"), Some(EpicsValue::Long(7)), "PROC");
+        assert_eq!(pump(&mut ads, &mut rx, &mut li), [EpicsValue::Long(5)]);
+        // That pass answered its request though it popped nothing.
+        burst(&ads, &int32s([8]));
+        assert_eq!(pump(&mut ads, &mut rx, &mut li), [EpicsValue::Long(8)]);
+    }
+
+    /// A request the pump drops without a pass (record off I/O Intr, IOC
+    /// paused) leaves its entry owed, and the next callback's requests reach
+    /// both. C's dropped request is lost and its ring stays one process behind
+    /// for good, as at a PACT bail (end_processing); not copied.
+    #[test]
+    fn a_request_dropped_without_a_pass_is_not_counted_after_a_pop() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s([1]));
+        assert!(rx.try_recv().is_ok(), "the pump drops request 1");
+        burst(&ads, &int32s([2]));
+        assert_eq!(
+            pump(&mut ads, &mut rx, &mut li),
+            [1, 2].map(EpicsValue::Long)
+        );
+        assert!(!ads.callback_value_waiting());
+    }
+
+    /// Requests the pump drops without a pass (IOC paused) leave at most one
+    /// counted as taken: after two drops a FIFO 2 overflow, which owes no
+    /// new process, still rings for the two entries waiting.
+    #[test]
+    fn requests_dropped_while_paused_count_as_one_taken() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let info = std::collections::HashMap::from([("asyn:FIFO".to_string(), "2".to_string())]);
+        ads.apply_record_info(&info);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s([1, 2]));
+        assert_eq!(wakes(&mut rx), 2, "the paused pump drops requests 1 and 2");
+        burst(&ads, &int32s([3]));
+        assert_eq!(
+            pump(&mut ads, &mut rx, &mut li),
+            [2, 3].map(EpicsValue::Long)
+        );
+    }
+
+    /// A pass that bails on PACT (dbAccess.c:537) pops nothing and its
+    /// request is spent: nothing rings again, so a held record does not spin
+    /// its pump. The entry stays owed and the next callback rings for it; C
+    /// leaves it with no request, one process behind for good, not copied.
+    #[test]
+    fn a_pass_that_pops_nothing_rings_nothing() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut li = LonginRecord::new(0);
+        ads.init(&mut li).unwrap();
+        let mut rx = join_io_intr(&mut ads, &mut li).expect("io intr receiver");
+        burst(&ads, &int32s([7]));
+        assert!(rx.try_recv().is_ok());
+        ads.arm_readback_callback();
+        ads.reconcile_readback_callback();
+        assert!(rx.try_recv().is_err(), "the bail rings nothing");
+        assert!(ads.callback_value_waiting());
+        burst(&ads, &int32s([8]));
+        let both = vec![EpicsValue::Long(7), EpicsValue::Long(8)];
+        assert_eq!(pump(&mut ads, &mut rx, &mut li), both);
+    }
+
+    /// C resets `result.status` after a failed pass (devAsynOctet.c:817-821,
+    /// devAsynXXXArray.cpp:335-339) but not the alarm it mapped into `result`
+    /// (:806-809): a latest-slot entry's second pass alarms the same and
+    /// returns 0, clearing UDF, until a new callback lands its own status.
+    #[test]
+    fn a_failed_latest_slot_entry_fails_its_first_pass_only() {
+        use epics_base_rs::server::recgbl::alarm_status::TIMEOUT_ALARM;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        let gate = open_gate();
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
+        let fire = |text: &str, aux_status| {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Octet(text.as_bytes().into()),
+                timestamp: SystemTime::UNIX_EPOCH,
+                aux_status,
+                ..Default::default()
+            });
+        };
+        let (ok, timeout) = (
+            crate::error::AsynStatus::Success,
+            crate::error::AsynStatus::Timeout,
+        );
+        let timed_out = Some((TIMEOUT_ALARM, 3));
+        fire("a", ok);
+        fire("b", timeout);
+        fire("c", timeout);
+        let mut pass = |ads: &mut AsynDeviceSupport| {
+            let failed = ads.read(&mut si).unwrap().status.read_failed();
+            (failed, ads.last_alarm().map(|a| (a.stat, a.sevr)))
+        };
+        assert_eq!(pass(&mut ads), (true, timed_out), "first pass");
+        assert_eq!(pass(&mut ads), (false, timed_out), "status reset");
+        assert_eq!(pass(&mut ads), (false, timed_out), "still reset");
+        fire("d", timeout);
+        assert_eq!(
+            pass(&mut ads),
+            (true, timed_out),
+            "a new callback's own status"
+        );
+        assert_eq!(si.val(), Some(EpicsValue::String("a".into())));
+    }
+
+    /// LEN and NORD describe the value the pass posts. C sets them from the
+    /// last callback's length, failed ones included (devAsynOctet.c:505), on a
+    /// pass whose status is good (:776), and the reset after a failed pass
+    /// (:817-820) makes the next one good: after "abcd" then a failed "x" it
+    /// posts LEN 3 / NORD 2 over VAL "abcd". Not copied.
+    #[test]
+    fn a_latest_slot_len_describes_the_value_it_posts() {
+        use epics_base_rs::server::records::{lsi::LsiRecord, waveform::WaveformRecord};
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+        let records: [(Box<dyn Record>, &str, EpicsValue); 2] = [
+            (Box::new(LsiRecord::new("zz")), "LEN", EpicsValue::ULong(6)),
+            (
+                Box::new(WaveformRecord::new(16, DbFieldType::Char)),
+                "NORD",
+                EpicsValue::ULong(5),
+            ),
+        ];
+        for (mut rec, len, want) in records {
+            let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+            ads.bind_interrupt_gate(&gate);
+            ads.init(&mut *rec).unwrap();
+            let _rx = join_io_intr(&mut ads, &mut *rec).expect("io intr receiver");
+            let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
+            // asynPortDriver's octet callback counts the NUL (strlen+1).
+            for (text, aux_status) in [
+                ("abcd", crate::error::AsynStatus::Success),
+                ("x", crate::error::AsynStatus::Timeout),
+            ] {
+                interrupts.notify(InterruptValue {
+                    reason,
+                    addr: 0,
+                    value: crate::param::ParamValue::Octet(text.as_bytes().into()),
+                    timestamp: SystemTime::UNIX_EPOCH,
+                    aux_status,
+                    ..Default::default()
+                });
+            }
+            for pass in ["failed", "reset"] {
+                ads.read(&mut *rec).unwrap();
+                let Some(EpicsValue::CharArray(val)) = rec.get_field("VAL") else {
+                    panic!("{len}: VAL is a char array");
+                };
+                let text: Vec<u8> = val.iter().copied().take_while(|&c| c != 0).collect();
+                assert_eq!(
+                    (text.as_slice(), rec.get_field(len)),
+                    (&b"abcd"[..], Some(want.clone())),
+                    "{len}, {pass} pass"
+                );
+            }
+        }
+    }
+
+    /// The reset holds with no good value ever copied: C's second pass still
+    /// returns 0 (devAsynOctet.c:817-818) and the record keeps its value.
+    #[test]
+    fn a_latest_slot_with_no_good_value_resets_its_status_too() {
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        let gate = open_gate();
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut si = StringinRecord::new("init");
+        ads.init(&mut si).unwrap();
+        let _rx = join_io_intr(&mut ads, &mut si).expect("io intr receiver");
+        let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
+        for _ in 0..2 {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Octet(b"x".as_slice().into()),
+                aux_status: crate::error::AsynStatus::Timeout,
+                ..Default::default()
+            });
+        }
+        let failed: Vec<_> = (0..2)
+            .map(|_| ads.read(&mut si).unwrap().status.read_failed())
+            .collect();
+        assert_eq!(failed, [true, false]);
+        assert_eq!(si.val(), Some(EpicsValue::String("init".into())));
+    }
+
+    /// Callbacks that land while a queued write holds the record are owed,
+    /// not rung (devAsynInt32.c:607-613); the cycle's end rings once, and the
+    /// pops ring on until all are processed (:1013-1018).
+    #[test]
+    fn callbacks_owed_during_a_queued_write_ring_at_its_end() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let gate = open_gate();
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.set_asyn_readback(true);
+        ads.bind_interrupt_gate(&gate);
+        let mut lo = LongoutRecord::new(0);
+        ads.init(&mut lo).unwrap();
+        let mut rx = ads.io_intr_receiver().expect("readback receiver");
+        while rx.try_recv().is_ok() {}
+        ads.interrupt_fifo.lock().unwrap().processing_async = true;
+        burst(&ads, &int32s(1..=20));
+        assert!(
+            rx.try_recv().is_err(),
+            "no process while the write holds it"
+        );
+        ads.end_processing();
+        let owed: Vec<_> = (11..=20).map(EpicsValue::Long).collect();
+        assert_eq!(pump(&mut ads, &mut rx, &mut lo), owed);
+        assert!(!ads.callback_value_waiting());
     }
 
     #[test]
@@ -9193,6 +10535,46 @@ mod tests {
             Some(EpicsValue::UShort(8)),
             "SHFT must equal computeShift(0xFF00) = 8"
         );
+    }
+
+    /// C init* sets `pr->mask = pPvt->mask` on every digital record, a 0 mask
+    /// too, over the `.db`/NOBT mask (devAsynUInt32Digital.c:668, 710, 880,
+    /// 924, 1009, 1053), and SHFT on the mbb ones (computeShift(0) = 32).
+    #[test]
+    fn uint32_digital_init_sets_every_records_mask_even_0() {
+        use epics_base_rs::server::records::{
+            bi::BiRecord, bo::BoRecord, mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord,
+            mbbo::MbboRecord, mbbo_direct::MbboDirectRecord,
+        };
+        for mask in [0xFF00u32, 0] {
+            let records: [(&str, Box<dyn Record>, bool); 6] = [
+                ("bi", Box::new(BiRecord::new(0)), false),
+                ("bo", Box::new(BoRecord::new(0)), false),
+                ("mbbi", Box::new(MbbiRecord::new(0)), true),
+                ("mbbo", Box::new(MbboRecord::new(0)), true),
+                ("mbbiDirect", Box::new(MbbiDirectRecord::default()), true),
+                ("mbboDirect", Box::new(MbboDirectRecord::default()), true),
+            ];
+            for (name, mut rec, has_shft) in records {
+                rec.put_field("MASK", EpicsValue::ULong(0x0F)).unwrap();
+                let mut ads = make_adapter(ScanType::Passive);
+                ads.set_iface_type("asynUInt32Digital");
+                ads = ads.with_mask(mask);
+                ads.init(rec.as_mut()).unwrap();
+                assert_eq!(
+                    rec.get_field("MASK"),
+                    Some(EpicsValue::ULong(mask)),
+                    "{name} MASK, link mask {mask:#x}"
+                );
+                if has_shft {
+                    assert_eq!(
+                        rec.get_field("SHFT"),
+                        Some(EpicsValue::UShort(compute_mask_shift(mask) as u16)),
+                        "{name} SHFT, link mask {mask:#x}"
+                    );
+                }
+            }
+        }
     }
 
     /// C parity: devAsynOctet initCommon passes `plsi->sizv` as the
@@ -9782,7 +11164,7 @@ mod tests {
         }
 
         fn ring_len(&self) -> usize {
-            self.ads.interrupt_fifo.lock().unwrap().entries.len()
+            self.ads.interrupt_fifo.lock().unwrap().waiting()
         }
     }
 
@@ -10206,7 +11588,7 @@ mod tests {
         // Only devAsynOctet's output reads the tag.
         ads.apply_record_info(&info);
         assert!(!ads.initial_readback, "a non-octet-output dset ignores it");
-        ads.octet_output = true;
+        (ads.output, ads.dset) = (true, Dset::Octet);
         ads.apply_record_info(&info);
         assert!(ads.initial_readback, "info tag must enable readback");
 
@@ -10468,7 +11850,7 @@ mod tests {
             "Disconnected maps to COMM_ALARM(9)/INVALID(3)"
         );
         assert_eq!(
-            ads.interrupt_fifo.lock().unwrap().entries.len(),
+            ads.interrupt_fifo.lock().unwrap().waiting(),
             1,
             "the error entry must be consumed, leaving exactly the clean follow-up"
         );
@@ -10803,7 +12185,7 @@ mod tests {
             });
             // Wait for the fire to land, then hand it back for the read.
             let entry = loop {
-                if let Some(e) = ads.interrupt_fifo.lock().unwrap().pop() {
+                if let Some(e) = ads.interrupt_fifo.lock().unwrap().pop().map(|d| d.entry) {
                     break e;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;

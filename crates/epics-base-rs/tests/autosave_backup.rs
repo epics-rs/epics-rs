@@ -7,6 +7,7 @@ fn make_entry(name: &str, val: &str) -> SaveEntry {
         pv_name: name.into(),
         value: val.into(),
         connected: true,
+        array_fprintfs: Vec::new(),
     }
 }
 
@@ -40,8 +41,9 @@ async fn test_corrupt_sav_fallback_to_savb() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
 
-    // Write corrupt .sav (no END marker)
-    epics_base_rs::runtime::fs::write(&sav_path, "PV1 1.0\n")
+    // Write corrupt .sav (no END marker), under a header C <END>-checks
+    // (dbrestore.c:1175).
+    epics_base_rs::runtime::fs::write(&sav_path, "# R1.9\nPV1 1.0\n")
         .await
         .unwrap();
 
@@ -77,10 +79,10 @@ async fn test_seq_file_fallback() {
     let sav_path = dir.path().join("test.sav");
 
     // Write corrupt .sav and .savB
-    epics_base_rs::runtime::fs::write(&sav_path, "PV1 1.0\n")
+    epics_base_rs::runtime::fs::write(&sav_path, "# R1.9\nPV1 1.0\n")
         .await
         .unwrap();
-    epics_base_rs::runtime::fs::write(sav_path.with_extension("savB"), "PV1 1.0\n")
+    epics_base_rs::runtime::fs::write(sav_path.with_extension("savB"), "# R1.9\nPV1 1.0\n")
         .await
         .unwrap();
 
@@ -102,7 +104,7 @@ async fn test_partial_write_corrupt() {
     let path = dir.path().join("partial.sav");
 
     // Simulate partial write (no END)
-    epics_base_rs::runtime::fs::write(&path, "PV1 1.0\nPV2 2.0\n")
+    epics_base_rs::runtime::fs::write(&path, "# R1.9\nPV1 1.0\nPV2 2.0\n")
         .await
         .unwrap();
 

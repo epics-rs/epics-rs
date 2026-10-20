@@ -56,6 +56,16 @@ impl AsynMotor for Posting {
         }
         Ok(())
     }
+    fn move_relative(
+        &mut self,
+        _: &AsynUser,
+        _distance: f64,
+        _: f64,
+        _: f64,
+        _: f64,
+    ) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -68,12 +78,13 @@ impl AsynMotor for Posting {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.polls += 1;
         if self.on_poll {
             self.post(100 + self.polls);
         }
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
@@ -152,6 +163,9 @@ impl AsynMotor for Reentrant {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -164,9 +178,10 @@ impl AsynMotor for Reentrant {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let _ = self.0.read_int32_blocking(own(), 0);
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -221,6 +236,9 @@ impl AsynMotor for Pi {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -246,12 +264,13 @@ impl AsynMotor for Pi {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.polls.fetch_add(1, Ordering::SeqCst);
-        Ok(MotorStatus {
+        *status = MotorStatus {
             done: self.done,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
@@ -387,6 +406,9 @@ impl AsynMotor for Ordered {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -399,8 +421,9 @@ impl AsynMotor for Ordered {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus::default();
+        Ok(())
     }
     fn take_port_sets(&mut self) -> PortSets {
         let mut sets = PortSets::default();

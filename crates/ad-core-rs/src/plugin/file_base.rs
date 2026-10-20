@@ -41,9 +41,44 @@ impl NDFileMode {
     }
 }
 
+/// C `NDFileOpenMode_t` (NDPluginFile.h:10-16): the access bits `openFile`
+/// is called with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NDFileOpenMode(u8);
+
+impl NDFileOpenMode {
+    pub const READ: Self = Self(0x01);
+    pub const WRITE: Self = Self(0x02);
+    pub const APPEND: Self = Self(0x04);
+    pub const MULTIPLE: Self = Self(0x08);
+
+    pub fn contains(self, bits: Self) -> bool {
+        self.0 & bits.0 == bits.0
+    }
+
+    /// The `openFile` refusal of C's write-only formats, which return
+    /// asynError for a read or an append and print nothing.
+    pub fn refuse_read_or_append(self, writer: &str) -> ADResult<()> {
+        if self.contains(Self::READ) || self.contains(Self::APPEND) {
+            return Err(ADError::UnsupportedConversion(format!(
+                "{writer} opens files only to write"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::BitOr for NDFileOpenMode {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 /// Trait for file format writers.
 pub trait NDFileWriter: Send + Sync {
-    fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()>;
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()>;
     /// Write one frame. The frame arrives as its `Arc` (C `NDArray*` with
     /// `reserve()` available) so a writer that materialises the file later
     /// can hold it without copying.
@@ -152,7 +187,7 @@ fn open_file_base<W: NDFileWriter + ?Sized>(
     w: &mut W,
     base: &str,
     path: &Path,
-    mode: NDFileMode,
+    mode: NDFileOpenMode,
     layout: &NDArray,
 ) -> ADResult<()> {
     w.open_file(path, mode, layout).map_err(|e| {
@@ -160,7 +195,12 @@ fn open_file_base<W: NDFileWriter + ?Sized>(
             "Error opening file {}, status={WRITER_ERROR}",
             path.display()
         );
-        base_failure(e.lines(), base, message)
+        let failure = base_failure(e.lines(), base, message);
+        if e.is_aborted() {
+            ADError::Aborted(Box::new(failure))
+        } else {
+            failure
+        }
     })
 }
 
@@ -222,7 +262,7 @@ fn with_open_file<W: NDFileWriter + ?Sized, R>(
     writer: &mut W,
     base: &str,
     path: &Path,
-    mode: NDFileMode,
+    mode: NDFileOpenMode,
     layout: &NDArray,
     body: impl FnOnce(&mut W) -> ADResult<R>,
     close: impl FnOnce(&mut W) -> ADResult<()>,
@@ -257,7 +297,15 @@ pub(crate) fn read_file_base<W: NDFileWriter + ?Sized>(
         let _ = w.close_file();
         Ok(())
     };
-    with_open_file(writer, BASE, path, NDFileMode::Single, layout, read, close)
+    with_open_file(
+        writer,
+        BASE,
+        path,
+        NDFileOpenMode::READ,
+        layout,
+        read,
+        close,
+    )
 }
 
 /// The file I/O half of NDPluginFile's locking. C runs `openFile`,
@@ -298,7 +346,7 @@ type FrameWritten<'a> = dyn FnMut(Duration, Option<&Arc<NDArray>>, Option<&ADErr
 fn write_one_file(
     writer: &mut dyn NDFileWriter,
     num_capture: usize,
-    mode: NDFileMode,
+    mode: NDFileOpenMode,
     path: &Path,
     final_path: Option<&Path>,
     frames: &[Arc<NDArray>],
@@ -662,7 +710,7 @@ impl NDPluginFileBase {
                     write_one_file(
                         w,
                         num_capture,
-                        NDFileMode::Single,
+                        NDFileOpenMode::WRITE,
                         &write_path,
                         final_path.as_deref(),
                         std::slice::from_ref(&array),
@@ -818,7 +866,7 @@ impl NDPluginFileBase {
                 write_one_file(
                     w,
                     num_capture,
-                    NDFileMode::Capture,
+                    NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
                     &write_path,
                     final_path.as_deref(),
                     &frames,
@@ -851,7 +899,7 @@ impl NDPluginFileBase {
                 write_one_file(
                     w,
                     num_capture,
-                    NDFileMode::Single,
+                    NDFileOpenMode::WRITE,
                     &write_path,
                     final_path.as_deref(),
                     std::slice::from_ref(arr),
@@ -903,7 +951,13 @@ impl NDPluginFileBase {
         base.is_open = true;
         let opened = lock.io(|w| {
             w.set_num_capture(num_capture);
-            open_file_base(w, "openFileBase", &write_path, NDFileMode::Stream, array)
+            open_file_base(
+                w,
+                "openFileBase",
+                &write_path,
+                NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                array,
+            )
         });
         if opened.is_err() {
             lock.base().is_open = false;
@@ -1077,7 +1131,12 @@ mod tests {
     }
 
     impl NDFileWriter for MockWriter {
-        fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+        fn open_file(
+            &mut self,
+            path: &Path,
+            _mode: NDFileOpenMode,
+            _array: &NDArray,
+        ) -> ADResult<()> {
             self.opens.push(path.to_path_buf());
             Ok(())
         }
@@ -1305,7 +1364,7 @@ mod tests {
     /// A writer whose open creates the file, so a rename has one to move.
     struct Touch(MockWriter);
     impl NDFileWriter for Touch {
-        fn open_file(&mut self, p: &Path, m: NDFileMode, a: &NDArray) -> ADResult<()> {
+        fn open_file(&mut self, p: &Path, m: NDFileOpenMode, a: &NDArray) -> ADResult<()> {
             std::fs::write(p, b"")?;
             self.0.open_file(p, m, a)
         }

@@ -427,9 +427,8 @@ fn cmd_ioc_log_prefix() -> CommandDef {
     )
 }
 
-/// `iocLogShow <level>` — C `libComRegister.c:242-250`. The lines go through
-/// the command context so a redirect captures them, where C writes straight
-/// to `stdout`.
+/// `iocLogShow <level>` — C `libComRegister.c:242-250`. logClient.c does not
+/// include `epicsStdio.h`, so the lines bypass a redirect.
 fn cmd_ioc_log_show() -> CommandDef {
     CommandDef::new(
         "iocLogShow",
@@ -440,8 +439,9 @@ fn cmd_ioc_log_show() -> CommandDef {
         "Determine if a IOC Log Prefix has been set",
         |args: &[ArgValue], ctx: &CommandContext| {
             let level = int_arg(args.first()).max(0) as u32;
-            for line in crate::runtime::log_client::ioc_log_show(level) {
-                ctx.println(&line);
+            let text = crate::runtime::log_client::ioc_log_show(level);
+            if let Some(text) = text.strip_suffix(b"\n") {
+                ctx.console_println_bytes(text);
             }
             Ok(CommandOutcome::Continue)
         },

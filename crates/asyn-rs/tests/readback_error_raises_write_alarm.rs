@@ -110,7 +110,7 @@ async fn a_failed_readback_on_a_scalar_output_is_write_alarm() {
             b.set_uint32_param(reasons[3], 0, 1, 0x3, 0).unwrap();
             b.set_string_param(reasons[4], 0, "x").unwrap();
             for &r in &reasons {
-                b.set_param_status(r, 0, AsynStatus::Error, 0, 0).unwrap();
+                b.set_param_status(r, 0, AsynStatus::Error).unwrap();
             }
             b.call_param_callbacks(0).unwrap();
         })

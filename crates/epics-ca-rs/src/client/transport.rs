@@ -37,6 +37,7 @@ use tokio::net::TcpStream;
 
 use crate::channel::AccessRights;
 use crate::protocol::*;
+use epics_libcom_rs::cfmt::CFloat;
 
 use super::types::{
     CircuitKey, DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply, ReadReplyMode,
@@ -962,7 +963,7 @@ impl RecvBodyPolicy {
     pub(super) fn refuses(&mut self, peer: SocketAddr, body_len: usize) -> bool {
         let over = self.limit.is_some_and(|limit| body_len > limit);
         if over && !self.oversize_logged {
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
                 "CA: {peer}: response with payload size={body_len} \
                  > EPICS_CA_MAX_ARRAY_BYTES ignored"
             );
@@ -1275,8 +1276,11 @@ fn resolve_connection_timeout() -> Duration {
         // of the "Unable to find a real number in ..." that
         // `envGetDoubleConfigParam` already printed.
         Err(_) => {
-            eprintln!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
-            eprintln!("Defaulting \"EPICS_CA_CONN_TMO\" = {default_secs:.6}");
+            epics_libcom_rs::stderr_println!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
+            epics_libcom_rs::stderr_println!(
+                "Defaulting \"EPICS_CA_CONN_TMO\" = {:.6}",
+                CFloat(default_secs)
+            );
             default_secs
         }
     };
@@ -1305,10 +1309,11 @@ fn resolve_connection_timeout() -> Duration {
     if secs > 0.0 && secs.is_finite() {
         crate::estdlib::duration_from_secs(secs)
     } else {
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "Warning: \"EPICS_CA_CONN_TMO\" = {secs} is not a positive period; \
-             using {default_secs:.6} (a non-positive period fires the connection \
-             watchdog continuously)"
+             using {:.6} (a non-positive period fires the connection \
+             watchdog continuously)",
+            CFloat(default_secs)
         );
         crate::estdlib::duration_from_secs(default_secs)
     }
@@ -1865,7 +1870,7 @@ fn process_command(
                 // that; reaching here means the request slipped past
                 // it, so drop the frame rather than emit a header the
                 // peer cannot parse.
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "CA: {server_addr}: dropping WRITE for sid {sid}: \
                      libca would throw cacChannel::outOfBounds for this \
                      payload against a peer speaking CA minor {peer_minor} \
@@ -1932,7 +1937,7 @@ fn process_command(
             // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
             if count >= 0xFFFF {
                 if hdr.set_payload_size(16, count, peer_minor).is_err() {
-                    eprintln!(
+                    epics_libcom_rs::stderr_println!(
                         "CA: {server_addr}: dropping EVENT_ADD for sid {sid}: \
                          extended header needed but peer speaks CA minor \
                          {peer_minor} (< 9) — ECA_BADCOUNT"
@@ -1978,7 +1983,7 @@ fn process_command(
             if hdr.set_payload_size(0, count, peer_minor).is_err() {
                 // Unreachable: the matching EVENT_ADD could not have
                 // been framed for this peer either.
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "CA: {server_addr}: dropping EVENT_CANCEL for sid {sid}: \
                      extended header needed but peer speaks CA minor \
                      {peer_minor} (< 9) — ECA_BADCOUNT"
@@ -2051,7 +2056,9 @@ fn send_frame(
             .pending_frames
             .load(std::sync::atomic::Ordering::Relaxed);
         if pending >= SEND_BACKPRESSURE_FRAMES {
-            eprintln!("CA: {server_addr}: send buffer stalled ({pending} frames pending), closing");
+            epics_libcom_rs::stderr_println!(
+                "CA: {server_addr}: send buffer stalled ({pending} frames pending), closing"
+            );
             true
         } else {
             conn.pending_frames
@@ -2875,7 +2882,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // malformed case cannot be added that logs the peer and keeps reading
         // from it.
         let close_circuit = |reason: &FrameError| {
-            eprintln!("CA: {server_addr}: {reason}, closing");
+            epics_libcom_rs::stderr_println!("CA: {server_addr}: {reason}, closing");
             let _ = event_tx.send(TransportEvent::TcpClosed {
                 server_addr,
                 priority,
@@ -2938,7 +2945,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             // Defense-in-depth: verify payload is within buffer bounds
             // even though msg_len check above should guarantee this.
             if data_end > accumulated.len() {
-                eprintln!("CA: {server_addr}: payload exceeds buffer bounds, skipping");
+                epics_libcom_rs::stderr_println!(
+                    "CA: {server_addr}: payload exceeds buffer bounds, skipping"
+                );
                 break;
             }
 

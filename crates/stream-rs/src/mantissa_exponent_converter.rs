@@ -5,8 +5,9 @@
 
 use crate::buffer::StreamBuffer;
 use crate::converter::StreamFormatConverter;
-use crate::cstr::{CPtr, c_sscanf_int, fmt_c_e};
+use crate::cstr::{CPtr, c_sscanf_int};
 use crate::format::*;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// `MantissaExponentConverter`, `m`.
 pub struct MantissaExponentConverter;
@@ -50,9 +51,10 @@ impl StreamFormatConverter for MantissaExponentConverter {
         let prec = if fmt.prec < 1 { 6 } else { fmt.prec as i32 };
         let mut buf = StreamBuffer::new();
         buf.append(
-            fmt_c_e(
-                value.abs() / 10f64.powf((prec - 1) as f64),
+            format!(
+                "{:.*e}",
                 (prec - 1) as usize,
+                CFloat(value.abs() / 10f64.powf((prec - 1) as f64))
             )
             .as_bytes(),
         );

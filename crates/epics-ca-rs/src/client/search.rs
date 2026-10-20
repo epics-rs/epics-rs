@@ -43,6 +43,7 @@ use crate::protocol::*;
 
 use super::circuit_breaker::CircuitBreakerRegistry;
 use super::types::{SearchAttempts, SearchReason, SearchRequest, SearchResponse};
+use epics_libcom_rs::cfmt::CFloat;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Snippet of a UDP/TCP search-response datagram, plus the address it
@@ -257,8 +258,11 @@ fn resolve_max_search_period_secs() -> f64 {
         Ok(v) => v,
         // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
         Err(_) => {
-            eprintln!("EPICS \"{name}\" wasn't a real number");
-            eprintln!("Setting \"{name}\" = {default_secs:.6} seconds");
+            epics_libcom_rs::stderr_println!("EPICS \"{name}\" wasn't a real number");
+            epics_libcom_rs::stderr_println!(
+                "Setting \"{name}\" = {:.6} seconds",
+                CFloat(default_secs)
+            );
             return default_secs;
         }
     };
@@ -268,8 +272,11 @@ fn resolve_max_search_period_secs() -> f64 {
     // one deviation here, because a NaN tick would stop the client searching
     // altogether.
     if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
-        eprintln!("\"{name}\" out of range (low)");
-        eprintln!("Setting \"{name}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
+        epics_libcom_rs::stderr_println!("\"{name}\" out of range (low)");
+        epics_libcom_rs::stderr_println!(
+            "Setting \"{name}\" = {:.6} seconds",
+            CFloat(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS)
+        );
         return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
     }
     // C's upper bound is not on the period: `getNTimers` (`udpiiu.cpp:96-111`)
@@ -288,8 +295,8 @@ fn resolve_max_search_period_secs() -> f64 {
     // out-of-range period gets.
     if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
         let capped = max_search_period_upper_limit_secs();
-        eprintln!("\"{name}\" out of range (high)");
-        eprintln!("Setting \"{name}\" = {capped:.6} seconds");
+        epics_libcom_rs::stderr_println!("\"{name}\" out of range (high)");
+        epics_libcom_rs::stderr_println!("Setting \"{name}\" = {:.6} seconds", CFloat(capped));
         return capped;
     }
     v

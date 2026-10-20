@@ -23,7 +23,7 @@ use asyn_rs::port_handle::PortHandle;
 use epics_base_rs::runtime::interrupt_accept::InterruptGate;
 
 use crate::controller_port::{ControllerParams, WriteHook};
-use crate::device_support::{MotorAxis, MotorDeviceSupport};
+use crate::device_support::{AxisSlot, MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::MissingAxis;
 use crate::poll_loop::SharedControllerPoll;
 use crate::trace::{MotorTrace, TraceUser};
@@ -139,9 +139,36 @@ enum PortDriver {
     DrvMotorAsyn,
 }
 
-/// Asyn motor ports by name: their driver and `numAxes`.
-fn ports() -> &'static Mutex<HashMap<String, (PortDriver, i32)>> {
-    static PORTS: OnceLock<Mutex<HashMap<String, (PortDriver, i32)>>> = OnceLock::new();
+/// An asyn motor port: its driver and `numAxes`, and a model-3 port's
+/// `pAxes_`, one slot per address.
+struct Port {
+    driver: PortDriver,
+    num_axes: i32,
+    axes: Vec<Arc<AxisSlot>>,
+}
+
+impl Port {
+    /// Whether the port takes an axis at `user`.
+    fn admit(&self, port: &str, user: &TraceUser) -> Result<(), String> {
+        let (driver, (_, addr)) = (self.driver, split(user));
+        if (driver == PortDriver::DrvMotorAsyn) != matches!(user, TraceUser::Model2 { .. }) {
+            return Err(format!("motor port {port} has a {driver:?} driver"));
+        }
+        if !(0..self.num_axes).contains(&addr) {
+            return Err(format!("motor port {port} has no axis {addr}"));
+        }
+        Ok(())
+    }
+
+    /// The slot at `addr`; `None` off a model-3 port's addresses.
+    fn slot(&self, addr: i32) -> Option<Arc<AxisSlot>> {
+        self.axes.get(usize::try_from(addr).ok()?).cloned()
+    }
+}
+
+/// Asyn motor ports by name.
+fn ports() -> &'static Mutex<HashMap<String, Port>> {
+    static PORTS: OnceLock<Mutex<HashMap<String, Port>>> = OnceLock::new();
     PORTS.get_or_init(Default::default)
 }
 
@@ -150,7 +177,16 @@ fn register_port(port: &str, driver: PortDriver, num_axes: i32) -> Result<(), St
     if ports.contains_key(port) {
         return Err(format!("motor port {port} is already registered"));
     }
-    ports.insert(port.to_owned(), (driver, num_axes));
+    let axes = match driver {
+        PortDriver::Controller => (0..num_axes).map(|_| Arc::default()).collect(),
+        PortDriver::DrvMotorAsyn => Vec::new(),
+    };
+    let entry = Port {
+        driver,
+        num_axes,
+        axes,
+    };
+    ports.insert(port.to_owned(), entry);
     Ok(())
 }
 
@@ -353,39 +389,44 @@ fn split(user: &TraceUser) -> (Controller, i32) {
 
 /// Make `axis` reachable from a record's OUT at its address
 /// ([`MotorAxis::address`]). The create command calls this; a
-/// second axis at the same address is refused, and an asyn axis needs its
-/// port registered with that driver and the address in range.
+/// second axis at the same address replaces the first, as C's constructor
+/// sets `pC->pAxes_[axisNo]` (asynMotorAxis.cpp:46), and an asyn axis needs
+/// its port registered with that driver and the address in range.
 pub fn register_axis(axis: MotorAxis) -> Result<(), String> {
     let (controller, addr) = split(axis.address());
     if let Controller::Port(port) = &controller {
-        let model2 = matches!(axis.address(), TraceUser::Model2 { .. });
         match lock(ports()).get(port) {
             None => return Err(format!("motor port {port} is not registered")),
-            Some(&(driver, n)) => {
-                if (driver == PortDriver::DrvMotorAsyn) != model2 {
-                    return Err(format!("motor port {port} has a {driver:?} driver"));
-                }
-                if !(0..n).contains(&addr) {
-                    return Err(format!("motor port {port} has no axis {addr}"));
-                }
-            }
+            Some(entry) => entry.admit(port, axis.address())?,
         }
     }
-    let mut controllers = lock(controllers());
-    let axes = controllers.entry(controller.clone()).or_default();
-    if axes.contains_key(&addr) {
-        return Err(format!(
-            "axis {addr} of {controller:?} is already registered"
-        ));
-    }
-    axes.insert(addr, (axis, false));
-    drop(controllers);
+    lock(controllers())
+        .entry(controller.clone())
+        .or_default()
+        .insert(addr, (axis, false));
     if let Controller::Port(port) = &controller {
         if let Some(handle) = controller_port_handle(port) {
             init_axis_params(&handle, addr);
         }
     }
     Ok(())
+}
+
+/// The slot `user`'s axis takes on its port, C's `pAxes_[axisNo]`, or `None`
+/// off a model-3 port. A registered port's refusal comes here, before the
+/// axis joins a poller, as C's constructor returns before it sets `pAxes_`
+/// (asynMotorAxis.cpp:35-44); a port not registered yet, a harness's or a
+/// drvMotorAsyn port its axes wait for, is [`register_axis`]'s to check.
+pub(crate) fn claim(user: &TraceUser) -> Result<Option<Arc<AxisSlot>>, String> {
+    let (Controller::Port(port), addr) = split(user) else {
+        return Ok(None);
+    };
+    let ports = lock(ports());
+    let Some(entry) = ports.get(&port) else {
+        return Ok(None);
+    };
+    entry.admit(&port, user)?;
+    Ok(entry.slot(addr))
 }
 
 /// The parameters C's `asynMotorAxis` constructor sets on its axis address
@@ -440,6 +481,12 @@ enum Failure {
     BadLink(&'static str),
     /// `connectDevice`: no such port.
     NoPort(String),
+    /// An asyn port with no motor axes, which `connectDevice` reaches.
+    NotMotor {
+        port: String,
+        addr: i32,
+        user_param: Option<String>,
+    },
     /// `asynPortDriver::getAddress` refuses an address past `numAxes`, so
     /// the first `findDrvInfo` fails (asynPortDriver.cpp:1901-1915, 3569).
     BadAddress {
@@ -483,40 +530,52 @@ enum Taken {
 /// devMotorAsyn's binding: a live port reached at an axis it lacks still
 /// serves the record, with the driver refusing every request.
 fn bind_asyn(out: &str) -> Result<MotorDeviceSupport, Failure> {
-    let (port, addr) = parse_link(out).map_err(Failure::BadLink)?;
-    let Some((driver, num_axes)) = lock(ports()).get(&port).copied() else {
+    let (port, addr, user_param) = parse_link(out).map_err(Failure::BadLink)?;
+    let entry = lock(ports())
+        .get(&port)
+        .map(|p| (p.driver, p.num_axes, p.slot(addr)));
+    let Some((driver, num_axes, slot)) = entry else {
+        if asyn_rs::registry::get_port(&port).is_some() {
+            return Err(Failure::NotMotor {
+                port,
+                addr,
+                user_param,
+            });
+        }
         return Err(Failure::NoPort(port));
     };
     let in_range = (0..num_axes).contains(&addr);
-    let (user, missing) = match driver {
-        PortDriver::Controller if !in_range => {
-            return Err(Failure::BadAddress {
-                port,
+    match (driver, slot) {
+        // An address past numAxes has no slot.
+        (PortDriver::Controller, None) => Err(Failure::BadAddress {
+            port,
+            addr,
+            num_axes,
+        }),
+        // The record reaches whatever axis holds the address when it sends,
+        // none yet included (asynMotorController.cpp:532-537).
+        (PortDriver::Controller, Some(slot)) => {
+            let user = TraceUser::Asyn {
+                port: port.clone(),
                 addr,
-                num_axes,
-            });
+            };
+            take(Controller::Port(port), addr)
+                .or_else(|_| Ok(slot.attach(user, std::time::Duration::ZERO)))
         }
-        PortDriver::Controller => (
-            TraceUser::Asyn {
+        (PortDriver::DrvMotorAsyn, _) => {
+            let user = TraceUser::Model2 {
                 port: port.clone(),
                 addr,
-            },
-            MissingAxis::Controller,
-        ),
-        PortDriver::DrvMotorAsyn => (
-            TraceUser::Model2 {
-                port: port.clone(),
-                addr,
-            },
-            MissingAxis::DrvMotorAsyn { invalid: !in_range },
-        ),
-    };
-    take(Controller::Port(port), addr).or_else(|_| {
-        Ok(MotorDeviceSupport::missing(
-            Arc::new(MotorTrace::with_user(user)),
-            missing,
-        ))
-    })
+            };
+            let missing = MissingAxis::DrvMotorAsyn { invalid: !in_range };
+            take(Controller::Port(port), addr).or_else(|_| {
+                Ok(MotorDeviceSupport::missing(
+                    Arc::new(MotorTrace::with_user(user)),
+                    missing,
+                ))
+            })
+        }
+    }
 }
 
 fn bind_model1(device: &'static str, out: &str) -> Result<MotorDeviceSupport, Failure> {
@@ -562,128 +621,38 @@ fn bind_motor_interface(out: &str) -> Result<MotorDeviceSupport, Failure> {
         .map_err(|_| Failure::NoOpen)
 }
 
-/// `pasynEpicsUtils->parseLink` (asynEpicsUtils.c:56-148): the port and
-/// address, or the `errorMessage` it writes.
-fn parse_link(out: &str) -> Result<(String, i32), &'static str> {
+/// `pasynEpicsUtils->parseLink` (asynEpicsUtils.c:56-148): the port,
+/// address and userParam, or the `errorMessage` it writes.
+fn parse_link(out: &str) -> Result<(String, i32, Option<String>), &'static str> {
     const INVALID: &str = "invalid INST_IO Must be asyn(<port> <addr> <timeout>)userParams";
     match parse_link_v2(out) {
         ParsedLink::Hw(HwLink::VmeIo { signal, parm, .. }) => {
-            let port: String = parm
-                .trim_start()
-                .chars()
-                .take_while(|c| !c.is_ascii_whitespace() && *c != ',')
-                .collect();
-            if port.is_empty() {
+            use epics_base_rs::runtime::stdlib::c_isspace;
+            // C defect not copied: asynEpicsUtils.c:82 copies the name from
+            // the parm's start, so a leading blank makes `@ M1` port ` M`.
+            let parm = parm.trim_start_matches(c_isspace);
+            let len = parm
+                .find(|c| c_isspace(c) || c == ',')
+                .unwrap_or(parm.len());
+            if len == 0 {
                 return Err("parm is null. Must be <port> <addr> ...");
             }
-            Ok((port, i32::from(signal)))
+            let user_param = parm[len..].trim_start_matches(c_isspace);
+            Ok((
+                parm[..len].to_owned(),
+                i32::from(signal),
+                (!user_param.is_empty()).then(|| user_param.to_owned()),
+            ))
         }
-        ParsedLink::Hw(HwLink::InstIo { string }) => parse_inst_io(&string).ok_or(INVALID),
+        // asyn's own scanner, with C's strtol/strtod and their ERANGE.
+        ParsedLink::Hw(HwLink::InstIo { .. }) => asyn_rs::adapter::parse_asyn_link(out)
+            .map(|link| {
+                let user_param = (!link.drv_info.is_empty()).then_some(link.drv_info);
+                (link.port_name, link.addr, user_param)
+            })
+            .map_err(|_| INVALID),
         _ => Err("Link must be INST_IO or VME_IO"),
     }
-}
-
-/// The INST_IO arm: `asyn(<port> <addr> <timeout>)`, separators blanks or
-/// commas, addr and timeout optional.
-fn parse_inst_io(s: &str) -> Option<(String, i32)> {
-    let skip = |p: &str, comma: bool| -> usize {
-        p.find(|c: char| !(c.is_ascii_whitespace() || (comma && c == ',')))
-            .unwrap_or(p.len())
-    };
-    let mut p = &s[s.find("asyn(")? + 5..];
-    p = &p[skip(p, false)..];
-    let len = p
-        .find(|c: char| c.is_ascii_whitespace() || c == ',' || c == ')')
-        .unwrap_or(p.len());
-    if len == p.len() {
-        return None;
-    }
-    let port = p[..len].to_owned();
-    p = &p[len..];
-    p = &p[skip(p, true)..];
-    if p.is_empty() {
-        return None;
-    }
-    if p.starts_with(')') {
-        return Some((port, 0));
-    }
-    let (addr, used) = strtol(p)?;
-    p = &p[used..];
-    p = &p[skip(p, true)..];
-    if p.is_empty() {
-        return None;
-    }
-    if p.starts_with(')') {
-        return Some((port, addr));
-    }
-    p = &p[strtod_len(p)..];
-    p = &p[skip(p, false)..];
-    p.starts_with(')').then_some((port, addr))
-}
-
-/// `strtol(p, &endp, 0)` into an `int`: the value and the bytes consumed,
-/// `None` where C's `errno` is set (out of `long` range). No digits consume
-/// nothing and read 0, as C's does.
-fn strtol(p: &str) -> Option<(i32, usize)> {
-    let b = p.as_bytes();
-    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
-    let neg = matches!(b.get(i), Some(b'-'));
-    if matches!(b.get(i), Some(b'-' | b'+')) {
-        i += 1;
-    }
-    let radix = if b.get(i) == Some(&b'0')
-        && matches!(b.get(i + 1), Some(b'x' | b'X'))
-        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
-    {
-        i += 2;
-        16
-    } else if b.get(i) == Some(&b'0') {
-        8
-    } else {
-        10
-    };
-    let start = i;
-    let mut value: i64 = 0;
-    while let Some(d) = b.get(i).and_then(|c| (*c as char).to_digit(radix)) {
-        value = value
-            .checked_mul(i64::from(radix))?
-            .checked_add(i64::from(d))?;
-        i += 1;
-    }
-    if i == start {
-        return Some((0, 0));
-    }
-    let value = if neg { -value } else { value };
-    Some((value as i32, i))
-}
-
-/// The bytes `strtod` consumes for a decimal floating constant.
-fn strtod_len(p: &str) -> usize {
-    let b = p.as_bytes();
-    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
-    if matches!(b.get(i), Some(b'-' | b'+')) {
-        i += 1;
-    }
-    let mantissa = i;
-    i += b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        i += b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    }
-    if i == mantissa || (i == mantissa + 1 && b[mantissa] == b'.') {
-        return 0;
-    }
-    if matches!(b.get(i), Some(b'e' | b'E')) {
-        let mut j = i + 1;
-        if matches!(b.get(j), Some(b'-' | b'+')) {
-            j += 1;
-        }
-        let digits = b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
-        if digits > 0 {
-            i = j + digits;
-        }
-    }
-    i
 }
 
 /// A motor record whose OUT reached no axis. Its init prints what C's does
@@ -706,6 +675,7 @@ impl DeviceSupport for Unbound {
                 epics_base_rs::runtime::log::errlog_vprintf(format_args!(
                     "devMotorAsyn::init_record {name} bad link {why}\n"
                 ));
+                unqueued_dial_limits(name);
                 return Ok(bad(record));
             }
             Failure::NoPort(port) => {
@@ -719,6 +689,15 @@ impl DeviceSupport for Unbound {
                         "devMotorAsyn::init_record, {name} connectDevice failed to {port}\n"
                     ),
                 );
+                unqueued_dial_limits(name);
+                return Ok(bad(record));
+            }
+            Failure::NotMotor {
+                port,
+                addr,
+                user_param,
+            } => {
+                refuse_foreign_port(name, port, *addr, user_param.as_deref());
                 return Ok(bad(record));
             }
             Failure::BadAddress {
@@ -817,6 +796,25 @@ impl DeviceSupport for Unbound {
     }
 }
 
+/// motorRecord's init_record still sends both dial limits after `bad:`
+/// (motorRecord.cc:717-718); a user that never connected to a port cannot
+/// queue them (devMotorAsyn.c:641-645, asynManager.c:1528-1531).
+fn unqueued_dial_limits(name: &str) {
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::trace::TraceMask;
+    for _ in 0..2 {
+        PortManager::global().trace_manager().print(
+            None,
+            None,
+            0,
+            TraceMask::ERROR,
+            format_args!(
+                "devMotorAsyn::build_trans: {name} error calling queueRequest, asynManager::queueRequest asynUser not associated with a port\n"
+            ),
+        );
+    }
+}
+
 /// asynManager's `autoConnectDevice`: one attempt per device in any 2 s
 /// (asynManager.c:727-737), shared by every record on that address.
 fn auto_connect_due(port: &str, addr: i32) -> bool {
@@ -834,6 +832,94 @@ fn auto_connect_due(port: &str, addr: i32) -> bool {
     last.insert(key, now);
     true
 }
+
+/// devMotorAsyn's init_record on asyn port `port`, which has no motor axes
+/// (devMotorAsyn.c:293-337): its line for the first interface the port
+/// lacks or the first motor drvInfo its drvUserCreate refuses. C's `bad:`
+/// still lets motorRecord queue both dial limits on reason 0 of that port,
+/// or on a NULL interface (motorRecord.cc:717-718); that C defect is not
+/// copied.
+fn refuse_foreign_port(name: &str, port: &str, addr: i32, user_param: Option<&str>) {
+    use asyn_rs::interfaces::InterfaceType;
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::port::DrvUserRequest;
+    use asyn_rs::trace::TraceMask;
+
+    let Some(handle) = asyn_rs::registry::get_port(port).map(|entry| entry.handle) else {
+        return;
+    };
+    let print = |args: std::fmt::Arguments<'_>| {
+        PortManager::global().trace_manager().print(
+            Some(port),
+            Some(addr),
+            0,
+            TraceMask::ERROR,
+            args,
+        )
+    };
+    let lacks = |iface| !handle.has_interface(iface);
+    let creates = |drv_info: &str| {
+        handle
+            .drv_user_create_blocking(&DrvUserRequest::new(drv_info, addr))
+            .is_ok()
+    };
+    for (iface, which) in [
+        (InterfaceType::Int32, "int32"),
+        (InterfaceType::Float64, "float64"),
+    ] {
+        if lacks(iface) {
+            print(format_args!(
+                "devMotorAsyn::init_record, {name} find {which} interface failed\n"
+            ));
+            return;
+        }
+    }
+    // pasynFloat64SyncIO->connect: asynCommon, then the userParam's
+    // drvUserCreate where the port has asynDrvUser (asynFloat64SyncIO.c).
+    if lacks(InterfaceType::Common)
+        || user_param.is_some_and(|p| !lacks(InterfaceType::DrvUser) && !creates(p))
+    {
+        print(format_args!(
+            "devMotorAsyn::init_record, {name} connect Float64SyncIO interface failed\n"
+        ));
+        return;
+    }
+    if lacks(InterfaceType::DrvUser) {
+        print(format_args!(
+            "devMotorAsyn::init_record, {name} find drvUser interface failed\n"
+        ));
+        return;
+    }
+    if let Some(drv_info) = MOTOR_DRV_INFO.iter().find(|drv_info| !creates(drv_info)) {
+        print(format_args!(
+            "devMotorAsyn::findDrvInfo, {name} drvUserCreate failed for {drv_info}\n"
+        ));
+    }
+}
+
+/// The drvInfo strings devMotorAsyn's init_record looks up, in its order
+/// (devMotorAsyn.c:333-351).
+const MOTOR_DRV_INFO: [&str; 19] = [
+    "MOTOR_MOVE_REL",
+    "MOTOR_MOVE_ABS",
+    "MOTOR_MOVE_VEL",
+    "MOTOR_HOME",
+    "MOTOR_STOP_AXIS",
+    "MOTOR_VELOCITY",
+    "MOTOR_VEL_BASE",
+    "MOTOR_ACCEL",
+    "MOTOR_POSITION",
+    "MOTOR_RESOLUTION",
+    "MOTOR_ENCODER_RATIO",
+    "MOTOR_PGAIN",
+    "MOTOR_IGAIN",
+    "MOTOR_DGAIN",
+    "MOTOR_HIGH_LIMIT",
+    "MOTOR_LOW_LIMIT",
+    "MOTOR_CLOSED_LOOP",
+    "MOTOR_STATUS",
+    "MOTOR_UPDATE_STATUS",
+];
 
 /// devMotorAsyn's `bad:` arm: `pmr->pact = 1; return 0`, after which
 /// motorRecord's init_record runs on to its closing `monitor()`, through
@@ -868,19 +954,37 @@ mod tests {
 
     #[test]
     fn inst_io_reads_port_and_addr_as_parse_link_does() {
-        assert_eq!(parse_inst_io("asyn(M1,3)"), Some(("M1".into(), 3)));
-        assert_eq!(parse_inst_io("asyn(M1 3 0.5)x"), Some(("M1".into(), 3)));
-        assert_eq!(parse_inst_io("asyn( M1)"), Some(("M1".into(), 0)));
-        assert_eq!(parse_inst_io("asyn(M1, 0x10)"), Some(("M1".into(), 16)));
-        assert_eq!(parse_inst_io("asyn(M1"), None);
-        assert_eq!(parse_inst_io("asyn(M1,"), None);
-        assert_eq!(parse_inst_io("asyn(M1,1,2"), None);
-        assert_eq!(parse_inst_io("M1,1"), None);
+        let ok = |port: &str, addr| Ok((port.into(), addr, None));
+        let invalid = Err("invalid INST_IO Must be asyn(<port> <addr> <timeout>)userParams");
+        assert_eq!(parse_link("@asyn(M1,3)"), ok("M1", 3));
+        assert_eq!(
+            parse_link("@asyn(M1 3 0.5) x"),
+            Ok(("M1".into(), 3, Some("x".into())))
+        );
+        assert_eq!(parse_link("@asyn( M1)"), ok("M1", 0));
+        assert_eq!(parse_link("@asyn(M1, 0x10)"), ok("M1", 16));
+        assert_eq!(parse_link("@asyn(M1"), invalid);
+        assert_eq!(parse_link("@asyn(M1,"), invalid);
+        assert_eq!(parse_link("@asyn(M1,1,2"), invalid);
+        assert_eq!(parse_link("@M1,1"), invalid);
+        // C strtod reads a hex or spelled timeout, and refuses one out of
+        // range (ERANGE).
+        assert_eq!(parse_link("@asyn(M1 3 0x1p1)"), ok("M1", 3));
+        assert_eq!(parse_link("@asyn(M1 3 inf)"), ok("M1", 3));
+        assert_eq!(parse_link("@asyn(M1 3 1e999)"), invalid);
+        // C strtol takes LONG_MIN; the int it lands in keeps the low bits.
+        assert_eq!(parse_link("@asyn(M1 -9223372036854775808)"), ok("M1", 0));
+        // C isspace separates on a vertical tab.
+        assert_eq!(parse_link("@asyn(M1\x0b3)"), ok("M1", 3));
     }
 
     #[test]
     fn a_vme_io_link_names_the_port_in_parm() {
-        assert_eq!(parse_link("#C0 S2 @M1 x"), Ok(("M1".into(), 2)));
+        let ok = |port: &str, user_param: &str| Ok((port.into(), 2, Some(user_param.into())));
+        assert_eq!(parse_link("#C0 S2 @M1 x"), ok("M1", "x"));
+        assert_eq!(parse_link("#C0 S2 @M1,0"), ok("M1", ",0"));
+        // C isspace ends the port at a vertical tab.
+        assert_eq!(parse_link("#C0 S2 @M1\x0bx"), ok("M1", "x"));
         assert_eq!(
             parse_link("#C0 S2 @"),
             Err("parm is null. Must be <port> <addr> ...")

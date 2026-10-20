@@ -4,6 +4,7 @@
 //! binary's own allocator, as monitored minus unmonitored over the same
 //! ticks, the unmonitored cycle's own cost being outside this change.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 

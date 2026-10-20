@@ -38,7 +38,7 @@ async fn one_pv_set(sav: &std::path::Path, backup: BackupConfig) -> SaveSet {
         request_pvs: vec!["PV1".into()],
         backup,
         macros: Default::default(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     })
     .await

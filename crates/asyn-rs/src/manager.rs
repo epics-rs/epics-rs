@@ -40,7 +40,7 @@ impl PortManager {
     /// the services a port built with `RuntimeConfig::default()` gets, so a
     /// port created from a driver's own configure command and one created by
     /// `drvAsynIPPortConfigure` share the trace file, the masks and the
-    /// exception list. [`crate::adapter::register_asyn_device_support`]
+    /// exception list. `adapter::register_asyn_device_support` (feature `epics`)
     /// registers the asyn iocsh commands on this manager.
     pub fn global() -> Arc<PortManager> {
         static GLOBAL: OnceLock<Arc<PortManager>> = OnceLock::new();

@@ -345,3 +345,106 @@ pub(crate) fn frame(id: i32) -> ad_core_rs::ndarray::NDArray {
     arr.unique_id = id;
     arr
 }
+
+/// Write ReadFile 1 to `processor` with FilePath, FileName and FileTemplate
+/// naming `path`, as the port runs C `writeInt32`'s `readFileBase`.
+pub(crate) fn read_file<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
+    processor: &mut P,
+    path: &std::path::Path,
+) -> (
+    ad_core_rs::plugin::runtime::WriteOutcome<i32>,
+    asyn_rs::port::PortDriverBase,
+) {
+    use ad_core_rs::plugin::runtime::{WritePort, WriteVerdict};
+    let mut base = asyn_rs::port::PortDriverBase::new(
+        "FILEREAD",
+        1,
+        asyn_rs::port::PortFlags::default(),
+        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    );
+    ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
+    processor.register_params(&mut base).unwrap();
+    let dir = format!("{}/", path.parent().unwrap().display());
+    let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+    for (param, value) in [
+        ("FILE_PATH", dir),
+        ("FILE_NAME", name),
+        ("FILE_TEMPLATE", "%s%s".into()),
+    ] {
+        let reason = base.find_param(param).unwrap();
+        processor.validate_octet(
+            reason,
+            0,
+            &value,
+            WriteVerdict::Accept(value.clone()),
+            &base,
+        );
+    }
+    let reason = base.find_param("READ_FILE").unwrap();
+    let out = processor.validate_int32(
+        reason,
+        0,
+        1,
+        WriteVerdict::Accept(1),
+        &mut WritePort::new(&mut base),
+    );
+    (out, base)
+}
+
+/// C readFileBase's line for a writer whose `openFile` refuses
+/// NDFileModeRead (NDPluginFile.cpp:158-166).
+pub(crate) fn read_refused_lines(
+    path: &std::path::Path,
+) -> Vec<(asyn_rs::trace::TraceMask, String)> {
+    vec![(
+        asyn_rs::trace::TraceMask::ERROR,
+        format!(
+            "NDPluginFile::readFileBase Error opening file {}, status=3\n",
+            path.display()
+        ),
+    )]
+}
+
+/// The bits NDPluginFile opens a writer that supports multiple arrays with
+/// in this write mode (NDPluginFile.cpp:245, :281, :335).
+pub(crate) fn opened(
+    mode: ad_core_rs::plugin::file_base::NDFileMode,
+) -> ad_core_rs::plugin::file_base::NDFileOpenMode {
+    use ad_core_rs::plugin::file_base::{NDFileMode, NDFileOpenMode};
+    match mode {
+        NDFileMode::Single => NDFileOpenMode::WRITE,
+        NDFileMode::Capture | NDFileMode::Stream => {
+            NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE
+        }
+    }
+}
+
+/// A dataset read as the NDArray type whose native HDF5 type it stores, or
+/// with `frames`, only that many records of its leading axis.
+pub(crate) fn read_native(
+    ds: &rust_hdf5::H5Dataset,
+    frames: Option<usize>,
+) -> ad_core_rs::ndarray::NDDataBuffer {
+    use ad_core_rs::ndarray::NDDataBuffer;
+    use rust_hdf5::types::H5Type;
+    let shape = ds.shape();
+    let stored = ds.datatype().unwrap();
+    macro_rules! read_as {
+        ($($t:ty => $variant:ident),*) => {
+            $(if stored == <$t>::hdf5_type() {
+                return NDDataBuffer::$variant(match frames {
+                    Some(n) => {
+                        let mut counts = shape.clone();
+                        counts[0] = n;
+                        ds.read_slice::<$t>(&vec![0; shape.len()], &counts).unwrap()
+                    }
+                    None => ds.read_raw::<$t>().unwrap(),
+                });
+            })*
+        };
+    }
+    read_as!(i8 => I8, u8 => U8, i16 => I16, u16 => U16, i32 => I32, u32 => U32,
+        i64 => I64, u64 => U64, f32 => F32, f64 => F64);
+    panic!("no NDArray type is stored as {stored:?}")
+}

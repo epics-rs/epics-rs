@@ -36,7 +36,7 @@
 //! (`record_link_fields` → `setup_cp_links`, `setup_external_link_opens`,
 //! `dbcaxr`) already route through.
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::types::EpicsValue;
@@ -64,10 +64,11 @@ impl SpyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for SpyLset {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         self.asked.lock().push(format!(
             "{}:get:{}",
             self.scheme,
@@ -75,7 +76,8 @@ impl LinkSet for SpyLset {
         ));
         Some(EpicsValue::Long(3))
     }
-    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         self.asked.lock().push(format!(
             "{}:read:{}",
             self.scheme,
@@ -85,9 +87,10 @@ impl LinkSet for SpyLset {
     }
     async fn connect_link(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         _: Option<epics_base_rs::server::database::CaLinkInit>,
     ) {
+        let name = link.name;
         self.asked.lock().push(format!(
             "{}:open:{}",
             self.scheme,

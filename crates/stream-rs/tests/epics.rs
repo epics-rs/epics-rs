@@ -234,7 +234,7 @@ static RUN: Mutex<()> = Mutex::new(());
 /// quotes; an array as run-epics.sh keeps it, "[NORD] a b".
 fn dbgf(v: Option<EpicsValue>) -> String {
     use EpicsValue as V;
-    let g = |v: f64, p| epics_base_rs::calc::cvt::fmt_g(v, p, false, false);
+    let g = |v: f64, p: usize| format!("{:.p$}", epics_libcom_rs::cfmt::CFloat(v).g());
     // dbTest.c printBuffer, each element
     let elements: Vec<String> = match v {
         Some(V::Long(v)) => return format!("{v} = {v:#x}"),

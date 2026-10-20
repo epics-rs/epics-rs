@@ -28,7 +28,7 @@ fn manual_set(name: &str, save_path: std::path::PathBuf, req: std::path::PathBuf
         request_pvs: Vec::new(),
         backup: no_backup(),
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }

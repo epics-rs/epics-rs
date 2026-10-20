@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, RecordFields};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure, RecordFields};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -34,8 +34,21 @@ struct Card {
     calls: Arc<Mutex<Vec<Call>>>,
 }
 
+/// `motor_init` reads the card with the status function the task queries.
+impl Model1Motor for Card {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        self.poll(&AsynUser::default(), &mut status)
+            .expect("the card answers");
+        status
+    }
+}
+
 impl AsynMotor for Card {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
     fn home(&mut self, _: &AsynUser, _: f64, velocity: f64, _: f64, _: bool) -> AsynResult<()> {
@@ -56,11 +69,12 @@ impl AsynMotor for Card {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus {
             done: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -70,7 +84,7 @@ async fn boot(card: i32) -> (Arc<PvDatabase>, Arc<Mutex<Vec<Call>>>) {
     let calls = motor.calls.clone();
     let AxisSetup {
         axis, poll_loop, ..
-    } = MotorBuilder::new(Arc::new(Mutex::new(motor)))
+    } = MotorBuilder::model1(Arc::new(Mutex::new(motor)))
         .trace_user(TraceUser::Model1 {
             device: MODEL1.choice,
             card,

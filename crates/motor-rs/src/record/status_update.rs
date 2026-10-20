@@ -1,4 +1,5 @@
 use super::*;
+use epics_libcom_rs::cfmt::CFloat;
 
 impl MotorRecord {
     /// C `update_values`'s line (devMotorAsyn.c:445-447), which every
@@ -151,35 +152,16 @@ impl MotorRecord {
         self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position + 0.5).floor());
         self.pos.rep =
             epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position + 0.5).floor());
-        let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
 
-        // RRBV depends on UEIP
-        self.pos.rrbv = if self.conv.ueip {
-            self.pos.rep
-        } else {
-            self.pos.rmp
-        };
-
-        // URIP path: use external readback link value with RRES conversion.
-        // C 3682: skipped on the init call (`initcall == false` required).
-        if !self.conv.ueip && self.conv.urip && !initcall {
-            if let Some(rdbl_value) = self.conv.rdbl_value {
-                let rres = if self.conv.rres != 0.0 {
-                    self.conv.rres
-                } else {
-                    1.0
-                };
-                self.pos.rrbv = coordinate::to_long(((rdbl_value * rres) / self.conv.mres).round());
-            }
+        // C 3682: the RDBL read is skipped on the init call. A failed one
+        // (3687-3697) flags the stop ahead of process()'s external-move
+        // marking; the stop is consumed where the pass reaches do_work
+        // (check_completion).
+        if !self.derive_readback(self.conv.urip && !initcall) && !self.stat.mip.is_empty() {
+            self.clear_buttons();
+            self.ctrl.stop = 1;
+            self.mark(m::STOP);
         }
-
-        // DRBV: use ERES for encoder path (UEIP), MRES for motor position path
-        let resolution = if self.conv.ueip && eres_valid {
-            self.conv.eres
-        } else {
-            self.conv.mres
-        };
-        self.pos.drbv = coordinate::raw_to_dial(self.pos.rrbv, resolution);
 
         // RBV from DRBV
         self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
@@ -308,6 +290,41 @@ impl MotorRecord {
 
     /// Sync all positions from readback.
     pub fn sync_positions(&mut self) {
+        self.sync_targets();
+        self.pos.diff = 0.0;
+        self.pos.rdif = 0;
+    }
+
+    /// C's readback chain (process_motor_info 3676-3705, syncTargetPosition
+    /// 4422-4446): REP at ERES under UEIP, the RDBL read at RRES/MRES under
+    /// `urip`, else RMP at MRES. False when the RDBL read failed, which
+    /// leaves RRBV and DRBV as they were.
+    pub(crate) fn derive_readback(&mut self, urip: bool) -> bool {
+        let urip = urip && !self.conv.ueip;
+        if urip && self.conv.rdbl_error {
+            return false;
+        }
+        self.pos.rrbv = if self.conv.ueip {
+            self.pos.rep
+        } else {
+            self.pos.rmp
+        };
+        if let Some(rdbl_value) = self.conv.rdbl_value.filter(|_| urip) {
+            self.pos.rrbv =
+                coordinate::to_long(((rdbl_value * self.conv.rres) / self.conv.mres).round());
+        }
+        let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
+        let resolution = if self.conv.ueip && eres_valid {
+            self.conv.eres
+        } else {
+            self.conv.mres
+        };
+        self.pos.drbv = coordinate::raw_to_dial(self.pos.rrbv, resolution);
+        true
+    }
+
+    /// The drive values and their lasts take the readback (C 4452-4457).
+    pub(crate) fn sync_targets(&mut self) {
         self.pos.dval = self.pos.drbv;
         self.pos.val = self.pos.rbv;
         // C 712/843/4455: the synced RVAL is the raw MOTOR command
@@ -315,8 +332,6 @@ impl MotorRecord {
         // which is encoder counts under UEIP=Yes (or the RDBL scaling
         // under URIP) and differs whenever ERES != MRES.
         self.pos.rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
-        self.pos.diff = 0.0;
-        self.pos.rdif = 0;
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
         self.internal.lrvl = self.pos.rval;
@@ -446,10 +461,12 @@ impl MotorRecord {
                 asyn_rs::trace::TraceMask::FLOW,
                 self.trace().status_reason(),
                 format_args!(
-                    "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={autosaved_dval:.6}, rdbd={rdbd:.6}",
+                    "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={:.6}, rdbd={:.6}",
                     self.trace().record(),
-                    status.position,
-                    self.conv.mres,
+                    CFloat(status.position),
+                    CFloat(self.conv.mres),
+                    CFloat(autosaved_dval),
+                    CFloat(rdbd),
                 ),
             );
             if self.links.omsl == 1 {

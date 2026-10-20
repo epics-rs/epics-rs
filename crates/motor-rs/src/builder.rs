@@ -1,15 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::interfaces::motor::{AsynMotor, PortSets};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, PortSets};
 use epics_base_rs::server::record::Record;
 use tokio::sync::mpsc;
 
-use crate::device_state::AxisSubscribers;
-use crate::device_support::{MotorAxis, MotorDeviceSupport};
+use crate::device_support::{AxisSlot, MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::{
-    Axis, FirstPollPending, Join, Joining, MotorPollLoop, PollCommand, PollerInbox,
-    SharedControllerPoll,
+    Axis, FirstPollPending, Join, Joining, MotorPollLoop, Place, PollCommand, SharedControllerPoll,
 };
 use crate::record::MotorRecord;
 use crate::trace::TraceUser;
@@ -33,9 +31,17 @@ pub struct AxisSetup {
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_POLL_CHANNEL_CAPACITY: usize = 16;
 
+/// The driver a [`MotorBuilder`] builds its axis on.
+enum Driver {
+    /// A model-3 or model-2 axis, which its controller's poller polls.
+    Polled(Arc<Mutex<dyn AsynMotor>>),
+    /// A model-1 axis, which its driver's motor task queries.
+    Model1(Arc<Mutex<dyn Model1Motor>>),
+}
+
 /// Builder for constructing a complete motor record + device support + poll loop.
 pub struct MotorBuilder {
-    motor: Arc<Mutex<dyn AsynMotor>>,
+    motor: Driver,
     user: TraceUser,
     timeout: Duration,
     moving_poll_interval: Duration,
@@ -46,7 +52,17 @@ pub struct MotorBuilder {
 }
 
 impl MotorBuilder {
+    /// A model-3 or model-2 axis.
     pub fn new(motor: Arc<Mutex<dyn AsynMotor>>) -> Self {
+        Self::on(Driver::Polled(motor))
+    }
+
+    /// A model-1 axis; its [`Self::trace_user`] is a [`TraceUser::Model1`].
+    pub fn model1(motor: Arc<Mutex<dyn Model1Motor>>) -> Self {
+        Self::on(Driver::Model1(motor))
+    }
+
+    fn on(motor: Driver) -> Self {
         Self {
             motor,
             user: TraceUser::Asyn {
@@ -110,40 +126,42 @@ impl MotorBuilder {
     /// driver of one axis, any other a controller of one.
     pub fn build_axis(mut self) -> AxisSetup {
         self.configure_record = None;
-        let model1 = matches!(self.user, TraceUser::Model1 { .. });
-        if !model1 {
-            let mut controller = ControllerBuilder::new();
-            // A controller of one axis is its port's poller.
-            if let TraceUser::Asyn { port, .. } = &self.user {
-                controller = controller.port(port);
+        let model1_user = matches!(self.user, TraceUser::Model1 { .. });
+        let motor = match self.motor {
+            Driver::Polled(motor) => {
+                assert!(
+                    !model1_user,
+                    "a model-1 axis is built with MotorBuilder::model1"
+                );
+                motor
             }
-            let ControllerAxis { axis, poll_cmd_tx } = controller.axis_with(
-                self.motor,
-                self.user,
-                self.timeout,
-                self.poll_channel_capacity,
-            );
-            return AxisSetup {
-                axis,
-                poll_loop: controller.build(
-                    self.moving_poll_interval,
-                    self.idle_poll_interval,
-                    self.forced_fast_polls,
-                ),
-                poll_cmd_tx,
-            };
+            Driver::Model1(motor) => {
+                assert!(model1_user, "a model-1 axis has a TraceUser::Model1");
+                // A model-1 driver's task scans at its moving period alone.
+                let mut task = MotorTaskBuilder::new(self.moving_poll_interval);
+                let ControllerAxis { axis, poll_cmd_tx } =
+                    task.axis_with(motor, self.user, self.timeout, self.poll_channel_capacity);
+                return AxisSetup {
+                    axis,
+                    poll_loop: task.build(),
+                    poll_cmd_tx,
+                };
+            }
+        };
+        let mut controller = ControllerBuilder::new();
+        // A controller of one axis is its port's poller.
+        if let TraceUser::Asyn { port, .. } = &self.user {
+            controller = controller.port(port);
         }
-        // A model-1 driver's task scans at its moving period alone.
-        let mut task = MotorTaskBuilder::new(self.moving_poll_interval);
-        let ControllerAxis { axis, poll_cmd_tx } = task.axis_with(
-            self.motor,
-            self.user,
-            self.timeout,
-            self.poll_channel_capacity,
-        );
+        let ControllerAxis { axis, poll_cmd_tx } =
+            controller.axis_with(motor, self.user, self.timeout, self.poll_channel_capacity);
         AxisSetup {
             axis,
-            poll_loop: task.build(),
+            poll_loop: controller.build(
+                self.moving_poll_interval,
+                self.idle_poll_interval,
+                self.forced_fast_polls,
+            ),
             poll_cmd_tx,
         }
     }
@@ -177,43 +195,35 @@ impl MotorBuilder {
     }
 }
 
-/// An axis's record half, its poller's inbox and subscribers, and the
-/// sender of its poll commands.
+/// An axis's record half and the place its poller takes; the axis of
+/// `poll`'s controller at `slot` from now on, `None` while another
+/// controller's axis holds it.
 fn axis_parts(
     motor: &Arc<Mutex<dyn AsynMotor>>,
     user: TraceUser,
     timeout: Duration,
     capacity: usize,
-) -> (
-    MotorAxis,
-    PollerInbox,
-    AxisSubscribers,
-    mpsc::Sender<PollCommand>,
-) {
-    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(capacity);
-    let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
-    let subscribers = AxisSubscribers::new();
+    slot: Arc<AxisSlot>,
+    poll: &SharedControllerPoll,
+) -> Option<(MotorAxis, Place)> {
     let disables_ntm = motor.lock().is_ok_and(|m| m.disables_ntm());
-    let axis = MotorAxis::new(
-        user,
-        motor.clone(),
-        timeout,
-        poll_cmd_tx.clone(),
-        motor_cmd_tx,
-        subscribers.clone(),
-    )
-    .disabling_ntm(disables_ntm);
-    let inbox = PollerInbox {
-        poll: poll_cmd_rx,
-        commands: motor_cmd_rx,
-    };
-    (axis, inbox, subscribers, poll_cmd_tx)
+    let (axis, place) = MotorAxis::placed(user, motor.clone(), timeout, slot, poll, capacity)?;
+    Some((axis.disabling_ntm(disables_ntm), place))
 }
 
 /// An axis of a [`ControllerBuilder`], for a create command to register.
 pub struct ControllerAxis {
     pub axis: MotorAxis,
     pub poll_cmd_tx: mpsc::Sender<PollCommand>,
+}
+
+impl ControllerAxis {
+    fn of(axis: MotorAxis) -> Self {
+        Self {
+            poll_cmd_tx: axis.poll_cmd_tx().clone(),
+            axis,
+        }
+    }
 }
 
 /// The axes of one asynMotorController and the one poller that polls them
@@ -241,9 +251,9 @@ struct Axes {
 struct Opened {
     motor: Arc<Mutex<dyn AsynMotor>>,
     axis: MotorAxis,
-    poll_cmd_tx: mpsc::Sender<PollCommand>,
-    /// The controller port address the status is mirrored to.
-    mirror: Option<(String, i32)>,
+    /// The controller port address the status is mirrored to, and the axis
+    /// there, which a later add at the address returns.
+    mirror: Option<((String, i32), MotorAxis)>,
 }
 
 enum AxisList {
@@ -294,6 +304,20 @@ impl ControllerAxes {
     pub fn start_move_to_home_thread(&self) -> std::io::Result<()> {
         let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
         axes.poll.start_move_to_home_thread()
+    }
+
+    /// C `setMovingPollPeriod` / `setIdlePollPeriod` for a poller no port
+    /// names, a driver's own thread (pmacAsynCoord.c:981-1031): the periods
+    /// given replace the running poller's, then it runs a pass.
+    pub fn set_poll_periods(&self, moving: Option<Duration>, idle: Option<Duration>) {
+        let axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(period) = moving {
+            axes.poll.set_moving_period(period);
+        }
+        if let Some(period) = idle {
+            axes.poll.set_idle_period(period);
+        }
+        axes.poll.wakeup();
     }
 
     /// Add an axis; on a running poller, return once the poller has taken
@@ -388,42 +412,57 @@ impl ControllerAxes {
         timeout: Duration,
         capacity: usize,
     ) -> Result<Queued, String> {
+        let slot = crate::devices::claim(&user)?;
         let mirror = match &user {
             TraceUser::Asyn { port, addr } => Some((port.clone(), *addr)),
             _ => None,
         };
+        let address = mirror.clone();
+        let held = || match &address {
+            Some((port, addr)) => {
+                format!("motor port {port} address {addr} is another controller's")
+            }
+            None => "the address is another controller's".to_owned(),
+        };
+        // A drvMotorAsyn port's callback posts the axis.
+        let callback = matches!(user, TraceUser::Model2 { .. });
         let same = |o: &Opened| std::ptr::addr_eq(Arc::as_ptr(&o.motor), Arc::as_ptr(&motor));
         let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((port, _)) = &mirror {
-            axes.poll.set_port(port);
-        }
         // Recorded before the poller confirms, so a concurrent add of the
         // same motor finds it.
         let (mut join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
-            let added = ControllerAxis {
-                axis: opened.axis.at(user),
-                poll_cmd_tx: opened.poll_cmd_tx.clone(),
-            };
             match (mirror, &opened.mirror) {
+                (None, _) if callback => (
+                    Join::Callback {
+                        motor: motor.clone(),
+                    },
+                    ControllerAxis::of(opened.axis.at(user)),
+                ),
                 (None, _) => {
                     return Ok(Queued {
-                        added,
+                        added: ControllerAxis::of(opened.axis.at(user)),
                         joined: None,
                     });
                 }
-                (Some(to), Some(had)) if &to == had => {
+                (Some(to), Some((had, at))) if &to == had => {
                     return Ok(Queued {
-                        added,
+                        added: ControllerAxis::of(at.at(user)),
                         joined: None,
                     });
                 }
-                (Some((port, addr)), Some((had_port, had_addr))) => {
+                (Some((port, addr)), Some(((had_port, had_addr), _))) => {
                     return Err(format!(
                         "the axis is at port {had_port} address {had_addr}, not {port} {addr}"
                     ));
                 }
                 (Some((port, addr)), None) => {
-                    opened.mirror = Some((port.clone(), addr));
+                    // The address's queue and records, which the axis there
+                    // before leaves to this one.
+                    let (at, place) = opened
+                        .axis
+                        .placed_too(user, slot.unwrap_or_default(), capacity)
+                        .ok_or_else(held)?;
+                    opened.mirror = Some(((port.clone(), addr), at.clone()));
                     let motor = motor.clone();
                     let poll = axes.poll.clone();
                     (
@@ -432,30 +471,42 @@ impl ControllerAxes {
                             port,
                             addr,
                             poll,
+                            place,
                         },
-                        added,
+                        ControllerAxis::of(at),
                     )
                 }
             }
         } else {
-            let (axis, inbox, subscribers, poll_cmd_tx) =
-                axis_parts(&motor, user, timeout, capacity);
+            let slot = slot.unwrap_or_default();
+            let (axis, place) =
+                axis_parts(&motor, user, timeout, capacity, slot, &axes.poll).ok_or_else(held)?;
             let axis = axis.with_controller_poll(axes.poll.clone());
             axes.opened.push(Opened {
                 motor: motor.clone(),
-                axis: axis.at(axis.address().clone()),
-                poll_cmd_tx: poll_cmd_tx.clone(),
-                mirror: mirror.clone(),
+                axis: axis.clone(),
+                mirror: mirror.clone().map(|address| (address, axis.clone())),
             });
-            let mut polled = Axis::polled(inbox, motor.clone(), subscribers, axis.params().clone());
+            let mut polled = Axis::polled(place, motor.clone(), axis.params().clone());
             if let Some((port, addr)) = mirror {
+                polled.construct_asyn_motor_axis();
                 polled.mirror_to(&port, addr, axes.poll.clone());
             }
-            (
-                Join::Axis(Box::new(polled)),
-                ControllerAxis { axis, poll_cmd_tx },
-            )
+            if callback {
+                polled.post_by_callback();
+            }
+            (Join::Axis(Box::new(polled)), ControllerAxis::of(axis))
         };
+        // Named only once the address is placed: a refused add sets nothing.
+        if let Some((port, _)) = &address {
+            axes.poll.set_port(port);
+        }
+        // The axis this one replaces at the address leaves the poller too
+        // (`Join::place`).
+        if address.is_some() {
+            axes.opened
+                .retain(|o| same(o) || o.mirror.as_ref().map(|(at, _)| at) != address.as_ref());
+        }
         let poll = axes.poll.clone();
         let joined = match &mut axes.list {
             AxisList::Pending(axes) => {
@@ -599,23 +650,26 @@ impl MotorTaskBuilder {
 
     /// The next axis, queried after those added before it. `user` is its
     /// [`TraceUser::Model1`] card and signal.
-    pub fn axis(&mut self, motor: Arc<Mutex<dyn AsynMotor>>, user: TraceUser) -> ControllerAxis {
+    pub fn axis(&mut self, motor: Arc<Mutex<dyn Model1Motor>>, user: TraceUser) -> ControllerAxis {
         self.axis_with(motor, user, DEFAULT_TIMEOUT, DEFAULT_POLL_CHANNEL_CAPACITY)
     }
 
     fn axis_with(
         &mut self,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Arc<Mutex<dyn Model1Motor>>,
         user: TraceUser,
         timeout: Duration,
         capacity: usize,
     ) -> ControllerAxis {
-        let (axis, inbox, subscribers, poll_cmd_tx) = axis_parts(&motor, user, timeout, capacity);
-        self.axes.push(Axis::task(inbox, motor, subscribers));
-        ControllerAxis { axis, poll_cmd_tx }
+        let polled: Arc<Mutex<dyn AsynMotor>> = motor.clone();
+        let poll = SharedControllerPoll::default();
+        let (axis, place) = axis_parts(&polled, user, timeout, capacity, Arc::default(), &poll)
+            .expect("a new slot is no controller's");
+        self.axes.push(Axis::task(place, motor));
+        ControllerAxis::of(axis)
     }
 
-    /// The task, after its startup pass over the axes.
+    /// The task over the axes.
     pub fn build(self) -> MotorPollLoop {
         MotorPollLoop::motor_task(self.axes, self.scan)
     }
@@ -646,8 +700,24 @@ mod tests {
         delay: Duration,
     }
 
+    impl Model1Motor for Card {
+        fn take_init_status(&mut self) -> MotorStatus {
+            MotorStatus::default()
+        }
+    }
+
     impl AsynMotor for Card {
         fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_relative(
             &mut self,
             _: &AsynUser,
             _: f64,
@@ -669,15 +739,16 @@ mod tests {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             let polled = (self.name, std::thread::current().id(), Instant::now());
             self.log.lock().unwrap().push(polled);
             std::thread::sleep(self.delay);
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: false,
                 moving: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
     }
 
@@ -743,20 +814,23 @@ mod tests {
             .collect();
         let task = task.build();
         log.lock().unwrap().clear();
+        // Both moves are queued before the task's first wake drains them. A
+        // move landing after it is queried a wake later, in C too
+        // (motordrvCom.cc:241-263).
+        for ControllerAxis { axis, .. } in &axes {
+            axis.send(MotorCommand::MoveAbsolute {
+                position: 1.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            });
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         rt.block_on(async {
             let running = tokio::spawn(task.start());
-            for ControllerAxis { axis, .. } in &axes {
-                axis.send(MotorCommand::MoveAbsolute {
-                    position: 1.0,
-                    min_velocity: 0.0,
-                    velocity: 1.0,
-                    acceleration: 1.0,
-                });
-            }
             tokio::time::sleep(SLOW * 6).await;
             axes[0]
                 .poll_cmd_tx
@@ -795,6 +869,16 @@ mod tests {
         ) -> AsynResult<()> {
             Ok(())
         }
+        fn move_relative(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
         fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
             Ok(())
         }
@@ -807,9 +891,10 @@ mod tests {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             self.1.lock().unwrap().push(self.0);
-            Ok(MotorStatus::default())
+            *status = MotorStatus::default();
+            Ok(())
         }
     }
 
@@ -900,6 +985,55 @@ mod tests {
             polled
         });
         assert_eq!(polled, ["A"], "the second address reaches the one axis");
+    }
+
+    /// pmacAsynCoord.c:981-1031: a period set on the running poller wakes
+    /// it, and the waits after that pass are the new period's.
+    #[test]
+    fn periods_set_on_a_running_poller_are_the_next_waits() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = ControllerBuilder::new();
+        let ControllerAxis { poll_cmd_tx, .. } = controller.axis(
+            Arc::new(Mutex::new(Named("A", log.clone()))),
+            TraceUser::Asyn {
+                port: String::new(),
+                addr: 0,
+            },
+        );
+        let axes = controller.axes();
+        let hour = Duration::from_secs(3600);
+        let poller = controller.build(hour, hour, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let passes = |n: usize| {
+            let log = log.clone();
+            async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while log.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                log.lock().unwrap().len()
+            }
+        };
+        let ms = Duration::from_millis(10);
+        let (moving, idle) = rt.block_on(async {
+            let running = tokio::spawn(poller.start());
+            assert_eq!(passes(1).await, 1, "the startup pass");
+            // The woken pass, then its one forced fast poll.
+            axes.set_poll_periods(Some(ms), None);
+            let moving = passes(3).await;
+            tokio::time::sleep(10 * ms).await;
+            let moving = moving.max(log.lock().unwrap().len());
+            axes.set_poll_periods(None, Some(ms));
+            let idle = passes(moving + 4).await - moving;
+            poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+            running.await.unwrap();
+            (moving, idle)
+        });
+        assert_eq!(moving, 3);
+        assert_eq!(idle, 4);
     }
 
     /// An add the poller never took fails, and a later add of the same motor

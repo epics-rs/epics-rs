@@ -76,7 +76,7 @@ async fn an_unopenable_destination_is_named_as_c() {
                 request_pvs: vec!["TEMP".into()],
                 backup: BackupConfig { enable_savb: true },
                 macros: HashMap::new(),
-                macro_string: String::new(),
+                macro_string: None,
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,

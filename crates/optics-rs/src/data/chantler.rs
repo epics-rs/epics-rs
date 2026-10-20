@@ -1222,6 +1222,11 @@ fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
 ///
 /// Returns `None` if `energy_kev` is outside the tabulated range.
 pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
+    interpolate(mat, energy_kev).map(|(_, _, mu)| mu)
+}
+
+/// [`interpolate_mu`] with the `j` and `frac` it ran on.
+fn interpolate(mat: &FilterMaterial, energy_kev: f64) -> Option<(usize, f64, f64)> {
     let kev = mat.kev;
     let mu = mat.mu;
     let j = first_energy_above(kev, energy_kev);
@@ -1232,7 +1237,40 @@ pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
     // Both table differences are `float - float` in C, rounded to float
     // before they meet a double.
     let frac = (energy_kev - kev[j - 1] as f64) / (kev[j] - kev[j - 1]) as f64;
-    Some(mu[j - 1] as f64 + frac * (mu[j] - mu[j - 1]) as f64)
+    Some((
+        j,
+        frac,
+        mu[j - 1] as f64 + frac * (mu[j] - mu[j - 1]) as f64,
+    ))
+}
+
+/// C `calcTrans`'s values (`filterDrive.st:286-301`), which its debug lines
+/// print.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attenuation {
+    /// The first node above the energy: the interpolation runs on `[j-1, j]`.
+    pub j: usize,
+    pub frac: f64,
+    pub mu: f64,
+    pub abs_len_um: f64,
+    pub transmission: f64,
+}
+
+/// [`transmission`] with the values C's `calcTrans` computes on the way.
+pub fn attenuation(
+    mat: &FilterMaterial,
+    energy_kev: f64,
+    thickness_um: f64,
+) -> Option<Attenuation> {
+    let (j, frac, mu) = interpolate(mat, energy_kev)?;
+    let abs_len_um = 1.0 / (mat.density * mu) * 1.0e4;
+    Some(Attenuation {
+        j,
+        frac,
+        mu,
+        abs_len_um,
+        transmission: (-(thickness_um / abs_len_um)).exp(),
+    })
 }
 
 /// Compute the X-ray transmission through `thickness_um` microns of a filter,
@@ -1241,9 +1279,7 @@ pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
 /// C `calcTrans` (`filterDrive.st:296-300`) goes through the absorption length
 /// in microns, and the result keeps that rounding order.
 pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_um: f64) -> Option<f64> {
-    let mu = interpolate_mu(mat, energy_kev)?;
-    let abs_len = 1.0 / (mat.density * mu) * 1.0e4;
-    Some((-(thickness_um / abs_len)).exp())
+    attenuation(mat, energy_kev, thickness_um).map(|a| a.transmission)
 }
 
 /// Absorption length in microns, for pf4's `OtherAbsorptionLength`.

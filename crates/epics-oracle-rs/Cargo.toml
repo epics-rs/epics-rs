@@ -14,6 +14,7 @@ publish = false
 named-port = { path = "../named-port" }
 epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 # The Rust side of the PVA differential pair (`oracle-ioc --pva`), measured
 # against pvxs QSRV2's softIocPVX.
 epics-pva-rs = { workspace = true }

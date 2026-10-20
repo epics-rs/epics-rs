@@ -33,13 +33,12 @@
 //!
 //! # Output routing
 //!
-//! `heapSpace` and `setlogmask` print through [`CommandContext`], so a `>`
-//! redirect in the shell captures them. C's callbacks use `printf`, which
-//! writes to the process's stdout and is *not* what `epicsGetThreadStdout`
-//! redirects — so this port's output is redirectable where base's is not.
-//! `netstat` and `rt` are not: their text is written by C code inside libbsd
-//! and the RTEMS shell, straight to descriptor 1, on both this port and base.
+//! rtems_init.c does not include `epicsStdio.h`, so `heapSpace` and
+//! `setlogmask` print on the console and a `>` redirect does not take them.
+//! `netstat` and `rt` text is written by C code inside libbsd and the RTEMS
+//! shell, straight to descriptor 1, on both this port and base.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rtems_boot::shell::{self, ShellError};
 use epics_rtems_boot::stats::{self, HeapSpace};
 
@@ -109,7 +108,7 @@ fn cmd_heap_space() -> CommandDef {
             let Some(heap) = stats::heap_space() else {
                 return Err("heapSpace: no malloc statistics on this build".to_string());
             };
-            ctx.print_fmt(format_args!("{}", heap_space_line(heap)));
+            ctx.console_println(&heap_space_line(heap));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -129,9 +128,9 @@ fn heap_space_line(heap: HeapSpace) -> String {
     let free = heap.free() as f64;
     // C's threshold and its two units. `%.1f` in both arms.
     if free >= (1024 * 1024) as f64 {
-        format!("Heap space: {:.1} MB", free / (1024.0 * 1024.0))
+        format!("Heap space: {:.1} MB", CFloat(free / (1024.0 * 1024.0)))
     } else {
-        format!("Heap space: {:.1} kB", free / 1024.0)
+        format!("Heap space: {:.1} kB", CFloat(free / 1024.0))
     }
 }
 
@@ -238,16 +237,16 @@ fn cmd_setlogmask() -> CommandDef {
         "Set syslog() threshold level",
         |args: &[ArgValue], ctx: &CommandContext| {
             let Some(ArgValue::String(name)) = args.first() else {
-                ctx.print_fmt(format_args!(
-                    "{}",
-                    setlogmask_usage(&shell::log_priority_names())
-                ));
+                ctx.console_println(&setlogmask_usage(&shell::log_priority_names()));
                 return Ok(CommandOutcome::Continue);
             };
             match shell::set_log_priority(&name.to_str_lossy()) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 // C prints this and calls `iocshSetError(-1)`.
-                Err(ShellError::UnknownLevel) => Err("Error: unknown log level.".to_string()),
+                Err(ShellError::UnknownLevel) => {
+                    ctx.console_println("Error: unknown log level.");
+                    Ok(CommandOutcome::Failed)
+                }
                 Err(other) => Err(other.to_string()),
             }
         },
@@ -255,7 +254,7 @@ fn cmd_setlogmask() -> CommandDef {
 }
 
 /// C's no-argument `setlogmask` output (`rtems_init.c:665-671`), without the
-/// trailing newline [`CommandContext::print_fmt`] adds.
+/// trailing newline.
 fn setlogmask_usage(levels: &[String]) -> String {
     let mut out = String::from("Usage: setlogmask <level>\n\n  Level names:");
     for level in levels {
@@ -417,6 +416,31 @@ mod tests {
         assert_eq!(
             setlogmask_usage(&[]),
             "Usage: setlogmask <level>\n\n  Level names:"
+        );
+    }
+
+    /// rtems_init.c does not include `epicsStdio.h`, so `setlogmask`'s usage
+    /// stays on the console under `setlogmask > f` (`rtems_init.c:663-667`).
+    #[test]
+    fn setlogmask_s_usage_stays_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let (file, console) = (dir.path().join("f"), dir.path().join("c"));
+        let def = cmd_setlogmask();
+        let ctx = &shell.ctx;
+        let sink = std::fs::File::create(&console).unwrap();
+        ctx.with_console(sink, std::io::stderr(), || {
+            ctx.with_output(std::fs::File::create(&file).unwrap(), || {
+                def.handler.call(&[], ctx)
+            })
+        })
+        .unwrap();
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+        assert_eq!(read(&file), "");
+        assert!(
+            read(&console).starts_with("Usage: setlogmask <level>\n\n  Level names:\n"),
+            "{}",
+            read(&console)
         );
     }
 }

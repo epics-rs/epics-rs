@@ -702,14 +702,16 @@ fn main() -> ExitCode {
         match load_config(&path) {
             Ok(cfg) => merge_config(&mut args, &cfg, &matches),
             Err(e) => {
-                eprintln!("dual-gateway-rs: {e}");
+                epics_base_rs::stderr_println!("dual-gateway-rs: {e}");
                 return ExitCode::FAILURE;
             }
         }
     }
 
     if args.no_ca && args.no_pva {
-        eprintln!("dual-gateway-rs: --no-ca and --no-pva together leave nothing to run");
+        epics_base_rs::stderr_println!(
+            "dual-gateway-rs: --no-ca and --no-pva together leave nothing to run"
+        );
         return ExitCode::FAILURE;
     }
 
@@ -751,7 +753,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("dual-gateway-rs: failed to build tokio runtime: {e}");
+            epics_base_rs::stderr_println!("dual-gateway-rs: failed to build tokio runtime: {e}");
             return ExitCode::FAILURE;
         }
     };

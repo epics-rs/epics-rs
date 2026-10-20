@@ -124,7 +124,7 @@ async fn all_record_names_returns_load_order() {
     }
 
     assert_eq!(
-        db.all_record_names().await,
+        db.all_record_names(),
         names,
         "all_record_names must return database load order, not hash order"
     );

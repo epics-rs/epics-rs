@@ -1018,6 +1018,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     c.push_error_updates(&mut updates, &mut out.trace, true, false, &err);
                     c.push_file_number_update(&mut updates);
                     c.push_full_file_name_update(&mut updates);
+                    let refused: ADResult<()> = Err(err);
+                    abort_on_writer_abort(self, &mut updates, &refused);
                     out.set_updates(updates)
                 }
             };
@@ -1309,6 +1311,7 @@ mod tests {
     use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use crate::error::ADError;
     use crate::ndarray::{NDArray, NDDataType, NDDimension};
+    use crate::plugin::file_base::NDFileOpenMode;
     use std::path::Path;
 
     /// Mock writer that records operations.
@@ -1352,7 +1355,7 @@ mod tests {
         }
     }
     impl NDFileWriter for MockWriter {
-        fn open_file(&mut self, _p: &Path, _m: NDFileMode, _a: &NDArray) -> ADResult<()> {
+        fn open_file(&mut self, _p: &Path, _m: NDFileOpenMode, _a: &NDArray) -> ADResult<()> {
             self.opens += 1;
             if self.fail_open {
                 return Err(ADError::Reported {
@@ -3104,7 +3107,7 @@ mod tests {
     struct GateWriter(Arc<std::sync::Barrier>);
 
     impl NDFileWriter for GateWriter {
-        fn open_file(&mut self, _p: &Path, _m: NDFileMode, _a: &NDArray) -> ADResult<()> {
+        fn open_file(&mut self, _p: &Path, _m: NDFileOpenMode, _a: &NDArray) -> ADResult<()> {
             Ok(())
         }
         fn write_file(&mut self, _a: &Arc<NDArray>) -> ADResult<()> {

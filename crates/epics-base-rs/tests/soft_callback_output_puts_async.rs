@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -35,19 +35,24 @@ struct Lset {
 
 #[async_trait::async_trait]
 impl LinkSet for Lset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         self.admission
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, _: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        _: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
         self.release
             .acquire()
             .await

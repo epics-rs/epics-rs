@@ -8733,7 +8733,7 @@ mod tests {
             events: Arc<parking_lot::Mutex<Vec<(u64, WatermarkKind)>>>,
         }
         impl crate::server_native::source::ChannelSource for RecordingWmSource {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["WM:PV".into()]
             }
             async fn has_pv(&self, name: &[u8]) -> bool {
@@ -12932,7 +12932,7 @@ mod tests {
 
     #[cfg(test)]
     impl crate::server_native::source::ChannelSource for RawSeedSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -13211,7 +13211,7 @@ mod tests {
 
     #[cfg(test)]
     impl crate::server_native::source::ChannelSource for ChanSeedSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -13637,7 +13637,7 @@ mod tests {
         fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
             &self.gate
         }
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -13815,7 +13815,7 @@ mod tests {
         fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
             &self.gate
         }
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, n: &[u8]) -> bool {
@@ -14690,7 +14690,7 @@ mod tests {
         log: Arc<parking_lot::Mutex<Vec<String>>>,
     }
     impl crate::server_native::source::ChannelSource for AckOrderSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, n: &[u8]) -> bool {
@@ -16508,7 +16508,7 @@ mod tests {
             closed: Arc<parking_lot::Mutex<Vec<String>>>,
         }
         impl crate::server_native::source::ChannelSource for RecordingCloseSource {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
             async fn has_pv(&self, name: &[u8]) -> bool {
@@ -16629,7 +16629,7 @@ mod tests {
         value: PvField,
     }
     impl crate::server_native::source::ChannelSource for CredRecordingSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -18251,7 +18251,7 @@ mod tests {
             used_ctxless_get: Arc<AtomicBool>,
         }
         impl ChannelSource for SplitReadSource {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
             fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
@@ -19495,7 +19495,7 @@ mod tests {
             calls: Arc<AtomicUsize>,
         }
         impl ChannelSource for GatedIntrospectSource {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
             async fn has_pv(&self, name: &[u8]) -> bool {
@@ -19877,7 +19877,7 @@ mod tests {
         starts: Arc<parking_lot::Mutex<Vec<bool>>>,
     }
     impl crate::server_native::source::ChannelSource for Bfr12Source {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, n: &[u8]) -> bool {
@@ -19924,7 +19924,7 @@ mod tests {
     fn a_panicking_monitor_start_callback_cannot_escape_the_drop() {
         struct PanickingSource;
         impl crate::server_native::source::ChannelSource for PanickingSource {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["dut".into()]
             }
             async fn has_pv(&self, n: &[u8]) -> bool {
@@ -20145,7 +20145,7 @@ mod tests {
         keep: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::MonitorUpdate>>>>,
     }
     impl crate::server_native::source::ChannelSource for GatedQuietSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, n: &[u8]) -> bool {
@@ -20277,8 +20277,8 @@ mod tests {
         raw: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>>,
     }
     impl crate::server_native::source::ChannelSource for QuietRawSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
-            self.quiet.list_pvs().await
+        fn list_pvs(&self) -> Vec<RecordName> {
+            self.quiet.list_pvs()
         }
         async fn has_pv(&self, n: &[u8]) -> bool {
             self.quiet.has_pv(n).await
@@ -20979,7 +20979,7 @@ mod tests {
     /// `send_op_error` path. INIT still succeeds via `ch.introspection`.
     struct Bfr13FailSource;
     impl crate::server_native::source::ChannelSource for Bfr13FailSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
@@ -22232,7 +22232,7 @@ mod r14_tests {
     struct SlowGetSource(Arc<std::sync::atomic::AtomicBool>);
 
     impl crate::server_native::source::ChannelSource for SlowGetSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["slow".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -22436,7 +22436,7 @@ mod bfr15_tests {
     }
 
     impl crate::server_native::source::ChannelSource for ExecBlockSource {
-        async fn list_pvs(&self) -> Vec<RecordName> {
+        fn list_pvs(&self) -> Vec<RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, name: &[u8]) -> bool {
@@ -23645,7 +23645,7 @@ mod hosted_subscriber_tests {
     struct Dut<S>(S);
 
     impl<S: Subscribe> ChannelSource for Dut<S> {
-        async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+        fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
             vec!["dut".into()]
         }
         async fn has_pv(&self, n: &[u8]) -> bool {

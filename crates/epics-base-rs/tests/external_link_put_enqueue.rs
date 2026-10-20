@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -48,16 +48,22 @@ struct GateLset {
 
 #[async_trait::async_trait]
 impl LinkSet for GateLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, name: &[u8], value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        _: LinkPutOp,
+    ) -> Result<(), String> {
+        let name = link.name;
         let v = value.to_f64().expect("tests only put doubles");
         let _ = self.entered.send(v);
         if name == self.gated.as_bytes() {
@@ -94,19 +100,24 @@ impl RecordingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for RecordingLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         self.admission
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, _: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(
+        &self,
+        _: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
         self.writes
             .lock()
             .unwrap()

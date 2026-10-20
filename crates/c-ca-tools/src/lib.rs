@@ -4,6 +4,11 @@
 //! implementation (`softIoc`, `caget`, `caput`, `camonitor`). They need
 //! the C tools on `PATH` and fail, not skip, when one is absent.
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "test-only crate: tests may keep eprintln!"
+)]
+
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};

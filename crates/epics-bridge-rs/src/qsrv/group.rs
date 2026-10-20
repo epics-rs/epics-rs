@@ -11,8 +11,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbAttachment, SubscriptionActivation};
+use epics_base_rs::server::database::{PutSplit, PvDatabase};
 use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::server::snapshot::PropertySupport;
@@ -1490,7 +1490,7 @@ impl GroupChannel {
         // while losing the deferred reprocess: two rapid group PUTs to a Passive
         // async output wrote one value to the device where C writes both.
         self.db
-            .put_driven_process_already_locked(record_name)
+            .put_driven_process_already_locked(record_name, PutSplit::PvxsPostProcessing)
             .map_err(|e| BridgeError::PutRejected(e.to_string()))
     }
 
@@ -1507,7 +1507,7 @@ impl GroupChannel {
             return Ok(());
         }
         self.db
-            .put_driven_process(record_name)
+            .put_driven_process(record_name, PutSplit::PvxsPostProcessing)
             .await
             .map_err(|e| BridgeError::PutRejected(e.to_string()))
     }
@@ -1580,8 +1580,13 @@ impl GroupChannel {
                     // parked on the member record (a dropped receiver
                     // would occupy its notify slot until async
                     // processing settles).
-                    puts.put_record_field_from_ca_no_notify(record, field_name, value)
-                        .map_err(to_err)?;
+                    puts.put_record_field_from_ca_no_notify(
+                        record,
+                        field_name,
+                        value,
+                        PutSplit::PvxsPostProcessing,
+                    )
+                    .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
                     // Any PACT park this put releases replays on the cycle two
@@ -1590,7 +1595,10 @@ impl GroupChannel {
                     // active record, PUTF and dbProcess on an idle one.
                     puts.put_pv(record, field_name, value).map_err(to_err)?;
                     self.db
-                        .put_driven_process_already_locked(record_name)
+                        .put_driven_process_already_locked(
+                            record_name,
+                            PutSplit::PvxsPostProcessing,
+                        )
                         .map_err(to_err)?;
                 }
             }
@@ -6039,7 +6047,6 @@ mod tests {
         // the whole group.
         for m in def.channels.iter() {
             super::super::channel::resolve_db_channel(&db, m)
-                .await
                 .expect("an eligible `$` member must bind");
         }
 
@@ -6124,7 +6131,6 @@ mod tests {
             .pop()
             .unwrap();
         let err = super::super::channel::resolve_db_channel(&db, &def.channels[0])
-            .await
             .expect_err("`$` on a DBF_DOUBLE VAL must not bind");
         assert_eq!(err, "Invalid PV: LS:num.VAL$");
     }

@@ -66,14 +66,16 @@ fn restore_of(sav: &str) -> Vec<String> {
     errlog_of("child_restore", dir.path())
 }
 
-/// :966-974, with `.VAL` added to a bare name (:912).
+/// :966-974, with `.VAL` added to a bare name (:912). A missing field is
+/// `dbFindField`'s `S_dbLib_fieldNotFound` (dbStaticLib.c:1847-1853), the
+/// same line as a missing record, as the C oracle IOC prints it.
 #[test]
 fn a_missing_record_or_field_is_named() {
     assert_eq!(
         restore_of("# h\nB 1\nA.NOPE 2\nA 3\n<END>\n"),
         [
             "../dbrestore.c:reboot_restore dbFindRecord for 'B.VAL' failed",
-            "../dbrestore.c:reboot_restore dbFindRecord did not find field 'A.NOPE'",
+            "../dbrestore.c:reboot_restore dbFindRecord for 'A.NOPE' failed",
         ]
     );
 }
@@ -142,5 +144,15 @@ fn a_file_that_cannot_be_opened_is_named() {
             "../dbrestore.c:fopen_and_check ...last tried 'DIR/s.sav2'. I give up.",
             "../dbrestore.c:reboot_restore Can't open save file.",
         ]
+    );
+}
+
+/// dbStatic finds no field with a filter after it (dbStaticLib.c:1855-1858),
+/// so the C oracle IOC restores nothing to `A.DESC{"x":1}$`.
+#[test]
+fn a_filtered_name_is_not_restored_at_boot() {
+    assert_eq!(
+        restore_of("# h\nA.DESC{\"x\":1}$ hi\n<END>\n"),
+        ["../dbrestore.c:reboot_restore dbFindRecord for 'A.DESC{\"x\":1}$' failed"]
     );
 }

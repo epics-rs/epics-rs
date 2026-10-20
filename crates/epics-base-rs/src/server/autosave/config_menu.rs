@@ -2,25 +2,23 @@
 //! `save_restore.c` calls they make (`findConfigFiles`, `fdbrestoreX`,
 //! `manual_save`, `getMacroString`).
 //!
-//! A load or save runs on a background task, as on C's save_restore task;
-//! its completion is C `configMenuCallback`: `D = status` under the
-//! record's lock, then `scanOnce` so the second process reports it.
+//! A load or save is an op of the save_restore task, as C's is; its
+//! completion is C `configMenuCallback`: `D = status` under the record's
+//! lock, then `scanOnce` so the second process reports it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::CaResult;
-use crate::runtime::task::{CallbackPriority, spawn_background};
 use crate::server::database::{PvDatabase, SubroutineContext};
 use crate::server::record::{ContextSubroutineFn, Record};
 use crate::types::EpicsValue;
 
+use super::manager::TaskOp;
 use super::request::concatenate_paths;
 use super::save_set::ManualSource;
 use super::settings::SrSettings;
-use super::startup::{
-    AutosaveStartupConfig, manual_restore_request_ok, manual_save_manager, run_manual_restore,
-};
+use super::startup::{AutosaveStartupConfig, manual_restore_request_ok, manual_save_queue};
 
 /// C `NUM_ITEMS`: menu entries per page.
 const NUM_ITEMS: usize = 10;
@@ -43,45 +41,49 @@ pub fn find_config_files(
     let debug = settings.debug();
     let prefix = format!("{config}_");
     if debug != 0 {
-        println!("findConfigFiles: config='{config}', config_underscore={prefix}");
+        crate::epics_println!("findConfigFiles: config='{config}', config_underscore={prefix}");
     }
     let shown = dir.map(|d| d.display().to_string()).unwrap_or_default();
-    let Some(entries) = dir.and_then(|d| std::fs::read_dir(d).ok()) else {
+    let Some(names) = dir.and_then(dir_names) else {
         if debug != 0 {
-            println!("findConfigFiles: opendir('{shown}') failed.");
+            crate::epics_println!("findConfigFiles: opendir('{shown}') failed.");
         }
         return Err(-1);
     };
     if debug != 0 {
-        println!("findConfigFiles: opendir('{shown}') succeeded.");
+        crate::epics_println!("findConfigFiles: opendir('{shown}') succeeded.");
     }
     let mut found = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
+    for raw in &names {
+        if debug > 1 {
+            let mut line = b"findConfigFiles: checking '".to_vec();
+            line.extend_from_slice(raw);
+            line.extend_from_slice(b"'.\n");
+            crate::runtime::stdio::stdout_bytes(&line);
+        }
+        let Ok(file_name) = std::str::from_utf8(raw) else {
             continue;
         };
-        if debug > 1 {
-            println!("findConfigFiles: checking '{file_name}'.");
-        }
         let Some(rest) = file_name.strip_prefix(&prefix) else {
             continue;
         };
         if debug != 0 {
-            println!("findConfigFiles: found '{file_name}'");
-            println!("findConfigFiles: searching '{rest}' for .cfg");
+            crate::epics_println!("findConfigFiles: found '{file_name}'");
+            crate::epics_println!("findConfigFiles: searching '{rest}' for .cfg");
         }
         let Some(name) = rest.strip_suffix(".cfg") else {
             continue;
         };
         if debug != 0 {
-            println!("findConfigFiles: found config file '{name}'");
+            crate::epics_println!("findConfigFiles: found config file '{name}'");
         }
         let fullpath = concatenate_paths(&shown, file_name, settings);
         let description = match std::fs::read_to_string(&fullpath) {
             Ok(text) => {
                 if debug != 0 {
-                    println!("findConfigFiles: searching '{fullpath}' for description");
+                    crate::epics_println!(
+                        "findConfigFiles: searching '{fullpath}' for description"
+                    );
                 }
                 text.lines().find_map(|line| {
                     let at = line.find("Menu:currDesc")?;
@@ -94,7 +96,7 @@ pub fn find_config_files(
             }
             Err(_) => {
                 if debug != 0 {
-                    println!("findConfigFiles: can't open '{file_name}'");
+                    crate::epics_println!("findConfigFiles: can't open '{file_name}'");
                 }
                 None
             }
@@ -105,9 +107,9 @@ pub fn find_config_files(
         });
     }
     if debug != 0 {
-        println!("findConfigFiles: ");
+        crate::epics_println!("findConfigFiles: ");
         for f in &found {
-            println!(
+            crate::epics_println!(
                 "\tname='{}'; desc='{}'",
                 f.name,
                 f.description.as_deref().unwrap_or("(null)")
@@ -115,6 +117,48 @@ pub fn find_config_files(
         }
     }
     Ok(found)
+}
+
+/// Every name C's `readdir` loop sees in `dir`, in the order the OS returns
+/// them, `None` when `opendir` fails. `std::fs::read_dir` drops `.` and `..`,
+/// which C traces, and they need not come first.
+#[cfg(unix)]
+fn dir_names(dir: &Path) -> Option<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is NUL-terminated, each entry's name is copied before
+    // the next `readdir`, and the stream is closed once.
+    unsafe {
+        let pdir = libc::opendir(path.as_ptr());
+        if pdir.is_null() {
+            return None;
+        }
+        let mut names = Vec::new();
+        loop {
+            let ent = libc::readdir(pdir);
+            if ent.is_null() {
+                break;
+            }
+            names.push(
+                std::ffi::CStr::from_ptr((*ent).d_name.as_ptr())
+                    .to_bytes()
+                    .to_vec(),
+            );
+        }
+        libc::closedir(pdir);
+        Some(names)
+    }
+}
+
+#[cfg(not(unix))]
+fn dir_names(dir: &Path) -> Option<Vec<Vec<u8>>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    Some(
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned().into_bytes())
+            .collect(),
+    )
 }
 
 /// C `makeLegal`: every non-alphanumeric character becomes `_`.
@@ -204,7 +248,7 @@ fn list_do(
             }
         }
         if status != 0 {
-            println!("configMenuList_do({config}): findConfigFiles returned {status}");
+            crate::epics_println!("configMenuList_do({config}): findConfigFiles returned {status}");
         }
         rec.put_field("C", EpicsValue::Short(0))?;
     }
@@ -267,9 +311,9 @@ fn menu_do(
                 record: ctx.name().to_string(),
             };
             if save {
-                manual_save(holder, db, &req_file, filename, done)
+                manual_save(holder, &req_file, filename, done)
             } else {
-                fdbrestore_x(holder, db, &req_file, filename, done)
+                fdbrestore_x(holder, &req_file, filename, done)
             }
         }
         None => -1,
@@ -303,7 +347,7 @@ fn set_macros(holder: &Mutex<AutosaveStartupConfig>, req_file: &str) -> String {
     let manager = holder.lock().unwrap().manager.clone();
     manager
         .and_then(|m| m.find_set_by_request_file(req_file))
-        .map(|(set, _)| set.config().macro_string.clone())
+        .and_then(|(set, _)| set.config().macro_string.clone())
         .unwrap_or_default()
 }
 
@@ -316,7 +360,6 @@ fn save_dir_path(holder: &Mutex<AutosaveStartupConfig>, filename: &str) -> PathB
 /// of failed puts, or of differences when every put landed.
 fn fdbrestore_x(
     holder: &Arc<Mutex<AutosaveStartupConfig>>,
-    db: PvDatabase,
     req_file: &str,
     filename: String,
     done: Completion,
@@ -325,24 +368,14 @@ fn fdbrestore_x(
     if !manual_restore_request_ok(&filename, "", &settings) {
         return -1;
     }
-    let macros = set_macros(holder, req_file);
+    let macrostring = set_macros(holder, req_file);
     let path = save_dir_path(holder, &filename);
-    let (manager, settings) = {
-        let cfg = holder.lock().unwrap();
-        (cfg.manager.clone(), cfg.settings.clone())
-    };
-    spawn_background(CallbackPriority::Low, async move {
-        let status = run_manual_restore(
-            manager,
-            &settings,
-            &db,
-            &path,
-            &filename,
-            ManualSource::AsciiFile,
-            &macros,
-        )
-        .await;
-        done.finish(status);
+    holder.lock().unwrap().send(TaskOp::Restore {
+        filename,
+        path,
+        from: ManualSource::AsciiFile,
+        macrostring,
+        callback: Box::new(move |status| done.finish(status)),
     });
     0
 }
@@ -351,7 +384,6 @@ fn fdbrestore_x(
 /// `req_file` to `filename` in the save directory, then `asVerify` it.
 fn manual_save(
     holder: &Arc<Mutex<AutosaveStartupConfig>>,
-    db: PvDatabase,
     req_file: &str,
     filename: String,
     done: Completion,
@@ -359,14 +391,14 @@ fn manual_save(
     // C passes configMenuCallback and the record as its user pointer.
     let callback = format!("{:p}", Completion::finish as fn(Completion, i32));
     let puser = format!("{:p}", &done);
-    let Some(manager) = manual_save_manager(holder, req_file, &filename, &callback, &puser) else {
+    let Some(ops) = manual_save_queue(holder, req_file, &filename, &callback, &puser) else {
         return -1;
     };
-    let path = save_dir_path(holder, &filename);
-    let req_file = req_file.to_string();
-    spawn_background(CallbackPriority::Low, async move {
-        let status = manager.save_file_op(&db, &req_file, &filename, &path).await;
-        done.finish(status);
+    ops.send(TaskOp::Save {
+        request_file: req_file.to_string(),
+        path: save_dir_path(holder, &filename),
+        filename,
+        callback: Box::new(move |status| done.finish(status)),
     });
     0
 }

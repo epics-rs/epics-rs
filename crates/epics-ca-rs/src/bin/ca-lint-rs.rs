@@ -269,7 +269,7 @@ fn main() {
     let args = Args::parse();
     let did_anything = args.env || !args.db.is_empty() || !args.acf.is_empty();
     if !did_anything {
-        eprintln!(
+        epics_libcom_rs::stderr_println!(
             "ca-lint-rs: nothing to do — pass --env, --db FILE, and/or --acf FILE.\n\
              See `ca-lint-rs --help`."
         );
@@ -284,7 +284,9 @@ fn main() {
         if let Some((k, v)) = kv.split_once('=') {
             macros.insert(k.trim().to_string(), v.trim().to_string());
         } else {
-            eprintln!("warning: --macro expects KEY=VALUE, got {kv:?}; skipping");
+            epics_libcom_rs::stderr_println!(
+                "warning: --macro expects KEY=VALUE, got {kv:?}; skipping"
+            );
         }
     }
     for db in &args.db {

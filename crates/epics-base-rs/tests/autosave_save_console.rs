@@ -92,7 +92,7 @@ async fn save_once() -> Option<()> {
                     enable_savb: backups == "savb",
                 },
                 macros: HashMap::new(),
-                macro_string: String::new(),
+                macro_string: None,
                 search_paths: Vec::new(),
             },
             SaveStrategy::Manual,
@@ -100,7 +100,7 @@ async fn save_once() -> Option<()> {
         .build()
         .await;
     if backups == "dated" {
-        mgr.sets()[0].0.do_periodic_dated_backup(&db).await;
+        mgr.sets()[0].0.do_periodic_dated_backup().await;
     } else if backups != "seq-only" {
         let _ = mgr.manual_save("set", &db).await;
     }

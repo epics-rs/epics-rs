@@ -123,6 +123,23 @@ impl ModbusFunctionCode {
         })
     }
 
+    /// The integer [`Self::from_i32`] decodes: C's `modbusFunction_`.
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Self::ReadCoils => 1,
+            Self::ReadDiscreteInputs => 2,
+            Self::ReadHoldingRegisters => 3,
+            Self::ReadInputRegisters => 4,
+            Self::WriteSingleCoil => 5,
+            Self::WriteSingleRegister => 6,
+            Self::WriteMultipleCoils => 15,
+            Self::WriteMultipleRegisters => 16,
+            Self::ReportSlaveId => 17,
+            Self::ReadInputRegistersF23 => 123,
+            Self::WriteMultipleRegistersF23 => 223,
+        }
+    }
+
     /// Bytes the reply PDU — function code first, as
     /// [`crate::interpose::ModbusFramer::unwrap_response`] delivers it — should
     /// occupy. C `doModbusIO`'s `replySize` (drvModbusAsyn.cpp:2096-2206).
@@ -285,6 +302,9 @@ pub struct IoStatistics {
     pub histogram_ms_per_bin: u32,
     /// Read-time histogram; the last bin catches all longer times.
     pub histogram: Vec<u32>,
+    /// The statistics moved since [`Self::take_moved`], one bit per C
+    /// `setIntegerParam` site in `doModbusIO`.
+    moved: u8,
 }
 
 impl Default for IoStatistics {
@@ -299,18 +319,40 @@ impl Default for IoStatistics {
             histogram_enabled: false,
             histogram_ms_per_bin: 1,
             histogram: vec![0; HISTOGRAM_LENGTH],
+            moved: 0,
         }
     }
 }
 
 impl IoStatistics {
+    /// [`Self::take_moved`]'s bit for `read_ok`.
+    pub const READ_OK: u8 = 1 << 0;
+    /// [`Self::take_moved`]'s bit for `write_ok`.
+    pub const WRITE_OK: u8 = 1 << 1;
+    /// [`Self::take_moved`]'s bit for `io_errors`.
+    pub const IO_ERRORS: u8 = 1 << 2;
+    /// [`Self::take_moved`]'s bit for `last_io_msec`.
+    pub const LAST_IO: u8 = 1 << 3;
+    /// [`Self::take_moved`]'s bit for `max_io_msec`.
+    pub const MAX_IO: u8 = 1 << 4;
+
+    /// The statistics `doModbusIO` set since the last call, and clear them. C
+    /// sets a statistic's parameter only where that one moves
+    /// (drvModbusAsyn.cpp:2205-2341), so a value a record wrote to it reads
+    /// back until then.
+    pub fn take_moved(&mut self) -> u8 {
+        std::mem::take(&mut self.moved)
+    }
+
     /// Record a completed I/O cycle of `elapsed` duration into the timing
     /// stats and, if enabled, the histogram.
     fn record_timing(&mut self, elapsed: Duration) {
         let msec = (elapsed.as_secs_f64() * 1000.0 + 0.5) as u32;
         self.last_io_msec = msec;
+        self.moved |= Self::LAST_IO;
         if msec > self.max_io_msec {
             self.max_io_msec = msec;
+            self.moved |= Self::MAX_IO;
         }
         if self.histogram_enabled {
             let bin = (msec / self.histogram_ms_per_bin.max(1)) as usize;
@@ -830,6 +872,7 @@ impl ModbusEngine {
             Ok(pdu) => pdu,
             Err(e) => {
                 self.stats.io_errors += 1;
+                self.stats.moved |= IoStatistics::IO_ERRORS;
                 self.stats.current_io_errors += 1;
                 return Err(e);
             }
@@ -872,8 +915,10 @@ impl ModbusEngine {
         // check.
         if function.is_read() {
             self.stats.read_ok += 1;
+            self.stats.moved |= IoStatistics::READ_OK;
         } else {
             self.stats.write_ok += 1;
+            self.stats.moved |= IoStatistics::WRITE_OK;
         }
         let words = self.parse_response(function, len, &resp);
         if let Err(ModbusError::WordCount { expected, received }) = words {

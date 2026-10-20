@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
+use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -41,8 +42,9 @@ fn output_of(name: &str, dir: &Path) -> (Vec<String>, Vec<String>) {
     )
 }
 
-/// `line` run in an iocsh with the autosave startup commands, the save path
-/// `$CHILD` and `record(ao, "A")`, in the child only; `A`'s value after.
+/// `line` run in an iocsh with the autosave startup commands, a running
+/// save task, the save path `$CHILD` and `record(ao, "A")`, in the child
+/// only; `A`'s value once the task has served the line's ops.
 fn child_shell(line: &str) -> Option<(f64, PathBuf)> {
     let dir = PathBuf::from(std::env::var_os(CHILD)?);
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -51,6 +53,10 @@ fn child_shell(line: &str) -> Option<(f64, PathBuf)> {
         .unwrap();
     let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
     holder.lock().unwrap().save_file_path = Some(dir.clone());
+    let settings = holder.lock().unwrap().settings.clone();
+    let mgr = Arc::new(rt.block_on(AutosaveBuilder::new().settings(settings).build()));
+    holder.lock().unwrap().manager = Some(mgr.clone());
+    let _task = mgr.clone().start(db.clone());
     let bridge = {
         let _guard = rt.enter();
         epics_base_rs::runtime::task::BlockingBridge::capture()
@@ -67,6 +73,7 @@ fn child_shell(line: &str) -> Option<(f64, PathBuf)> {
     })
     .join()
     .unwrap();
+    rt.block_on(mgr.ops_served());
     epics_base_rs::runtime::log::errlog_flush();
     Some((db.get_pv("A").unwrap().to_f64().unwrap(), dir))
 }

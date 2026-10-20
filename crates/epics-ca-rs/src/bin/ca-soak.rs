@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::client::CaClient;
+use epics_libcom_rs::cfmt::CFloat;
 
 #[derive(Parser, Debug)]
 #[command(about = "CA client soak test")]
@@ -63,7 +64,7 @@ async fn main() {
     for pv_name in &args.pvs {
         let ch = client.create_channel(pv_name);
         if let Err(e) = ch.wait_connected(Duration::from_secs(10)).await {
-            eprintln!("connect {pv_name}: {e:?}");
+            epics_libcom_rs::stderr_println!("connect {pv_name}: {e:?}");
             continue;
         }
 
@@ -75,7 +76,7 @@ async fn main() {
                 if item.is_ok() {
                     mon_count.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    eprintln!("monitor {pv_for_mon}: error");
+                    epics_libcom_rs::stderr_println!("monitor {pv_for_mon}: error");
                 }
             }
         }));
@@ -159,16 +160,16 @@ async fn main() {
                 next += report_interval;
                 let elapsed = start.elapsed().as_secs_f64();
                 let snap = client.diagnostics();
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "[soak +{:>6.1}s] mons={} reads={} (err {}) writes={} (err {})",
-                    elapsed,
+                    CFloat(elapsed),
                     monitors_received.load(Ordering::Relaxed),
                     reads_done.load(Ordering::Relaxed),
                     reads_failed.load(Ordering::Relaxed),
                     writes_done.load(Ordering::Relaxed),
                     writes_failed.load(Ordering::Relaxed),
                 );
-                eprintln!(
+                epics_libcom_rs::stderr_println!(
                     "  diag: conns={} disconns={} reconns={} \
                      unresp={} drop_mon={} beacon_anom={}",
                     snap.connections,
@@ -185,7 +186,7 @@ async fn main() {
                 }
             }
             _ = &mut interrupted => {
-                eprintln!("\nSIGINT received, stopping...");
+                epics_libcom_rs::stderr_println!("\nSIGINT received, stopping...");
                 break;
             }
         }
@@ -197,7 +198,10 @@ async fn main() {
 
     let final_diag = client.diagnostics();
     println!("\n=== Soak summary ===");
-    println!("Duration:       {:.1}s", start.elapsed().as_secs_f64());
+    println!(
+        "Duration:       {:.1}s",
+        CFloat(start.elapsed().as_secs_f64())
+    );
     println!(
         "Monitor events: {}",
         monitors_received.load(Ordering::Relaxed)

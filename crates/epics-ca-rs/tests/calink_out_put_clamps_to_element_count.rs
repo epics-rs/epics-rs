@@ -28,7 +28,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet};
+use epics_base_rs::server::record::OpenLatch;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -51,7 +52,7 @@ fn pin_env(port: u16) {
 
 /// A three-element DBF_DOUBLE waveform on its own CA server, plus a
 /// client and a resolver with the link already connected.
-async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
+async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver, OpenLatch) {
     let server = CaServer::builder()
         .port(0)
         .record(pv, WaveformRecord::new(3, DbFieldType::Double))
@@ -68,13 +69,15 @@ async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
             .expect("CA client"),
     );
     let resolver = CaLinkResolver::with_client(client.clone());
+    let open = OpenLatch::default();
+    LinkSet::connect_link(&resolver, LinkRef::new(pv.as_bytes(), &open), None).await;
     assert!(
         resolver
             .wait_for_link_connected(pv, fact_budget::FACT_BUDGET)
             .await,
         "CA link must connect to the upstream CA server"
     );
-    (client, resolver)
+    (client, resolver, open)
 }
 
 /// Read `pv` back over a fresh channel until it matches `want`, so a
@@ -108,11 +111,11 @@ async fn readback_becomes(client: &CaClient, pv: &str, want: EpicsValue) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn an_oversized_array_put_truncates_instead_of_failing() {
-    let (client, resolver) = wf3("CALINK:CLAMP:WF").await;
+    let (client, resolver, open) = wf3("CALINK:CLAMP:WF").await;
 
     LinkSet::put_value(
         &resolver,
-        b"CALINK:CLAMP:WF",
+        LinkRef::new(b"CALINK:CLAMP:WF", &open),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
         LinkPutOp::Async,
     )
@@ -134,11 +137,11 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_plain_put_takes_the_same_clamp() {
-    let (client, resolver) = wf3("CALINK:CLAMP:WFP").await;
+    let (client, resolver, open) = wf3("CALINK:CLAMP:WFP").await;
 
     LinkSet::put_value(
         &resolver,
-        b"CALINK:CLAMP:WFP",
+        LinkRef::new(b"CALINK:CLAMP:WFP", &open),
         EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         LinkPutOp::Plain,
     )
@@ -174,6 +177,9 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
             .expect("CA client"),
     );
     let resolver = CaLinkResolver::with_client(client.clone());
+    let open = OpenLatch::default();
+    let link = LinkRef::new(b"CALINK:CLAMP:AI", &open);
+    LinkSet::connect_link(&resolver, link, None).await;
     assert!(
         resolver
             .wait_for_link_connected("CALINK:CLAMP:AI", fact_budget::FACT_BUDGET)
@@ -182,7 +188,7 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
 
     LinkSet::put_value(
         &resolver,
-        b"CALINK:CLAMP:AI",
+        link,
         EpicsValue::DoubleArray(vec![7.5, 8.5, 9.5].into()),
         LinkPutOp::Async,
     )
@@ -200,7 +206,7 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_direct_client_put_is_still_refused() {
-    let (client, _resolver) = wf3("CALINK:CLAMP:DIRECT").await;
+    let (client, _resolver, _open) = wf3("CALINK:CLAMP:DIRECT").await;
 
     let ch = client.create_channel("CALINK:CLAMP:DIRECT");
     ch.wait_connected(fact_budget::FACT_BUDGET)

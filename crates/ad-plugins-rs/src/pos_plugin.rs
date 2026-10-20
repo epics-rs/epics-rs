@@ -1,11 +1,13 @@
 use asyn_rs::port::InterfaceMask;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
@@ -297,50 +299,6 @@ fn push_int(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: i32) {
 fn push_str(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: String) {
     if let Some(i) = idx {
         updates.push(ParamUpdate::octet(i, value));
-    }
-}
-
-/// Format `v` the way C++ `std::ostream << double` does by default
-/// (`defaultfloat`, stream precision 6) — equivalent to C `printf("%g", v)`.
-/// C builds the NDPos_CurrentPos string by streaming each position double
-/// (NDPosPlugin.cpp:159), so the observable octet value must use this format
-/// rather than Rust's shortest-round-trip `Display`.
-fn format_cpp_g6(v: f64) -> String {
-    const PREC: i32 = 6;
-    if v == 0.0 {
-        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
-    }
-    if v.is_nan() {
-        return "nan".to_string();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    // Round to PREC significant figures via scientific form, then read the
-    // decimal exponent — this avoids log10 floor off-by-one at powers of ten.
-    let sci = format!("{:.*e}", (PREC - 1) as usize, v);
-    let epos = sci.find('e').unwrap();
-    let exp: i32 = sci[epos + 1..].parse().unwrap();
-    if exp >= -4 && exp < PREC {
-        // %f branch: precision = PREC-1-exp digits after the point.
-        let prec = (PREC - 1 - exp).max(0) as usize;
-        strip_g_trailing(&format!("{:.*}", prec, v))
-    } else {
-        // %e branch: strip mantissa trailing zeros, render a signed 2+digit
-        // exponent (C printf style: "1.23457e+06", "1e-05").
-        let mantissa = strip_g_trailing(&sci[..epos]);
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{}{:02}", mantissa, sign, exp.abs())
-    }
-}
-
-/// Strip `%g` trailing zeros: remove trailing '0' digits after a '.', then a
-/// dangling '.'. No-op for strings without a decimal point.
-fn strip_g_trailing(s: &str) -> String {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s.to_string()
     }
 }
 
@@ -710,7 +668,8 @@ impl NDPluginProcess for PosPluginProcessor {
             }
             current_pos.push_str(key);
             current_pos.push('=');
-            current_pos.push_str(&format_cpp_g6(value));
+            // `ostream << double` is `%g` (NDPosPlugin.cpp:159).
+            let _ = write!(current_pos, "{}", CFloat(value).g());
             out.attributes.add(NDAttribute::new_static(
                 (*key).clone(),
                 "Position of NDArray",
@@ -1438,6 +1397,8 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("y".into(), 2.0);
         p.insert("x".into(), 1.5);
+        // libstdc++ formats through `%.*g`, which prints a NaN's sign bit.
+        p.insert("z".into(), -f64::NAN);
         proc.load_positions(vec![p]);
         proc.start();
 
@@ -1449,7 +1410,7 @@ mod tests {
             } => Some(value.clone()),
             _ => None,
         });
-        assert_eq!(s.as_deref(), Some("[x=1.5,y=2]"));
+        assert_eq!(s.as_deref(), Some("[x=1.5,y=2,z=-nan]"));
     }
 
     #[test]
@@ -1509,23 +1470,6 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((x - 3.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_format_cpp_g6() {
-        // Matches C printf("%g") / C++ default ostream<<double (precision 6).
-        assert_eq!(format_cpp_g6(1.0), "1");
-        assert_eq!(format_cpp_g6(1.5), "1.5");
-        assert_eq!(format_cpp_g6(42.5), "42.5");
-        assert_eq!(format_cpp_g6(100.0), "100");
-        assert_eq!(format_cpp_g6(0.1), "0.1");
-        assert_eq!(format_cpp_g6(0.0001), "0.0001");
-        assert_eq!(format_cpp_g6(0.00001), "1e-05");
-        assert_eq!(format_cpp_g6(1_000_000.0), "1e+06");
-        assert_eq!(format_cpp_g6(1_234_567.0), "1.23457e+06");
-        assert_eq!(format_cpp_g6(123456.0), "123456");
-        assert_eq!(format_cpp_g6(-1.5), "-1.5");
-        assert_eq!(format_cpp_g6(0.0), "0");
     }
 
     #[test]

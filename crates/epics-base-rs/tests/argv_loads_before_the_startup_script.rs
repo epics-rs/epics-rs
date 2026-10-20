@@ -96,7 +96,7 @@ async fn an_inline_pv_reaches_the_protocol_runner() {
         .pv("ARGV:INLINE:PV", EpicsValue::Double(2.5))
         .run_phased(|config| async move {
             assert!(
-                config.db.find_pv("ARGV:INLINE:PV").await.is_some(),
+                config.db.find_pv("ARGV:INLINE:PV").is_some(),
                 "the inline PV was created before the runner started"
             );
             Ok(())

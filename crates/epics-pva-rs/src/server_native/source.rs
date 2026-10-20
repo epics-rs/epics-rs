@@ -931,17 +931,31 @@ pub trait ChannelSource: Send + Sync + 'static {
         0
     }
 
-    /// The `(name, order)` entries this source puts in pvxs's one `Server`
-    /// source map, which `pvxsr` lists (`src/server.cpp:293-305`). `None`
-    /// for a leaf, which is the single entry it was added under; a
+    /// The entries this source puts in pvxs's one `Server` source map, which
+    /// `pvxsr` lists (`src/server.cpp:293-305`). `None` for a leaf, which is
+    /// the single entry it was added under; a
     /// [`crate::server_native::CompositeSource`] nested as one entry stands
     /// for its own entries, which pvxs would have added to the server.
-    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+    fn registry_entries(&self) -> Option<Vec<RegistryEntry>> {
         None
     }
 
+    /// pvxs `Source::show` (`src/server.cpp:837-847`), which `pvxsr` prints
+    /// after the source's `prio=` from detail 1: `Source` and the `onList`
+    /// names, which [`Self::list_pvs`] is, unless the source says otherwise.
+    fn show(&self) -> SourceShow {
+        SourceShow {
+            kind: "Source",
+            names: self.list_pvs(),
+            nested: true,
+        }
+    }
+
     /// Enumerate every PV name this source can serve.
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send;
+    ///
+    /// A plain call, as pvxs `Source::onList` is: `pvxsr` asks it from the
+    /// iocsh thread, which must not wait on the runtime to answer.
+    fn list_pvs(&self) -> Vec<RecordName>;
 
     /// True iff `name` resolves to a known PV.
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send;
@@ -2453,6 +2467,25 @@ impl std::fmt::Debug for MonitorGate {
 /// `Arc<MySource>` directly; this is mainly for the runtime internals.
 pub type DynSource = Arc<dyn ChannelSourceObj>;
 
+/// One `(order, name)` entry of pvxs's `Server` source map and the source
+/// added under it.
+#[derive(Clone)]
+pub struct RegistryEntry {
+    pub name: String,
+    pub order: i32,
+    pub source: DynSource,
+}
+
+/// What a source's [`ChannelSource::show`] prints: a word, then one name per
+/// line. pvxs keeps the names in a `std::set`, so the report sorts them.
+pub struct SourceShow {
+    pub kind: &'static str,
+    pub names: Vec<RecordName>,
+    /// The base `Source::show` indents its names once more than the IOC and
+    /// static sources' own `show` do (`src/server.cpp:841`).
+    pub nested: bool,
+}
+
 /// Run one synchronous source lifecycle callback, containing a panic in it.
 ///
 /// INVARIANT: a panic out of user source code MUST NOT reach the connection
@@ -2484,9 +2517,7 @@ fn contain_callback_panic(what: &str, name: &[u8], f: impl FnOnce()) {
 /// Object-safe variant of [`ChannelSource`]. Auto-implemented via blanket
 /// for any `T: ChannelSource`.
 pub trait ChannelSourceObj: Send + Sync {
-    fn list_pvs<'a>(
-        &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send + 'a>>;
+    fn list_pvs(&self) -> Vec<RecordName>;
     fn has_pv<'a>(
         &'a self,
         name: &'a [u8],
@@ -2557,7 +2588,9 @@ pub trait ChannelSourceObj: Send + Sync {
     /// Source-registry beacon-change counter. Dyn forwarder.
     fn beacon_change(&self) -> u64;
     /// Registry entries for `pvxsr`. Dyn forwarder.
-    fn registry_entries(&self) -> Option<Vec<(String, i32)>>;
+    fn registry_entries(&self) -> Option<Vec<RegistryEntry>>;
+    /// Dyn forwarder for [`ChannelSource::show`].
+    fn show(&self) -> SourceShow;
     /// Monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
@@ -2701,10 +2734,8 @@ pub trait ChannelSourceObj: Send + Sync {
 }
 
 impl<T: ChannelSource + 'static> ChannelSourceObj for T {
-    fn list_pvs<'a>(
-        &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send + 'a>> {
-        Box::pin(<Self as ChannelSource>::list_pvs(self))
+    fn list_pvs(&self) -> Vec<RecordName> {
+        <Self as ChannelSource>::list_pvs(self)
     }
     fn has_pv<'a>(
         &'a self,
@@ -2802,8 +2833,11 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn beacon_change(&self) -> u64 {
         <Self as ChannelSource>::beacon_change(self)
     }
-    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+    fn registry_entries(&self) -> Option<Vec<RegistryEntry>> {
         <Self as ChannelSource>::registry_entries(self)
+    }
+    fn show(&self) -> SourceShow {
+        <Self as ChannelSource>::show(self)
     }
     fn revalidate_read<'a>(
         &'a self,
@@ -3042,7 +3076,7 @@ mod tests {
             seen: Mutex<Vec<&'static str>>,
         }
         impl ChannelSource for PanickyLifecycle {
-            async fn list_pvs(&self) -> Vec<RecordName> {
+            fn list_pvs(&self) -> Vec<RecordName> {
                 Vec::new()
             }
             async fn has_pv(&self, _n: &[u8]) -> bool {

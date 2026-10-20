@@ -71,7 +71,6 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
     let composite = epics_pva_rs::server_native::CompositeSource::new();
     QsrvMount {
         store: Arc::new(store),
-        enabled: true,
         acf: epics_base_rs::server::access_security::new_acf_cell(None),
     }
     .install_channel_sources(&db, &composite)

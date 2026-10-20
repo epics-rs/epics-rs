@@ -14,10 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{
-    CaLinkInit, CpTarget, LinkHolder, LinkOpen, LinkPutDone, LinkPutOp, LinkSet, PutAdmission,
+    CaLinkInit, LinkHolder, LinkOpen, LinkPutDone, LinkPutOp, LinkRef, LinkSet, PutAdmission,
     PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::CaLinkResolver;
 use epics_ca_rs::server::CaServer;
@@ -35,40 +36,37 @@ struct Held {
 
 #[async_trait::async_trait]
 impl LinkSet for Held {
-    fn is_connected(&self, name: &[u8]) -> bool {
-        self.inner.is_connected(name)
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        self.inner.is_connected(link)
     }
-    fn init_ready(&self, name: &[u8]) -> bool {
-        self.inner.init_ready(name)
+    fn init_ready(&self, link: LinkRef<'_>) -> bool {
+        self.inner.init_ready(link)
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.inner.get_value(name).await
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.inner.get_value(link).await
     }
-    fn open_link(&self, holder: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
-        self.inner.open_link(holder, name)
+    fn open_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
+        self.inner.open_link(holder, link)
     }
-    fn remove_link(&self, holder: LinkHolder<'_>, name: &[u8]) {
-        self.inner.remove_link(holder, name)
+    fn remove_link(&self, holder: LinkHolder<'_>, link: LinkRef<'_>) {
+        self.inner.remove_link(holder, link)
     }
-    async fn connect_link(&self, name: &[u8], init: Option<CaLinkInit>) {
-        self.inner.connect_link(name, init).await
+    async fn connect_link(&self, link: LinkRef<'_>, init: Option<CaLinkInit>) {
+        self.inner.connect_link(link, init).await
     }
-    fn cp_link_added(&self, name: &[u8], holder: CpTarget) {
-        self.inner.cp_link_added(name, holder)
-    }
-    fn put_admission(&self, name: &[u8]) -> PutAdmission {
-        self.inner.put_admission(name)
+    fn put_admission(&self, link: LinkRef<'_>) -> PutAdmission {
+        self.inner.put_admission(link)
     }
     async fn put_value_done(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
         let _ = self.entered.send(());
         // Closed is the release.
         let _ = self.gate.acquire().await;
-        self.inner.put_value_done(name, value, op).await
+        self.inner.put_value_done(link, value, op).await
     }
 }
 
@@ -134,6 +132,8 @@ record(ao, "SRC") {{
     )
     .await;
     db.initialize_link_locality().await;
+    // The build ran with no `ca` lset: its `dbCaAddLink` pass is this one.
+    db.setup_external_link_opens().await;
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
@@ -150,7 +150,12 @@ record(ao, "SRC") {{
         .expect("the put reaches the lset");
     sdb.remove_simple_pv("RMT").await.expect("RMT served");
     assert!(
-        until(Duration::from_secs(10), || !resolver.is_connected(b"RMT")).await,
+        until(Duration::from_secs(10), || {
+            let out = src_out(&db);
+            let out = out.external().unwrap();
+            !resolver.is_connected(LinkRef::new(out.name, out.open))
+        })
+        .await,
         "the link sees the outage"
     );
     gate.close();
@@ -164,6 +169,14 @@ record(ao, "SRC") {{
         "the link reconnects"
     );
     (db, h, sdb)
+}
+
+/// `SRC.OUT`'s held link, whose channel its puts go on.
+fn src_out(db: &PvDatabase) -> ParsedLink {
+    db.record_link_fields("SRC")
+        .into_iter()
+        .find_map(|(field, _, link)| (field == "OUT").then_some(link))
+        .expect("SRC has an OUT link")
 }
 
 /// A plain `SRC` process writing `v` — C `dbPutField` without a put

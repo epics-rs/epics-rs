@@ -429,9 +429,11 @@ pub(crate) async fn install_records<H: InstallHost>(
                     // `.await`-free window.
                     let mut link =
                         crate::server::record::PreparedCommonLink::for_put(&name, &value);
-                    let put = rec_arc
-                        .write()
-                        .put_common_field_db_load_prepared(&name, value, &mut link);
+                    let put = {
+                        let mut guard = rec_arc.write();
+                        let put = guard.put_common_field_db_load_prepared(&name, value, &mut link);
+                        put.map(|moved| host.db().settle_scan(&rec_arc, guard, moved).1)
+                    };
                     drop(link);
                     match put {
                         Ok(CommonFieldPutResult::ScanChanged {
@@ -481,11 +483,14 @@ pub(crate) async fn install_records<H: InstallHost>(
                         &rec_arc,
                         None,
                     );
+                    let name = def.name.to_str_lossy();
+                    let err = &|line: &str| crate::stderr_println!("{line}");
                     let reached = {
                         let mut inst = rec_arc.write();
-                        let reached = inst.run_init_pass0(&def.name.to_str_lossy());
+                        let (reached, owed) = inst.run_init_pass0(&name);
+                        let mut inst = host.db().pay_device_init(&rec_arc, inst, owed, &name, err);
                         if reached {
-                            inst.run_add_record(&def.name.to_str_lossy(), input);
+                            inst.run_add_record(&name, input);
                         }
                         reached
                     };
@@ -494,9 +499,8 @@ pub(crate) async fn install_records<H: InstallHost>(
                     let mut reads = reached.then(|| host.db().read_init_links(&rec_arc));
                     let mut inst = rec_arc.write();
                     if let Some(reads) = &mut reads {
-                        inst.run_init_pass1(&def.name.to_str_lossy(), reads, &|line| {
-                            eprintln!("{line}")
-                        });
+                        let owed = inst.run_init_pass1(&name, reads, err);
+                        inst = host.db().pay_device_init(&rec_arc, inst, owed, &name, err);
                     }
                     rec_arc.settle_addr_facts(&inst);
                 }

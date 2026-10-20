@@ -98,27 +98,65 @@ impl Delivery {
     }
 
     /// C `endProcessCallbacks` up to its delivery (NDPluginDriver.cpp:
-    /// 265-328), for a processed frame and for NDPluginFile's ReadFile and
-    /// WriteFile alike (NDPluginFile.cpp:193, :252, :301, :349). `pArrays[0]`
-    /// is cached before the throttle and the sort buffer see the array: the
-    /// array itself with NDArrayCallbacks 0 (:273-280), otherwise its copy
-    /// once the copy succeeded (:285-299). Returns what is ready to deliver.
+    /// 265-328), for a processed frame and for the frames NDPluginFile
+    /// writes (NDPluginFile.cpp:252, :301, :349). `pArrays[0]` is cached
+    /// before the throttle and the sort buffer see the array: the array
+    /// itself with NDArrayCallbacks 0 (:273-280), otherwise its copy once
+    /// the copy succeeded (:285-299). Returns what is ready to deliver.
     pub(super) fn end_process(
         &self,
         arrays: Vec<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
     ) -> Vec<PublishedArray> {
+        self.end(arrays, attributes, copy, true)
+    }
+
+    /// `pArrays[0] = pArray` of the `endProcessCallbacks(pArray, false, ..)`
+    /// a ReadFile write runs inside `writeInt32` (NDPluginFile.cpp:190-193),
+    /// so the write's next one, a PoolPreAllocBuffers say, finds it. Set on
+    /// the writing thread: the rest waits for the data thread, which a write
+    /// must not wait for.
+    pub(super) fn cache_written(&self, array: &Arc<NDArray>) {
+        self.state.lock().last_output_array = Some(Arc::clone(array));
+    }
+
+    /// [`Self::end_process`] for what a write published, whose `pArrays[0]`
+    /// [`Self::cache_written`] set in the write.
+    pub(super) fn end_written(
+        &self,
+        arrays: Vec<Arc<NDArray>>,
+        attributes: Option<&NDAttributeList>,
+    ) -> Vec<PublishedArray> {
+        self.end(arrays, attributes, CopyArray::Never, false)
+    }
+
+    fn end(
+        &self,
+        arrays: Vec<Arc<NDArray>>,
+        attributes: Option<&NDAttributeList>,
+        copy: CopyArray<'_>,
+        cache: bool,
+    ) -> Vec<PublishedArray> {
         let callbacks = self.array_callbacks.get();
         let mut state = self.state.lock();
-        if !callbacks && let Some(last) = arrays.last() {
+        if cache
+            && !callbacks
+            && let Some(last) = arrays.last()
+        {
             state.last_output_array = Some(Arc::clone(last));
         }
         if !callbacks && !self.std_arrays {
             return Vec::new();
         }
+        // C copies only past the NDArrayCallbacks return (:274-286); the
+        // StdArrays waveform route takes the frame as it is.
+        let copy = if callbacks { copy } else { CopyArray::Never };
         let arrays = self.publishable(arrays, attributes, copy);
-        if callbacks && let Some(last) = arrays.last() {
+        if cache
+            && callbacks
+            && let Some(last) = arrays.last()
+        {
             state.last_output_array = Some(Arc::clone(last.array()));
         }
         state.route_output_arrays(arrays)

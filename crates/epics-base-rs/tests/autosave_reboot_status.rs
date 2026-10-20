@@ -16,21 +16,24 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext};
 use epics_base_rs::types::EpicsValue;
 
-/// The IOC booted from `lines`, its save task started; what the three PVs
-/// read once the task has had its start.
+/// The IOC booted from `lines`, its save task started by a
+/// `create_manual_set` after `iocInit`; what the three PVs read once the
+/// task has had its start.
 async fn reboot_pvs(dir: &std::path::Path, lines: &[&str]) -> (f64, String, String) {
     let found = Arc::new(Mutex::new(None));
     let out = found.clone();
     std::fs::write(dir.join("a.db"), "record(ao, \"T:A\") { }\n").unwrap();
+    let holder = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
     let mut app = IocApplication::new()
         .port(0)
-        .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
+        .autosave_startup(holder.clone())
         .startup_line(&format!("set_savefile_path(\"{}\")", dir.display()))
         .startup_line("save_restoreSet_status_prefix(\"T:\")")
         .startup_line("dbLoadRecords(\"$(AUTOSAVE)/db/save_restoreStatus.db\", \"P=T:\")")
@@ -42,13 +45,25 @@ async fn reboot_pvs(dir: &std::path::Path, lines: &[&str]) -> (f64, String, Stri
         app = app.startup_line(line);
     }
     app.run(move |config| async move {
-        let mgr = config.autosave_manager.unwrap();
-        let _task = mgr
-            .clone()
-            .start(&Reactor::current().unwrap(), config.db.clone());
-        sleep(Duration::from_millis(500)).await;
+        let cmds = AutosaveStartupConfig::register_startup_commands(holder);
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        let db = config.db.clone();
+        std::thread::spawn(move || {
+            let ctx = CommandContext::new(db, bridge);
+            let create = cmds.iter().find(|c| c.name == "create_manual_set");
+            let args = [ArgValue::String("".into())];
+            create.unwrap().handler.call(&args, &ctx).unwrap();
+        })
+        .join()
+        .unwrap();
+        // SR_rebootTime is the task's last put at its start.
+        for _ in 0..100 {
+            if is_time(&read(&config.db).2) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
         *out.lock().unwrap() = Some(read(&config.db));
-        mgr.shutdown();
         Ok(())
     })
     .await

@@ -959,7 +959,7 @@ impl ParamPost for PortPost {
             .map(|(reason, addr, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
             .collect();
         if let Err(e) = port.set_params_and_notify_blocking(0, sets) {
-            eprintln!("plugin param post error: {e}");
+            epics_libcom_rs::stderr_println!("plugin param post error: {e}");
         }
     }
 
@@ -1592,9 +1592,7 @@ impl SharedProcessorInner {
                 (vec![Arc::clone(&array)], Some((array, begin)), attributes)
             }
         };
-        let ready = self
-            .delivery
-            .end_process(arrays, attributes.as_ref(), CopyArray::Never);
+        let ready = self.delivery.end_written(arrays, attributes.as_ref());
         let mut output = self.build_publish_batch(
             ready,
             Vec::new(),
@@ -2217,11 +2215,11 @@ impl ParamBatch {
             None => Ok(()),
         };
         if let Err(e) = sent {
-            eprintln!("plugin param flush error (addr 0): {e}");
+            epics_libcom_rs::stderr_println!("plugin param flush error (addr 0): {e}");
         }
         for (addr, updates) in self.extra {
             if let Err(e) = port.set_params_and_notify(addr, updates).await {
-                eprintln!("plugin param flush error (addr {addr}): {e}");
+                epics_libcom_rs::stderr_println!("plugin param flush error (addr {addr}): {e}");
             }
         }
     }
@@ -2384,6 +2382,7 @@ impl PluginPortDriver {
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
         max_memory: usize,
         wiring: Arc<WiringRegistry>,
+        max_threads: i32,
     ) -> AsynResult<(Self, Arc<P>, PluginPool)> {
         let mut base = PortDriverBase::new(
             port_name,
@@ -2420,14 +2419,13 @@ impl PluginPortDriver {
         // QUEUE_FREE (params.rs:40) whatever the struct field is called, so 0
         // here published a permanently full queue on an idle plugin.
         base.set_int32_param(plugin_params.queue_use, 0, queue_size)?;
-        base.set_int32_param(plugin_params.max_threads, 0, PLUGIN_MAX_THREADS)?;
+        base.set_int32_param(plugin_params.max_threads, 0, max_threads)?;
         base.set_int32_param(plugin_params.num_threads, 0, PLUGIN_NUM_THREADS)?;
         base.set_int32_param(plugin_params.blocking_callbacks, 0, blocking_callbacks)?;
         // C `:164-166`: only a non-blocking plugin starts its threads here.
         let callback_threads = blocking_callbacks == 0;
         if callback_threads {
-            let settled =
-                create_callback_threads(PLUGIN_NUM_THREADS, PLUGIN_MAX_THREADS, queue_size);
+            let settled = create_callback_threads(PLUGIN_NUM_THREADS, max_threads, queue_size);
             for line in &settled.lines {
                 base.trace_print(TraceMask::ERROR, format_args!("{line}"));
             }
@@ -2601,6 +2599,11 @@ impl PluginPortDriver {
     }
 
     fn send_published(&self, publish: Published, addressed: Addressed) {
+        if let Published::Read(array) = &publish
+            && let Some(hand_on) = self.hand_on.get()
+        {
+            hand_on.delivery.cache_written(array);
+        }
         if !matches!(publish, Published::Nothing) || !addressed.0.is_empty() {
             let _ = self
                 .param_change_tx
@@ -3222,26 +3225,6 @@ impl PluginRuntimeHandle {
         ack_rx.recv_timeout(timeout).is_ok()
     }
 
-    /// Apply C's `maxThreads` `*Configure` argument (NDPluginDriver.cpp:117,
-    /// `:158`) to an already-built plugin.
-    ///
-    /// In C this is a constructor argument and nothing else: `writeInt32` has
-    /// no `MaxThreads` arm, and `MaxThreads_RBV` is a `longin` with no output
-    /// partner (NDPluginBase.template:290-295), so the configure line is an
-    /// operator's only route to the ceiling. `create_plugin_runtime*` takes no
-    /// such argument, so the configure command applies it here instead.
-    ///
-    /// Blocks until the port holds it, so the ceiling is in place before the
-    /// configure command returns, as it is in C.
-    pub fn set_max_threads(&self, max_threads: i32) {
-        // C `if (maxThreads < 1) maxThreads = 1;` (NDPluginDriver.cpp:117).
-        let _ = self.port_runtime.port_handle().write_int32_blocking(
-            self.plugin_params.max_threads,
-            0,
-            max_threads.max(1),
-        );
-    }
-
     pub fn port_name(&self) -> &str {
         &self.port_name
     }
@@ -3289,9 +3272,21 @@ pub struct PluginThreads {
     /// to `unsigned int` (asynManager.c:2049).
     pub register_priority: u32,
     pub register_stack_size: usize,
+    /// The `maxThreads` the plugin runs with: 1 unless the `*Configure` has
+    /// one, never below 1 ([`Self::with_max_threads`]).
+    max_threads: i32,
 }
 
 impl PluginThreads {
+    /// These threads, with a `*Configure` command's `maxThreads` floored as
+    /// the `NDPluginDriver` constructor floors it (NDPluginDriver.cpp:117).
+    pub fn with_max_threads(self, max_threads: i32) -> Self {
+        Self {
+            max_threads: max_threads.max(1),
+            ..self
+        }
+    }
+
     /// The port's registration, with C's `registerPort` thread arguments.
     pub fn port_config(&self) -> RuntimeConfig {
         RuntimeConfig {
@@ -3308,6 +3303,7 @@ pub const DEFAULT_PLUGIN_THREADS: PluginThreads = PluginThreads {
     stack: DEFAULT_PLUGIN_STACK,
     register_priority: 0,
     register_stack_size: 0,
+    max_threads: PLUGIN_MAX_THREADS,
 };
 
 /// A `*Configure` command's `priority` and `stackSize`, each read as C reads it.
@@ -3318,6 +3314,7 @@ pub fn plugin_threads(priority: i64, stack_size: i64) -> PluginThreads {
         // C's `int` to `unsigned int`: the low 32 bits.
         register_priority: priority as u32,
         register_stack_size: stack_size as u32 as usize,
+        max_threads: PLUGIN_MAX_THREADS,
     }
 }
 
@@ -3396,6 +3393,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         array_data,
         max_memory,
         wiring.clone(),
+        threads.max_threads,
     )
     .expect("failed to create plugin port driver");
     let own_pool = plugin_pool.current();
@@ -4439,6 +4437,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_data,
         max_memory,
         wiring.clone(),
+        threads.max_threads,
     )
     .expect("failed to create plugin port driver");
     let own_pool = plugin_pool.current();
@@ -5157,6 +5156,88 @@ mod tests {
         }
     }
 
+    /// C `endProcessCallbacks` copies a handed-on input into the pool it came
+    /// from with NDArrayCallbacks 1 (NDPluginDriver.cpp:285-286, :419) and
+    /// with 0 only reserves it (:274-279), so only the first charges the
+    /// detector's pool a second buffer.
+    #[test]
+    fn a_handed_on_input_is_copied_into_its_pool_only_with_array_callbacks() {
+        for (name, callbacks) in [("HANDON1", 1), ("HANDON0", 0)] {
+            let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+            let mut output = NDArrayOutput::new();
+            output.add(downstream_sender);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                &asyn_rs::asyn_record::claim_port(name).unwrap(),
+                StampProcessor { stamp: 0 },
+                1_000_000,
+                10,
+                0,
+                output,
+                "",
+                test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
+            );
+            enable_callbacks(&handle);
+            handle
+                .port_runtime()
+                .port_handle()
+                .write_int32_blocking(handle.ndarray_params.array_callbacks, 0, callbacks)
+                .unwrap();
+            params_applied(&handle);
+            let detector = DriverPool::standalone(1_000_000);
+            let frame = detector
+                .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
+                .unwrap()
+                .share();
+            send_array(handle.array_sender(), frame.clone());
+            let received = (callbacks == 1).then(|| downstream_rx.blocking_recv().unwrap());
+            let queued = detector.owner().queued().clone();
+            wait_until("the detector's queue to drain", || queued.get() == 0);
+            if let Some(received) = &received {
+                assert!(!Arc::ptr_eq(received, frame.array()));
+                assert_eq!(received.pool_id(), detector.id());
+            }
+            assert_eq!(detector.num_alloc_buffers(), 1 + callbacks as u32, "{name}");
+        }
+    }
+
+    /// NDPluginStdArrays at NDArrayCallbacks 0 serves its waveform from the
+    /// frame it was handed: C copies only past the NDArrayCallbacks return
+    /// (NDPluginDriver.cpp:274-286).
+    #[test]
+    fn a_std_arrays_frame_at_array_callbacks_0_is_served_uncopied() {
+        let served = Arc::new(parking_lot::Mutex::new(None));
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("SERVE0").unwrap(),
+            ServingProcessor {
+                served: Arc::clone(&served),
+            },
+            1_000_000,
+            10,
+            0,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        params_applied(&handle);
+        let detector = DriverPool::standalone(1_000_000);
+        let frame = detector
+            .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
+            .unwrap()
+            .share();
+        send_array(handle.array_sender(), frame.clone());
+        wait_until("the waveform to be served", || served.lock().is_some());
+        assert!(Arc::ptr_eq(served.lock().as_ref().unwrap(), frame.array()));
+        assert_eq!(detector.num_alloc_buffers(), 1);
+    }
+
     /// Sets its own STAMP to ten times the frame's id and forwards the frame.
     struct StampProcessor {
         stamp: usize,
@@ -5652,6 +5733,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         let (threads, addr) = (
@@ -5724,6 +5806,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         let (limit, twice, _, _) = *ids.lock();
@@ -5938,6 +6021,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base
@@ -6166,6 +6250,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base
@@ -6258,6 +6343,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base
@@ -6309,6 +6395,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         let name = drv.ndarray_params.file_name;
@@ -6412,6 +6499,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base
@@ -6498,6 +6586,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base
@@ -6566,6 +6655,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         assert!(!drv.base.flags.multi_device);
@@ -6605,6 +6695,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         drv.base.flags.multi_device = true;
@@ -6650,6 +6741,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         assert!(!drv.base.flags.multi_device);
@@ -6692,6 +6784,7 @@ mod tests {
             None,
             1_000_000,
             wiring,
+            PLUGIN_MAX_THREADS,
         )
         .unwrap();
         let nd = drv.ndarray_params;
@@ -8301,6 +8394,56 @@ mod tests {
         // C `:154` / `:155`.
         assert_eq!(read(handle.plugin_params.dropped_arrays).unwrap(), 0);
         assert_eq!(read(handle.plugin_params.dropped_output_arrays).unwrap(), 0);
+    }
+
+    /// C hands `maxThreads` to the `NDPluginDriver` constructor and floors it
+    /// there (NDPluginDriver.cpp:117, :158): the port starts holding it, and
+    /// no `writeInt32` override ever sees it written.
+    #[test]
+    fn max_threads_is_a_constructor_argument() {
+        struct Recorder(Arc<parking_lot::Mutex<Vec<usize>>>);
+        impl NDPluginProcess for Recorder {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::forward(array, vec![])
+            }
+            fn plugin_type(&self) -> &str {
+                "Recorder"
+            }
+            fn validate_int32(
+                &self,
+                reason: usize,
+                _addr: i32,
+                _value: i32,
+                verdict: WriteVerdict<i32>,
+                _params: &mut WritePort<'_>,
+            ) -> WriteOutcome<i32> {
+                self.0.lock().push(reason);
+                verdict.into()
+            }
+        }
+        for (port, given, held) in [("MAXTHR_FOUR", 4, 4), ("MAXTHR_ZERO", 0, 1)] {
+            let seen = Arc::default();
+            let (handle, _data_jh) = create_plugin_runtime(
+                &asyn_rs::asyn_record::claim_port(port).unwrap(),
+                Recorder(Arc::clone(&seen)),
+                1_000_000,
+                4,
+                0,
+                ("MAXTHR_UP", 0),
+                test_wiring(),
+                DEFAULT_PLUGIN_THREADS.with_max_threads(given),
+            );
+            let max_threads = handle.plugin_params.max_threads;
+            let port_handle = handle.port_runtime().port_handle();
+            assert_eq!(
+                port_handle.read_int32_blocking(max_threads, 0).unwrap(),
+                held
+            );
+            assert!(!seen.lock().contains(&max_threads), "{port}");
+        }
     }
 
     /// Observable half of `OverlapProcessor`, kept in the test so the

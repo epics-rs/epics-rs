@@ -3,8 +3,8 @@
 //! autosave never mounts anything itself.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -14,6 +14,9 @@ use super::AutosaveStartupConfig;
 use super::request::concatenate_paths;
 use super::settings::SrSettings;
 use super::startup::c_path;
+
+/// C `REMOUNT_CHECK_INTERVAL_SECONDS` (nfs_utils.h:7).
+const REMOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 pub struct NfsHost {
@@ -36,23 +39,42 @@ impl NfsHost {
     }
 
     /// C `save_restore_nfs_show()` (nfs_utils.c:103-108).
-    pub fn show(&self, ctx: &CommandContext, settings: &SrSettings) {
-        ctx.print_fmt(format_args!(
+    pub fn show(&self, out: &dyn Fn(std::fmt::Arguments<'_>), settings: &SrSettings) {
+        out(format_args!(
             "  NFS host: '{}'; address:'{}'",
             self.host_name, self.host_addr
         ));
-        ctx.print_fmt(format_args!("  NFS mount point:\n    '{}'", self.mnt_point));
-        let ok = settings.nfs_ok.load(Ordering::Relaxed) != 0;
-        ctx.print_fmt(format_args!(
+        out(format_args!("  NFS mount point:\n    '{}'", self.mnt_point));
+        let ok = settings.nfs_ok();
+        out(format_args!(
             "  NFS mount status: {}",
             if ok { "Ok" } else { "Failed" }
         ));
     }
 
+    /// C `restore_mount` (nfs_utils.c:31-53): `false` for a remount that
+    /// failed, which every one does here, so C's `just_remounted` never
+    /// becomes 1 and has no counterpart.
+    ///
+    /// C takes `remount_check_time` by value, so its update is lost and
+    /// after the first minute it tries on every pass; that C defect is not
+    /// kept: `last_check` is the task's, and a try is a minute apart.
+    pub(super) fn restore_mount(&self, last_check: &mut Instant, now: Instant) -> bool {
+        if now.duration_since(*last_check) <= REMOUNT_CHECK_INTERVAL {
+            return true;
+        }
+        *last_check = now;
+        crate::epics_println!("save_restore: attempting to remount filesystem");
+        not_managed(); // dismountFileSystem
+        not_managed(); // mountFileSystem
+        crate::epics_println!("save_restore: failed to remount '{}' ", self.mnt_point);
+        false
+    }
+
     /// C `do_mount()` (nfs_utils.c:16-29), whose mount always fails here.
-    fn do_mount(&self) -> i32 {
+    pub(super) fn do_mount(&self) -> i32 {
         not_managed();
-        println!("save_restore: Can't mount '{}'", self.mnt_point);
+        crate::epics_println!("save_restore: Can't mount '{}'", self.mnt_point);
         -1
     }
 }
@@ -66,7 +88,7 @@ pub fn save_restore_set_nfs_host(
     mntpoint: Option<&str>,
 ) -> i32 {
     // Dismount what we mounted, presuming the caller wants a remount.
-    if cfg.settings.nfs_ok.load(Ordering::Relaxed) != 0 && !cfg.nfs.mnt_point.is_empty() {
+    if cfg.settings.nfs_ok() && !cfg.nfs.mnt_point.is_empty() {
         not_managed();
     }
     cfg.nfs.host_name = c_path(hostname);
@@ -90,7 +112,7 @@ pub fn save_restore_set_nfs_host(
         }
         None if !save_path.is_empty() => cfg.nfs.mnt_point = c_path(&save_path),
         None => {
-            println!("save_restore: Mount point not specified, cannot mount NFS.");
+            crate::epics_println!("save_restore: Mount point not specified, cannot mount NFS.");
             return -1;
         }
     }
@@ -139,5 +161,29 @@ impl AutosaveStartupConfig {
                 })
             },
         )]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No try in the task's first minute, a failed one after it, and the
+    /// next a minute after that, not on the next pass as C's lost
+    /// `remount_check_time` has it.
+    #[test]
+    fn a_remount_is_tried_a_minute_after_the_last() {
+        let nfs = NfsHost::default();
+        let start = Instant::now();
+        let mut last = start;
+        assert!(nfs.restore_mount(&mut last, start + REMOUNT_CHECK_INTERVAL));
+        let tried = start + REMOUNT_CHECK_INTERVAL + Duration::from_secs(1);
+        assert!(!nfs.restore_mount(&mut last, tried));
+        assert_eq!(last, tried);
+        assert!(nfs.restore_mount(&mut last, tried + Duration::from_secs(1)));
+        assert!(!nfs.restore_mount(
+            &mut last,
+            tried + REMOUNT_CHECK_INTERVAL + Duration::from_secs(1)
+        ));
     }
 }

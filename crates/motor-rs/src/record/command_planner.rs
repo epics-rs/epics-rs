@@ -16,10 +16,7 @@ impl MotorRecord {
         // HLM/LLM/DHLM/DLLM are pp(TRUE). A rising violation sets
         // stop = 1 (1480), which the latent-stop gate below consumes in
         // this same pass, exactly like C's do_work stop branch.
-        if self.recompute_lvio_during_motion() {
-            self.ctrl.stop = 1;
-            self.mark(m::STOP);
-        }
+        self.recompute_lvio_during_motion();
 
         // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
         // of every put-processing pass, before any other work
@@ -39,13 +36,9 @@ impl MotorRecord {
         // (This includes src == Spmg with a latent stop: the stop gate
         // below wins the pass and the Spmg arm never runs, like C's
         // stop_or_pause return skipping the Go branch.)
-        if self.ctrl.spmg != self.internal.lspg
-            && (self.ctrl.stop != 0 || src == CommandSource::Stop)
-        {
+        if src == CommandSource::Stop {
             self.internal.lspg = self.ctrl.spmg;
-        }
-        if self.ctrl.stop != 0 && src != CommandSource::Stop {
-            self.handle_stop(&mut effects);
+        } else if self.take_latent_stop(&mut effects) {
             return effects;
         }
 
@@ -303,7 +296,7 @@ impl MotorRecord {
         // 2257-2262) return before reaching it, so a SET-mode
         // write is never rolled back. Stopping an in-flight
         // motion is owned by the poll-time read failure
-        // (3687-3697, db5da2f0), ported in check_completion;
+        // (3687-3697, db5da2f0), ported in process_motor_info;
         // a refused write while moving only rolls back to the
         // in-flight target like C.
         if self.conv.urip
@@ -713,6 +706,18 @@ impl MotorRecord {
                 self.backlash_accel_egu(),
             );
         }
+    }
+
+    /// C do_work's top block (1854-1907) for a pass that reaches do_work:
+    /// a pending stop, with any SPMG change it rides (1858), is consumed
+    /// and ends the pass. Returns whether one was pending.
+    pub(super) fn take_latent_stop(&mut self, effects: &mut ProcessEffects) -> bool {
+        if self.ctrl.stop == 0 {
+            return false;
+        }
+        self.internal.lspg = self.ctrl.spmg;
+        self.handle_stop(effects);
+        true
     }
 
     /// Handle STOP command.
@@ -1723,9 +1728,10 @@ impl MotorRecord {
         }
     }
 
-    /// Check if a new command can be accepted.
+    /// Whether do_work reaches its sections and move block: no pending
+    /// stop for its top block (1854-1907) and no Stop/Pause (2237).
     pub fn can_accept_command(&self) -> bool {
-        matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
+        self.ctrl.stop == 0 && matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
     }
 
     /// C clear_buttons (motorRecord.cc:4386-4408): release all four
@@ -1756,7 +1762,7 @@ impl MotorRecord {
             || self.stat.phase != MotionPhase::Idle
             || !self.stat.mip.is_empty()
             || self.stat.dmov == 0
-            || !matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
+            || !self.can_accept_command()
         {
             return false;
         }
@@ -1857,7 +1863,7 @@ impl MotorRecord {
             // C enter_do_work LVIO (1463-1484) precedes do_work.
             if self.recompute_lvio_during_motion() {
                 let mut effects = ProcessEffects::default();
-                self.stop_axis(&mut effects);
+                self.take_latent_stop(&mut effects);
                 return effects;
             }
             let top_block_returns = self.ctrl.stop != 0
@@ -1935,7 +1941,9 @@ impl MotorRecord {
                     // dispatches here even though completion is skipped.
                     // CALLBACK_DATA pass — no implicit GET_INFO (C 2546).
                     let mut effects = ProcessEffects::default();
-                    self.dispatch_latent_collection(&mut effects, false);
+                    if !self.take_latent_stop(&mut effects) {
+                        self.dispatch_latent_collection(&mut effects, false);
+                    }
                     return effects;
                 }
                 self.check_completion()
@@ -1956,6 +1964,8 @@ impl MotorRecord {
                     self.stat.mip.remove(MipFlags::DELAY_REQ);
                     self.stat.mip.insert(MipFlags::DELAY_ACK);
                     effects.commands.push(MotorCommand::Poll);
+                    // C 1416-1426: the ACK pass leaves through process_exit.
+                    effects.process_exit = true;
                 }
                 effects
             }
@@ -1966,11 +1976,7 @@ impl MotorRecord {
                 // pp(TRUE) in C). C still runs the enter_do_work LVIO
                 // re-evaluation (1463-1484) on it: a limit lowered onto a
                 // running jog must stop the axis on the write pass.
-                if self.recompute_lvio_during_motion() {
-                    let mut effects = ProcessEffects::default();
-                    self.stop_axis(&mut effects);
-                    return effects;
-                }
+                self.recompute_lvio_during_motion();
                 // C process (1301-1409): a CALLBACK_DATA pass on an idle
                 // record runs the stopped branch — LOAD_P collapse
                 // (1405-1409), the pp pass (1382-1402) — before falling
@@ -1988,7 +1994,8 @@ impl MotorRecord {
                     // the implicit GET_INFO (2546-2557, NOTHING_DONE
                     // passes only — put_pass carries that discriminator).
                     let mut effects = ProcessEffects::default();
-                    if !self.jog_stop_section(&mut effects) {
+                    if !self.take_latent_stop(&mut effects) && !self.jog_stop_section(&mut effects)
+                    {
                         self.dispatch_latent_collection(&mut effects, true);
                     }
                     effects

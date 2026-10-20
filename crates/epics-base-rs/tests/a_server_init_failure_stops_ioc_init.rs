@@ -79,11 +79,39 @@ async fn a_server_init_hands_its_state_to_the_runner() {
                 config.servers.take::<u16>("probe"),
                 config.servers.take::<u16>("probe"),
             ));
-            epics_base_rs::server::db_server::announce_serving();
+            epics_base_rs::server::db_server::announce_serving("probe");
             Ok(())
         })
         .await
         .expect("the IOC runs");
 
     assert_eq!(*got.lock().unwrap(), Some((Some(0), None)));
+}
+
+/// The failed `iocInit` leaves its `_main_` parked for good, as C's
+/// `cantProceed` leaves the thread. A job queued after that is new work, the
+/// next IOC's softMain or a `main`'s own `iocsh(NULL)`, so it runs on a
+/// `_main_` of its own instead of waiting behind the parked one forever.
+#[epics_macros_rs::epics_test]
+async fn a_job_after_the_failed_ioc_init_runs_on_a_main_of_its_own() {
+    let err = IocApplication::new()
+        .port(0)
+        .register_server_init("probe", |_args: ServerInitArgs| async {
+            Err::<(), _>(CaError::InvalidValue("probe: port held".into()))
+        })
+        .startup_script(&script("server_init_failure_then_job.cmd", &["iocInit"]))
+        .run(|_config| async { panic!("the runner must not be started") })
+        .await
+        .expect_err("the init's error is the IOC's");
+    assert!(err.to_string().contains("probe: port held"), "got: {err}");
+
+    let later = epics_base_rs::runtime::task::run_on_main_thread(|| {
+        std::thread::current().name().map(str::to_owned)
+    })
+    .unwrap();
+    let name = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(10), later)
+        .await
+        .expect("the job waited behind the parked _main_")
+        .unwrap();
+    assert_eq!(name.as_deref(), Some("_main_"));
 }

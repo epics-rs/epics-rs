@@ -200,9 +200,8 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<PluginArgs, String> {
 /// C's `NDPluginDriver` constructor floors it — `if (maxThreads < 1)
 /// maxThreads = 1` (NDPluginDriver.cpp:117) — and an absent iocsh int
 /// argument is 0, so 0 is the "operator said nothing" value on both sides.
-/// The floor is deliberately not applied here: the plugin's `MAX_THREADS`
-/// owner clamps every write, and duplicating the clamp gives two sites that
-/// can disagree about the ceiling the plugin is actually running on.
+/// The floor is [`PluginThreads::with_max_threads`]'s alone, so the threads a
+/// plugin reports are the ones it runs with.
 ///
 /// `index` is the argument's position in *that command's* C signature, which
 /// is not uniform. Most carry it at 9; the two whose signature inserts an

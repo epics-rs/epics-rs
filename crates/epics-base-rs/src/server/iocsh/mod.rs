@@ -57,12 +57,13 @@ pub fn add_registrars(names: &[String]) {
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::runtime::log::{
     ANSI_ESC_BLUE, ANSI_ESC_BOLD, ANSI_ESC_RED, ANSI_ESC_RESET, ANSI_ESC_UNDERLINE,
 };
 use crate::server::database::PvDatabase;
+use epics_libcom_rs::cfmt::CFloat;
 use registry::*;
 
 /// Error-handling mode set by the `on error` command — C `OnError`
@@ -334,85 +335,42 @@ impl Drop for MacroScopeGuard {
     }
 }
 
-/// C `softMain` runs the startup script and the prompt as two STATEMENTS of one
-/// `main` — `iocsh(pathname)` at `softMain.cpp:231` returns before `iocsh(NULL)`
-/// at `:250` is reached — so no prompt can appear while a script line is still
-/// running, and nothing has to arrange that.
+/// softMain's one `iocsh(NULL)` (`softMain.cpp:250`) in the
+/// `IocApplication::run` that holds `_main_`. A protocol runner's shell started
+/// by an `iocInit` typed at the prompt is that same statement, queued behind
+/// the prompt already reading, so it ends with that one instead of opening a
+/// second. Outside a run a prompt is a `main`'s own `iocsh(NULL)`, which C
+/// reads at every call.
 ///
-/// Here the two are on different threads. `IocApplication::run` runs the script
-/// on its own thread, and since the script's own `iocInit` line
-/// now starts the protocol runner (C `iocRun` -> `dbRunServers`), the runner's
-/// interactive shell exists while the script still has lines to run. This pair
-/// states the ordering C gets from statement order: while a startup script is
-/// in flight the count is non-zero and [`IocShell::run_repl`] waits before it
-/// reads its first line.
-///
-/// Zero by default, so every shell that is not under an `IocApplication`
-/// startup script — a `CaServerBuilder` binary, a test, the interactive tail —
-/// passes straight through.
-static STARTUP_SCRIPT_PHASE: (Mutex<usize>, std::sync::Condvar) =
-    (Mutex::new(0), std::sync::Condvar::new());
+/// Only `_main_` jobs open and close a run's span, so the queue's order puts
+/// every prompt the run queued inside it, however late that prompt runs.
+static MAIN_PROMPT: std::sync::Mutex<MainPrompt> = std::sync::Mutex::new(MainPrompt::NoRun);
 
-/// Hold the prompt for as long as the returned guard lives.
-///
-/// A guard rather than a begin/end pair because the phase has to end on every
-/// way out of the script — a load error, a `?`, a panic — and a REPL left
-/// waiting on a phase nobody ended is a wedged IOC.
-pub(crate) fn startup_script_phase() -> StartupScriptPhase {
-    *STARTUP_SCRIPT_PHASE.0.lock().unwrap() += 1;
-    StartupScriptPhase
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MainPrompt {
+    NoRun,
+    Unopened,
+    Opened,
 }
 
-/// See [`startup_script_phase`].
-pub(crate) struct StartupScriptPhase;
+fn set_main_prompt(state: MainPrompt) {
+    *MAIN_PROMPT.lock().unwrap_or_else(|e| e.into_inner()) = state;
+}
 
-impl Drop for StartupScriptPhase {
+/// One run's [`MAIN_PROMPT`] span: a `_main_` job ahead of the run's first
+/// opens it and one behind its last closes it.
+pub(crate) struct SoftMainPromptSpan(());
+
+impl SoftMainPromptSpan {
+    pub(crate) fn open() -> std::io::Result<Self> {
+        crate::runtime::task::run_on_main_thread(|| set_main_prompt(MainPrompt::Unopened))?;
+        Ok(Self(()))
+    }
+}
+
+impl Drop for SoftMainPromptSpan {
     fn drop(&mut self) {
-        let mut in_flight = STARTUP_SCRIPT_PHASE.0.lock().unwrap();
-        *in_flight -= 1;
-        if *in_flight == 0 {
-            STARTUP_SCRIPT_PHASE.1.notify_all();
-        }
-    }
-}
-
-fn await_startup_script_phase() {
-    let mut in_flight = STARTUP_SCRIPT_PHASE.0.lock().unwrap();
-    while *in_flight > 0 {
-        in_flight = STARTUP_SCRIPT_PHASE.1.wait(in_flight).unwrap();
-    }
-}
-
-/// Whether an [`IocShell::run_repl`] is reading stdin. C has one `iocsh(NULL)`
-/// per process (`softMain.cpp:250`); here a protocol runner's shell can be
-/// started by an `iocInit` typed at the prompt of the shell already reading,
-/// and the second reader joins the first instead of racing it for stdin.
-static INTERACTIVE_SHELL: (Mutex<bool>, std::sync::Condvar) =
-    (Mutex::new(false), std::sync::Condvar::new());
-
-/// The claim on stdin, released however the REPL ends.
-struct InteractiveShell;
-
-impl InteractiveShell {
-    /// `None` when another REPL holds stdin; this one has then waited for it
-    /// to end.
-    fn claim_or_wait() -> Option<Self> {
-        let mut reading = INTERACTIVE_SHELL.0.lock().unwrap();
-        if !*reading {
-            *reading = true;
-            return Some(Self);
-        }
-        while *reading {
-            reading = INTERACTIVE_SHELL.1.wait(reading).unwrap();
-        }
-        None
-    }
-}
-
-impl Drop for InteractiveShell {
-    fn drop(&mut self) {
-        *INTERACTIVE_SHELL.0.lock().unwrap() = false;
-        INTERACTIVE_SHELL.1.notify_all();
+        let _ = crate::runtime::task::run_on_main_thread(|| set_main_prompt(MainPrompt::NoRun));
     }
 }
 
@@ -789,6 +747,20 @@ impl IocShell {
         }
     }
 
+    /// [`Self::iocsh_cmd`] from inside a command `caller` is running on this
+    /// thread, writing where `caller` writes: C's `iocshCmd` reaches the
+    /// thread's streams, under whatever redirect the caller's line holds.
+    pub(crate) fn nested_iocsh_cmd(
+        &self,
+        caller: &CommandContext,
+        cmd: impl AsRef<[u8]>,
+    ) -> CommandResult {
+        caller.swap_streams(&self.ctx);
+        let result = self.iocsh_cmd(cmd);
+        caller.swap_streams(&self.ctx);
+        result
+    }
+
     /// Run one split line under its redirects.
     fn execute_command(
         &self,
@@ -866,10 +838,13 @@ impl IocShell {
         let Some((fd, file)) = files.pop() else {
             return f();
         };
+        use crate::runtime::stdio;
         match fd {
-            0 => self.ctx.with_input(file, || self.with_redirects(files, f)),
-            1 => self.ctx.with_output(file, || self.with_redirects(files, f)),
-            2 => self.ctx.with_error(file, || self.with_redirects(files, f)),
+            0 => stdio::redirect_stdin(std::io::BufReader::new(file), || {
+                self.with_redirects(files, f)
+            }),
+            1 => stdio::redirect_stdout(file, || self.with_redirects(files, f)),
+            2 => stdio::redirect_stderr(file, || self.with_redirects(files, f)),
             _ => {
                 let _held = file;
                 self.with_redirects(files, f)
@@ -900,7 +875,7 @@ impl IocShell {
         // commands while it runs — `dbLoadDatabase` and every `.dbd` registrar
         // do — and with one process-wide table (see `COMMAND_REGISTRY`) it is
         // load-bearing here too: the script's `iocInit` line performs the build,
-        // and the build registers each link set's `caxr`/`dbcaxr`/… before that
+        // and the build registers each link set's `dbcaxr`/`pvxr`/… before that
         // line returns. Holding the read guard across the handler made that a
         // deadlock. `CommandDef` is `Arc`-backed so the clone is the lookup's
         // result, not a copy of the command.
@@ -1236,6 +1211,20 @@ impl IocShell {
             .unwrap_or(Ok(()))
     }
 
+    /// softMain's `iocsh(NULL)`: [`Self::run_repl`], except a second time in
+    /// one `IocApplication::run`, which C's one statement never reaches.
+    pub fn run_main_prompt(&self) -> Result<(), String> {
+        {
+            let mut prompt = MAIN_PROMPT.lock().unwrap_or_else(|e| e.into_inner());
+            match *prompt {
+                MainPrompt::Opened => return Ok(()),
+                MainPrompt::Unopened => *prompt = MainPrompt::Opened,
+                MainPrompt::NoRun => {}
+            }
+        }
+        self.run_repl()
+    }
+
     /// Run the interactive REPL. Blocks until exit or EOF.
     ///
     /// When stdin is not a terminal (piped input, `<script.cmd` shell
@@ -1244,15 +1233,6 @@ impl IocShell {
     /// PROMPT is not a terminal decoration in C and is not one here either,
     /// see `Self::run_repl_piped`.
     pub fn run_repl(&self) -> Result<(), String> {
-        // C's `iocsh(NULL)` is the statement after `iocsh(pathname)`; see
-        // [`STARTUP_SCRIPT_PHASE`] for why that ordering has to be waited for
-        // rather than assumed here.
-        await_startup_script_phase();
-        // The shell already reading stdin ends the process's interactive
-        // session; this one ends with it, its commands on the shared table.
-        let Some(_stdin) = InteractiveShell::claim_or_wait() else {
-            return Ok(());
-        };
         // C `iocsh.cpp:1045-1050` sets `scope.interactive` from
         // `pathname == NULL` — reading stdin, terminal or not — so the
         // piped path below is the interactive scope too.
@@ -1310,7 +1290,6 @@ impl IocShell {
         rl.set_helper(Some(completion::IocshCompleter::new(
             self.registry.clone(),
             self.ctx.db().clone(),
-            self.ctx.bridge().clone(),
         )));
 
         // epics-base 8-D `c0da3dd` ANSI color: tint the prompt
@@ -1411,7 +1390,7 @@ impl IocShell {
                     }
                 }
                 Err(e) => {
-                    eprintln!("stdin read error: {e}");
+                    crate::stderr_println!("stdin read error: {e}");
                     break;
                 }
             }
@@ -1542,8 +1521,10 @@ impl IocShell {
                 ErrorReaction::Stop
             }
             OnError::Halt { timeout } if timeout > 0.0 && timeout.is_finite() => {
-                self.ctx
-                    .eprintln(&format!("iocsh Error: Waiting {timeout:.1} sec ..."));
+                self.ctx.eprintln(&format!(
+                    "iocsh Error: Waiting {:.1} sec ...",
+                    CFloat(timeout)
+                ));
                 // C `iocsh.cpp:1140` sleeps through `epicsThreadSleep`,
                 // so an `on error wait 1e300` continues at once instead
                 // of parking the script on a saturated `Duration::MAX`.
@@ -1984,35 +1965,61 @@ pub(crate) fn join_backslash_continuations(input: &[u8]) -> Vec<(usize, Vec<u8>)
 }
 
 #[cfg(test)]
+impl IocShell {
+    /// `line > f` on this shell: what `f` got, and what reached C's raw
+    /// `stdout` (the console cell) meanwhile.
+    pub(crate) fn file_and_console(&self, line: &str) -> (String, String) {
+        self.fd_file_and_console(1, line)
+    }
+
+    /// [`Self::file_and_console`] for `line 2> f` and C's raw `stderr`.
+    pub(crate) fn err_file_and_console(&self, line: &str) -> (String, String) {
+        self.fd_file_and_console(2, line)
+    }
+
+    fn fd_file_and_console(&self, fd: u8, line: &str) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        let console = dir.path().join("console.txt");
+        let sink = std::fs::File::create(&console).unwrap();
+        let line = format!("{line} {fd}> {}", file.display());
+        let _ = match fd {
+            1 => self
+                .ctx
+                .with_console(sink, std::io::stderr(), || self.execute_line(&line)),
+            _ => self
+                .ctx
+                .with_console(std::io::stdout(), sink, || self.execute_line(&line)),
+        };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        (read(&file), read(&console))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
 
-    /// One `iocsh(NULL)` per process: a second REPL waits for the one holding
-    /// stdin and ends with it rather than reading alongside it.
+    /// One `iocsh(NULL)` per run: once it has opened, a later prompt — a
+    /// runner's, queued behind it on `_main_` — returns without reading. Run
+    /// over a stdin that never ends, so a read would hang instead of passing.
+    #[cfg(unix)]
     #[test]
-    fn a_second_interactive_shell_waits_for_the_first_and_ends_with_it() {
-        let first = InteractiveShell::claim_or_wait().expect("stdin is free");
+    fn a_prompt_after_the_main_one_returns_without_reading() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a two-int out-param; dup2 onto 0 replaces this
+        // test process's stdin with the pipe's read end, kept open by `fds[1]`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::dup2(fds[0], 0) }, 0);
+
+        *MAIN_PROMPT.lock().unwrap() = MainPrompt::Opened;
         let (tx, rx) = std::sync::mpsc::channel();
-        let second = std::thread::spawn(move || {
-            tx.send(InteractiveShell::claim_or_wait().is_some())
-                .unwrap();
-        });
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
-            "the second shell returned while the first still reads"
-        );
-        drop(first);
+        std::thread::spawn(move || tx.send(make_shell().run_main_prompt()).unwrap());
         assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)),
-            Ok(false),
-            "the second shell ends with the first and never claims stdin"
-        );
-        second.join().unwrap();
-        assert!(
-            InteractiveShell::claim_or_wait().is_some(),
-            "stdin is free again"
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(Ok(())),
+            "the second prompt read stdin"
         );
     }
 
@@ -2236,7 +2243,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
     }
 
-    fn make_shell() -> IocShell {
+    pub(super) fn make_shell() -> IocShell {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
         let bridge = {
@@ -3173,6 +3180,34 @@ mod tests {
         assert!(content.starts_with("existing\n"));
         assert!(content.contains("TEST_REC"));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// C `epicsStdio.h` makes each `printf` the thread's stdout, so `>`
+    /// reaches a print that has no `CommandContext`, in order with the
+    /// command's own lines; another thread's print stays on the console.
+    #[test]
+    fn a_redirect_reaches_a_print_with_no_context() {
+        let shell = make_shell();
+        shell.register(CommandDef::new(
+            "deepPrint",
+            vec![],
+            "deepPrint",
+            |_args: &[ArgValue], ctx: &CommandContext| {
+                ctx.println("one");
+                crate::epics_println!("two");
+                std::thread::spawn(|| crate::epics_println!("elsewhere"))
+                    .join()
+                    .unwrap();
+                ctx.println("three");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        shell
+            .execute_line(format!("deepPrint > {}", script_token(&out)))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "one\ntwo\nthree\n");
     }
 
     /// A `2>` (fd≠1) redirect must NOT capture the command's stdout. C

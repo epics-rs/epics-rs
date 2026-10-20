@@ -4,6 +4,7 @@
 //! builds it from the protocol's format.
 
 use crate::buffer::StreamBuffer;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// A conversion as glibc's parser reads it.
 struct Spec {
@@ -222,7 +223,7 @@ const MAX_SIGNIFICANT: usize = 800;
 
 /// `a` (finite, not negative) as `%.{p}e` does, mantissa and exponent.
 fn exp_digits(a: f64, p: usize) -> (String, i32) {
-    let s = format!("{:.*e}", p.min(MAX_SIGNIFICANT), a);
+    let s = format!("{:.*e}", p.min(MAX_SIGNIFICANT), CFloat(a));
     let (m, x) = s.split_once('e').unwrap();
     let mut m = m.to_string();
     m.extend(std::iter::repeat_n('0', p.saturating_sub(MAX_SIGNIFICANT)));
@@ -230,7 +231,7 @@ fn exp_digits(a: f64, p: usize) -> (String, i32) {
 }
 
 fn fixed_digits(a: f64, p: usize) -> String {
-    let mut s = format!("{:.*}", p.min(MAX_FRACTION), a);
+    let mut s = format!("{:.*}", p.min(MAX_FRACTION), CFloat(a));
     s.extend(std::iter::repeat_n('0', p.saturating_sub(MAX_FRACTION)));
     s
 }

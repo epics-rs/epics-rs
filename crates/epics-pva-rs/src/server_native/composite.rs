@@ -263,12 +263,16 @@ impl ChannelSource for CompositeSource {
     }
 
     /// Each entry in consultation order, a nested composite's in its place.
-    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+    fn registry_entries(&self) -> Option<Vec<super::RegistryEntry>> {
         let mut out = Vec::new();
         for ((order, name), source) in self.entries.read().iter() {
             match source.registry_entries() {
                 Some(inner) => out.extend(inner),
-                None => out.push((name.clone(), *order)),
+                None => out.push(super::RegistryEntry {
+                    name: name.clone(),
+                    order: *order,
+                    source: source.clone(),
+                }),
             }
         }
         Some(out)
@@ -331,17 +335,15 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
+    fn list_pvs(&self) -> Vec<RecordName> {
         let sources = self.snapshot();
-        async move {
-            let mut all: Vec<RecordName> = Vec::new();
-            for src in sources {
-                all.extend(src.list_pvs().await);
-            }
-            all.sort();
-            all.dedup();
-            all
+        let mut all: Vec<RecordName> = Vec::new();
+        for src in sources {
+            all.extend(src.list_pvs());
         }
+        all.sort();
+        all.dedup();
+        all
     }
 
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
@@ -964,9 +966,9 @@ mod tests {
     }
 
     impl ChannelSource for PvSrc {
-        fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
+        fn list_pvs(&self) -> Vec<RecordName> {
             let n = RecordName::from(self.name);
-            async move { vec![n] }
+            vec![n]
         }
         fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
             let want = self.name;
@@ -1026,8 +1028,8 @@ mod tests {
             tag: &'static str,
         }
         impl ChannelSource for EdgeSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { true }
@@ -1132,8 +1134,8 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
@@ -1225,8 +1227,8 @@ mod tests {
             blanket: bool,
         }
         impl ChannelSource for WmSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let owned = name == self.serves.as_bytes();
@@ -1330,8 +1332,8 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
@@ -1565,8 +1567,11 @@ mod tests {
             )
             .unwrap();
         }
-        let served =
-            crate::server_native::server_info::compose_with_server_info(user as DynSource).unwrap();
+        let served = crate::server_native::server_info::compose_with_server_info(
+            user as DynSource,
+            Arc::new(crate::server_native::SharedSource::new()),
+        )
+        .unwrap();
         assert_eq!(served.beacon_change(), 2);
     }
 
@@ -1651,7 +1656,7 @@ mod tests {
             10,
         )
         .unwrap();
-        let mut pvs = comp.list_pvs().await;
+        let mut pvs = comp.list_pvs();
         pvs.sort();
         assert_eq!(pvs, vec!["alpha".to_string(), "beta".to_string()]);
     }
@@ -1682,8 +1687,8 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let seen = self.plain_seen.clone();
@@ -1878,8 +1883,8 @@ mod tests {
             name: &'static str,
         }
         impl ChannelSource for NonSearchableSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let m = name == self.name.as_bytes();
@@ -2003,8 +2008,8 @@ mod tests {
             name: &'static str,
         }
         impl ChannelSource for RefusesAtCreateSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-                async { Vec::new() }
+            fn list_pvs(&self) -> Vec<RecordName> {
+                Vec::new()
             }
             /// The CREATE gate: this source serves nothing.
             fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {

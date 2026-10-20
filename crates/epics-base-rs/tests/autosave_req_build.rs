@@ -31,6 +31,9 @@ record(ao, "L") {
 record(ao, "N") {
     info(autosaveFields, "OUT$ PREC")
 }
+record(ao, "U") {
+    info(autosaveFields, "ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ PREC")
+}
 record(bo, "B") {
     info(autosaveFields_pass0, "VAL")
     info(autosaveFields, "ZNAM")
@@ -99,11 +102,12 @@ fn child_req_build() {
     epics_base_rs::runtime::log::errlog_flush();
 }
 
-const SETTINGS: &str = "A.PREC\nA.DESC\nN.OUT$\nN.PREC\nB.ZNAM\nS.VAL$\nS.OUT$\nS.DESC\n";
+const SETTINGS: &str = "A.PREC\nA.DESC\nN.OUT$\nN.PREC\nU.PREC\nB.ZNAM\nS.VAL$\nS.OUT$\nS.DESC\n";
 
 /// Records by type, then load order, an alias once; a field the record
 /// lacks, or a `$` on a field that is neither a string nor a link, is
-/// named and left out; ".req" is appended.
+/// named and left out, cut at 29 bytes even inside a character; ".req"
+/// is appended.
 #[test]
 fn a_request_file_from_the_info_items() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,6 +124,10 @@ fn a_request_file_from_the_info_items() {
         [
             "makeAutosaveFileFromDbInfo: A.NOPE not found",
             "makeAutosaveFileFromDbInfo: L.VAL$ not found",
+            &format!(
+                "makeAutosaveFileFromDbInfo: U.{}\u{FFFD} not found",
+                "Ä".repeat(14)
+            ),
         ]
     );
     assert_eq!(errlog, Vec::<String>::new());

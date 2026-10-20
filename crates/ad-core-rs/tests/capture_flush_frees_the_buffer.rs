@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter, NDPluginFileBase};
+use ad_core_rs::plugin::file_base::{NDFileMode, NDFileOpenMode, NDFileWriter, NDPluginFileBase};
 
 /// Records which frame landed in which file, and fails a chosen write.
 struct RecordingWriter {
@@ -38,7 +38,7 @@ impl RecordingWriter {
 }
 
 impl NDFileWriter for RecordingWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, _mode: NDFileOpenMode, _array: &NDArray) -> ADResult<()> {
         self.current = Some(path.to_path_buf());
         Ok(())
     }

@@ -720,14 +720,14 @@ fn array_fixture(dbd: &Dbd, record_type: &str) -> Option<ArrayFixture> {
         // Not a `caput -a REC n v0 v1 …` destination — named rather than
         // dropped in silence.
         DbaddrShape::LongString { .. } => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
                  cvt_dbaddr serves ONE string of SIZV bytes; the put phase drives it"
             );
             return None;
         }
         DbaddrShape::Opaque => {
-            eprintln!(
+            epics_base_rs::stderr_println!(
                 "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
                  the record type declares no capacity field, so the .dbd names no \
                  bounded element sequence to drive"

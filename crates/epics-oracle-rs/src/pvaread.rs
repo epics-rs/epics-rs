@@ -97,6 +97,7 @@ use crate::ntshape::NtShape;
 use crate::pvatool::{PvaTools, Readings};
 use crate::report::{Counts, Denominator, StaleRow};
 use crate::surface::{Coverage, Surface};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// The named contracts a PVA channel can differ on.
 ///
@@ -358,7 +359,7 @@ impl PvaReport {
             "  channels measured on BOTH sides, BOTH contracts: {}/{} = {:.1}%",
             cov.measured,
             cov.enumerated,
-            cov.percent()
+            CFloat(cov.percent())
         );
         let _ = writeln!(
             s,
@@ -581,7 +582,7 @@ pub fn probe(
     let mut cases = Vec::new();
     for (i, rt) in record_types.iter().enumerate() {
         let n = surface.fields_of(rt).count();
-        eprintln!(
+        epics_base_rs::stderr_println!(
             "[{}/{}] pva read: {rt} ({n} channels)",
             i + 1,
             record_types.len()
@@ -913,7 +914,7 @@ fn resolve<S: PvaServer>(
             // terminate.
             suspects.clone_from(&pending);
         }
-        eprintln!(
+        epics_base_rs::stderr_println!(
             "    the {} PVA server died under {} — reading its {} unanswered channel(s) \
              one at a time, each death re-confirmed on a server that channel is the sole \
              client of, so only the channel that kills it is charged",

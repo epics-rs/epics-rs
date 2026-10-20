@@ -41,6 +41,7 @@ use epics_base_rs::server::iocsh::registry::{
 
 use crate::server_native::PvaServerConfig;
 use crate::server_native::ServerReportHandle;
+use crate::server_native::SharedPV;
 
 /// pvxs's `server()` singleton as this port can spell it: `None` until a
 /// server is bound, which is the state `pvxsr` is registered in.
@@ -67,6 +68,25 @@ pub fn publish_pvxs_report(handle: ServerReportHandle) {
 /// Returns the handle by clone so no caller holds the lock across its report.
 pub fn pvxs_report() -> Option<ServerReportHandle> {
     report_cell().read().unwrap().clone()
+}
+
+/// pvxs `ioc::server().addPV(name, pv)` (`iochooks.cpp:80-87`,
+/// `server.cpp:174-180`): `pv` joins the singleton's `__builtin` store,
+/// before `start` as after.
+pub fn pvxs_add_pv(name: &str, pv: SharedPV) -> Result<(), AddPvRefused> {
+    let handle = pvxs_report().ok_or(AddPvRefused::NoInstance)?;
+    (handle.builtin().try_add(name, pv)).map_err(|_| AddPvRefused::Duplicate)
+}
+
+/// Why [`pvxs_add_pv`] refused; `Display` is the `what()` pvxs throws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AddPvRefused {
+    /// No server bound (`iochooks.cpp:86`).
+    #[error("No Instance")]
+    NoInstance,
+    /// The name is in `__builtin` already (`sharedpv.cpp:588`).
+    #[error("add() will not create duplicate PV")]
+    Duplicate,
 }
 
 /// pvxs `pvxsBaseRegistrar`'s `pvxsr` registration
@@ -175,16 +195,45 @@ pub fn pvxs_base_registrar_with_enable2(
         Ok(bound) => {
             publish_server_port(bound.bound_tcp_port());
             publish_pvxs_report(bound.report_handle());
+            register_pvxs_init_hook();
             Some(bound)
         }
         Err(e) => {
-            eprintln!("Error in pvxsBaseRegistrar : {}", pvxs_what(&e));
+            epics_libcom_rs::stderr_println!("Error in pvxsBaseRegistrar : {}", pvxs_what(&e));
             None
         }
     };
     app.register_server_init(PVXS_SERVER, move |_| async move {
         Ok::<_, epics_base_rs::error::CaError>(PvxsServer(bound))
     })
+}
+
+/// pvxs `initHookRegister(&pvxsInitHook)` (`ioc/iochooks.cpp:501`), which a
+/// failed bind's throw skips. C dedups the registration by function pointer;
+/// a closure cannot be compared, so a second registrar call is a no-op here.
+fn register_pvxs_init_hook() {
+    use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        init_hook_register(std::sync::Arc::new(|state| {
+            if matches!(state, InitHookState::AtBeginning) {
+                register_qsrv2_db_server();
+            }
+        }));
+    });
+}
+
+/// pvxs `dbRegisterQSRV2` (`ioc/singlesourcehooks.cpp:138-154`): QSRV's
+/// `dbServer`, whose `client` names the PVA peer behind a put.
+pub fn register_qsrv2_db_server() {
+    use epics_base_rs::server::db_server::{DbServer, db_register_server};
+    db_register_server(DbServer {
+        name: "qsrv2",
+        report: Some(Box::new(|level, out: &dyn Fn(&str)| {
+            report_server(level as i64, &|line| out(&String::from_utf8_lossy(line)))
+        })),
+        client: Some(super::current_op::q_client),
+    });
 }
 
 /// pvxs's `e.what()` for a failed server: a bind throws `std::system_error`,
@@ -234,71 +283,92 @@ pub fn pvxsr_command() -> CommandDef {
                 _ => 0,
             };
 
-            let Some(handle) = pvxs_report() else {
-                return Ok(CommandOutcome::Continue);
-            };
-            for line in handle.pvxs_config().lines() {
-                ctx.println(line);
-            }
-            for (name, order) in handle.source_list() {
-                ctx.println(&format!("Source: {name} prio={order} "));
-            }
-
-            // pvxs's `if(detail<2) return` (src/server.cpp:308).
-            if detail >= 2 {
-                let report = handle.report();
-                ctx.println(&format!(
-                    "State: {} TCP_Port: {}",
-                    if handle.is_running() {
-                        "Running"
-                    } else {
-                        "Stopped"
-                    },
-                    report.tcp_port,
-                ));
-                for (addr, peer) in &report.peers {
-                    // Peer line carries only the auth *method* at this level
-                    // (src/server.cpp:338 `auth=<method>`); the account is part
-                    // of the full credential dump gated below.
-                    let method = peer
-                        .credentials
-                        .as_ref()
-                        .map(|(_account, method)| method.as_str())
-                        .unwrap_or("unvalidated");
-                    ctx.println(&format!(
-                        "  peer {addr}: {} channel(s), bytes in={} out={}, auth={}{}",
-                        peer.channels,
-                        peer.bytes_in,
-                        peer.bytes_out,
-                        method,
-                        if peer.tls { ", tls" } else { "" },
-                    ));
-                    // Full credentials + per-channel listing — pvxs gates
-                    // both at detail > 2 (src/server.cpp:339 full cred,
-                    // src/server.cpp:342 per-channel).
-                    if detail >= 3 {
-                        if let Some((account, method)) = &peer.credentials {
-                            // pvxs streams `cred->account` as its bytes.
-                            ctx.println_bytes(
-                                &[
-                                    b"    credentials: ".as_slice(),
-                                    account.as_bytes(),
-                                    b"/",
-                                    method.as_bytes(),
-                                ]
-                                .concat(),
-                            );
-                        }
-                        for ch in &peer.channels_detail {
-                            ctx.println(&format!("      {} tx={} rx={}", ch.name, ch.tx, ch.rx));
-                        }
-                    }
-                }
-            }
-
+            report_server(detail, &|line| ctx.println_bytes(line));
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// pvxs `operator<<(Server)` (`src/server.cpp:281-379`) at `detail`, one line
+/// per `out` call: what `pvxsr` prints, and QSRV2's `dbServer.report`
+/// (`qReport`, `ioc/singlesourcehooks.cpp:75-86`) under `dbsr`. Both print
+/// nothing without a server.
+fn report_server(detail: i64, out: &dyn Fn(&[u8])) {
+    let Some(handle) = pvxs_report() else {
+        return;
+    };
+    let line = |s: &str| out(s.as_bytes());
+    for config in handle.pvxs_config().lines() {
+        line(config);
+    }
+    // From detail 1 each source's `show` follows its `prio=` under one
+    // `Indented` (`src/server.cpp:297-302`).
+    if detail > 0 {
+        for (name, order, show) in handle.source_shows() {
+            line(&format!("Source: {name} prio={order} {}", show.kind));
+            let indent: &[u8] = if show.nested { b"        " } else { b"    " };
+            let mut names = show.names;
+            names.sort();
+            names.dedup();
+            for pv in names {
+                out(&[indent, pv.as_bytes()].concat());
+            }
+        }
+    } else {
+        for (name, order) in handle.source_list() {
+            line(&format!("Source: {name} prio={order} "));
+        }
+    }
+
+    // pvxs's `if(detail<2) return` (src/server.cpp:308).
+    if detail >= 2 {
+        let report = handle.report();
+        line(&format!(
+            "State: {} TCP_Port: {}",
+            if handle.is_running() {
+                "Running"
+            } else {
+                "Stopped"
+            },
+            report.tcp_port,
+        ));
+        for (addr, peer) in &report.peers {
+            // Peer line carries only the auth *method* at this level
+            // (src/server.cpp:338 `auth=<method>`); the account is part
+            // of the full credential dump gated below.
+            let method = peer
+                .credentials
+                .as_ref()
+                .map(|(_account, method)| method.as_str())
+                .unwrap_or("unvalidated");
+            line(&format!(
+                "  peer {addr}: {} channel(s), bytes in={} out={}, auth={}{}",
+                peer.channels,
+                peer.bytes_in,
+                peer.bytes_out,
+                method,
+                if peer.tls { ", tls" } else { "" },
+            ));
+            // Full credentials + per-channel listing — pvxs gates
+            // both at detail > 2 (src/server.cpp:339 full cred,
+            // src/server.cpp:342 per-channel).
+            if detail >= 3 {
+                if let Some((account, method)) = &peer.credentials {
+                    // pvxs streams `cred->account` as its bytes.
+                    out(&[
+                        b"    credentials: ".as_slice(),
+                        account.as_bytes(),
+                        b"/",
+                        method.as_bytes(),
+                    ]
+                    .concat());
+                }
+                for ch in &peer.channels_detail {
+                    line(&format!("      {} tx={} rx={}", ch.name, ch.tx, ch.rx));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +392,90 @@ mod tests {
             app.startup_commands().iter().any(|c| c.name == "pvxsr"),
             "`pvxsr` must be on the startup shell"
         );
+    }
+
+    /// The base `Source::show` names sit one indent deeper than the IOC
+    /// sources' (`src/server.cpp:841`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pvxsr_1_nests_the_names_of_a_plain_source() {
+        assert_eq!(
+            pvxsr_1_sources(),
+            [
+                "Source: __builtin prio=-1 StaticProvider",
+                "Source: __server prio=-1 Source",
+                "Source: __user prio=0 Source",
+                "        A",
+                "        B",
+            ]
+        );
+    }
+
+    /// pvxs `onList` is a plain call (`src/server.cpp:837-847`), so the
+    /// names print on a thread that may not block on the runtime — here the
+    /// only thread of the runtime, busy running the command.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pvxsr_1_lists_names_on_the_runtime_s_only_thread() {
+        assert_eq!(
+            &pvxsr_1_sources()[2..],
+            ["Source: __user prio=0 Source", "        A", "        B"]
+        );
+    }
+
+    /// `pvxsr 1`'s `Source:` lines and the names under them, for a server
+    /// on a plain source serving `A` and `B`.
+    #[cfg(tokio_backend)]
+    fn pvxsr_1_sources() -> Vec<String> {
+        use crate::pvdata::{FieldDesc, PvField};
+        use crate::server_native::{ChannelSource, MonitorStream, OpError, PvaServer};
+        use epics_base_rs::types::RecordName;
+
+        struct Plain;
+        impl ChannelSource for Plain {
+            fn list_pvs(&self) -> Vec<RecordName> {
+                vec!["B".into(), "A".into()]
+            }
+            async fn has_pv(&self, _: &[u8]) -> bool {
+                false
+            }
+            async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
+                None
+            }
+            async fn get_value(&self, _: &[u8]) -> Option<PvField> {
+                None
+            }
+            async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
+                Err("read-only".into())
+            }
+            async fn is_writable(&self, _: &[u8]) -> bool {
+                false
+            }
+            async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
+                None
+            }
+        }
+
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(std::sync::Arc::new(Plain), config).unwrap();
+        publish_pvxs_report(server.report_handle());
+        let lines = std::cell::RefCell::new(Vec::new());
+        report_server(1, &|l| {
+            lines
+                .borrow_mut()
+                .push(String::from_utf8_lossy(l).into_owned())
+        });
+        lines
+            .into_inner()
+            .into_iter()
+            .filter(|l| l.starts_with("Source: ") || l.starts_with(' '))
+            .collect()
     }
 }

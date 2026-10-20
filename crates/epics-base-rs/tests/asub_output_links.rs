@@ -145,13 +145,9 @@ async fn r9_78_failed_do_sub_pushes_nothing() {
 #[epics_macros_rs::epics_test]
 async fn r9_78_failed_input_fetch_pushes_nothing() {
     let db = asub_db(0).await;
-    {
-        let inst = db.get_record("ASUB").unwrap();
-        let mut g = inst.write();
-        g.record
-            .put_field("INPA", EpicsValue::String("NOSUCHREC".into()))
-            .unwrap();
-    }
+    db.put_pv_no_process("ASUB.INPA", EpicsValue::String("NOSUCHREC".into()))
+        .await
+        .unwrap();
 
     process(&db, "ASUB").await;
 

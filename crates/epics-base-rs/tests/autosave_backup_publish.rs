@@ -27,6 +27,7 @@ fn entry(name: &str, val: &str) -> SaveEntry {
         pv_name: name.into(),
         value: val.into(),
         connected: true,
+        array_fprintfs: Vec::new(),
     }
 }
 
@@ -111,7 +112,7 @@ async fn a_failed_rotation_fails_and_records_the_save_cycle() {
         request_pvs: vec!["PV1".into()],
         backup: savb_only(),
         macros: Default::default(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     })
     .await

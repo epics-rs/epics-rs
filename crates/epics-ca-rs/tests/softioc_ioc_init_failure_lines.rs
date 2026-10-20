@@ -23,7 +23,12 @@ const REFUSED: &str =
     "iocBuild: ERROR IOC can only be initialized from uninitialized or stopped state";
 
 /// softioc-rs `args` then `script`, stdin `exit`: its stderr lines, sorted.
+/// A port taken before the IOC bound it is drawn again.
 fn stderr_lines(args: &[&str], script: &str) -> Vec<String> {
+    named_port::on_a_named_port(|port| stderr_lines_on(args, script, port))
+}
+
+fn stderr_lines_on(args: &[&str], script: &str, port: u16) -> Option<Vec<String>> {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("a.db"), "record(ai, \"R1\") {\n}\n").unwrap();
     std::fs::write(dir.path().join("st.cmd"), script).unwrap();
@@ -33,10 +38,7 @@ fn stderr_lines(args: &[&str], script: &str) -> Vec<String> {
         .arg("st.cmd")
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env(
-            "EPICS_CA_SERVER_PORT",
-            named_port::free_for_tcp_and_udp().to_string(),
-        )
+        .env("EPICS_CA_SERVER_PORT", port.to_string())
         .env(
             "EPICS_CA_REPEATER_PORT",
             named_port::free_for_tcp_and_udp().to_string(),
@@ -48,12 +50,13 @@ fn stderr_lines(args: &[&str], script: &str) -> Vec<String> {
         .expect("spawn softioc-rs");
     child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
     let out = child.wait_with_output().expect("softioc-rs output");
-    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .map(str::to_owned)
-        .collect();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if named_port::verdict::rs_ioc_port_was_taken(&stderr, port) {
+        return None;
+    }
+    let mut lines: Vec<String> = stderr.lines().map(str::to_owned).collect();
     lines.sort();
-    lines
+    Some(lines)
 }
 
 fn sorted(lines: &[&str]) -> Vec<String> {

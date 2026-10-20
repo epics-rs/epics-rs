@@ -6,10 +6,13 @@
 # table) or to a port nobody listens on, and keeps AsynDriverInterface.cc's
 # debug lines of stderr without the thread name and file:line prefix,
 # pointers masked as 0x*, and the bus's error lines (those naming one of
-# its functions):
+# its functions, and connectToBus's EOS warning):
 #   attach-connected, attach-disconnected, attach-noport: record "rec" of
 #     a.proto attached at iocInit to P with and without a listener, and to
 #     a port Q that does not exist; every line.
+#   noeos: "rec" reloaded (streamReload) on P configured with noProcessEos,
+#     whose getInputEos fails, so the protocol parsed at iocInit makes
+#     connectToBus warn; every line.
 #   lock: "rec" processed once; the lockRequest, lockHandler and unlock
 #     lines.
 #   locktimeout: "first" (lt.proto hold) owns P while waiting for a reply
@@ -110,7 +113,7 @@ EOF
 keep() {
     perl -ne 'next unless s/^\S+ //;
         if (/^\S+\.cc?:\d+: /) { next unless s/^AsynDriverInterface\.cc:\d+: // }
-        else { next unless /^\S+ \w+: (pasynManager->|port )/ }
+        else { next unless /^\S+ \w+: (pasynManager->|port )|^\S+: warning: No input EOS/ }
         s/0x[0-9a-f]+/0x*/g; print if /'"$2"'/' "$work/$1.err" >"$here/$1.log"
 }
 
@@ -119,11 +122,15 @@ keep_raw() { grep -E "$2" "$work/$1.err" >"$here/$1.log"; }
 
 rec() { printf 'record(%s, "%s") { field(DTYP, "stream") field(%s, "@%s P") }' "$@"; }
 
-for c in ${@:-attach-connected attach-disconnected attach-noport lock locktimeout write flush read noreply readtimeout eos eosrestore split splitrestore connect intr reinit reinit-fail reconnect syncrefused}; do
+for c in ${@:-attach-connected attach-disconnected attach-noport noeos lock locktimeout write flush read noreply readtimeout eos eosrestore split splitrestore connect intr reinit reinit-fail reconnect syncrefused}; do
     case $c in
     attach-connected) boot $c 'Q=>' "$(rec ai rec INP 'a.proto p')" "" && keep $c . ;;
     attach-disconnected) boot $c - "$(rec ai rec INP 'a.proto p')" "" && keep $c . ;;
     attach-noport) boot $c - "$(rec ai rec INP 'a.proto p' | sed 's/ P"/ Q"/')" "" && keep $c . ;;
+    noeos)
+        boot $c 'Q=>' "$(rec ai rec INP 'a.proto p')" "streamReload rec" streamApp \
+            "drvAsynIPPortConfigure \"P\", \"127.0.0.1:$port\", 0, 0, 1"
+        keep $c . ;;
     lock)
         boot $c 'X=>1\r' "$(rec ai rec INP 'a.proto p')" "dbpf rec.PROC 1"
         keep $c '::(lockRequest|lockHandler|unlock)\(' ;;

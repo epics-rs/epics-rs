@@ -40,7 +40,7 @@ unrelated emit sites.
 
 ```rust
 pub trait ChannelSource: Send + Sync + 'static {
-    async fn list_pvs(&self) -> Vec<String>;
+    fn list_pvs(&self) -> Vec<String>;
     async fn has_pv(&self, name: &str) -> bool;
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc>;
     async fn get_value(&self, name: &str) -> Option<PvField>;

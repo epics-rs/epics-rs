@@ -27,6 +27,9 @@ impl AsynMotor for Axis {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -39,10 +42,11 @@ impl AsynMotor for Axis {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.log.lock().unwrap().push((self.name, Instant::now()));
         std::thread::sleep(self.delay);
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -183,6 +187,9 @@ impl AsynMotor for Creeping {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -195,12 +202,13 @@ impl AsynMotor for Creeping {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: f64::from(n),
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -217,6 +225,9 @@ impl AsynMotor for Watching {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -229,13 +240,14 @@ impl AsynMotor for Watching {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         while self.io_intr.try_recv().is_ok() {
             self.pulses += 1;
         }
         let polls = self.polls.load(std::sync::atomic::Ordering::SeqCst);
         self.seen.lock().unwrap().push((polls, self.pulses));
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -335,7 +347,8 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
     poller.await.unwrap();
 }
 
-/// Done until it is told to move, then moving at the same place.
+/// Done until it is told to move, then moving at the same place, which
+/// its poll sets as C sets `motorStatusMoving_`.
 #[derive(Default)]
 struct Mover {
     moved: bool,
@@ -344,6 +357,9 @@ struct Mover {
 impl AsynMotor for Mover {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         self.moved = true;
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
@@ -358,12 +374,14 @@ impl AsynMotor for Mover {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus {
             done: !self.moved,
             moving: self.moved,
+            msta_moving: self.moved,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -436,6 +454,9 @@ impl AsynMotor for MoveWatcher {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -448,14 +469,15 @@ impl AsynMotor for MoveWatcher {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         if let Some(rx) = self.io_intr.lock().unwrap().as_mut() {
             while rx.try_recv().is_ok() {
                 self.pulses += 1;
             }
         }
         self.seen.lock().unwrap().push(self.pulses);
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 
@@ -766,6 +788,9 @@ impl AsynMotor for Unreachable {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -778,15 +803,13 @@ impl AsynMotor for Unreachable {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.log.lock().unwrap().push(("U", Instant::now()));
+        status.moving = true;
         Err(asyn_rs::error::AsynError::Status {
             status: asyn_rs::error::AsynStatus::Timeout,
             message: "unreachable".into(),
         })
-    }
-    fn failed_poll_moving(&self) -> Option<bool> {
-        Some(true)
     }
 }
 
@@ -908,4 +931,171 @@ fn a_port_reads_its_poller_s_first_polls_and_0_before_one_is_named() {
     assert_eq!(first_polls_pending(PORT), Some(1));
     drop(first);
     assert_eq!(first_polls_pending(PORT), Some(0));
+}
+
+/// Polls once, then returns before its callParamCallbacks every time,
+/// having set HOME.
+#[derive(Default)]
+struct Bailing {
+    polled: bool,
+}
+
+impl AsynMotor for Bailing {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        if !std::mem::replace(&mut self.polled, true) {
+            *status = MotorStatus::default();
+            return Ok(());
+        }
+        status.home = true;
+        Err(asyn_rs::error::AsynError::Status {
+            status: asyn_rs::error::AsynStatus::Error,
+            message: "bailed".into(),
+        })
+    }
+}
+
+/// What a bailing poll set raises statusChanged_ (asynMotorAxis.cpp:
+/// 255-264). A port write that runs no axis method still ends in
+/// pAxis->callParamCallbacks(), which posts it (asynMotorController.cpp:246).
+#[tokio::test]
+async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use motor_rs::controller_port::index;
+    const PORT: &str = "BAILLEFT";
+    let port =
+        motor_rs::devices::register_controller_port(&asyn_rs::registry::open_owner(), PORT, 2, ())
+            .unwrap();
+    let mut controller = ControllerBuilder::new();
+    let m = controller.axis(
+        Arc::new(Mutex::new(Bailing::default())),
+        TraceUser::Asyn {
+            port: PORT.into(),
+            addr: 1,
+        },
+    );
+    let mut record = m.axis.attach();
+    record.bind_dev_sup_gate(&InterruptGate::opened());
+    let mut io_intr = record.io_intr_receiver().unwrap();
+    motor_rs::devices::register_axis(m.axis.clone()).unwrap();
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
+    let mut pulses = move || {
+        let mut n = 0;
+        while io_intr.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    };
+    tokio::time::sleep(PERIOD * 8).await;
+    assert_eq!(
+        pulses(),
+        1,
+        "only the startup poll, which the constructor raised, posts"
+    );
+    tokio::task::spawn_blocking(move || port.write_int32_blocking(index::POWER_AUTO_ONOFF, 1, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(PERIOD * 8).await;
+    assert_eq!(pulses(), 1);
+    m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await.unwrap();
+}
+
+/// Bails `bails` times before its first poll that calls back.
+struct LateFirstPoll {
+    bails: u32,
+    constructor_calls_back: bool,
+}
+
+impl AsynMotor for LateFirstPoll {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        if self.bails > 0 {
+            self.bails -= 1;
+            return Err(asyn_rs::error::AsynError::Status {
+                status: asyn_rs::error::AsynStatus::Error,
+                message: "bailed".into(),
+            });
+        }
+        *status = MotorStatus::default();
+        Ok(())
+    }
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        self.constructor_calls_back
+    }
+}
+
+/// asynMotorAxis's constructor raises statusChanged_ (asynMotorAxis.cpp:29),
+/// so the first poll that calls back posts the constructor's status to a
+/// record already bound, unless the driver's constructor called back first
+/// (:316-322).
+#[tokio::test]
+async fn the_first_poll_to_call_back_posts_unless_the_constructor_did() {
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+    use epics_base_rs::server::device_support::DeviceSupport;
+    for (constructor_calls_back, posts) in [(false, 1), (true, 0)] {
+        let mut controller = ControllerBuilder::new();
+        let motor = LateFirstPoll {
+            bails: 2,
+            constructor_calls_back,
+        };
+        let m = controller.axis(
+            Arc::new(Mutex::new(motor)),
+            TraceUser::Asyn {
+                port: String::new(),
+                addr: 0,
+            },
+        );
+        let mut record = m.axis.attach();
+        record.bind_dev_sup_gate(&InterruptGate::opened());
+        let mut io_intr = record.io_intr_receiver().unwrap();
+        let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
+        tokio::time::sleep(PERIOD * 12).await;
+        m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+        poller.await.unwrap();
+        let mut pulses = 0;
+        while io_intr.try_recv().is_ok() {
+            pulses += 1;
+        }
+        assert_eq!(
+            pulses, posts,
+            "constructor called back: {constructor_calls_back}"
+        );
+    }
 }

@@ -635,7 +635,8 @@ impl NDPluginProcess for ROIStatProcessor {
             }
         }
 
-        ProcessResult::sink(updates)
+        // C `endProcessCallbacks(pArray, true, true)` (NDPluginROIStat.cpp:323).
+        ProcessResult::forward(array, updates)
     }
 
     fn plugin_type(&self) -> &str {
@@ -1052,6 +1053,33 @@ mod tests {
             }
         }
         arr
+    }
+
+    /// C hands every frame on, whatever its rank (NDPluginROIStat.cpp:323).
+    #[test]
+    fn every_frame_is_handed_on() {
+        let pool = NDArrayPool::new(1_000_000);
+        let rois = vec![ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [2, 2],
+            bgd_width: 0,
+        }];
+        let proc = ROIStatProcessor::new(rois, 0);
+        let three_d = NDArray::new(
+            vec![
+                NDDimension::new(2),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::Float64,
+        );
+        for arr in [make_2d_array(2, 2, |_, _| 1.0), three_d] {
+            let arr = Arc::new(arr);
+            let result = proc.process_array(&arr, &pool);
+            assert_eq!(result.output_arrays.len(), 1);
+            assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
+        }
     }
 
     #[test]

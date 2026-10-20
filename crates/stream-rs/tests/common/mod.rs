@@ -7,9 +7,8 @@ use std::sync::{Arc, Once, Weak};
 
 use parking_lot::Mutex;
 
-use stream_rs::StreamBuffer;
 use stream_rs::bus::{self, StreamBusInterface};
-use stream_rs::core::{ProtocolResult, StreamCore, StreamCoreHooks, StreamCoreLock};
+use stream_rs::core::{ProtocolResult, StreamCore, StreamCoreHooks, StreamCoreLock, ValueMatch};
 use stream_rs::error::stream_error;
 use stream_rs::format::*;
 
@@ -113,6 +112,9 @@ pub struct TestHooks {
 }
 
 impl StreamCoreHooks for TestHooks {
+    type FieldAddress = ();
+    type LinkPut = std::convert::Infallible;
+
     fn start_timer(&self, _: &StreamCore<Self>, _: u64) {}
     fn interrupt_accept(&self, _: &StreamCore<Self>) -> bool {
         true
@@ -128,7 +130,7 @@ impl StreamCoreHooks for TestHooks {
             stream_error(format!("{}: Protocol aborted\n", core.name()).as_bytes());
         }
     }
-    fn format_value(&self, core: &StreamCore<Self>, fmt: &StreamFormat, _: Option<&[u8]>) -> bool {
+    fn format_value(&self, core: &StreamCore<Self>, fmt: &StreamFormat, _: Option<&()>) -> bool {
         match (&self.value, fmt.type_) {
             // A longout's VAL is an epicsInt32, read as unsigned long.
             (Value::Longout(v), UNSIGNED_FORMAT) => {
@@ -148,7 +150,12 @@ impl StreamCoreHooks for TestHooks {
     }
     /// `Stream::matchValue` without a field: `readData` scans, then the
     /// value's bytes are consumed.
-    fn match_value(&self, core: &StreamCore<Self>, fmt: &StreamFormat, _: Option<&[u8]>) -> bool {
+    fn match_value(
+        &self,
+        core: &StreamCore<Self>,
+        fmt: &StreamFormat,
+        _: Option<&()>,
+    ) -> ValueMatch<Self::LinkPut> {
         let consumed = match (&self.value, fmt.type_) {
             (Value::Longin(_), UNSIGNED_FORMAT | SIGNED_FORMAT | ENUM_FORMAT)
             | (Value::Ai, UNSIGNED_FORMAT | SIGNED_FORMAT) => core.scan_value_long(fmt, &mut 0),
@@ -158,24 +165,23 @@ impl StreamCoreHooks for TestHooks {
                 let mut size = sval.len();
                 core.scan_value_string(fmt, &mut sval, &mut size)
             }
-            _ => return false,
+            _ => return ValueMatch::Failed,
         };
         if consumed < 0 {
-            return false;
+            return ValueMatch::Failed;
         }
         core.consumed_input
             .set(core.consumed_input.get() + consumed as usize);
-        true
+        ValueMatch::Matched
+    }
+    /// No field takes a put here.
+    fn link_put_done(&self, _: &StreamCore<Self>, put: Self::LinkPut, _: i32) -> bool {
+        match put {}
     }
 
     /// `Stream::getFieldAddress`: `RECORD.FIELD`, else a field of this
     /// (stringout) record, else `FIELD.VAL`.
-    fn get_field_address(
-        &self,
-        _: &StreamCore<Self>,
-        fieldname: &[u8],
-        address: &mut StreamBuffer,
-    ) -> bool {
+    fn get_field_address(&self, _: &StreamCore<Self>, fieldname: &[u8]) -> Option<()> {
         let name = String::from_utf8_lossy(fieldname);
         let found = match name.split_once('.') {
             Some((rec, field)) => {
@@ -183,10 +189,7 @@ impl StreamCoreHooks for TestHooks {
             }
             None => name == "VAL" || self.records.iter().any(|r| *r == name),
         };
-        if found {
-            address.append(fieldname);
-        }
-        found
+        found.then_some(())
     }
 }
 
@@ -200,8 +203,18 @@ pub fn load(file: &str, protocol: &str, name: &str, records: &[String]) -> (Core
         records: records.to_vec(),
         ..Default::default()
     });
-    let ok = core.lock().parse(file, protocol.as_bytes());
+    let ok = parse(&core, file, protocol.as_bytes());
     (core, ok)
+}
+
+/// `StreamCore::parse`, which C compiles into the core: what it wrote
+/// installed, and whether the protocol compiled.
+pub fn parse(core: &Core, file: &str, protocol: &[u8]) -> bool {
+    let core = core.lock();
+    let mut parsed = core.installed();
+    let compiled = core.parse(&mut parsed, file, protocol);
+    core.install(parsed);
+    compiled
 }
 
 /// Each non-empty command list of a parsed core, with its handler

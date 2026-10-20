@@ -435,7 +435,7 @@ impl ControlSource {
 }
 
 impl ChannelSource for ControlSource {
-    async fn list_pvs(&self) -> Vec<RecordName> {
+    fn list_pvs(&self) -> Vec<RecordName> {
         let mut out: Vec<RecordName> = self.diag_pv_names().into_iter().map(Into::into).collect();
         out.extend(self.control_pv_names().into_iter().map(Into::into));
         out
@@ -1144,7 +1144,7 @@ mod tests {
         // get_value still works on the diagnostic PVs.
         assert!(ctrl.get_value(b"gw:cacheSize").await.is_some());
         // list_pvs exposes both diagnostic and control PVs.
-        let names = ctrl.list_pvs().await;
+        let names = ctrl.list_pvs();
         assert!(names.contains(&RecordName::from("gw:cacheSize")));
         assert!(names.contains(&RecordName::from("gw:flush")));
         assert!(names.contains(&RecordName::from("gw:drop")));

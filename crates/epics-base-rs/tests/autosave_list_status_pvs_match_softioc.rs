@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
@@ -69,7 +69,7 @@ fn set(name: &str, save_path: PathBuf, pv: &str) -> SaveSetConfig {
         request_pvs: vec![pv.into()],
         backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -139,10 +139,7 @@ async fn a_clean_save_fills_its_list_records_in_creation_order() {
             .build()
             .await,
     );
-    let handle = mgr
-        .clone()
-        .start(&Reactor::current().unwrap(), db.clone())
-        .unwrap();
+    let handle = mgr.clone().start(db.clone()).unwrap();
     sleep(Duration::from_millis(500)).await;
     let before: Vec<_> = names
         .iter()
@@ -198,10 +195,7 @@ async fn a_value_it_could_not_fetch_is_counted_in_statusstr() {
             .build()
             .await,
     );
-    let handle = mgr
-        .clone()
-        .start(&Reactor::current().unwrap(), db.clone())
-        .unwrap();
+    let handle = mgr.clone().start(db.clone()).unwrap();
     let _ = mgr.manual_save("first", &db).await;
     sleep(Duration::from_millis(1500)).await;
     mgr.shutdown();

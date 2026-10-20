@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::PvDatabase;
 
-/// iocInit's CP pass followed by C `dbCaRun`.
+/// iocInit's link open passes followed by C `dbCaRun`.
 pub async fn connect(db: &PvDatabase) {
     db.setup_cp_links().await;
+    db.setup_external_link_opens().await;
     db.process_cp_links_on_connect().await;
 }
 

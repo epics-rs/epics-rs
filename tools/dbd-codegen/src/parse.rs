@@ -42,8 +42,8 @@ pub struct Field {
     pub dbf: String,
     pub prompt: Option<String>,
     pub promptgroup: Option<String>,
-    /// The `SPC_*` token, or a bare number (a few records use `special(255)`).
-    pub special: Option<String>,
+    /// C's `pdbFldDes->special`, read by [`c_special`]; 0 when undeclared.
+    pub special: i16,
     pub pp: bool,
     pub asl: Option<String>,
     pub size: Option<u32>,
@@ -443,6 +443,53 @@ fn parse_recordtype_body(p: &mut Parser, common: &[Field]) -> Result<Vec<Field>,
     Ok(fields)
 }
 
+pub const SPC_NOMOD: i16 = 1;
+pub const SPC_DBADDR: i16 = 2;
+
+/// C `pamapspcType` (`special.h:42-61`). Nine names for ten codes: C never
+/// added `SPC_ATTRIBUTE`, so `special(SPC_ATTRIBUTE)` is a load error there.
+const PAMAPSPC_TYPE: [(&str, i16); 9] = [
+    ("SPC_NOMOD", SPC_NOMOD),
+    ("SPC_DBADDR", SPC_DBADDR),
+    ("SPC_SCAN", 3),
+    ("SPC_ALARMACK", 5),
+    ("SPC_AS", 6),
+    ("SPC_MOD", 100),
+    ("SPC_RESET", 101),
+    ("SPC_LINCONV", 102),
+    ("SPC_CALC", 103),
+];
+
+/// A `special(value)` as `dbRecordtypeFieldItem` reads it
+/// (`dbLexRoutines.c:624-636`): a `pamapspcType` name, else `sscanf("%hd")`
+/// — leading space, a sign, digits, trailing text ignored, glibc's `strtol`
+/// saturation, then truncation to `short`. `None` is C's `yyerror`.
+pub fn c_special(value: &str) -> Option<i16> {
+    if let Some(&(_, code)) = PAMAPSPC_TYPE.iter().find(|(name, _)| *name == value) {
+        return Some(code);
+    }
+    let s = value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let digits = s.bytes().take_while(u8::is_ascii_digit);
+    let mut n: i64 = 0;
+    let mut any = false;
+    for d in digits {
+        let d = i64::from(d - b'0');
+        n = n.saturating_mul(10);
+        n = if neg {
+            n.saturating_sub(d)
+        } else {
+            n.saturating_add(d)
+        };
+        any = true;
+    }
+    any.then_some(n as i16)
+}
+
 fn parse_field(p: &mut Parser) -> Result<Field, String> {
     p.expect(&Tok::LParen)?;
     let name = match p.next() {
@@ -475,7 +522,10 @@ fn parse_field(p: &mut Parser) -> Result<Field, String> {
                 match attr.as_str() {
                     "prompt" => f.prompt = Some(arg),
                     "promptgroup" => f.promptgroup = Some(arg),
-                    "special" => f.special = Some(arg),
+                    "special" => {
+                        f.special = c_special(&arg)
+                            .ok_or_else(|| format!("{}: Invalid 'special' value '{arg}'", f.name))?
+                    }
                     // C `dbRecordtypeFieldItem` (`dbLexRoutines.c:637-645`):
                     // YES or TRUE sets `process_passive`, NO or FALSE clears
                     // it, and any other spelling is
@@ -613,10 +663,10 @@ recordtype(demo) {
         assert!(val.pp);
         assert!(val.prop);
         assert_eq!(val.asl.as_deref(), Some("ASL0"));
-        assert_eq!(val.special, None);
+        assert_eq!(val.special, 0);
 
         let nm = &rec.fields[1];
-        assert_eq!(nm.special.as_deref(), Some("SPC_NOMOD"));
+        assert_eq!(nm.special, SPC_NOMOD);
         assert_eq!(nm.size, Some(61));
         assert_eq!(nm.interest, Some(2));
         assert_eq!(nm.initial.as_deref(), Some("x"));

@@ -158,6 +158,45 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
     server.stop();
 }
 
+#[cfg(tokio_backend)]
+/// pvxput assigns the PUT's fetch into its put value before it builds the
+/// put (`clientget.cpp:561`). A read-only PV opened on an unmarked
+/// NTNDArray, as NDPluginPvxs's, fetches no field, so the put reaches the
+/// server and is refused; a fetch marking the unselected `value` union
+/// throws in the client instead, which then times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interop_put_to_an_unmarked_readonly_pv_is_refused() {
+    let pvxput = require_pvxs(PVXPUT);
+    let pv = SharedPV::build_readonly();
+    pv.open_value(epics_pva_rs::pvdata::Value::create_from(
+        epics_pva_rs::nt::nd_array::nt_nd_array_desc(),
+    ))
+    .unwrap();
+    let src = SharedSource::new();
+    src.add("RO:NDA", pv);
+    let server = PvaServer::isolated(Arc::new(src)).expect("server start");
+    let server_str = format!("127.0.0.1:{}", server.tcp_addr().port());
+    let out = tokio::task::spawn_blocking(move || {
+        pvxs_command(&pvxput)
+            .args(["-w", "3", "RO:NDA", "uniqueId=7"])
+            .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_PVA_NAME_SERVERS", &server_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .pvxs_output()
+            .expect("pvxput exec")
+    })
+    .await
+    .expect("join");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("Read-only PV"),
+        "exit={:?}\nstderr: {stderr}",
+        out.status
+    );
+    server.stop();
+}
+
 /// Direction B: Rust client → pvxs writable server (reverse_server
 /// --writable) → readback via pvxget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

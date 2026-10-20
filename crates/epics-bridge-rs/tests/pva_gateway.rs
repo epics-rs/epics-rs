@@ -1474,9 +1474,8 @@ fn partial_value() -> PvField {
 }
 
 impl ChannelSource for PartialReadSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let n = self.pv_name.clone();
-        async move { vec![n.into()] }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        vec![self.pv_name.as_str().into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let want = self.pv_name.clone().into_bytes();
@@ -1602,9 +1601,8 @@ struct MarkedMonitorSource {
 }
 
 impl ChannelSource for MarkedMonitorSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let n = self.pv_name.clone();
-        async move { vec![n.into()] }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        vec![self.pv_name.as_str().into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let want = self.pv_name.clone().into_bytes();
@@ -1745,7 +1743,7 @@ impl RefusingUpstream {
 }
 
 impl ChannelSource for RefusingUpstream {
-    async fn list_pvs(&self) -> Vec<RecordName> {
+    fn list_pvs(&self) -> Vec<RecordName> {
         vec![Self::PV.into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {

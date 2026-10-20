@@ -47,6 +47,10 @@ default-members = [
     # require. The configuration it protects is the one a bare run does not
     # build, so the gate has to ride the run that everybody does make.
     "tools/target-cfg-gate",
+    # And the C float-spelling census: a raw float reaching a `{:.N}` prints
+    # Rust's `NaN` where the C IOC prints `nan` / `-nan`, and only a bare run
+    # sees the file that adds one.
+    "tools/cfloat-gate",
 ]
 resolver = "3"
 

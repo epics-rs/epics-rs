@@ -93,37 +93,123 @@ fn console_is_ours() -> bool {
 /// to be flushed afterwards, belong to [`Console`] — this is the step both of
 /// its arms share.
 ///
-/// The bytes go out in one `write`, as glibc's `fprintf` to an unbuffered
-/// stream stages the whole conversion first. `write_fmt` on stderr writes each
-/// piece of the format separately, and a stdout line from another thread then
-/// lands inside the console line.
-fn write_console(out: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
+/// The bytes go out in one `write`. `write_fmt` on stderr writes each piece
+/// of the format separately, and a stdout line from another thread then lands
+/// inside the console line. glibc writes an unbuffered `fprintf` in 128-byte
+/// chunks, so one write at any length is a deliberate deviation from C.
+fn write_console<'a>(out: &mut impl std::io::Write, line: impl Into<Message<'a>>) {
     // C ignores `fprintf`'s return here too: a console that cannot be written
     // is not something an errlog line can report.
-    let _ = out.write_all(StagedLine::of(line).bytes());
+    let _ = out.write_all(StagedLine::of_message(line.into()).bytes());
 }
 
-/// One console line formatted whole before it is written: on the stack, so a
+/// One errlog message as its poster hands it over. C has one kind,
+/// `vsnprintf`'s output, and that is bytes: a `%s` of a device's reply
+/// (asynManager.c:3175) carries whatever the device sent. `Bytes` is that
+/// case, its parts run together as one message.
+#[derive(Clone, Copy)]
+enum Message<'a> {
+    Text(std::fmt::Arguments<'a>),
+    Bytes(&'a [&'a [u8]]),
+}
+
+impl<'a> From<std::fmt::Arguments<'a>> for Message<'a> {
+    fn from(text: std::fmt::Arguments<'a>) -> Self {
+        Message::Text(text)
+    }
+}
+
+impl Message<'_> {
+    /// Write it as C's `vsnprintf` writes the slot.
+    fn put(self, out: &mut impl WriteBytes) {
+        match self {
+            // A `Display` that fails leaves what it wrote, as `vsnprintf` has
+            // no failure to report.
+            Message::Text(text) => {
+                let _ = std::fmt::write(out, text);
+            }
+            Message::Bytes(parts) => parts.iter().for_each(|p| out.write_bytes(p)),
+        }
+    }
+}
+
+/// A sink an errlog message is written into byte for byte.
+trait WriteBytes: std::fmt::Write {
+    fn write_bytes(&mut self, bytes: &[u8]);
+}
+
+/// Bytes as text for the consumers that take `&str` — listeners and the
+/// `tracing` record: U+FFFD for a byte that is not UTF-8. The one place this
+/// port cuts what C passes through; the arena and the console keep the byte.
+struct Lossy<'a>(&'a [&'a [u8]]);
+
+impl std::fmt::Display for Lossy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for chunk in self.0.iter().flat_map(|p| p.utf8_chunks()) {
+            f.write_str(chunk.valid())?;
+            if !chunk.invalid().is_empty() {
+                std::fmt::Write::write_char(f, char::REPLACEMENT_CHARACTER)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `line` to `out` in one `write_all`, at any length: a deliberate deviation
+/// from C, whose unbuffered `fprintf` glibc writes in 128-byte chunks.
+/// `write!` on stderr or a `File` writes each piece of the format separately,
+/// and another writer's line can then land between the pieces.
+pub fn write_whole(
+    out: &mut (impl std::io::Write + ?Sized),
+    line: std::fmt::Arguments<'_>,
+) -> std::io::Result<()> {
+    out.write_all(StagedLine::of(line).bytes())
+}
+
+/// Text and raw bytes staged whole before one write: on the stack, so a
 /// poster's immediate echo allocates nothing, and on the heap only past the
 /// stack buffer.
-struct StagedLine {
+pub struct StagedLine {
     buf: [u8; 1024],
     len: usize,
     spill: Vec<u8>,
 }
 
-impl StagedLine {
-    fn of(line: std::fmt::Arguments<'_>) -> Self {
-        let mut staged = StagedLine {
+impl Default for StagedLine {
+    fn default() -> Self {
+        StagedLine {
             buf: [0; 1024],
             len: 0,
             spill: Vec::new(),
-        };
-        let _ = std::fmt::Write::write_fmt(&mut staged, line);
+        }
+    }
+}
+
+impl StagedLine {
+    pub fn of(line: std::fmt::Arguments<'_>) -> Self {
+        Self::of_message(line.into())
+    }
+
+    fn of_message(line: Message<'_>) -> Self {
+        let mut staged = StagedLine::default();
+        line.put(&mut staged);
         staged
     }
 
-    fn bytes(&self) -> &[u8] {
+    /// Append `b` untouched: invalid UTF-8 and control bytes included.
+    pub fn push_bytes(&mut self, b: &[u8]) {
+        if self.spill.is_empty() && self.len + b.len() <= self.buf.len() {
+            self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+            self.len += b.len();
+        } else {
+            if self.spill.is_empty() {
+                self.spill.extend_from_slice(&self.buf[..self.len]);
+            }
+            self.spill.extend_from_slice(b);
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
         if self.spill.is_empty() {
             &self.buf[..self.len]
         } else {
@@ -132,19 +218,93 @@ impl StagedLine {
     }
 }
 
+impl WriteBytes for StagedLine {
+    fn write_bytes(&mut self, s: &[u8]) {
+        self.push_bytes(s);
+    }
+}
+
 impl std::fmt::Write for StagedLine {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        if self.spill.is_empty() && self.len + s.len() <= self.buf.len() {
-            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
-            self.len += s.len();
-        } else {
-            if self.spill.is_empty() {
-                self.spill.extend_from_slice(&self.buf[..self.len]);
-            }
-            self.spill.extend_from_slice(s.as_bytes());
-        }
+        self.push_bytes(s.as_bytes());
         Ok(())
     }
+}
+
+/// The process's stderr. The workspace's `clippy.toml` bans
+/// `std::io::stderr` everywhere else outside tests, so every write to it goes
+/// through this module: [`StagedStderr`], [`stderr_print!`](crate::stderr_print!) or the console.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place the workspace takes the stderr handle"
+)]
+fn raw_stderr() -> std::io::Stderr {
+    std::io::stderr()
+}
+
+/// Whether stderr is a terminal.
+pub fn stderr_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&raw_stderr())
+}
+
+/// stderr as a [`std::io::Write`]: a `write!` / `writeln!` is staged whole
+/// ([`write_whole`]) and each `write` goes out in one `write_all`, so no call
+/// reaches the stream in pieces another writer's line can land between.
+pub struct StagedStderr;
+
+impl std::io::Write for StagedStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        raw_stderr().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_fmt(&mut self, line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        write_whole(&mut raw_stderr(), line)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        raw_stderr().flush()
+    }
+}
+
+/// [`stderr_print!`](crate::stderr_print!)'s body: the line staged whole, then handed to `eprint!`
+/// as one `&str`, which `std` writes with one `write_all`. Through `eprint!`
+/// rather than to `stderr()` so a test harness still captures it and a failed
+/// write still panics, as before.
+#[doc(hidden)]
+pub fn stderr_whole(line: std::fmt::Arguments<'_>) {
+    let staged = StagedLine::of(line);
+    #[expect(
+        clippy::disallowed_macros,
+        reason = "the one `eprint!` the workspace keeps: its argument is a single staged `&str`"
+    )]
+    {
+        std::eprint!("{}", String::from_utf8_lossy(staged.bytes()));
+    }
+}
+
+/// `eprint!` in one `write`: the line is formatted whole first, so a stdout
+/// line from another thread cannot land inside it. The workspace's
+/// `clippy.toml` bans `eprint!` / `eprintln!` outside tests for that reason.
+#[macro_export]
+macro_rules! stderr_print {
+    ($($arg:tt)*) => {
+        $crate::runtime::log::stderr_whole(::core::format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!` in one `write`; see [`stderr_print!`](crate::stderr_print!).
+#[macro_export]
+macro_rules! stderr_println {
+    () => {
+        $crate::runtime::log::stderr_whole(::core::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::runtime::log::stderr_whole(::core::format_args!(
+            "{}\n",
+            ::core::format_args!($($arg)*)
+        ))
+    };
 }
 
 /// C's `pvt.console` and `pvt.ttyConsole` (`errlog.c:100-101`): the stream
@@ -205,11 +365,12 @@ fn console() -> std::sync::MutexGuard<'static, Console> {
 
 impl Console {
     /// One already-formatted errlog line to whichever stream is installed.
-    fn write(&mut self, line: std::fmt::Arguments<'_>) {
+    fn write<'a>(&mut self, line: impl Into<Message<'a>>) {
+        let line = line.into();
         match &mut self.sink {
             // stderr is unbuffered, so C's `fflush(console)` (`errlog.c:830`)
             // has nothing to do here.
-            ConsoleSink::Stderr => write_console(&mut std::io::stderr().lock(), line),
+            ConsoleSink::Stderr => write_console(&mut raw_stderr().lock(), line),
             ConsoleSink::Set { stream, .. } => {
                 write_console(stream, line);
                 // A caller's stream may buffer, and a line sitting in a buffer
@@ -229,7 +390,7 @@ impl Console {
             // `errlog.c:585`): this port answers at the call site, which can
             // run before any errlog entry point has, so there is no init pass
             // to latch it in.
-            ConsoleSink::Stderr => is_a_tty(&std::io::stderr()),
+            ConsoleSink::Stderr => is_a_tty(&raw_stderr()),
             ConsoleSink::Set { paints, .. } => *paints,
         }
     }
@@ -553,7 +714,7 @@ pub fn install_panic_hook() -> bool {
         tracing::error!(target: "epics_base_rs::errlog", "{}", as_record(&line));
         // Written by the panicking thread itself: it may be about to abort
         // the process, and it may not wait for the worker.
-        errlog_post(format_args!("{line}"), ConsoleEcho::Immediate);
+        errlog_post(format_args!("{line}").into(), ConsoleEcho::Immediate);
     }));
     true
 }
@@ -658,14 +819,19 @@ pub const ANSI_ESC_BLUE: &str = "\x1b[34;1m";
 /// Read by `iocsh`'s `format_help_entry` for an argument name.
 pub const ANSI_ESC_UNDERLINE: &str = "\x1b[4m";
 
+/// C `ANSI_ESC_GREEN` (`errlog.h:282`) — opens a green bold span.
+///
+/// `afterIocRunningHook`'s `ANSI_GREEN("afterIocRunning:")` echo
+/// (`afterIocRunning.c:47`).
+pub const ANSI_ESC_GREEN: &str = "\x1b[32;1m";
+
 /// C `ANSI_ESC_RESET` (`errlog.h:289`) — closes any span above.
 pub const ANSI_ESC_RESET: &str = "\x1b[0m";
 
-// The remaining four of `errlog.h:281-288` — GREEN, YELLOW, MAGENTA, CYAN —
-// are deliberately absent: a constant nothing reads is a claim about C nobody
-// is checking. Green and magenta do appear in this workspace, but only inside
-// whole strings that are already correct and have no half-reader:
-// `IOCSH_PS1`'s compiled default (`ANSI_GREEN("epics> ")`) and [`ERL_WARNING`]
+// The remaining three of `errlog.h:281-288` — YELLOW, MAGENTA, CYAN — are
+// deliberately absent: a constant nothing reads is a claim about C nobody is
+// checking. Magenta does appear in this workspace, but only inside a whole
+// string that is already correct and has no half-reader: [`ERL_WARNING`]
 // (`ANSI_MAGENTA("WARNING")`).
 
 /// C `ERL_ERROR` (`errlog.h:298`) — `ANSI_RED("ERROR")`, the severity word a
@@ -780,7 +946,7 @@ pub fn errlog_sev_vprintf(severity: ErrlogSevEnum, message: std::fmt::Arguments<
             tracing::error!(target: "epics_base_rs::errlog", "{record}")
         }
     }
-    errlog_post(line, ConsoleEcho::Yes);
+    errlog_post(line.into(), ConsoleEcho::Yes);
 }
 
 /// Emit a pre-formatted message through the errlog facility
@@ -802,7 +968,17 @@ pub fn errlog_printf(message: &str) {
 /// posting allocates nothing.
 pub fn errlog_vprintf(message: std::fmt::Arguments<'_>) {
     tracing::info!(target: "epics_base_rs::errlog", "{}", Record(message));
-    errlog_post(message, ConsoleEcho::Yes);
+    errlog_post(message.into(), ConsoleEcho::Yes);
+}
+
+/// [`errlog_vprintf`] of bytes that need not be text, `parts` run together as
+/// one message: C's `errlogPrintf("%.*s\n", n, buffer)` of a device's reply
+/// (asynManager.c:3175). The arena, the console and a
+/// [`errlog_add_listener_bytes`] listener take the bytes as C's do; a text
+/// listener and the `tracing` record get U+FFFD for a byte that is not UTF-8.
+pub fn errlog_printf_bytes(parts: &[&[u8]]) {
+    tracing::info!(target: "epics_base_rs::errlog", "{}", Record(format_args!("{}", Lossy(parts))));
+    errlog_post(Message::Bytes(parts), ConsoleEcho::Yes);
 }
 
 /// C `errlogPrintfNoConsole` (`errlog.c:343-364`): the same message queue,
@@ -810,7 +986,7 @@ pub fn errlog_vprintf(message: std::fmt::Arguments<'_>) {
 /// Listeners — the IOC log client among them — still receive it.
 pub fn errlog_printf_no_console(message: std::fmt::Arguments<'_>) {
     tracing::info!(target: "epics_base_rs::errlog", "{}", Record(message));
-    errlog_post(message, ConsoleEcho::No);
+    errlog_post(message.into(), ConsoleEcho::No);
 }
 
 /// C `errlogMessage` (`errlog.c:337-341`) — `errlogPrintf("%s", message)`.
@@ -877,9 +1053,10 @@ pub const fn max_message_size(bufsize: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ErrlogListenerId(u64);
 
-/// A registered listener. Shared so the worker can call it with the list's
+/// A registered listener, called with the record's bytes as C's
+/// `const char *message`. Shared so the worker can call it with the list's
 /// `RefCell` released, which is what lets a callback add or remove listeners.
-type ErrlogListenerFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+type ErrlogListenerFn = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// C `listenerNode` (`errlog.c:79-85`).
 struct ListenerNode {
@@ -923,6 +1100,13 @@ impl ErrlogBuf {
     /// The committed messages in order, as `(console, text)`.
     #[cfg(test)]
     fn messages(&self) -> impl Iterator<Item = (bool, &str)> {
+        self.message_bytes()
+            .map(|(echo, body)| (echo, std::str::from_utf8(body).unwrap_or_default()))
+    }
+
+    /// [`Self::messages`] as the bytes the arena holds.
+    #[cfg(test)]
+    fn message_bytes(&self) -> impl Iterator<Item = (bool, &[u8])> {
         let mut at = 0;
         std::iter::from_fn(move || {
             if at >= self.pos {
@@ -932,9 +1116,7 @@ impl ErrlogBuf {
             let body = &self.base[at + 1..self.pos];
             let len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
             at += 1 + len + 1;
-            // Only `accept` writes here, and it copies whole characters.
-            let text = std::str::from_utf8(&body[..len]).unwrap_or_default();
-            Some((flag & ERL_LOCALECHO != 0, text))
+            Some((flag & ERL_LOCALECHO != 0, &body[..len]))
         })
     }
 
@@ -1176,7 +1358,6 @@ fn errlog_worker(errlog: &'static Errlog) {
         drop(q);
 
         print.drain(|echo, record| {
-            // Only `accept` writes the arena, and it copies whole characters.
             // C writes the console first, from this thread, for a message
             // posted with local echo while `pvt.toConsole` holds, stripped
             // in the record unless the console is a terminal (`errlog.c:789-795`);
@@ -1187,13 +1368,10 @@ fn errlog_worker(errlog: &'static Errlog) {
                 if !console.paints() {
                     len = Some(strip_ansi_in_place(record));
                 }
-                let text =
-                    std::str::from_utf8(&record[..len.unwrap_or(record.len())]).unwrap_or_default();
-                console.write(format_args!("{text}"));
+                console.write(Message::Bytes(&[&record[..len.unwrap_or(record.len())]]));
             }
             let len = len.unwrap_or_else(|| strip_ansi_in_place(record));
-            let text = std::str::from_utf8(&record[..len]).unwrap_or_default();
-            deliver(&errlog.listeners, text);
+            deliver(&errlog.listeners, &record[..len]);
         });
         // C `errlog.c:823-824`.
         print.base.fill(0);
@@ -1218,7 +1396,7 @@ fn errlog_worker(errlog: &'static Errlog) {
 /// its lock, once per message. The next node is found after the call, so a
 /// listener added by a callback hears this message, and one removed by it
 /// hears nothing more.
-fn deliver(listeners: &ErrlogListeners, text: &str) {
+fn deliver(listeners: &ErrlogListeners, record: &[u8]) {
     let list = listeners.lock();
     let mut at = 0;
     loop {
@@ -1230,7 +1408,7 @@ fn deliver(listeners: &ErrlogListeners, text: &str) {
             node.active = true;
             std::sync::Arc::clone(&node.listener)
         };
-        listener(text);
+        listener(record);
         let mut nodes = list.borrow_mut();
         // The callback may have removed a node ahead of this one.
         let Some(here) = nodes.iter().position(|n| n.active) else {
@@ -1287,7 +1465,7 @@ enum ConsoleEcho {
 /// into itself when a listener logs;
 /// `at_exit` matches C's `!atExit`, the worker having stopped; `local_echo`
 /// matches C's argument, so `errlogPrintfNoConsole` and `eltc(0)` cost no wait.
-fn errlog_post(message: std::fmt::Arguments<'_>, echo: ConsoleEcho) {
+fn errlog_post(message: Message<'_>, echo: ConsoleEcho) {
     let errlog = errlog_pvt();
     // C reads it before the lock (`errlog.c:147`); it is this thread's own.
     let ok_to_block = crate::runtime::task::thread_is_ok_to_block();
@@ -1323,8 +1501,9 @@ fn errlog_post(message: std::fmt::Arguments<'_>, echo: ConsoleEcho) {
 /// C `msgbufCommit`'s truncation marker (`errlog.c:157`).
 const TRUNCATED: &str = "<<TRUNCATED>>\n";
 
-/// C `vsnprintf` into `msgbufAlloc`'s slot: copies the prefix that fits, in
-/// whole characters so the arena only ever holds UTF-8, and counts the rest.
+/// C `vsnprintf` into `msgbufAlloc`'s slot: copies the prefix that fits and
+/// counts the rest. Bytes, as C's arena is, so a cut can split a character
+/// exactly where C's does.
 struct ArenaText<'a> {
     buf: &'a mut [u8],
     len: usize,
@@ -1334,25 +1513,28 @@ struct ArenaText<'a> {
     ended: bool,
 }
 
-impl std::fmt::Write for ArenaText<'_> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+impl WriteBytes for ArenaText<'_> {
+    fn write_bytes(&mut self, s: &[u8]) {
         if self.ended {
-            return Ok(());
+            return;
         }
-        let s = match s.find('\0') {
+        let s = match s.iter().position(|&b| b == 0) {
             Some(nul) => {
                 self.ended = true;
                 &s[..nul]
             }
             None => s,
         };
-        let mut take = s.len().min(self.buf.len() - self.len);
-        while !s.is_char_boundary(take) {
-            take -= 1;
-        }
-        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        let take = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&s[..take]);
         self.len += take;
         self.nchar += s.len();
+    }
+}
+
+impl std::fmt::Write for ArenaText<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write_bytes(s.as_bytes());
         Ok(())
     }
 }
@@ -1360,7 +1542,7 @@ impl std::fmt::Write for ArenaText<'_> {
 impl ErrlogQueue {
     /// The whole admission decision, in one place so it can be tested at its
     /// boundaries without a worker thread. `true` when the message was taken.
-    fn accept(&mut self, message: std::fmt::Arguments<'_>, console: bool) -> bool {
+    fn accept<'a>(&mut self, message: impl Into<Message<'a>>, console: bool) -> bool {
         if self.at_exit {
             return false;
         }
@@ -1387,15 +1569,10 @@ impl ErrlogQueue {
             nchar: 0,
             ended: false,
         };
-        // A `Display` that fails leaves what it wrote, as `vsnprintf` has no
-        // failure to report.
-        let _ = std::fmt::write(&mut slot, message);
+        message.into().put(&mut slot);
         let mut nchar = slot.len;
         if slot.nchar >= max {
-            let mut cut = (max - 1).saturating_sub(TRUNCATED.len());
-            while cut > 0 && text[cut] & 0xC0 == 0x80 {
-                cut -= 1;
-            }
+            let cut = (max - 1).saturating_sub(TRUNCATED.len());
             text[cut..cut + TRUNCATED.len()].copy_from_slice(TRUNCATED.as_bytes());
             nchar = cut + TRUNCATED.len();
         }
@@ -1462,13 +1639,23 @@ pub fn errlog_flush() {
     errlog_sequence(errlog, &mine, &waiter);
 }
 
-/// C `errlogAddListener` (`errlog.c:417-431`).
-///
-/// The listener is called on the errlog worker thread with the message text
-/// after ANSI stripping — never on the thread that logged it.
+/// [`errlog_add_listener_bytes`] for a listener that wants text: a byte that
+/// is not UTF-8 reaches it as U+FFFD.
 pub fn errlog_add_listener<F>(listener: F) -> ErrlogListenerId
 where
     F: Fn(&str) + Send + Sync + 'static,
+{
+    errlog_add_listener_bytes(move |m: &[u8]| listener(&String::from_utf8_lossy(m)))
+}
+
+/// C `errlogAddListener` (`errlog.c:417-431`).
+///
+/// The listener is called on the errlog worker thread with the message after
+/// ANSI stripping — never on the thread that logged it — as the bytes C hands
+/// its `const char *message`.
+pub fn errlog_add_listener_bytes<F>(listener: F) -> ErrlogListenerId
+where
+    F: Fn(&[u8]) + Send + Sync + 'static,
 {
     let errlog = errlog_pvt();
     let id = ErrlogListenerId(
@@ -2390,8 +2577,8 @@ mod tests {
     }
 
     /// The message is formatted in the slot, piece by piece, and `nchar` is
-    /// the whole would-be length: an argument that crosses the end is cut in
-    /// whole characters, and the cut before the marker never splits one.
+    /// the whole would-be length. The slot is bytes, as C's is, so the cut
+    /// before the marker splits a character where C's does.
     #[test]
     fn a_formatted_message_is_measured_and_cut_in_the_slot() {
         let mut q = test_queue();
@@ -2403,8 +2590,34 @@ mod tests {
         // The cut before the marker, `max - 1 - 14`, falls inside the `é`.
         let head = "a".repeat(max - 1 - TRUNCATED.len() - 1);
         assert!(q.accept(format_args!("{head}{}{}", "é", "z".repeat(max)), false));
-        let (_, stored) = q.log.messages().next().unwrap();
-        assert_eq!(stored, format!("{head}{TRUNCATED}"));
+        let (_, stored) = q.log.message_bytes().next().unwrap();
+        assert_eq!(
+            stored,
+            [head.as_bytes(), &[0xc3], TRUNCATED.as_bytes()].concat()
+        );
+    }
+
+    /// C's arena is bytes: a byte that is not UTF-8 is stored and reaches the
+    /// console as itself, and only a `&str` listener sees it as U+FFFD.
+    #[test]
+    #[serial(errlog)]
+    fn device_bytes_reach_the_console_as_bytes_and_listeners_as_text() {
+        let mut q = test_queue();
+        assert!(q.accept(Message::Bytes(&[b"a\xff", b"\0b"]), true));
+        assert_eq!(q.log.message_bytes().next(), Some((true, &b"a\xff"[..])));
+
+        let console = ConsoleUnderTest::new("bytes");
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&heard);
+        let id = errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        tracing::subscriber::with_default(ConsoleSubscriber, || {
+            errlog_printf_bytes(&[b"reply \xfe", b"\n"])
+        });
+        errlog_flush();
+        assert!(errlog_remove_listener(id));
+        let bytes = std::fs::read(console.path("bytes")).unwrap();
+        assert_eq!(bytes, b"reply \xfe\n");
+        assert_eq!(*heard.lock().unwrap(), ["reply \u{fffd}\n"]);
     }
 
     /// The two severity words expand exactly as `errlog.h:290-299` does:
@@ -2540,6 +2753,58 @@ mod tests {
                 "n={n}"
             );
         }
+    }
+
+    /// A `write!` to [`StagedStderr`] reaches fd 2 whole; the same `write!`
+    /// to `stderr()` goes out one format piece per `write`. fd 2 is a
+    /// datagram socket here, so each `write` is one datagram.
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_stderr_line_is_one_write() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the pair, and each fd is owned once.
+        let (rx, tx) = unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()),
+                0
+            );
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        };
+        let n = 512;
+        let text = "x".repeat(n);
+        // SAFETY: fd 2 is swapped for the one `write!` and put back before
+        // anything can panic.
+        let wrote = unsafe {
+            let saved = OwnedFd::from_raw_fd(libc::dup(2));
+            libc::dup2(tx.as_raw_fd(), 2);
+            let wrote = writeln!(StagedStderr, "t: {text} n={n}");
+            libc::dup2(saved.as_raw_fd(), 2);
+            wrote
+        };
+        wrote.unwrap();
+
+        let mut datagrams = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            // SAFETY: `buf` is writable for its length.
+            let got = unsafe {
+                libc::recv(
+                    rx.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if got <= 0 {
+                break;
+            }
+            datagrams.push(buf[..got as usize].to_vec());
+        }
+        let line = format!("t: {text} n={n}\n").into_bytes();
+        assert!(datagrams.contains(&line), "{datagrams:?}");
     }
 
     /// A file console for one test, taken back however the test leaves.

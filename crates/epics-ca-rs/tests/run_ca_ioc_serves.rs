@@ -20,17 +20,44 @@ record(ai, \"E2E:X\") { field(VAL, \"4.5\") }
 record(ai, \"E2E:Y\") { field(INP, \"E2E:X CA\") field(SCAN, \".1 second\") }
 ";
 
-/// The child half; a no-op unless the parent set [`CHILD`].
+/// The child half; a no-op unless the parent set [`CHILD`]. A failed run
+/// panics with the error's Display, as softioc-rs prints it: the Debug form
+/// hides a stolen port from the parent's verdict.
 #[test]
 fn ioc_child() {
     let Ok(db) = std::env::var(CHILD) else {
         return;
     };
-    test_block_on(epics_ca_rs::server::run_ca_ioc_app(
+    if let Err(e) = test_block_on(epics_ca_rs::server::run_ca_ioc_app(
         epics_base_rs::server::ioc_app::IocApplication::new()
             .startup_line(&format!("dbLoadRecords(\"{db}\")")),
-    ))
-    .expect("run_ca_ioc_app");
+    )) {
+        panic!("run_ca_ioc_app: {e}");
+    }
+}
+
+/// A search port somebody else holds reads as that, so the named-port retry
+/// takes it: the child reports the error as softioc-rs does, in the text
+/// [`named_port::verdict::rs_ioc_port_was_taken`] reads.
+#[test]
+fn a_held_search_port_reads_as_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("e2e.db");
+    std::fs::write(&db, DB).unwrap();
+    let held = named_port::HeldPort::closed_udp();
+    let out = ioc_child_on(&db, held.port)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the IOC child");
+    let log = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        named_port::verdict::rs_ioc_port_was_taken(&log, held.port),
+        "{log}"
+    );
 }
 
 #[test]
@@ -56,20 +83,31 @@ async fn read(client: &epics_ca_rs::client::CaClient, pv: &str, deadline: Instan
     }
 }
 
-/// One run on `port`; `None` when the IOC reports that port taken.
-fn serves_on(db: &std::path::Path, port: u16) -> Option<()> {
-    let ca_env = [
+/// The client and the server on `port`, on loopback only.
+fn ca_env(port: u16) -> [(&'static str, String); 5] {
+    [
         ("EPICS_CA_SERVER_PORT", port.to_string()),
         ("EPICS_CAS_SERVER_PORT", port.to_string()),
         ("EPICS_CA_ADDR_LIST", "127.0.0.1".to_string()),
         ("EPICS_CA_AUTO_ADDR_LIST", "NO".to_string()),
         ("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1".to_string()),
-    ];
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+    ]
+}
+
+/// [`ioc_child`] serving `db` on `port`.
+fn ioc_child_on(db: &std::path::Path, port: u16) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["ioc_child", "--exact", "--nocapture"])
         .env(CHILD, db)
-        .envs(ca_env.iter().map(|(k, v)| (k, v)))
-        .env_remove("EPICS_CA_NAME_SERVERS")
+        .envs(ca_env(port))
+        .env_remove("EPICS_CA_NAME_SERVERS");
+    cmd
+}
+
+/// One run on `port`; `None` when the IOC reports that port taken.
+fn serves_on(db: &std::path::Path, port: u16) -> Option<()> {
+    let ca_env = ca_env(port);
+    let mut child = ioc_child_on(db, port)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

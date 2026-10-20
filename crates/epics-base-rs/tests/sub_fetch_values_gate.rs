@@ -59,22 +59,24 @@ async fn sub_db(inpb: &str) -> PvDatabase {
     // SNAM before the add: C applies every `field()` line and only then runs
     // `init_record`, which parks PACT for good when SNAM is empty
     // (subRecord.c:119-123).
+    // The links too: a link field written after the add bypasses the link
+    // its slot opened.
     let mut seed = SubRecord::default();
     seed.put_field("SNAM", EpicsValue::String("sum_a_c".into()))
+        .unwrap();
+    seed.put_field("INPA", EpicsValue::String("SRCA".into()))
+        .unwrap();
+    if !inpb.is_empty() {
+        seed.put_field("INPB", EpicsValue::String(inpb.into()))
+            .unwrap();
+    }
+    seed.put_field("INPC", EpicsValue::String("SRCC".into()))
         .unwrap();
     db.add_record("SUB", Box::new(seed)).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let mut inst = arc.write();
     let r = &mut inst.record;
-    r.put_field("INPA", EpicsValue::String("SRCA".into()))
-        .unwrap();
-    if !inpb.is_empty() {
-        r.put_field("INPB", EpicsValue::String(inpb.into()))
-            .unwrap();
-    }
-    r.put_field("INPC", EpicsValue::String("SRCC".into()))
-        .unwrap();
     // Stale "previous cycle" values the C gate must preserve.
     r.put_field("C", EpicsValue::Double(99.0)).unwrap();
     r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
@@ -144,19 +146,18 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
     db.add_record("SRCA", Box::new(AiRecord::new(10.0)))
         .await
         .unwrap();
-    db.add_record("ASUB", Box::new(ASubRecord::default()))
-        .await
+    let mut seed = ASubRecord::default();
+    seed.put_field("INPA", EpicsValue::String("SRCA".into()))
         .unwrap();
+    seed.put_field("INPB", EpicsValue::String("NOSUCHPV".into()))
+        .unwrap();
+    db.add_record("ASUB", Box::new(seed)).await.unwrap();
 
     {
         let arc = db.get_record("ASUB").unwrap();
         let mut inst = arc.write();
         let r = &mut inst.record;
         r.put_field("SNAM", EpicsValue::String("ran".into()))
-            .unwrap();
-        r.put_field("INPA", EpicsValue::String("SRCA".into()))
-            .unwrap();
-        r.put_field("INPB", EpicsValue::String("NOSUCHPV".into()))
             .unwrap();
         r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
         // Returns 7: had the subroutine run, the framework would publish the

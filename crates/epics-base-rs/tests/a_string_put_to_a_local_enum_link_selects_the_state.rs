@@ -47,11 +47,16 @@ async fn a_state_name_put_through_a_local_ca_link_selects_that_state() {
 /// link at `dbCaAddLink` and refuses its puts until it connects.
 async fn open_links(db: &PvDatabase) {
     db.setup_external_link_opens().await;
-    for name in db.external_link_pv_names().await {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while db.external_link_metadata(name.as_bytes()).is_none() {
-            assert!(Instant::now() < deadline, "{name} connects");
-            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    for record in db.all_record_names() {
+        for (field, _, link) in db.record_link_fields(&record) {
+            let Some(link) = link.external() else {
+                continue;
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while db.external_link_metadata(link).is_none() {
+                assert!(Instant::now() < deadline, "{record}.{field} connects");
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+            }
         }
     }
 }

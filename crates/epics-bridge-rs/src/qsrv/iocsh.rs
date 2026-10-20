@@ -445,12 +445,10 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 Some(ArgValue::Int(n)) => *n,
                 _ => 0,
             };
-            let db = provider.database().clone();
-            let mut names = ctx.block_on(async {
-                let mut n = db.all_record_names().await;
-                n.extend(db.all_alias_names());
-                n.iter().map(|n| n.to_string()).collect::<Vec<_>>()
-            });
+            let db = provider.database();
+            let mut names = db.all_record_names();
+            names.extend(db.all_alias_names());
+            let mut names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
             names.sort();
             names.dedup();
             for line in pvxsl_lines(&names, detail) {
@@ -693,31 +691,18 @@ pub fn register_qsrv_runtime_commands(provider: Arc<BridgeProvider>) -> Vec<Comm
     ]
 }
 
-/// QSRV2-gated runtime-command installer. pvxs registers the QSRV command
-/// surface — `pvxsl` (`single_enable()`, singlesourcehooks.cpp:162-166),
-/// `pvxgl` / `dbLoadGroup` (`group_enable()`, groupsourcehooks.cpp:233-245)
-/// — only inside `if(enableQ)` in `pvxsBaseRegistrar()`
-/// (iochooks.cpp:492-496), where `enableQ` is the one `enable2()` decision
-/// that also gates `addSource()`. When QSRV2 is disabled (`PVXS_QSRV_ENABLE=NO`
-/// or `EPICS_IOC_IGNORE_SERVERS=qsrv2`), none of those commands exist.
-///
-/// This is the single owner of that gate for the runtime (post-iocInit)
-/// command set: when `enabled` is false it returns an empty set, so a
-/// disabled IOC exposes no `processGroups` / `qsrvStats` / `pvxsl` / `pvxgl`
-/// / `resetGroups` control surface (`pvxsl` reads the database directly and
-/// `resetGroups` mutates the group registry — both must be absent when the
-/// QSRV2 sources are not served). It is bound to the same `qsrv2_on` decision
-/// that gates serving and group loading, so the whole QSRV surface follows
-/// one decision rather than each call site re-deciding.
+/// [`register_qsrv_runtime_commands`] less what `enable2()` gates: pvxs
+/// registers `pvxsl` (`single_enable()`, singlesourcehooks.cpp:162-166) and
+/// `pvxgl` (`group_enable()`, groupsourcehooks.cpp:233-245) only inside
+/// `if(enableQ)` (iochooks.cpp:503-507). The rest are this port's own.
 pub fn register_qsrv_runtime_commands_if_enabled(
     enabled: bool,
     provider: Arc<BridgeProvider>,
 ) -> Vec<CommandDef> {
-    if enabled {
-        register_qsrv_runtime_commands(provider)
-    } else {
-        Vec::new()
-    }
+    register_qsrv_runtime_commands(provider)
+        .into_iter()
+        .filter(|cmd| enabled || !matches!(cmd.name.as_str(), "pvxsl" | "pvxgl"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -829,12 +814,8 @@ mod tests {
         assert!(names.contains(&"resetGroups"));
     }
 
-    /// pvxs gates `single_enable()` / `group_enable()` command registration
-    /// behind `enable2()` (iochooks.cpp:492-496). A QSRV2-enabled IOC
-    /// installs the full runtime set; a disabled IOC
-    /// (`PVXS_QSRV_ENABLE=NO` / `EPICS_IOC_IGNORE_SERVERS=qsrv2`) installs
-    /// none of it — no `processGroups`/`qsrvStats`/`pvxsl`/`pvxgl`/
-    /// `resetGroups` control surface.
+    /// `enable2()` gates `pvxsl` and `pvxgl` (iochooks.cpp:503-507) and
+    /// nothing else of the runtime set.
     #[test]
     fn qsrv_runtime_commands_gated_on_qsrv2_enable() {
         let db = Arc::new(PvDatabase::new());
@@ -848,11 +829,12 @@ mod tests {
         assert!(names.contains(&"pvxsl"));
         assert!(names.contains(&"pvxgl"));
         assert!(names.contains(&"resetGroups"));
-        // `dbLoadGroup` is a base startup command, never in the runtime set.
+        // `dbLoadGroup` is a startup command, never in the runtime set.
         assert!(!names.contains(&"dbLoadGroup"));
 
         let disabled = register_qsrv_runtime_commands_if_enabled(false, provider);
-        assert!(disabled.is_empty());
+        let names: Vec<&str> = disabled.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["processGroups", "qsrvStats", "resetGroups"]);
     }
 
     #[test]

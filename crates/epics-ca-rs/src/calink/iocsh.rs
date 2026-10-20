@@ -1,54 +1,19 @@
-//! iocsh commands for `calink` — `caxr`, `dbcaxr`.
+//! iocsh command for `calink` — `dbcaxr`.
 //!
-//! The CA-link counterpart of the bridge `pvalink::iocsh`. Mirrors C
-//! `dbCa.c` debug surface: pre-warm a CA link so the synchronous
-//! record-link resolver reads cached monitor values without a blocking
-//! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).
+//! The CA-link counterpart of the bridge `pvalink::iocsh`: dump CA-link
+//! state for a record, after C `dbCa.c`'s `dbcar` debug surface. There is
+//! no CA pre-warm command: each record link opens its own channel at
+//! `dbCaAddLink`, so a channel opened by name would serve no link.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): the flavored test drives the CA client stack,
 // which needs a multi-thread tokio runtime. These run and pass in the
 // exec-backend suite on the tokio driver.
-use epics_base_rs::server::database::LinkSet;
+use epics_base_rs::server::database::{LinkRef, LinkSet};
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
 use super::resolver::CaLinkResolver;
-
-/// `caxr <pv_name>` — pre-open a CA link in monitor mode so the
-/// resolver returns cached values for that PV without a blocking GET
-/// on first access. The CA-link analogue of `pvxr`; mirrors the
-/// C `dbCaAddLink` pre-warm done at `iocInit`.
-pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
-    CommandDef::new(
-        "caxr",
-        vec![ArgDesc {
-            name: "pv_name",
-            arg_type: ArgType::String,
-        }],
-        "caxr <pv_name>",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let name = match args.first() {
-                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                _ => return Err("caxr: missing pv_name".into()),
-            };
-            let resolver = resolver.clone();
-            let bridge = ctx.bridge().clone();
-            let result = std::thread::spawn(move || {
-                bridge.block_on(async move { resolver.open(&name).await })
-            })
-            .join();
-            match result {
-                Ok(Ok(_link)) => {
-                    ctx.println("caxr: opened (monitor active)");
-                    Ok(CommandOutcome::Continue)
-                }
-                Ok(Err(e)) => Err(format!("caxr: open failed: {e}")),
-                Err(_) => Err("caxr: panic in runtime thread".into()),
-            }
-        },
-    )
-}
 
 /// `dbcaxr [<recordName>]` — print CA-link debug info. With no
 /// argument prints resolver-level stats (open-link count); with a
@@ -92,26 +57,17 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                     ctx.println(&format!("  '{rec}': {} link field(s)", links.len()));
                     for (field, raw, parsed) in links {
                         if let epics_base_rs::server::record::ParsedLink::Ca(ca) = parsed {
-                            let name = ca.pv;
-                            // Only `get_value` is async now (it may open the
-                            // link); the cached accessors are plain `fn` and
-                            // are read inline. The off-runtime thread stays
-                            // for the one remaining blocking call.
-                            let r = resolver.clone();
-                            let n = name.clone();
-                            let b = ctx.bridge().clone();
-                            let connected =
-                                <CaLinkResolver as LinkSet>::is_connected(&r, n.as_bytes());
-                            let alarm =
-                                <CaLinkResolver as LinkSet>::alarm_severity(&r, n.as_bytes());
-                            let ts = <CaLinkResolver as LinkSet>::time_stamp(&r, n.as_bytes());
-                            let value = std::thread::spawn(move || {
-                                b.block_on(async move {
-                                    <CaLinkResolver as LinkSet>::get_value(&r, n.as_bytes()).await
-                                })
-                            })
-                            .join()
-                            .unwrap_or(None);
+                            // The record's held parse: its link is the one
+                            // whose channel is reported.
+                            let link = LinkRef::new(ca.pv.as_bytes(), &ca.open);
+                            let name = &ca.pv;
+                            // A report: the value is peeked, so the link is
+                            // neither opened nor monitored by reading it.
+                            let r = &resolver;
+                            let connected = <CaLinkResolver as LinkSet>::is_connected(r, link);
+                            let alarm = <CaLinkResolver as LinkSet>::alarm_severity(r, link);
+                            let ts = <CaLinkResolver as LinkSet>::time_stamp(r, link);
+                            let value = r.peek_value(link);
                             ctx.println(&format!(
                                 "    {field}={raw:?}  ca://{name}  connected={connected}"
                             ));
@@ -137,10 +93,7 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
 /// `resolver`. Drop the result into
 /// [`epics_base_rs::server::ioc_app::IocRunConfig::shell_commands`].
 pub fn register_calink_commands(resolver: CaLinkResolver) -> Vec<CommandDef> {
-    vec![
-        ca_caxr_command(resolver.clone()),
-        db_dbcaxr_command(resolver),
-    ]
+    vec![db_dbcaxr_command(resolver)]
 }
 
 #[cfg(test)]
@@ -152,12 +105,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn register_calink_commands_returns_two() {
+    async fn register_calink_commands_returns_dbcaxr() {
         let r = dummy_resolver();
         let cmds = register_calink_commands(r);
-        assert_eq!(cmds.len(), 2);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"caxr"));
-        assert!(names.contains(&"dbcaxr"));
+        assert_eq!(names, ["dbcaxr"]);
     }
 }

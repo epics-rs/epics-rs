@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -60,26 +60,26 @@ struct AdmissionLset {
 
 #[async_trait::async_trait]
 impl LinkSet for AdmissionLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _: LinkRef<'_>) -> PutAdmission {
         self.admission
     }
-    fn link_metadata(&self, _: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _: LinkRef<'_>) -> Option<LinkMetadata> {
         Some(LinkMetadata {
             dbf_type: Some(LinkDbfType::Double),
             element_count: Some(1),
             ..Default::default()
         })
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
-    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Ok(())
     }
 }

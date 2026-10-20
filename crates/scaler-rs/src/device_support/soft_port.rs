@@ -483,7 +483,7 @@ impl SoftScalerPorts {
                 let current = db.get_pv(format!("{}.{}", pv.record, pv.field)).ok();
                 let (Ok(reader), Some(record), Some(current)) = (reader, record, current) else {
                     // C asynPrint ASYN_TRACE_ERROR, then `stateFailed`.
-                    eprintln!(
+                    epics_base_rs::stderr_println!(
                         "drvScalerSoft::connectPVs port {port} can't find PV {}.",
                         pv.name
                     );

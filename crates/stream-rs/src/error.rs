@@ -6,7 +6,7 @@
 //! Messages are byte strings: a token quoted in a message can hold any byte
 //! the protocol file held.
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use parking_lot::{Mutex, RwLock};
@@ -56,7 +56,7 @@ pub fn set_stream_msg_time_stamped(on: i32) {
 pub fn stream_debug_colored() -> bool {
     match STREAM_DEBUG_COLORED.load(Ordering::Relaxed) {
         -1 => {
-            let tty = std::io::stderr().is_terminal();
+            let tty = epics_base_rs::runtime::log::stderr_is_terminal();
             STREAM_DEBUG_COLORED.store(tty as i32, Ordering::Relaxed);
             tty
         }
@@ -156,7 +156,7 @@ fn write_stderr(bytes: &[u8]) {
         None => false,
     };
     if !captured {
-        let _ = std::io::stderr().write_all(bytes);
+        let _ = epics_base_rs::runtime::log::StagedStderr.write_all(bytes);
     }
 }
 

@@ -2,8 +2,7 @@
 //!
 //! Corresponds to C++ areaDetector's NDPluginPva. Captures each incoming
 //! NDArray, converts it to a native [`PvField::Structure`] shaped per
-//! `epics:nt/NTNDArray:1.0`, and stores it in the registry consumed by the
-//! qsrv adapter.
+//! `epics:nt/NTNDArray:1.0`, and posts it to the plugin's [`SharedPV`].
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — the one site ran and
 // passed on the exec backend (measured on this tree:
@@ -22,26 +21,51 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, PortPost, ProcessResult};
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
-use epics_bridge_rs::qsrv::PvaPvHandle;
 use epics_pva_rs::nt::nd_array::{
     NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
     nt_nd_array_desc, nt_nd_array_value,
 };
-use epics_pva_rs::pvdata::{PvArray, PvField, ScalarValue, VariantValue};
+use epics_pva_rs::proto::BitSet;
+use epics_pva_rs::pvdata::encode::default_value_for;
+use epics_pva_rs::pvdata::{PvArray, PvField, ScalarValue, Value, VariantValue};
+use epics_pva_rs::server_native::SharedPV;
+
+/// The fields NDPluginPvxs's `fromArray` assigns on every frame
+/// (ntndArrayConverterPvxs.cpp:200-209, 351-470).
+const FROM_ARRAY: [&str; 12] = [
+    "value",
+    "codec.name",
+    "codec.parameters",
+    "compressedSize",
+    "uncompressedSize",
+    "uniqueId",
+    "dataTimeStamp.secondsPastEpoch",
+    "dataTimeStamp.nanoseconds",
+    "timeStamp.secondsPastEpoch",
+    "timeStamp.nanoseconds",
+    "dimension",
+    "attribute",
+];
+
+/// Which fields of the served value a frame assigns, as the C server has it.
+enum Marking {
+    /// NDPluginPva's pvDatabase record answers a GET with bit 0, every field
+    /// (channelLocal.cpp:353-356).
+    Whole,
+    /// NDPluginPvxs's SharedPV, opened on an unmarked `create()`: each post
+    /// assigns these bits, [`FROM_ARRAY`]'s.
+    FromArray(BitSet),
+}
 
 /// PVA plugin processor: captures the latest NDArray, converts it to an
-/// NTNDArray [`PvField`], and posts it through its shared [`PvaPvHandle`].
-///
-/// The handle is the single validating write owner (pvxs
-/// `SharedPV::post`): a frame that does not match the canonical NTNDArray
-/// descriptor is rejected and never replaces the last good snapshot or
-/// reaches monitor subscribers. The producer holds one clone of the
-/// handle and the qsrv adapter registers another; both share the same
-/// `latest`/`subscribers` state.
+/// NTNDArray [`PvField`], and posts it to its [`SharedPV`], which the IOC
+/// adds to the PVA server's `__builtin` store as NDPluginPvxs does
+/// (NDPluginPvxs.cpp:50-56).
 pub struct PvaProcessor {
     pv_name: String,
-    handle: PvaPvHandle,
+    pv: SharedPV,
     plugin_type: &'static str,
+    marking: Marking,
 }
 
 impl PvaProcessor {
@@ -52,21 +76,35 @@ impl PvaProcessor {
     /// `NDPluginPvxs` serves the same NTNDArray under its own PluginType
     /// (NDPluginPvxs.cpp:139).
     pub fn with_plugin_type(pv_name: String, plugin_type: &'static str) -> Self {
-        // The producer always emits NTNDArray-shaped values; advertising
-        // `nt_nd_array_desc()` lets `post` gate any malformed frame before
-        // it can become the served snapshot.
+        // Opened on an empty NTNDArray, as C's `NTNDArray{}.build().create()`
+        // (NDPluginPvxs.cpp:41-52).
+        let pv = SharedPV::build_readonly();
+        let desc = nt_nd_array_desc();
+        let marking = if plugin_type == "NDPluginPvxs" {
+            let mut marks = BitSet::new();
+            for path in FROM_ARRAY {
+                marks.set(desc.bit_for_path(path).expect("an NTNDArray field"));
+            }
+            pv.open_value(Value::create_from(desc))
+                .expect("an empty NTNDArray fits its descriptor");
+            Marking::FromArray(marks)
+        } else {
+            let empty = default_value_for(&desc);
+            pv.open(desc, empty)
+                .expect("an empty NTNDArray fits its descriptor");
+            Marking::Whole
+        };
         Self {
             pv_name,
-            handle: PvaPvHandle::new(Some(nt_nd_array_desc())),
+            pv,
             plugin_type,
+            marking,
         }
     }
 
-    /// A clone of the shared handle to register with the qsrv adapter.
-    /// Producer posts and server reads/monitors flow through the same
-    /// `latest`/`subscribers` state.
-    pub fn handle(&self) -> PvaPvHandle {
-        self.handle.clone()
+    /// The PV the frames are posted to, for the server to serve.
+    pub fn pv(&self) -> SharedPV {
+        self.pv.clone()
     }
 }
 
@@ -99,12 +137,13 @@ impl NDPluginProcess for PvaProcessor {
         }
         let payload = ndarray_to_pv_field(array);
 
-        // Regression.
-        // `post` validates against the canonical NTNDArray descriptor and
-        // is the single owner of `latest`/`subscribers`: a malformed frame
-        // is rejected without replacing the last good snapshot or reaching
-        // monitor subscribers (pvxs `SharedPV::post`).
-        if let Err(err) = self.handle.post(payload) {
+        // A frame that does not fit the NTNDArray descriptor keeps the last
+        // good value and reaches no monitor (pvxs `SharedPV::post`).
+        let posted = match &self.marking {
+            Marking::Whole => self.pv.try_post_checked(payload),
+            Marking::FromArray(marks) => self.pv.post_delta(marks, &payload),
+        };
+        if let Err(err) = posted {
             tracing::warn!(
                 pv = %self.pv_name,
                 error = %err,
@@ -720,20 +759,106 @@ mod tests {
         );
     }
 
-    /// Regression.
-    /// A real NDArray frame must match the canonical `nt_nd_array_desc()`
-    /// the producer advertises in its handle; otherwise `post` would reject
-    /// every frame and the served value would stay empty. Posting a real
-    /// frame and asserting `current_value().is_some()` verifies the
-    /// producer output and the advertised descriptor agree.
+    /// The served value's `uniqueId`.
+    fn served_unique_id(pv: &SharedPV) -> Option<i32> {
+        match pv.current()? {
+            PvField::Structure(s) => match s.get_field("uniqueId") {
+                Some(PvField::Scalar(ScalarValue::Int(id))) => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The fields a GET of `pv` frames: the server's `marked` set, `None`
+    /// for all of them.
+    fn served_marks(pv: SharedPV) -> Option<Vec<String>> {
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+        use epics_pva_rs::server_native::{ChannelSource, SharedSource};
+        let src = SharedSource::new();
+        src.add("M", pv);
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            creds: Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
+            pv_request: None,
+            log: Default::default(),
+        };
+        epics_base_rs::runtime::task::test_block_on(async {
+            let checked = AccessGate::open()
+                .check("M", "127.0.0.1", "anonymous", "anonymous", "")
+                .await;
+            src.read_checked(checked, ctx).await.expect("open").marked
+        })
+    }
+
+    /// C NDPluginPvxs opens its SharedPV on `NTNDArray{}.build().create()`,
+    /// which marks nothing, so a GET before the first frame frames no field
+    /// (NDPluginPvxs.cpp:41-52): the PUT's fetch a pvxs client assigns from
+    /// must not carry the unselected `value` union (clientget.cpp:561).
+    #[test]
+    fn an_ndpvxs_pv_reads_no_field_before_its_first_frame() {
+        let proc = PvaProcessor::with_plugin_type("M".into(), "NDPluginPvxs");
+        assert_eq!(served_marks(proc.pv()), Some(Vec::new()));
+    }
+
+    /// Each NDPluginPvxs frame marks exactly what `fromArray` assigns
+    /// (ntndArrayConverterPvxs.cpp:200-209, 351-470).
+    #[test]
+    fn an_ndpvxs_frame_marks_what_from_array_assigns() {
+        let proc = PvaProcessor::with_plugin_type("M".into(), "NDPluginPvxs");
+        let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+        proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let mut got = served_marks(proc.pv()).expect("a field subset");
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "attribute",
+                "codec.name",
+                "codec.parameters",
+                "compressedSize",
+                "dataTimeStamp.nanoseconds",
+                "dataTimeStamp.secondsPastEpoch",
+                "dimension",
+                "timeStamp.nanoseconds",
+                "timeStamp.secondsPastEpoch",
+                "uncompressedSize",
+                "uniqueId",
+                "value",
+            ]
+        );
+    }
+
+    /// NDPluginPva's pvDatabase record answers every GET with bit 0
+    /// (channelLocal.cpp:353-356): all fields, before a frame or after.
+    #[test]
+    fn an_ndpva_pv_reads_every_field() {
+        let proc = PvaProcessor::new("M".into());
+        assert_eq!(served_marks(proc.pv()), None);
+        let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+        proc.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        assert_eq!(served_marks(proc.pv()), None);
+    }
+
+    /// A real NDArray frame must fit the `nt_nd_array_desc()` the PV is
+    /// opened with, or every frame is refused and the PV keeps serving the
+    /// empty NTNDArray it opened on.
     #[test]
     fn processor_stores_latest() {
         let proc = PvaProcessor::new("TEST:Pva1:Image".into());
+        assert_eq!(served_unique_id(&proc.pv()), Some(0));
         let pool = NDArrayPool::new(1_000_000);
-        let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+        let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+        arr.unique_id = 5;
         proc.process_array(&Arc::new(arr), &pool);
 
-        assert!(proc.handle().current_value().is_some());
+        assert_eq!(served_unique_id(&proc.pv()), Some(5));
     }
 
     #[test]
@@ -756,7 +881,7 @@ mod tests {
         assert!(compressed.codec.is_some(), "input must carry a codec");
 
         let processor = PvaProcessor::new("TEST:Pva1:Image".into());
-        let pv = processor.handle();
+        let pv = processor.pv();
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("PVA1").unwrap(),
@@ -794,8 +919,8 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let served = loop {
-            if let Some(v) = pv.current_value() {
-                break v;
+            if served_unique_id(&pv) == Some(1) {
+                break pv.current().unwrap();
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -832,7 +957,7 @@ mod tests {
         use ad_core_rs::plugin::wiring::WiringRegistry;
 
         let processor = PvaProcessor::new("TEST:PvaThrottle:Image".into());
-        let pv = processor.handle();
+        let pv = processor.pv();
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("PVA_THROTTLE").unwrap(),
@@ -887,13 +1012,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let Some(PvField::Structure(served)) = pv.current_value() else {
-            panic!("nothing posted");
-        };
-        assert_eq!(
-            served.get_field("uniqueId"),
-            Some(&PvField::Scalar(ScalarValue::Int(1)))
-        );
+        assert_eq!(served_unique_id(&pv), Some(1));
     }
 
     #[test]

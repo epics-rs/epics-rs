@@ -2447,6 +2447,7 @@ mod tests {
                 Some(DbFieldType::String) | Some(DbFieldType::Enum)
             ),
             constant_type: false,
+            put_admitted: true,
         }
     }
 
@@ -2461,6 +2462,7 @@ mod tests {
             is_ca_link: false,
             puts_as_string: true,
             constant_type: false,
+            put_admitted: true,
         }
     }
 

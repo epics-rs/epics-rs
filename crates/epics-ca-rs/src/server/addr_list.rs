@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
 use epics_base_rs::error::{CaError, CaResult};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Configuration for the CA server's UDP layer.
 #[derive(Debug, Clone)]
@@ -248,7 +249,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // C `caservertask.c:441-442`, whatever `autobeaconlist` was: an empty
     // list stays empty, and beacons go nowhere.
     if beacon_addrs.is_empty() {
-        eprintln!("Warning: RSRV has empty beacon address list");
+        epics_libcom_rs::stderr_println!("Warning: RSRV has empty beacon address list");
     }
     cfg.beacon_addrs = beacon_addrs;
 
@@ -304,10 +305,12 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
         // fetched came from the deprecated var, so this does too.
         _ => {
-            eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
+                "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed"
+            );
+            epics_libcom_rs::stderr_println!(
                 "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
-                default_beacon_period_secs()
+                CFloat(default_beacon_period_secs())
             );
         }
     }

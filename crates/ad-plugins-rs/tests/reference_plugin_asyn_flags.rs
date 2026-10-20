@@ -95,6 +95,15 @@ fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bridge = {
         let _guard = rt.enter();
+        // NDPvxsConfigure adds to the server `pvxsBaseRegistrar` binds before
+        // the startup script.
+        #[cfg(feature = "pva")]
+        {
+            use epics_pva_rs::server_native::{PvaServer, SharedSource};
+            let server = PvaServer::isolated(Arc::new(SharedSource::new())).unwrap();
+            epics_pva_rs::server::iocsh::publish_pvxs_report(server.report_handle());
+            std::mem::forget(server);
+        }
         epics_base_rs::runtime::task::BlockingBridge::capture()
     };
     // The shell's command handlers block on this runtime; it must outlive them.
@@ -123,6 +132,8 @@ fn configure_line(ioc: &AdIoc, name: &str, port: &str, upstream: &str) -> String
             (0, _) => format!("\"{port}\""),
             (_, ArgType::Int) if a.name == "queueSize" => "20".into(),
             (_, ArgType::Int | ArgType::Double) => "0".into(),
+            // NDPva and NDPvxs both add theirs to pvxs's `__builtin`.
+            _ if a.name == "pvName" => format!("\"{port}\""),
             _ => format!("\"{upstream}\""),
         })
         .collect();

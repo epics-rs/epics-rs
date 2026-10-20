@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use crate::error::{CaError, CaResult, CalcSaid, LinkRefusal, LinkWhy};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
+use crate::server::database::LinkSerial;
 use crate::server::recgbl::ReportString;
 use crate::types::{DbFieldType, DbfLinkClass, EpicsValue, PvString};
 
@@ -854,23 +855,75 @@ impl PvaJsonLink {
 /// The scheme prefix a `pva` link's boundary name carries.
 const PVA_SCHEME: &str = "pva://";
 
-/// Set once an external link's open is staged: the one `CA_CONNECT`
-/// `dbCaAddLink` queues per `caLink` (`dbCa.c:397-401`). It lives on the
-/// parse because the parse is the `caLink` — a relink makes a new one, which
-/// opens again — and it is what lets a cycle on a link that is down read
-/// state instead of staging again. Not part of the link's identity, and
-/// shared by every clone of the parse. Behind an `Arc` so `ParsedLink` holds
-/// no cell inline (see [`ForwardSlot`]).
+/// An external link's identity and the state C keeps on its `caLink`: a
+/// [`LinkSerial`] no other link has, set once its open is staged — the one
+/// `CA_CONNECT` `dbCaAddLink` queues per `caLink` (`dbCa.c:397-401`) — and
+/// set again once `dbCaRemoveLink` removed it (`dbCa.c:431-446`). It lives on
+/// the parse because the parse is the `caLink` — a relink makes a new one,
+/// which opens again — and it is what lets a cycle on a link that is down read
+/// state instead of staging again. Not part of the parse's value, and shared
+/// by every clone of the parse. Behind an `Arc` so `ParsedLink` holds no cell
+/// inline (see [`ForwardSlot`]).
 #[derive(Debug, Default)]
-pub struct OpenLatch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct OpenLatch(std::sync::Arc<LinkCell>);
+
+#[derive(Debug, Default)]
+struct LinkCell {
+    serial: LinkSerial,
+    opened: std::sync::atomic::AtomicBool,
+    removed: std::sync::atomic::AtomicBool,
+    /// `pvlOptCP | pvlOptCPP` in C's `pv_link.pvlMask`.
+    processes_holder: bool,
+    /// The `pvlOptInpNative` `dbInitLink`/`dbAddLink` set (`dbLink.c:125-126`,
+    /// `:180-181`): a `DBF_INLINK`.
+    input: bool,
+}
 
 impl OpenLatch {
+    /// The latch of a CA link in a field of `ftype`, parsed with `policy`.
+    pub fn ca(policy: LinkProcessPolicy, ftype: LinkFieldType) -> Self {
+        Self(std::sync::Arc::new(LinkCell {
+            processes_holder: policy.cp_passive_only().is_some(),
+            input: ftype == LinkFieldType::In,
+            ..LinkCell::default()
+        }))
+    }
+
+    /// A CP or CPP link: its events may process its holder.
+    pub fn processes_holder(&self) -> bool {
+        self.0.processes_holder
+    }
+
+    /// A `DBF_INLINK`: monitored from its connect. Any other CA link is
+    /// monitored from its first read (`dbCa.c:455-457`).
+    pub fn is_input(&self) -> bool {
+        self.0.input
+    }
+
     pub(crate) fn is_set(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.opened.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .opened
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn serial(&self) -> LinkSerial {
+        self.0.serial
+    }
+
+    /// `dbCaRemoveLink` ran: an lset that keeps state per link must not
+    /// create any for it from here on.
+    pub fn is_removed(&self) -> bool {
+        self.0.removed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn remove(&self) {
+        self.0
+            .removed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -888,20 +941,12 @@ impl PartialEq for OpenLatch {
 
 impl Eq for OpenLatch {}
 
-/// An external link as a cycle addresses it: its boundary name and the
-/// latch of its one open.
-#[derive(Clone, Copy)]
+/// An external link as a cycle addresses it: its boundary name and its
+/// identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalRef<'a> {
     pub name: &'a [u8],
-    /// `None` for a name no parse holds — an init-time caller, whose open
-    /// the queue still stages once per channel.
-    pub(crate) open: Option<&'a OpenLatch>,
-}
-
-impl<'a> ExternalRef<'a> {
-    pub(crate) fn unlatched(name: &'a [u8]) -> Self {
-        Self { name, open: None }
-    }
+    pub open: &'a OpenLatch,
 }
 
 /// Separator byte between the bare `pv` and the encoded options in a
@@ -1068,24 +1113,70 @@ pub struct CalcLink {
     /// `apply_timestamp` time.
     pub time_source: Option<char>,
     /// C `clink->val`: the last result, which `VAL` reads in the next
-    /// evaluation.
+    /// evaluation; `clink->arg`, which a failed input read leaves as it
+    /// was; and `clink->time`/`utag`, which only a good read of the `time`
+    /// input changes.
     pub val: CalcVal,
 }
 
-/// C `clink->val` (`lnkCalc.c:61`). Link state, not configuration: every
-/// two compare equal, and every clone of the parse shares it. Behind an
-/// `Arc` so `ParsedLink` holds no cell inline (see [`ForwardSlot`]).
+/// C `clink->arg`, `time`, `utag` and `val` (`lnkCalc.c:65-68`): what one
+/// evaluation leaves for the next. Link state, not configuration: every two
+/// compare equal, and every clone of the parse shares it. Behind an `Arc` so
+/// `ParsedLink` holds no cell inline (see [`ForwardSlot`]).
 #[derive(Default)]
-pub struct CalcVal(std::sync::Arc<std::sync::atomic::AtomicU64>);
+pub struct CalcVal(std::sync::Arc<[std::sync::atomic::AtomicU64; CalcVal::UTAG + 1]>);
 
 impl CalcVal {
     pub fn get(&self) -> f64 {
-        f64::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+        self.load(0)
     }
 
     pub fn set(&self, val: f64) {
-        self.0
-            .store(val.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.store(0, val);
+    }
+
+    /// `clink->arg[i]`.
+    pub(crate) fn arg(&self, i: usize) -> f64 {
+        self.load(1 + i)
+    }
+
+    pub(crate) fn set_arg(&self, i: usize, val: f64) {
+        self.store(1 + i, val);
+    }
+
+    const TIME: usize = 1 + crate::calc::engine::CALC_NARGS;
+    const UTAG: usize = Self::TIME + 1;
+    /// The time slot counts nanoseconds from the EPICS epoch, wrapping, so
+    /// the zeroed slot is `{0,0}` and every `WallTime` round-trips.
+    const EPICS_EPOCH_NANOS: u64 =
+        crate::runtime::general_time::EPICS_EPOCH_UNIX_SECS * 1_000_000_000;
+
+    /// `clink->time` and `clink->utag`, `{0,0}` and 0 until the `time`
+    /// input first reads.
+    pub(crate) fn stamp(&self) -> (crate::types::WallTime, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let unix = self.0[Self::TIME]
+            .load(Relaxed)
+            .wrapping_add(Self::EPICS_EPOCH_NANOS);
+        (
+            crate::types::WallTime::from_unix(unix / 1_000_000_000, (unix % 1_000_000_000) as u32),
+            self.0[Self::UTAG].load(Relaxed),
+        )
+    }
+
+    pub(crate) fn set_stamp(&self, time: crate::types::WallTime, utag: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let unix = u64::try_from(time.since_unix_epoch().as_nanos()).unwrap_or(u64::MAX);
+        self.0[Self::TIME].store(unix.wrapping_sub(Self::EPICS_EPOCH_NANOS), Relaxed);
+        self.0[Self::UTAG].store(utag, Relaxed);
+    }
+
+    fn load(&self, slot: usize) -> f64 {
+        f64::from_bits(self.0[slot].load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn store(&self, slot: usize, val: f64) {
+        self.0[slot].store(val.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1500,7 +1591,7 @@ impl DbLink {
     pub fn external(&self) -> ExternalRef<'_> {
         ExternalRef {
             name: &self.pvname,
-            open: Some(&self.open),
+            open: &self.open,
         }
     }
 
@@ -1569,8 +1660,8 @@ pub fn ca_forward_flag(ftype: LinkFieldType, pv: &[u8]) -> bool {
 /// from the parse ([`ParsedLink::external_forward`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalForward<'a> {
-    /// dbCa: put 1 through `pv` when `fwd` ([`CaLink::fwd`]), else nothing.
-    Ca { pv: &'a [u8], fwd: bool },
+    /// dbCa: put 1 through `link` when `fwd` ([`CaLink::fwd`]), else nothing.
+    Ca { link: ExternalRef<'a>, fwd: bool },
     /// The `pva` lset's `scanForward`, through the handle the link was
     /// opened with.
     Pva(&'a ForwardSlot),
@@ -1708,6 +1799,14 @@ impl CaLink {
             policy: LinkProcessPolicy::NoProcess,
             fwd: false,
             open: OpenLatch::default(),
+        }
+    }
+
+    /// A JSON `{ca:…}` link in a field of `ftype`: [`Self::new`]'s shape.
+    fn json(pv: impl Into<crate::types::RecordName>, ftype: LinkFieldType) -> Self {
+        Self {
+            open: OpenLatch::ca(LinkProcessPolicy::NoProcess, ftype),
+            ..Self::new(pv)
         }
     }
 }
@@ -2223,7 +2322,10 @@ impl ParsedLink {
     pub fn external_forward(&self) -> Option<ExternalForward<'_>> {
         match self {
             ParsedLink::Ca(ca) => Some(ExternalForward::Ca {
-                pv: ca.pv.as_bytes(),
+                link: ExternalRef {
+                    name: ca.pv.as_bytes(),
+                    open: &ca.open,
+                },
                 fwd: ca.fwd,
             }),
             ParsedLink::Pva(p) => Some(ExternalForward::Pva(&p.forward)),
@@ -2258,18 +2360,18 @@ impl ParsedLink {
         match self {
             ParsedLink::Ca(ca) => Some(ExternalRef {
                 name: &ca.pv,
-                open: Some(&ca.open),
+                open: &ca.open,
             }),
             // Scheme-qualified: `split_external_link_name` reads the prefix
             // back into the `pva` scheme, and a bare name is a CA
             // link. The lset itself still sees the unprefixed body.
             ParsedLink::Pva(name) => Some(ExternalRef {
                 name: name.qualified.as_bytes(),
-                open: Some(&name.open),
+                open: &name.open,
             }),
             ParsedLink::PvaJson(j) => Some(ExternalRef {
                 name: j.qualified.as_bytes(),
-                open: Some(&j.open),
+                open: &j.open,
             }),
             _ => None,
         }
@@ -2809,7 +2911,7 @@ pub(crate) fn parse_json_link_in(
     }
     // The body reader splits on `:` and matches barewords too, so it needs the
     // same normalized text.
-    match try_parse_json_link_body(&normalized, lookup) {
+    match try_parse_json_link_body(&normalized, ftype, lookup) {
         Some(parsed) => JsonLinkParse::Parsed(parsed),
         // DEVIATION, deliberate. A registered type whose jlif merely IGNORES a
         // token it does not want (pvxs `pva_parse_integer` at
@@ -3259,7 +3361,7 @@ impl LnkCalcParse {
 
     fn double(&mut self, value: f64, said: &mut Said) -> bool {
         if self.pstate != CalcPs::Args {
-            let g = crate::calc::engine::cvt::fmt_g(value, 6, false, false);
+            let g = epics_libcom_rs::cfmt::CFloat(value).g().to_string();
             calc_stop(said, CalcSaid::UnexpectedDouble(ReportString::new(&g)));
             return false;
         }
@@ -3437,7 +3539,11 @@ fn check_hw_link_text(text: &str) -> CaResult<()> {
 /// Read a link body that has ALREADY been through
 /// [`crate::json5::relaxed_to_strict`]. Every key here is quoted and every
 /// comment is gone, so the `:` split below is safe.
-fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLink> {
+fn try_parse_json_link_body(
+    s: &str,
+    ftype: LinkFieldType,
+    lookup: LinkLookup<'_>,
+) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
         return None;
@@ -3489,8 +3595,9 @@ fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLin
                         // JSON CA links carry no plain-text MS modifier and
                         // ignore pvalink options; take only the PV name.
                         // Alarm policy defaults to NoMaximize.
-                        Some(ParsedLink::Ca(CaLink::new(
+                        Some(ParsedLink::Ca(CaLink::json(
                             extract_pv_and_opts_from_subobject(obj)?.0?,
+                            ftype,
                         )))
                     } else {
                         // PVA longhand: keep the options as structured JLink
@@ -3513,7 +3620,7 @@ fn try_parse_json_link_body(s: &str, lookup: LinkLookup<'_>) -> Option<ParsedLin
                     // yajl string, so its escapes are decoded by the one owner.
                     let name = decode_json_string(name.trim());
                     if key == "ca" {
-                        Some(ParsedLink::Ca(CaLink::new(name)))
+                        Some(ParsedLink::Ca(CaLink::json(name, ftype)))
                     } else {
                         Some(ParsedLink::Pva(name.into()))
                     }
@@ -4339,7 +4446,7 @@ fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
             // pre-fix it was discarded into a bare latest-value link.
             policy,
             fwd: ca_forward_flag(ftype, pv),
-            open: OpenLatch::default(),
+            open: OpenLatch::ca(policy, ftype),
         });
     }
     if let Some(rest) = s.strip_prefix(b"pva://") {
@@ -4383,7 +4490,7 @@ fn parse_name_link(s: &[u8], ftype: LinkFieldType) -> ParsedLink {
             monitor_switch: ms,
             policy,
             fwd: ca_forward_flag(ftype, link_part),
-            open: OpenLatch::default(),
+            open: OpenLatch::ca(policy, ftype),
         });
     }
 

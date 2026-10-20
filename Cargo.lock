@@ -29,6 +29,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "fearless_simd 1.0.0",
  "fearless_simd_macros",
@@ -498,6 +499,13 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "cfloat-gate"
+version = "0.0.0"
+dependencies = [
+ "source-guard",
+]
 
 [[package]]
 name = "chrono"
@@ -1165,6 +1173,7 @@ dependencies = [
  "clap",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "named-port",
  "optics-rs",
@@ -2210,6 +2219,7 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "tokio",
 ]
 
@@ -2293,6 +2303,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "libm",
  "motor-rs",
@@ -2350,6 +2361,7 @@ dependencies = [
  "criterion",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "libc",
  "tokio",
 ]
@@ -2383,6 +2395,7 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "libc",
  "rumqttc-v5-next",
  "serde_json",
@@ -2644,6 +2657,7 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "libm",
  "motor-rs",
  "named-port",
@@ -2659,6 +2673,7 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "motor-rs",
  "tokio",
  "tracing",
@@ -3296,6 +3311,7 @@ dependencies = [
  "clap",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "libc",
  "tokio",
@@ -3335,9 +3351,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bcc231bb1a1d9ef4e07d6cac13f7054363bdc80ab52cf57967069ac5e27ebbb"
+checksum = "17cfbae863e14403da0e1ea5208754f4ed170b21b84da97bbfaeb12f998f44a1"
 dependencies = [
  "bzip2",
  "fearless_simd 1.0.0",
@@ -3533,6 +3549,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "parking_lot",
 ]
 
@@ -3731,6 +3748,7 @@ dependencies = [
  "ad-plugins-rs",
  "asyn-rs",
  "epics-base-rs",
+ "epics-libcom-rs",
  "named-port",
  "parking_lot",
  "rand 0.9.3",
@@ -3828,6 +3846,7 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "futures-util",
  "parking_lot",
  "tempfile",
@@ -3870,6 +3889,7 @@ dependencies = [
  "asyn-rs",
  "chrono",
  "epics-base-rs",
+ "epics-libcom-rs",
  "libc",
  "parking_lot",
  "stream-pcre-sys",
@@ -4850,6 +4870,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "motor-rs",
  "parking_lot",
  "xrt-core",

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::Local;
+use epics_libcom_rs::cfmt::CFloat;
 
 use super::error::AutosaveResult;
 use super::format::END_MARKER;
@@ -31,7 +32,8 @@ impl Default for BackupConfig {
 /// `fopen_and_check` then rejects it for the missing `<END>`. Copying
 /// to a sibling temp path and renaming makes that intermediate state
 /// unconstructible: `dst` holds its previous complete content or the new
-/// copy, never a truncation.
+/// copy, never a truncation. C's `fopen(dest, "wb")` truncates in place
+/// (dbrestore.c:192), a C defect not copied.
 ///
 /// The temp name is the destination plus `.tmp`, so it is in the same
 /// directory (`rename` is only atomic within a filesystem) and cannot
@@ -58,15 +60,24 @@ pub(super) async fn publish_copy(
     let tmp = PathBuf::from(tmp);
     let published = crate::runtime::fs::blocking({
         let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
-        move || Ok(copy_through(&src, &dst, &tmp))
+        // `true` with a source that would not open.
+        move || {
+            Ok(match std::fs::read(&src) {
+                Ok(contents) => copy_through(&contents, &dst, &tmp).map_err(|(l, e)| (l, e, false)),
+                Err(e) => Err((format!("Can't open file '{}'", src.display()), e, true)),
+            })
+        }
     })
     .await
-    .unwrap_or_else(|e| Err((format!("Can't open file '{}'", dst.display()), e)));
+    .unwrap_or_else(|e| Err((format!("Can't open file '{}'", dst.display()), e, false)));
     // Announced here rather than by the callers: this is the only place a
     // backup artefact is written, as C's `myFileCopy` is.
     match published {
         Ok(()) => Ok(()),
-        Err((line, e)) => {
+        Err((line, e, unread)) => {
+            if unread {
+                settings.note_io_error(false);
+            }
             crate::runtime::log::errlog_vprintf(format_args!("../dbrestore.c:myFileCopy {line}\n"));
             Err(e.into())
         }
@@ -76,13 +87,18 @@ pub(super) async fn publish_copy(
 /// `publish_copy`'s blocking half; the error carries C's `myFileCopy` line.
 /// C names the source when it cannot be read and the destination for
 /// anything after (dbrestore.c:181-216).
-fn copy_through(src: &Path, dst: &Path, tmp: &Path) -> Result<(), (String, std::io::Error)> {
+fn copy_through(contents: &[u8], dst: &Path, tmp: &Path) -> Result<(), (String, std::io::Error)> {
     use std::io::Write as _;
     let failed = |what: &str, path: &Path| {
         let line = format!("{what} '{}'", path.display());
         move |e| (line, e)
     };
-    let contents = std::fs::read(src).map_err(failed("Can't open file", src))?;
+    // C's `fopen("", "wb")`, for `write_save_file`'s empty `backup_file`.
+    if dst.as_os_str().is_empty() {
+        return Err(failed("Can't open file", dst)(
+            std::io::ErrorKind::NotFound.into(),
+        ));
+    }
     let published = std::fs::File::create(tmp)
         .map_err(failed("Can't open file", dst))
         // C only says "Error closing file" for a failed write-back and still
@@ -91,7 +107,7 @@ fn copy_through(src: &Path, dst: &Path, tmp: &Path) -> Result<(), (String, std::
         .and_then(|mut file| {
             // C's `fopen(dest, "wb")` keeps the mode of a file already there.
             keep_permissions(&file, dst);
-            file.write_all(&contents)
+            file.write_all(contents)
                 .map_err(failed("Error closing file", dst))
         })
         // A destination C could not `fopen(dest, "wb")`.
@@ -113,7 +129,7 @@ pub(super) fn date_str() -> String {
 /// C's `line` between two rows of `stars` `***`s.
 pub(super) fn print_banner(stars: usize, line: &str) {
     let row = "*** ".repeat(stars - 1) + "***";
-    println!("{row}\n{line}\n{row}");
+    crate::epics_println!("{row}\n{line}\n{row}");
 }
 
 /// Whether the `.savB` backup still holds the *outgoing* generation and
@@ -145,23 +161,46 @@ pub(super) enum FileState {
     Ok,
 }
 
+impl FileState {
+    /// C's `BS_NONE`, `BS_BAD` and `BS_OK` values (save_restore.c:1637-1639).
+    pub(super) fn code(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Bad => 1,
+            Self::Ok => 2,
+        }
+    }
+}
+
 /// C `check_file` (save_restore.c:1642-1690): a file that opens is good
 /// when `<END>` starts 7 or 6 bytes before its end.
 pub(super) async fn check_file(path: &Path, settings: &SrSettings) -> FileState {
     let path = path.to_path_buf();
-    let Ok(bytes) = crate::runtime::fs::blocking(move || std::fs::read(path)).await else {
+    let debug = settings.debug();
+    crate::runtime::fs::blocking(move || Ok(check_file_blocking(&path, debug)))
+        .await
+        .unwrap_or(FileState::None)
+}
+
+/// [`check_file`] on the calling thread. It reads only the tail, as C's
+/// `fseek` and `fgets` do.
+pub(super) fn check_file_blocking(path: &Path, debug: i32) -> FileState {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut fd) = std::fs::File::open(path) else {
         return FileState::None;
     };
     for back in [7, 6] {
-        let Some(start) = bytes.len().checked_sub(back) else {
-            println!("save_restore:check_file: seek failed");
+        if fd.seek(SeekFrom::End(-(back as i64))).is_err() {
+            crate::epics_println!("save_restore:check_file: seek failed");
             return FileState::Bad;
-        };
+        }
+        let mut tail = Vec::with_capacity(back);
+        let _ = (&mut fd).take(back as u64).read_to_end(&mut tail);
         // C's `fgets` of the rest cannot come back empty here, so its
         // "fgets failed" line has no counterpart.
-        let tmpstr = fgets(&bytes[start..], back);
-        if settings.debug() >= 5 {
-            println!(
+        let tmpstr = fgets(&tail, back);
+        if debug >= 5 {
+            crate::epics_println!(
                 "save_restore:check_file: tmpstr='{}'",
                 String::from_utf8_lossy(tmpstr)
             );
@@ -204,7 +243,7 @@ async fn ensure_savb(
     }
 
     let datetime = date_str();
-    println!(
+    crate::epics_println!(
         "save_restore:write_save_file: Backup file ({}) bad or not found.  Writing a new one. [{datetime}]",
         savb.display()
     );
@@ -215,14 +254,21 @@ async fn ensure_savb(
         aside.push(format!("_SBAD_{datetime}"));
         let aside = Path::new(&aside);
         if publish_copy(&savb, aside, settings).await.is_err() {
-            println!(
+            crate::epics_println!(
                 "save_restore:write_save_file: myFileCopy() failed for '{}' -> '{}'",
                 savb.display(),
                 aside.display()
             );
         }
     }
-    if let Err(e) = write_save_file_with_settings(&savb, entries, settings).await {
+    if let Err(e) = write_save_file_with_settings(
+        &savb,
+        entries,
+        settings,
+        &sav_path.file_name().unwrap_or_default().to_string_lossy(),
+    )
+    .await
+    {
         print_banner(
             19,
             &format!("save_restore:write_save_file: Can't write new backup file. [{datetime}]"),
@@ -336,7 +382,7 @@ pub async fn fopen_and_check(fname: &Path, settings: &SrSettings) -> Option<(Pat
         } else {
             "(nil)".to_string()
         };
-        println!("fopen_and_check: checkFile returned {fd}");
+        crate::epics_println!("fopen_and_check: checkFile returned {fd}");
     }
     if first {
         return Some((fname.to_path_buf(), false));
@@ -347,7 +393,9 @@ pub async fn fopen_and_check(fname: &Path, settings: &SrSettings) -> Option<(Pat
         return Some((savb, false));
     }
     // Every slot is tried, as in C; the ones `stat` dates younger than C's
-    // 1e9 s horizon (:1265, :1281) first, closest to now first.
+    // 1e9 s horizon (:1265, :1281) first, closest to now first. C tries the
+    // closest and then the next numbers round (:1296-1304), which after
+    // the newest is the oldest; that C defect is not kept.
     let now = SystemTime::now();
     let mut slots = Vec::new();
     for i in 0..num_seq_files {
@@ -366,7 +414,7 @@ pub async fn fopen_and_check(fname: &Path, settings: &SrSettings) -> Option<(Pat
             log(format!(
                 "'{}' is {:.6} seconds old",
                 path.display(),
-                (secs(now) - secs(mtime)).abs() as f64
+                CFloat((secs(now) - secs(mtime)).abs() as f64)
             ));
         }
         let age = mtime
@@ -392,67 +440,87 @@ pub async fn fopen_and_check(fname: &Path, settings: &SrSettings) -> Option<(Pat
     }
     log("Can't find a file to restore from...".to_string());
     log(format!("...last tried '{}'. I give up.", last.display()));
-    println!("save_restore: **********************************\n");
+    crate::epics_println!("save_restore: **********************************\n");
     None
 }
 
-/// C `checkFile` (dbrestore.c:1137-1234): whether `file` opens and ends in
+/// C `checkFile` (dbrestore.c:1137-1234): whether `file` opens and,
+/// unless its header names a version below 1.8 (:1171-1180), ends in
 /// `<END>`; a file that does not is copied to `file` + `_RBAD_[date]`.
-///
-/// C trusts a file whose header carries no version, or one below 1.8,
-/// without the `<END>` test (:1163-1180). Every autosave-rs header (V1.0,
-/// CRead's V1.7) and a headerless `PV1 1.0` line would pass that way, so
-/// the test is made on every file here.
 async fn check_restore_file(file: &Path, settings: &SrSettings) -> bool {
     let log = |line: String| {
         crate::runtime::log::errlog_vprintf(format_args!("../dbrestore.c:checkFile {line}\n"))
     };
     let debug = settings.debug();
     if debug >= 2 {
-        println!("checkFile: entry");
+        crate::epics_println!("checkFile: entry");
     }
     let path = file.to_path_buf();
     let Ok(bytes) = crate::runtime::fs::blocking(move || std::fs::read(path)).await else {
         log(format!("Can't open file '{}'.", file.display()));
         return false;
     };
-    if debug >= 2 {
-        // The number after the header's first `R`, else its first `V`.
-        let header = fgets(&bytes, usize::MAX);
-        let tag = header
-            .iter()
-            .position(|&b| b == b'R')
-            .or_else(|| header.iter().position(|&b| b == b'V'));
-        if let Some(at) = tag {
-            let version = if header.get(at + 1).is_some_and(u8::is_ascii_digit) {
-                crate::runtime::stdlib::strtod(&header[at + 1..]).value
-            } else {
-                0.0
-            };
-            println!("checkFile: version={version:.6}");
+    // C's stream: `fgets` from `pos`, which a failed `fseek` leaves alone.
+    let mut pos = 0;
+    let gets = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let line = fgets(bytes.get(*pos..).filter(|b| !b.is_empty())?, n);
+        *pos += line.len();
+        Some(line)
+    };
+    // An empty file C gives up on without a word (:1159-1161).
+    // C's `PATH_SIZE + 50` buffer (save_restore.h:85).
+    let Some(header) = gets(&mut pos, 255 + 50) else {
+        return false;
+    };
+    // The number after the header's first `R`, else its first `V`.
+    let tag = header
+        .iter()
+        .position(|&b| b == b'R')
+        .or_else(|| header.iter().position(|&b| b == b'V'));
+    // C trusts a header with no version (dbrestore.c:1165-1169), and since
+    // autosave 8804347 the "Autosave release" header it writes has none, so
+    // it restores a torn .sav over a good .savB. A C regression, not
+    // copied: only an explicit version below 1.8 skips the `<END>` test.
+    if let Some(at) = tag {
+        let version = if header.get(at + 1).is_some_and(u8::is_ascii_digit) {
+            crate::runtime::stdlib::strtod(&header[at + 1..]).value
+        } else {
+            0.0
+        };
+        if debug >= 2 {
+            crate::epics_println!("checkFile: version={:.6}", CFloat(version));
+        }
+        if version < 1.8 {
+            return true;
         }
     }
-    // An empty file, or one too short to seek back over the marker, C
-    // gives up on at its `fgets` without a word (:1159-1161, :1190-1192).
-    if bytes.len() < 6 {
-        return false;
-    }
-    // `fgets(tmpstr, n, ...)` from `back` bytes before the end.
-    let ends = |back: usize, n: usize| {
-        let Some(start) = bytes.len().checked_sub(back) else {
+    let len = bytes.len();
+    for (back, line) in [(6, 1183), (7, 1202)] {
+        match len.checked_sub(back) {
+            Some(start) => pos = start,
+            // `fseek`'s EINVAL, a C library errno and not an OS error: 22
+            // and this text in glibc, musl, newlib and the Windows CRT.
+            None => super::save_file::print_errno(
+                "checkFile: fseek error ",
+                "../dbrestore.c",
+                line,
+                22,
+                "Invalid argument",
+            ),
+        }
+        // A file too short for the marker C gives up on without a word.
+        let Some(tail) = gets(&mut pos, back) else {
             return false;
         };
-        let tail = fgets(&bytes[start..], n);
         if debug >= 5 {
-            println!(
+            crate::epics_println!(
                 "checkFile: files ends with '{}'",
                 String::from_utf8_lossy(tail)
             );
         }
-        tail.starts_with(END_MARKER.as_bytes())
-    };
-    if ends(6, 6) || ends(7, 7) {
-        return true;
+        if tail.starts_with(END_MARKER.as_bytes()) {
+            return true;
+        }
     }
     log(format!("File '{}' is not trusted.", file.display()));
     let rbad = appended(
@@ -474,4 +542,24 @@ async fn check_restore_file(file: &Path, settings: &SrSettings) -> bool {
         ));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `myFileCopy` counts a source it cannot open as an I/O error, and
+    /// no other failure of the copy (dbrestore.c:181-195).
+    #[crate::epics_test]
+    async fn only_an_unopened_copy_source_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = SrSettings::default();
+        let missing = dir.path().join("missing");
+        let _ = publish_copy(&missing, &dir.path().join("b"), &settings).await;
+        assert_eq!(settings.io_errors(), 1);
+        let src = dir.path().join("a");
+        std::fs::write(&src, "x").unwrap();
+        let _ = publish_copy(&src, &missing.join("b"), &settings).await;
+        assert_eq!(settings.io_errors(), 1);
+    }
 }

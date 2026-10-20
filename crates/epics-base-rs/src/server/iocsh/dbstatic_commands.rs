@@ -111,7 +111,7 @@ fn print_escaped(s: &str) -> String {
 /// lines and it is C's iteration order, not a shared policy, so it is stated
 /// where it is used rather than exported.
 fn record_names_by_type(ctx: &CommandContext) -> Vec<crate::types::RecordName> {
-    let mut names = ctx.block_on(ctx.db().all_record_names());
+    let mut names = ctx.db().all_record_names();
     let record_types = crate::server::record::record_types();
     let rank = |name: &crate::types::RecordName| {
         let record_type = ctx
@@ -1218,10 +1218,11 @@ fn cmd_db_pvd_dump() -> CommandDef {
                 _ => false,
             };
 
-            let mut names = ctx.block_on(ctx.db().all_record_names());
+            let mut names = ctx.db().all_record_names();
             names.extend(ctx.db().all_alias_names());
             names.extend(
-                ctx.block_on(ctx.db().all_simple_pv_names())
+                ctx.db()
+                    .all_simple_pv_names()
                     .into_iter()
                     .map(crate::types::RecordName::from),
             );

@@ -612,33 +612,25 @@ impl DriverPool {
     }
 
     /// What C's `endProcessCallbacks` makes of a plugin's output
-    /// (NDPluginDriver.cpp:285-291): an array from a driver's pool goes out
-    /// as it is, counted on that driver, and any other is copied into this
-    /// pool first, so it is counted on this pool's driver. `attributes` are
-    /// what `getAttributes` merges onto it; an array someone else still holds
-    /// is copied first, as C sets them on its copy.
-    ///
-    /// `copied` is C's `copyArray`: that copy keeps only the codec's name
-    /// (NDArrayPool.cpp:293), so an array whose codec has more goes out with
-    /// [`Codec::copied`].
+    /// (NDPluginDriver.cpp:285-291). `copied` is C's `copyArray`: the output
+    /// is copied into this pool and counted on this pool's driver, and the
+    /// copy keeps only the codec's name (NDArrayPool.cpp:293). Otherwise an
+    /// array from a driver's pool goes out as it is, counted on that driver,
+    /// and any other is copied into this pool first. `attributes` are what
+    /// `getAttributes` merges onto it; an output someone else still holds is
+    /// copied before they are set on it.
     pub(crate) fn publishable(
         &self,
         mut array: Arc<NDArray>,
         attributes: Option<&NDAttributeList>,
         copied: bool,
     ) -> ADResult<PublishedArray> {
-        if let Some(pool) = array.pool().and_then(Self::of) {
-            let rename = copied && array.codec.as_ref().is_some_and(|c| !c.is_copied());
-            if attributes.is_none() && !rename {
+        if !copied && let Some(pool) = array.pool().and_then(Self::of) {
+            let Some(attributes) = attributes else {
                 return Ok(PublishedArray { array, pool });
-            }
+            };
             if let Some(own) = Arc::get_mut(&mut array) {
-                if let Some(attributes) = attributes {
-                    own.attributes.copy_from(attributes);
-                }
-                if rename {
-                    own.codec = own.codec.as_ref().map(Codec::copied);
-                }
+                own.attributes.copy_from(attributes);
                 return Ok(PublishedArray { array, pool });
             }
         }

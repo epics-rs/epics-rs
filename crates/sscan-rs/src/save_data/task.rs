@@ -33,6 +33,7 @@ use epics_base_rs::types::{
     DBR_DOUBLE, DBR_FLOAT, DBR_LONG, DBR_SHORT, DBR_STRING, DBR_TIME_SHORT,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
+use epics_libcom_rs::cfmt::CFloat;
 use futures_util::future::join_all;
 use parking_lot::Mutex;
 
@@ -528,10 +529,10 @@ static TASK: OnceLock<mpsc::Sender<Msg>> = OnceLock::new();
 pub fn save_data_init(fname: &str, macros: &str, ctx: CaClientContext, bridge: BlockingBridge) {
     let (tx, rx) = mpsc::channel(MAX_MSG);
     if TASK.set(tx.clone()).is_err() {
-        println!("saveData already initialized");
+        epics_base_rs::epics_println!("saveData already initialized");
         return;
     }
-    println!("saveData: message queue created");
+    epics_base_rs::epics_println!("saveData: message queue created");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let ca = Ca { ctx, bridge, tx };
     let (fname, macros) = (bounded(fname, 40), bounded(macros, 40));
@@ -1930,7 +1931,7 @@ impl Task {
             1,
             "saveData:proc_scan_cpt:{} data point written ({:.3}s)\n",
             self.scans[scan].name,
-            opened.elapsed().as_secs_f32()
+            CFloat(f64::from(opened.elapsed().as_secs_f32()))
         );
     }
 
@@ -2280,7 +2281,7 @@ impl Task {
                     "{n}.R{}CV[{}]= {:.6}",
                     k + 1,
                     cs(&c.rxcv[k]),
-                    s.pos[k].rxcv
+                    CFloat(s.pos[k].rxcv)
                 ));
             }
         }
@@ -2322,7 +2323,7 @@ impl Task {
                     "{n}.D{:02}CV[{}]= {:.6}",
                     k + 1,
                     cs(&c.dxcv[k]),
-                    s.det[k].dxcv
+                    CFloat(f64::from(s.det[k].dxcv))
                 ));
             }
         }
@@ -2352,7 +2353,7 @@ impl Task {
                     "{n}.T{}CD[{}]= {:.6}",
                     k + 1,
                     cs(&c.txcd[k]),
-                    s.trg[k].txcd
+                    CFloat(f64::from(s.trg[k].txcd))
                 ));
             }
         }
@@ -2553,10 +2554,7 @@ pub fn register_save_data() {
         vec![s("name")],
         "",
         |args: &[ArgValue], ctx: &CommandContext| -> CommandResult {
-            ctx.print_fmt(format_args!(
-                "{}",
-                save_data_print_scan_info(&arg_str(args, 0))
-            ));
+            ctx.print_bytes(save_data_print_scan_info(&arg_str(args, 0)).as_bytes());
             Ok(CommandOutcome::Continue)
         },
     ));
@@ -2601,7 +2599,7 @@ pub fn register_save_data() {
         vec![],
         "",
         |_: &[ArgValue], ctx: &CommandContext| -> CommandResult {
-            ctx.print_fmt(format_args!("{}", save_data_info()));
+            ctx.print_bytes(save_data_info().as_bytes());
             Ok(CommandOutcome::Continue)
         },
     ));

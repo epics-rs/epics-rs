@@ -24,6 +24,8 @@
 //! immediately (search_engine.rs `SearchReason::Initial`), so on
 //! localhost that phase is RTT-bound and small. The CREATE_CHANNEL cost
 //! IS measured (it is the per-channel connect work).
+
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 // The tests that drive a live server are `tokio_backend`-only, so on
 // `exec_backend` the fixtures and imports they share go unreferenced while the
 // rest of this file still runs. The default build lints it in full.
@@ -37,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -79,14 +81,13 @@ fn nt_scalar_desc() -> FieldDesc {
 }
 
 impl ChannelSource for BenchSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
-        let values = self.values.clone();
-        async move { values.lock().await.keys().cloned().collect() }
+    fn list_pvs(&self) -> Vec<RecordName> {
+        self.values.lock().keys().cloned().collect()
     }
     fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let values = self.values.clone();
         let name = RecordName::from(name);
-        async move { values.lock().await.contains_key(&name) }
+        async move { values.lock().contains_key(&name) }
     }
     fn get_introspection(
         &self,
@@ -95,7 +96,7 @@ impl ChannelSource for BenchSource {
         let values = self.values.clone();
         let name = RecordName::from(name);
         async move {
-            if values.lock().await.contains_key(&name) {
+            if values.lock().contains_key(&name) {
                 Some(nt_scalar_desc())
             } else {
                 None
@@ -105,7 +106,7 @@ impl ChannelSource for BenchSource {
     fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let values = self.values.clone();
         let name = RecordName::from(name);
-        async move { values.lock().await.get(&name).cloned() }
+        async move { values.lock().get(&name).cloned() }
     }
     fn put_value(
         &self,
@@ -115,7 +116,7 @@ impl ChannelSource for BenchSource {
         let values = self.values.clone();
         let name = RecordName::from(name);
         async move {
-            values.lock().await.insert(name, value);
+            values.lock().insert(name, value);
             Ok(())
         }
     }

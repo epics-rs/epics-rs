@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 asyn-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 rumqttc-v5-next = { version = "0.34", default-features = false }
 serde_json = { workspace = true }
 socket2 = "0.6"

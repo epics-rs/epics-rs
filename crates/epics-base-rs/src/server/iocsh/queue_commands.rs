@@ -25,6 +25,7 @@
 
 use super::registry::*;
 use crate::runtime::background::{CallbackPriority, CallbackQueueStats};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Register the queue-facility command set on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
@@ -85,7 +86,12 @@ fn queue_stats_table(count_column: &str, rows: &[(&str, CallbackQueueStats)]) ->
         let qusage = 100.0 * st.num_used as f64 / st.size as f64;
         out.push(format!(
             "{:>8}  {:>15}  {:>10}  {:>6}  {:>6.1}  {:>11}",
-            name, st.max_used, st.num_used, st.size, qusage, st.num_overflow
+            name,
+            st.max_used,
+            st.num_used,
+            st.size,
+            CFloat(qusage),
+            st.num_overflow
         ));
     }
     out
@@ -352,11 +358,11 @@ fn cmd_callback_set_queue_size() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             let size = ival(args, 0);
             if size <= 0 {
-                ctx.eprintln(QUEUE_SIZE_MUST_BE_POSITIVE);
+                ctx.console_eprintln(QUEUE_SIZE_MUST_BE_POSITIVE);
                 return Ok(CommandOutcome::Failed);
             }
             if crate::runtime::task::background_started() {
-                ctx.eprintln(CALLBACK_ALREADY_INIT);
+                ctx.console_eprintln(CALLBACK_ALREADY_INIT);
                 return Ok(CommandOutcome::Failed);
             }
             crate::runtime::background::callback_executor::set_queue_size(size as usize);
@@ -379,7 +385,7 @@ fn cmd_callback_queue_show() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             let reset = ival(args, 0) != 0;
             match crate::runtime::task::background_callback_stats(reset) {
-                None => ctx.eprintln(CALLBACK_NOT_INIT),
+                None => ctx.console_eprintln(CALLBACK_NOT_INIT),
                 Some(bands) => {
                     let rows: Vec<(&str, CallbackQueueStats)> = BAND_NAMES
                         .iter()
@@ -387,7 +393,7 @@ fn cmd_callback_queue_show() -> CommandDef {
                         .zip(bands.iter().copied())
                         .collect();
                     for line in queue_stats_table(IN_USE_COLUMN, &rows) {
-                        ctx.println(&line);
+                        ctx.console_println(&line);
                     }
                 }
             }
@@ -418,7 +424,7 @@ fn cmd_callback_parallel_threads() -> CommandDef {
          priorities or one of LOW, MEDIUM, or HIGH.",
         |args: &[ArgValue], ctx: &CommandContext| {
             if crate::runtime::task::background_started() {
-                ctx.eprintln(CALLBACK_ALREADY_INIT);
+                ctx.console_eprintln(CALLBACK_ALREADY_INIT);
                 return Ok(CommandOutcome::Failed);
             }
             let prio = match args.get(1) {
@@ -428,7 +434,7 @@ fn cmd_callback_parallel_threads() -> CommandDef {
             let band = match priority_from_name(prio.as_deref()) {
                 Ok(band) => band,
                 Err(()) => {
-                    ctx.eprintln(&format!(
+                    ctx.console_eprintln(&format!(
                         "callbackParallelThreads: Unknown priority \"{}\"",
                         prio.as_deref().unwrap_or("")
                     ));
@@ -471,7 +477,8 @@ mod tests {
     /// Both streams, because which one a line lands on is the assertion:
     /// C prints these tables with `printf` and every refusal with
     /// `fprintf(stderr, ...)`, so a helper that captured stdout alone let a
-    /// refusal on the wrong stream pass its test.
+    /// refusal on the wrong stream pass its test. Each stream as the operator
+    /// sees it: the thread's (dbScan.c) and the raw one (callback.c).
     fn run(ctx: &CommandContext, name: &str, tokens: &[&str]) -> (String, String, bool) {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
@@ -482,10 +489,11 @@ mod tests {
         let err_tmp = tempfile::NamedTempFile::new().unwrap();
         let out_path = out_tmp.path().to_path_buf();
         let err_path = err_tmp.path().to_path_buf();
-        let outcome = ctx.with_output(std::fs::File::create(&out_path).unwrap(), || {
-            ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
-                cmd.handler.call(&args, ctx)
-            })
+        let out = std::fs::File::create(&out_path).unwrap();
+        let err = std::fs::File::create(&err_path).unwrap();
+        let (raw_out, raw_err) = (out.try_clone().unwrap(), err.try_clone().unwrap());
+        let outcome = ctx.with_console(raw_out, raw_err, || {
+            ctx.with_output(out, || ctx.with_error(err, || cmd.handler.call(&args, ctx)))
         });
         let failed = matches!(outcome, Ok(CommandOutcome::Failed));
         (
@@ -870,5 +878,28 @@ mod tests {
         assert_eq!(resolve_thread_count(-2, 8, 8), 6);
         assert_eq!(resolve_thread_count(-8, 8, 8), 1, "floors at 1");
         assert_eq!(resolve_thread_count(-99, 8, 8), 1, "floors at 1");
+    }
+
+    /// callback.c does not include `epicsStdio.h`, so its lines stay on the
+    /// console under `cmd > f` and `cmd 2> f`. C oracle (`oracleStdIoc`):
+    /// every `f` empty.
+    #[test]
+    fn the_callback_queue_lines_stay_on_the_console() {
+        let shell = crate::server::iocsh::tests::make_shell();
+        assert_eq!(
+            shell.err_file_and_console("callbackSetQueueSize 0"),
+            (String::new(), "Queue size must be positive\n".to_string())
+        );
+        assert_eq!(
+            shell.err_file_and_console("callbackParallelThreads 2 Nope"),
+            (
+                String::new(),
+                "callbackParallelThreads: Unknown priority \"Nope\"\n".to_string()
+            )
+        );
+        let (out, out_console) = shell.file_and_console("callbackQueueShow");
+        let (err, err_console) = shell.err_file_and_console("callbackQueueShow");
+        assert_eq!((out, err), (String::new(), String::new()));
+        assert!(!out_console.is_empty() || !err_console.is_empty());
     }
 }

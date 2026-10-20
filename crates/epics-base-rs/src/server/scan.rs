@@ -24,6 +24,7 @@ use crate::runtime::taskwd::{CheckIn, TASKWD_DELAY, taskwd_insert};
 use crate::server::database::PvDatabase;
 use crate::server::database::scan_index::ScanPassSnapshot;
 use crate::server::record::ScanType;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Scan scheduler that processes records at their configured scan rates.
 ///
@@ -529,9 +530,9 @@ impl OverrunTracker {
                  happened {} times in a row.\n\tTo fix this, move some records \
                  to a slower scan rate{remedy}\n",
                     crate::runtime::log::erl_warning(),
-                    period + self.overtime / f64::from(self.consecutive),
-                    period + self.over_min,
-                    period + self.over_max,
+                    CFloat(period + self.overtime / f64::from(self.consecutive)),
+                    CFloat(period + self.over_min),
+                    CFloat(period + self.over_max),
                     self.consecutive,
                 );
                 self.reported = now;

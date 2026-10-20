@@ -393,21 +393,24 @@ pub fn pvalink_disable_command(resolver: PvaLinkResolver) -> CommandDef {
     )
 }
 
-/// Convenience: build the full pvalink iocsh command set bound to
-/// `resolver`. Drop the result into [`epics_base_rs::server::ioc_app::IocRunConfig::shell_commands`].
+/// The pvalink iocsh commands pvxs has no counterpart of, bound to
+/// `resolver`; [`pvalink_enable_commands`] is the set pvxs gates.
 pub fn register_pvalink_commands(resolver: PvaLinkResolver) -> Vec<CommandDef> {
-    // pvxs's `pvalink_enable` registers the `dbpvar` command and the
-    // `pvaLinkNWorkers` variable from the one entry point
-    // (`pvxs/ioc/pvalink.cpp:328-334`); so does this.
-    epics_base_rs::server::iocsh::vars::register_variable(pvalink_nworkers_var());
     vec![
         db_pvxr_command(resolver.clone()),
         pvalinkrefdiff_command(resolver.clone()),
-        dbpvar_command(resolver.clone()),
-        dbpvxr_command(resolver.clone()),
         pvalink_enable_command(resolver.clone()),
         pvalink_disable_command(resolver),
     ]
+}
+
+/// pvxs `pvalink_enable()`, which `pvxsBaseRegistrar` calls only when
+/// `enable2()` is true (`pvxs/ioc/pvalink.cpp:328-334`,
+/// `ioc/iochooks.cpp:503-507`): the `pvaLinkNWorkers` variable and `dbpvar`,
+/// with its `dbpvxr` alias.
+pub fn pvalink_enable_commands(resolver: PvaLinkResolver) -> Vec<CommandDef> {
+    epics_base_rs::server::iocsh::vars::register_variable(pvalink_nworkers_var());
+    vec![dbpvar_command(resolver.clone()), dbpvxr_command(resolver)]
 }
 
 #[cfg(test)]
@@ -421,7 +424,11 @@ mod tests {
     #[tokio::test]
     async fn register_pvalink_commands_exports_pvxs_compatible_set() {
         let r = dummy_resolver();
-        let cmds = register_pvalink_commands(r);
+        let enabled = pvalink_enable_commands(r.clone());
+        let enabled: Vec<&str> = enabled.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(enabled, ["dbpvar", "dbpvxr"]);
+        let mut cmds = register_pvalink_commands(r.clone());
+        cmds.extend(pvalink_enable_commands(r));
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         // pvxs registers the diagnostic under the name `dbpvar` and the
         // `pvaLinkNWorkers` variable (`pvxs/ioc/pvalink.cpp:328-334`);
@@ -436,7 +443,7 @@ mod tests {
         assert!(!names.contains(&"pvaLinkNWorkers"));
         assert!(
             epics_base_rs::server::iocsh::vars::variable_names().contains(&"pvaLinkNWorkers"),
-            "register_pvalink_commands must publish the variable"
+            "pvalink_enable_commands must publish the variable"
         );
         // pvxs starts `pvxLinkNWorkers` at 1
         // (`pvxs/ioc/pvalink_channel.cpp:20`).

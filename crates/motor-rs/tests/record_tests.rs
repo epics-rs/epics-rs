@@ -56,7 +56,8 @@ fn test_default_values() {
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.stat.mip, MipFlags::empty());
     assert_eq!(rec.ctrl.spmg, SpmgMode::Go);
-    assert_eq!(rec.conv.mres, 1.0);
+    // C dbd: MRES has no initial(); init sets 1.0.
+    assert_eq!(rec.conv.mres, 0.0);
     // C dbd: VELO has no initial() (0.0, like JVEL/HVEL); ACCL carries
     // initial("0.2").
     assert_eq!(rec.vel.velo, 0.0);
@@ -1266,6 +1267,7 @@ fn test_home_accel_derives_from_hvel_not_velo() {
     // acceleration from HVEL, not VELO:
     // (hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
     rec.vel.vbas = 0.5;
     rec.vel.velo = 5.0;
@@ -1291,6 +1293,7 @@ fn test_home_accel_derives_from_hvel_not_velo() {
 fn test_home_at_zero_hvel_carries_no_acceleration() {
     for vbas in [0.0, 0.5] {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         rec.stat.msta = MstaFlags::DONE;
         rec.vel.vbas = vbas;
         rec.vel.hvel = 0.0;
@@ -1315,6 +1318,7 @@ fn test_queued_home_refire_accel_derives_from_hvel() {
     // The stop-completion re-fire (C 859-862) uses the same HVEL-based
     // acceleration as the direct dispatch.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.vel.vbas = 0.5;
@@ -1628,6 +1632,73 @@ fn test_ls_stop_syncs_drive_values_to_readback() {
     assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
     assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
     assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+}
+
+fn fires_rlnk(rec: &mut MotorRecord) -> bool {
+    use epics_base_rs::server::record::ProcessAction;
+    let outcome = rec.process().unwrap();
+    outcome.actions.iter().any(|a| {
+        matches!(
+            a,
+            ProcessAction::WriteDbLink {
+                link_field: "RLNK",
+                ..
+            }
+        )
+    })
+}
+
+#[test]
+fn test_dly_passes_through_process_exit_skip_the_rlnk_put() {
+    // C goto process_exit (1425, 1454) jumps past dbPutLink(rlnk) at 1495.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.links.rlnk = "sink.PROC".into();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.timing.dly = 0.5;
+    rec.limits.dhlm = 100.0;
+    rec.limits.hlm = 100.0;
+    rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    assert!(fires_rlnk(&mut rec), "the move-start pass");
+    assert!(rec.stat.dmov == 0);
+
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(10.0, false)));
+    assert!(!fires_rlnk(&mut rec), "1454: the DLY-arming pass");
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_REQ));
+
+    rec.set_event(MotorEvent::DelayExpired);
+    assert!(!fires_rlnk(&mut rec), "1425: the delay-ACK pass");
+
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(10.0, false)));
+    assert!(fires_rlnk(&mut rec), "1427: the GET_INFO reply");
+    assert!(rec.stat.dmov != 0);
+}
+
+#[test]
+fn test_ls_error_update_skips_the_rlnk_put() {
+    // C 1366-1380 ends in goto process_exit, past the RLNK put at 1495.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.links.rlnk = "sink.PROC".into();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
+    rec.stat.dmov = 0;
+    rec.stat.cdir = 1;
+    rec.pos.dval = 10.0;
+    rec.pos.val = 10.0;
+    let at_limit = asyn_rs::interfaces::motor::MotorStatus {
+        high_limit: true,
+        ..status_at(9.0, false)
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(at_limit.clone()));
+    assert!(!fires_rlnk(&mut rec), "1379: the LS-error pass");
+    assert!(rec.stat.mip.is_empty());
+
+    rec.set_event(MotorEvent::DeviceUpdate(at_limit));
+    assert!(fires_rlnk(&mut rec), "the GET_INFO reply reaches 1495");
 }
 
 #[test]
@@ -2317,6 +2388,7 @@ fn test_latent_stop_wins_over_same_pass_val_write() {
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
+    rec.pos.rmp = 2500;
     rec.stat.msta = MstaFlags::MOVING;
     rec.ctrl.stop = 1;
     rec.pos.dval = 80.0;
@@ -2774,6 +2846,7 @@ fn test_put_pass_leaves_injected_device_update_pending() {
     // completion pipeline on the following pass instead of being
     // reduced to a readback apply.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.do_process();
@@ -2807,6 +2880,7 @@ fn test_put_pass_leaves_delay_expiry_pending() {
     // the settle watchdog timer is one-shot, so consuming it without
     // acting would leave DELAY_REQ armed forever.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.timing.dly = 0.5;
     rec.pos.dval = 10.0;
@@ -2870,6 +2944,7 @@ fn test_stup_busy_ack_callback_skips_completion() {
     // response must not complete an in-flight motion; the next poll
     // does.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
@@ -3131,6 +3206,7 @@ fn test_stop_before_the_axis_moves_syncs_targets_at_once() {
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
+    rec.pos.rmp = 2500;
 
     let effects = rec.plan_motion(CommandSource::Stop);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
@@ -3174,6 +3250,7 @@ fn test_stop_during_the_settle_after_a_stop_syncs_targets() {
     rec.pos.drbv = 26.0;
     rec.pos.rbv = 26.0;
     rec.pos.rrbv = 2600;
+    rec.pos.rmp = 2600;
     let effects = rec.plan_motion(CommandSource::Stop);
     assert!(matches!(effects.commands[..], [MotorCommand::Stop { .. }]));
     assert_eq!(rec.pos.dval, 26.0);
@@ -3197,6 +3274,7 @@ fn test_stop_on_a_parked_jog_request_syncs_targets() {
     rec.pos.rbv = 12.0;
     rec.pos.drbv = 12.0;
     rec.pos.rrbv = 1200;
+    rec.pos.rmp = 1200;
 
     let effects = rec.plan_motion(CommandSource::Stop);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
@@ -3945,6 +4023,23 @@ fn test_accs_default_mirrors_accl() {
 }
 
 #[test]
+fn test_unloaded_mres_is_marked_at_init() {
+    // The dbd gives MRES no initial(), so C check_speed_and_resolution's
+    // mres == 0 arm (motorRecord.cc:3917-3921) sets 1.0 and marks M_MRES,
+    // which a record whose dset init fails keeps in MMAP.
+    let mut rec = MotorRecord::default();
+    assert_eq!(rec.get_field("MRES"), Some(EpicsValue::Double(0.0)));
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert_eq!(rec.conv.mres, 1.0);
+    let Some(EpicsValue::ULong(mmap)) = rec.get_field("MMAP") else {
+        panic!("MMAP");
+    };
+    let m_mres = 1 << 7;
+    assert_ne!(mmap & m_mres, 0);
+}
+
+#[test]
 fn test_put_accl_recalculates_accs_and_leaves_accu_untouched() {
     // C special() motorRecordACCL (motorRecord.cc:2735-2742): recompute ACCS
     // from ACCL but DO NOT change ACCU (63bfe5d0 made ACCU a user control).
@@ -4124,6 +4219,7 @@ fn test_delaywait_finalizes_after_delay_expires() {
     // only the watchdog expiry (DELAY_REQ -> DELAY_ACK) plus the status
     // refresh it requests drive the post-settle evaluation.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.timing.dly = 0.5;
     rec.stat.phase = MotionPhase::DelayWait;
     rec.stat.dmov = 0;
@@ -4456,6 +4552,7 @@ fn test_ra_problem_completes_normally_when_driver_done() {
 fn test_move_accel_is_egu_per_sec_squared() {
     // VELO=10, VBAS=0, ACCL=2 → accel = (10-0)/2 = 5 EGU/s²
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.vbas = 0.0;
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
@@ -4472,6 +4569,7 @@ fn test_move_accel_is_egu_per_sec_squared() {
 #[test]
 fn test_move_accel_uses_accs_directly_when_accu_is_accs() {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.vbas = 0.0;
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap();
@@ -4491,6 +4589,7 @@ fn test_move_accel_accu_accs_ignores_velo_vbas() {
     // C accEGUfromVelo: ACCU=Accs returns ACCS unconditionally — VELO/VBAS
     // do not enter the calculation.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(99.0)).unwrap();
     rec.put_field("VBAS", EpicsValue::Double(50.0)).unwrap();
@@ -4511,6 +4610,7 @@ fn test_move_accel_accu_accs_ignores_velo_vbas() {
 fn test_move_accel_velo_equals_vbas_fallback() {
     // VELO==VBAS: span==0 → fall back to VELO/ACCL (C: PR #75)
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("VBAS", EpicsValue::Double(4.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
@@ -4538,6 +4638,7 @@ fn test_move_accel_zero_for_unconfigured_axis() {
     // VELO==VBAS==0 gives C's `accel <= 0`, which skips SET_ACCEL
     // (motorRecord.cc:2529); the poller moves on the stored acceleration.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.velo = 0.0;
     rec.vel.vbas = 0.0;
     rec.vel.accl = 0.5;
@@ -4579,6 +4680,7 @@ fn test_move_accel_vbas_unsupported_treats_vbas_as_zero() {
     use asyn_rs::interfaces::motor::MotorStatus;
     // Driver advertises VBAS unsupported: accel math ignores VBAS.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.process_motor_info(&MotorStatus {
         done: true,
         vbas_supported: false,
@@ -5041,6 +5143,7 @@ fn test_jog_started_while_moving_only_stops() {
     // close-enough clears mip (1088) and the consumed MIP_JOG_REQ (2106)
     // starts nothing. The axis rests with JOGF latched.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -5195,7 +5298,7 @@ fn test_urip_rdbl_error_refuses_in_flight_retarget_without_stop() {
     // down is refused and rolled back to the lasts — the put pass
     // itself sends nothing. Halting the axis is owned by the poll-time
     // read failure (3687-3697), exercised below and in the
-    // _on_completion_check test.
+    // _on_the_next_callback test.
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
     rec.set_rdbl_error(false); // start healthy
@@ -5215,6 +5318,7 @@ fn test_urip_rdbl_error_refuses_in_flight_retarget_without_stop() {
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 
     // The next poll pass stops the axis (C 3691-3697).
+    rec.process_motor_info(&status_at(5.0, true));
     let effects = rec.check_completion();
     assert!(
         effects
@@ -5276,15 +5380,16 @@ fn test_urip_rdbl_error_set_mode_write_escapes_refusal() {
 }
 
 #[test]
-fn test_urip_rdbl_error_stops_in_flight_on_completion_check() {
+fn test_urip_rdbl_error_stops_in_flight_on_the_next_callback() {
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 
-    // RDBL fails mid-motion. check_completion should emit STOP.
+    // RDBL fails mid-motion: the next callback stops the axis.
     rec.set_rdbl_error(true);
+    rec.process_motor_info(&status_at(5.0, true));
     let effects = rec.check_completion();
     assert!(
         effects
@@ -5299,27 +5404,69 @@ fn test_urip_rdbl_error_stop_completes_without_a_retry() {
     // C 3692-3694 sets stop = 1, which do_work's stop block consumes: pp
     // TRUE and mip = MIP_STOP wholesale (1890-1907). The completion's
     // postProcess leaves MIP_DONE, so the retry test runs no maybeRetry.
+    // It syncs to the last good readback (3687-3697 kept it).
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.conv.urip = true;
+    rec.conv.rres = 1.0;
     rec.retry.rtry = 3;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.plan_motion(CommandSource::Val);
-    rec.stat.movn = 1;
+    rec.conv.rdbl_value = Some(2.0);
+    rec.process_motor_info(&status_at(2.0, true));
+    rec.check_completion();
     rec.set_rdbl_error(true);
+    rec.process_motor_info(&status_at(3.0, true));
     rec.check_completion();
     assert_eq!(rec.stat.mip, MipFlags::STOP);
 
-    let effects = complete_stop_at(&mut rec, 4.0);
+    rec.process_motor_info(&status_at(4.0, false));
+    let effects = rec.check_completion();
     assert!(
-        !effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+        )),
         "{:?}",
         effects.commands
     );
     assert!(rec.stat.mip.is_empty());
-    assert_eq!(rec.pos.dval, 4.0);
+    assert_eq!(rec.pos.dval, 2.0);
+}
+
+#[test]
+fn test_urip_rdbl_error_leaves_the_readback_untouched() {
+    // C 3687-3697: a failed dbGetLink sets neither RRBV nor DRBV; RBV and
+    // DIFF follow the kept DRBV (3716, 3764).
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rres = 1.0;
+    rec.initial_readback(&status_at(3.0, false));
+    rec.set_rdbl_error(true);
+    rec.process_motor_info(&status_at(5.0, false));
+    assert_eq!((rec.pos.rrbv, rec.pos.drbv, rec.pos.rbv), (3, 3.0, 3.0));
+
+    rec.set_rdbl_error(false);
+    rec.conv.rdbl_value = Some(7.0);
+    rec.process_motor_info(&status_at(5.0, false));
+    assert_eq!((rec.pos.rrbv, rec.pos.drbv), (7, 7.0));
+    rec.set_rdbl_error(true);
+    rec.conv.mres = 0.5;
+    rec.process_motor_info(&status_at(9.0, false));
+    assert_eq!((rec.pos.rrbv, rec.pos.drbv), (7, 7.0));
+}
+
+#[test]
+fn test_urip_scales_rdbl_by_an_unset_rres() {
+    // C 3701: rrbv = NINT(rdbl * rres / mres), and the dbd gives RRES no
+    // initial(), so an unset RRES reads back 0.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rdbl_value = Some(7.0);
+    rec.process_motor_info(&status_at(5.0, false));
+    assert_eq!((rec.pos.rrbv, rec.pos.drbv), (0, 0.0));
 }
 
 #[test]
@@ -5346,6 +5493,7 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
     assert_ne!(rec.stat.phase, MotionPhase::Idle);
 
     rec.set_rdbl_error(true);
+    rec.process_motor_info(&status_at(5.0, true));
     let effects = rec.check_completion();
     assert!(
         effects
@@ -5354,6 +5502,144 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
             .any(|c| matches!(c, MotorCommand::Stop { .. }))
     );
     assert!(rec.ctrl.jogf == 0, "JOGF released by the error stop");
+}
+
+fn sends_stop(actions: &motor_rs::device_state::DeviceActions) -> bool {
+    actions
+        .commands
+        .iter()
+        .any(|c| matches!(c, MotorCommand::Stop { .. }))
+}
+
+fn sends_move(actions: &motor_rs::device_state::DeviceActions) -> bool {
+    actions.commands.iter().any(|c| {
+        matches!(
+            c,
+            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+        )
+    })
+}
+
+#[test]
+fn test_urip_rdbl_error_stops_an_external_move() {
+    // C process_motor_info (3687-3697) flags the stop on `mip != MIP_DONE`
+    // before process() marks the move external (1314-1320): the first
+    // moving callback only marks MIP_EXTERNAL, the second stops the axis
+    // through do_work's stop block (1874-1907).
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    let state = live_axis(&mut rec);
+    rec.set_rdbl_error(true);
+    let first = live_pass(&mut rec, &state, Some(status_at(3.0, true)));
+    assert!(!sends_stop(&first), "{:?}", first.commands);
+    assert_eq!(rec.stat.mip, MipFlags::EXTERNAL);
+
+    let second = live_pass(&mut rec, &state, Some(status_at(4.0, true)));
+    assert!(sends_stop(&second), "{:?}", second.commands);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.get_field("STOP"), Some(EpicsValue::Short(0)));
+}
+
+#[test]
+fn test_urip_rdbl_error_on_an_idle_record_stops_nothing() {
+    // C 3691: no stop at `mip == MIP_DONE`.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    let state = live_axis(&mut rec);
+    rec.set_rdbl_error(true);
+    let pass = live_pass(&mut rec, &state, Some(status_at(3.0, false)));
+    assert!(!sends_stop(&pass), "{:?}", pass.commands);
+    assert_eq!(rec.get_field("STOP"), Some(EpicsValue::Short(0)));
+}
+
+#[test]
+fn test_urip_rdbl_error_first_seen_at_the_stopped_callback_completes() {
+    // C runs the stopped block before do_work: DMOV goes TRUE (1351) and
+    // maybeRetry ends or arms the move (1427-1430), then do_work's stop
+    // block (1874-1888) sends STOP_AXIS, and a MIP_RETRY becomes
+    // MIP_DONE with DMOV TRUE. Nothing is re-dispatched.
+    for (stop_at, rcnt) in [(10.0, 0), (4.0, 1)] {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.conv.urip = true;
+        rec.conv.rres = 1.0;
+        rec.retry.rtry = 3;
+        let state = live_axis(&mut rec);
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        live_pass(&mut rec, &state, None);
+        rec.conv.rdbl_value = Some(5.0);
+        live_pass(&mut rec, &state, Some(status_at(5.0, true)));
+        rec.conv.rdbl_value = Some(stop_at);
+        live_pass(&mut rec, &state, Some(status_at(stop_at, true)));
+
+        rec.set_rdbl_error(true);
+        let done = live_pass(&mut rec, &state, Some(status_at(stop_at, false)));
+        assert!(sends_stop(&done), "at {stop_at}: {:?}", done.commands);
+        assert!(!sends_move(&done), "at {stop_at}: {:?}", done.commands);
+        assert!(rec.stat.dmov != 0, "at {stop_at}");
+        assert!(rec.stat.mip.is_empty(), "at {stop_at}: {:?}", rec.stat.mip);
+        assert_eq!(rec.retry.rcnt, rcnt, "at {stop_at}");
+        assert_eq!(rec.get_field("STOP"), Some(EpicsValue::Short(0)));
+    }
+}
+
+#[test]
+fn test_urip_rdbl_error_at_the_stopped_callback_keeps_a_parked_target() {
+    // The pp replay (1384-1397) jumps to do_work with MIP_DONE, whose stop
+    // block only sends STOP_AXIS (1874-1888): the target stays parked with
+    // pp TRUE, and the next callback replays it.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = live_axis(&mut rec);
+    live_pass(&mut rec, &state, Some(status_at(3.0, true)));
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    live_pass(&mut rec, &state, None);
+
+    rec.set_rdbl_error(true);
+    let done = live_pass(&mut rec, &state, Some(status_at(10.0, false)));
+    assert!(sends_stop(&done), "{:?}", done.commands);
+    assert!(!sends_move(&done), "{:?}", done.commands);
+    assert!(rec.stat.dmov != 0);
+    assert!(rec.stat.mip.is_empty(), "{:?}", rec.stat.mip);
+    assert_eq!(rec.get_field("PP"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.pos.val, 50.0);
+
+    rec.set_rdbl_error(false);
+    let replay = live_pass(&mut rec, &state, Some(status_at(10.0, false)));
+    assert!(sends_move(&replay), "{:?}", replay.commands);
+}
+
+#[test]
+fn test_urip_rdbl_error_at_the_dly_arming_callback_stops_after_the_delay() {
+    // C 1441-1453 leaves the arming callback through process_exit, so the
+    // stop flagged by its process_motor_info stays latent in STOP until
+    // the post-delay callback reaches do_work.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rres = 1.0;
+    rec.timing.dly = 0.5;
+    let state = live_axis(&mut rec);
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    live_pass(&mut rec, &state, None);
+    rec.conv.rdbl_value = Some(10.0);
+    live_pass(&mut rec, &state, Some(status_at(10.0, true)));
+
+    rec.set_rdbl_error(true);
+    let armed = live_pass(&mut rec, &state, Some(status_at(10.0, false)));
+    assert!(!sends_stop(&armed), "{:?}", armed.commands);
+    let delay = armed.schedule_delay.expect("C 1441-1453: DLY armed");
+    assert_eq!(rec.get_field("STOP"), Some(EpicsValue::Short(1)));
+
+    state.lock().unwrap().expired_delay_id = Some(delay.id);
+    live_pass(&mut rec, &state, None);
+    let done = live_pass(&mut rec, &state, Some(status_at(10.0, false)));
+    assert!(sends_stop(&done), "{:?}", done.commands);
+    assert!(rec.stat.dmov != 0);
+    assert!(rec.stat.mip.is_empty(), "{:?}", rec.stat.mip);
+    assert_eq!(rec.get_field("STOP"), Some(EpicsValue::Short(0)));
 }
 
 #[test]
@@ -5568,6 +5854,7 @@ fn test_external_move_that_ends_normally_completes_through_pp() {
     // ends the move. A pass with no callback runs do_work only.
     for dly in [0.0, 0.5] {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         rec.timing.dly = dly;
         let state = live_axis(&mut rec);
         live_pass(&mut rec, &state, Some(status_at(3.0, true)));
@@ -5604,6 +5891,7 @@ fn test_external_move_that_ends_on_a_limit_completes_through_pp() {
     // waiting out DLY (1405-1409).
     for dly in [0.0, 0.5] {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         rec.timing.dly = dly;
         let state = live_axis(&mut rec);
         assert_eq!(rec.stat.cdir, 0);
@@ -5633,6 +5921,7 @@ fn test_move_replayed_from_the_external_pp_pass_completes_as_a_move() {
     // (C 1384-1397) with pp consumed, so the replayed move completes like
     // any move: a short stop retries.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.velo = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -5671,6 +5960,7 @@ fn test_home_during_an_external_move_stops_and_queues() {
     // move runs stops the axis, and the stop's postProcess syncs and
     // re-fires the home (827-891).
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.velo = 1.0;
     rec.vel.hvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -5706,6 +5996,7 @@ fn test_parked_jog_request_survives_the_pp_pass_maybe_retry() {
     // DLY > 0 there is no M_DMOV edge and nothing runs.
     for dly in [0.0, 0.5] {
         let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
         rec.vel.velo = 1.0;
         rec.vel.jvel = 1.0;
         rec.put_field("RTRY", EpicsValue::Short(1)).unwrap();
@@ -5753,6 +6044,7 @@ fn test_parked_jog_request_retries_on_an_idle_status_pass() {
     // FALSE (1077-1080); under Pause do_work returns (2237), and Go
     // re-arms the jog from its button (1914-1918).
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.vel.velo = 1.0;
     rec.vel.jvel = 1.0;
     rec.put_field("RTRY", EpicsValue::Short(3)).unwrap();
@@ -5893,9 +6185,7 @@ fn test_spmg_stop_during_external_move_emits_stop() {
 fn test_sync_pv_reseeds_val_dval_rval_from_readback() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
-    rec.pos.drbv = 25.0;
-    rec.pos.rrbv = 2500;
-    rec.pos.rbv = 25.0;
+    rec.pos.rmp = 2500;
     // VAL/DVAL/RVAL diverge from readback
     rec.pos.val = 0.0;
     rec.pos.dval = 0.0;
@@ -5908,6 +6198,35 @@ fn test_sync_pv_reseeds_val_dval_rval_from_readback() {
     assert_eq!(rec.pos.dval, 25.0);
     // C syncTargetPosition (4455): rval = NINT(dval / mres)
     assert_eq!(rec.pos.rval, 2500);
+}
+
+#[test]
+fn test_sync_rereads_rdbl_and_leaves_diff() {
+    // C syncTargetPosition (4422-4447) re-reads RDBL and derives RBV from
+    // DIR/OFF; DIFF and RDIF wait for the next callback.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rres = 1.0;
+    rec.conv.rdbl_value = Some(3.0);
+    rec.pos.dval = 5.0;
+    rec.process_motor_info(&status_at(3.0, false));
+    assert_eq!((rec.pos.diff, rec.pos.rdif), (2.0, 2));
+
+    rec.conv.rdbl_value = Some(7.0);
+    rec.pos.off = 1.0;
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!((rec.pos.rrbv, rec.pos.drbv, rec.pos.rbv), (7, 7.0, 8.0));
+    assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), (8.0, 7.0, 7));
+    assert_eq!((rec.pos.diff, rec.pos.rdif), (2.0, 2));
+
+    // C 4433-4434: a failed read keeps RRBV/DRBV.
+    rec.set_rdbl_error(true);
+    rec.conv.rdbl_value = Some(9.0);
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!((rec.pos.rrbv, rec.pos.dval), (7, 7.0));
 }
 
 #[test]
@@ -6214,6 +6533,7 @@ fn test_sync_pv_resyncs_under_closed_loop() {
     rec.pos.drbv = 25.0;
     rec.pos.rbv = 25.0;
     rec.pos.rrbv = 2500;
+    rec.pos.rmp = 2500;
     rec.pos.val = 0.0;
     rec.pos.dval = 0.0;
 
@@ -7469,6 +7789,7 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
 /// Shared setup: move 0 → 50, axis reported moving.
 fn paused_move_setup() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
@@ -7483,6 +7804,7 @@ fn complete_stop_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
     rec.pos.drbv = pos;
     rec.pos.rbv = pos;
     rec.pos.rrbv = pos as i32;
+    rec.pos.rmp = rec.pos.rrbv;
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = 0;
     rec.check_completion()
@@ -7757,6 +8079,7 @@ fn test_sub_step_move_quiesces_lasts() {
     // C 2345-2347: the too-small suppress path updates the previous-target
     // registers so the divergence is not re-detected on later passes.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(0.4)).unwrap();
@@ -7813,6 +8136,7 @@ fn test_val_written_during_home_replays_at_completion() {
     // gate. C replays it at the home completion (1387-1397) instead of
     // syncing it away.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.homf = 1;
@@ -7923,6 +8247,7 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     // C: MIP_JOG_BL2 passes the replay gate — a VAL written during the
     // jog backlash correction re-fires when BL2 completes.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -7972,6 +8297,7 @@ fn test_sub_step_replay_quiesces_without_loop() {
     // A replayed target within one motor step quiesces (commit: too_small
     // lasts update) — the next completion pass must not re-replay.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.homf = 1;
@@ -8135,6 +8461,7 @@ fn test_latent_tweak_folds_into_val_write() {
     // the same pass's val processing (2167-2181 precede 2204): one
     // combined move toward written-VAL + TWV.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.twv = 5.0;
@@ -8181,6 +8508,7 @@ fn test_tweak_under_spmg_pause_collects_and_fires_on_go() {
     // VAL/DVAL and Go fires the move, like any write collected while
     // stopped.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.val = 10.0;
@@ -8221,6 +8549,8 @@ fn test_sync_while_idle_applies_immediately() {
     // C: sync != 0 && mip == MIP_DONE at the chain end of an idle pass
     // — syncTargetPosition runs and the latch consumes.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.pos.rmp = 20;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.val = 50.0;
@@ -8242,6 +8572,7 @@ fn test_sync_during_move_defers_to_completion() {
     // (no mid-move target yank) and consumes at the completion pass
     // (do_work runs on dmov, 1485).
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
@@ -8254,10 +8585,11 @@ fn test_sync_during_move_defers_to_completion() {
     assert_eq!(rec.pos.val, 50.0, "no mid-move yank");
     assert!(rec.internal.sync != 0, "latch survives the busy pass");
 
-    complete_stop_at(&mut rec, 49.9995);
+    rec.retry.rdbd = 2.0;
+    complete_stop_at(&mut rec, 49.0);
     assert!(rec.stat.dmov != 0);
     assert!(rec.internal.sync == 0, "latch consumed at completion");
-    assert_eq!(rec.pos.val, 49.9995, "completion applied the sync");
+    assert_eq!(rec.pos.val, 49.0, "completion applied the sync");
 }
 
 #[test]
@@ -8266,6 +8598,7 @@ fn test_latent_sync_overtaken_by_position_write() {
     // move dispatches (C move block fires, sync else-if skipped) and the
     // latch consumes at that move's completion.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
@@ -8283,9 +8616,10 @@ fn test_latent_sync_overtaken_by_position_write() {
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = 1;
 
-    complete_stop_at(&mut rec, 49.9995);
+    rec.retry.rdbd = 2.0;
+    complete_stop_at(&mut rec, 49.0);
     assert!(rec.internal.sync == 0, "latch consumed at completion");
-    assert_eq!(rec.pos.val, 49.9995);
+    assert_eq!(rec.pos.val, 49.0);
 }
 
 #[test]
@@ -8293,6 +8627,8 @@ fn test_sync_under_pause_defers_until_go() {
     // C: SPMG Stop/Pause returns at 2237 before the sync else-if — the
     // latch survives the pause and applies on the Go pass.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.pos.rmp = 20;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.val = 50.0;
@@ -8460,6 +8796,7 @@ fn test_hlm_put_while_idle_does_not_stop() {
 /// to DONE via maybeRetry's close-enough branch.
 fn paused_idle_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
@@ -8621,6 +8958,7 @@ fn test_bare_release_kills_queued_jog_at_resume() {
     // last_write, never processed as Jogf): C re-fires no jog at the stop
     // completion (postProcess re-fires only a home), held or not.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
@@ -8705,6 +9043,7 @@ fn test_go_during_pause_deceleration_resumes_move() {
     // (!dmov, C 2241/2455) — the new MOVE supersedes the decelerating
     // stop in the controller. The Go edge must not be dropped.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
@@ -8815,6 +9154,7 @@ fn test_spmg_move_restores_to_pause_on_close_enough() {
     // C maybeRetry close-enough (1096-1101): a motion initiated under
     // SPMG=Move reverts to Pause when the target is reached.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.ctrl.spmg = SpmgMode::Move;
     rec.internal.lspg = SpmgMode::Move; // settled, not a fresh edge
     rec.retry.rdbd = 0.1;
@@ -8842,6 +9182,7 @@ fn test_spmg_move_giveup_miss_keeps_move() {
     // that assignment commented out (1062). Only the close-enough
     // branch restores.
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.ctrl.spmg = SpmgMode::Move;
     rec.internal.lspg = SpmgMode::Move;
     rec.retry.rtry = 1;
@@ -11205,6 +11546,7 @@ fn test_val_put_during_external_motion_parks_until_done() {
 /// A jogf released into its backlash, with BL2 in flight.
 fn jog_backlash_bl2() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -11345,6 +11687,7 @@ fn test_stop_during_queued_jog_does_not_jog() {
 
 fn jogging() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
     rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();

@@ -44,8 +44,7 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
         let builder = holder.lock().unwrap().into_builder();
         let mgr = Arc::new(builder.build().await);
         assert!(mgr.set_names().is_empty());
-        let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-        let task = mgr.clone().start(&reactor, db.clone());
+        let task = mgr.clone().start(db.clone());
         holder.lock().unwrap().manager = Some(mgr);
         (
             epics_base_rs::runtime::task::BlockingBridge::capture(),
@@ -64,10 +63,6 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
 
     let mgr = holder.lock().unwrap().manager.clone().unwrap();
     assert_eq!(mgr.set_names(), vec!["settings.req".to_string()]);
-    assert!(
-        holder.lock().unwrap().sets.is_empty(),
-        "a set added to the running manager is not queued for a build that already happened"
-    );
 
     // The set's task ticks on its own; C's `create_data_set` starts the
     // save task the same way.

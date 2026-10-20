@@ -31,9 +31,8 @@ async fn pvalink_installs_at_iocinit_seam() {
     // against the other `epics_env`-group tests by `#[serial]`, so no
     // other thread reads/writes the environment concurrently.
     unsafe {
-        // QSRV2 gates the shim (pvxs `enable2()`). Pin it ON and clear
-        // the ignore list so the decision is deterministic regardless of
-        // the ambient environment.
+        // Pin QSRV2 ON and clear the ignore list so the IOC's environment
+        // is deterministic regardless of the ambient one.
         std::env::set_var("PVXS_QSRV_ENABLE", "YES");
         std::env::remove_var("EPICS_IOC_IGNORE_SERVERS");
         // Confine the pvalink monitor's background UDP search to

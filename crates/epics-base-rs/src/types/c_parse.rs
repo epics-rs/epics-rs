@@ -612,6 +612,24 @@ fn parse_ulong(s: &str) -> Option<u64> {
     ulong_from(&scan_int(s, 0))
 }
 
+/// C `atol` (glibc `strtol(s, NULL, 10)`): total, as autosave's array
+/// restore uses it; no digits is 0 and `ERANGE` saturates at `long`.
+pub fn atol(s: &str) -> i64 {
+    let d = scan_int(s, 10);
+    long_from(&d).unwrap_or(match (d.any, d.negative) {
+        (false, _) => 0,
+        (true, true) => i64::MIN,
+        (true, false) => i64::MAX,
+    })
+}
+
+/// C `strtoul(s, NULL, 0)`: total; no digits is 0 and `ERANGE` is
+/// `ULONG_MAX`.
+pub fn strtoul_auto(s: &str) -> u64 {
+    let d = scan_int(s, 0);
+    ulong_from(&d).unwrap_or(if d.any { u64::MAX } else { 0 })
+}
+
 /// `if (c && !units) return S_stdlib_extraneous;`, after the trailing
 /// whitespace skip (`epicsStdlib.c:44-48`).
 fn extraneous(s: &str, end: usize) -> bool {

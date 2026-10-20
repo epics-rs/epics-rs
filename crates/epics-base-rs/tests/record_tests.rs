@@ -641,7 +641,11 @@ fn test_parse_pv_name() {
     assert_eq!(parse_pv_name("TEMP"), (&b"TEMP"[..], "VAL"));
     assert_eq!(parse_pv_name("TEMP.EGU"), (&b"TEMP"[..], "EGU"));
     assert_eq!(parse_pv_name("TEMP.HOPR"), (&b"TEMP"[..], "HOPR"));
-    assert_eq!(parse_pv_name("A.B.C"), (&b"A.B"[..], "C"));
+    assert_eq!(parse_pv_name("A.B.C"), (&b"A"[..], "B.C"));
+    assert_eq!(
+        parse_pv_name(r#"W.VAL{"d":1.5}"#),
+        (&b"W"[..], r#"VAL{"d":1.5}"#)
+    );
 }
 
 #[test]

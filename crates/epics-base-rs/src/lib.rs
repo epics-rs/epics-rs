@@ -61,6 +61,14 @@
 //! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
 //! vendored third-party) are outside this table and carry no pin.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_macros,
+        clippy::disallowed_methods,
+        reason = "tests may keep eprintln! and stderr()"
+    )
+)]
 #![allow(
     clippy::approx_constant,
     clippy::collapsible_match,
@@ -123,7 +131,7 @@ pub mod reference;
 // are the paths every downstream crate and every module below already spells,
 // and the re-export keeps `crate::net::…` / `crate::runtime::…` valid inside
 // this crate too, so the split cost zero call-site edits.
-pub use epics_libcom_rs::{net, runtime};
+pub use epics_libcom_rs::{epics_print, epics_println, net, runtime, stderr_print, stderr_println};
 pub mod server;
 pub mod sync;
 pub mod types;

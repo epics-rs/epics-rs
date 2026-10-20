@@ -1068,7 +1068,7 @@ impl ChannelSource for GatewayChannelSource {
         }
     }
 
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         // pva2pva's `GWServerChannelProvider` overrides only `channelFind`
         // and `createChannel`, NOT `channelList` (p2pApp/server.h:9-31), so
         // the base `ChannelProvider::channelList` returns
@@ -1849,7 +1849,7 @@ mod tests {
             "test entry must be present in the cache"
         );
         assert!(
-            src.list_pvs().await.is_empty(),
+            src.list_pvs().is_empty(),
             "gateway list_pvs must not masquerade the cache as channelList (pva2pva parity)"
         );
     }

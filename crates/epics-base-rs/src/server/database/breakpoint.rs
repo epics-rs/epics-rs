@@ -64,6 +64,7 @@
 //! comparison.
 
 use crate::types::RecordName;
+use epics_libcom_rs::cfmt::CFloat;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -329,7 +330,9 @@ impl StatLine {
                 elapsed_secs,
             } => format!(
                 "             Entrypoint: {:<28.28}  #C: {:05}  C/S: {:7.1}",
-                name, count, elapsed_secs
+                name,
+                count,
+                CFloat(*elapsed_secs)
             ),
             Self::Breakpoint { name, autoprint } => format!(
                 "             Breakpoint: {:<28.28}{}",
@@ -1564,6 +1567,20 @@ mod tests {
             .render(),
             "             Entrypoint: BP:a                          #C: 00007  C/S:    12.2"
         );
+    }
+
+    /// C's `%7.1f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+    #[test]
+    fn entrypoint_age_prints_a_nan_as_c_does() {
+        for (elapsed_secs, want) in [(f64::NAN, "C/S:     nan"), (-f64::NAN, "C/S:    -nan")] {
+            let got = StatLine::Entrypoint {
+                name: "BP:a".into(),
+                count: 7,
+                elapsed_secs,
+            }
+            .render();
+            assert!(got.ends_with(want), "{got}");
+        }
     }
 
     /// Wait for `pred` to hold of the stopped record, or give up. Polling is

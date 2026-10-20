@@ -1,0 +1,11 @@
+[package]
+name = "cfloat-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Dev-only: checks that every precision or exponent float placeholder in production source formats a CFloat"
+
+[dependencies]
+# Dev-only and `publish = false`, as in record-seam-gate.
+source-guard = { path = "../../crates/source-guard" }

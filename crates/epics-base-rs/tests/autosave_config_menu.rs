@@ -33,17 +33,31 @@ record(aSub, "DO") {
 }
 "#;
 
+/// The database, with `holder`'s manager, or one with no set, running the
+/// save task the operations are queued to.
 async fn ioc(holder: Arc<Mutex<AutosaveStartupConfig>>) -> Arc<PvDatabase> {
     let mut b = IocBuilder::new();
-    for (name, func) in config_menu::subroutines(holder) {
+    for (name, func) in config_menu::subroutines(holder.clone()) {
         b = b.register_context_subroutine(name, func);
     }
-    b.db_string(DB, &HashMap::new())
+    let db = b
+        .db_string(DB, &HashMap::new())
         .unwrap()
         .build()
         .await
         .unwrap()
-        .0
+        .0;
+    let mgr = holder.lock().unwrap().manager.clone();
+    let mgr = match mgr {
+        Some(mgr) => mgr,
+        None => {
+            let mgr = Arc::new(AutosaveBuilder::new().build().await);
+            holder.lock().unwrap().manager = Some(mgr.clone());
+            mgr
+        }
+    };
+    let _task = mgr.start(db.clone());
+    db
 }
 
 fn holder(dir: &std::path::Path) -> Arc<Mutex<AutosaveStartupConfig>> {
@@ -139,6 +153,48 @@ fn find_config_files_lists_matching_cfg_files_with_descriptions() {
     );
 }
 
+const TRACE_CHILD: &str = "AUTOSAVE_FIND_CONFIG_FILES_DIR";
+
+/// `find_config_files` at debug 2 on the child's directory, in the child only.
+#[test]
+fn child_find_config_files() {
+    let Some(dir) = std::env::var_os(TRACE_CHILD) else {
+        return;
+    };
+    let settings = epics_base_rs::server::autosave::settings::SrSettings::default();
+    settings.set_debug(2);
+    config_menu::find_config_files(Some(std::path::Path::new(&dir)), "CFG", &settings).unwrap();
+}
+
+/// C traces every name its `readdir` loop returns, `.` and `..` among
+/// them (save_restore.c:642-643); the C oracle's lines for this directory
+/// name all four.
+#[test]
+fn find_config_files_traces_every_name_readdir_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CFG_one.cfg"), "").unwrap();
+    std::fs::write(dir.path().join("other.txt"), "").unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_find_config_files",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(TRACE_CHILD, dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut checked: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.split_once("findConfigFiles: checking '"))
+        .map(|(_, rest)| rest.strip_suffix("'.").unwrap())
+        .collect();
+    checked.sort_unstable();
+    assert_eq!(checked, [".", "..", "CFG_one.cfg", "other.txt"], "{stdout}");
+}
+
 #[test]
 fn make_legal_replaces_every_non_alphanumeric() {
     assert_eq!(config_menu::make_legal("a b/c.1"), "a_b_c_1");
@@ -197,8 +253,8 @@ async fn holder_with_set(dir: &std::path::Path) -> Arc<Mutex<AutosaveStartupConf
                 request_file: Some("CFGMenu.req".into()),
                 request_pvs: Vec::new(),
                 backup: BackupConfig::default(),
-                macros: HashMap::new(),
-                macro_string: String::new(),
+                macros: HashMap::from([("CONFIGMENU".into(), "1".into())]),
+                macro_string: None,
                 search_paths: vec![dir.to_path_buf()],
             },
             SaveStrategy::Manual,

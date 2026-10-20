@@ -10,8 +10,6 @@
 //! share only the spec grammar and option names; this module is the single
 //! source of that shared grammar so the two Rust backends cannot drift.
 
-use crate::error::{AsynError, AsynResult, AsynStatus};
-
 // --- Configuration types ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,26 +75,31 @@ pub struct SerialConfig {
 }
 
 impl SerialConfig {
-    /// Parse a serial port specification string.
-    ///
-    /// Format: `"/dev/ttyUSB0"` — just the device path.
-    /// Baud and other settings default to 9600 8N1 no flow control.
-    pub fn parse(spec: &str) -> AsynResult<Self> {
-        let device = spec.trim().to_string();
-        if device.is_empty() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "empty serial device path".into(),
-            });
-        }
-        Ok(Self {
-            device,
+    /// The line a configured port starts with: 9600 8N1, no flow control, on
+    /// `device` exactly as given (`epicsStrDup(ttyName)`,
+    /// drvAsynSerialPort.c:1069). An empty or padded name is not refused here;
+    /// it fails at `open`, as in C.
+    pub fn new(device: &str) -> Self {
+        Self {
+            device: device.to_owned(),
             baud: 9600,
             data_bits: DataBits::default(),
             parity: Parity::default(),
             stop_bits: StopBits::default(),
             flow_control: FlowControl::default(),
-        })
+        }
+    }
+}
+
+/// The name the Win32 port keeps for `ttyName` and names in every message:
+/// `\\.\` prepended unless the name already starts with it
+/// (drvAsynSerialPortWin32.c:753-762).
+#[cfg(any(windows, test))]
+pub(crate) fn win32_device_name(tty: &str) -> String {
+    if tty.starts_with(r"\\.\") {
+        tty.to_owned()
+    } else {
+        format!(r"\\.\{tty}")
     }
 }
 
@@ -104,3 +107,21 @@ impl SerialConfig {
 // per-key diagnostic live with the rest of the C option grammar, in
 // [`super::option_parse::parse_yn_option`] — every backend, serial and IP, takes
 // it from there.
+
+#[cfg(test)]
+mod tests {
+    use super::win32_device_name;
+
+    /// drvAsynSerialPortWin32.c:753-762: `epicsStrnCaseCmp(ttyName, "\\\\.\\", 4)`.
+    #[test]
+    fn the_win32_name_gains_the_device_prefix_once() {
+        for (tty, kept) in [
+            ("COM3", r"\\.\COM3"),
+            (r"\\.\COM10", r"\\.\COM10"),
+            ("", r"\\.\"),
+            (r"\\.", r"\\.\\\."),
+        ] {
+            assert_eq!(win32_device_name(tty), kept, "{tty:?}");
+        }
+    }
+}

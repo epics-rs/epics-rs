@@ -79,6 +79,10 @@
 //! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
 //! vendored third-party) are outside this table and carry no pin.
 
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")
+)]
 // The three `epics-base-rs` crate-level allows this code was written under and
 // still needs — `collapsible_if` and `manual_range_contains` in `runtime`,
 // `io_other_error` in `net`. Narrowed to those three rather than inherited

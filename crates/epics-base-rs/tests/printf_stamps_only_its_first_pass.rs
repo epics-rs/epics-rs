@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, WallTime};
@@ -17,28 +17,28 @@ struct Slow;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for Slow {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    fn put_admission(&self, _name: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _name: LinkRef<'_>) -> PutAdmission {
         PutAdmission::Connected
     }
-    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
     async fn put_value(
         &self,
-        _name: &[u8],
+        _name: LinkRef<'_>,
         _value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         Ok(())
     }
-    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: LinkRef<'_>) -> Option<LinkMetadata> {
         Some(LinkMetadata {
             dbf_type: Some(LinkDbfType::String),
             element_count: Some(1),

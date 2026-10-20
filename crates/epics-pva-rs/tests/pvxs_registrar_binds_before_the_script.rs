@@ -3,7 +3,9 @@
 //! (`:374-379`). Measured on softIocPVX 1.5.3: a held TCP 5075 falls back and
 //! `PVXS_SERVER_PORT` names the fallback port from the script's first line; a
 //! held UDP 5076 prints `Error in pvxsBaseRegistrar` before `Starting iocInit`
-//! and the IOC runs without pvAccess. On either backend.
+//! and the IOC runs without pvAccess, nor QSRV2 in `dbsr`: the throw skips
+//! `initHookRegister(&pvxsInitHook)` (`:501`), whose `initHookAtBeginning`
+//! joins it. On either backend.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +28,21 @@ fn read_port(into: Arc<Mutex<Option<String>>>) -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// What `dbsr` prints at `level`.
+fn dbsr(level: u32) -> Vec<String> {
+    let lines = std::cell::RefCell::new(Vec::new());
+    epics_base_rs::server::db_server::dbsr(level, &|l| lines.borrow_mut().push(l.to_string()));
+    lines.into_inner()
+}
+
+/// The layers `dbsr` lists.
+fn db_servers() -> Vec<String> {
+    dbsr(0)
+        .into_iter()
+        .filter(|l| l.starts_with("Server '"))
+        .collect()
 }
 
 /// Loopback only, no beacons, both ports from `udp`.
@@ -69,7 +86,18 @@ async fn the_script_sees_the_port_the_registrar_holds() {
         // nothing serves it yet.
         std::net::TcpStream::connect(("127.0.0.1", port))
             .expect("the registrar's listener holds the port");
-        epics_base_rs::server::db_server::announce_serving();
+        assert_eq!(db_servers(), ["Server 'qsrv2'"]);
+        // QSRV2's report is `pvxsr`'s (`qReport`); softIocPVX's `dbsr` prints
+        // the `EPICS_PVAS_*` lines and a `Source:` line per source under it.
+        let handle = epics_pva_rs::server::iocsh::pvxs_report().expect("the bound server");
+        let mut report = vec!["Server state: running".to_string(), "Server 'qsrv2'".into()];
+        report.extend(handle.pvxs_config().lines().map(str::to_string));
+        report.extend(
+            (handle.source_list().into_iter())
+                .map(|(name, prio)| format!("Source: {name} prio={prio} ")),
+        );
+        assert_eq!(dbsr(0), report);
+        epics_base_rs::server::db_server::announce_serving(PVXS_SERVER);
         Ok(())
     })
     .await
@@ -90,6 +118,7 @@ async fn a_held_search_port_leaves_the_ioc_without_pvaccess() {
     );
     app.run(move |mut config| async move {
         assert_eq!(*seen.lock().unwrap(), None, "no server, no port");
+        assert_eq!(db_servers(), Vec::<String>::new());
         let server = PvaServer::from_parts(config.db, None, config.acf, None, None)
             .bound_at_registrar(&mut config.servers);
         // Serving nothing is pending until the runner ends; a server that

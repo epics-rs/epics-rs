@@ -129,7 +129,10 @@ async fn main() {
             match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
-                    eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
+                    epics_libcom_rs::stderr_println!(
+                        "error: invalid pvRequest {:?}: {e}",
+                        args.request
+                    );
                     std::process::exit(1);
                 }
             }
@@ -199,14 +202,14 @@ async fn main() {
                 // (tools/get.cpp:136-138).
                 Err(epics_pva_rs::error::PvaError::Timeout) => outstanding += 1,
                 Err(e) => {
-                    eprintln!("{pv_name}: {e}");
+                    epics_libcom_rs::stderr_println!("{pv_name}: {e}");
                     failed = true;
                 }
             }
         })
         .await;
     if outstanding > 0 {
-        eprintln!("Timeout with {outstanding} outstanding");
+        epics_libcom_rs::stderr_println!("Timeout with {outstanding} outstanding");
         std::process::exit(1);
     }
     if failed {

@@ -25,6 +25,7 @@
 //! in-process async `CaServer`, served from the tokio runtime the test
 //! entered.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(tokio_backend)]
 
 use std::process::{Command, Stdio};

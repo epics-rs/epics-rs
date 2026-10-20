@@ -1,9 +1,9 @@
 //! [`CaLinkResolver`] — a [`LinkSet`] backend that resolves CA record
 //! links through a live [`crate::client::CaClient`].
 //!
-//! Each distinct CA-link PV name gets one [`CaLink`]: a CA channel, a
-//! subscription, and a monitor task that keeps an [`arc_swap::ArcSwap`]
-//! snapshot current. The [`LinkSet`] read methods serve from that
+//! Each record link gets its own [`CaLink`], as each C `caLink` has its own
+//! channel: a CA channel, a subscription, and a monitor task that keeps an
+//! [`arc_swap::ArcSwap`] snapshot current. The [`LinkSet`] read methods serve from that
 //! cache — never a synchronous per-read network fetch. This is the
 //! C `dbCa.c` model: `dbCaGetLink` (`dbCa.c:419`) reads the value
 //! cached by the monitor `eventCallback` (`dbCa.c:891`).
@@ -17,8 +17,9 @@ use crate::client::{CaChannel, CaClient, ConnFold};
 use arc_swap::ArcSwap;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    CaLinkInit, CpTarget, ExternalCpProcess, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp,
-    LinkSet, PutAdmission, PvDatabase, link_put_convert,
+    CaLinkInit, CpWorker, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
+    LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
+    link_put_convert,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
@@ -65,9 +66,6 @@ pub enum CaLinkError {
     /// The shared [`CaClient`] could not be constructed.
     #[error("CA client init failed: {0}")]
     ClientInit(String),
-    /// Subscribing the monitor for a CA link failed.
-    #[error("CA link subscribe failed for {pv}: {reason}")]
-    Subscribe { pv: String, reason: String },
 }
 
 /// One open CA link — a monitor-backed cache of a remote PV.
@@ -75,7 +73,7 @@ pub enum CaLinkError {
 /// Mirrors C `caLink` (`dbCa.c`): a CA channel plus a subscription
 /// whose callback refreshes the cached value. The cache is the only
 /// thing the synchronous [`LinkSet`] read path touches. An opaque
-/// handle — construct it via [`CaLinkResolver::open`].
+/// handle, opened by [`LinkSet::connect_link`] for one record link.
 pub struct CaLink {
     /// Latest monitor snapshot plus the native description it was produced
     /// under. `None` until the first event arrives (channel not yet
@@ -114,16 +112,19 @@ pub struct CaLink {
     /// The channel — kept alive so the monitor stays subscribed.
     /// Used by the OUT-link write path.
     channel: Arc<CaChannel>,
-    /// Abort-on-drop handle for the monitor task. Dropping the
-    /// `CaLink` stops the task and (via `MonitorHandle::drop`)
-    /// unsubscribes the remote monitor.
-    _monitor_task: AbortOnDrop,
+    /// C `evidNative`: the monitor task, started once the link is a native
+    /// input ([`Self::monitor_native`]). Dropping the `CaLink` stops the
+    /// task and (via `MonitorHandle::drop`) unsubscribes the remote monitor.
+    monitor: std::sync::OnceLock<AbortOnDrop>,
+    reactor: task::Reactor,
+    pv_name: RecordName,
     /// Abort-on-drop handle for the connection-event watcher task.
     /// Drains `CaChannel::connection_events()` and keeps `connected`
     /// in sync with the real circuit state.
     _conn_task: AbortOnDrop,
-    /// The link's one processor of CP/CPP holders ([`run_processor`]).
-    _process_task: AbortOnDrop,
+    /// The link's one processor of CP/CPP holders ([`run_processor`]), on
+    /// the attached database's `dbCaLink` thread; none with no database.
+    _process_task: Option<CpWorker>,
 }
 
 /// `ca_field_type` / `ca_element_count`; `None` while the channel is not
@@ -206,7 +207,7 @@ struct LinkConnState {
     ///
     /// `true` at rest for the same reason as `read_access` above.
     write_access: AtomicBool,
-    /// The database whose CP/CPP holders of `pv_name` must be processed on a
+    /// The database whose CP/CPP holder of the link must be processed on a
     /// disconnect. Attached after the resolver is mounted, hence the lock and
     /// the `Option`; a `None` here is a link opened with no database, which
     /// has no holders to process.
@@ -236,7 +237,7 @@ struct LinkConnState {
 }
 
 impl LinkConnState {
-    fn new(db: Arc<RwLock<Option<PvDatabase>>>, pv_name: RecordName) -> Self {
+    fn new(db: Arc<RwLock<Option<PvDatabase>>>, link: LinkRef<'_>) -> Self {
         Self {
             flag: AtomicBool::new(false),
             read_access: AtomicBool::new(true),
@@ -244,7 +245,7 @@ impl LinkConnState {
             n_disconnect: AtomicU64::new(0),
             connects_seen: AtomicU64::new(0),
             used_input_native: AtomicBool::new(false),
-            process: ExternalCpProcess::new(pv_name),
+            process: ExternalCpProcess::new(link),
             db,
         }
     }
@@ -266,7 +267,7 @@ impl LinkConnState {
     }
 
     /// Mark the link dead and, on the true→false edge, request the process
-    /// of every local CP/CPP holder of this PV, whose link read then fails
+    /// of the link's CP/CPP holder, whose link read then fails
     /// unless the link has reconnected first. Returns `true` on the edge.
     fn mark_disconnected(&self) -> bool {
         if !self.flag.swap(false, Ordering::AcqRel) {
@@ -276,6 +277,8 @@ impl LinkConnState {
         // critical section that clears `isConnected` and queues the CP
         // dispatch (`dbCa.c:820-826`) — one edge, one count, one owner.
         self.n_disconnect.fetch_add(1, Ordering::Relaxed);
+        // `dbCa.c:866-871` asks for this pass; C's `cs_conn` skip at
+        // `:1225` is a defect, not copied.
         self.request_process();
         true
     }
@@ -434,20 +437,11 @@ impl CaLink {
         }
     }
 
-    /// True when the CA circuit is currently up AND a monitor event whose
-    /// native description still matches the channel has been cached. C
-    /// `dbCaGetLink` (`dbCa.c:419`) treats a CA link as readable only when
-    /// `pca->connected` is set (the `connectionCallback` clears it on
-    /// disconnect) *and* the monitor callback has populated a matching
-    /// `pca->pgetNative` (cleared by `dbCa.c:835-859` on a type/count
-    /// change).
-    ///
-    /// Pre-fix this keyed off cache presence alone, so an upstream IOC
-    /// restart was invisible — `is_connected()` stayed `true` and stale
-    /// data was served with no LINK alarm; a later refinement added the
-    /// circuit-state flag, and BRIDGE-106 added the type/count match.
+    /// C `isConnected` (`dbCa.c:604-612`): `pca->isConnected`, which
+    /// `connectionCallback` sets and clears. Whether a value is cached is
+    /// [`Self::value`]'s question; an OUT link never caches one.
     pub fn is_connected(&self) -> bool {
-        self.with_servable(|_| ()).is_some()
+        self.connected.is_set()
     }
 
     /// The cached write right — `dbCaPutLinkCallback`'s second operand
@@ -462,15 +456,17 @@ impl CaLink {
     /// `testInitReady` (`dbCa.c:835-845` at `ef4829829`, epics-base #856
     /// "dbCa: iocInit wait for all conditions" — post-`R7.0.10` and in no
     /// tag, so this is the one dbCa.c citation here that is not
-    /// pin-relative): servable (connected with the first
-    /// monitor event cached — C's NATIVE wait bit) AND the attribute
+    /// pin-relative): connected, a monitored link with its first event
+    /// servable (C's NATIVE wait bit), AND the attribute
     /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
     /// `Some` even when the CTRL get failed, exactly the
     /// action-completed edge `getAttribEventCallback` clears the bit
     /// on). C's STRING bit has no twin here: this port keeps one native
     /// monitor and renders strings from it.
     pub fn init_ready(&self) -> bool {
-        self.is_connected() && self.meta.load().is_some()
+        self.is_connected()
+            && (self.monitor.get().is_none() || self.with_servable(|_| ()).is_some())
+            && self.meta.load().is_some()
     }
 
     /// Current cached value, or `None` when the link is not servable: no
@@ -498,10 +494,10 @@ impl CaLink {
     }
 
     /// Mark that the LINK SET was asked for this link's value — C setting
-    /// `pvlOptInpNative` inside `dbCaGetLink` (`dbCa.c:455-457`), which runs
-    /// ahead of the `!pca->gotInNative` bail at `:459`, so a read of a
-    /// connected but still-empty link already marks the link as a native
-    /// input.
+    /// `pvlOptInpNative` and adding `CA_MONITOR_NATIVE` inside `dbCaGetLink`
+    /// (`dbCa.c:455-457`), after the `!isConnected || !hasReadAccess` bail
+    /// and ahead of the `!pca->gotInNative` one, so a read of a connected
+    /// but still-empty link already monitors it.
     ///
     /// Deliberately NOT inside [`Self::value`]: that is the shared cache
     /// accessor, which `wait_for_link_connected` and other in-crate helpers
@@ -509,7 +505,23 @@ impl CaLink {
     /// at the cache" rather than C's "a link read happened", and every
     /// diagnostic that polls a link would set it.
     fn note_read(&self) {
+        if self.connected.is_set() && self.connected.has_read_access() {
+            self.monitor_native();
+        }
+    }
+
+    /// C `pvlOptInpNative` with its `CA_MONITOR_NATIVE` (`dbCa.c:1218-1235`):
+    /// subscribe once.
+    fn monitor_native(&self) {
         self.connected.note_input_native();
+        self.monitor.get_or_init(|| {
+            AbortOnDrop(self.reactor.spawn(run_monitor(
+                self.channel.clone(),
+                self.cache.clone(),
+                self.connected.clone(),
+                self.pv_name.clone(),
+            )))
+        });
     }
 
     /// This link's `dbcar` report state — C reading the `caLink` fields
@@ -518,9 +530,7 @@ impl CaLink {
     /// link.
     ///
     /// `connected` is the connection-state owner's flag, C's
-    /// `ca_field_type(pca->chid) != TYPENOTCONN` (`dbCaTest.c:97`) — NOT
-    /// [`Self::is_connected`], which additionally requires a servable cache
-    /// because it answers the lset's readable question.
+    /// `ca_field_type(pca->chid) != TYPENOTCONN` (`dbCaTest.c:97`).
     pub async fn diagnostics(&self) -> LinkDiagnostics {
         LinkDiagnostics {
             connected: self.connected.is_set(),
@@ -597,20 +607,21 @@ impl CaLink {
 /// serves every name the database does, as C's `dbContext` does, and hands
 /// this one the rest.
 ///
-/// Holds a single shared [`CaClient`] and a registry of open
-/// [`CaLink`]s keyed by PV name, so multiple records pointing at the
-/// same remote PV share one CA channel + subscription. Cheap to
-/// clone — every field is `Arc`-backed.
+/// Holds a single shared [`CaClient`] and a registry of open [`CaLink`]s,
+/// one per record link as C gives each `caLink` its own channel, so two
+/// records naming one remote PV are two channels and two subscriptions on
+/// the client's one circuit. Cheap to clone — every field is `Arc`-backed.
 #[derive(Clone)]
 pub struct CaLinkResolver {
-    /// Shared CA client, created lazily on the first link [`Self::open`].
-    /// An IOC with no CA links never spins one up — the same lazy-client
-    /// shape as `pvalink`'s per-link `PvaClient` (the C `dbCa` client is
-    /// likewise only created once a link is added). Seeded eagerly by
+    /// Shared CA client, created lazily on the first link open. An IOC with
+    /// no CA links never spins one up — the same lazy-client shape as
+    /// `pvalink`'s per-link `PvaClient` (the C `dbCa` client is likewise
+    /// only created once a link is added). Seeded eagerly by
     /// [`Self::with_client`] when a caller wants to share/pin a client.
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
-    /// Open links keyed by bare PV name (`ca://` scheme stripped).
-    links: Arc<RwLock<HashMap<RecordName, Arc<CaLink>>>>,
+    /// Open links by [`LinkSerial`], each with its bare PV name (`ca://`
+    /// scheme stripped).
+    links: Arc<RwLock<HashMap<LinkSerial, (RecordName, Arc<CaLink>)>>>,
     /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
     /// ([`ExternalCpProcess::run_worker`]). `None` until
@@ -626,8 +637,8 @@ pub struct CaLinkResolver {
 
 impl CaLinkResolver {
     /// Build a resolver whose shared [`CaClient`] is created lazily on
-    /// the first link [`Self::open`]. Infallible — an IOC with no such link never constructs a
-    /// client, and any client-init failure surfaces at that `open`
+    /// the first link open. Infallible — an IOC with no such link never constructs a
+    /// client, and any client-init failure surfaces at that open
     /// (mirroring `pvalink`'s lazy client), so installation cannot fail
     /// and never aborts the IOC.
     pub fn new(reactor: task::Reactor) -> Self {
@@ -642,8 +653,7 @@ impl CaLinkResolver {
     /// Build a resolver around an already-constructed [`CaClient`].
     /// Lets a caller share one client across the CA gateway and the
     /// CA links, or pin the client to a specific server in tests. The
-    /// client is seeded eagerly, so the lazy-init path in [`Self::open`]
-    /// is bypassed.
+    /// client is seeded eagerly, so the lazy init is bypassed.
     pub fn with_client(client: Arc<CaClient>) -> Self {
         Self {
             reactor: client.reactor().clone(),
@@ -679,78 +689,44 @@ impl CaLinkResolver {
         *self.db.write() = Some(db);
     }
 
-    /// Open / cache the CA link for `pv_name` (a bare PV name, no
-    /// `ca://` scheme). Idempotent — repeated calls return the cached
-    /// [`CaLink`]. Creates a CA channel, subscribes a monitor, and
-    /// spawns the task that keeps the cached snapshot current.
-    ///
-    /// This is the entry point an IOC calls at init for every CA
-    /// record link so the synchronous resolver hot path can serve
-    /// from cache (the C `dbCaAddLink` analogue).
-    pub async fn open(&self, pv_name: impl AsRef<[u8]>) -> Result<Arc<CaLink>, CaLinkError> {
-        self.open_init(pv_name.as_ref(), None).await
-    }
-
-    /// [`Self::open`] for a link `dbCaRun` waits on: `init` rides on the
-    /// link that serves the name and is released after its first event's
-    /// process, at once for a channel with no such wait, or here when no
-    /// link opens.
-    async fn open_init(
-        &self,
-        pv_name: &[u8],
-        init: Option<CaLinkInit>,
-    ) -> Result<Arc<CaLink>, CaLinkError> {
-        let link = self.open_link(pv_name).await?;
-        if let Some(init) = init {
-            link.connected.process.adopt_init(init);
+    /// `link`'s [`CaLink`], opened here if it has none: C `dbCaTask`'s
+    /// `CA_CONNECT` (`dbCa.c:1140-1159`). A channel, a monitor, and the tasks
+    /// that keep its cache current. `None` when the open failed, or the
+    /// link was removed while it ran — `CA_CLEAR_CHANNEL` comes first
+    /// (`dbCa.c:1200`).
+    async fn open_link(&self, link: LinkRef<'_>) -> Option<Arc<CaLink>> {
+        if let Some(existing) = self.cached_link(link) {
+            return Some(existing);
         }
-        Ok(link)
-    }
-
-    async fn open_link(&self, pv_name: &[u8]) -> Result<Arc<CaLink>, CaLinkError> {
-        let pv_name = RecordName::from(pv_name);
-        if let Some(existing) = self.links.read().get(pv_name.as_bytes()).cloned() {
-            return Ok(existing);
-        }
-        let link = self.open_net(pv_name.clone()).await?;
-        // Re-check under the write lock so two concurrent first-callers
-        // converge on one link (the loser's freshly opened link drops,
-        // unsubscribing its monitor).
+        let client = self.client().await.ok()?;
+        // The link starts as its entry is published, under this lock: two
+        // first opens of one link start one channel, and an open the link's
+        // removal overtook starts none.
         let mut links = self.links.write();
-        if let Some(existing) = links.get(pv_name.as_bytes()).cloned() {
-            return Ok(existing);
+        if link.is_removed() {
+            return None;
         }
-        links.insert(pv_name, link.clone());
-        Ok(link)
+        let entry = match links.entry(link.serial()) {
+            std::collections::hash_map::Entry::Occupied(won) => return Some(won.get().1.clone()),
+            std::collections::hash_map::Entry::Vacant(entry) => entry,
+        };
+        let pv_name = RecordName::from(strip_ca_scheme(link.name));
+        let opened = self.start_net(client, pv_name.clone(), link);
+        Some(entry.insert((pv_name, opened)).1.clone())
     }
 
-    /// The link over a network channel.
-    async fn open_net(&self, pv_name: RecordName) -> Result<Arc<CaLink>, CaLinkError> {
+    /// The link over a network channel. MUST NOT block: it runs under the
+    /// `links` lock.
+    fn start_net(&self, client: &CaClient, pv_name: RecordName, link: LinkRef<'_>) -> Arc<CaLink> {
         // The receiver is taken with the channel, before its search starts:
         // an `AccessRightsChanged` / `Connected` pair published ahead of the
         // watcher is lost for good — `meta` stays empty and the write right
         // stays at its default `true` (C `connectionCallback` scheduling
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
-        let (channel, conn_rx) = self.client().await?.create_channel_with_events(&pv_name, 0);
+        let (channel, conn_rx) = client.create_channel_with_events(&pv_name, 0);
         let channel = Arc::new(channel);
-        // C `dbCa` opens the record-link monitor with `ca_add_array_event`
-        // (`dbCa.c:1225-1229`), whose libca macro expands to
-        // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
-        // (`cadef.h:2004-2012`). DBE_LOG / DBE_ARCHIVE is a separate
-        // event-trigger class (`cadef.h:1148-1158`) that `dbCa` never
-        // requests, so a CP/CPP record link must not refresh its cache (or
-        // wake a scan) on archive/log-only posts. The default
-        // `CaChannel::subscribe()` requests `DBE_VALUE | DBE_LOG |
-        // DBE_ALARM`, so request the dbCa mask explicitly here.
-        let monitor = channel
-            .subscribe_with_mask(0.0, CALINK_EVENT_MASK)
-            .await
-            .map_err(|e| CaLinkError::Subscribe {
-                pv: pv_name.to_string(),
-                reason: e.to_string(),
-            })?;
         let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
-        let connected = Arc::new(LinkConnState::new(self.db.clone(), pv_name.clone()));
+        let connected = Arc::new(LinkConnState::new(self.db.clone(), link));
         let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
         // real circuit state so `is_connected()` reflects upstream
@@ -766,42 +742,53 @@ impl CaLinkResolver {
             meta.clone(),
             pv_name.clone(),
         ));
-        let process_task = reactor.spawn(run_processor(connected.clone()));
-        let monitor_task = reactor.spawn(run_monitor(
-            monitor,
-            cache.clone(),
-            connected.clone(),
-            channel.clone(),
-            pv_name.clone(),
-        ));
-        Ok(Arc::new(CaLink {
+        let process_task = self
+            .db
+            .read()
+            .as_ref()
+            .map(|db| db.spawn_cp_worker(run_processor(connected.clone())));
+        let opened = Arc::new(CaLink {
             cache,
             connected,
             meta,
             channel,
-            _monitor_task: AbortOnDrop(monitor_task),
+            monitor: std::sync::OnceLock::new(),
+            reactor: reactor.clone(),
+            pv_name,
             _conn_task: AbortOnDrop(conn_task),
-            _process_task: AbortOnDrop(process_task),
-        }))
+            _process_task: process_task,
+        });
+        // `dbInitLink`'s `pvlOptInpNative` for a `DBF_INLINK`: monitored
+        // from the connect (`dbCa.c:865-867`).
+        if link.is_input() {
+            opened.monitor_native();
+        }
+        opened
     }
 
-    /// Wait until the CA link for `pv_name` has received at least one
-    /// monitor event (its cached value is populated). Returns `false`
-    /// on timeout. The canonical test / IOC-init helper for "wait for
-    /// the upstream IOC to come online".
+    /// Wait until the record links to `pv_name` have opened and each is
+    /// connected, a monitored one with its first event cached. Returns
+    /// `false` on timeout. The canonical test / IOC-init helper for
+    /// "wait for the upstream IOC to come online".
     pub async fn wait_for_link_connected(
         &self,
         pv_name: impl AsRef<[u8]>,
         timeout: std::time::Duration,
     ) -> bool {
         let name = strip_ca_scheme(pv_name.as_ref());
-        let link = match self.open(name).await {
-            Ok(l) => l,
-            Err(_) => return false,
-        };
         let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
-            if link.value().is_some() {
+            let ready = {
+                let links = self.links.read();
+                let mut named = links.values().filter(|(n, _)| n.as_bytes() == name);
+                let first = named.next();
+                first.is_some()
+                    && first.into_iter().chain(named).all(|(_, link)| {
+                        link.is_connected()
+                            && (link.monitor.get().is_none() || link.value().is_some())
+                    })
+            };
+            if ready {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -813,6 +800,12 @@ impl CaLinkResolver {
             // panics the band worker it is polled on.
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// The link's served value as `dbcaxr` reports it: no open, and none of
+    /// `dbCaGetLink`'s effects on the link.
+    pub(super) fn peek_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.cached_link(link)?.value()
     }
 
     /// Number of open CA links.
@@ -831,7 +824,7 @@ impl CaLinkResolver {
         let mut out: Vec<(String, bool)> = self
             .links
             .read()
-            .iter()
+            .values()
             .map(|(name, link)| (name.to_string(), link.is_connected()))
             .collect();
         out.sort();
@@ -851,31 +844,24 @@ impl CaLinkResolver {
         Some(client.ioc_connection_count().await)
     }
 
-    /// Lazily resolve `name` to its cached [`CaLink`]. Opens the link when
-    /// it is not yet in the registry — the first-access slow path.
-    /// Steady-state reads hit the registry directly.
-    async fn link_for(&self, name: &[u8]) -> Option<Arc<CaLink>> {
-        if let Some(existing) = self.cached_link(name) {
-            return Some(existing);
-        }
-        self.open(name).await.ok()
-    }
-
-    /// The registry read with NO lazy open — the record-processing half of
-    /// [`Self::link_for`]. C `dbCaGetLink` and the `getAttributes` family
+    /// The registry read with NO open — the record-processing half of
+    /// [`Self::open_link`]. C `dbCaGetLink` and the `getAttributes` family
     /// read `pca->...` under `pca->lock` and never create a channel
     /// (`dbCa.c:419-506`, `:633-675`); the open is `dbCaAddLink`'s
     /// `CA_CONNECT` on the `dbCaTask`, reached here through
     /// [`LinkSet::connect_link`]. Every synchronous `LinkSet` accessor goes
     /// through this, so none of them can suspend the record thread.
-    fn cached_link(&self, name: &[u8]) -> Option<Arc<CaLink>> {
-        self.links.read().get(name).cloned()
+    fn cached_link(&self, link: LinkRef<'_>) -> Option<Arc<CaLink>> {
+        self.links
+            .read()
+            .get(&link.serial())
+            .map(|(_, l)| l.clone())
     }
 }
 
 /// C `dbCaTask`'s `CA_DBPROCESS` arm (`dbCa.c:1185-1195`, `:1314-1321`)
-/// for one link: take the pending request, then process every local
-/// CP/CPP holder of the PV. The flag is cleared before processing, so a
+/// for one link: take the pending request, then process the link's CP/CPP
+/// holder. The flag is cleared before processing, so a
 /// request raised during it processes again, as C's re-queue does.
 async fn run_processor(state: Arc<LinkConnState>) {
     // A clone per process: no read guard is held across record processing.
@@ -902,19 +888,36 @@ fn note_monitor_value(
     connected.request_process();
 }
 
-/// Monitor task: drain the subscription, refresh the cache on every
-/// event. Ends when the channel is dropped (`recv` returns `None`).
+/// Monitor task: subscribe, then drain the subscription, refresh the cache
+/// on every event. Ends when the channel is dropped (`recv` returns `None`).
 ///
 /// Mirrors C `dbCa.c` `eventCallback` (`dbCa.c:891`) — every CA
 /// monitor event overwrites the cached value/severity/timestamp that
 /// `dbCaGetLink` later serves.
 async fn run_monitor(
-    mut monitor: crate::client::MonitorHandle,
+    channel: Arc<CaChannel>,
     cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
     connected: Arc<LinkConnState>,
-    channel: Arc<CaChannel>,
     pv_name: RecordName,
 ) {
+    // C `dbCa` opens the record-link monitor with `ca_add_array_event`
+    // (`dbCa.c:1225-1229`), whose libca macro expands to
+    // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
+    // (`cadef.h:2004-2012`). DBE_LOG / DBE_ARCHIVE is a separate
+    // event-trigger class (`cadef.h:1148-1158`) that `dbCa` never
+    // requests, so a CP/CPP record link must not refresh its cache (or
+    // wake a scan) on archive/log-only posts. The default
+    // `CaChannel::subscribe()` requests `DBE_VALUE | DBE_LOG |
+    // DBE_ALARM`, so request the dbCa mask explicitly here.
+    let mut monitor = match channel.subscribe_with_mask(0.0, CALINK_EVENT_MASK).await {
+        Ok(monitor) => monitor,
+        // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
+        // the link stays without a value.
+        Err(e) => {
+            tracing::debug!(pv = %pv_name, error = %e, "calink: subscribe failed");
+            return;
+        }
+    };
     while let Some(event) = monitor.recv().await {
         match event {
             Ok(snapshot) => {
@@ -1096,39 +1099,17 @@ impl LinkSet for CaLinkResolver {
         Some(Arc::new(self.clone()))
     }
 
-    fn is_connected(&self, name: &[u8]) -> bool {
-        let name = strip_ca_scheme(name);
-        match self.links.read().get(name) {
-            Some(link) => link.is_connected(),
-            // Not opened yet — report not connected. `open` /
-            // `get_value` open it lazily.
-            None => false,
-        }
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        // Not opened yet — not connected; `connect_link` opens it.
+        self.cached_link(link).is_some_and(|l| l.is_connected())
     }
 
-    /// This port shares one [`CaLink`] per name, so a link added once the
-    /// shared one has delivered its first event gets no event of its own.
-    fn cp_link_added(&self, name: &[u8], holder: CpTarget) {
-        let name = strip_ca_scheme(name);
-        if let Some(link) = self.links.read().get(name)
-            && link.is_connected()
-            && link.cache.load().is_some()
-        {
-            link.connected.process.request_holder(holder);
-        }
+    fn init_ready(&self, link: LinkRef<'_>) -> bool {
+        self.cached_link(link).is_some_and(|l| l.init_ready())
     }
 
-    fn init_ready(&self, name: &[u8]) -> bool {
-        let name = strip_ca_scheme(name);
-        match self.links.read().get(name) {
-            Some(link) => link.init_ready(),
-            None => false,
-        }
-    }
-
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        let name = strip_ca_scheme(name);
-        let link = self.link_for(name).await?;
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let link = self.open_link(link).await?;
         link.note_read();
         link.value()
     }
@@ -1139,12 +1120,11 @@ impl LinkSet for CaLinkResolver {
     /// event (the `eventCallback` analogue, `dbCa.c:891`).
     ///
     /// The difference from [`Self::get_value`] is the missing
-    /// `Self::link_for` fallback (`resolver.rs:452-457`), which opens the
-    /// channel and awaits the subscription round trip. That open now happens
-    /// on the database's link work owner via [`Self::connect_link`].
-    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        let name = strip_ca_scheme(name);
-        let link = self.links.read().get(name).cloned()?;
+    /// `CaLinkResolver::open_link` fallback, which opens the channel and
+    /// awaits the subscription round trip. That open happens on the
+    /// database's link work owner via [`Self::connect_link`].
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let link = self.cached_link(link)?;
         link.note_read();
         link.value()
     }
@@ -1156,10 +1136,31 @@ impl LinkSet for CaLinkResolver {
     /// (`dbCa.c:1218-1235`), which `connectionCallback` schedules at
     /// `dbCa.c:866` once the channel is up. This port does both in one
     /// call; it runs on the link work owner, so the `subscribe` round trip
-    /// inside `open` is off the record thread either way.
-    async fn connect_link(&self, name: &[u8], init: Option<CaLinkInit>) {
-        let name = strip_ca_scheme(name);
-        let _ = self.open_init(name, init).await;
+    /// inside the open is off the record thread either way.
+    ///
+    /// `init` rides on the link's first event's process, and is released
+    /// here when no link opens.
+    async fn connect_link(&self, link: LinkRef<'_>, init: Option<CaLinkInit>) {
+        if let Some(link) = self.open_link(link).await
+            && let Some(init) = init
+        {
+            link.connected.process.adopt_init(init);
+        }
+    }
+
+    /// A link not opened yet starts after this, from the `links` lock
+    /// `Self::open_link` starts it under.
+    fn join_cp_link(&self, link: LinkRef<'_>) {
+        if let Some(link) = self.cached_link(link) {
+            link.connected.process.join();
+        }
+    }
+
+    /// `dbCaRemoveLink` (`dbCa.c:431-446`): the link's channel is cleared
+    /// with its monitor. A put in flight keeps the channel until it answers.
+    fn remove_link(&self, _holder: LinkHolder<'_>, link: LinkRef<'_>) {
+        let removed = self.links.write().remove(&link.serial());
+        drop(removed);
     }
 
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
@@ -1178,28 +1179,27 @@ impl LinkSet for CaLinkResolver {
     /// Both flavours are closed by refusing here; neither needs a second,
     /// later check.
     ///
-    /// A link this resolver has never opened reports `Unopened` rather than
-    /// `Refused`: C opens at `dbCaAddLink` (record init) so the `caLink`
-    /// always exists by the first put, while this resolver opens lazily
-    /// inside `put_value` / `get_value`. Reporting `Refused` would refuse
-    /// the very write whose staging performs the open, and the link would
-    /// never connect.
-    fn put_admission(&self, name: &[u8]) -> PutAdmission {
-        let name = strip_ca_scheme(name);
-        let links = self.links.read();
-        match links.get(name) {
-            None => PutAdmission::Unopened,
+    /// A link this resolver has not opened is refused too: C opens every CA
+    /// link at `dbCaAddLink` (iocInit's open pass, or a relink here) and
+    /// refuses its puts until it connects.
+    fn put_admission(&self, link: LinkRef<'_>) -> PutAdmission {
+        match self.cached_link(link) {
             Some(link) if link.is_connected() && link.has_write_access() => PutAdmission::Connected,
-            Some(_) => PutAdmission::Refused,
+            _ => PutAdmission::Refused,
         }
     }
 
-    async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
-        self.put_value_done(name, value, op).await.1
+    async fn put_value(
+        &self,
+        link: LinkRef<'_>,
+        value: EpicsValue,
+        op: LinkPutOp,
+    ) -> Result<(), String> {
+        self.put_value_done(link, value, op).await.1
     }
 
-    fn put_native(&self, name: &[u8]) -> Option<(DbFieldType, u32)> {
-        channel_native(&self.cached_link(strip_ca_scheme(name))?.channel)
+    fn put_native(&self, link: LinkRef<'_>) -> Option<(DbFieldType, u32)> {
+        channel_native(&self.cached_link(link)?.channel)
     }
 
     /// Issuing the put and completing it are separate steps, as in C
@@ -1209,7 +1209,7 @@ impl LinkSet for CaLinkResolver {
     /// when the server answers or the circuit drops, with no put timeout.
     async fn put_value_done(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
@@ -1229,8 +1229,8 @@ impl LinkSet for CaLinkResolver {
         // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
         // CA server from stalling normal record processing, while `Async`
         // keeps the WRITE_NOTIFY completion the put-notify chain needs.
-        let name = strip_ca_scheme(name);
-        let Some(link) = self.link_for(name).await else {
+        let name = strip_ca_scheme(link.name);
+        let Some(link) = self.open_link(link).await else {
             let reason = format!("CA link {} not open", String::from_utf8_lossy(name));
             return (LinkPutDone::NotIssued, Err(reason));
         };
@@ -1283,52 +1283,51 @@ impl LinkSet for CaLinkResolver {
         }
     }
 
-    fn alarm_severity(&self, name: &[u8]) -> Option<i32> {
-        let name = strip_ca_scheme(name);
-        let sev = self.cached_link(name)?.alarm_severity()?;
+    fn alarm_severity(&self, link: LinkRef<'_>) -> Option<i32> {
+        let sev = self.cached_link(link)?.alarm_severity()?;
         // Mirror the lset contract: only a non-zero severity is a
         // contribution worth propagating into the owning record's
         // LINK_ALARM. `0` (NO_ALARM) means "do not propagate".
         if sev > 0 { Some(sev) } else { None }
     }
 
-    fn alarm_status(&self, name: &[u8]) -> Option<i32> {
+    fn alarm_status(&self, link: LinkRef<'_>) -> Option<i32> {
         // surface the remote STAT for `MSS` propagation.
         // Record processing only consults this when the alarm is
         // actually propagated (severity > 0 via `alarm_severity`), so
         // no severity gate is needed here.
-        let name = strip_ca_scheme(name);
-        self.cached_link(name)?.alarm_status()
+        self.cached_link(link)?.alarm_status()
     }
 
-    fn time_stamp(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
-        let name = strip_ca_scheme(name);
-        self.cached_link(name)?.time_stamp()
+    fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
+        self.cached_link(link)?.time_stamp()
     }
 
-    fn link_metadata(&self, name: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, link: LinkRef<'_>) -> Option<LinkMetadata> {
         // surface the remote display/control/alarm limits,
         // precision, units, DBF type and element count through the DB
         // link API so a record with a CA INP link inherits them, matching
         // the pvalink metadata path. Reads the cached CTRL attributes —
         // no fresh GET — exactly as C `getControlLimits` &c. read
         // `pca->controlLimits`.
-        let name = strip_ca_scheme(name);
-        self.cached_link(name)?.link_metadata()
+        self.cached_link(link)?.link_metadata()
     }
 
     fn link_names(&self) -> Vec<RecordName> {
-        self.links.read().keys().cloned().collect()
+        let mut names: Vec<RecordName> =
+            self.links.read().values().map(|(n, _)| n.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
-    /// `None` for a name this resolver has never opened — C's `pca == NULL`,
+    /// `None` for a link this resolver has never opened — C's `pca == NULL`,
     /// which `dbcar` renders as a not-connected link with zero counters
     /// (`dbCaTest.c:127-132`). Never opens the link itself: `dbcar` is a
     /// report, and C's walk reads `plink->value.pv_link.pvt` without
     /// touching CA.
-    async fn link_diagnostics(&self, name: &[u8]) -> Option<LinkDiagnostics> {
-        let name = strip_ca_scheme(name);
-        let link = self.cached_link(name)?;
+    async fn link_diagnostics(&self, link: LinkRef<'_>) -> Option<LinkDiagnostics> {
+        let link = self.cached_link(link)?;
         Some(link.diagnostics().await)
     }
 }
@@ -1348,7 +1347,7 @@ fn strip_ca_scheme(name: &[u8]) -> &[u8] {
 /// `PvDatabase::resolve_external_pv`.
 ///
 /// Returns the resolver so the caller can pre-open links
-/// ([`CaLinkResolver::open`]) at IOC init and query stats.
+/// (`CaLinkResolver::open`) at IOC init and query stats.
 ///
 /// Infallible: the shared CA client is created lazily on the first link
 /// open ([`CaLinkResolver::new`]), so installation never spins one up
@@ -1418,7 +1417,7 @@ mod tests {
     /// reconnect followed by a second drop adds one more.
     #[test]
     fn the_disconnect_count_moves_once_per_edge() {
-        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
+        let connected = cp_link_state();
         // Never connected: C's `caLink` at its calloc zero.
         connected.sync(fold(false, RW, 0));
         assert_eq!(connected.disconnect_count(), 0);
@@ -1444,7 +1443,7 @@ mod tests {
     /// that includes a connect `run_monitor` flagged first.
     #[test]
     fn bug1_connection_event_tracks_disconnect() {
-        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
+        let connected = cp_link_state();
         assert!(connected.sync(fold(true, RW, 0)));
         assert!(connected.is_set());
         assert!(
@@ -1462,7 +1461,7 @@ mod tests {
         assert!(connected.is_set());
         assert!(!connected.has_read_access());
 
-        let early = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
+        let early = cp_link_state();
         early.mark_connected();
         assert!(
             early.sync(fold(true, RW, 0)),
@@ -1487,7 +1486,7 @@ mod tests {
     ///   clears on the next monitor event, not on the rights edge.
     #[test]
     fn access_rights_transitions_follow_dbca() {
-        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
+        let state = cp_link_state();
 
         // Disconnected: C's early return. No dispatch, no cache update.
         assert!(!state.note_access_rights(false, false));
@@ -1550,21 +1549,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl epics_base_rs::server::database::LinkSet for FlagLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
             self.state.is_set()
         }
-        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             self.read()
         }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
             self.read()
         }
         async fn connect_link(
             &self,
-            _: &[u8],
+            _: LinkRef<'_>,
             _: Option<epics_base_rs::server::database::CaLinkInit>,
         ) {
         }
+    }
+
+    /// A CP link's state, with no database.
+    fn cp_link_state() -> LinkConnState {
+        let open = epics_base_rs::server::record::OpenLatch::ca(
+            epics_base_rs::server::record::LinkProcessPolicy::ChannelProcess,
+            epics_base_rs::server::record::LinkFieldType::In,
+        );
+        LinkConnState::new(Arc::new(RwLock::new(None)), LinkRef::new(b"UP:PV", &open))
     }
 
     /// A link state on `UP:PV` and a database whose ai `HOLDER` reads it
@@ -1572,7 +1580,14 @@ mod tests {
     fn cp_holder() -> (Arc<LinkConnState>, Arc<FlagLset>, PvDatabase) {
         use epics_base_rs::server::records::ai::AiRecord;
         let db_slot = Arc::new(RwLock::new(None));
-        let state = Arc::new(LinkConnState::new(db_slot.clone(), "UP:PV".into()));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
+            "ca://UP:PV CP",
+        ));
+        let ext = inp.external().unwrap();
+        let state = Arc::new(LinkConnState::new(
+            db_slot.clone(),
+            LinkRef::new(ext.name, ext.open),
+        ));
         let lset = Arc::new(FlagLset {
             state: state.clone(),
             reads: AtomicU64::new(0),
@@ -1588,13 +1603,7 @@ mod tests {
                 let rec = db.get_record("HOLDER").unwrap();
                 let mut inst = rec.write();
                 inst.common.text.inp = "ca://UP:PV CP".into();
-                inst.install_link_cache(
-                    "INP",
-                    Arc::new(epics_base_rs::server::record::parse_link_v2(
-                        "ca://UP:PV CP",
-                    )),
-                )
-                .expect("a common link");
+                inst.install_link_cache("INP", inp).expect("a common link");
             }
             db.initialize_link_locality().await;
             db.setup_cp_links().await;
@@ -1618,11 +1627,106 @@ mod tests {
         run_to_wait(state.process.run_worker(|| state.db.read().clone()));
     }
 
-    /// One processing of `UP:PV`'s holders, taken by a worker of its own.
+    /// One processing of `HOLDER`'s link, taken by a worker of its own.
     fn process_once(db: &PvDatabase) {
-        let process = ExternalCpProcess::new("UP:PV");
+        let (_, _, inp) = db.record_link_fields("HOLDER").remove(0);
+        let ext = inp.external().unwrap();
+        let process = ExternalCpProcess::new(LinkRef::new(ext.name, ext.open));
         process.request();
         run_to_wait(process.run_worker(|| Some(db.clone())));
+    }
+
+    /// An open the link's removal overtook starts no channel and no task:
+    /// `dbCaTask` serves `CA_CLEAR_CHANNEL` first (`dbCa.c:1200`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_open_its_removal_overtook_starts_nothing() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let resolver = CaLinkResolver::new(task::Reactor::current().expect("test runtime"));
+        resolver.client().await.expect("a client");
+        let db = PvDatabase::new();
+        db.add_record("H", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
+            "ca://UP:PV CP",
+        ));
+        {
+            let rec = db.get_record("H").unwrap();
+            let mut inst = rec.write();
+            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.install_link_cache("INP", inp.clone())
+                .expect("a common link");
+        }
+        db.put_record_field_from_ca_no_notify("H", "INP", EpicsValue::String("0".into()))
+            .await
+            .unwrap();
+        let ext = inp.external().unwrap();
+        assert!(ext.open.is_removed());
+
+        // Current-thread: no task the open spawns runs, or is reaped, before
+        // the count below.
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let before = tasks();
+        assert!(
+            resolver
+                .open_link(LinkRef::new(ext.name, ext.open))
+                .await
+                .is_none()
+        );
+        assert_eq!(tasks(), before, "the removed link's open started a task");
+    }
+
+    /// A first event whose pass ran before the link's CP edge was published
+    /// still processes the holder (`dbCa.c:958-962`): the relink that
+    /// publishes the edge joins the link, and the join repeats the pass.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_that_found_no_edge_is_owed_to_the_join() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "H") { field(FLNK, "CNT") }
+                   record(calc, "CNT") { field(CALC, "VAL+1") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
+            "ca://UP:PV CP",
+        ));
+        {
+            let rec = db.get_record("H").unwrap();
+            let mut inst = rec.write();
+            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.install_link_cache("INP", inp.clone())
+                .expect("a common link");
+        }
+        let ext = inp.external().unwrap();
+        let link = LinkRef::new(ext.name, ext.open);
+        let resolver = CaLinkResolver::new(task::Reactor::current().expect("test runtime"));
+        // Opened with no database: no worker, the test steps the processor.
+        let opened = resolver.open_link(link).await.expect("an open");
+        resolver.attach_database((*db).clone());
+        db.process_cp_links_on_connect().await;
+        let processes = || db.get_pv("CNT").unwrap().to_f64().unwrap();
+
+        opened.connected.request_process();
+        step(&opened.connected);
+        assert_eq!(processes(), 0.0, "a pass with no edge processed H");
+
+        db.setup_cp_links().await;
+        resolver.join_cp_link(link);
+        step(&opened.connected);
+        assert_eq!(processes(), 1.0, "the join dropped the missed pass");
+        resolver.join_cp_link(link);
+        step(&opened.connected);
+        assert_eq!(processes(), 1.0, "the miss is owed once");
     }
 
     /// C `accessRightsCallback` only adds `CA_DBPROCESS` (`dbCa.c:1029`):
@@ -1786,7 +1890,7 @@ mod tests {
     /// transition owner is the thing that decides.
     #[test]
     fn disconnect_edge_dispatches_cp_holders_once() {
-        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".into());
+        let state = cp_link_state();
 
         // Never connected: a disconnect is not an edge and must not
         // dispatch — otherwise every link would process its holders once
@@ -1919,7 +2023,7 @@ mod tests {
         // Fail closed: an earlier `#[cfg(test)]` helper must not shrink a
         // slice past the code this guard is meant to cover.
         assert!(
-            resolver.contains("pub async fn open"),
+            resolver.contains("async fn open_link"),
             "resolver production slice no longer covers the link-open path"
         );
         assert!(
@@ -1927,8 +2031,8 @@ mod tests {
             "mod production slice no longer covers the link-set installer"
         );
         assert!(
-            iocsh.contains("ca_caxr_command"),
-            "iocsh production slice no longer covers the caxr command"
+            iocsh.contains("db_dbcaxr_command"),
+            "iocsh production slice no longer covers the dbcaxr command"
         );
 
         // Positive: calink production actually spawns through a held

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use super::channel_io::{ChannelTarget, LongStringMode, read_ack_state};
+use super::db_access::GetFailed;
 use crate::server::pv::{LogValue, MonitorEvent};
 use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
@@ -72,13 +73,14 @@ pub fn apply_long_string_mode(
             ..
         } => apply_long_string(v, no_elements, nul_at_count, requested_count),
         LongStringMode::NativeString => apply_native_long_string(v),
-        LongStringMode::Plain => v,
+        LongStringMode::Plain | LongStringMode::Text(_) => v,
     }
 }
 
 /// What one CA subscription does to each event between its queue and the
 /// wire: the channel's post chain, on a `$` channel's char image, then the
-/// long-string boundary conversion. Every delivery path reads its events
+/// long-string boundary conversion, then for a link or an attribute the text
+/// `dbGet` reads for the request type. Every delivery path reads its events
 /// through this one owner, as C's event task runs the post chain for every
 /// `event_read` (`dbEvent.c:984-985`).
 #[derive(Clone)]
@@ -94,26 +96,53 @@ pub struct DeliveryStage {
 struct StageTransform {
     post: Option<std::sync::Arc<crate::server::database::db_access::PostStage>>,
     long_string_mode: LongStringMode,
+    text: Option<TextStep>,
+}
+
+/// `dbGet`'s read of a link or an attribute for the stage's request type.
+#[derive(Clone, Copy)]
+enum TextStep {
+    Read(crate::server::database::char_view::TextRead),
+    /// `S_db_badDbrtype`: every update is `read_reply`'s GETFAIL
+    /// (`camessage.c:540-557`).
+    Refused,
 }
 
 impl DeliveryStage {
-    /// The stage for a channel whose post chain is `post`, on a field of
-    /// `autosize` elements.
+    /// The stage for a `data_type` request on a channel whose post chain is
+    /// `post`, on a field of `autosize` elements.
     pub fn new(
         post: crate::server::database::filters::FilterChain,
         long_string_mode: LongStringMode,
         autosize: u32,
+        data_type: u16,
     ) -> Self {
         let dollar = match long_string_mode {
             LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
             _ => None,
         };
+        let route = match long_string_mode {
+            LongStringMode::Text(route) => Some(route),
+            LongStringMode::DollarChar { view, .. } => view.source().text_route(),
+            _ => None,
+        };
+        // `DBR_CLASS_NAME` reads the record type, not the field
+        // (`db_access.c:784-800`).
+        let text = route
+            .filter(|_| data_type != crate::types::DBR_CLASS_NAME)
+            .map(|route| {
+                crate::types::native_type_for_dbr(data_type)
+                    .ok()
+                    .and_then(|target| route.read(target))
+                    .map_or(TextStep::Refused, TextStep::Read)
+            });
         let post = crate::server::database::db_access::PostStage::new(post, dollar)
             .map(std::sync::Arc::new);
         let transform = (post.is_some() || long_string_mode != LongStringMode::Plain).then(|| {
             Box::new(StageTransform {
                 post,
                 long_string_mode,
+                text,
             })
         });
         Self {
@@ -144,9 +173,17 @@ impl DeliveryStage {
         self.transform.is_none()
     }
 
+    /// Whether `dbGet` refuses the stage's request type, so that every
+    /// update fails.
+    pub fn refuses(&self) -> bool {
+        self.transform
+            .as_ref()
+            .is_some_and(|t| matches!(t.text, Some(TextStep::Refused)))
+    }
+
     /// `event` as sent for a `requested_count` request, `None` where the post
-    /// chain drops it.
-    pub fn prepare(
+    /// chain drops it. The caller has answered [`Self::refuses`].
+    fn prepare(
         &self,
         event: crate::server::pv::MonitorEvent,
         requested_count: u32,
@@ -157,6 +194,25 @@ impl DeliveryStage {
         // An autosize request reads the field's own count, which a log the
         // filters grew (`ts`) is cut to.
         let n_request = self.item_count(requested_count) as usize;
+        let mut event = Self::convert(transform, event, requested_count, n_request)?;
+        if let Some(TextStep::Read(read)) = transform.text {
+            let text = event.replace_value(crate::types::EpicsValue::Long(0));
+            event.replace_value(read.get(
+                crate::server::database::char_view::text_of(&text),
+                n_request,
+            ));
+        }
+        Some(event)
+    }
+
+    /// [`Self::prepare`] before the text read: the post chain and the
+    /// long-string conversion.
+    fn convert(
+        transform: &StageTransform,
+        event: crate::server::pv::MonitorEvent,
+        requested_count: u32,
+        n_request: usize,
+    ) -> Option<crate::server::pv::MonitorEvent> {
         let mut event = match &transform.post {
             // A `$` view's read is already `dbGet`'s chars for this count.
             Some(post) if post.reads_chars() => return post.read_request(event, n_request),
@@ -171,7 +227,10 @@ impl DeliveryStage {
             }
             None => event,
         };
-        if transform.long_string_mode != LongStringMode::Plain {
+        if !matches!(
+            transform.long_string_mode,
+            LongStringMode::Plain | LongStringMode::Text(_)
+        ) {
             let value = event.replace_value(crate::types::EpicsValue::Long(0));
             event.replace_value(apply_long_string_mode(
                 value,
@@ -185,7 +244,8 @@ impl DeliveryStage {
     /// [`Self::prepare`] for a snapshot no queue carried: a read, or a single
     /// event posted under subscriber mask `mask`, rewritten in place; `false`
     /// where the chain drops it, which leaves `snapshot` without its value.
-    pub fn prepare_snapshot(
+    /// The caller has answered [`Self::refuses`].
+    fn prepare_snapshot(
         &self,
         snapshot: &mut crate::server::snapshot::Snapshot,
         requested_count: u32,
@@ -221,7 +281,9 @@ pub struct Update<'a> {
 /// An [`Update`] after its channel's stage, as the encode reads it.
 pub struct Delivery<'a> {
     log: &'a MonitorEvent,
-    body: Body<'a>,
+    /// `Err` where the stage [refuses](DeliveryStage::refuses) the request
+    /// type.
+    body: Result<Body<'a>, GetFailed>,
 }
 
 enum Body<'a> {
@@ -266,10 +328,16 @@ impl<'a> Update<'a> {
         log: &'s mut Option<Cow<'a, MonitorEvent>>,
     ) -> Option<Delivery<'s>> {
         let Self { log: posted, body } = self;
+        if stage.refuses() {
+            return Some(Delivery {
+                log: log.insert(posted),
+                body: Err(GetFailed),
+            });
+        }
         if stage.is_identity() {
             return Some(Delivery {
                 log: log.insert(posted),
-                body,
+                body: Ok(body),
             });
         }
         match body {
@@ -279,14 +347,14 @@ impl<'a> Update<'a> {
                 }
                 Some(Delivery {
                     log: log.insert(posted),
-                    body: Body::Read(read),
+                    body: Ok(Body::Read(read)),
                 })
             }
             Body::Log(_) => {
                 let log = log.insert(Cow::Owned(
                     stage.prepare(posted.into_owned(), requested_count)?,
                 ));
-                let body = Body::Log(scalar(log.value()));
+                let body = Ok(Body::Log(scalar(log.value())));
                 Some(Delivery { log, body })
             }
         }
@@ -296,7 +364,12 @@ impl<'a> Update<'a> {
 impl Delivery<'_> {
     pub fn encode_dbr_into(&self, dst: &mut Vec<u8>, data_type: u16) -> crate::error::CaResult<()> {
         let log = self.log;
-        match &self.body {
+        let Ok(body) = &self.body else {
+            return Err(crate::error::CaError::GetConvertFailed(
+                "dbGet refuses the request type (S_db_badDbrtype)".into(),
+            ));
+        };
+        match body {
             Body::Log(Some(v)) => crate::types::encode_log_dbr_into(
                 dst,
                 data_type,
@@ -313,17 +386,18 @@ impl Delivery<'_> {
     /// The element count the encode carries.
     pub fn count(&self) -> u32 {
         match &self.body {
-            Body::Log(Some(v)) => v.count(),
-            Body::Log(None) => self.log.value().as_value().map_or(0, |v| v.count()),
-            Body::Read(read) => read.value.count(),
+            Ok(Body::Log(Some(v))) => v.count(),
+            Ok(Body::Log(None)) => self.log.value().as_value().map_or(0, |v| v.count()),
+            Ok(Body::Read(read)) => read.value.count(),
+            Err(GetFailed) => 0,
         }
     }
 
     /// The channel read this update encodes, if it reads one.
     pub fn read(&self) -> Option<&Snapshot> {
         match &self.body {
-            Body::Read(read) => Some(read),
-            Body::Log(_) => None,
+            Ok(Body::Read(read)) => Some(read),
+            _ => None,
         }
     }
 }
@@ -373,7 +447,7 @@ fn reads_options(data_type: u16, value: &EpicsValue) -> bool {
 /// `requested_type` request of `requested_count` elements (0 = autosize):
 /// the read chain, the post stage and the options `getOptions` takes from
 /// the record (`dbAccess.c:361-362`). rsrv's READ and the in-process CA link
-/// channel both read through it.
+/// channel both read through it. `Err` is a request type `dbGet` refuses.
 pub fn prepare_read(
     target: &ChannelTarget,
     chain: crate::server::database::filters::FilterChain,
@@ -382,7 +456,7 @@ pub fn prepare_read(
     requested_type: u16,
     requested_count: u32,
     mut snapshot: crate::server::snapshot::Snapshot,
-) -> crate::server::snapshot::Snapshot {
+) -> Result<crate::server::snapshot::Snapshot, GetFailed> {
     let (read_chain, post_chain) = chain.split();
     if !read_chain.is_empty() {
         if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
@@ -398,7 +472,15 @@ pub fn prepare_read(
     // `NativeString` is the inverse — a long-string record field
     // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
     // string so plain access ships one DBR_STRING (C cvt_dbaddr).
-    let stage = DeliveryStage::new(post_chain, long_string_mode, field_element_count);
+    let stage = DeliveryStage::new(
+        post_chain,
+        long_string_mode,
+        field_element_count,
+        requested_type,
+    );
+    if stage.refuses() {
+        return Err(GetFailed);
+    }
     if !stage.is_identity() {
         // The post chain drops nothing (`arr`, `ts`), so `None` is
         // unreachable; it keeps the value as read.
@@ -427,5 +509,5 @@ pub fn prepare_read(
             snapshot.class_name = Some(inst.record.record_type().to_string());
         }
     }
-    snapshot
+    Ok(snapshot)
 }

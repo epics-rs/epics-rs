@@ -573,7 +573,7 @@ fn cmd_aspmem() -> CommandDef {
                 ctx.println("aspmem: per-member CA-client listing is not available in this IOC");
             }
             // Group every record by its ASG field.
-            let names = ctx.block_on(ctx.db().all_record_names());
+            let names = ctx.db().all_record_names();
             let mut by_asg: std::collections::BTreeMap<String, Vec<crate::types::RecordName>> =
                 std::collections::BTreeMap::new();
             for rec_name in &names {

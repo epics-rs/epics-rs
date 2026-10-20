@@ -59,6 +59,7 @@ pub fn fatal_action() -> FatalAction {
 /// it is what gets the bytes onto a slow serial console ahead of `abort()`.
 pub fn cant_proceed(msg: &str) -> ! {
     let action = fatal_action();
+    let park = task::ForeverPark::begin();
     errlog_vprintf(format_args!("{msg}\n"));
     errlog_vprintf(format_args!(
         "CRITICAL ERROR Thread {} can't proceed, {}.\n",
@@ -77,12 +78,7 @@ pub fn cant_proceed(msg: &str) -> ! {
             errlog_flush();
             std::process::abort()
         }
-        // C loops because `epicsThreadResume` can be called on a parked
-        // thread: resuming one that cannot proceed must park it again, not let
-        // it run on.
-        FatalAction::SuspendSelf => loop {
-            task::suspend_self();
-        },
+        FatalAction::SuspendSelf => park.park(),
     }
 }
 

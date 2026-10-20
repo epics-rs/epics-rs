@@ -72,8 +72,8 @@ pub(crate) fn add_addr_to_channel_access_address_list(
 /// (`<TAB>` is a literal U+0009 in C's format string and in the output; it is
 /// spelled out here only because a tab in a doc comment is a clippy error.)
 fn bad_address(env_name: &str, token: &str) {
-    eprintln!("../iocinf.cpp: Parsing '{env_name}'");
-    eprintln!("\tBad internet address or host name: '{token}'");
+    epics_libcom_rs::stderr_println!("../iocinf.cpp: Parsing '{env_name}'");
+    epics_libcom_rs::stderr_println!("\tBad internet address or host name: '{token}'");
 }
 
 /// libcom `aToIPAddr` (`aToIPAddr.c:75-194`): `<host>` or `<host>:<port>`, where
@@ -140,7 +140,9 @@ pub(crate) fn remove_duplicate_addresses<T>(
         let addr = addr_of(&entry);
         if kept.iter().any(|k| addr_of(k) == addr) {
             // `iocinf.cpp:123-126`, byte for byte.
-            eprintln!("Warning: Duplicate EPICS CA Address list entry \"{addr}\" discarded");
+            epics_libcom_rs::stderr_println!(
+                "Warning: Duplicate EPICS CA Address list entry \"{addr}\" discarded"
+            );
             continue;
         }
         kept.push(entry);

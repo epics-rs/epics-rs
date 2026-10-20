@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
 
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
 /// C `autoConnectDevice` reconnect throttle window (asynManager.c:715).
@@ -1022,7 +1023,9 @@ impl PortDriverBase {
     /// `args` is formatted only when `mask` is enabled, onto the stack: a
     /// driver write that fails under a record's lock allocates nothing.
     /// The line goes through device 0, the device C's constructor connects
-    /// `pasynUserSelf` to (asynPortDriver.cpp:4099).
+    /// `pasynUserSelf` to (asynPortDriver.cpp:4099), and names the caller's
+    /// source line as C's macro does.
+    #[track_caller]
     pub fn trace_print(&self, mask: crate::trace::TraceMask, args: std::fmt::Arguments<'_>) {
         self.trace
             .print(Some(&self.port_name), Some(0), 0, mask, args);
@@ -1116,7 +1119,9 @@ impl PortDriverBase {
         let value = self.get_int32_param(user.reason, addr).map_err(|e| {
             param_access_error(&self.params, user, "readInt32", e, format_args!("value=0"))
         })?;
-        self.trace_io(user, "readInt32", format_args!("{value}"));
+        if self.param_status_ok(user.reason, addr) {
+            self.trace_io(user, "readInt32", format_args!("{value}"));
+        }
         Ok(value)
     }
 
@@ -1126,7 +1131,9 @@ impl PortDriverBase {
         let value = self.get_int64_param(user.reason, addr).map_err(|e| {
             param_access_error(&self.params, user, "readInt64", e, format_args!("value=0"))
         })?;
-        self.trace_io(user, "readInt64", format_args!("{value}"));
+        if self.param_status_ok(user.reason, addr) {
+            self.trace_io(user, "readInt64", format_args!("{value}"));
+        }
         Ok(value)
     }
 
@@ -1143,11 +1150,13 @@ impl PortDriverBase {
             )
         })?;
         let value = val & mask;
-        self.trace_io(
-            user,
-            "readUInt32Digital",
-            format_args!("{value}, mask={mask}"),
-        );
+        if self.param_status_ok(user.reason, addr) {
+            self.trace_io(
+                user,
+                "readUInt32Digital",
+                format_args!("{value}, mask={mask}"),
+            );
+        }
         Ok(value)
     }
 
@@ -1163,8 +1172,86 @@ impl PortDriverBase {
             };
             param_access_error(&self.params, user, "readFloat64", e, value)
         })?;
-        self.trace_io(user, "readFloat64", format_args!("{value:.6}"));
+        if self.param_status_ok(user.reason, addr) {
+            self.trace_io(user, "readFloat64", format_args!("{}", CFloat(value)));
+        }
         Ok(value)
+    }
+
+    /// Whether the parameter holds no `setParamStatus` failure. C's
+    /// `getXxxParam` returns that status beside the value (asynPortDriver.cpp:309),
+    /// and a `read*` default prints its `ASYN_TRACEIO_DRIVER` line only
+    /// without one; [`Self::param_status_read`] fails the read with it.
+    fn param_status_ok(&self, reason: usize, addr: i32) -> bool {
+        matches!(
+            self.params.get_param_status(reason, addr),
+            Ok((AsynStatus::Success, ..))
+        )
+    }
+
+    /// A read's outcome once its parameter's `setParamStatus` is applied. C's
+    /// `getXxxParam` returns that status with the value copied out
+    /// (asynPortDriver.cpp:307-309), and the read fails with both and an
+    /// `errorMessage` naming the value (:1982-1985, :2121-2124, :2261-2264,
+    /// :2510-2512, :2620-2623): here inside the octet read's own status, or as
+    /// [`AsynError::FailedRead`].
+    pub(crate) fn param_status_read(
+        &self,
+        user: &AsynUser,
+        op: &crate::request::RequestOp,
+        mut read: crate::request::RequestResult,
+        status: AsynStatus,
+    ) -> AsynResult<crate::request::RequestResult> {
+        use crate::request::RequestOp;
+        if status == AsynStatus::Success {
+            return Ok(read);
+        }
+        let message = |function: &str, value: std::fmt::Arguments<'_>| {
+            param_access_message(
+                OctetWriter::ASYN_PORT_DRIVER,
+                &self.params,
+                user,
+                function,
+                status as i32,
+                value,
+            )
+        };
+        let message = match (op, &read) {
+            (RequestOp::Int32Read, r) => r
+                .int_val
+                .map(|v| message("readInt32", format_args!("value={v}"))),
+            (RequestOp::Int64Read, r) => r
+                .int64_val
+                .map(|v| message("readInt64", format_args!("value={v}"))),
+            (RequestOp::UInt32DigitalRead { mask }, r) => r
+                .uint_val
+                .map(|v| message("readUInt32Digital", format_args!("value={v} mask={mask}"))),
+            (RequestOp::Float64Read, r) => r
+                .float_val
+                .map(|v| message("readFloat64", format_args!("value={}", CFloat(v)))),
+            (_, r) => r.octet().map(|octet| {
+                let data = octet.data();
+                let text = &data[..data.iter().position(|&c| c == 0).unwrap_or(data.len())];
+                message(
+                    "readOctet",
+                    format_args!("value={}", crate::fixed_text::LossyText(text)),
+                )
+            }),
+        }
+        // The other reads' C defaults never consult the status; a driver's
+        // own override of them that fails on it names nothing.
+        .unwrap_or_default();
+        if let Some(octet) = read.octet.take() {
+            let failed =
+                AsynError::Status { status, message }.in_octet_step(crate::error::OctetStep::Read);
+            read.octet = Some(octet.failing(failed));
+            return Ok(read);
+        }
+        Err(AsynError::FailedRead {
+            status,
+            message,
+            read: Box::new(read),
+        })
     }
 
     /// C `asynPortDriver::writeInt32`: store the value, run the callbacks for
@@ -1217,16 +1304,16 @@ impl PortDriverBase {
                 file!(),
                 line!(),
                 format_args!(
-                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}\n",
+                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={}\n",
                     e.c_status_code(),
                     user.reason,
                     self.params.param_name(user.reason).unwrap_or(""),
-                    value
+                    CFloat(value)
                 ),
             );
             return status;
         }
-        self.trace_io(user, "writeFloat64", format_args!("{value:.6}"));
+        self.trace_io(user, "writeFloat64", format_args!("{}", CFloat(value)));
         Ok(())
     }
 
@@ -2112,13 +2199,13 @@ impl PortDriverBase {
         }
     }
 
-    fn reported(
+    fn reported<T>(
         &self,
         function_name: &str,
         index: usize,
         addr: i32,
-        result: AsynResult<()>,
-    ) -> AsynResult<()> {
+        result: AsynResult<T>,
+    ) -> AsynResult<T> {
         if let Err(e) = &result {
             self.report_set_param(function_name, index, addr, e);
         }
@@ -2372,22 +2459,100 @@ impl PortDriverBase {
         self.params.set_generic_pointer(index, addr, value)
     }
 
+    /// C `setParamStatus(list, index, status)` (asynPortDriver.cpp:1132-1144).
     pub fn set_param_status(
         &mut self,
         index: usize,
         addr: i32,
         status: AsynStatus,
-        alarm_status: u16,
-        alarm_severity: u16,
     ) -> AsynResult<()> {
-        let result =
-            self.params
-                .set_param_status(index, addr, status, alarm_status, alarm_severity);
+        let result = self.params.set_status(index, addr, status);
         self.reported("setParamStatus", index, addr, result)
     }
 
-    pub fn get_param_status(&self, index: usize, addr: i32) -> AsynResult<(AsynStatus, u16, u16)> {
-        self.params.get_param_status(index, addr)
+    /// C `setParamAlarmStatus` (asynPortDriver.cpp:1188-1200).
+    pub fn set_param_alarm_status(
+        &mut self,
+        index: usize,
+        addr: i32,
+        alarm_status: u16,
+    ) -> AsynResult<()> {
+        let result = self.params.set_alarm_status(index, addr, alarm_status);
+        self.reported("setParamAlarmStatus", index, addr, result)
+    }
+
+    /// C `setParamAlarmSeverity` (asynPortDriver.cpp:1244-1256).
+    pub fn set_param_alarm_severity(
+        &mut self,
+        index: usize,
+        addr: i32,
+        alarm_severity: u16,
+    ) -> AsynResult<()> {
+        let result = self.params.set_alarm_severity(index, addr, alarm_severity);
+        self.reported("setParamAlarmSeverity", index, addr, result)
+    }
+
+    /// C `getParamStatus` (asynPortDriver.cpp:1160-1172), which reports its
+    /// failure through reportSetParamErrors as the setters do.
+    pub fn get_param_status(&self, index: usize, addr: i32) -> AsynResult<AsynStatus> {
+        let result = self.params.get_param_status(index, addr);
+        self.reported("getParamStatus", index, addr, result.map(|(s, ..)| s))
+    }
+
+    /// C `getParamAlarmStatus` (asynPortDriver.cpp:1216-1228).
+    pub fn get_param_alarm_status(&self, index: usize, addr: i32) -> AsynResult<u16> {
+        let result = self.params.get_param_status(index, addr);
+        self.reported(
+            "getParamAlarmStatus",
+            index,
+            addr,
+            result.map(|(_, a, _)| a),
+        )
+    }
+
+    /// C `getParamAlarmSeverity` (asynPortDriver.cpp:1272-1284).
+    pub fn get_param_alarm_severity(&self, index: usize, addr: i32) -> AsynResult<u16> {
+        let result = self.params.get_param_status(index, addr);
+        self.reported(
+            "getParamAlarmSeverity",
+            index,
+            addr,
+            result.map(|(.., v)| v),
+        )
+    }
+
+    /// The C `setXxxParam` / `setParam*Status` call one update stands for.
+    pub fn set_param(&mut self, update: &crate::request::ParamSetValue) -> AsynResult<()> {
+        use crate::request::ParamSetValue as P;
+        match *update {
+            P::Value {
+                reason,
+                addr,
+                ref value,
+            } => self.set_param_value(reason, addr, value.clone()),
+            P::UInt32Digital {
+                reason,
+                addr,
+                value,
+                mask,
+                interrupt_mask,
+            } => self.set_uint32_param(reason, addr, value, mask, interrupt_mask),
+            P::Status {
+                reason,
+                addr,
+                status,
+            } => self.set_param_status(reason, addr, status),
+            P::AlarmStatus {
+                reason,
+                addr,
+                alarm_status,
+            } => self.set_param_alarm_status(reason, addr, alarm_status),
+            P::AlarmSeverity {
+                reason,
+                addr,
+                alarm_severity,
+            } => self.set_param_alarm_severity(reason, addr, alarm_severity),
+        }
     }
 
     /// C `asynPortDriver::reportParams` (asynPortDriver.cpp:1799-1809) — the
@@ -2866,15 +3031,26 @@ fn param_access_error_by(
     ) {
         return e;
     }
-    let message = format!(
-        "{}:{function}: status={}, function={}, {}={}, {value}",
+    let message = param_access_message(writer, params, user, function, e.c_status_code(), value);
+    e.in_param_access(message)
+}
+
+/// `"<driver>:<function>: status=%d, function=%d, name=%s, <value>"`.
+fn param_access_message(
+    writer: OctetWriter,
+    params: &crate::param::ParamList,
+    user: &AsynUser,
+    function: &str,
+    status: i32,
+    value: std::fmt::Arguments<'_>,
+) -> String {
+    format!(
+        "{}:{function}: status={status}, function={}, {}={}, {value}",
         writer.driver,
-        e.c_status_code(),
         user.reason,
         writer.name_key,
         params.param_name(user.reason).unwrap_or(""),
-    );
-    e.in_param_access(message)
+    )
 }
 
 /// C's `writeArray` template default (asynPortDriver.cpp:1820-1826): a port
@@ -3157,11 +3333,13 @@ pub trait PortDriver: Any + Send + Sync {
         let n = text.len().min(room);
         buf[..n].copy_from_slice(&text[..n]);
         buf[n] = 0;
-        base.trace_io(
-            user,
-            "readOctet",
-            format_args!("{}", crate::fixed_text::LossyText(&buf[..n])),
-        );
+        if base.param_status_ok(user.reason, addr) {
+            base.trace_io(
+                user,
+                "readOctet",
+                format_args!("{}", crate::fixed_text::LossyText(&buf[..n])),
+            );
+        }
         OctetReadResult::ok(n + 1, EomReason::END)
     }
 
@@ -3434,7 +3612,7 @@ pub trait PortDriver: Any + Send + Sync {
         // "not implemented" for every length, exactly as its Fail stub does,
         // and a layer that owns the terminator refuses an illegal one without
         // storing it.
-        match base.interpose_octet.set_input_eos(addr, eos) {
+        match base.interpose_octet.set_input_eos(user, eos) {
             EosSet::NotTaken => return Err(eos_not_implemented(&port, "setInputEos")),
             EosSet::IllegalLength => return Err(illegal_eoslen(&port, eos.len())),
             EosSet::Stored => {}
@@ -3448,7 +3626,7 @@ pub trait PortDriver: Any + Send + Sync {
     fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
         let base = self.base();
         base.interpose_octet
-            .input_eos(user.addr)
+            .input_eos(user)
             .ok_or_else(|| eos_not_implemented(&base.port_name, "getInputEos"))
     }
 
@@ -3461,7 +3639,7 @@ pub trait PortDriver: Any + Send + Sync {
         let addr = user.addr;
         let port = self.base().port_name.clone();
         let base = self.base_mut();
-        match base.interpose_octet.set_output_eos(addr, eos) {
+        match base.interpose_octet.set_output_eos(user, eos) {
             EosSet::NotTaken => return Err(eos_not_implemented(&port, "setOutputEos")),
             EosSet::IllegalLength => return Err(illegal_eoslen(&port, eos.len())),
             EosSet::Stored => {}
@@ -3475,7 +3653,7 @@ pub trait PortDriver: Any + Send + Sync {
     fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
         let base = self.base();
         base.interpose_octet
-            .output_eos(user.addr)
+            .output_eos(user)
             .ok_or_else(|| eos_not_implemented(&base.port_name, "getOutputEos"))
     }
 
@@ -4226,7 +4404,7 @@ pub(crate) mod tests {
         // changed but it stays undefined.
         drv.base_mut()
             .params
-            .set_param_status(0, 0, AsynStatus::Error, 0, 0)
+            .set_status(0, 0, AsynStatus::Error)
             .unwrap();
         // Mark the never-set array param changed: an override-served trigger.
         drv.base_mut().mark_param_changed(arr, 0).unwrap();
@@ -4297,10 +4475,11 @@ pub(crate) mod tests {
         let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 99).unwrap();
-        drv.base_mut()
-            .params
-            .set_param_status(0, 0, crate::error::AsynStatus::Timeout, 4, 2)
+        let base = drv.base_mut();
+        base.set_param_status(0, 0, crate::error::AsynStatus::Timeout)
             .unwrap();
+        base.set_param_alarm_status(0, 0, 4).unwrap();
+        base.set_param_alarm_severity(0, 0, 2).unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
 
         let iv = rx.try_recv().unwrap();
@@ -4317,10 +4496,11 @@ pub(crate) mod tests {
         let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         drv.base_mut().set_int32_param(0, 0, 1).unwrap();
-        drv.base_mut()
-            .params
-            .set_param_status(0, 0, crate::error::AsynStatus::Disconnected, 7, 3)
+        let base = drv.base_mut();
+        base.set_param_status(0, 0, crate::error::AsynStatus::Disconnected)
             .unwrap();
+        base.set_param_alarm_status(0, 0, 7).unwrap();
+        base.set_param_alarm_severity(0, 0, 3).unwrap();
         drv.base_mut().call_param_callback(0, 0).unwrap();
 
         let iv = rx.try_recv().unwrap();
@@ -6505,6 +6685,81 @@ pub(crate) mod tests {
         assert_eq!(log.lines().count(), 4, "{log:?}");
     }
 
+    /// Each of C's three status setters and getters prints its own
+    /// reportSetParamErrors line (asynPortDriver.cpp:1099-1115, :1142, :1170,
+    /// :1198, :1226, :1254, :1282), so a bad index costs one line per call.
+    #[test]
+    fn each_param_status_setter_reports_under_its_own_name() {
+        use crate::request::ParamSetValue;
+        use crate::trace::{TraceFile, TraceMask};
+
+        let services = crate::services::PortServices::new();
+        let mut base = PortDriverBase::new(
+            "tstat",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("tstat", true);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("tstat.log");
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("tstat"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("tstat"), TraceMask::ERROR);
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+
+        for update in [
+            ParamSetValue::status(9, 0, AsynStatus::Error),
+            ParamSetValue::alarm_status(9, 0, 7),
+            ParamSetValue::alarm_severity(9, 0, 3),
+            ParamSetValue::status(val, 1, AsynStatus::Error),
+        ] {
+            assert!(base.set_param(&update).is_err());
+        }
+        assert!(base.get_param_status(9, 0).is_err());
+        assert!(base.get_param_alarm_status(9, 0).is_err());
+        assert!(base.get_param_alarm_severity(9, 0).is_err());
+
+        // An alarm-only set leaves the parameter's status alone, as C's
+        // setParamAlarmStatus/Severity do.
+        base.set_param_status(val, 0, AsynStatus::Timeout).unwrap();
+        base.set_param_alarm_status(val, 0, 7).unwrap();
+        base.set_param_alarm_severity(val, 0, 3).unwrap();
+        assert_eq!(base.get_param_status(val, 0).unwrap(), AsynStatus::Timeout);
+        assert_eq!(base.get_param_alarm_status(val, 0).unwrap(), 7);
+        assert_eq!(base.get_param_alarm_severity(val, 0).unwrap(), 3);
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        // Past the trace's date and time.
+        let lines: Vec<&str> = log
+            .lines()
+            .map(|l| l.splitn(3, ' ').nth(2).unwrap())
+            .collect();
+        let line = |f: &str, index: i32, list: i32, why: &str| {
+            format!(
+                "asynPortDriver:{f}: port=tstat error setting parameter {index} in list {list}, {why}"
+            )
+        };
+        assert_eq!(
+            lines,
+            [
+                line("setParamStatus", 9, 0, "bad index"),
+                line("setParamAlarmStatus", 9, 0, "bad index"),
+                line("setParamAlarmSeverity", 9, 0, "bad index"),
+                line("setParamStatus", 0, 1, "invalid list"),
+                line("getParamStatus", 9, 0, "bad index"),
+                line("getParamAlarmStatus", 9, 0, "bad index"),
+                line("getParamAlarmSeverity", 9, 0, "bad index"),
+            ]
+        );
+    }
+
     /// `trace_print` formats nothing while its mask is off, and with it on
     /// writes the one line.
     #[test]
@@ -6593,6 +6848,39 @@ pub(crate) mod tests {
         );
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log, format!("[tpat,2,7] [port.rs:{line}] caller\n"));
+    }
+
+    /// `trace_print` is C's `asynPrint(pasynUserSelf, …)`, whose macro passes
+    /// the driver's `__FILE__`/`__LINE__` (asynDriver.h:296-306).
+    #[test]
+    fn trace_print_names_its_caller() {
+        use crate::trace::{TraceFile, TraceInfoMask, TraceMask};
+
+        let services = crate::services::PortServices::new();
+        let mut base = PortDriverBase::new(
+            "tpsrc",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("tpsrc", false);
+        trace.set_trace_mask(Some("tpsrc"), TraceMask::ERROR);
+        trace.set_trace_info_mask(Some("tpsrc"), TraceInfoMask::SOURCE);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("tpsrc.log");
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("tpsrc"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+
+        let line = line!() + 1;
+        base.trace_print(TraceMask::ERROR, format_args!("self\n"));
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log, format!("[port.rs:{line}] self\n"));
     }
 
     /// `trace_write_at` writes a reply's bytes as they are, where a

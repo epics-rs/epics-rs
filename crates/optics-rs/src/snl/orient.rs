@@ -7,6 +7,7 @@
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::snl::{PutQueue, SeqPv};
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 use crate::math::matrix3::{IDENTITY, Mat3, Vec3, invert};
@@ -1286,7 +1287,12 @@ impl Orient {
             if self.conn.motors.load(Ordering::Relaxed) {
                 if self.debug() {
                     let [h, k, l] = self.hkl();
-                    println!("putAll:newMotors: H={h:8.4}, K={k:8.4}, L={l:8.4}");
+                    println!(
+                        "putAll:newMotors: H={:8.4}, K={:8.4}, L={:8.4}",
+                        CFloat(h),
+                        CFloat(k),
+                        CFloat(l)
+                    );
                 }
                 for (i, a) in AXES.iter().enumerate() {
                     let angle = self.get(a);
@@ -1294,8 +1300,9 @@ impl Orient {
                         if self.debug() {
                             let mot = format!("mot{a}");
                             println!(
-                                "putAll:newMotors: {a:>3}={angle:8.4}, {mot:>6}={:8.4}",
-                                self.mot(i)
+                                "putAll:newMotors: {a:>3}={:8.4}, {mot:>6}={:8.4}",
+                                CFloat(angle),
+                                CFloat(self.mot(i))
                             );
                         }
                         self.put_l(&format!("weWrote_mot{a}"), 1).await;

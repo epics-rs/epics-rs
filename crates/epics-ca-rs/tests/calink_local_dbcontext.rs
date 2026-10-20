@@ -7,8 +7,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::server::database::{LinkPutOp, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, PvDatabase};
 use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::record::{OpenLatch, ParsedLink};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver, register_calink_commands};
 use serial_test::serial;
@@ -67,6 +68,14 @@ fn sevr(db: &PvDatabase, name: &str) -> u16 {
     inst.common.sevr as u16
 }
 
+/// `record`'s held `field` link.
+fn held(db: &PvDatabase, record: &str, field: &str) -> ParsedLink {
+    db.record_link_fields(record)
+        .into_iter()
+        .find_map(|(f, _, link)| (f == field).then_some(link))
+        .expect("a link field")
+}
+
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !done() {
@@ -87,9 +96,11 @@ async fn a_ca_link_to_a_local_record_connects_with_no_server_reachable() {
          record(ai, \"RPRO:A\") { field(INP, \"RPRO:B CA\") }\n",
         |db, resolver| async move {
             let ca = db.link_set("ca").await.expect("ca entry");
-            ca.connect_link(b"RPRO:B", None).await;
+            // RPRO:A's own link, opened by iocInit's `dbCaAddLink`.
+            let inp = held(&db, "RPRO:A", "INP");
+            let link = LinkRef::new(b"RPRO:B", inp.external().unwrap().open);
             until("the local CA link never connected", || {
-                ca.is_connected(b"RPRO:B")
+                ca.is_connected(link)
             })
             .await;
             db.process_record("RPRO:A").await.expect("process RPRO:A");
@@ -116,8 +127,10 @@ async fn a_local_ca_link_follows_the_source_through_the_in_process_monitor() {
         "record(ai, \"LMON:SRC\") { field(VAL, \"1\") }\n",
         |db, resolver| async move {
             let ca = db.link_set("ca").await.expect("ca entry");
-            ca.connect_link(b"LMON:SRC", None).await;
-            let value = || ca.get_cached_value(b"LMON:SRC").and_then(|v| v.to_f64());
+            let open = OpenLatch::default();
+            let link = LinkRef::new(b"LMON:SRC", &open);
+            ca.connect_link(link, None).await;
+            let value = || ca.get_cached_value(link).and_then(|v| v.to_f64());
             until("the first event never arrived", || value() == Some(1.0)).await;
             for v in [7.0, 11.0] {
                 db.put_pv_and_post("LMON:SRC", EpicsValue::Double(v))
@@ -140,11 +153,18 @@ async fn a_local_ca_put_writes_the_target_plain_and_with_callback() {
         "record(ao, \"LPUT:TGT\") { field(VAL, \"0\") }\n",
         |db, resolver| async move {
             let ca = db.link_set("ca").await.expect("ca entry");
-            ca.put_value(b"LPUT:TGT", EpicsValue::Double(3.0), LinkPutOp::Plain)
+            let open = OpenLatch::default();
+            let link = LinkRef::new(b"LPUT:TGT", &open);
+            ca.connect_link(link, None).await;
+            until("the local CA link never connected", || {
+                ca.is_connected(link)
+            })
+            .await;
+            ca.put_value(link, EpicsValue::Double(3.0), LinkPutOp::Plain)
                 .await
                 .expect("plain put");
             assert_eq!(val(&db, "LPUT:TGT"), Some(3.0));
-            ca.put_value(b"LPUT:TGT", EpicsValue::Double(9.0), LinkPutOp::Async)
+            ca.put_value(link, EpicsValue::Double(9.0), LinkPutOp::Async)
                 .await
                 .expect("put callback");
             assert_eq!(val(&db, "LPUT:TGT"), Some(9.0));
@@ -156,8 +176,7 @@ async fn a_local_ca_put_writes_the_target_plain_and_with_callback() {
 
 /// A CP link put on `RL:H` after iocRun, to a name `RL:HP`'s link already
 /// serves: C opens the new link its own `caLink`, whose first event
-/// processes `RL:H` once (`dbCa.c:958-962`). The port shares the channel,
-/// so that process is requested for `RL:H` alone.
+/// processes `RL:H` once (`dbCa.c:958-962`).
 #[epics_macros_rs::epics_test]
 #[serial(epics_env)]
 async fn a_cp_link_added_to_a_served_name_processes_its_holder_once() {

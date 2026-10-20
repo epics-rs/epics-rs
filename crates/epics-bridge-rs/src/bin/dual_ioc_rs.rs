@@ -71,7 +71,9 @@ fn parse_macros(raw: &[String]) -> HashMap<String, String> {
         if let Some((k, v)) = kv.split_once('=') {
             out.insert(k.trim().to_string(), v.trim().to_string());
         } else {
-            eprintln!("warning: --macro expects KEY=VAL, got {kv:?}; skipping");
+            epics_base_rs::stderr_println!(
+                "warning: --macro expects KEY=VAL, got {kv:?}; skipping"
+            );
         }
     }
     out
@@ -126,7 +128,7 @@ async fn main() -> ExitCode {
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
     epics_base_rs::runtime::task::block_on_sync(run()).unwrap_or_else(|e| {
-        eprintln!("dual-ioc-rs: {e}");
+        epics_base_rs::stderr_println!("dual-ioc-rs: {e}");
         ExitCode::FAILURE
     })
 }
@@ -141,12 +143,12 @@ async fn run() -> ExitCode {
 
     let args = Args::parse();
     if args.no_ca && args.no_pva {
-        eprintln!("error: --no-ca and --no-pva are mutually exclusive");
+        epics_base_rs::stderr_println!("error: --no-ca and --no-pva are mutually exclusive");
         return ExitCode::from(2);
     }
 
     if args.pvs.is_empty() && args.db_files.is_empty() {
-        eprintln!("error: at least one --pv or --db is required");
+        epics_base_rs::stderr_println!("error: at least one --pv or --db is required");
         return ExitCode::from(2);
     }
 
@@ -173,7 +175,7 @@ async fn run() -> ExitCode {
                 builder = builder.pv(&name, value);
             }
             Err(e) => {
-                eprintln!("error parsing --pv {pv_def:?}: {e}");
+                epics_base_rs::stderr_println!("error parsing --pv {pv_def:?}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -185,7 +187,7 @@ async fn run() -> ExitCode {
         builder = match builder.db_file(&path_str, &macros) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("error loading {}: {e}", db_path.display());
+                epics_base_rs::stderr_println!("error loading {}: {e}", db_path.display());
                 return ExitCode::from(2);
             }
         };
@@ -214,7 +216,7 @@ async fn run() -> ExitCode {
     let mut ioc = match builder.build_ioc().await {
         Ok(ioc) => ioc,
         Err(e) => {
-            eprintln!("error building IOC: {e}");
+            epics_base_rs::stderr_println!("error building IOC: {e}");
             return ExitCode::from(2);
         }
     };
@@ -250,7 +252,7 @@ async fn run() -> ExitCode {
         {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("error binding CA server on port {ca_port}: {e}");
+                epics_base_rs::stderr_println!("error binding CA server on port {ca_port}: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -276,7 +278,7 @@ async fn run() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("dual-ioc-rs: {e}");
+            epics_base_rs::stderr_println!("dual-ioc-rs: {e}");
             ExitCode::FAILURE
         }
     }

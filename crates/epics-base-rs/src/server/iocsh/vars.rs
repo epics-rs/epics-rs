@@ -12,7 +12,7 @@
 //! # What a softIoc has here that this table does not
 //!
 //! Measured on `softIoc` R7.0.10: a bare `var` lists 24 names, and the
-//! same command here lists 13, twelve of which are C's. The 24 arrive by
+//! same command here lists 14, thirteen of which are C's. The 24 arrive by
 //! two routes —
 //! `registerAllRecordDeviceDrivers.cpp` copies the 22 `variable()` lines
 //! of `softIoc.dbd` into the iocsh table, and `libComRegister.c:518-520`
@@ -22,24 +22,24 @@
 //! either implements with the default hard-wired or does not have at all.
 //! Each of the 24, with its reason:
 //!
-//! **Registered here (12).** `asCheckClientIP`, from
+//! **Registered here (13).** `asCheckClientIP`, from
 //! `access_commands`; `dbRecordsOnceOnly` and `dbQuietMacroWarnings`,
-//! from `commands`; and the nine knobs `seeded_knobs` seeds:
+//! from `commands`; and the ten knobs `seeded_knobs` seeds:
 //! `boHIGHlimit`, `boHIGHprecision`, `calcoutODLYlimit`,
 //! `calcoutODLYprecision`, `histogramSDELprecision`, `seqDLYlimit`,
-//! `seqDLYprecision`, `callbackParallelThreadsDefault` and
-//! `dbTemplateMaxVars`. All nine were a `const` or a computing function
-//! until they were registered; a name in this table has to reach a global
+//! `seqDLYprecision`, `callbackParallelThreadsDefault`,
+//! `dbTemplateMaxVars` and `dbAccessDebugPUTF`. The first nine were a
+//! `const` or a computing function until they were registered; a name in this table has to reach a global
 //! something actually reads, or `var seqDLYlimit 5000` lists and echoes a
 //! value nothing uses, which looks like it worked. Three of them are C
 //! `double`s, which is what
 //! [`crate::server::iocsh::vars::VarAccess::Double`] is for.
 //!
-//! **C `printf` debug switches with no counterpart here (7).**
+//! **C `printf` debug switches with no counterpart here (6).**
 //! `asCaDebug` (`asCa.c:102`), `atExitDebug` (`epicsExit.c:91`),
-//! `CASDEBUG` (`camessage.c:328`), `dbAccessDebugPUTF`
-//! (`dbAccess.c:1269`), `dbJLinkDebug` (`dbJLink.c:33`), `lnkDebug_debug`
-//! (`lnkDebug.c:33`), `logClientDebug` (`logClient.c:73`). Every one
+//! `CASDEBUG` (`camessage.c:328`), `dbJLinkDebug` (`dbJLink.c:33`),
+//! `lnkDebug_debug` (`lnkDebug.c:33`), `logClientDebug` (`logClient.c:73`).
+//! Every one
 //! guards `printf`/`errlogPrintf` statements in its own C file, and this
 //! port carries no equivalent statements for the knob to switch on.
 //!
@@ -55,7 +55,7 @@
 //! workspace calls `mlockall`. `freeListBypass` — it turns off the
 //! recycling pool in `freeListLib.c:61`, which Rust allocation replaces.
 //!
-//! # The thirteenth, which C's 24 do not include
+//! # The fourteenth, which C's 24 do not include
 //!
 //! `scanParallelThreadsDefault`. `dbCore.dbd:33` declares it on the
 //! parallel-scan branch this port tracks (epics-base #998) and R7.0.10
@@ -106,8 +106,9 @@ static VARIABLES: LazyLock<Mutex<BTreeMap<&'static str, VarDef>>> = LazyLock::ne
 /// The knobs C registers from a `.dbd` `variable()` line rather than from
 /// a C file — seven out of the record `.dbd`s via the generated
 /// `<app>_registerRecordDeviceDriver` (`registerRecordDeviceDriver.pl:270`)
-/// and `callbackParallelThreadsDefault` and `scanParallelThreadsDefault`
-/// out of `dbCore.dbd:32-33`.
+/// and `dbAccessDebugPUTF`, `dbTemplateMaxVars`,
+/// `callbackParallelThreadsDefault` and `scanParallelThreadsDefault` out of
+/// `dbCore.dbd:26-33`.
 /// This port resolves its vendored `.dbd`s at build time and has no such
 /// runtime registrar to hang them off, so the table is born holding them;
 /// that is what keeps it and
@@ -163,6 +164,16 @@ fn seeded_knobs() -> Vec<VarDef> {
             access: VarAccess::Int {
                 get: || crate::server::db_loader::db_template_max_vars() as i64,
                 set: |value| crate::server::db_loader::set_db_template_max_vars(value as i32),
+            },
+        },
+        // C `dbAccessDebugPUTF` — `dbCore.dbd:26`, an `int` global
+        // (`dbAccess.c:69`) that a put-driven process reads when it defers
+        // a TPRO record to RPRO.
+        VarDef {
+            name: "dbAccessDebugPUTF",
+            access: VarAccess::Int {
+                get: || crate::server::database::db_access_debug_putf() as i64,
+                set: |value| crate::server::database::set_db_access_debug_putf(value as i32),
             },
         },
         VarDef {

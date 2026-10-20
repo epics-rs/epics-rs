@@ -4,10 +4,13 @@
 //! Builds the group/dataset tree from a user XML file (`HDF5_layoutFilename`),
 //! mirroring `XML_schema/hdf5_xml_layout_schema.xsd`.
 //!
-//! The parser is hand-written in the same focused-parser style as
-//! `ad-core-rs` `read_nd_attributes_file` — no external XML crate dependency.
+//! `xml` reads the document as C's libxml2 does; no external XML crate
+//! dependency.
 
+use std::borrow::Cow;
 use std::fmt;
+
+mod xml;
 
 /// Data source kind for a layout node (schema `dsetSourceEnum`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,22 +45,23 @@ impl LayoutDataType {
     }
 }
 
-/// When a constant/attribute value is written (schema `when` enum).
+/// When an NDAttribute value is written: C `hdf5::When_t`
+/// (NDFileHDF5Layout.h:21-25).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutWhen {
     OnFileOpen,
     OnFileClose,
-    OnFileWrite,
     /// Default — written per frame.
     OnFrame,
 }
 
 impl LayoutWhen {
+    /// C knows only these two names; any other `when` is `OnFrame`
+    /// (NDFileHDF5LayoutXML.cpp:401-405, :568-572).
     fn parse(s: &str) -> LayoutWhen {
         match s {
             "OnFileOpen" => LayoutWhen::OnFileOpen,
             "OnFileClose" => LayoutWhen::OnFileClose,
-            "OnFileWrite" => LayoutWhen::OnFileWrite,
             _ => LayoutWhen::OnFrame,
         }
     }
@@ -110,6 +114,15 @@ pub struct LayoutDataset {
     pub attributes: Vec<LayoutAttribute>,
 }
 
+impl LayoutDataset {
+    /// The dataset's `<attribute source="constant">` nodes.
+    pub fn constant_attributes(&self) -> impl Iterator<Item = &LayoutAttribute> {
+        self.attributes
+            .iter()
+            .filter(|a| a.source == LayoutSource::Constant)
+    }
+}
+
 /// A `<hardlink>` element.
 #[derive(Debug, Clone)]
 pub struct LayoutHardlink {
@@ -130,6 +143,27 @@ pub struct LayoutGroup {
 }
 
 impl LayoutGroup {
+    /// C keeps a group's children in `std::map`s keyed by name
+    /// (NDFileHDF5Layout.h:130, :251-253), so every walk and first-match
+    /// lookup over them runs in name order.
+    fn sort_like_c(&mut self) {
+        self.attributes.sort_by(|a, b| a.name.cmp(&b.name));
+        self.datasets.sort_by(|a, b| a.name.cmp(&b.name));
+        for d in &mut self.datasets {
+            d.attributes.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        self.hardlinks.sort_by(|a, b| a.name.cmp(&b.name));
+        self.groups.sort_by(|a, b| a.name.cmp(&b.name));
+        for g in &mut self.groups {
+            g.sort_like_c();
+        }
+    }
+
+    /// C `Group::name_exist` (NDFileHDF5Layout.cpp:615-625).
+    fn name_exist(&self, name: &str) -> bool {
+        self.datasets.iter().any(|d| d.name == name) || self.groups.iter().any(|g| g.name == name)
+    }
+
     fn new(name: String, ndattr_default: bool) -> Self {
         Self {
             name,
@@ -143,12 +177,25 @@ impl LayoutGroup {
 }
 
 /// The parsed HDF5 layout tree (`<hdf5_layout>` root).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Hdf5Layout {
     /// Top-level groups.
     pub groups: Vec<LayoutGroup>,
     /// `<global name="detector_data_destination" ndattribute="..."/>`.
     pub detector_data_destination: Option<String>,
+    /// The root's `auto_ndattr_default`: only `"false"` clears it
+    /// (NDFileHDF5LayoutXML.cpp:440-460).
+    pub auto_ndattr_default: bool,
+}
+
+impl Default for Hdf5Layout {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            detector_data_destination: None,
+            auto_ndattr_default: true,
+        }
+    }
 }
 
 /// Error from layout XML parsing.
@@ -173,25 +220,39 @@ impl Hdf5Layout {
 
     /// Load the layout an XMLFileName names, inline or from disk.
     pub fn load(spec: &str) -> Result<Hdf5Layout, LayoutError> {
+        Self::from_bytes(&Self::read_spec(spec)?)
+    }
+
+    /// C `verifyLayoutXMLFile`'s check of an XMLFileName: libxml
+    /// well-formedness only, so a document that is no layout passes.
+    pub fn verify(spec: &str) -> Result<(), LayoutError> {
+        xml::check(&Self::read_spec(spec)?)
+    }
+
+    fn read_spec(spec: &str) -> Result<Cow<'_, [u8]>, LayoutError> {
         if Self::is_inline(spec) {
-            Self::parse(spec)
-        } else {
-            Self::from_file(std::path::Path::new(spec))
+            return Ok(Cow::Borrowed(spec.as_bytes()));
         }
+        std::fs::read(spec)
+            .map(Cow::Owned)
+            .map_err(|e| LayoutError(format!("cannot read layout file: {}", e)))
     }
 
     /// Parse a layout XML file from disk.
     pub fn from_file(path: &std::path::Path) -> Result<Hdf5Layout, LayoutError> {
-        let text = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
             .map_err(|e| LayoutError(format!("cannot read layout file: {}", e)))?;
-        Self::parse(&text)
+        Self::from_bytes(&bytes)
     }
 
     /// Parse a layout XML document from a string.
     pub fn parse(text: &str) -> Result<Hdf5Layout, LayoutError> {
-        let tokens = tokenize(text)?;
-        let mut parser = Parser { tokens, pos: 0 };
-        parser.parse_document()
+        Self::from_bytes(text.as_bytes())
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Hdf5Layout, LayoutError> {
+        let tokens = xml::parse(bytes)?;
+        Parser { tokens, pos: 0 }.parse_document()
     }
 
     /// Walk every dataset in the tree, yielding `(full_group_path, dataset)`.
@@ -234,7 +295,7 @@ impl Hdf5Layout {
     }
 
     /// Enumerate every detector-source dataset's full path (leading slash), in
-    /// document order. C `NDFileHDF5` holds one `NDFileHDF5Dataset` per
+    /// tree order. C `NDFileHDF5` holds one `NDFileHDF5Dataset` per
     /// `<dataset source="detector">` node in `detDataMap`, each created by
     /// `createDatasetDetector` (NDFileHDF5.cpp:1324-1357) and keyed by
     /// `get_full_name()` — the same leading-slash full path produced here. The
@@ -265,21 +326,28 @@ impl Hdf5Layout {
 
     /// Find the layout `<dataset source="ndattribute" ndattribute="name">`
     /// declared for the NDAttribute `name`, returning `(parent group full path,
-    /// dataset name)`. C `find_dset_ndattr` (NDFileHDF5.cpp:2792) routes a
-    /// matching NDAttribute into its XML-declared dataset/group instead of the
-    /// default attribute group.
-    pub fn ndattribute_dataset(&self, name: &str) -> Option<(String, String)> {
-        let mut found = None;
-        self.for_each_dataset(|path, d| {
-            if found.is_none() && d.source == LayoutSource::NdAttribute && d.ndattribute == name {
-                found = Some((path.to_string(), d.name.clone()));
-            }
-        });
-        found
+    /// dataset)`, first in [`Self::for_each_dataset`] order. C
+    /// `find_dset_ndattr` (NDFileHDF5.cpp:2792) routes a matching NDAttribute
+    /// into its XML-declared dataset/group instead of the default attribute
+    /// group.
+    pub fn ndattribute_dataset(&self, name: &str) -> Option<(String, &LayoutDataset)> {
+        fn find<'a>(
+            g: &'a LayoutGroup,
+            path: &str,
+            name: &str,
+        ) -> Option<(String, &'a LayoutDataset)> {
+            let here = format!("{}/{}", path, g.name);
+            g.datasets
+                .iter()
+                .find(|d| d.source == LayoutSource::NdAttribute && d.ndattribute == name)
+                .map(|d| (here.clone(), d))
+                .or_else(|| g.groups.iter().find_map(|sub| find(sub, &here, name)))
+        }
+        self.groups.iter().find_map(|g| find(g, "", name))
     }
 
     /// Enumerate every `<attribute source="ndattribute">` declared on a group
-    /// or dataset in the tree, in document order, with the owning element's
+    /// or dataset in the tree, in tree order, with the owning element's
     /// full path. C `storeOnOpenCloseAttribute` (NDFileHDF5.cpp:553-632) writes
     /// each as an HDF5 attribute on its element, sourcing the value from the
     /// live NDAttribute (`get_attributes()` over groups *and* datasets).
@@ -349,10 +417,40 @@ impl Hdf5Layout {
         }
         None
     }
+
+    /// Where C puts an NDAttribute dataset the layout does not declare: the
+    /// `ndattr_default` group, else the file root (`""`) unless
+    /// `auto_ndattr_default` is false (NDFileHDF5.cpp:2766-2782).
+    pub fn ndattr_home(&self) -> Option<String> {
+        self.ndattr_default_group()
+            .or_else(|| self.auto_ndattr_default.then(String::new))
+    }
+
+    /// C `createPerformanceDataset`'s group (NDFileHDF5.cpp:2603-2632): the
+    /// parent of the layout's `timestamp` dataset when that group is named
+    /// `performance` and the dataset is not ndattribute-sourced, else
+    /// [`Self::ndattr_home`].
+    pub fn performance_group(&self) -> Option<String> {
+        let mut found = None;
+        self.for_each_dataset(|path, d| {
+            if d.name == "timestamp" && found.is_none() {
+                found = Some((path.to_string(), d.source));
+            }
+        });
+        match found {
+            Some((path, source))
+                if path.rsplit('/').next() == Some("performance")
+                    && source != LayoutSource::NdAttribute =>
+            {
+                Some(path)
+            }
+            _ => self.ndattr_home(),
+        }
+    }
 }
 
 // ===========================================================================
-// Tokenizer
+// Tokens
 // ===========================================================================
 
 #[derive(Debug, Clone)]
@@ -365,143 +463,6 @@ enum Token {
     },
     /// `</tag>`.
     Close(String),
-}
-
-/// Tokenize an XML document into element open/close tokens. Text content,
-/// comments, processing instructions and the prolog are discarded — the
-/// layout schema has no text-bearing elements.
-fn tokenize(text: &str) -> Result<Vec<Token>, LayoutError> {
-    let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        // Comment <!-- ... -->
-        if text[i..].starts_with("<!--") {
-            match text[i..].find("-->") {
-                Some(end) => {
-                    i += end + 3;
-                    continue;
-                }
-                None => return Err(LayoutError("unterminated XML comment".into())),
-            }
-        }
-        // Processing instruction / declaration <? ... ?>  or  <! ... >
-        if text[i..].starts_with("<?") || text[i..].starts_with("<!") {
-            match text[i..].find('>') {
-                Some(end) => {
-                    i += end + 1;
-                    continue;
-                }
-                None => return Err(LayoutError("unterminated XML declaration".into())),
-            }
-        }
-        // Find the matching '>'
-        let close = text[i..]
-            .find('>')
-            .ok_or_else(|| LayoutError("unterminated XML tag".into()))?;
-        let inner = &text[i + 1..i + close];
-        i += close + 1;
-
-        let inner_trim = inner.trim();
-        if let Some(rest) = inner_trim.strip_prefix('/') {
-            tokens.push(Token::Close(rest.trim().to_string()));
-            continue;
-        }
-        let self_closing = inner_trim.ends_with('/');
-        let body = if self_closing {
-            inner_trim[..inner_trim.len() - 1].trim()
-        } else {
-            inner_trim
-        };
-        let (name, attrs) = parse_tag_body(body)?;
-        tokens.push(Token::Open {
-            name,
-            attrs,
-            self_closing,
-        });
-    }
-    Ok(tokens)
-}
-
-/// Parse `name attr="val" attr2='val2'` into a name and attribute list.
-fn parse_tag_body(body: &str) -> Result<(String, Vec<(String, String)>), LayoutError> {
-    let chars: Vec<char> = body.chars().collect();
-    let mut idx = 0;
-    // Element name
-    let name_start = idx;
-    while idx < chars.len() && !chars[idx].is_whitespace() {
-        idx += 1;
-    }
-    let name: String = chars[name_start..idx].iter().collect();
-    if name.is_empty() {
-        return Err(LayoutError("empty XML tag name".into()));
-    }
-    let mut attrs = Vec::new();
-    loop {
-        while idx < chars.len() && chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        if idx >= chars.len() {
-            break;
-        }
-        // attribute name up to '='
-        let attr_start = idx;
-        while idx < chars.len() && chars[idx] != '=' && !chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        let attr_name: String = chars[attr_start..idx].iter().collect();
-        while idx < chars.len() && chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        if idx >= chars.len() || chars[idx] != '=' {
-            return Err(LayoutError(format!(
-                "malformed attribute '{}' in tag '{}'",
-                attr_name, name
-            )));
-        }
-        idx += 1; // skip '='
-        while idx < chars.len() && chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        if idx >= chars.len() || (chars[idx] != '"' && chars[idx] != '\'') {
-            return Err(LayoutError(format!(
-                "unquoted attribute value for '{}' in tag '{}'",
-                attr_name, name
-            )));
-        }
-        let quote = chars[idx];
-        idx += 1;
-        let val_start = idx;
-        while idx < chars.len() && chars[idx] != quote {
-            idx += 1;
-        }
-        if idx >= chars.len() {
-            return Err(LayoutError(format!(
-                "unterminated attribute value for '{}'",
-                attr_name
-            )));
-        }
-        let raw: String = chars[val_start..idx].iter().collect();
-        idx += 1; // skip closing quote
-        attrs.push((attr_name, unescape(&raw)));
-    }
-    Ok((name, attrs))
-}
-
-/// Decode the five standard XML entities.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 // ===========================================================================
@@ -519,9 +480,13 @@ impl Parser {
         let mut layout = Hdf5Layout::default();
         match self.tokens.get(self.pos).cloned() {
             Some(Token::Open {
-                name, self_closing, ..
+                name,
+                attrs,
+                self_closing,
             }) if name == "hdf5_layout" => {
                 self.pos += 1;
+                layout.auto_ndattr_default =
+                    attr_get(&attrs, "auto_ndattr_default").as_deref() != Some("false");
                 if self_closing {
                     return Ok(layout);
                 }
@@ -540,7 +505,9 @@ impl Parser {
                     match name.as_str() {
                         "group" => {
                             let g = self.parse_group(attrs, self_closing)?;
-                            layout.groups.push(g);
+                            if !layout.groups.iter().any(|h| h.name == g.name) {
+                                layout.groups.push(g);
+                            }
                         }
                         "global" => {
                             let n = attr_get(&attrs, "name").unwrap_or_default();
@@ -572,6 +539,10 @@ impl Parser {
                 None => return Err(LayoutError("unterminated <hdf5_layout> element".into())),
             }
         }
+        layout.groups.sort_by(|a, b| a.name.cmp(&b.name));
+        for g in &mut layout.groups {
+            g.sort_like_c();
+        }
         Ok(layout)
     }
 
@@ -595,24 +566,44 @@ impl Parser {
                     self_closing: sc,
                 }) => {
                     self.pos += 1;
+                    // C refuses a name the group already holds (new_group,
+                    // new_dset, new_hardlink; NDFileHDF5Layout.cpp:329-416) and
+                    // parses on, but its cursor then pops at the refused
+                    // element's end tag and re-parents the later siblings. That
+                    // is a C defect, not copied: the refused subtree is dropped.
                     match child.as_str() {
-                        "group" => group.groups.push(self.parse_group(cattrs, sc)?),
-                        "dataset" => group.datasets.push(self.parse_dataset(cattrs, sc)?),
+                        "group" => {
+                            let g = self.parse_group(cattrs, sc)?;
+                            if !group.name_exist(&g.name) {
+                                group.groups.push(g);
+                            }
+                        }
+                        "dataset" => {
+                            let d = self.parse_dataset(cattrs, sc)?;
+                            if !group.name_exist(&d.name) {
+                                group.datasets.push(d);
+                            }
+                        }
                         "attribute" => {
-                            group.attributes.push(parse_attribute(&cattrs)?);
+                            add_attribute(&mut group.attributes, parse_attribute(&cattrs)?);
                             if !sc {
                                 self.skip_to_close("attribute")?;
                             }
                         }
                         "hardlink" => {
-                            group.hardlinks.push(LayoutHardlink {
+                            let h = LayoutHardlink {
                                 name: attr_get(&cattrs, "name").ok_or_else(|| {
                                     LayoutError("<hardlink> missing 'name'".into())
                                 })?,
                                 target: attr_get(&cattrs, "target").ok_or_else(|| {
                                     LayoutError("<hardlink> missing 'target'".into())
                                 })?,
-                            });
+                            };
+                            if !group.name_exist(&h.name)
+                                && !group.hardlinks.iter().any(|k| k.name == h.name)
+                            {
+                                group.hardlinks.push(h);
+                            }
                             if !sc {
                                 self.skip_to_close("hardlink")?;
                             }
@@ -654,13 +645,17 @@ impl Parser {
         let name = attr_get(&attrs, "name")
             .ok_or_else(|| LayoutError("<dataset> missing required 'name'".into()))?;
         let source = parse_source(&attrs, &name)?;
+        let data_type = attr_get(&attrs, "type");
         let mut ds = LayoutDataset {
             name: name.clone(),
             source,
-            data_type: LayoutDataType::parse(
-                &attr_get(&attrs, "type").unwrap_or_else(|| "string".into()),
-            ),
-            value: attr_get(&attrs, "value").unwrap_or_default(),
+            // C keeps a dataset constant's value only alongside a `type`
+            // (NDFileHDF5LayoutXML.cpp:583-592).
+            value: match data_type {
+                Some(_) => attr_get(&attrs, "value").unwrap_or_default(),
+                None => String::new(),
+            },
+            data_type: LayoutDataType::parse(&data_type.unwrap_or_else(|| "string".into())),
             ndattribute: attr_get(&attrs, "ndattribute").unwrap_or_default(),
             det_default: attr_bool(&attrs, "det_default"),
             when: LayoutWhen::parse(&attr_get(&attrs, "when").unwrap_or_default()),
@@ -678,7 +673,7 @@ impl Parser {
                 }) => {
                     self.pos += 1;
                     if child == "attribute" {
-                        ds.attributes.push(parse_attribute(&cattrs)?);
+                        add_attribute(&mut ds.attributes, parse_attribute(&cattrs)?);
                         if !sc {
                             self.skip_to_close("attribute")?;
                         }
@@ -730,6 +725,14 @@ impl Parser {
             }
         }
         Err(LayoutError(format!("unterminated <{}> element", tag)))
+    }
+}
+
+/// C `Element::add_attribute` (NDFileHDF5Layout.cpp:251-259): an element
+/// keeps its first `<attribute>` of a name and drops the rest.
+fn add_attribute(attrs: &mut Vec<LayoutAttribute>, a: LayoutAttribute) {
+    if !attrs.iter().any(|b| b.name == a.name) {
+        attrs.push(a);
     }
 }
 

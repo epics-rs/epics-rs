@@ -423,9 +423,10 @@ impl AsynMotor for SimMotor {
 
     /// C `motorSimAxis::poll` does nothing: the status is what the steps
     /// posted.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.advance_to(Instant::now());
-        Ok(self.posted.clone())
+        *status = self.posted.clone();
+        Ok(())
     }
 
     /// Unreachable: C `motorSimAxis::poll` has no failure path.
@@ -449,10 +450,16 @@ mod tests {
         AsynUser::new(0)
     }
 
+    fn polled(motor: &mut SimMotor) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        motor.poll(&user(), &mut status).unwrap();
+        status
+    }
+
     #[test]
     fn test_sim_motor_initial_state() {
         let mut motor = SimMotor::new();
-        let status = motor.poll(&user()).unwrap();
+        let status = polled(&mut motor);
         assert_eq!(status.position, 0.0);
         assert!(status.done);
         assert!(!status.moving);
@@ -463,7 +470,7 @@ mod tests {
     #[test]
     fn test_sim_motor_reports_home_on_encoder_home_bit_only() {
         let mut motor = SimMotor::new();
-        let at_home = motor.poll(&user()).unwrap();
+        let at_home = polled(&mut motor);
         assert!(at_home.encoder_home);
         assert!(!at_home.home && !at_home.has_encoder && !at_home.direction);
 
@@ -519,7 +526,7 @@ mod tests {
     fn test_sim_motor_set_position() {
         let mut motor = SimMotor::new();
         motor.set_position(&user(), 42.0).unwrap();
-        let status = motor.poll(&user()).unwrap();
+        let status = polled(&mut motor);
         assert_eq!(status.position, 42.0);
         // The switches stay physical, as motorSimAxis::setPosition moves
         // only enc_offset_.

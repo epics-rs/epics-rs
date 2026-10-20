@@ -1130,7 +1130,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Arm an output driver-callback (`asyn:READBACK`) cycle.
     ///
     /// Called by [`crate::server::database::PvDatabase::process_record_readback`]
-    /// immediately before the processing pass, mirroring C
+    /// under the pass's record gate, before the pass, mirroring C
     /// `devAsynInt32.c::outputCallbackCallback` setting
     /// `newOutputCallbackValue = 1` before `dbProcess`. Pair with
     /// [`Self::reconcile_readback_callback`]: if the pass never reaches the
@@ -1139,7 +1139,14 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// discards the stale callback-ring entry so a callback ring never
     /// desyncs from the record's pop count. Default no-op — only output
     /// callback-driven device support (asyn readback) needs it.
-    fn arm_readback_callback(&mut self) {}
+    ///
+    /// Returns the device's own write of UDF at this point, the one owner of
+    /// it on a readback cycle: devAsyn clears it before `dbProcess`
+    /// (`devAsynInt32.c:631` and its twins), devOpcua's write dset only in
+    /// its read, after `checkAlarms`.
+    fn arm_readback_callback(&mut self) -> DeviceUdf {
+        DeviceUdf::Untouched
+    }
 
     /// Reconcile an armed output driver-callback cycle after processing.
     ///
@@ -1149,12 +1156,14 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// entry. Default no-op; see [`Self::arm_readback_callback`].
     fn reconcile_readback_callback(&mut self) {}
 
-    /// The pass that completes a [`WriteStart::Pending`] write reached C's
-    /// second `processXxx`, which takes the write's result for
-    /// [`Self::last_alarm`], raised next, and requests a driver callback
-    /// devAsyn deferred while the write held the record
-    /// (`devAsynInt32.c:1013-1018`). Default no-op.
-    fn async_write_completed(&mut self) {}
+    /// C's second `write_xxx` call: the pass that completes a
+    /// [`WriteStart::Pending`] write runs it where `writeValue` runs, so
+    /// IVOA can skip it (`boRecord.c:221-245`), and before `monitor()`. It
+    /// takes the write's result for [`Self::last_alarm`], raised next, may
+    /// set the record's fields (`devMW100_bo.c:192-200` drops a trigger's VAL to 0), and
+    /// requests a driver callback devAsyn deferred while the write held the
+    /// record (`devAsynInt32.c:1013-1018`). Default no-op.
+    fn async_write_completed(&mut self, _record: &mut dyn Record) {}
 
     /// Whether a driver-callback (`asyn:READBACK`) processing cycle replaces
     /// this device's output stage with a value readback.
@@ -1164,8 +1173,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// calls the output `write()` — re-writing would re-assert the setpoint
     /// and re-trigger the driver (the AD `Acquire` loop). Only device support
     /// implementing that contract (the [`Self::arm_readback_callback`] /
-    /// [`Self::reconcile_readback_callback`] pair) returns `true`; such a
-    /// cycle starts with UDF cleared, as C's `outputCallbackCallback` does.
+    /// [`Self::reconcile_readback_callback`] pair) returns `true`.
     ///
     /// Default `false`: a C `dbProcess` driven by a driver callback is a full
     /// record process, output stage included. `devMotorAsyn` has no readback
@@ -1228,10 +1236,63 @@ pub trait DeviceSupport: Send + Sync + 'static {
         self.write(record)
     }
 
+    /// The record is lent to `init`, `read_begin`, `write_begin` and
+    /// `scanAdd`'s `get_ioint_info` as a
+    /// [`HeldInstance`](crate::server::database::HeldInstance) rather than
+    /// borrowed: the framework lets the borrow go around each call and calls
+    /// its `_held` form. For device support that puts to fields or processes
+    /// records from inside those calls, as StreamEpics.cc's `matchValue`
+    /// does. Asked when the device is attached. Default `false`.
+    fn lends_held(&self) -> bool {
+        false
+    }
+
+    /// [`init_common`](Self::init_common) for a device that
+    /// [`lends_held`](Self::lends_held), the record held a step at a time.
+    fn init_held(
+        &mut self,
+        hold: &mut crate::server::database::InitHold<'_>,
+    ) -> CaResult<DeviceInitOutcome> {
+        hold.held(|held| held.with(|record, common| self.init_common(record, common)))
+    }
+
+    /// [`read_begin_common`](Self::read_begin_common) for a device that
+    /// [`lends_held`](Self::lends_held).
+    fn read_begin_held(
+        &mut self,
+        held: &crate::server::database::HeldInstance<'_>,
+        done: &crate::server::database::DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        held.with(|record, common| self.read_begin_common(record, common, done))
+    }
+
+    /// [`write_begin_common`](Self::write_begin_common) for a device that
+    /// [`lends_held`](Self::lends_held).
+    fn write_begin_held(
+        &mut self,
+        held: &crate::server::database::HeldInstance<'_>,
+        done: &crate::server::database::DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        held.with(|record, common| self.write_begin_common(record, common, done))
+    }
+
+    /// `scanAdd`'s [`get_ioint_info`](Self::get_ioint_info) for a device
+    /// that [`lends_held`](Self::lends_held); `scanDelete`'s is not lent.
+    fn get_ioint_info_add_held(
+        &mut self,
+        held: &crate::server::database::HeldInstance<'_>,
+    ) -> bool {
+        held.with(|record, common| self.get_ioint_info(record, common, IoIntrCmd::Add))
+    }
+
     /// [`async_write_completed`](Self::async_write_completed) with the
     /// record's `dbCommon`.
-    fn async_write_completed_common(&mut self, _common: &mut CommonFields) {
-        self.async_write_completed()
+    fn async_write_completed_common(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut CommonFields,
+    ) {
+        self.async_write_completed(record)
     }
 
     /// Begin the record's input read — C devAsyn's `queueRequest` on a
@@ -1327,11 +1388,23 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// The device is attached (`instance.device = Some(dev)`) regardless
 /// of init outcome so the record is addressable; a failed init leaves
 /// the alarm set.
-pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceSupport>) {
+///
+/// A device that [`DeviceSupport::lends_held`] is lent `rec` for its
+/// init, as the init passes lend it, so `rec` must not be borrowed here.
+pub fn wire_device_to_record(
+    db: &crate::server::database::PvDatabase,
+    rec: &std::sync::Arc<crate::server::record::RecordCell>,
+    dev: Box<dyn DeviceSupport>,
+) {
+    let mut instance = rec.write();
     let record_type = instance.record.record_type();
     instance.common.dtyp.bind(record_type);
-    attach_device_to_record(instance, dev);
-    init_device_support(instance);
+    attach_device_to_record(&mut instance, dev);
+    let owed = init_device_support(&mut instance, InitStage::Wire);
+    let name = instance.name.to_str_lossy().into_owned();
+    drop(db.pay_device_init(rec, instance, owed, &name, &|line| {
+        crate::stderr_print!("{line}")
+    }));
 }
 
 /// The BIND half of [`wire_device_to_record`]: C `iocInit.c::doInitRecord0`'s
@@ -1355,13 +1428,73 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
     instance.invalidate_plan();
 }
 
+/// Which init leaves an [`OwedDeviceInit`]: pass 1's tail runs after it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitStage {
+    Pass0,
+    Pass1,
+    /// [`wire_device_to_record`], outside the passes.
+    Wire,
+}
+
+/// The dset `init_record` an init pass leaves to its caller for a device
+/// that [`DeviceSupport::lends_held`]: called with the record's borrow let
+/// go, by [`crate::server::database::PvDatabase::pay_device_init`].
+#[must_use]
+pub(crate) struct OwedDeviceInit {
+    dev: Box<dyn DeviceSupport>,
+    saved: Option<(f64, f64)>,
+    stage: InitStage,
+}
+
+impl OwedDeviceInit {
+    pub(crate) fn init_held(
+        &mut self,
+        hold: &mut crate::server::database::InitHold<'_>,
+    ) -> CaResult<DeviceInitOutcome> {
+        self.dev.init_held(hold)
+    }
+
+    /// The rest of [`init_device_support`], then the rest of the pass.
+    pub(crate) fn finish(
+        self,
+        instance: &mut RecordInstance,
+        outcome: CaResult<DeviceInitOutcome>,
+        name: &str,
+        err: &dyn Fn(&str),
+    ) {
+        finish_device_init(instance, self.dev, self.saved, outcome);
+        if self.stage == InitStage::Pass1 {
+            instance.finish_init_pass1(name, err);
+        }
+    }
+}
+
 /// The INIT half: C `pdset->common.init_record(prec)`, the call every record
 /// type makes from inside its own `init_record` once the dset test above has
-/// passed (`aiRecord.c:115-124`).
+/// passed (`aiRecord.c:115-124`). A device that lends held is left owed, for
+/// [`crate::server::database::PvDatabase::pay_device_init`].
 ///
 /// No-op for a record that has no device attached — C reaches this line only
 /// past `if (!pdset) return S_dev_noDSET`.
-pub fn init_device_support(instance: &mut RecordInstance) {
+pub(crate) fn init_device_support(
+    instance: &mut RecordInstance,
+    stage: InitStage,
+) -> Option<OwedDeviceInit> {
+    let (mut dev, saved) = begin_device_init(instance)?;
+    if dev.lends_held() {
+        return Some(OwedDeviceInit { dev, saved, stage });
+    }
+    let outcome = dev.init_common(&mut *instance.record, &mut instance.common);
+    finish_device_init(instance, dev, saved, outcome);
+    None
+}
+
+/// [`init_device_support`] up to the dset call: the device and the saved
+/// EOFF/ESLO, or `None` once a record with no device is done.
+fn begin_device_init(
+    instance: &mut RecordInstance,
+) -> Option<(Box<dyn DeviceSupport>, Option<(f64, f64)>)> {
     let saved = instance.record.eoff_eslo_before_dset_init();
     if let Some(soft) = instance.common.dtyp.soft() {
         instance.record.init_soft_dset(soft);
@@ -1380,11 +1513,20 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         } else {
             DsetInit::Ok
         };
-        return;
+        return None;
     };
     dev.bind_database(instance.device_done.database());
     dev.set_callback_priority(instance.common.callback_priority());
-    let outcome = dev.init_common(&mut *instance.record, &mut instance.common);
+    Some((dev, saved))
+}
+
+/// [`init_device_support`] after the dset call.
+fn finish_device_init(
+    instance: &mut RecordInstance,
+    mut dev: Box<dyn DeviceSupport>,
+    saved: Option<(f64, f64)>,
+    outcome: CaResult<DeviceInitOutcome>,
+) {
     instance.post_device_values(dev.take_device_posts());
     instance.record.after_dset_init();
     if let Some(saved) = saved.filter(|_| dev.has_init_record()) {
@@ -1452,7 +1594,8 @@ fn apply_init_udf(instance: &mut RecordInstance, udf: DeviceUdf) {
 mod tests {
     use super::*;
     use crate::error::CaError;
-    use crate::server::record::{Record, RecordInstance, ScanType};
+    use crate::server::database::PvDatabase;
+    use crate::server::record::{Record, RecordCell, RecordInstance, ScanType};
     use crate::server::records::ai::AiRecord;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1521,27 +1664,42 @@ mod tests {
         }
     }
 
-    /// Wire a probe with `verdict` onto a fresh ai and hand back the instance.
-    fn wire(verdict: InitVerdict) -> RecordInstance {
-        let mut instance = RecordInstance::new("TEST:DEAD", AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".into();
-        wire_device_to_record(
-            &mut instance,
-            Box::new(ProbeDev {
-                obs: Arc::new(Mutex::new(WireObservation::default())),
-                info: HashMap::new(),
-                record_info_set: false,
-                prio: None,
-                verdict,
-            }),
-        );
-        instance
+    /// Wire `dev` onto a fresh ai `name`, which `set` prepares first.
+    async fn wired(
+        name: &str,
+        set: impl FnOnce(&mut RecordInstance),
+        dev: ProbeDev,
+    ) -> (PvDatabase, Arc<RecordCell>) {
+        let db = PvDatabase::new();
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record(name).unwrap();
+        {
+            let mut instance = rec.write();
+            instance.common.dtyp = "ProbeDev".into();
+            set(&mut instance);
+        }
+        wire_device_to_record(&db, &rec, Box::new(dev));
+        (db, rec)
+    }
+
+    /// Wire a probe with `verdict` onto a fresh ai.
+    async fn wire(verdict: InitVerdict) -> (PvDatabase, Arc<RecordCell>) {
+        let dev = ProbeDev {
+            obs: Arc::new(Mutex::new(WireObservation::default())),
+            info: HashMap::new(),
+            record_info_set: false,
+            prio: None,
+            verdict,
+        };
+        wired("TEST:DEAD", |_| {}, dev).await
     }
 
     /// Device support reads the record's `PRIO` band in `init_record`, as C's
     /// motor record does for its delay callback (motorRecord.cc:634).
-    #[test]
-    fn init_sees_the_band_of_the_record_s_prio() {
+    #[epics_macros_rs::epics_test]
+    async fn init_sees_the_band_of_the_record_s_prio() {
         use crate::runtime::task::CallbackPriority;
         for (prio, band) in [
             (0, CallbackPriority::Low),
@@ -1549,19 +1707,14 @@ mod tests {
             (2, CallbackPriority::High),
         ] {
             let obs = Arc::new(Mutex::new(WireObservation::default()));
-            let mut instance = RecordInstance::new("TEST:PRIO", AiRecord::new(0.0));
-            instance.common.dtyp = "ProbeDev".into();
-            instance.common.prio = prio;
-            wire_device_to_record(
-                &mut instance,
-                Box::new(ProbeDev {
-                    obs: obs.clone(),
-                    info: HashMap::new(),
-                    record_info_set: false,
-                    prio: None,
-                    verdict: InitVerdict::Live,
-                }),
-            );
+            let dev = ProbeDev {
+                obs: obs.clone(),
+                info: HashMap::new(),
+                record_info_set: false,
+                prio: None,
+                verdict: InitVerdict::Live,
+            };
+            wired("TEST:PRIO", |instance| instance.common.prio = prio, dev).await;
             assert_eq!(obs.lock().unwrap().prio_at_init, Some(band), "PRIO {prio}");
         }
     }
@@ -1571,9 +1724,10 @@ mod tests {
     /// (`devAsynXXXTimeSeries.h:118-120`, `dbAccess.c:536`). The port had no way
     /// for device support to reach that state: an invalid FTVL left the driver
     /// returning an inert `read()` while the record kept processing with PACT=0.
-    #[test]
-    fn wire_device_dead_init_leaves_the_record_in_pact() {
-        let instance = wire(InitVerdict::Dead);
+    #[epics_macros_rs::epics_test]
+    async fn wire_device_dead_init_leaves_the_record_in_pact() {
+        let (_db, rec) = wire(InitVerdict::Dead).await;
+        let instance = rec.read();
 
         assert!(
             instance.is_processing(),
@@ -1590,10 +1744,11 @@ mod tests {
     /// `pr->pact=1; return -1`), and the arms that do raise one
     /// (`devAsynInt32.c:349` LINK_ALARM) do it from device support, through the
     /// driver's own alarm channel.
-    #[test]
-    fn wire_device_dead_init_raises_no_alarm_of_its_own() {
-        let dead = wire(InitVerdict::Dead);
-        let live = wire(InitVerdict::Live);
+    #[epics_macros_rs::epics_test]
+    async fn wire_device_dead_init_raises_no_alarm_of_its_own() {
+        let (_dead_db, dead) = wire(InitVerdict::Dead).await;
+        let (_live_db, live) = wire(InitVerdict::Live).await;
+        let (dead, live) = (dead.read(), live.read());
 
         assert_eq!(dead.common.sevr, live.common.sevr);
         assert_eq!(
@@ -1607,11 +1762,11 @@ mod tests {
     /// (`devBiDbState.c:28-31`, `devGeneralTime.c:60-63`) — a flagged record
     /// still scans, which is why the dead arm needed a value of its own rather
     /// than folding into the error channel.
-    #[test]
-    fn wire_device_live_and_failed_inits_leave_the_record_processing() {
-        assert!(!wire(InitVerdict::Live).is_processing());
+    #[epics_macros_rs::epics_test]
+    async fn wire_device_live_and_failed_inits_leave_the_record_processing() {
+        assert!(!wire(InitVerdict::Live).await.1.read().is_processing());
         assert!(
-            !wire(InitVerdict::Fail).is_processing(),
+            !wire(InitVerdict::Fail).await.1.read().is_processing(),
             "an errored init flags the record but must not kill it"
         );
     }
@@ -1619,10 +1774,11 @@ mod tests {
     /// iocInit.c:570 discards init_record's status: a failed dset init raises
     /// no alarm (the dset printed its own line), and the record learns of it
     /// only through `DsetInit::Failed`.
-    #[test]
-    fn wire_device_init_failure_raises_no_alarm_and_marks_the_dset_failed() {
-        let failed = wire(InitVerdict::Fail);
-        let live = wire(InitVerdict::Live);
+    #[epics_macros_rs::epics_test]
+    async fn wire_device_init_failure_raises_no_alarm_and_marks_the_dset_failed() {
+        let (_failed_db, failed) = wire(InitVerdict::Fail).await;
+        let (_live_db, live) = wire(InitVerdict::Live).await;
+        let (failed, live) = (failed.read(), live.read());
 
         assert_eq!(failed.common.sevr, live.common.sevr);
         assert_eq!(failed.common.stat, live.common.stat);
@@ -1637,21 +1793,19 @@ mod tests {
     /// set_record_info → apply_record_info → init. A driver reading
     /// `info(...)` tags inside `init()` must see a populated map, and
     /// `set_record_info` must have run first.
-    #[test]
-    fn wire_device_applies_info_and_record_info_before_init() {
-        let mut instance = RecordInstance::new("TEST:AI2", AiRecord::new(0.0));
-        instance.common.dtyp = "ProbeDev".into();
-        instance.set_info("asyn:READBACK", "1");
+    #[epics_macros_rs::epics_test]
+    async fn wire_device_applies_info_and_record_info_before_init() {
         let obs = Arc::new(Mutex::new(WireObservation::default()));
-        let dev = Box::new(ProbeDev {
+        let dev = ProbeDev {
             obs: obs.clone(),
             info: HashMap::new(),
             record_info_set: false,
             prio: None,
             verdict: InitVerdict::Live,
-        });
+        };
 
-        wire_device_to_record(&mut instance, dev);
+        let set_info = |instance: &mut RecordInstance| instance.set_info("asyn:READBACK", "1");
+        wired("TEST:AI2", set_info, dev).await;
 
         let o = obs.lock().unwrap();
         assert!(o.init_ran, "init must have run");

@@ -377,7 +377,6 @@ async fn after_an_unresponsive_window(
     };
     let hook = db
         .find_pv(name)
-        .await
         .expect("shadow PV")
         .access_hook()
         .expect("access hook");
@@ -406,7 +405,7 @@ async fn after_an_unresponsive_window(
     until(
         bound,
         "the window never took the shadow PV down",
-        || async { db.find_pv(name).await.is_none() },
+        || async { db.find_pv(name).is_none() },
     )
     .await;
     during(&rig);
@@ -419,7 +418,7 @@ async fn after_an_unresponsive_window(
     // No sleep: the first appearance is what is asserted, and a PV that
     // shows stale rights for a moment must not be missed between polls.
     let back = loop {
-        if let Some(pv) = db.find_pv(name).await {
+        if let Some(pv) = db.find_pv(name) {
             break pv;
         }
         assert!(

@@ -18,7 +18,7 @@
 //! - [`BridgeChannel`] serves single-record PVs (NTScalar, NTEnum, NTScalarArray).
 //! - [`GroupChannel`] serves multi-record composite PVs from JSON config.
 //! - [`GroupMonitor`] bridges `DbSubscription` events to PVA monitor updates;
-//!   single records are monitored through `qsrvSingle` ([`QsrvMount::install_sources`]).
+//!   single records are monitored through `qsrvSingle` ([`QsrvMount::install_channel_sources`]).
 //!
 //! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined in
 //! this module. [`pva_adapter::QsrvPvStore`] bridges them to the native
@@ -44,13 +44,8 @@ pub use provider::{
     AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
     Channel, ChannelProvider, ClientCreds, PvaMonitor, WriteGrant,
 };
-#[cfg(all(feature = "qsrv-core", feature = "pvalink"))]
-pub use pva_adapter::install_pvalink;
 #[cfg(feature = "qsrv-core")]
-pub use pva_adapter::{
-    PvaPvHandle, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
-    register_pva_pv_global, take_registered_pva_pvs,
-};
+pub use pva_adapter::{QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install};
 // The dual-protocol runner: `qsrv` (not `qsrv-core`) because it needs
 // `epics-ca-rs`.
 #[cfg(feature = "qsrv")]

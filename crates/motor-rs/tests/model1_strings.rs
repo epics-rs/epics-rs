@@ -14,7 +14,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
 use epics_base_rs::types::EpicsValue;
-use motor_rs::device_state::{AxisSubscribers, StampedStatus};
+use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::MotorAxis;
 use motor_rs::devices::{
     device_support_factory, devices, model1_device, register_axis, register_model1_device,
@@ -43,12 +43,9 @@ fn axis(card: i32) -> mpsc::UnboundedReceiver<ToAxis> {
 /// [`axis`], with the subscribers its status posts go through.
 fn axis_with(card: i32) -> (mpsc::UnboundedReceiver<ToAxis>, AxisSubscribers) {
     let subscribers = AxisSubscribers::new();
-    subscribers.store(StampedStatus {
-        seq: 1,
-        status: MotorStatus {
-            done: true,
-            ..MotorStatus::default()
-        },
+    subscribers.store(MotorStatus {
+        done: true,
+        ..MotorStatus::default()
     });
     let (poll_tx, _) = mpsc::channel(16);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -231,13 +228,10 @@ record(motor, "S:post") { field(DTYP, "TestStrings") field(OUT, "#C47 S0 @") fie
 
     // A VAL put during the move is parked (C do_work 2457), so the next
     // move is built once this one is done.
-    for pulse in subscribers.post(StampedStatus {
-        seq: 2,
-        status: MotorStatus {
-            position: 5.0,
-            done: true,
-            ..MotorStatus::default()
-        },
+    for pulse in subscribers.post(MotorStatus {
+        position: 5.0,
+        done: true,
+        ..MotorStatus::default()
     }) {
         pulse.try_send(()).unwrap();
     }
@@ -384,6 +378,9 @@ impl AsynMotor for Hooks {
         self.seen.lock().unwrap().push("move".into());
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -420,8 +417,9 @@ impl AsynMotor for Hooks {
         self.seen.lock().unwrap().push(format!("primitive {init}"));
         Ok(())
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(MotorStatus::default())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = MotorStatus::default();
+        Ok(())
     }
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE

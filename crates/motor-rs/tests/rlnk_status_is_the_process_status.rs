@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, ProcStack, PvDatabase};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, ProcStack, PvDatabase};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
@@ -15,16 +15,16 @@ struct Down;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for Down {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         false
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Err("channel disconnected".into())
     }
 }

@@ -53,6 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", ev.to_json());
     })
     .await?;
-    eprintln!("replayed {count} events");
+    epics_libcom_rs::stderr_println!("replayed {count} events");
     Ok(())
 }

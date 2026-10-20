@@ -68,7 +68,7 @@ record(ao, "ao") { field(VAL, "1.5") }
         request_pvs: Vec::new(),
         backup: BackupConfig::default(),
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: vec![dir.path().to_path_buf()],
     })
     .await

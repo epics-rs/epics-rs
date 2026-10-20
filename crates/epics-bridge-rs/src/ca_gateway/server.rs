@@ -1756,11 +1756,7 @@ mod tests {
         let server = GatewayServer::build(config).await.unwrap();
         // Registered in the shadow DB (gate-independent lookup).
         assert!(
-            server
-                .shadow_db
-                .find_pv("gateway:heartbeat")
-                .await
-                .is_some(),
+            server.shadow_db.find_pv("gateway:heartbeat").is_some(),
             "build() must register the stat PV in the shadow DB"
         );
         // But hidden by the restrictive pvlist that omits the stat prefix.

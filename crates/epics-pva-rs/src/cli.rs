@@ -48,7 +48,7 @@ pub fn parse_or_exit_styled<T: clap::Parser>(style: UsageErrorStyle) -> T {
                 .then(|| c_option_error(&e, &cmd, &argv))
                 .flatten()
             {
-                Some(msg) => eprint!("{msg}"),
+                Some(msg) => epics_libcom_rs::stderr_print!("{msg}"),
                 None => {
                     let _ = e.print();
                 }
@@ -315,9 +315,9 @@ pub fn version_information() -> &'static str {
 /// config ([`crate::client_native::context::PvaClient::config`]), not a
 /// second read of the environment, so the environment's warnings print
 /// once. pvxs writes it to `std::cerr`.
-#[cfg(not(epics_embedded_target))]
+#[cfg(all(feature = "client", not(epics_embedded_target)))]
 pub fn print_effective_config(client: &crate::client_native::context::PvaClient) {
-    eprint!("{}", effective_config_string(client));
+    epics_libcom_rs::stderr_print!("{}", effective_config_string(client));
 }
 
 /// Render one resolved [`crate::config::env::Endpoint`] the way pvxs prints
@@ -387,7 +387,7 @@ fn client_config_lines(cfg: &crate::config::env::Config, indent: &str) -> String
 /// unit-testable without capturing process stderr.
 ///
 /// Host-only, as [`crate::config::env::Config`].
-#[cfg(not(epics_embedded_target))]
+#[cfg(all(feature = "client", not(epics_embedded_target)))]
 pub fn effective_config_string(client: &crate::client_native::context::PvaClient) -> String {
     format!(
         "Effective config\n{}",
@@ -616,6 +616,7 @@ mod tests {
     /// `pvcall`/`pvinfo`) prints on `-v`; asserting on the fixed keys
     /// keeps the check environment-independent.
     #[test]
+    #[cfg(feature = "client")]
     fn effective_config_emits_config_keys() {
         let s =
             effective_config_string(&crate::client_native::context::PvaClient::builder().build());
@@ -650,6 +651,7 @@ mod tests {
     /// config.cpp:640-644). Serialised on `epics_env` because it mutates the
     /// process-global environment.
     #[test]
+    #[cfg(feature = "client")]
     #[serial_test::serial(epics_env)]
     fn effective_config_shows_expanded_addr_list_not_raw_env() {
         // SAFETY: std::env mutation is unsafe in edition 2024; the `epics_env`
@@ -693,6 +695,7 @@ mod tests {
     /// empty interface list reads as `expand()`'s wildcard, and
     /// `EPICS_PVA_CONN_TMO` is `tcpTimeout/tmoScale` of the client's timeout.
     #[test]
+    #[cfg(feature = "client")]
     #[serial_test::serial(epics_env)]
     fn effective_config_is_the_clients_not_the_environments() {
         // SAFETY: std::env mutation is unsafe in edition 2024; the `epics_env`
@@ -748,12 +751,16 @@ mod tests {
             "CONN_TMO must not appear in the server block: {s}"
         );
         // The client `-v` block is client-only: no EPICS_PVAS_ key.
-        let client =
-            effective_config_string(&crate::client_native::context::PvaClient::builder().build());
-        assert!(
-            !client.contains("EPICS_PVAS_"),
-            "the `-v` client block must not carry server keys: {client}"
-        );
+        #[cfg(feature = "client")]
+        {
+            let client = effective_config_string(
+                &crate::client_native::context::PvaClient::builder().build(),
+            );
+            assert!(
+                !client.contains("EPICS_PVAS_"),
+                "the `-v` client block must not carry server keys: {client}"
+            );
+        }
     }
 
     /// The shared `-V` text reports more than `<binary> <crate-version>`:

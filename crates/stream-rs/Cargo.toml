@@ -13,6 +13,7 @@ repository.workspace = true
 asyn-rs = { workspace = true }
 chrono = "0.4"
 epics-base-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 libc = "0.2"
 parking_lot = "0.12"
 

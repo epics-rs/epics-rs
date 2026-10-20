@@ -77,9 +77,9 @@ pub enum RawSoftEntry {
 /// [`Self::code`] is C's `SPC_*` number (`special.h:26-39` @R7.0.10), the
 /// integer C prints and stores. It is a table, not a cast, because the
 /// numbering is not contiguous — C has no code 4, and the record-specific half
-/// starts at 100 — and because a `.dbd` may also declare a code by number
+/// starts at 100 — and because a `.dbd` may also declare any code by number
 /// (`special(111)`, which `dbLexRoutines.c:631` reads with `%hd`), which
-/// [`Self::Record`] carries.
+/// [`Self::Record`] and [`Self::Global`] carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Special {
     /// No `special()` declared — C leaves `pdbFldDes->special` 0.
@@ -115,14 +115,17 @@ pub enum Special {
     /// names — sscan's `special(111)` (`SPC_SC_S`) .. `special(120)`. C
     /// routes it to the record's `special()` as it does `SPC_MOD`.
     Record(i16),
+    /// A code below `SPC_MOD` that `special.h` does not name (4, 8..99, or
+    /// negative), declared by number. `dbPutSpecial`'s global arm
+    /// (`dbAccess.c:122-134`) acts on none of them.
+    Global(i16),
 }
 
 impl Special {
     /// The `.dbd` numeric form: a named code when C names it, else
-    /// [`Self::Record`]. `None` for a number below `SPC_MOD` that C does not
-    /// name, which no `.dbd` declares.
-    pub const fn from_code(code: i16) -> Option<Self> {
-        Some(match code {
+    /// [`Self::Record`] from `SPC_MOD` up and [`Self::Global`] below.
+    pub const fn from_code(code: i16) -> Self {
+        match code {
             0 => Self::None,
             1 => Self::NoMod,
             2 => Self::DbAddr,
@@ -135,8 +138,8 @@ impl Special {
             102 => Self::LinConv,
             103 => Self::Calc,
             104.. => Self::Record(code),
-            _ => return None,
-        })
+            _ => Self::Global(code),
+        }
     }
 
     /// C's `pdbFldDes->special` for this code.
@@ -153,7 +156,7 @@ impl Special {
             Self::Reset => 101,
             Self::LinConv => 102,
             Self::Calc => 103,
-            Self::Record(code) => code,
+            Self::Record(code) | Self::Global(code) => code,
         }
     }
 }
@@ -919,6 +922,10 @@ pub struct OutTarget {
     /// not `dbLinkIsConstant`, which a removed link also answers: its type
     /// stays `PV_LINK` (`dbDbLink.c:132`) while it has no target.
     pub constant_type: bool,
+    /// C `dbCaPutLinkCallback`'s gate, `isConnected && hasWriteAccess`
+    /// (`dbCa.c:529-532`), read at resolution from the link the record holds.
+    /// `true` for a link that never reaches that gate (local, constant, none).
+    pub put_admitted: bool,
 }
 
 impl OutTarget {
@@ -932,6 +939,7 @@ impl OutTarget {
         is_ca_link: false,
         puts_as_string: false,
         constant_type: true,
+        put_admitted: true,
     };
 }
 
@@ -4319,7 +4327,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// The soft dset's own `init_record` for a record whose DTYP names one —
     /// the state it leaves in the record's fields, input and output alike.
-    /// Called once, from [`crate::server::device_support::init_device_support`],
+    /// Called once, from the dset init (`init_device_support`),
     /// after the record's pass-0 init (C's order). Default: no such state.
     fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
         let _ = soft;
@@ -8285,7 +8293,8 @@ mod declaration_numbering_tests {
             | Special::Reset
             | Special::LinConv
             | Special::Calc
-            | Special::Record(_) => (),
+            | Special::Record(_)
+            | Special::Global(_) => (),
         }
     }
 
@@ -8293,7 +8302,7 @@ mod declaration_numbering_tests {
     fn every_special_carries_cs_spc_number() {
         for (spc, n, name) in C_SPECIAL {
             assert_eq!(spc.code(), n, "{name}: wrong SPC_ number");
-            assert_eq!(Special::from_code(n), Some(spc), "{name}: numeric form");
+            assert_eq!(Special::from_code(n), spc, "{name}: numeric form");
         }
         for (a, (x, ..)) in C_SPECIAL.iter().enumerate() {
             for (y, ..) in C_SPECIAL.iter().skip(a + 1) {
@@ -8301,9 +8310,20 @@ mod declaration_numbering_tests {
             }
         }
         assert!(!C_SPECIAL.iter().any(|(_, n, _)| *n == 4), "C has no SPC 4");
-        assert_eq!(Special::from_code(4), None);
-        assert_eq!(Special::from_code(111), Some(Special::Record(111)));
-        assert_eq!(Special::Record(111).code(), 111);
+        // Every other `%hd` value is a code too: below SPC_MOD global, from
+        // 104 record-specific.
+        for (n, spc) in [
+            (4, Special::Global(4)),
+            (8, Special::Global(8)),
+            (99, Special::Global(99)),
+            (-1, Special::Global(-1)),
+            (i16::MIN, Special::Global(i16::MIN)),
+            (104, Special::Record(104)),
+            (i16::MAX, Special::Record(i16::MAX)),
+        ] {
+            assert_eq!(Special::from_code(n), spc);
+            assert_eq!(spc.code(), n);
+        }
         // `pamapspcType[SPC_NTYPES]` (`special.h:42,51-61`) is the `.dbd`
         // parser's table: nine entries, omitting SPC_ATTRIBUTE — which C sets
         // internally — and the 0 that means no `special()` at all.

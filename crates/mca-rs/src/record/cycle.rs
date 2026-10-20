@@ -28,6 +28,7 @@ use std::time::SystemTime;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::CommonFields;
 use epics_base_rs::types::{EpicsValue, PvString, WallTime, c_cast};
+use epics_libcom_rs::cfmt::CFloat;
 
 use super::McaRecord;
 
@@ -518,9 +519,9 @@ impl McaRecord {
         self.rdns = 0;
         debug_print!(
             5,
-            "process: status from callback: elapsedReal={:.6}, elapsedLive={:.6}, acquiring={}\n",
-            status.elapsed_real,
-            status.elapsed_live,
+            "process: status from callback: elapsedReal={}, elapsedLive={}, acquiring={}\n",
+            CFloat(status.elapsed_real),
+            CFloat(status.elapsed_live),
             i32::from(status.acquiring)
         );
 

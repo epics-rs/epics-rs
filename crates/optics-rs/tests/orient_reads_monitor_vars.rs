@@ -656,6 +656,9 @@ async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
             (format!("{P}motGet_Auto"), EpicsValue::Enum(1)),
         ],
     );
+    let mut busy_mon = DbSubscription::subscribe(&db, format!("{P}Busy"))
+        .await
+        .unwrap();
     put(&db, "H", 4.0).await;
     put(&db, "K", 4.0).await;
     wait_near(&ioc, "X:m:tth", 34.6923).await;
@@ -667,8 +670,20 @@ async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
         "drive already done"
     );
     assert_eq!(busy, 1.0);
-    wait_for(&ioc, &format!("{P}waiting4Mot"), 0.0).await;
-    wait_for(&ioc, &format!("{P}Busy"), 0.0).await;
+    // The completion's motGet_Auto copy writes loadH/loadK, the first
+    // disabled H_event/K_event pass since the client's, which posts
+    // (dbAccess.c:579-593), so orient runs newHKL and raises Busy once more
+    // (orient_st.st:730, :1083): it is idle only after that second drop.
+    let (mut raised, mut drops) = (false, 0);
+    while drops < 2 {
+        let v = task::timeout(Duration::from_secs(10), busy_mon.recv_f64())
+            .await
+            .expect("the drive and the copy's echo did not finish")
+            .unwrap();
+        drops += usize::from(raised && v == 0.0);
+        raised = v != 0.0;
+    }
+    assert_eq!(f64_of(&ioc, &format!("{P}waiting4Mot")).await, 0.0);
     wait_near(&ioc, &format!("{P}K"), 4.0).await;
 
     post(&db, &[("X:m:tth".to_string(), EpicsValue::Double(10.0))]);

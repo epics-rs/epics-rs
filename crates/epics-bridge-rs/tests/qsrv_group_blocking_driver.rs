@@ -110,8 +110,6 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
         }],
     )
     .await;
-    assert!(mount.enabled, "QSRV2 must be enabled by default");
-
     // The binary's exact composition: `qsrvSingle` at 0, `qsrvGroup` at 1.
     let composite = CompositeSource::new();
     composite

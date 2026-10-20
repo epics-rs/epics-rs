@@ -7,6 +7,7 @@ use crate::converter::{ESC, StreamFormatConverter};
 use crate::cstr::{CPtr, c_isalpha, c_isspace, c_strtol, c_strtoul, c_tolower};
 use crate::error::stream_error;
 use crate::format::*;
+use epics_libcom_rs::cfmt::CFloat;
 
 pub(crate) struct TimestampConverter;
 
@@ -91,7 +92,7 @@ impl StreamFormatConverter for TimestampConverter {
         let info = escape_fractions(CPtr::new(fmt.info).cstr());
         crate::debug!(
             b"TimestampConverter::printDouble ",
-            c_f(value),
+            format!("{:.6}", CFloat(value)),
             b", '",
             CPtr::new(fmt.info).cstr(),
             b"'\n"
@@ -102,7 +103,7 @@ impl StreamFormatConverter for TimestampConverter {
         // second carries and every field prints zeros; otherwise each field
         // is rounded on its own, as C does.
         if let Some(n) = finest_fraction(&buffer)
-            && format!("{frac:.n$}").starts_with('1')
+            && format!("{:.n$}", CFloat(frac)).starts_with('1')
         {
             sec += 1;
             buffer = ctime::strftime40(&info, &ctime::localtime(sec));
@@ -123,7 +124,7 @@ impl StreamFormatConverter for TimestampConverter {
             let c = c + 1;
             // print fractional part
             let n = precision(n);
-            let fraction = format!("{frac:.n$}");
+            let fraction = format!("{:.n$}", CFloat(frac));
             // C bug not copied: C crashes on %0f, where printf gives no '.'.
             let digits = fraction.get(2..).unwrap_or("");
             output.replace(i, c as isize - i, digits.as_bytes());
@@ -706,18 +707,6 @@ fn escape_fractions(info: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
-}
-
-/// printf `%f`.
-fn c_f(v: f64) -> String {
-    let sign = if v.is_sign_negative() { "-" } else { "" };
-    if v.is_nan() {
-        format!("{sign}nan")
-    } else if v.is_infinite() {
-        format!("{sign}inf")
-    } else {
-        format!("{v:.6}")
-    }
 }
 
 /// The `<time.h>` calls the converter makes.

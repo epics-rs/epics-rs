@@ -255,7 +255,9 @@ async fn serve_pva(
                 // The UDP search port is what a client needs; the TCP port is
                 // discovered from the search reply.
                 if let Err(e) = announce("ORACLE_IOC_PVA_PORT", handle.report().udp_port) {
-                    eprintln!("oracle-ioc: could not announce the PVA port: {e}");
+                    epics_base_rs::stderr_println!(
+                        "oracle-ioc: could not announce the PVA port: {e}"
+                    );
                 }
                 return;
             }

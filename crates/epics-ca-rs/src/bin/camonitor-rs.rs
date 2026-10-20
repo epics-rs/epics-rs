@@ -11,6 +11,7 @@ use epics_ca_rs::cli::{
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 use epics_ca_rs::copt::{self, CTool};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Owner of every C-scanned option argument in this binary (see
 /// [`epics_ca_rs::copt`]).
@@ -79,7 +80,7 @@ Example: camonitor -f8 my_channel another_channel
   (doubles are printed as %f with precision of 8)
 
 "#,
-        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        timeout = CFloat(epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS),
         max = epics_ca_rs::copt::CA_PRIORITY_MAX,
     )
 }
@@ -793,10 +794,10 @@ fn render_timestamp(
             TimestampKind::Absolute => format_server_timestamp(ts),
             TimestampKind::Relative => {
                 let r = if is_server { server_ref } else { start };
-                format!("{:+12.6}", secs_between(ts, r))
+                format!("{:+12.6}", CFloat(secs_between(ts, r)))
             }
             TimestampKind::IncrAll | TimestampKind::IncrChan => {
-                format!("{:+12.6}", secs_between(ts, prev.unwrap_or(ts)))
+                format!("{:+12.6}", CFloat(secs_between(ts, prev.unwrap_or(ts))))
             }
         }
     };

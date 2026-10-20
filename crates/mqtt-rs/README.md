@@ -212,15 +212,18 @@ and masks, so `asynSetTraceMask` / `asynSetTraceFile` govern them:
 
 | Event | Mask | Message |
 |-------|------|---------|
-| Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` |
-| Boot connect failed: every attempt while the address lookup, `socket()` or `connect()` fails at once, else only the first; subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` |
-| Broker refused a subscribe or publish (SUBACK/PUBACK/PUBREC/PUBCOMP reason ≥ 0x80); the session stays up | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: '` |
-| A subscribe or publish still unacked when its session ends, on a loss (before the `onDisconnectCb` line) or at the exit disconnect | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: '` |
+| Live session lost | `ERROR` | `MqttDriver::onDisconnectCb: Connection lost. Reconnecting...` |
+| Boot connect failed: every attempt while the address lookup, `socket()` or `connect()` fails at once (`<error>` empty), else only the first, with paho's `TCP/TLS connect failure`, `TCP connect completion failure`, `TCP connect timeout`, `CONNACK return code` or `Received disconnect`; subscribe or publish failed | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>\n'` |
+| Broker refused a subscribe or publish (SUBACK/PUBACK/PUBREC/PUBCOMP reason ≥ 0x80); the session stays up | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'` |
+| A subscribe or publish written and still unacked when its session ends, on a loss (before the `onDisconnectCb` line) or at the exit disconnect; one not yet written waits for the next session, as paho's command queue keeps it | `ERROR` | `MqttDriver::onFailCb: MQTT Operation error: 'Error: \n'` |
 | ConnAck after a loss, or after a boot failure met once the connect was in flight | `ERROR\|DRIVER` | `MqttDriver::onConnectCb: Reconnected.` |
 | Every ConnAck | `DRIVER` | `MqttDriver::onConnectCb: Connected to broker` |
 | SUBACK granted / PUBLISH acked (QoS 0: written, QoS 1: PUBACK, QoS 2: PUBCOMP) | `DRIVER` | `MqttDriver::onSubscribeCb: Subscribed to topic '<t>'` / `MqttDriver::onPublishCb: Published to topic '<t>'` |
 | Inbound payload a record cannot take | `ERROR` | `MqttDriver::onMessageCb: ...` |
 | Write failed | `ERROR` | `MqttDriver::<x>Write: Failed to set value for topic '<t>': ...` |
+
+The `\n` in the `onFailCb` rows is the newline paho ends its error text with
+(`mqttClient.cpp:167`): the closing quote opens the next line, as in C.
 
 The Connected PV recovery path (`MQTT {Publish,PingResp} received while
 Connected=0 — restoring Connected=1`) and the shutdown lines are `tracing`

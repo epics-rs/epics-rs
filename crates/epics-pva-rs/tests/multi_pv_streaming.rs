@@ -43,7 +43,7 @@ const SLOW: Duration = Duration::from_millis(1000);
 struct TwoSpeedSource;
 
 impl ChannelSource for TwoSpeedSource {
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["fast".into(), "slow".into()]
     }
     async fn has_pv(&self, name: &[u8]) -> bool {

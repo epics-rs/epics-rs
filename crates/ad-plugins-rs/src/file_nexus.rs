@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::NDAttributeList;
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
@@ -28,12 +28,6 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResu
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
-
-/// Name of the HDF5 attribute recording the NDArray data type ordinal
-/// (matches C `NDDataType_t`). `read_file` uses it to recover the exact type
-/// — without it `read_raw::<u8>` / `<u16>` cannot distinguish signed vs
-/// unsigned or i32 vs u32 vs f32 (all 4-byte) datasets.
-const DTYPE_ATTR: &str = "NDArrayDataType";
 
 /// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
 /// 0.2.15 records every numeric datatype message as little-endian and copies
@@ -613,7 +607,9 @@ impl Default for NexusWriter {
 }
 
 impl NDFileWriter for NexusWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
+        // NDFileNexus.cpp:45-48
+        mode.refuse_read_or_append("NDFileNexus")?;
         self.current_path = Some(path.to_path_buf());
         self.frame_count = 0;
         self.dataset = None;
@@ -698,10 +694,8 @@ impl NDFileWriter for NexusWriter {
         };
         let data_group = resolve_group(&self.data_group_path)?;
 
-        // Element type recorded on the data dataset for lossless read-back,
-        // and the frame bytes serialized explicitly little-endian (rust-hdf5
+        // The frame bytes serialized explicitly little-endian (rust-hdf5
         // 0.2.15 records LE datatypes and copies write_chunk bytes verbatim).
-        let dtype_ordinal = array.data.data_type() as i32;
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
 
         if self.frame_count == 0 {
@@ -753,12 +747,6 @@ impl NDFileWriter for NexusWriter {
             let ds = create_typed!(data_group, &data_node_name);
             ds.write_chunk(0, &frame_bytes)
                 .map_err(|e| ADError::UnsupportedConversion(format!("NeXus write error: {}", e)))?;
-            // Record the exact data type for lossless read-back.
-            let _ = ds
-                .new_attr::<i32>()
-                .shape(())
-                .create(DTYPE_ATTR)
-                .and_then(|a| a.write_numeric(&dtype_ordinal));
             // Write NDArray attributes on the first frame.
             for attr in array.attributes.iter() {
                 let val_str = attr.value.as_string();
@@ -863,71 +851,12 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
+    /// Unreachable through `readFileBase`, whose open is refused first; C's
+    /// `readFile` is a stub that fails (NDFileNexus.cpp:115-130).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let h5file = H5File::open(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("NeXus open error: {}", e)))?;
-
-        // Read from the data path established at open_file time (the built-in
-        // entry/instrument/detector/data, or the template's pArray location).
-        let data_path = format!("{}/{}", self.data_group_path, self.data_node_name);
-        let ds = h5file
-            .dataset(&data_path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("NeXus dataset error: {}", e)))?;
-
-        let shape = ds.shape();
-        let dims: Vec<NDDimension> = shape.iter().rev().map(|&s| NDDimension::new(s)).collect();
-        let element_size = ds.element_size();
-
-        // Recover the exact NDArray data type from the recorded attribute.
-        // Untyped read_raw cannot distinguish signed/unsigned or i32/u32/f32
-        // (all same element size), so the recorded type is authoritative.
-        let recorded: Option<NDDataType> = ds
-            .attr(DTYPE_ATTR)
-            .ok()
-            .and_then(|a| a.read_numeric::<i32>().ok())
-            .and_then(|v| NDDataType::from_ordinal(v as u8));
-
-        let data_type = recorded.unwrap_or(match element_size {
-            1 => NDDataType::UInt8,
-            2 => NDDataType::UInt16,
-            4 => NDDataType::Float32,
-            8 => NDDataType::Float64,
-            other => {
-                return Err(ADError::UnsupportedConversion(format!(
-                    "unsupported NeXus element size {}",
-                    other
-                )));
-            }
-        });
-
-        macro_rules! read_typed {
-            ($t:ty, $variant:ident) => {{
-                let data = ds.read_raw::<$t>().map_err(|e| {
-                    ADError::UnsupportedConversion(format!("NeXus read error: {}", e))
-                })?;
-                let mut arr = NDArray::new(dims, data_type);
-                arr.data = NDDataBuffer::$variant(data);
-                return Ok(arr);
-            }};
-        }
-
-        match data_type {
-            NDDataType::Int8 => read_typed!(i8, I8),
-            NDDataType::UInt8 => read_typed!(u8, U8),
-            NDDataType::Int16 => read_typed!(i16, I16),
-            NDDataType::UInt16 => read_typed!(u16, U16),
-            NDDataType::Int32 => read_typed!(i32, I32),
-            NDDataType::UInt32 => read_typed!(u32, U32),
-            NDDataType::Int64 => read_typed!(i64, I64),
-            NDDataType::UInt64 => read_typed!(u64, U64),
-            NDDataType::Float32 => read_typed!(f32, F32),
-            NDDataType::Float64 => read_typed!(f64, F64),
-        }
+        Err(ADError::UnsupportedConversion(
+            "NDFileNexus cannot read".into(),
+        ))
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -1111,6 +1040,7 @@ impl NDPluginProcess for NexusFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDimension;
 
     fn temp_path(prefix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1122,6 +1052,28 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` refuses NDFileModeRead (NDFileNexus.cpp:45), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("nexus_read_refused");
+        let mut writer = NexusWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = NexusFileProcessor::new();
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1139,7 +1091,9 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1179,7 +1133,13 @@ mod tests {
             }
         }
 
-        writer.open_file(&path, NDFileMode::Stream, &arr1).unwrap();
+        writer
+            .open_file(
+                &path,
+                NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                &arr1,
+            )
+            .unwrap();
         writer.write_file(&Arc::new(arr1)).unwrap();
         writer.write_file(&Arc::new(arr2)).unwrap();
         writer.close_file().unwrap();
@@ -1222,7 +1182,9 @@ mod tests {
         a2.unique_id = 11;
         a2.time_stamp = 2.5;
 
-        writer.open_file(&path, NDFileMode::Stream, &a1).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE, &a1)
+            .unwrap();
         writer.write_file(&Arc::new(a1)).unwrap();
         writer.write_file(&Arc::new(a2)).unwrap();
         writer.close_file().unwrap();
@@ -1296,7 +1258,9 @@ mod tests {
                 *x = i as u8;
             }
         }
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1476,7 +1440,9 @@ mod tests {
         };
 
         let a0 = mk(0);
-        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE, &a0)
+            .unwrap();
         writer.write_file(&Arc::new(a0)).unwrap();
         writer.write_file(&Arc::new(mk(100))).unwrap();
         writer.close_file().unwrap();
@@ -1515,7 +1481,9 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = arr.data {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
-        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
@@ -1539,10 +1507,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// C records no NDArray data type attribute on the data (NDFileNexus.cpp
+    /// writes only the template's attributes).
     #[test]
-    fn test_read_file_roundtrips_all_data_types() {
-        // N4: every NDArray data type must round-trip through read_file,
-        // not just u8/u16/f64.
+    fn the_data_carries_no_data_type_attribute() {
+        let path = temp_path("nexus_no_dtype");
+        let mut writer = NexusWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(2)],
+            NDDataType::Int16,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        let data_path = format!("{}/{}", writer.data_group_path, writer.data_node_name);
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset(&data_path).unwrap().attr_names().unwrap();
+        assert!(!names.iter().any(|n| n == "NDArrayDataType"), "{names:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn every_data_type_is_stored_as_its_native_type() {
+        // N4: every NDArray data type must round-trip, not just u8/u16/f64.
         use ad_core_rs::ndarray::NDDataType::*;
         for dt in [
             Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float32, Float64,
@@ -1564,22 +1553,22 @@ mod tests {
                 NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
             }
 
-            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer
+                .open_file(&path, NDFileOpenMode::WRITE, &arr)
+                .unwrap();
             writer.write_file(&Arc::new(arr.clone())).unwrap();
+            let data_path = format!("{}/{}", writer.data_group_path, writer.data_node_name);
             writer.close_file().unwrap();
 
-            let mut reader = NexusWriter::new();
-            reader.current_path = Some(path.clone());
-            let read = reader
-                .read_file()
-                .unwrap_or_else(|e| panic!("{:?} read failed: {}", dt, e));
-            assert_eq!(read.data.data_type(), dt, "{:?}: type must round-trip", dt);
+            let h5 = H5File::open(&path).unwrap();
+            let read = crate::test_util::read_native(&h5.dataset(&data_path).unwrap(), None);
+            assert_eq!(read.data_type(), dt, "{:?}: type must round-trip", dt);
             // Leading frame dim [1] + 2x2 => 3 dims, 4 elements.
-            assert_eq!(read.data.len(), 4, "{:?}: element count", dt);
+            assert_eq!(read.len(), 4, "{:?}: element count", dt);
             for i in 0..4 {
                 assert_eq!(
                     arr.data.get_as_f64(i),
-                    read.data.get_as_f64(i),
+                    read.get_as_f64(i),
                     "{:?}: element {} must round-trip",
                     dt,
                     i

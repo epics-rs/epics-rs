@@ -197,7 +197,7 @@ struct UpstreamSubscription {
     /// `asg`/`asl` capture that left hooks enforcing the identity
     /// resolved at first subscription forever.
     acl: PvAclCell,
-    /// The [`ChannelEventOwner`] task. Aborted on drop (when the
+    /// The `ChannelEventOwner` task. Aborted on drop (when the
     /// subscription is removed via `unsubscribe`).
     channel_events: AbortOnDrop,
     /// The shadow PV's life, which the forwarding tasks follow.
@@ -3051,7 +3051,6 @@ ASG(NewGroup) {
             .expect("gate sender kept");
         let hook = db
             .find_pv(name)
-            .await
             .expect("the shadow PV is registered before the watcher")
             .access_hook()
             .expect("shadow PV carries the access hook");
@@ -3256,7 +3255,7 @@ ASG(NewGroup) {
         // Without this guard the test would pass vacuously if the seed ever
         // silently succeeded (the units would already be present).
         {
-            let pv = db.find_pv(name).await.expect("shadow registered");
+            let pv = db.find_pv(name).expect("shadow registered");
             let immediate = pv
                 .snapshot()
                 .display
@@ -3278,7 +3277,7 @@ ASG(NewGroup) {
         let mut units = String::new();
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(pv) = db.find_pv(name).await {
+            if let Some(pv) = db.find_pv(name) {
                 if let Some(d) = pv.snapshot().display {
                     let u = d.units.to_string();
                     if !u.is_empty() {
@@ -3340,13 +3339,13 @@ ASG(NewGroup) {
         // The downstream-facing entry is keyed by the alias the client
         // searched for — this is the FR-2 fix.
         assert!(
-            db.find_pv(served).await.is_some(),
+            db.find_pv(served).is_some(),
             "shadow PV must be registered under the served (alias) name"
         );
         // The real upstream name is NOT exposed downstream (the client
         // never learns it; only the alias is served).
         assert!(
-            db.find_pv(real).await.is_none(),
+            db.find_pv(real).is_none(),
             "real upstream name must not be a downstream entry"
         );
         // Subscription dedup also keys on the served name.
@@ -3394,7 +3393,7 @@ ASG(NewGroup) {
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
-        assert!(db.find_pv(name).await.is_some(), "served == real registers");
+        assert!(db.find_pv(name).is_some(), "served == real registers");
         assert!(mgr.is_subscribed(name), "subscription tracked under name");
 
         mgr.shutdown().await;
@@ -3440,7 +3439,7 @@ ASG(NewGroup) {
         mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("upstream connects");
-        let shadow = db.find_pv(name).await.expect("shadow PV registered");
+        let shadow = db.find_pv(name).expect("shadow PV registered");
         assert!(!shadow.is_destroyed(), "live upstream, live shadow PV");
 
         // Retire the PV upstream. The gateway's own CA channel dies exactly
@@ -3455,7 +3454,7 @@ ASG(NewGroup) {
         // gone AND the object the downstream channels hold is destroyed.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if db.find_pv(name).await.is_none() {
+            if db.find_pv(name).is_none() {
                 break;
             }
             assert!(
@@ -3484,7 +3483,7 @@ ASG(NewGroup) {
             .expect("upstream PV comes back");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let revived = loop {
-            if let Some(pv) = db.find_pv(name).await {
+            if let Some(pv) = db.find_pv(name) {
                 break pv;
             }
             assert!(
@@ -3540,7 +3539,7 @@ ASG(NewGroup) {
         mgr.ensure_subscribed(name.as_bytes(), name.as_bytes(), None, 0)
             .await
             .expect("connects");
-        let upstream = upstream_db.find_pv(name).await.expect("upstream PV");
+        let upstream = upstream_db.find_pv(name).expect("upstream PV");
 
         // With a monitor that is released while the PV is dead.
         mgr.ensure_monitor(name.as_bytes());
@@ -3553,7 +3552,7 @@ ASG(NewGroup) {
             let db = db.clone();
             async move {
                 let deadline = std::time::Instant::now() + Duration::from_secs(15);
-                while db.find_pv(name).await.is_some() != live {
+                while db.find_pv(name).is_some() != live {
                     assert!(std::time::Instant::now() < deadline, "{what}");
                     epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
                 }
@@ -3582,7 +3581,7 @@ ASG(NewGroup) {
             .await
             .expect("upstream back");
         wait_for(true, "revival with no monitor").await;
-        let revived = db.find_pv(name).await.expect("revived");
+        let revived = db.find_pv(name).expect("revived");
         assert_eq!(
             revived.snapshot().value,
             EpicsValue::Double(7.0),
@@ -3642,7 +3641,6 @@ ASG(NewGroup) {
         };
         let shadow_units = |db: Arc<PvDatabase>| async move {
             db.find_pv(name)
-                .await
                 .and_then(|pv| pv.snapshot().display)
                 .map(|d| d.units.to_string())
         };
@@ -3678,7 +3676,7 @@ ASG(NewGroup) {
         assert_eq!(shadow_units(db.clone()).await.as_deref(), Some("mm"));
         mgr.ensure_prop_monitor(name.as_bytes());
         if !start_late {
-            let first = upstream_db.find_pv(name).await.expect("upstream PV");
+            let first = upstream_db.find_pv(name).expect("upstream PV");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while first.subscriber_count() < armed {
                 assert!(
@@ -3694,7 +3692,7 @@ ASG(NewGroup) {
             .await
             .expect("upstream PV");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while db.find_pv(name).await.is_some() {
+        while db.find_pv(name).is_some() {
             assert!(std::time::Instant::now() < deadline, "upstream death");
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
@@ -3713,7 +3711,7 @@ ASG(NewGroup) {
             .set_pv_metadata(name, &units_of("cm"))
             .await
             .expect("upstream metadata");
-        let returned = upstream_db.find_pv(name).await.expect("upstream PV");
+        let returned = upstream_db.find_pv(name).expect("upstream PV");
         let channel = mgr.subs.lock()[name.as_bytes()].channel.clone();
         channel
             .wait_connected(Duration::from_secs(30))
@@ -3908,7 +3906,7 @@ ASG(NewGroup) {
             "ensure_subscribed must fail when the upstream never connects"
         );
         assert!(
-            db.find_pv(name).await.is_none(),
+            db.find_pv(name).is_none(),
             "no shadow PV may be registered for a never-connected upstream"
         );
         assert!(
@@ -3963,7 +3961,7 @@ ASG(NewGroup) {
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
-        let pv = db.find_pv(name).await.expect("shadow PV registered");
+        let pv = db.find_pv(name).expect("shadow PV registered");
         // Make the stored shadow value a sentinel the fresh fetch must
         // override — proving the GET goes upstream, not to the cache.
         pv.set(EpicsValue::Double(SENTINEL));
@@ -4018,7 +4016,7 @@ ASG(NewGroup) {
             .await
             .expect("ensure_subscribed connects to the hosted upstream");
 
-        let pv = db.find_pv(name).await.expect("shadow PV registered");
+        let pv = db.find_pv(name).expect("shadow PV registered");
 
         // The cached-mode subscribe above leaves the upstream monitor's first
         // event in flight, and the forwarding task writes it into the very

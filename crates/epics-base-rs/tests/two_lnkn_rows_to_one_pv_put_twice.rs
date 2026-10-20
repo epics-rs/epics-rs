@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::database::{LinkPutOp, LinkSet, ProcStack, PutAdmission};
+use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet, ProcStack, PutAdmission};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -15,21 +15,22 @@ struct Remote {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for Remote {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: LinkRef<'_>) -> bool {
         true
     }
-    fn put_admission(&self, _name: &[u8]) -> PutAdmission {
+    fn put_admission(&self, _name: LinkRef<'_>) -> PutAdmission {
         PutAdmission::Connected
     }
-    async fn get_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
     async fn put_value(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         _value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
+        let name = link.name;
         self.puts
             .lock()
             .unwrap()

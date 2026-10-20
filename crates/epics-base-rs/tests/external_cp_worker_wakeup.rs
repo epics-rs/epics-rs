@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -51,19 +51,23 @@ fn until(done: impl Fn() -> bool, what: &str) {
 
 #[async_trait::async_trait]
 impl LinkSet for CounterLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
 
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.value()
     }
 
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.value()
     }
 
-    async fn connect_link(&self, _: &[u8], _: Option<epics_base_rs::server::database::CaLinkInit>) {
+    async fn connect_link(
+        &self,
+        _: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
     }
 }
 
@@ -93,11 +97,18 @@ async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
 }
 
 /// `HOLDER`'s database with a worker for `UP:PV` on a thread of its own;
+/// The process of `HOLDER`'s INP link, the one its worker processes for.
+fn holder_process(db: &PvDatabase) -> ExternalCpProcess {
+    let (_, _, inp) = db.record_link_fields("HOLDER").remove(0);
+    let inp = inp.external().unwrap();
+    ExternalCpProcess::new(LinkRef::new(inp.name, inp.open))
+}
+
 /// the worker never returns, the test process ends it.
 fn holder_with_worker(lset: &Arc<CounterLset>) -> (PvDatabase, Arc<ExternalCpProcess>) {
     let db = epics_base_rs::runtime::task::block_on_sync(holder_db(lset.clone()))
         .expect("a plain test thread");
-    let process = Arc::new(ExternalCpProcess::new("UP:PV".to_string()));
+    let process = Arc::new(holder_process(&db));
     {
         let (process, db) = (process.clone(), db.clone());
         std::thread::spawn(move || {

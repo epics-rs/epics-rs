@@ -325,10 +325,6 @@ impl NDPluginProcess for BadPixelProcessor {
         let height = info.y_size;
 
         let list = Arc::clone(&self.list.lock());
-        if list.pixels.is_empty() {
-            // No corrections needed, pass through
-            return ProcessResult::forward(array, vec![]);
-        }
 
         // C `NDPluginBadPixel.cpp:99-109` reads the detector offset/binning from
         // the axis the image info names — `pArray->dims[pArrayInfo->xDim]` and
@@ -345,8 +341,8 @@ impl NDPluginProcess for BadPixelProcessor {
             (0, 1)
         };
 
-        // C copies the input through the pool before correcting it
-        // (NDPluginBadPixel.cpp:236).
+        // C copies the input through the pool before correcting it, an empty
+        // list included (NDPluginBadPixel.cpp:236).
         let mut out = match pool.alloc_copy(array) {
             Ok(out) => out,
             Err(e) => {
@@ -752,7 +748,10 @@ mod tests {
         let result = proc.process_array(&arr, &pool);
 
         assert_eq!(result.output_arrays.len(), 1);
-        assert!(Arc::ptr_eq(&result.output_arrays[0], &arr));
+        // C copies the input into its own pool with or without bad pixels
+        // (:236), which is the buffer an AC0 plugin keeps cached.
+        assert!(!Arc::ptr_eq(&result.output_arrays[0], &arr));
+        assert_eq!(result.output_arrays[0].pool_id(), pool.id());
         for iy in 0..4 {
             for ix in 0..4 {
                 let expected = (ix + iy * 4) as f64;

@@ -4,7 +4,7 @@
 //! `SaveSetConfig::request_file` is `Option<PathBuf>`, and the `None` had
 //! two meanings: "this set has no request file, its members are
 //! `request_pvs`" and "this set named one, but it could not be found".
-//! `AutosaveStartupConfig::into_builder` produced the second by
+//! The startup config's set builder produced the second by
 //! pre-resolving the name and dropping the failure, so a typo'd
 //! `create_monitor_set("auto_setting.req", 5)` built a set with zero
 //! entries. `SaveSet::save_once` then rotated the good `.sav` into `.savB`,
@@ -21,23 +21,47 @@
 //! machine, so these pin the port's own stated invariant.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveManager;
 use epics_base_rs::server::autosave::save_set::SaveSetStatus;
-use epics_base_rs::server::autosave::startup::{
-    SetDef, monitor_method, period_arg, triggered_method,
-};
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext};
 
 /// A `.sav` from a previous run: real values, and a valid `<END>`.
 const GOOD_SAV: &str = "# autosave-rs V1.0\nIOC:setpoint 42.5\nIOC:enable 1\n<END>\n";
 
-fn monitor_set(filename: &str) -> SetDef {
-    SetDef::new(
-        filename.to_string(),
-        String::new(),
-        monitor_method(period_arg(5)),
-    )
+/// Run `cmd(args)` on `cfg` on a plain thread, as the shell does, and
+/// return the manager the first `create_*_set` started.
+fn run(cfg: AutosaveStartupConfig, lines: &[(&str, &str, ArgValue)]) -> Arc<AutosaveManager> {
+    let holder = Arc::new(Mutex::new(cfg));
+    let cmds = AutosaveStartupConfig::register_startup_commands(holder.clone());
+    let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    let lines: Vec<(String, Vec<ArgValue>)> = lines
+        .iter()
+        .map(|(cmd, file, arg)| {
+            let args = vec![ArgValue::String((*file).into()), arg.clone()];
+            (cmd.to_string(), args)
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+        for (cmd, args) in lines {
+            let def = cmds.iter().find(|c| c.name == cmd).expect("registered");
+            def.handler
+                .call(&args, &ctx)
+                .expect("C's command never fails");
+        }
+    })
+    .join()
+    .unwrap();
+    let mgr = holder.lock().unwrap().manager.clone();
+    mgr.expect("started")
+}
+
+fn monitor_set(filename: &str) -> (&str, &str, ArgValue) {
+    ("create_monitor_set", filename, ArgValue::Int(5))
 }
 
 /// A startup config whose request-file search path and save-file directory
@@ -61,10 +85,8 @@ async fn assert_not_kept(mgr: &AutosaveManager) {
 #[epics_macros_rs::epics_test]
 async fn a_monitor_set_naming_a_missing_request_file_does_not_build() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut cfg, sav) = config_with_good_sav(dir.path(), "auto_settings");
-    cfg.sets.push(monitor_set("auto_settings.req"));
-
-    let mgr = cfg.into_builder().build().await;
+    let (cfg, sav) = config_with_good_sav(dir.path(), "auto_settings");
+    let mgr = run(cfg, &[monitor_set("auto_settings.req")]);
     assert_not_kept(&mgr).await;
     assert_eq!(
         std::fs::read_to_string(&sav).unwrap(),
@@ -78,14 +100,9 @@ async fn a_monitor_set_naming_a_missing_request_file_does_not_build() {
 #[epics_macros_rs::epics_test]
 async fn a_triggered_set_naming_a_missing_request_file_does_not_build() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut cfg, sav) = config_with_good_sav(dir.path(), "trig");
-    cfg.sets.push(SetDef::new(
-        "trig.req".to_string(),
-        String::new(),
-        triggered_method("IOC:saveTrigger".to_string()),
-    ));
-
-    let mgr = cfg.into_builder().build().await;
+    let (cfg, sav) = config_with_good_sav(dir.path(), "trig");
+    let trigger = ArgValue::String("IOC:saveTrigger".into());
+    let mgr = run(cfg, &[("create_triggered_set", "trig.req", trigger)]);
     assert_not_kept(&mgr).await;
     assert_eq!(std::fs::read_to_string(&sav).unwrap(), GOOD_SAV);
 }
@@ -95,12 +112,12 @@ async fn a_triggered_set_naming_a_missing_request_file_does_not_build() {
 #[epics_macros_rs::epics_test]
 async fn a_missing_request_file_costs_only_its_own_set() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut cfg, sav) = config_with_good_sav(dir.path(), "present");
+    let (cfg, sav) = config_with_good_sav(dir.path(), "present");
     std::fs::write(dir.path().join("present.req"), "IOC:setpoint\n").unwrap();
-    cfg.sets.push(monitor_set("present.req"));
-    cfg.sets.push(monitor_set("absent.req"));
-
-    let mgr = cfg.into_builder().build().await;
+    let mgr = run(
+        cfg,
+        &[monitor_set("present.req"), monitor_set("absent.req")],
+    );
     assert_eq!(mgr.set_names(), vec!["present.req".to_string()]);
     let statuses = mgr.status_all().await;
     assert_eq!(statuses.len(), 1, "C keeps no list for absent.req");
@@ -113,11 +130,9 @@ async fn a_missing_request_file_costs_only_its_own_set() {
 #[epics_macros_rs::epics_test]
 async fn a_resolvable_request_file_still_builds_with_its_members() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut cfg, _sav) = config_with_good_sav(dir.path(), "present");
+    let (cfg, _sav) = config_with_good_sav(dir.path(), "present");
     std::fs::write(dir.path().join("present.req"), "IOC:setpoint\nIOC:enable\n").unwrap();
-    cfg.sets.push(monitor_set("present.req"));
-
-    let mgr = cfg.into_builder().build().await;
+    let mgr = run(cfg, &[monitor_set("present.req")]);
     let sets = mgr.sets();
     assert_eq!(sets.len(), 1);
     assert_eq!(

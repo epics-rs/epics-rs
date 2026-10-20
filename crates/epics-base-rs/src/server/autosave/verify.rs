@@ -4,7 +4,6 @@
 
 use std::path::Path;
 
-use crate::calc::engine::cvt::{fmt_f, fmt_g};
 use crate::calc::engine::string::{escaped_from_raw, raw_from_escaped};
 use crate::runtime::stdlib::strtod;
 use crate::server::database::{ClientChannel, Connection, PvDatabase};
@@ -12,6 +11,7 @@ use crate::server::record::record_instance::value_as_dbr_string;
 use crate::types::{
     DBR_CHAR, DBR_DOUBLE, DBR_FLOAT, DBR_SHORT, DBR_STRING, DbFieldType, EpicsValue,
 };
+use epics_libcom_rs::cfmt::CFloat;
 
 /// `save_restore.h` `BUF_SIZE`: what one `fgets` reads.
 const BUF_SIZE: usize = 200;
@@ -70,7 +70,7 @@ fn atof(s: &[u8]) -> f64 {
 }
 
 /// `safeDoubleToFloat` (verify.c:454-470).
-fn safe_double_to_float(d: f64) -> f32 {
+pub(super) fn safe_double_to_float(d: f64) -> f32 {
     let abs = d.abs();
     if d == 0.0 {
         0.0
@@ -468,11 +468,11 @@ pub async fn do_as_verify(
                                 "{}{} {} {}",
                                 prefix(different > 0),
                                 left(&pv, 25),
-                                left(&fmt_f(narrow(atof(&value)), 6), 25),
-                                fmt_f(live[0], 6)
+                                left(&CFloat(narrow(atof(&value))).to_string(), 25),
+                                CFloat(live[0])
                             );
                         } else if different > 0 {
-                            println!("{}, maxDiff={}", array_diffs(different), fmt_f(max_diff, 6));
+                            println!("{}, maxDiff={}", array_diffs(different), CFloat(max_diff));
                         } else {
                             println!("{}", array_diffs(different));
                         }
@@ -481,7 +481,8 @@ pub async fn do_as_verify(
                     mismatch(if float { "asVerify: " } else { "" });
                 }
                 if trial.is_some() {
-                    let g = |v: f64| fmt_g(v, if float { 7 } else { 14 }, false, false);
+                    let p = if float { 7 } else { 14 };
+                    let g = |v: f64| format!("{:.p$}", CFloat(v).g());
                     if is_scalar {
                         fr.push_str(&format!("{pv} {}\n", g(live[0])));
                     } else {

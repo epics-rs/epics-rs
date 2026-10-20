@@ -129,6 +129,9 @@ pub struct ServerReportHandle {
     /// pvxs `operator<<(Server::config())` text of the bound server.
     pub(crate) pvxs_config: Arc<str>,
     pub(crate) peers: Arc<super::peers::PeerRegistry>,
+    /// The `__builtin` store, there from the bind as pvxs's
+    /// (`server.cpp:542`).
+    pub(crate) builtin: Arc<super::SharedSource>,
     /// `None` for a bound server that serves nothing yet.
     pub(crate) running: Option<Running>,
 }
@@ -186,13 +189,60 @@ impl ServerReportHandle {
     }
 
     /// pvxs's `Server` source map as `(name, order)`, in consultation
-    /// order. Before the start only the server's own source, which pvxs's
+    /// order. Before the start only the server's own sources, which pvxs's
     /// constructor adds (`server.cpp:542-547`) and `start` always composes.
     pub fn source_list(&self) -> Vec<(String, i32)> {
         match &self.running {
-            Some(r) => r.source.registry_entries().unwrap_or_default(),
-            None => vec![(super::server_info::SERVER_SOURCE_NAME.to_owned(), -1)],
+            Some(r) => r
+                .source
+                .registry_entries()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| (e.name, e.order))
+                .collect(),
+            None => super::server_info::INTERNAL_SOURCES
+                .map(|name| (name.to_owned(), -1))
+                .into(),
         }
+    }
+
+    /// [`Self::source_list`] with each source's
+    /// [`show`](super::ChannelSource::show), which `pvxsr` prints from
+    /// detail 1 (`src/server.cpp:297-302`).
+    pub fn source_shows(&self) -> Vec<(String, i32, super::SourceShow)> {
+        match &self.running {
+            Some(r) => {
+                let mut shows = Vec::new();
+                for e in r.source.registry_entries().unwrap_or_default() {
+                    let show = e.source.show();
+                    shows.push((e.name, e.order, show));
+                }
+                shows
+            }
+            None => {
+                let [builtin, server] = super::server_info::INTERNAL_SOURCES;
+                // `ServerSource` lists nothing, so the base `show` prints
+                // only its kind.
+                let server_show = super::SourceShow {
+                    kind: "Source",
+                    names: Vec::new(),
+                    nested: true,
+                };
+                vec![
+                    (
+                        builtin.to_owned(),
+                        -1,
+                        super::ChannelSource::show(&*self.builtin),
+                    ),
+                    (server.to_owned(), -1, server_show),
+                ]
+            }
+        }
+    }
+
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`.
+    pub fn builtin(&self) -> &Arc<super::SharedSource> {
+        &self.builtin
     }
 }
 

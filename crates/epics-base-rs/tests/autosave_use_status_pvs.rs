@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveBuilder;
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
@@ -59,7 +59,7 @@ async fn run(at_start: i32, later: i32) -> [(String, String, String); 2] {
                     request_pvs: vec!["T:SAVED".into()],
                     backup: BackupConfig { enable_savb: false },
                     macros: HashMap::new(),
-                    macro_string: String::new(),
+                    macro_string: None,
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::Manual,
@@ -67,10 +67,7 @@ async fn run(at_start: i32, later: i32) -> [(String, String, String); 2] {
             .build()
             .await,
     );
-    let handle = mgr
-        .clone()
-        .start(&Reactor::current().unwrap(), db.clone())
-        .unwrap();
+    let handle = mgr.clone().start(db.clone()).unwrap();
     let read = || {
         (
             text(&db, "T:SR_rebootStatusStr"),

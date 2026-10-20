@@ -27,7 +27,7 @@ async fn saved_twice(sav: &Path, settings: SrSettings, before: impl Fn()) {
             request_pvs: vec!["PV1".into()],
             backup: BackupConfig { enable_savb: true },
             macros: Default::default(),
-            macro_string: String::new(),
+            macro_string: None,
             search_paths: Vec::new(),
         },
         Arc::new(settings),

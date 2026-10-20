@@ -157,20 +157,20 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
 /// reconnect arm, not a disconnect gate.
 fn inp_disconnect_scan(
     connected: &AtomicBool,
-    disconnect_time: &Mutex<Option<(i64, i32)>>,
+    snaps: &Mutex<Snaps>,
     tx: &mpsc::Sender<ScanEvent>,
     overrun: &ScanOverrun,
 ) {
     if !connected.swap(false, Ordering::AcqRel) {
         return;
     }
-    // Capture the disconnect-event time so a `time=true` link adopts it
-    // (not the stale last value's time, nor local processing time) while
-    // disconnected — pvxs `snap_time = e.time` in `onDisconnect`
-    // (`pvxs/ioc/pvalink_channel.cpp:372`). We have no client-supplied exception
-    // time, so the observation moment (now) is the closest analogue.
+    // pvxs `snap_time = e.time` (`pvxs/ioc/pvalink_channel.cpp:372`). We have
+    // no client-supplied exception time, so the observation moment (now) is
+    // the closest analogue.
     if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        *disconnect_time.lock() = Some((dur.as_secs() as i64, dur.subsec_nanos() as i32));
+        snaps
+            .lock()
+            .disconnect((dur.as_secs() as i64, dur.subsec_nanos() as i32));
     }
     // Notify the scan forwarder of the lifecycle transition so CP /
     // passive-CPP targets process and expose LINK_ALARM/INVALID even
@@ -182,6 +182,64 @@ fn inp_disconnect_scan(
     // payload-less, so the forwarder still reads `is_connected() == false`
     // and raises LINK_ALARM/INVALID on the CP/CPP targets.
     enqueue_scan_trigger(tx, overrun, ScanEvent::Disconnected);
+}
+
+/// pvxs `pvaLink`'s `snap_severity` / `snap_message` / `snap_time` /
+/// `snap_tag` (`pvxs/ioc/pvalink.h:248-251`), which the alarm and timestamp
+/// getters report: a value read latches them (`pvalink_lset.cpp:396-422`)
+/// and a disconnect sets every link's time (`pvalink_channel.cpp:370-373`).
+///
+/// Keyed by the selected field root (`""` = top level) because one shared
+/// `PvaLink` serves sibling DB links that differ in `.field` (the registry
+/// keys on `(pv, pipeline, Q)`, not field), and pvxs reads the snapshot at
+/// `root[fieldName]`. A field with no entry holds pvxs's initial snapshot,
+/// `INVALID_ALARM` and blank, with the last disconnect's time.
+#[derive(Default)]
+struct Snaps {
+    fields: HashMap<String, Snap>,
+    disconnected_at: Option<(i64, i32)>,
+}
+
+struct Snap {
+    severity: i32,
+    message: Arc<str>,
+    time: (i64, i32),
+    tag: u64,
+}
+
+/// pvxs's initial `snap_time = {}`, the EPICS epoch, as `(seconds past the
+/// POSIX epoch, nanoseconds)`.
+pub(crate) const NO_TIME: (i64, i32) = (
+    epics_base_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS as i64,
+    0,
+);
+
+impl Snaps {
+    fn alarm(&self, field: &str) -> (i32, Arc<str>) {
+        // pvxs initial `snap_severity` (`pvxs/ioc/pvalink.h:250`).
+        const INVALID_ALARM: i32 = 3;
+        self.fields.get(field).map_or_else(
+            || (INVALID_ALARM, no_text()),
+            |snap| (snap.severity, snap.message.clone()),
+        )
+    }
+
+    fn stamp(&self, field: &str) -> (i64, i32, u64) {
+        match self.fields.get(field) {
+            Some(snap) => (snap.time.0, snap.time.1, snap.tag),
+            None => {
+                let (secs, nsec) = self.disconnected_at.unwrap_or(NO_TIME);
+                (secs, nsec, 0)
+            }
+        }
+    }
+
+    fn disconnect(&mut self, time: (i64, i32)) {
+        for snap in self.fields.values_mut() {
+            snap.time = time;
+        }
+        self.disconnected_at = Some(time);
+    }
 }
 
 /// A live PVA link.
@@ -263,41 +321,15 @@ pub struct PvaLink {
     /// (pvxs replays the queued put on the client reconnect event,
     /// `pvalink.rst:99-100`).
     retry_pending: AtomicBool,
-    /// `(seconds_past_epoch, nanoseconds)` captured at the moment the
-    /// INP monitor subscription last dropped — pvxs `snap_time = e.time`
-    /// set in `onDisconnect` (`pvxs/ioc/pvalink_channel.cpp:372`). A `time=true`
-    /// link in the disconnected-stale state adopts THIS into the owning
-    /// record's time, not the stale last-value timestamp and not local
-    /// processing time, mirroring pvxs `pvaGetValue` copying `snap_time`
-    /// on the invalid read (`pvxs/ioc/pvalink_lset.cpp:268-270`). `None` until the
-    /// first disconnect; shared with the monitor task, so it is an `Arc`.
-    disconnect_time: Arc<Mutex<Option<(i64, i32)>>>,
     /// Coalescing overrun accounting for the scan-trigger queue. Shared
     /// with the monitor task (producer, marks on a full queue) and the
     /// scan forwarder (consumer, drains the owed scan), so a full local
     /// queue coalesces to `latest` + an overrun marker rather than
     /// silently dropping a CP/CPP scan. `Arc` because it is shared.
     scan_overrun: Arc<ScanOverrun>,
-    /// Value-read-latched remote alarm snapshot, keyed by the selected
-    /// field root (`""` = top level). pvxs `pvaLink` keeps a
-    /// `snap_severity` / `snap_message` pair initialized to
-    /// `INVALID_ALARM` / blank and updated ONLY by `pvaGetValue` on a
-    /// connected value read (`pvxs/ioc/pvalink.h:250`,
-    /// `pvxs/ioc/pvalink_lset.cpp:412-422`). The ungated DB-link alarm inspection
-    /// ([`Self::remote_alarm_snapshot`], the `dbGetAlarm` /
-    /// `dbGetAlarmMsg` analog) reports THIS latched value, not the live
-    /// cached monitor alarm — so a connected link reports the initial
-    /// INVALID/blank until the first value read, exactly like pvxs
-    /// `dbGetAlarm` before the first `dbGetLink`
-    /// (`pvxs/test/testpvalink.cpp:373-375`).
-    ///
-    /// Keyed by field because one shared `PvaLink` serves sibling DB
-    /// links that differ in `.field` (the registry keys on
-    /// `(pv, pipeline, Q)`, not field), and pvxs resolves the alarm at
-    /// `root[fieldName]` — each field root carries its own alarm, so each
-    /// gets its own latch. An absent entry is the pvxs initial
-    /// `INVALID_ALARM` / blank snapshot.
-    snap_alarm: Mutex<HashMap<String, (i32, Arc<str>)>>,
+    /// What the last value read latched. Shared with the monitor task,
+    /// whose disconnect writes the time.
+    snaps: Arc<Mutex<Snaps>>,
 }
 
 /// The blank remote message, shared so a snapshot without one allocates
@@ -380,7 +412,7 @@ impl PvaLink {
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("PvaLink::open is awaited on the IOC's reactor");
         let latest = Arc::new(Mutex::new(None));
-        let disconnect_time: Arc<Mutex<Option<(i64, i32)>>> = Arc::new(Mutex::new(None));
+        let snaps: Arc<Mutex<Snaps>> = Arc::default();
         let scan_overrun = Arc::new(ScanOverrun::default());
         let mut notify_rx = None;
         let mut monitor_abort = None;
@@ -404,7 +436,7 @@ impl PvaLink {
             let connected = Arc::new(AtomicBool::new(false));
             let connected_for_task = connected.clone();
             monitor_connected = Some(connected);
-            let disconnect_time_task = disconnect_time.clone();
+            let snaps_task = snaps.clone();
             let scan_overrun_task = scan_overrun.clone();
             // B4-pipeline / B4-Q: when the link asks for pipeline
             // flow-control or a non-default queue depth, build a
@@ -430,7 +462,7 @@ impl PvaLink {
                     let connected_disc = connected_for_task.clone();
                     let overrun_inner = scan_overrun_task.clone();
                     let overrun_disc = scan_overrun_task.clone();
-                    let disconnect_time_ev = disconnect_time_task.clone();
+                    let snaps_ev = snaps_task.clone();
                     // pvxs's pvalink channel is driven by the monitor's
                     // event stream: `Connected` / value updates / the
                     // `catch(client::Disconnect&)` branch
@@ -475,7 +507,7 @@ impl PvaLink {
                         MonitorEvent::Disconnected | MonitorEvent::Finished => {
                             inp_disconnect_scan(
                                 &connected_disc,
-                                &disconnect_time_ev,
+                                &snaps_ev,
                                 &tx_disc,
                                 &overrun_disc,
                             );
@@ -499,12 +531,7 @@ impl PvaLink {
                     // because it is gated on the prior `connected` state,
                     // so a `Disconnected` event already handled above does
                     // not scan twice here.
-                    inp_disconnect_scan(
-                        &connected_for_task,
-                        &disconnect_time_task,
-                        &tx,
-                        &scan_overrun_task,
-                    );
+                    inp_disconnect_scan(&connected_for_task, &snaps_task, &tx, &scan_overrun_task);
                     match &result {
                         Ok(()) => tracing::debug!(
                             pv = %pv_name,
@@ -616,9 +643,8 @@ impl PvaLink {
             monitor_connected,
             notify_rx: Mutex::new(notify_rx),
             out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
+            snaps,
             retry_pending: AtomicBool::new(false),
-            disconnect_time,
             scan_overrun,
             _monitor_abort: monitor_abort,
         })
@@ -679,8 +705,8 @@ impl PvaLink {
         // read; surface a failed read so the lset's `get_value`
         // returns `None` and base processing raises LINK_ALARM/INVALID,
         // instead of handing back a stale value as if it were fresh.
-        // The `latest` slot is still retained for the diagnostic /
-        // timestamp accessors (`latest_value`, `time_stamp`). Mirrors
+        // The `latest` slot is still retained for the diagnostic
+        // accessor (`latest_value`). Mirrors
         // pvxs `pvaGetValue`'s `!self->valid()` gate
         // (pvxs/ioc/pvalink_lset.cpp:259-272), which returns failure while
         // disconnected and does NOT fall back to a one-shot GET.
@@ -696,7 +722,7 @@ impl PvaLink {
                     // value-read latch: pvxs `pvaGetValue` copies the live
                     // `fld_severity` / `fld_message` into the snapshot on
                     // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
-                    self.latch_alarm_snapshot(field, v);
+                    self.latch_snapshot(field, v);
                     Ok(select_link_value(v, field).clone())
                 }
                 // Connected flag set but the first event has not yet
@@ -748,7 +774,7 @@ impl PvaLink {
         let v = cached.as_ref()?;
         // value-read latch — same as `read_with_field` (pvxs
         // `pvaGetValue` snapshot, `pvxs/ioc/pvalink_lset.cpp:412-422`).
-        self.latch_alarm_snapshot(field, v);
+        self.latch_snapshot(field, v);
         Some(read(select_link_value(v, field)))
     }
 
@@ -1195,12 +1221,10 @@ impl PvaLink {
         (severity, message)
     }
 
-    /// Latch the remote alarm snapshot for `field` from the value being
-    /// read. The Rust counterpart of pvxs `pvaGetValue` copying the live
-    /// `fld_severity` / `fld_message` into `snap_severity` /
-    /// `snap_message` (`pvxs/ioc/pvalink_lset.cpp:412-422`): the ungated
-    /// DB-link alarm inspection ([`Self::remote_alarm_snapshot`]) reports
-    /// THIS latched snapshot, not the live cached monitor alarm — so a
+    /// Latch `field`'s snapshot from the value being read: pvxs
+    /// `pvaGetValue` copying `fld_*` into `snap_*` on every connected read
+    /// (`pvxs/ioc/pvalink_lset.cpp:396-422`). The alarm and timestamp getters
+    /// report THIS, not the live cached monitor value — so a
     /// connected-but-never-read link reports the initial INVALID/blank
     /// exactly like pvxs `dbGetAlarm` before the first `dbGetLink`
     /// (`pvxs/test/testpvalink.cpp:373-375`). Called from the value-read
@@ -1208,13 +1232,26 @@ impl PvaLink {
     /// on a connected read. Reuses the existing key and the held message in
     /// steady state, so a hot read allocates only when the remote message
     /// text changes.
-    fn latch_alarm_snapshot(&self, field: &str, value: &PvField) {
+    fn latch_snapshot(&self, field: &str, value: &PvField) {
         let (severity, message) = Self::alarm_from_value(value, field);
-        let mut g = self.snap_alarm.lock();
-        match g.get_mut(field) {
-            Some(slot) => *slot = (severity, shared_text(Some(&slot.1), &message)),
+        let (time, tag) = Self::stamp_from_value(value, field);
+        let mut g = self.snaps.lock();
+        match g.fields.get_mut(field) {
+            Some(snap) => {
+                snap.message = shared_text(Some(&snap.message), &message);
+                snap.severity = severity;
+                snap.time = time;
+                snap.tag = tag;
+            }
             None => {
-                g.insert(field.to_string(), (severity, shared_text(None, &message)));
+                let message = shared_text(None, &message);
+                let snap = Snap {
+                    severity,
+                    message,
+                    time,
+                    tag,
+                };
+                g.fields.insert(field.to_string(), snap);
             }
         }
     }
@@ -1234,7 +1271,7 @@ impl PvaLink {
     /// [`epics_base_rs::server::database::RemoteAlarm::from_severity_message`].
     ///
     /// Crucially it reports the value-read-LATCHED snapshot
-    /// (`Self::latch_alarm_snapshot`), not the live cached monitor
+    /// (`Self::latch_snapshot`), not the live cached monitor
     /// alarm. pvxs `snap_severity` is initialized to `INVALID_ALARM`
     /// with a blank message (`pvxs/ioc/pvalink.h:250`) and only
     /// `pvaGetValue` updates it; so a connected link that has never been
@@ -1251,18 +1288,10 @@ impl PvaLink {
         field: &str,
     ) -> Option<epics_base_rs::server::database::RemoteAlarm> {
         use epics_base_rs::server::database::RemoteAlarm;
-        // pvxs initial `snap_severity` (`pvxs/ioc/pvalink.h:250`): a
-        // connected-but-never-read link reports INVALID with a blank msg.
-        const INVALID_ALARM: i32 = 3;
         if self.monitor_disconnected_stale() || self.latest.lock().is_none() {
             return None;
         }
-        let (severity, message) = self
-            .snap_alarm
-            .lock()
-            .get(field)
-            .cloned()
-            .unwrap_or_else(|| (INVALID_ALARM, no_text()));
+        let (severity, message) = self.snaps.lock().alarm(field);
         Some(RemoteAlarm::from_severity_message(severity, message))
     }
 
@@ -1407,85 +1436,60 @@ impl PvaLink {
         // No `alarm.message` leaves pvxs's `snap_message` empty
         // (`pvalink_lset.cpp:423-427`).
         let msg = msg?;
-        let held = self.snap_alarm.lock();
-        Some(shared_text(held.get(field).map(|(_, m)| m), &msg))
+        let held = self.snaps.lock();
+        Some(shared_text(
+            held.fields.get(field).map(|snap| &snap.message),
+            &msg,
+        ))
     }
 
     /// Latest cached NT value, if any. Returned as the raw [`PvField`]
     /// so callers can pull whichever sub-field they need (alarm,
-    /// timeStamp, value, etc.). pvxs `pvaGetTimeStampTag`
-    /// (pvxs/ioc/pvalink_lset.cpp:577) lives on top of this.
+    /// timeStamp, value, etc.).
     pub fn latest_value(&self) -> Option<PvField> {
         self.latest.lock().as_deref().cloned()
     }
 
-    /// Timestamp the owning record adopts on a `time=true` read,
-    /// `(seconds, nanoseconds, userTag)`. This is the value-read
-    /// time-adoption hook (consumed by the database INP read path), the
-    /// Rust counterpart of pvxs `pvaGetValue` setting `precord->time`:
-    ///
-    /// * **Connected** — the remote NT `timeStamp` of the cached value,
-    ///   resolved at the link's selected field root
-    ///   (`pvxs/ioc/pvalink_lset.cpp:394-409`, the connected-read snapshot).
-    /// * **Disconnected-stale** — the *disconnect-event* time captured
-    ///   when the subscription dropped (pvxs `snap_time = e.time`,
-    ///   `pvxs/ioc/pvalink_channel.cpp:372`; adopted on the invalid read at
-    ///   `pvxs/ioc/pvalink_lset.cpp:268-270`). The stale last-value timestamp is
-    ///   NOT served — the record's time means "upstream link
-    ///   disconnected at this moment", not "local process ran" and not
-    ///   "the last value's time". The last value's `userTag` is kept
-    ///   alongside (pvxs leaves `snap_tag` unchanged on disconnect).
-    ///   When no disconnect was ever recorded, `None` (keep local time).
-    ///
-    /// `None` otherwise (no cached value / no timeStamp slot). The
-    /// metadata getter `pvaGetTimeStampTag` stays gated through
-    /// `CHECK_VALID` via `Self::monitor_disconnected_stale` in
-    /// [`Self::link_metadata`] — only this value-read hook adopts the
-    /// disconnect time.
+    /// pvxs `pvaGetTimeStampTag` (`pvxs/ioc/pvalink_lset.cpp:585-601`):
+    /// `field`'s snapshot, `(seconds, nanoseconds, userTag)`, while the link
+    /// is valid (`CHECK_VALID`).
     pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
-        if self.monitor_disconnected_stale() {
-            // Adopt the recorded disconnect-event time; keep the last
-            // value's userTag (read from the retained snapshot, 0 when
-            // absent). Without a recorded disconnect, keep local time.
-            let (secs, nsec) = (*self.disconnect_time.lock())?;
-            let utag = self.cached_timestamp(field).map_or(0, |(_, _, u)| u);
-            return Some((secs, nsec, utag));
-        }
-        self.cached_timestamp(field)
+        self.is_valid().then(|| self.snap_stamp(field))
     }
 
-    /// `(seconds, nanoseconds, userTag)` from the cached NT value's
-    /// `timeStamp` slot, resolved at the selected field root. The raw
-    /// connected-read snapshot used by [`Self::time_stamp`]; reads the
-    /// retained value regardless of connection state (the caller decides
-    /// whether to serve it).
-    fn cached_timestamp(&self, field: &str) -> Option<(i64, i32, u64)> {
-        let v = self.latest.lock().clone()?;
-        // Resolve `timeStamp` relative to the selected field root —
-        // pvxs reads `fld_seconds`/`fld_nanoseconds`/`fld_usertag` from
-        // the same `root[fieldName]` selected by `onTypeChange`
-        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
-        // `pvxs/ioc/pvalink_lset.cpp:399-409`).
-        let PvField::Structure(s) = select_target(&v, field) else {
-            return None;
+    /// The `snap_time` / `snap_tag` pvxs `pvaGetValue` copies into a
+    /// `time=true` link's record on every read, failed or not
+    /// (`pvxs/ioc/pvalink_lset.cpp:268-272`, `:438-442`): the last read's,
+    /// the disconnect's time once the channel drops (the tag stays), and
+    /// `{0,0}` before either.
+    pub fn snap_stamp(&self, field: &str) -> (i64, i32, u64) {
+        self.snaps.lock().stamp(field)
+    }
+
+    /// The `snap_time` / `snap_tag` pvxs latches from `value` at the selected
+    /// field root (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:396-414`): `{0,0}` without
+    /// `timeStamp.secondsPastEpoch`, and 0 for an absent nanoseconds or tag.
+    fn stamp_from_value(value: &PvField, field: &str) -> ((i64, i32), u64) {
+        let PvField::Structure(s) = select_target(value, field) else {
+            return (NO_TIME, 0);
         };
-        let ts = s.get_field("timeStamp")?;
-        let PvField::Structure(t) = ts else {
-            return None;
+        let Some(PvField::Structure(t)) = s.get_field("timeStamp") else {
+            return (NO_TIME, 0);
         };
-        let secs = match t.get_field("secondsPastEpoch")? {
-            PvField::Scalar(ScalarValue::Long(v)) => *v,
-            PvField::Scalar(ScalarValue::ULong(v)) => *v as i64,
-            _ => return None,
+        let secs = match t.get_field("secondsPastEpoch") {
+            Some(PvField::Scalar(ScalarValue::Long(v))) => Some(*v),
+            Some(PvField::Scalar(ScalarValue::ULong(v))) => Some(*v as i64),
+            _ => None,
         };
-        let nsec = match t.get_field("nanoseconds")? {
-            PvField::Scalar(ScalarValue::Int(v)) => *v,
-            PvField::Scalar(ScalarValue::UInt(v)) => *v as i32,
-            _ => return None,
-        };
-        // `pvxs/ioc/pvalink_lset.cpp:406-409` reads `timeStamp.userTag` into
-        // the snapshot tag, falling back to 0 when the field is absent
-        // (`if(self->fld_usertag) snap_tag = ...; else snap_tag = 0;`).
+        let time = secs.map_or(NO_TIME, |secs| {
+            let nsec = match t.get_field("nanoseconds") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i32,
+                _ => 0,
+            };
+            (secs, nsec)
+        });
         // The wire field is a signed int32; zero-extend (`as u32 as u64`)
         // rather than sign-extend so a bit-31 tag like 0x9000_0000 widens
         // to 0x0000_0000_9000_0000, not 0xFFFF_FFFF_9000_0000 (the
@@ -1495,7 +1499,7 @@ impl PvaLink {
             Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as u64,
             _ => 0,
         };
-        Some((secs, nsec, utag))
+        (time, utag)
     }
 
     /// Remote display / control / valueAlarm metadata snapshot for
@@ -1640,9 +1644,8 @@ impl PvaLink {
             monitor_connected: None,
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
+            snaps: Arc::default(),
             retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
             scan_overrun: Arc::new(ScanOverrun::default()),
         }
     }
@@ -1670,9 +1673,8 @@ impl PvaLink {
             monitor_connected: Some(Arc::new(AtomicBool::new(true))),
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
+            snaps: Arc::default(),
             retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
             scan_overrun: Arc::new(ScanOverrun::default()),
         }
     }
@@ -1700,9 +1702,8 @@ impl PvaLink {
             monitor_connected: Some(flag.clone()),
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
-            snap_alarm: Mutex::new(HashMap::new()),
+            snaps: Arc::default(),
             retry_pending: AtomicBool::new(false),
-            disconnect_time: Arc::new(Mutex::new(None)),
             scan_overrun: Arc::new(ScanOverrun::default()),
         };
         (link, flag)
@@ -1714,7 +1715,7 @@ impl PvaLink {
     /// transition.
     #[cfg(test)]
     pub(crate) fn record_disconnect_time_for_test(&self, secs: i64, nsec: i32) {
-        *self.disconnect_time.lock() = Some((secs, nsec));
+        self.snaps.lock().disconnect((secs, nsec));
     }
 
     /// Test-only: the monitor's delivery of `value`.
@@ -2497,6 +2498,7 @@ mod tests {
             Some("member hot"),
             "message must come from the selected member"
         );
+        link.try_read_cached_with_field("member");
         assert_eq!(
             link.time_stamp("member"),
             Some((999, 7, 5)),
@@ -2517,6 +2519,7 @@ mod tests {
             "top-level NO_ALARM under MS propagates nothing"
         );
         assert_eq!(link_top.alarm_message(), None);
+        link_top.try_read_cached_with_field("");
         assert_eq!(
             link_top.time_stamp(""),
             Some((1, 0, 0)),
@@ -3640,6 +3643,7 @@ mod tests {
         // Connected: both getters serve the cached metadata/timestamp
         // (the FR-13 gate is inert while connected).
         flag.store(true, Ordering::Release);
+        link.try_read_cached_with_field("");
         assert_eq!(
             link.time_stamp(""),
             Some((1_700_000_000, 42, 0)),
@@ -3651,16 +3655,12 @@ mod tests {
             "connected monitor surfaces the cached metadata"
         );
 
-        // Disconnected: the metadata getter refuses the stale snapshot
-        // (still gated through CHECK_VALID), and the value-read time hook
-        // refuses the stale *last value* timestamp. With no disconnect
-        // event yet recorded the time hook yields None (keep local time),
-        // never the stale remote 1_700_000_000.
+        // Disconnected: both getters refuse the stale snapshot through
+        // CHECK_VALID.
         flag.store(false, Ordering::Release);
         assert!(
             link.time_stamp("").is_none(),
-            "disconnected monitor with no recorded disconnect time keeps \
-             local time, never the stale latched remote timestamp"
+            "disconnected monitor must not serve the stale latched timestamp"
         );
         assert!(
             link.link_metadata().is_none(),
@@ -3672,16 +3672,11 @@ mod tests {
         );
 
         // Once the circuit-drop time is recorded (pvxs `snap_time =
-        // e.time`), a `time=true` read adopts THAT moment — not the
-        // stale value's 1_700_000_000 — carrying the last value's
-        // userTag (0 in this fixture). The metadata getter stays gated.
+        // e.time`), a `time=true` read writes THAT moment — not the stale
+        // value's 1_700_000_000 — while the getter stays gated.
         link.record_disconnect_time_for_test(1_800_000_500, 7);
-        assert_eq!(
-            link.time_stamp(""),
-            Some((1_800_000_500, 7, 0)),
-            "disconnected monitor adopts the disconnect-event time, not \
-             the stale remote value timestamp"
-        );
+        assert_eq!(link.snap_stamp(""), (1_800_000_500, 7, 0));
+        assert!(link.time_stamp("").is_none());
         assert!(
             link.link_metadata().is_none(),
             "metadata getter stays gated even after a disconnect time is \
@@ -3721,6 +3716,7 @@ mod tests {
 
         // Connected: the full remote timestamp+tag.
         flag.store(true, Ordering::Release);
+        link.try_read_cached_with_field("");
         assert_eq!(link.time_stamp(""), Some((1_700_000_000, 42, 0x55)));
 
         // Disconnected with a recorded drop time: adopt the drop time
@@ -3728,8 +3724,8 @@ mod tests {
         flag.store(false, Ordering::Release);
         link.record_disconnect_time_for_test(1_800_000_500, 7);
         assert_eq!(
-            link.time_stamp(""),
-            Some((1_800_000_500, 7, 0x55)),
+            link.snap_stamp(""),
+            (1_800_000_500, 7, 0x55),
             "disconnect-event time with the last value's userTag preserved"
         );
     }
@@ -3767,6 +3763,7 @@ mod tests {
                 Some(PvField::Structure(root)),
             );
             flag.store(true, Ordering::Release);
+            link.try_read_cached_with_field("");
             link.time_stamp("").map(|(_, _, utag)| utag)
         };
 

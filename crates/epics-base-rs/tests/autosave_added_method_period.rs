@@ -67,8 +67,8 @@ async fn a_method_added_before_ioc_init_keeps_its_period() {
         };
         run(&holder, first, 1);
         run(&holder, other, added);
-        let builder = holder.lock().unwrap().into_builder();
-        assert_eq!(periods(&builder.build().await), want, "{first}");
+        let mgr = holder.lock().unwrap().manager.clone().unwrap();
+        assert_eq!(periods(&mgr), want, "{first}");
     }
 }
 

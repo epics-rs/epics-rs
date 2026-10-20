@@ -92,7 +92,7 @@ fn main() {
             //
             // After detach, stderr goes to /dev/null. The eprintln! is
             // still useful when `-v` or `-d` was passed.
-            eprintln!("ca-repeater: {e}");
+            epics_libcom_rs::stderr_println!("ca-repeater: {e}");
             std::process::exit(1);
         }
     });

@@ -40,10 +40,10 @@
 //!
 //! # `pva://` record links resolve on this target (design stage 4)
 //!
-//! A C IOC linked against pvxs gets pvalink through `pvalink_enable()`
-//! (`ioc/iochooks.cpp:495`), so `INP=pva://...` resolves. This one does too:
-//! [`install_pvalink`](epics_bridge_rs::qsrv::install_pvalink) mounts the pva://
-//! external record-link resolver on the database at C `dbCaLinkInit`, and the
+//! A C IOC linked against pvxs resolves `INP=pva://...` whatever QSRV2's
+//! `enable2()` decided (`ioc/iochooks.cpp:338-341,367-369`). This one does too:
+//! [`install_pvalink_resolver`](epics_bridge_rs::pvalink::install_pvalink_resolver)
+//! mounts the pva:// external record-link resolver on the database at C `dbCaLinkInit`, and the
 //! startup banner reports it installed and the link count it pre-registered.
 //!
 //! The client that backs it is the blocking PVA client (design stages 1-3): on
@@ -102,11 +102,10 @@
 //! source is read straight off the database.
 //!
 //! QSRV2 answers to `PVXS_QSRV_ENABLE` / `EPICS_IOC_IGNORE_SERVERS=qsrv2` here
-//! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`),
-//! and it covers the same three facilities C gates in one `if(enableQ)`
-//! (`ioc/iochooks.cpp:485-496`): with QSRV2 off this IOC serves no single
-//! record, no `Q:group` PV and resolves no `pva://` link — the server comes up
-//! and answers nothing. The decision is printed at startup.
+//! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`):
+//! records, `Q:group` PVs and `pva://` links are served either way, and with
+//! QSRV2 off a `.json` argument is refused as the `dbLoadGroup` line it stands
+//! for. The decision is printed at startup.
 //!
 //! There is no shutdown command: like a C IOC on RTEMS this runs until the
 //! board is reset. The interactive iocsh is host-only, so it is not wired here.
@@ -355,8 +354,8 @@ mod ioc {
     ) -> CaResult<(BareIoc, Option<epics_bridge_rs::pvalink::PvaLinkResolver>)> {
         let macros = HashMap::new();
         // pvxs's `link("pva", "lsetPVX")` and its link set, installed by the
-        // build at C `dbCaLinkInit` so link init finds it. `None` when QSRV2
-        // is off. Kept for the banner and the probe report.
+        // build at C `dbCaLinkInit` so link init finds it. Kept for the banner
+        // and the probe report.
         let resolver = Arc::new(std::sync::OnceLock::new());
         let installed = Arc::clone(&resolver);
         // And dbCa, which every C IOC links, softIocPVX included: without it a
@@ -364,7 +363,8 @@ mod ioc {
         // built at the first CA link, reading the `EPICS_CA_*` boot variables.
         let mut builder = IocBuilder::new()
             .register_link_type("pva", move |db| async move {
-                let _ = installed.set(epics_bridge_rs::qsrv::install_pvalink(&db).await);
+                let _ =
+                    installed.set(epics_bridge_rs::pvalink::install_pvalink_resolver(&db).await);
                 Vec::new()
             })
             .register_link_type("ca", |db| async move {
@@ -405,7 +405,7 @@ mod ioc {
         }
         let ioc = block_on_sync(builder.build_ioc())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered")?;
-        Ok((ioc, resolver.get().cloned().flatten()))
+        Ok((ioc, resolver.get().cloned()))
     }
 
     /// `01020304…` — the GUID as the wire carries it, so a console line can be
@@ -508,8 +508,8 @@ mod ioc {
                 "UDPSEARCH reply pv={pv} server={} guid={:02x?} proto={} version={}",
                 hit.server, hit.guid, hit.proto, hit.peer_version
             ),
-            Ok(Err(e)) => eprintln!("UDPSEARCH failed pv={pv}: {e}"),
-            Err(e) => eprintln!("UDPSEARCH not runnable here: {e:?}"),
+            Ok(Err(e)) => epics_base_rs::stderr_println!("UDPSEARCH failed pv={pv}: {e}"),
+            Err(e) => epics_base_rs::stderr_println!("UDPSEARCH not runnable here: {e:?}"),
         }
     }
 
@@ -687,7 +687,7 @@ mod ioc {
         if let Some(why) =
             epics_base_rs::types::wall_clock_range_warning(std::time::SystemTime::now())
         {
-            eprintln!("epics-rs: {why}");
+            epics_base_rs::stderr_println!("epics-rs: {why}");
         }
 
         // (1b-rig) PARALLEL SCAN HELPERS, under `bringup-probes` only
@@ -742,7 +742,7 @@ mod ioc {
         let (ioc, resolver) = match load_database(&db_files) {
             Ok(loaded) => loaded,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: iocInit failed: {e}");
+                epics_base_rs::stderr_println!("realtime-pva-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -766,20 +766,19 @@ mod ioc {
         let mount: QsrvMount = match block_on_sync(build_qsrv_mount(&db, acf, &group_files)) {
             Ok(m) => m,
             Err(_) => {
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "realtime-pva-ioc: the QSRV mount needs a plain thread with no runtime entered"
                 );
                 return ExitCode::FAILURE;
             }
         };
 
-        // (2c) The two QSRV2 sources, through the one owner that turns both
-        //      on together: the `qsrvSingle` database source and the
-        //      `qsrvGroup` QSRV store. C runs these and `pvalink_enable()`
-        //      inside one `if(enableQ)` (`ioc/iochooks.cpp:485-496`); the
-        //      pva:// resolver, under the same decision, was installed by the
-        //      build at `dbCaLinkInit`, because link init refuses a `{pva:…}`
-        //      link whose set is not there yet.
+        // (2c) The two QSRV2 sources, the `qsrvSingle` database source and
+        //      the `qsrvGroup` QSRV store, which pvxs mounts at
+        //      `initHookAfterIocBuilt` whatever `enable2()` decided
+        //      (`ioc/iochooks.cpp:367-372`); the pva:// resolver was installed
+        //      by the build at `dbCaLinkInit`, because link init refuses a
+        //      `{pva:…}` link whose set is not there yet.
         //
         //      On this target the PVA client reaches upstream servers over TCP
         //      name servers alone (`EPICS_PVA_NAME_SERVERS`): the UDP SEARCH
@@ -789,10 +788,10 @@ mod ioc {
         //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
         //      number of pva:// links pre-registered from the loaded database.
         let composite = CompositeSource::new();
-        if let Err(e) = block_on_sync(mount.install_sources(&db, &composite))
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
-        {
-            eprintln!("realtime-pva-ioc: cannot register the QSRV2 sources: {e}");
+        if let Err(e) = mount.install_channel_sources(&db, &composite) {
+            epics_base_rs::stderr_println!(
+                "realtime-pva-ioc: cannot register the QSRV2 sources: {e}"
+            );
             return ExitCode::FAILURE;
         }
         let link_count = resolver.as_ref().map_or(0, |r| r.link_count());
@@ -820,7 +819,7 @@ mod ioc {
         //     source at 0, and a group PV — not in the database under its own
         //     name — falls through to the QSRV store at 1. The status PVs
         //     registered below are ordinary records, so they answer from
-        //     order 0, and with QSRV2 disabled they do not answer at all.
+        //     order 0.
         //
         //     The driver is `EPICS_PVA_RS_DRIVER`'s, defaulting to the reactor
         //     — the one the bring-up box measured at 38,483 B a connection
@@ -828,14 +827,14 @@ mod ioc {
         let config = match PvaServerConfig::default().with_env() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: {e}");
+                epics_base_rs::stderr_println!("realtime-pva-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
         let bound = match BoundPva::bind(composite, config) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: {e}");
+                epics_base_rs::stderr_println!("realtime-pva-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -852,7 +851,7 @@ mod ioc {
         let search_status = match bound.search() {
             Ok(s) => search_status(Some(s.local_port())),
             Err((udp_port, e)) => {
-                eprintln!(
+                epics_base_rs::stderr_println!(
                     "realtime-pva-ioc: no UDP name-search responder on port {udp_port}: {e}\n\
                          realtime-pva-ioc: the server is still serving on TCP {bound_tcp}; reach it \
                          with EPICS_PVA_NAME_SERVERS=<host>:{bound_tcp}"
@@ -882,14 +881,13 @@ mod ioc {
             }),
         );
         if let Err(e) = serve_status_pvs(db_for_status, status) {
-            eprintln!("realtime-pva-ioc: cannot register the status PVs: {e}");
+            epics_base_rs::stderr_println!("realtime-pva-ioc: cannot register the status PVs: {e}");
             return ExitCode::FAILURE;
         }
 
         // Listed after the status PVs are registered, so the console names
         // everything a client can reach rather than only what the `.db` carried.
-        let mut names = block_on_sync(db_for_names.all_record_names())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let mut names = db_for_names.all_record_names();
         names.sort();
 
         let serve_reactor = epics_base_rs::runtime::task::Reactor::current()
@@ -897,7 +895,7 @@ mod ioc {
         let serving = match bound.serve(&serve_reactor) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: {e}");
+                epics_base_rs::stderr_println!("realtime-pva-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -909,16 +907,8 @@ mod ioc {
             guid_hex(serving.server().guid()),
             serving.kind().as_str(),
         );
-        println!(
-            "realtime-pva-ioc: QSRV2 {}",
-            if mount.enabled {
-                "ENABLED — sources: qsrvSingle(0), qsrvGroup(1)"
-            } else {
-                "disabled — nothing mounted: this IOC answers no record and no \
-                 group and resolves no pva:// link (set PVXS_QSRV_ENABLE=YES)"
-            },
-        );
-        // The pvalink resolver, when the QSRV2 gate mounted one. Reported at
+        println!("realtime-pva-ioc: QSRV2 sources: qsrvSingle(0), qsrvGroup(1)");
+        // The pvalink resolver. Reported at
         // every boot — including `link_count == 0`, when the loaded database
         // configured none — because on a target with no shell the console is
         // the only place an operator can confirm the resolver came up and how
@@ -942,8 +932,6 @@ mod ioc {
         // is the `rt top` / `rt stackuse` reading criterion 6 asks for on a
         // target that starts no shell. Its own thread with a stated stack
         // class, like every other thread this entry point starts.
-        // The report reads the pvalink resolver, which exists only when
-        // QSRV2 is enabled; with it off there is nothing here to report.
         #[cfg(feature = "bringup-probes")]
         if let Some(probe_resolver) = resolver.clone() {
             let probe_db = db.clone();
@@ -979,12 +967,12 @@ mod ioc {
                     }
                 }) {
                 Ok(_) => {}
-                Err(e) => eprintln!("STAGE5 probe: cannot start the reporter thread: {e}"),
+                Err(e) => epics_base_rs::stderr_println!(
+                    "STAGE5 probe: cannot start the reporter thread: {e}"
+                ),
             }
         } else {
-            println!(
-                "STAGE5 probe: not started \u{2014} QSRV2 is disabled, so this IOC has no pvalink resolver"
-            );
+            println!("STAGE5 probe: not started \u{2014} no pvalink resolver was installed");
         }
 
         // Runs until the board is reset: an IOC has no self-shutdown path on
@@ -996,7 +984,9 @@ mod ioc {
         {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: name-search responder failed: {e}");
+                epics_base_rs::stderr_println!(
+                    "realtime-pva-ioc: name-search responder failed: {e}"
+                );
                 ExitCode::FAILURE
             }
         }
@@ -1301,17 +1291,16 @@ mod tests {
         );
     }
 
-    /// Every QSRV2 facility is mounted through a gated owner, and the
+    /// Every QSRV2 facility is mounted through the shared owner, and the
     /// banner reports what came up.
     ///
-    /// This is the whole reason the binary moved crates. The three facilities
-    /// C turns on together in one `if(enableQ)` — the single-record source,
-    /// the group source and the pvalink resolver — are mounted here by
-    /// `QsrvMount::install_sources` and `install_pvalink`, both reading the
-    /// one QSRV2 decision. A regression that opened any of
-    /// them back up at this call site would leave an IOC that still boots,
-    /// still answers searches and still passes every other guard here, while
-    /// serving a facility a C IOC with the same environment does not. There
+    /// This is the whole reason the binary moved crates. The single-record
+    /// source, the group source and the pvalink resolver are mounted here by
+    /// `QsrvMount::install_channel_sources` and the `pva` link type, the
+    /// owners every QSRV route shares. A regression that mounted any of them
+    /// at this call site instead would leave an IOC that still boots, still
+    /// answers searches and still passes every other guard here, while
+    /// serving differently from a C IOC with the same environment. There
     /// is no shell on the target to notice, so the call-site shape is
     /// asserted directly: no `add_source` of its own, and the banner lines an
     /// operator reads instead of a shell.
@@ -1321,9 +1310,9 @@ mod tests {
         let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         assert!(
-            prod.contains(concat!("install_", "sources(&db, &composite)")),
-            "the QSRV2 sources are no longer mounted through the one owner that \
-             gates both together; single records and groups can drift apart again"
+            prod.contains(concat!("install_channel_", "sources(&db, &composite)")),
+            "the QSRV2 sources are no longer mounted through the shared owner; \
+             single records and groups can drift apart again"
         );
         assert!(
             prod.contains(concat!("register_link_type(", "\"pva\", ")),

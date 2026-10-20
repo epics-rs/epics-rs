@@ -1083,3 +1083,417 @@ fn a_time_series_sample_prints_its_interrupt_callback_line_while_armed() {
     }
     assert_eq!(log.matches("::interruptCallback").count(), 2, "{log}");
 }
+
+/// C prints a double with `%f` (asynPortDriver.cpp:2516, :2562, :2566;
+/// devAsynXXXTimeSeries.h:199), which glibc spells `nan`/`-nan`; Rust's
+/// `{:.6}` writes `NaN` and drops the sign.
+#[test]
+fn a_nan_prints_as_c_percent_f_spells_it() {
+    use asyn_rs::interrupt::InterruptValue;
+    use asyn_rs::param::ParamValue;
+    use asyn_rs::request::RequestOp;
+    use asyn_rs::user::AsynUser;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let fx = fixture_of("TRNAN", PortFlags::default(), |base| DefaultPort { base });
+    for (reason, op) in [
+        (0, RequestOp::Float64Write { value: f64::NAN }),
+        (0, RequestOp::Float64Read),
+        (3, RequestOp::Float64Write { value: -f64::NAN }),
+    ] {
+        let _ = fx.handle.submit_blocking(op, AsynUser::new(reason));
+    }
+
+    let ctx = epics_base_rs::server::ioc_app::DeviceSupportContext {
+        record_type: "waveform",
+        dtyp: "asynFloat64TimeSeries",
+        inp: "@asyn(TRNAN,0,1)VAL",
+        out: "",
+    };
+    let mut dev = asyn_rs::adapter::universal_asyn_factory(&ctx).expect("the factory binds");
+    dev.set_record_info("TR:TSNAN", ScanType::Passive);
+    let mut rec = WaveformRecord::new(4, DbFieldType::Double);
+    dev.init(&mut rec).unwrap();
+    let _wake = dev.io_intr_receiver();
+    rec.rarm = 1;
+    dev.read(&mut rec).unwrap();
+    fx.handle.interrupts().notify(InterruptValue {
+        reason: 0,
+        addr: 0,
+        value: ParamValue::Float64(f64::NAN),
+        ..Default::default()
+    });
+
+    let log = fx.log();
+    for expected in [
+        "asynPortDriver:writeFloat64: function=0, name=VAL, value=nan\n",
+        "asynPortDriver:readFloat64: function=0, name=VAL, value=nan\n",
+        "asynPortDriver:writeFloat64: error, status=8 function=3, name=I32, value=-nan\n",
+        "TR:TSNAN devAsynFloat64TimeSeries::interruptCallback, value=nan, nord=0\n",
+    ] {
+        assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
+    }
+}
+
+/// devAsynFloat64's process, interrupt and ring-pop lines print with `%f`
+/// as well (devAsynFloat64.c:317, :342, :363, :410, :475, :539).
+#[test]
+fn a_nan_prints_in_device_support_as_c_percent_f_spells_it() {
+    use asyn_rs::interrupt::InterruptValue;
+    use asyn_rs::param::ParamValue;
+    use epics_base_rs::server::device_support::IoIntrCmd;
+    use epics_base_rs::server::record::CommonFields;
+
+    let fx = fixture_of("TRNAND", PortFlags::default(), |base| DefaultPort { base });
+    let mut ao = fx.device("TR:NAO", "asynFloat64");
+    let mut ao_rec = AoRecord::new(0.0);
+    ao.init(&mut ao_rec).unwrap();
+    let mut ai = fx.device("TR:NAI", "asynFloat64");
+    let mut ai_rec = AiRecord::new(0.0);
+    ai.init(&mut ai_rec).unwrap();
+    for value in [f64::NAN, -f64::NAN] {
+        ao_rec.oval = value;
+        ao.write(&mut ao_rec).unwrap();
+        ai.read(&mut ai_rec).unwrap();
+    }
+
+    let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
+    let bind = |record: &str, record_type: &str, dtyp: &str, rec: &mut dyn Record| {
+        let output = record_type == "ao";
+        let link = "@asyn(TRNAND,0,1)VAL";
+        let ctx = epics_base_rs::server::ioc_app::DeviceSupportContext {
+            record_type,
+            dtyp,
+            inp: if output { "" } else { link },
+            out: if output { link } else { "" },
+        };
+        let mut dev = asyn_rs::adapter::universal_asyn_factory(&ctx).expect("the factory binds");
+        dev.set_record_info(record, ScanType::IoIntr);
+        dev.bind_interrupt_gate(&gate);
+        if output {
+            let info = [("asyn:READBACK".to_string(), "1".to_string())].into();
+            dev.apply_record_info(&info);
+        }
+        dev.init(rec).unwrap();
+        if !output && dtyp != "asynFloat64Average" {
+            assert!(dev.get_ioint_info(rec, &mut CommonFields::default(), IoIntrCmd::Add));
+        }
+        dev
+    };
+    let mut intr_ai = AiRecord::new(0.0);
+    let mut intr = bind("TR:NII", "ai", "asynFloat64", &mut intr_ai);
+    let mut rb_ao = AoRecord::new(0.0);
+    let _rb = bind("TR:NIO", "ao", "asynFloat64", &mut rb_ao);
+    let mut avg_ai = AiRecord::new(0.0);
+    let _avg = bind("TR:NAVG", "ai", "asynFloat64Average", &mut avg_ai);
+    fx.handle.interrupts().notify(InterruptValue {
+        reason: 0,
+        addr: 0,
+        value: ParamValue::Float64(-f64::NAN),
+        ..Default::default()
+    });
+    intr.read(&mut intr_ai).unwrap();
+
+    let log = fx.log();
+    for expected in [
+        "TR:NAO devAsynFloat64::processCallbackOutput process value nan\n",
+        "TR:NAI devAsynFloat64::processCallbackInput process value=nan\n",
+        "asynPortDriver:writeFloat64: function=0, name=VAL, value=-nan\n",
+        "asynPortDriver:readFloat64: function=0, name=VAL, value=-nan\n",
+        "TR:NAO devAsynFloat64::processCallbackOutput process value -nan\n",
+        "TR:NAI devAsynFloat64::processCallbackInput process value=-nan\n",
+        "TR:NII devAsynFloat64::interruptCallbackInput new value=-nan\n",
+        "TR:NIO devAsynFloat64::interruptCallbackOutput new value=-nan\n",
+        "TR:NAVG devAsynFloat64::interruptCallbackAverage new value=-nan\n",
+        "TR:NII devAsynFloat64::getCallbackValue from ringBuffer value=-nan\n",
+    ] {
+        assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
+    }
+}
+
+/// A parameter holding a `setParamStatus` failure fails the default read with
+/// its value: C prints no `ASYN_TRACEIO_DRIVER` line, names the value in
+/// `errorMessage` (asynPortDriver.cpp:1982-1989, :2121-2128, :2261-2268,
+/// :2510-2517, :2620-2627), and device support prints that as its read
+/// error (devAsynFloat64.c:320-323).
+#[test]
+fn a_param_status_failure_fails_the_read_with_its_value() {
+    use asyn_rs::error::AsynStatus;
+    use asyn_rs::request::{ParamSetValue, RequestOp};
+    use asyn_rs::user::AsynUser;
+    let fx = fixture_of("TRPSTAT", PortFlags::default(), |base| DefaultPort { base });
+    for (reason, op) in [
+        (0, RequestOp::Float64Write { value: 3.5 }),
+        (
+            1,
+            RequestOp::OctetWrite {
+                data: b"hi".to_vec(),
+            },
+        ),
+        (3, RequestOp::Int32Write { value: 42 }),
+        (4, RequestOp::Int64Write { value: -7 }),
+        (
+            5,
+            RequestOp::UInt32DigitalWrite {
+                value: 0xFF,
+                mask: 0xFF,
+            },
+        ),
+    ] {
+        fx.handle
+            .submit_blocking(op, AsynUser::new(reason))
+            .unwrap();
+    }
+    fx.handle
+        .set_params_blocking(
+            0,
+            [0, 1, 3, 4, 5]
+                .map(|reason| ParamSetValue::status(reason, 0, AsynStatus::Error))
+                .to_vec(),
+        )
+        .unwrap();
+
+    for (reason, op, expected) in [
+        (
+            0,
+            RequestOp::Float64Read,
+            "asynPortDriver:readFloat64: status=3, function=0, name=VAL, value=3.500000",
+        ),
+        (
+            3,
+            RequestOp::Int32Read,
+            "asynPortDriver:readInt32: status=3, function=3, name=I32, value=42",
+        ),
+        (
+            4,
+            RequestOp::Int64Read,
+            "asynPortDriver:readInt64: status=3, function=4, name=I64, value=-7",
+        ),
+        (
+            5,
+            RequestOp::UInt32DigitalRead { mask: 0x0F },
+            "asynPortDriver:readUInt32Digital: status=3, function=5, name=U32, value=15 mask=15",
+        ),
+    ] {
+        let e = fx
+            .handle
+            .submit_blocking(op, AsynUser::new(reason))
+            .unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), expected);
+    }
+    let (data, status) = fx
+        .handle
+        .submit_octet_read_blocking(
+            asyn_rs::request::OctetReadOp::Read { buf_size: 40 },
+            AsynUser::new(1),
+        )
+        .into_parts();
+    assert_eq!(data, b"hi\0");
+    assert_eq!(
+        status.unwrap_err().message(),
+        "asynPortDriver:readOctet: status=3, function=1, name=MSG, value=hi"
+    );
+
+    let mut ai = fx.device("TR:PSAI", "asynFloat64");
+    let mut rec = AiRecord::new(0.0);
+    ai.init(&mut rec).unwrap();
+    let _ = ai.read(&mut rec);
+
+    let log = fx.log();
+    for read in [
+        "readFloat64",
+        "readInt32",
+        "readInt64",
+        "readUInt32Digital",
+        "readOctet",
+    ] {
+        let line = format!("asynPortDriver:{read}: function=");
+        assert!(!log.contains(&line), "{line:?} in:\n{log}");
+    }
+    let needle = "TR:PSAI devAsynFloat64::processCallbackInput process read error \
+                  asynPortDriver:readFloat64: status=3, function=0, name=VAL, value=3.500000\n";
+    assert!(log.contains(needle), "missing {needle:?} in:\n{log}");
+}
+
+/// Each scalar dset prints the value an interrupt hands it at
+/// `ASYN_TRACEIO_DEVICE` before it tests `interruptAccept`
+/// (devAsynInt32.c:541-543, devAsynInt64.c:428-430,
+/// devAsynUInt32Digital.c:444-446, devAsynFloat64.c:408-410, :474-476), so
+/// the line shows with the database gate still shut.
+#[test]
+fn an_interrupt_prints_its_new_value_before_interrupt_accept() {
+    use asyn_rs::interrupt::InterruptValue;
+    use asyn_rs::param::ParamValue;
+    use epics_base_rs::server::device_support::IoIntrCmd;
+    use epics_base_rs::server::record::CommonFields;
+    use epics_base_rs::server::records::bi::BiRecord;
+    use epics_base_rs::server::records::int64in::Int64inRecord;
+
+    let fx = fixture("TRNEW");
+    let shut = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::new();
+    let bind = |record: &str,
+                record_type: &str,
+                dtyp: &str,
+                link: String,
+                readback: bool,
+                rec: &mut dyn Record| {
+        let output = record_type == "ao";
+        let ctx = epics_base_rs::server::ioc_app::DeviceSupportContext {
+            record_type,
+            dtyp,
+            inp: if output { "" } else { &link },
+            out: if output { &link } else { "" },
+        };
+        let mut dev = asyn_rs::adapter::universal_asyn_factory(&ctx).expect("the factory binds");
+        dev.set_record_info(record, ScanType::IoIntr);
+        dev.bind_interrupt_gate(&shut);
+        if readback {
+            let info = [("asyn:READBACK".to_string(), "1".to_string())].into();
+            dev.apply_record_info(&info);
+        }
+        dev.init(rec).unwrap();
+        if !readback && dtyp != "asynFloat64Average" {
+            assert!(dev.get_ioint_info(rec, &mut CommonFields::default(), IoIntrCmd::Add));
+        }
+        dev
+    };
+    let at = |param: &str| format!("@asyn(TRNEW,0,1){param}");
+
+    let mut ai = AiRecord::new(0.0);
+    let _ai = bind("TR:AI", "ai", "asynInt32", at("I32"), false, &mut ai);
+    let mut ao = AoRecord::new(0.0);
+    let _ao = bind("TR:AO", "ao", "asynFloat64", at("VAL"), true, &mut ao);
+    let mut i64in = Int64inRecord::new(0);
+    let _i64 = bind(
+        "TR:I64",
+        "int64in",
+        "asynInt64",
+        at("I64"),
+        false,
+        &mut i64in,
+    );
+    let mut bi = BiRecord::new(0);
+    let mask = "@asynMask(TRNEW,0,0xf,1)U32".to_string();
+    let _bi = bind("TR:BI", "bi", "asynUInt32Digital", mask, false, &mut bi);
+    let mut avg = AiRecord::new(0.0);
+    let _avg = bind(
+        "TR:AVG",
+        "ai",
+        "asynFloat64Average",
+        at("VAL"),
+        false,
+        &mut avg,
+    );
+
+    let notify = |reason, value| {
+        fx.handle.interrupts().notify(InterruptValue {
+            reason,
+            addr: 0,
+            value,
+            uint32_changed_mask: 0xff,
+            ..Default::default()
+        })
+    };
+    notify(3, ParamValue::Int32(7));
+    notify(0, ParamValue::Float64(2.5));
+    notify(4, ParamValue::Int64(-5));
+    notify(5, ParamValue::UInt32Digital(0xff));
+
+    let log = fx.log();
+    for expected in [
+        "TR:AI devAsynInt32::interruptCallbackInput new value=7\n",
+        "TR:AO devAsynFloat64::interruptCallbackOutput new value=2.500000\n",
+        "TR:AVG devAsynFloat64::interruptCallbackAverage new value=2.500000\n",
+        "TR:I64 devAsynInt64::interruptCallbackInput new value=-5\n",
+        "TR:BI devAsynUInt32Digital::interruptCallbackInput new value=15\n",
+    ] {
+        assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
+    }
+}
+
+/// devAsynOctet.c:485-488 and devAsynXXXArray.cpp:402-405 print every octet
+/// and array callback with the ring size and the callback's own length, before
+/// the interruptAccept test; this port printed neither.
+#[test]
+fn an_octet_or_array_callback_prints_its_ring_size_and_data() {
+    use asyn_rs::interrupt::InterruptValue;
+    use asyn_rs::param::ParamValue;
+    use epics_base_rs::server::device_support::IoIntrCmd;
+    use epics_base_rs::server::record::CommonFields;
+    use epics_base_rs::server::records::stringin::StringinRecord;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+
+    let fx = fixture("TRRING");
+    let shut = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::new();
+    let bind = |record: &str,
+                record_type: &str,
+                dtyp: &str,
+                link: &str,
+                fifo: Option<&str>,
+                rec: &mut dyn Record| {
+        let ctx = epics_base_rs::server::ioc_app::DeviceSupportContext {
+            record_type,
+            dtyp,
+            inp: link,
+            out: "",
+        };
+        let mut dev = asyn_rs::adapter::universal_asyn_factory(&ctx).expect("the factory binds");
+        dev.set_record_info(record, ScanType::IoIntr);
+        dev.bind_interrupt_gate(&shut);
+        if let Some(n) = fifo {
+            dev.apply_record_info(&[("asyn:FIFO".to_string(), n.to_string())].into());
+        }
+        dev.init(rec).unwrap();
+        assert!(dev.get_ioint_info(rec, &mut CommonFields::default(), IoIntrCmd::Add));
+        dev
+    };
+    let mut si = StringinRecord::new("");
+    let _si = bind(
+        "TR:SI",
+        "stringin",
+        "asynOctetRead",
+        "@asyn(TRRING,0,1)MSG",
+        None,
+        &mut si,
+    );
+    let mut si3 = StringinRecord::new("");
+    let _si3 = bind(
+        "TR:SI3",
+        "stringin",
+        "asynOctetRead",
+        "@asyn(TRRING,0,1)MSG",
+        Some("3"),
+        &mut si3,
+    );
+    let mut wf = WaveformRecord::new(4, epics_base_rs::types::DbFieldType::Double);
+    let _wf = bind(
+        "TR:WF",
+        "waveform",
+        "asynFloat64ArrayIn",
+        "@asyn(TRRING,0,1)ARR",
+        None,
+        &mut wf,
+    );
+
+    let notify = |reason, value| {
+        fx.handle.interrupts().notify(InterruptValue {
+            reason,
+            addr: 0,
+            value,
+            ..Default::default()
+        })
+    };
+    notify(1, ParamValue::Octet(b"abc"[..].into()));
+    notify(2, ParamValue::Float64Array(vec![1.0, 2.0][..].into()));
+
+    let log = fx.log();
+    for expected in [
+        "TR:SI devAsynOctet::interruptCallback ringSize=0, len=4, callback data:\n",
+        "TR:SI3 devAsynOctet::interruptCallback ringSize=3, len=4, callback data:\n",
+        "TR:WF devAsynXXXArray::interruptCallback ringSize=0, len=2, callback data:\n",
+    ] {
+        assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
+    }
+}

@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use epics_base_rs::runtime::task::spawn_blocking_background;
 use epics_base_rs::server::snapshot::Snapshot;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::rec_dyn_link::{
     ACCESS_READ, ACCESS_WRITE, CaType, Deliver, FATAL_ERROR, Io, LinkEvent, LinkHost, LinkSpec,
@@ -397,7 +398,8 @@ impl SscanRecord {
             Some(v) => self.pos[li].cv = v,
             None => self.errlog(&format!(
                 "{}:posMonCallback: recDynLinkGet returned -1, pvIndex={li}, cv={:.6}",
-                self.name, self.pos[li].cv
+                self.name,
+                CFloat(self.pos[li].cv)
             )),
         }
         self.post(pf(li, p::CV));
@@ -700,5 +702,44 @@ mod tests {
         );
         drop(lines);
         assert_eq!(db.get_pv("S.T1NV").unwrap().to_f64(), Some(0.0));
+    }
+
+    /// C's `cv=%f` spells a NaN `nan`, and `-nan` when its sign bit is set.
+    #[epics_base_rs::epics_test]
+    async fn a_failed_pos_mon_get_logs_a_nan_cv_as_c_does() {
+        let (name, factory) = crate::sscan_record_factory();
+        let (db, _) = IocBuilder::new()
+            .register_record_type(name, factory)
+            .db_string("record(sscan, \"SNAN\") {}\n", &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if m.starts_with("SNAN:posMonCallback") {
+                sink.lock().unwrap().push(m.trim_end().to_owned());
+            }
+        });
+        let h = db.async_handle();
+        std::thread::spawn(move || {
+            with_sscan(&h, "SNAN", |s: &mut SscanRecord| {
+                for cv in [f64::NAN, -f64::NAN] {
+                    s.pos[0].cv = cv;
+                    s.pos_mon_callback(0);
+                }
+            });
+        })
+        .join()
+        .unwrap();
+        epics_base_rs::runtime::log::errlog_flush();
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "SNAN:posMonCallback: recDynLinkGet returned -1, pvIndex=0, cv=nan",
+                "SNAN:posMonCallback: recDynLinkGet returned -1, pvIndex=0, cv=-nan",
+            ]
+        );
     }
 }

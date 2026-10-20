@@ -146,7 +146,7 @@ impl Drop for MqttDriver {
             // is the report that the broker was NOT told, and it happens on the
             // way out of a process whose `tracing` subscriber may already be
             // gone.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => epics_libcom_rs::stderr_println!(
                 "mqtt: port '{}' did not get its DISCONNECT out within \
                  {TEARDOWN_TIMEOUT:?}; the broker was not told",
                 self.base.port_name

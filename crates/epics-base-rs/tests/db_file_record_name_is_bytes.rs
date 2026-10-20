@@ -32,7 +32,6 @@ async fn a_latin1_record_name_loads_under_its_bytes() {
 
     let mut names: Vec<Vec<u8>> = db
         .all_record_names()
-        .await
         .iter()
         .map(|n| n.as_bytes().to_vec())
         .collect();

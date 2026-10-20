@@ -12,6 +12,16 @@ use motor_rs::flags::*;
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::sim_motor::SimMotor;
 
+/// The status `motor` writes polled from the default.
+fn polled(
+    motor: &mut (impl AsynMotor + ?Sized),
+    user: &asyn_rs::user::AsynUser,
+) -> asyn_rs::interfaces::motor::MotorStatus {
+    let mut status = asyn_rs::interfaces::motor::MotorStatus::default();
+    motor.poll(user, &mut status).unwrap();
+    status
+}
+
 /// Eventual assertion — polls condition with timeout.
 async fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -571,7 +581,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
 // Helper: read the SimMotor's current dial position.
 fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
     let mut m = motor.lock().unwrap();
-    m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position
 }
 
 /// R59 regression: device-support `init()` must NOT reseed the controller.
@@ -795,23 +805,34 @@ async fn failed_poll_posts_comms_error_status() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             if self.offline.load(Ordering::SeqCst) {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "controller not responding".into(),
                 });
             }
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
             _user: &AsynUser,
             _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
             _min_vel: f64,
             _max_vel: f64,
             _accel: f64,
@@ -941,19 +962,31 @@ impl AsynMotor for FailingMotor {
     fn poll(
         &mut self,
         _user: &asyn_rs::user::AsynUser,
-    ) -> asyn_rs::error::AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+        status: &mut asyn_rs::interfaces::motor::MotorStatus,
+    ) -> asyn_rs::error::AsynResult<()> {
         if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(asyn_rs::error::AsynError::Status {
                 status: asyn_rs::error::AsynStatus::Timeout,
                 message: "controller not responding".into(),
             });
         }
-        Ok(asyn_rs::interfaces::motor::MotorStatus {
+        *status = asyn_rs::interfaces::motor::MotorStatus {
             position: 3.5,
             ..Default::default()
-        })
+        };
+        Ok(())
     }
     fn move_absolute(
+        &mut self,
+        _: &asyn_rs::user::AsynUser,
+        _: f64,
+        _: f64,
+        _: f64,
+        _: f64,
+    ) -> asyn_rs::error::AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(
         &mut self,
         _: &asyn_rs::user::AsynUser,
         _: f64,
@@ -1147,12 +1180,13 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
-            Ok(MotorStatus {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
+            *status = MotorStatus {
                 position: self.position,
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -1164,6 +1198,16 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         ) -> Result<(), AsynError> {
             self.moves.fetch_add(1, Ordering::SeqCst);
             self.position = position;
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -1226,7 +1270,7 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         "RSTM NearZero adopts the autosaved DVAL via SetPosition"
     );
     let user = AsynUser::new(0);
-    let st = motor.lock().unwrap().poll(&user).unwrap();
+    let st = polled(&mut *motor.lock().unwrap(), &user);
     assert_eq!(
         st.position, 1500.0,
         "the controller was redefined, not moved"
@@ -1261,12 +1305,13 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             self.wire();
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -1277,6 +1322,16 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
             _accel: f64,
         ) -> Result<(), AsynError> {
             self.wire();
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -1364,12 +1419,13 @@ async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             self.0.polls.fetch_add(1, Ordering::SeqCst);
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
@@ -1380,6 +1436,16 @@ async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
             _accel: f64,
         ) -> Result<(), AsynError> {
             self.0.moved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -1558,17 +1624,28 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
         fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
             asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+        fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
             &mut self,
             _user: &AsynUser,
             _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn move_relative(
+            &mut self,
+            _user: &AsynUser,
+            _distance: f64,
             _min_vel: f64,
             _max_vel: f64,
             _accel: f64,
@@ -1737,14 +1814,25 @@ async fn a_deferred_init_command_ends_its_own_transaction() {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> Result<MotorStatus, AsynError> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             self.0.lock().unwrap().push("poll");
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
         fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn move_relative(
             &mut self,
             _: &AsynUser,
             _: f64,

@@ -1,6 +1,6 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(18): this file does not build on the exec backend -
+// RTEMS-EXEC-MODEL-ALLOW(19): this file does not build on the exec backend -
 // server_native/mod.rs declares it under #[cfg(tokio_backend)] mod runtime;.
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -121,6 +121,8 @@ pub struct PvaServer {
     pvxs_config: Arc<str>,
     /// The served registry, for the `pvxsr` source list.
     source: DynSource,
+    /// The `__builtin` store in [`Self::source`].
+    builtin: Arc<super::SharedSource>,
     /// Bound TCP socket address — useful when the configured port was
     /// 0, or the requested port was taken, and the OS picked one. This
     /// is the actually-bound port (`start()` stamps it back from
@@ -355,6 +357,7 @@ impl PvaServer {
             bound_tcp_port,
             bound_tls_port,
             udp,
+            builtin: Arc::new(super::SharedSource::new()),
         })
     }
 
@@ -488,6 +491,11 @@ impl PvaServer {
         })
     }
 
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`.
+    pub fn builtin(&self) -> &Arc<super::SharedSource> {
+        &self.builtin
+    }
+
     /// A cheap, cloneable handle that reproduces [`Self::report`] from
     /// outside this server's owning task.
     ///
@@ -511,6 +519,7 @@ impl PvaServer {
             beacon_period_secs: self.effective_config.beacon_period.as_secs(),
             pvxs_config: self.pvxs_config.clone(),
             peers: self.peers.clone(),
+            builtin: self.builtin.clone(),
             running: Some(Running {
                 source: self.source.clone(),
                 tcp_alive: finished_reads_down(self.tcp_abort.clone()),
@@ -584,6 +593,7 @@ pub struct BoundPvaServer {
     bound_tcp_port: u16,
     bound_tls_port: u16,
     udp: crate::server_native::udp::UdpBind,
+    builtin: Arc<super::SharedSource>,
 }
 
 impl BoundPvaServer {
@@ -592,8 +602,14 @@ impl BoundPvaServer {
         self.bound_tcp_port
     }
 
+    /// The `__builtin` store: pvxs's `Server::addPV` / `removePV`, which
+    /// take PVs before `start` too.
+    pub fn builtin(&self) -> &Arc<super::SharedSource> {
+        &self.builtin
+    }
+
     /// The report of a server that has not started: pvxs's `Stopped`, with
-    /// no sources and no peers.
+    /// only the internal sources and no peers.
     pub fn report_handle(&self) -> ServerReportHandle {
         ServerReportHandle {
             bound_tcp_port: self.bound_tcp_port,
@@ -604,6 +620,7 @@ impl BoundPvaServer {
             beacon_period_secs: self.config.beacon_period.as_secs(),
             pvxs_config: self.pvxs_config.clone(),
             peers: crate::server_native::peers::PeerRegistry::new(),
+            builtin: self.builtin.clone(),
             running: None,
         }
     }
@@ -622,6 +639,7 @@ impl BoundPvaServer {
             bound_tcp_port,
             bound_tls_port,
             udp,
+            builtin,
         } = self;
         // The live per-peer registry is created up-front so the
         // built-in server-info source can report connection counts.
@@ -633,7 +651,7 @@ impl BoundPvaServer {
         // composition rule is how the blocking driver came to have no
         // server meta-channel at all.
         let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
-        let dyn_source: DynSource = super::server_info::compose_with_server_info(user_source)
+        let dyn_source = super::server_info::compose_with_server_info(user_source, builtin.clone())
             .map_err(|e| PvaError::Protocol(format!("PvaServer::start: {e}")))?;
         let report_source = dyn_source.clone();
 
@@ -738,6 +756,7 @@ impl BoundPvaServer {
             effective_config: config,
             pvxs_config,
             source: report_source,
+            builtin,
             bound_tcp_port,
             bound_tls_port,
             interrupt: Arc::new(tokio::sync::Notify::new()),
@@ -2078,7 +2097,10 @@ mod pvxs_report_tests {
                  EPICS_PVAS_SERVER_PORT={tcp}\n"
             )
         );
-        assert_eq!(handle.source_list(), [("__server".to_owned(), -1)]);
+        assert_eq!(
+            handle.source_list(),
+            [("__builtin".to_owned(), -1), ("__server".to_owned(), -1)]
+        );
 
         let app = crate::server_native::CompositeSource::new();
         app.add_source("qsrvSingle", Arc::new(SharedSource::new()), 0)
@@ -2091,10 +2113,29 @@ mod pvxs_report_tests {
         assert_eq!(
             handle.source_list(),
             [
+                ("__builtin".to_owned(), -1),
                 ("__server".to_owned(), -1),
                 ("qsrvSingle".to_owned(), 0),
                 ("qsrvGroup".to_owned(), 1),
             ]
         );
+    }
+
+    /// pvxs `Server::addPV` / `removePV` (`src/server.cpp:174-191`): the PV is
+    /// served from `__builtin`, and the beacon's change count moves.
+    #[tokio::test]
+    async fn an_added_pv_is_served_from_the_builtin_store() {
+        let server = PvaServer::start(Arc::new(SharedSource::new()), PvaServerConfig::isolated())
+            .expect("start");
+        let before = server.source.beacon_change();
+        assert!(!server.source.has_pv(b"B").await);
+        server
+            .builtin()
+            .try_add("B", crate::server_native::SharedPV::new())
+            .unwrap();
+        assert!(server.source.has_pv(b"B").await);
+        assert_ne!(server.source.beacon_change(), before);
+        server.builtin().remove("B");
+        assert!(!server.source.has_pv(b"B").await);
     }
 }

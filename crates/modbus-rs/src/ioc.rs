@@ -33,6 +33,7 @@
 //! of indexing the polled buffer; `poll_cycle` is a no-op and the periodic
 //! poller is not spawned.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,8 +58,8 @@ use epics_base_rs::server::iocsh::registry::*;
 
 use crate::datatype::{self, ModbusDataType};
 use crate::driver::{
-    IoTrace, ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
-    TransportFailure,
+    IoStatistics, IoTrace, ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse,
+    OctetTransport, TransportFailure,
 };
 use crate::error::{IoStatus, ModbusError, ModbusResult};
 use crate::interpose::{LinkType, MbapAccumulator, TransactionIdCounter};
@@ -224,18 +225,84 @@ fn decode_block_float64(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<f64>
     Ok(out)
 }
 
-/// Whether a Modbus function may carry a record *array* write. C
-/// `writeInt32Array`/`writeFloat64Array` (drvModbusAsyn.cpp:1398-1428 /
-/// 1230-...) switch only on `MODBUS_WRITE_MULTIPLE_COILS` and
-/// `MODBUS_WRITE_MULTIPLE_REGISTERS(_F23)`; every other function (the
-/// single-value writes and all read functions) hits `default: asynError`.
-fn is_array_write_function(function: ModbusFunctionCode) -> bool {
-    matches!(
-        function,
-        ModbusFunctionCode::WriteMultipleCoils
-            | ModbusFunctionCode::WriteMultipleRegisters
-            | ModbusFunctionCode::WriteMultipleRegistersF23
-    )
+/// A C `drvModbusAsyn` accessor (drvModbusAsyn.cpp:508-1592): the name its
+/// refusals print under, and the functions its `switch (modbusFunction_)` has
+/// an arm for. Every other function is its `default:` refusal.
+#[derive(Clone, Copy)]
+enum Accessor {
+    ReadUInt32Digital,
+    WriteUInt32Digital,
+    ReadInt32,
+    WriteInt32,
+    ReadInt64,
+    WriteInt64,
+    ReadFloat64,
+    WriteFloat64,
+    ReadFloat64Array,
+    WriteFloat64Array,
+    ReadInt32Array,
+    WriteInt32Array,
+    ReadOctet,
+    WriteOctet,
+}
+
+impl Accessor {
+    /// C's `functionName`.
+    fn c_name(self) -> &'static str {
+        match self {
+            Self::ReadUInt32Digital => "readUInt32D",
+            Self::WriteUInt32Digital => "writeUInt32D",
+            Self::ReadInt32 => "readInt32",
+            Self::WriteInt32 => "writeInt32",
+            Self::ReadInt64 => "readInt64",
+            Self::WriteInt64 => "writeInt64",
+            Self::ReadFloat64 => "readFloat64",
+            Self::WriteFloat64 => "writeFloat64",
+            Self::ReadFloat64Array => "readFloat64Array",
+            Self::WriteFloat64Array => "writeFloat64Array",
+            Self::ReadInt32Array => "readInt32Array",
+            Self::WriteInt32Array => "writeInt32Array",
+            Self::ReadOctet => "readOctet",
+            Self::WriteOctet => "writeOctet",
+        }
+    }
+
+    fn serves(self, function: ModbusFunctionCode) -> bool {
+        use ModbusFunctionCode as F;
+        match self {
+            Self::ReadUInt32Digital | Self::ReadInt32 => true,
+            Self::ReadInt64 | Self::ReadFloat64 | Self::ReadFloat64Array | Self::ReadInt32Array => {
+                function != F::ReportSlaveId
+            }
+            Self::ReadOctet => matches!(
+                function,
+                F::ReadHoldingRegisters
+                    | F::ReadInputRegisters
+                    | F::ReadInputRegistersF23
+                    | F::WriteMultipleRegisters
+                    | F::WriteMultipleRegistersF23
+            ),
+            Self::WriteUInt32Digital => matches!(
+                function,
+                F::WriteSingleCoil | F::WriteSingleRegister | F::WriteMultipleRegisters
+            ),
+            Self::WriteInt32 | Self::WriteInt64 | Self::WriteFloat64 => matches!(
+                function,
+                F::WriteSingleCoil
+                    | F::WriteSingleRegister
+                    | F::WriteMultipleRegisters
+                    | F::WriteMultipleRegistersF23
+            ),
+            Self::WriteFloat64Array | Self::WriteInt32Array => matches!(
+                function,
+                F::WriteMultipleCoils | F::WriteMultipleRegisters | F::WriteMultipleRegistersF23
+            ),
+            Self::WriteOctet => matches!(
+                function,
+                F::WriteMultipleRegisters | F::WriteMultipleRegistersF23
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -800,15 +867,63 @@ impl ModbusPortDriver {
 
     /// C `getDataType` (drvModbusAsyn.cpp:2356-2365): a `MODBUS_DATA`
     /// client's type is its drvUser's when `drvUserCreate` hung one on it,
-    /// else the port's. An error for any other reason.
-    fn datatype_of(&self, reason: usize, drv_user: Option<&DrvUser>) -> AsynResult<ModbusDataType> {
-        (reason == self.data_reason)
-            .then(|| {
-                ModbusDrvUser::of(drv_user).map_or(self.engine.config().data_type, |d| d.data_type)
-            })
-            .ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("reason {reason} is not a Modbus data parameter"),
+    /// else the port's. `None` for any other reason.
+    fn datatype_of(&self, reason: usize, drv_user: Option<&DrvUser>) -> Option<ModbusDataType> {
+        (reason == self.data_reason).then(|| {
+            ModbusDrvUser::of(drv_user).map_or(self.engine.config().data_type, |d| d.data_type)
+        })
+    }
+
+    /// C's `"%s::%s port %s <what>"` accessor refusal at `ASYN_TRACE_ERROR`,
+    /// and the `asynError` it returns.
+    fn refuse(&self, accessor: Accessor, what: std::fmt::Arguments<'_>) -> AsynError {
+        let what = what.to_string();
+        self.base.trace_print(
+            TraceMask::ERROR,
+            format_args!(
+                "drvModbusAsyn::{} port {} {what}\n",
+                accessor.c_name(),
+                self.base.port_name
+            ),
+        );
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: what,
+        }
+    }
+
+    /// The `checkOffset` a scalar accessor opens with.
+    fn accessor_offset(&self, accessor: Accessor, offset: i32) -> AsynResult<()> {
+        self.engine
+            .check_offset(offset)
+            .map_err(|_| self.refuse(accessor, format_args!("invalid offset {offset}")))
+    }
+
+    /// The accessor's `switch (modbusFunction_)`.
+    fn accessor_function(&self, accessor: Accessor) -> AsynResult<()> {
+        let function = self.engine.config().function;
+        if accessor.serves(function) {
+            return Ok(());
+        }
+        Err(self.refuse(
+            accessor,
+            format_args!("invalid request for Modbus function {}", function.as_i32()),
+        ))
+    }
+
+    /// An array or octet accessor's data type: those refuse every reason but
+    /// `P_Data` (and the histogram arrays, served before this).
+    fn accessor_data_type(
+        &self,
+        accessor: Accessor,
+        user: &AsynUser,
+    ) -> AsynResult<ModbusDataType> {
+        self.datatype_of(user.reason, user.drv_user.as_ref())
+            .ok_or_else(|| {
+                self.refuse(
+                    accessor,
+                    format_args!("invalid pasynUser->reason {}", user.reason),
+                )
             })
     }
 
@@ -833,31 +948,23 @@ impl ModbusPortDriver {
     /// runs the interrupt callbacks with the failed status attached
     /// (`drvModbusAsyn.cpp:1647`) rather than suppressing them.
     fn read_string_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
+        let dt = self.accessor_data_type(Accessor::ReadOctet, user)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        if self.is_absolute() {
-            // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
-            // `doModbusIO(..., min((int)maxChars, modbusLength_))`: the request
-            // length in REGISTERS equals the string CHAR count, because
-            // `readPlcString` (drvModbusAsyn.cpp:3001-3052) advances `offset`
-            // by exactly one register per loop iteration regardless of
-            // encoding. The single-byte encodings (`StringHigh`/`StringLow`/
-            // `ZStringHigh`/`ZStringLow`) therefore need one register per char,
-            // so the word count must be `buf.len()` (the char count) — not
-            // `div_ceil(2)`, which would under-read them by half. The two-byte
-            // encodings are over-read harmlessly, exactly as C over-reads them.
-            // `read_absolute_words` clamps the count to `config.length`,
-            // matching C's `min(maxChars, modbusLength_)`.
-            let words = buf.len().max(1);
-            let regs = self.read_absolute_words(user.addr, words)?;
-            let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            return Ok(n);
-        }
-        let regs = &self.polled_data()?[user.addr as usize..];
+        // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
+        // `doModbusIO(..., min((int)maxChars, modbusLength_))` on an absolute
+        // port: the request length in REGISTERS equals the string CHAR count,
+        // because `readPlcString` (drvModbusAsyn.cpp:3001-3052) advances
+        // `offset` by exactly one register per loop iteration regardless of
+        // encoding. The single-byte encodings (`StringHigh`/`StringLow`/
+        // `ZStringHigh`/`ZStringLow`) therefore need one register per char,
+        // so the word count must be `buf.len()` (the char count) — not
+        // `div_ceil(2)`, which would under-read them by half. The two-byte
+        // encodings are over-read harmlessly, exactly as C over-reads them.
+        // `read_absolute_words` clamps the count to `config.length`,
+        // matching C's `min(maxChars, modbusLength_)`.
+        let regs = self.read_registers(Accessor::ReadOctet, user.addr, buf.len().max(1))?;
         // String length comes from the record buffer (`NELM`).
-        let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
+        let (bytes, _) = datatype::read_string(dt, &regs, buf.len()).map_err(to_asyn)?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
@@ -918,6 +1025,25 @@ impl ModbusPortDriver {
             .as_ref()
             .map_or_else(|e| e.status(), |_| AsynStatus::Success);
         words
+    }
+
+    /// The registers a C read accessor decodes once its prologue has run: an
+    /// absolute port's own request of `words` registers at the checked
+    /// `offset`, or the polled block from it. Its function switch comes after
+    /// that I/O, as in C.
+    fn read_registers(
+        &mut self,
+        accessor: Accessor,
+        offset: i32,
+        words: usize,
+    ) -> AsynResult<Cow<'_, [u16]>> {
+        let regs = if self.is_absolute() {
+            Cow::Owned(self.read_absolute_words(offset, words)?)
+        } else {
+            Cow::Borrowed(&self.polled_data()?[offset as usize..])
+        };
+        self.accessor_function(accessor)?;
+        Ok(regs)
     }
 
     /// Absolute-mode per-record write: issue one Modbus request carrying
@@ -1206,7 +1332,7 @@ impl ModbusPortDriver {
         port_gate: bool,
     ) -> Result<Option<ParamValue>, Refusal> {
         let reason = filter.reason.unwrap_or_default();
-        let Ok(dt) = self.datatype_of(reason, filter.drv_user.as_ref()) else {
+        let Some(dt) = self.datatype_of(reason, filter.drv_user.as_ref()) else {
             // C's `pasynUser->reason != P_Data` arm (drvModbusAsyn.cpp:
             // 1722-1727), reached by an `I/O Intr` READ_OK/IO_ERRORS record.
             // C then `break`s, starving every later record on that interface
@@ -1283,10 +1409,10 @@ impl ModbusPortDriver {
         Ok(Some(value))
     }
 
-    /// Every Modbus transaction goes through here. C `doModbusIO` sets the
-    /// statistics params as it moves the counters (drvModbusAsyn.cpp:2205-2341)
-    /// and never posts them; whatever `callParamCallbacks` runs next on list 0
-    /// does.
+    /// Every Modbus transaction goes through here. C `doModbusIO` sets each
+    /// statistic's param where it moves that counter (drvModbusAsyn.cpp:
+    /// 2205-2341) and never posts them; whatever `callParamCallbacks` runs next
+    /// on list 0 does.
     fn modbus_io<T>(
         &mut self,
         io: impl FnOnce(&mut ModbusEngine, &mut dyn OctetTransport) -> ModbusResult<T>,
@@ -1297,17 +1423,20 @@ impl ModbusPortDriver {
         for line in self.engine.take_traces() {
             self.trace_io(&line);
         }
+        let moved = self.engine.stats.take_moved();
         let s = &self.engine.stats;
-        for (reason, v) in [
-            (self.read_ok_reason, s.read_ok),
-            (self.write_ok_reason, s.write_ok),
-            (self.io_errors_reason, s.io_errors),
-            (self.last_io_reason, s.last_io_msec),
-            (self.max_io_reason, s.max_io_msec),
+        for (bit, reason, v) in [
+            (IoStatistics::READ_OK, self.read_ok_reason, s.read_ok),
+            (IoStatistics::WRITE_OK, self.write_ok_reason, s.write_ok),
+            (IoStatistics::IO_ERRORS, self.io_errors_reason, s.io_errors),
+            (IoStatistics::LAST_IO, self.last_io_reason, s.last_io_msec),
+            (IoStatistics::MAX_IO, self.max_io_reason, s.max_io_msec),
         ] {
-            self.base
-                .set_int32_param(reason, 0, v as i32)
-                .expect("statistics params are created in new");
+            if moved & bit != 0 {
+                self.base
+                    .set_int32_param(reason, 0, v as i32)
+                    .expect("statistics params are created in new");
+            }
         }
         result
     }
@@ -1424,39 +1553,35 @@ impl ModbusPortDriver {
     /// put there. Only the array/string writes transmit *from* `data_`, and
     /// they use [`Self::flush_write_staged`].
     fn flush_write(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
-        let function = self.engine.config().function;
-        // C parity (drvModbusAsyn.cpp:760-767 / 920-927 / writeFloat64): a
-        // value that spans more than one register written through a
-        // WRITE_SINGLE_REGISTER port is sent as one single-register request
-        // per register at consecutive addresses — the FC06 PDU carries exactly
-        // one register, so C loops `for (i=0; i<bufferLen; i++) doModbusIO(...,
-        // modbusAddress+i, buffer+i, ...)`. Every other write function carries
-        // the whole block in one request. Without this loop a 32/64-bit value
-        // on an FC06 port would silently drop all registers past the first.
-        let per_register = function == ModbusFunctionCode::WriteSingleRegister && regs.len() > 1;
         if self.is_absolute() {
-            if per_register {
-                for (i, &r) in regs.iter().enumerate() {
-                    self.write_absolute_regs(offset + i as i32, &[r])?;
-                }
-            } else {
-                self.write_absolute_regs(offset, regs)?;
-            }
-            return Ok(());
+            return self.write_absolute_regs(offset, regs);
         }
+        let function = self.engine.config().function;
         let addr = self.modbus_address(offset);
-        if per_register {
-            for (i, &r) in regs.iter().enumerate() {
-                self.modbus_io(|e, t| {
-                    e.do_modbus_io(t, function, addr.wrapping_add(i as u16), &[r], 1)
-                })
-                .map_err(to_asyn)?;
-            }
-        } else {
-            self.modbus_io(|e, t| e.do_modbus_io(t, function, addr, regs, regs.len()))
-                .map_err(to_asyn)?;
-        }
+        self.modbus_io(|e, t| e.do_modbus_io(t, function, addr, regs, regs.len()))
+            .map_err(to_asyn)?;
         Ok(())
+    }
+
+    /// [`Self::flush_write`] for a scalar write's registers. The FC06 PDU
+    /// carries one register, so a value spanning several on a
+    /// WRITE_SINGLE_REGISTER port goes out as one request per register at
+    /// consecutive addresses (`for (i=0; i<bufferLen; i++) doModbusIO(...,
+    /// modbusAddress+i, ...)`); `run` is what the C write does after one fails.
+    fn write_scalar(&mut self, offset: i32, regs: &[u16], run: RegisterRun) -> AsynResult<()> {
+        if self.engine.config().function != ModbusFunctionCode::WriteSingleRegister
+            || regs.len() < 2
+        {
+            return self.flush_write(offset, regs);
+        }
+        let mut last = Ok(());
+        for (i, &r) in regs.iter().enumerate() {
+            last = self.flush_write(offset + i as i32, &[r]);
+            if last.is_err() && run == RegisterRun::StopAtFailure {
+                break;
+            }
+        }
+        last
     }
 
     /// Flush registers that C transmits *from* the register cache.
@@ -1483,6 +1608,17 @@ impl ModbusPortDriver {
         }
         self.flush_write(offset, regs)
     }
+}
+
+/// What a scalar write does with the rest of its FC06 registers after one
+/// fails — each C write has its own loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegisterRun {
+    /// `writeInt32`, `writeInt64` (drvModbusAsyn.cpp:763-767, :923-927): every
+    /// register is sent and the last one's status returned.
+    SendAll,
+    /// `writeFloat64` (:1068-1072): the first failure returns.
+    StopAtFailure,
 }
 
 /// Parse a drvUser `=N` string-length suffix the way C does
@@ -1621,53 +1757,41 @@ impl PortDriver for ModbusPortDriver {
         // `P_Data` reason runs the Modbus decode path; every other reason
         // (statistics/control params) delegates to `asynPortDriver::readInt32`,
         // whose `getAddress` reads list 0 at any asyn address.
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return self.base.read_int32_param(user);
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::ReadInt32, user.addr)?;
         // Absolute mode: read this record's own wire address now (the C
         // `absoluteAddressing_` branch issues an individual `doModbusIO`).
         // C `readInt32` (drvModbusAsyn.cpp:675-676) uses a FIXED request
         // length of `min(2, modbusLength_)` registers, not the data-type
         // width. `read_absolute_words` clamps to `config.length`.
-        if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, 2)?;
-            return Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0);
-        }
-        let regs = &self.polled_data()?[user.addr as usize..];
-        Ok(datatype::read_int32(dt, regs).map_err(to_asyn)?.0)
+        let regs = self.read_registers(Accessor::ReadInt32, user.addr, 2)?;
+        Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0)
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
         // Non-data reason → cached parameter value (see `read_int32`).
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return self.base.read_int64_param(user);
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::ReadInt64, user.addr)?;
         // C `readInt64` (drvModbusAsyn.cpp:836-837) uses a FIXED request
         // length of `min(4, modbusLength_)` registers.
-        if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, 4)?;
-            return Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0);
-        }
-        let regs = &self.polled_data()?[user.addr as usize..];
-        Ok(datatype::read_int64(dt, regs).map_err(to_asyn)?.0)
+        let regs = self.read_registers(Accessor::ReadInt64, user.addr, 4)?;
+        Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0)
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
         // Non-data reason → cached parameter value (see `read_int32`).
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return self.base.read_float64_param(user);
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::ReadFloat64, user.addr)?;
         // C `readFloat64` (drvModbusAsyn.cpp:982-983) uses a FIXED request
         // length of `min(4, modbusLength_)` registers.
-        if self.is_absolute() {
-            let regs = self.read_absolute_words(user.addr, 4)?;
-            return Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0);
-        }
-        let regs = &self.polled_data()?[user.addr as usize..];
-        Ok(datatype::read_float(dt, regs).map_err(to_asyn)?.0)
+        let regs = self.read_registers(Accessor::ReadFloat64, user.addr, 4)?;
+        Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0)
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
@@ -1675,18 +1799,14 @@ impl PortDriver for ModbusPortDriver {
         // see `read_int32` for the C parity reference.
         if self
             .datatype_of(user.reason, user.drv_user.as_ref())
-            .is_err()
+            .is_none()
         {
             return self.base.read_uint32_digital_param(user, mask);
         }
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        if self.is_absolute() {
-            // C `readUInt32Digital` reads `min(1, modbusLength_)` words.
-            let regs = self.read_absolute_words(user.addr, 1)?;
-            let raw = regs.first().copied().unwrap_or(0) as u32;
-            return Ok(if mask == 0 { raw } else { raw & mask });
-        }
-        let raw = self.polled_data()?[user.addr as usize] as u32;
+        self.accessor_offset(Accessor::ReadUInt32Digital, user.addr)?;
+        // C `readUInt32Digital` reads `min(1, modbusLength_)` words.
+        let regs = self.read_registers(Accessor::ReadUInt32Digital, user.addr, 1)?;
+        let raw = regs.first().copied().unwrap_or(0) as u32;
         Ok(if mask == 0 { raw } else { raw & mask })
     }
 
@@ -1720,7 +1840,7 @@ impl PortDriver for ModbusPortDriver {
             return Ok(n);
         }
         // Otherwise a Modbus data array — one element per `register_count`.
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
+        let dt = self.accessor_data_type(Accessor::ReadInt32Array, user)?;
         let rc = dt.register_count().max(1);
         // Absolute mode: C `readInt32Array` (drvModbusAsyn.cpp:1294-1295)
         // issues `doModbusIO(..., std::min((int)maxChans, modbusLength_))` —
@@ -1729,23 +1849,12 @@ impl PortDriver for ModbusPortDriver {
         // decodes elements from offset 0. (`readFloat64Array`,
         // drvModbusAsyn.cpp:1125-1126, uses the bare `modbusLength_` instead,
         // so `read_float64_array` differs deliberately.)
-        if self.is_absolute() {
-            self.engine.check_offset(user.addr).map_err(to_asyn)?;
-            let count = buf.len().min(self.engine.config().length);
-            let words = self.read_absolute_words(user.addr, count)?;
-            let mut n = 0;
-            while n < buf.len() && (n + 1) * rc <= words.len() {
-                buf[n] = datatype::read_int32(dt, &words[n * rc..])
-                    .map_err(to_asyn)?
-                    .0;
-                n += 1;
-            }
-            return Ok(n);
-        }
-        let data = self.polled_data()?;
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        let count = buf.len().min(self.engine.config().length);
+        let regs = self.read_registers(Accessor::ReadInt32Array, user.addr, count)?;
         let mut n = 0;
-        while n < buf.len() && (n + 1) * rc <= data.len() {
-            buf[n] = datatype::read_int32(dt, &data[n * rc..])
+        while n < buf.len() && (n + 1) * rc <= regs.len() {
+            buf[n] = datatype::read_int32(dt, &regs[n * rc..])
                 .map_err(to_asyn)?
                 .0;
             n += 1;
@@ -1774,26 +1883,16 @@ impl PortDriver for ModbusPortDriver {
             }
             return Ok(n);
         }
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
+        let dt = self.accessor_data_type(Accessor::ReadFloat64Array, user)?;
         let rc = dt.register_count().max(1);
         // Absolute mode: per-record read at the wire address (see
         // `read_int32_array`).
-        if self.is_absolute() {
-            self.engine.check_offset(user.addr).map_err(to_asyn)?;
-            let words = self.read_absolute_words(user.addr, self.engine.config().length)?;
-            let mut n = 0;
-            while n < buf.len() && (n + 1) * rc <= words.len() {
-                buf[n] = datatype::read_float(dt, &words[n * rc..])
-                    .map_err(to_asyn)?
-                    .0;
-                n += 1;
-            }
-            return Ok(n);
-        }
-        let data = self.polled_data()?;
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        let count = self.engine.config().length;
+        let regs = self.read_registers(Accessor::ReadFloat64Array, user.addr, count)?;
         let mut n = 0;
-        while n < buf.len() && (n + 1) * rc <= data.len() {
-            buf[n] = datatype::read_float(dt, &data[n * rc..])
+        while n < buf.len() && (n + 1) * rc <= regs.len() {
+            buf[n] = datatype::read_float(dt, &regs[n * rc..])
                 .map_err(to_asyn)?
                 .0;
             n += 1;
@@ -1802,21 +1901,8 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
-        // C `writeInt32Array` accepts only write-multiple functions; any other
-        // function (single-value writes, read functions) returns asynError
-        // (drvModbusAsyn.cpp:1422-1427). Reject it here rather than emit a
-        // per-register fan-out the C driver never performs for arrays.
-        let function = self.engine.config().function;
-        if !is_array_write_function(function) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "Modbus function {function:?} cannot write an array; \
-                     configure a write-multiple function"
-                ),
-            });
-        }
+        let dt = self.accessor_data_type(Accessor::WriteInt32Array, user)?;
+        self.accessor_function(Accessor::WriteInt32Array)?;
         // Reject a negative or out-of-range offset before it is cast to
         // `usize` in `flush_write` and wraps to a bogus wire address.
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1845,19 +1931,8 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
-        // C `writeFloat64Array` accepts only write-multiple functions; any
-        // other function returns asynError (drvModbusAsyn.cpp:1252-... default).
-        let function = self.engine.config().function;
-        if !is_array_write_function(function) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "Modbus function {function:?} cannot write an array; \
-                     configure a write-multiple function"
-                ),
-            });
-        }
+        let dt = self.accessor_data_type(Accessor::WriteFloat64Array, user)?;
+        self.accessor_function(Accessor::WriteFloat64Array)?;
         // Reject a negative or out-of-range offset before it is cast to
         // `usize` in `flush_write` and wraps to a bogus wire address.
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1919,23 +1994,25 @@ impl PortDriver for ModbusPortDriver {
         }
         // Any other non-data reason is C's `asynPortDriver::writeInt32`
         // (drvModbusAsyn.cpp:805), whose callbacks also post the statistics.
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return self.base.write_int32_param(user, value);
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::WriteInt32, user.addr)?;
+        self.accessor_function(Accessor::WriteInt32)?;
         let regs = datatype::write_int32(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)
+        self.write_scalar(user.addr, &regs, RegisterRun::SendAll)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
         // C `writeInt64` hands a non-data reason to `asynPortDriver::writeInt64`
         // (drvModbusAsyn.cpp:951).
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return self.base.write_int64_param(user, value);
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::WriteInt64, user.addr)?;
+        self.accessor_function(Accessor::WriteInt64)?;
         let regs = datatype::write_int64(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)
+        self.write_scalar(user.addr, &regs, RegisterRun::SendAll)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -1957,12 +2034,13 @@ impl PortDriver for ModbusPortDriver {
         }
         // C `writeFloat64` ignores any other non-data reason and returns
         // asynSuccess (drvModbusAsyn.cpp:1094-1101).
-        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()) else {
             return Ok(());
         };
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.accessor_offset(Accessor::WriteFloat64, user.addr)?;
+        self.accessor_function(Accessor::WriteFloat64)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)
+        self.write_scalar(user.addr, &regs, RegisterRun::StopAtFailure)
     }
 
     fn write_uint32_digital(
@@ -1988,97 +2066,64 @@ impl PortDriver for ModbusPortDriver {
         // (drvModbusAsyn.cpp:643).
         if self
             .datatype_of(user.reason, user.drv_user.as_ref())
-            .is_err()
+            .is_none()
         {
             return self.base.write_uint32_digital_param(user, value, mask);
         }
-        self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        // C `writeUInt32Digital` (drvModbusAsyn.cpp:595-625) dispatches on the
-        // configured function:
-        //   - WRITE_SINGLE_COIL: write the value directly, ignoring the mask.
-        //   - WRITE_SINGLE_REGISTER / WRITE_MULTIPLE_REGISTERS: read/modify/
-        //     write the masked bits, but ONLY when the mask is partial. A mask
-        //     of 0 or 0xFFFF writes the value directly with no readback. The
-        //     readback is a fresh Modbus READ_HOLDING_REGISTERS at
-        //     `modbusAddress + readbackOffset_` (the Wago readback offset), in
-        //     both relative and absolute addressing.
-        //   - any other function: asynError.
+        self.accessor_offset(Accessor::WriteUInt32Digital, user.addr)?;
+        self.accessor_function(Accessor::WriteUInt32Digital)?;
+        // C `writeUInt32Digital` (drvModbusAsyn.cpp:595-625): WRITE_SINGLE_COIL
+        // writes the value directly, ignoring the mask; WRITE_SINGLE_REGISTER /
+        // WRITE_MULTIPLE_REGISTERS read/modify/write the masked bits, but ONLY
+        // when the mask is partial. A mask of 0 or 0xFFFF writes the value
+        // directly with no readback. The readback is a fresh Modbus
+        // READ_HOLDING_REGISTERS at `modbusAddress + readbackOffset_` (the Wago
+        // readback offset), in both relative and absolute addressing.
         let function = self.engine.config().function;
-        let merged = match function {
-            ModbusFunctionCode::WriteSingleCoil => value,
-            ModbusFunctionCode::WriteSingleRegister
-            | ModbusFunctionCode::WriteMultipleRegisters => {
-                if mask == 0 || mask == 0xFFFF {
-                    value
+        let merged =
+            if function == ModbusFunctionCode::WriteSingleCoil || mask == 0 || mask == 0xFFFF {
+                value
+            } else {
+                // modbusAddress: the wire address (offset in absolute mode,
+                // start_address + offset in relative mode).
+                let modbus_address = if self.is_absolute() {
+                    user.addr
                 } else {
-                    // modbusAddress: the wire address (offset in absolute mode,
-                    // start_address + offset in relative mode).
-                    let modbus_address = if self.is_absolute() {
-                        user.addr
-                    } else {
-                        i32::from(self.modbus_address(user.addr))
-                    };
-                    let readback =
-                        (modbus_address + self.engine.config().readback_offset()).max(0) as u16;
-                    let response = self
-                        .modbus_io(|e, t| {
-                            e.do_modbus_io(
-                                t,
-                                ModbusFunctionCode::ReadHoldingRegisters,
-                                readback,
-                                &[],
-                                1,
-                            )
-                        })
-                        .map_err(to_asyn)?;
-                    let current = match response {
-                        ModbusIoResponse::Data(regs) => {
-                            u32::from(regs.first().copied().unwrap_or(0))
-                        }
-                        // Exception 05 copies nothing into C's readback
-                        // destination, which is the local `epicsUInt16 data =
-                        // value` (drvModbusAsyn.cpp:578, :2231-2237) — so the
-                        // read/modify/write merges the record's own value with
-                        // itself, instead of merging against a zero word that was
-                        // never read.
-                        ModbusIoResponse::Acknowledged => value & 0xFFFF,
-                    };
-                    // data |= (value & mask); data &= (value | ~mask)
-                    (current & !mask) | (value & mask)
-                }
-            }
-            other => {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!(
-                        "Modbus function {other:?} cannot service a UInt32Digital write"
-                    ),
-                });
-            }
-        };
+                    i32::from(self.modbus_address(user.addr))
+                };
+                let readback =
+                    (modbus_address + self.engine.config().readback_offset()).max(0) as u16;
+                let response = self
+                    .modbus_io(|e, t| {
+                        e.do_modbus_io(
+                            t,
+                            ModbusFunctionCode::ReadHoldingRegisters,
+                            readback,
+                            &[],
+                            1,
+                        )
+                    })
+                    .map_err(to_asyn)?;
+                let current = match response {
+                    ModbusIoResponse::Data(regs) => u32::from(regs.first().copied().unwrap_or(0)),
+                    // Exception 05 copies nothing into C's readback
+                    // destination, which is the local `epicsUInt16 data =
+                    // value` (drvModbusAsyn.cpp:578, :2231-2237) — so the
+                    // read/modify/write merges the record's own value with
+                    // itself, instead of merging against a zero word that was
+                    // never read.
+                    ModbusIoResponse::Acknowledged => value & 0xFFFF,
+                };
+                // data |= (value & mask); data &= (value | ~mask)
+                (current & !mask) | (value & mask)
+            };
         self.flush_write(user.addr, &[merged as u16])?;
         Ok(())
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
-        // C `writeOctet` (drvModbusAsyn.cpp:1545-1563) accepts only the
-        // write-multiple-registers functions; any other function returns
-        // asynError.
-        let function = self.engine.config().function;
-        if !matches!(
-            function,
-            ModbusFunctionCode::WriteMultipleRegisters
-                | ModbusFunctionCode::WriteMultipleRegistersF23
-        ) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "Modbus function {function:?} cannot write a string; \
-                     configure a write-multiple-registers function"
-                ),
-            });
-        }
+        let dt = self.accessor_data_type(Accessor::WriteOctet, user)?;
+        self.accessor_function(Accessor::WriteOctet)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // Word budget for the string. In relative mode the string shares the
         // polled buffer, so it is bounded by the registers above `addr`. In
@@ -4099,6 +4144,56 @@ mod tests {
         );
     }
 
+    /// A statistic a record wrote reads back until its own counter moves: C
+    /// sets each one's param only at that counter's site (drvModbusAsyn.cpp:
+    /// 2205-2341), so a read moves READ_OK and LAST_IO_TIME and leaves the
+    /// written WRITE_OK and IO_ERRORS.
+    #[test]
+    fn a_written_statistic_holds_until_its_counter_moves() {
+        let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
+        let mut driver = test_driver(
+            "MB_STAT_WRITE",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("absolute config must build");
+        let stats = [
+            PARAM_READ_OK,
+            PARAM_WRITE_OK,
+            PARAM_IO_ERRORS,
+            PARAM_LAST_IO_TIME,
+            PARAM_MAX_IO_TIME,
+        ]
+        .map(|name| driver.base.find_param(name).unwrap());
+        for reason in stats {
+            driver
+                .write_int32(&mut AsynUser::new(reason), 77)
+                .expect("a statistic takes asynPortDriver::writeInt32");
+        }
+        let (data_reason, data_reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(data_reason).with_drv_user(data_reason_du.clone());
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect("absolute read must succeed");
+
+        let read = |driver: &mut ModbusPortDriver, reason| {
+            driver.read_int32(&AsynUser::new(reason)).unwrap()
+        };
+        let s = driver.engine.stats.clone();
+        // MAX_IO_TIME moves only past the engine's own maximum, 0 here.
+        let max_io = if s.max_io_msec > 0 {
+            s.max_io_msec as i32
+        } else {
+            77
+        };
+        assert_eq!(
+            stats.map(|reason| read(&mut driver, reason)),
+            [1, 77, 77, s.last_io_msec as i32, max_io]
+        );
+    }
+
     /// R50 error path: C setIntegerParams P_IOErrors inside `doModbusIO` on a
     /// transport failure *before* it returns the error (drvModbusAsyn.cpp:
     /// 2206), so a failed absolute read must still publish IO_ERRORS = 1.
@@ -5319,6 +5414,120 @@ mod tests {
             &[0x01, 0x06, 0x00, 0x02, 0x56, 0x78],
             "second request writes the low word at addr 2"
         );
+    }
+
+    /// After a failed FC06 register `writeInt32` still sends the next and
+    /// returns its status (drvModbusAsyn.cpp:763-767); `writeFloat64` returns
+    /// at the failure (:1068-1072).
+    #[test]
+    fn a_failed_single_register_ends_only_a_float64_write() {
+        let echo_lo = tcp_response(2, &[0x01, 0x06, 0x00, 0x02, 0x56, 0x78]);
+        let transport = ReplayTransport::new(vec![Err(ModbusError::Timeout), Ok(echo_lo)]);
+        let written = transport.written_handle();
+        let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
+        let mut driver = test_driver("MB_WSR_RUN", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
+        user.addr = 1;
+        driver
+            .write_int32(&mut user, 0x1234_5678)
+            .expect("the last register's status is the write's");
+        assert_eq!(written.lock().unwrap().len(), 2, "both registers are sent");
+
+        let transport = ReplayTransport::new(vec![Err(ModbusError::Timeout)]);
+        let written = transport.written_handle();
+        let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
+        let mut driver = test_driver("MB_WSR_RUN_F", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Float32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
+        user.addr = 1;
+        driver
+            .write_float64(&mut user, 1.5)
+            .expect_err("the first failure is the write's");
+        assert_eq!(written.lock().unwrap().len(), 1, "the run stops there");
+    }
+
+    /// C `readInt32Array`/`readFloat64Array` decode a relative port's block
+    /// from the record's offset (`getAddr`, drvModbusAsyn.cpp:1289/:1120, then
+    /// `data_[offset]` onward), as the poller's array callback does.
+    #[test]
+    fn a_relative_array_read_starts_at_its_offset() {
+        let mut driver = test_driver(
+            "MB_ARR_OFF",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .unwrap();
+        driver.engine.data_mut().copy_from_slice(&[10, 20, 30, 40]);
+        driver.io_status = AsynStatus::Success;
+        let (reason, du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(du);
+        user.addr = 2;
+        let mut ints = [0; 4];
+        let n = driver.read_int32_array(&user, &mut ints).unwrap();
+        assert_eq!(ints[..n], [30, 40]);
+        let mut floats = [0.0; 4];
+        let n = driver.read_float64_array(&user, &mut floats).unwrap();
+        assert_eq!(floats[..n], [30.0, 40.0]);
+    }
+
+    /// A C accessor refuses in its own name (drvModbusAsyn.cpp:508-1592): a
+    /// failed `checkOffset`, a function its `switch` has no arm for, and an
+    /// array or octet client of no Modbus data each print a TRACE_ERROR line
+    /// and put nothing on the wire.
+    #[test]
+    fn an_accessor_refusal_prints_in_its_c_name() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        let port = "MB_REFUSE";
+        let transport = ReplayTransport::new(vec![]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::ReportSlaveId;
+        let mut driver = test_driver(port, cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
+        driver.io_status = AsynStatus::Success;
+        let path = std::env::temp_dir().join(format!("modbus_{port}_{}.trace", std::process::id()));
+        PortServices::global().trace().set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).expect("the trace sink must open"),
+            ))),
+        );
+
+        let (reason, du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(du);
+        user.addr = 0;
+        let mut refused = vec![
+            driver.write_int32(&mut user, 1).is_err(),
+            driver.read_int64(&user).is_err(),
+        ];
+        user.addr = 99;
+        refused.push(driver.write_float64(&mut user, 1.0).is_err());
+        let stat = AsynUser::new(driver.read_ok_reason);
+        refused.push(driver.read_octet(&stat, &mut [0; 8]).status.is_err());
+
+        let logged = std::fs::read_to_string(&path).expect("the trace sink must be readable");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(refused, [true; 4]);
+        assert!(written.lock().unwrap().is_empty(), "no request is sent");
+        for tail in [
+            format!("drvModbusAsyn::writeInt32 port {port} invalid request for Modbus function 17"),
+            format!("drvModbusAsyn::readInt64 port {port} invalid request for Modbus function 17"),
+            format!("drvModbusAsyn::writeFloat64 port {port} invalid offset 99"),
+            format!(
+                "drvModbusAsyn::readOctet port {port} invalid pasynUser->reason {}",
+                driver.read_ok_reason
+            ),
+        ] {
+            assert!(
+                logged.lines().any(|l| l.ends_with(&tail)),
+                "expected a line ending {tail:?}; the trace file holds {logged:?}"
+            );
+        }
     }
 
     /// Absolute-mode counterpart: the per-register FC06 loop also applies when

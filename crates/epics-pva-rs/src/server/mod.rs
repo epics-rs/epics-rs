@@ -6,6 +6,7 @@
 //! IOC runner stands up on either. Its iocsh command (`iocsh`) reads a report
 //! every serving path publishes.
 
+pub mod current_op;
 pub mod iocsh;
 pub mod native_source;
 pub mod pva_server;

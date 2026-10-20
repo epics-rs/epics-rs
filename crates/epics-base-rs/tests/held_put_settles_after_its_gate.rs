@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -69,7 +70,7 @@ async fn a_held_refusal_is_reported_once_its_gate_drops() {
         let ms = puts.record(0).unwrap();
         assert!(puts.record(1).is_none(), "no handle outside the locked set");
         let refused = (
-            puts.put_record_field_from_ca_no_notify(ms, "VAL", zz())
+            puts.put_record_field_from_ca_no_notify(ms, "VAL", zz(), PutSplit::DbPutField)
                 .is_err(),
             puts.put_pv(ms, "VAL", zz()).is_err(),
         );
@@ -133,7 +134,7 @@ async fn a_held_link_put_settles_when_the_body_panics() {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.put_many_locked(&["H", "X"], 1, |puts| {
             let h = puts.record(0).unwrap();
-            puts.put_record_field_from_ca_no_notify(h, "INPA", text)
+            puts.put_record_field_from_ca_no_notify(h, "INPA", text, PutSplit::DbPutField)
                 .unwrap();
             panic!("the body fails after its put");
         })

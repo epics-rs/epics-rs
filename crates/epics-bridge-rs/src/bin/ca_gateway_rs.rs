@@ -358,7 +358,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("ca-gateway-rs: failed to build tokio runtime: {e}");
+            epics_base_rs::stderr_println!("ca-gateway-rs: failed to build tokio runtime: {e}");
             return ExitCode::FAILURE;
         }
     };

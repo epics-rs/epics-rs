@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
@@ -27,6 +27,16 @@ struct Card {
     position: f64,
     target: Option<f64>,
     seen: Arc<Mutex<Vec<bool>>>,
+}
+
+/// `motor_init` reads the card with the status function the task queries.
+impl Model1Motor for Card {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        self.poll(&AsynUser::default(), &mut status)
+            .expect("the card answers");
+        status
+    }
 }
 
 impl AsynMotor for Card {
@@ -50,19 +60,25 @@ impl AsynMotor for Card {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         if let Some(target) = self.target.take() {
             self.position = target;
         }
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: self.position,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
-    fn poll_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+    fn poll_in_motion(
+        &mut self,
+        user: &AsynUser,
+        cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
         self.seen.lock().unwrap().push(*cdir);
         *cdir = false;
-        self.poll(user)
+        self.poll(user, status)
     }
 }
 
@@ -73,7 +89,7 @@ async fn the_driver_reads_and_sets_the_moving_records_cdir() {
     let seen = card.seen.clone();
     let AxisSetup {
         axis, poll_loop, ..
-    } = MotorBuilder::new(Arc::new(Mutex::new(card)))
+    } = MotorBuilder::model1(Arc::new(Mutex::new(card)))
         .trace_user(TraceUser::Model1 {
             device: MODEL1.choice,
             card: 0,

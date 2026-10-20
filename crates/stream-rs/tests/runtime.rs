@@ -179,7 +179,7 @@ fn run_case(case: &str, rtype: &str, val: &str, opts: &str) -> Result<(), String
         ..Default::default()
     });
     // Stream::initRecord attaches the bus before it parses.
-    if !core.attach_bus("P", 0, "") || !core.lock().parse(&format!("{case}.proto"), b"p") {
+    if !core.attach_bus("P", 0, "") || !common::parse(&core, &format!("{case}.proto"), b"p") {
         return Err(format!("{case}: protocol not loaded"));
     }
     let want = c_log(&std::fs::read_to_string(format!("tests/oracle/rt/{case}.log")).unwrap());

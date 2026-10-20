@@ -22,15 +22,22 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// One request taken by the link's worker, polled until it waits for the
+/// The process of `HOLDER`'s INP link, the one its worker processes for.
+fn holder_process(db: &PvDatabase) -> ExternalCpProcess {
+    let (_, _, inp) = db.record_link_fields("HOLDER").remove(0);
+    let inp = inp.external().unwrap();
+    ExternalCpProcess::new(LinkRef::new(inp.name, inp.open))
+}
+
 /// next: the only way a holder of an external CP link processes.
 fn process_holders(db: &PvDatabase) {
     use std::future::Future as _;
-    let process = ExternalCpProcess::new("UP:PV".to_string());
+    let process = holder_process(db);
     process.request();
     let worker = std::pin::pin!(process.run_worker(|| Some(db.clone())));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -69,19 +76,23 @@ impl ReadGateLset {
 impl LinkSet for ReadGateLset {
     /// Always up: C's lset `isConnected` (`dbCa.c:604-612`) returns
     /// `pca->isConnected` alone — READ-access loss does not disconnect.
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
 
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.readable().then(|| self.cached.clone())
     }
 
-    async fn connect_link(&self, _: &[u8], _: Option<epics_base_rs::server::database::CaLinkInit>) {
+    async fn connect_link(
+        &self,
+        _: LinkRef<'_>,
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
     }
 }
 

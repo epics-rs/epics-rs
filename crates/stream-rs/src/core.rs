@@ -12,10 +12,11 @@
 //!
 //! The hooks, C's virtual methods:
 //!
-//! - `get_field_address(fieldname, address)`: for `%(FIELD)` formats, put an
-//!   address structure for the field into `address`; it is copied bytewise
-//!   into the compiled code and handed back to `format_value` /
-//!   `match_value`. False when there is no such field.
+//! - `get_field_address(fieldname)`: for `%(FIELD)` formats, the field's
+//!   address, `None` when there is no such field. C appends the address
+//!   structure to the compiled code; here the code carries its index into
+//!   the addresses its [`Code`] holds, and the core hands the address back
+//!   to `format_value` / `match_value`.
 //! - `format_value(format, fieldaddress)`: take the value from the field
 //!   (or the default location for `format.type_`) and print it with the
 //!   matching `print_value_*`, once per element of an array (the separator
@@ -33,16 +34,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+use epics_libcom_rs::cfmt::CFloat;
+use parking_lot::{Condvar, Mutex, ReentrantMutex, ReentrantMutexGuard};
 
 use crate::buffer::StreamBuffer;
 use crate::bus::{self, BusInterface, ClientBus, ReadInput, StreamIoStatus};
 use crate::cmsg;
 use crate::converter::{self, ESC};
-use crate::cstr::fmt_c_alt_g;
 use crate::cstr::{CPtr, c_isspace};
 use crate::debug;
 use crate::error::{AnsiMode, Ch, ansi_escape, stream_error, stream_error_at};
@@ -167,6 +169,11 @@ use commands::*;
 /// StreamCore's virtual methods, implemented by the record layer. Each is
 /// called with the core's lock held.
 pub trait StreamCoreHooks: Send + Sized + 'static {
+    /// What a `%(FIELD)` format names (C's `DBADDR`).
+    type FieldAddress: Send + Sync + 'static;
+    /// What a matchValue that ends in a put the record layer makes outside
+    /// the core keeps for its status ([`ValueMatch::Put`]).
+    type LinkPut: Send;
     fn protocol_start_hook(&self, _core: &StreamCore<Self>) {}
     fn input_hook(&self, _core: &StreamCore<Self>, _input: &[u8]) {}
     fn protocol_finish_hook(&self, _core: &StreamCore<Self>, _result: ProtocolResult) {}
@@ -175,14 +182,17 @@ pub trait StreamCoreHooks: Send + Sized + 'static {
         &self,
         core: &StreamCore<Self>,
         format: &StreamFormat,
-        fieldaddress: Option<&[u8]>,
+        fieldaddress: Option<&Self::FieldAddress>,
     ) -> bool;
     fn match_value(
         &self,
         core: &StreamCore<Self>,
         format: &StreamFormat,
-        fieldaddress: Option<&[u8]>,
-    ) -> bool;
+        fieldaddress: Option<&Self::FieldAddress>,
+    ) -> ValueMatch<Self::LinkPut>;
+    /// The rest of a matchValue that ended in [`ValueMatch::Put`], given the
+    /// put's `status` ([`Entry::LinkPut`]): whether the value matched.
+    fn link_put_done(&self, core: &StreamCore<Self>, put: Self::LinkPut, status: i32) -> bool;
     /// `execute`: start the `exec` command in `core.output_line`. The
     /// default is C's: not supported.
     fn execute(&self, core: &StreamCore<Self>) -> bool {
@@ -197,14 +207,25 @@ pub trait StreamCoreHooks: Send + Sized + 'static {
         &self,
         core: &StreamCore<Self>,
         fieldname: &[u8],
-        address: &mut StreamBuffer,
-    ) -> bool;
+    ) -> Option<Self::FieldAddress>;
     /// `priority`, for the bus's queue.
     fn priority(&self, _core: &StreamCore<Self>) -> i64 {
         0
     }
     /// `interruptAccept`, for the bus's asynchronous input.
     fn interrupt_accept(&self, core: &StreamCore<Self>) -> bool;
+}
+
+/// What [`StreamCoreHooks::match_value`] made of a format.
+pub enum ValueMatch<P> {
+    /// C's `true`: the value matched, its input consumed.
+    Matched,
+    /// C's `false`.
+    Failed,
+    /// The value goes to a put C makes inside matchValue, which the record
+    /// layer makes holding neither the record nor the core: the run waits
+    /// for its status ([`Entry::LinkPut`]).
+    Put(P),
 }
 
 /// `class MutexLock`: the core, locked.
@@ -216,6 +237,7 @@ pub struct StreamCoreLock<H: StreamCoreHooks> {
     me: Weak<Self>,
     core: ReentrantMutex<StreamCore<H>>,
     gate: Option<EntryGate<H>>,
+    owner: Arc<RunOwner>,
 }
 
 /// An entry into the core from outside it, each a StreamCore method that
@@ -231,12 +253,125 @@ pub enum Entry<'a> {
     Disconnect(StreamIoStatus),
     Timer,
     Exec(StreamIoStatus),
+    /// The status of the put a suspended run waits for, 0 for success.
+    LinkPut(i32),
+}
+
+/// The run an [`Entry`] belongs to: the one in progress when it was made,
+/// none between runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunId(Option<NonZeroU64>);
+
+/// The run the entries made now belong to, which the core sets under its
+/// lock and an entry reads outside it, and the suspensions it ended, which
+/// an entry waits on outside it.
+#[derive(Default)]
+struct RunOwner {
+    run: AtomicU64,
+    /// [`RunState::Suspended`]s ended so far.
+    resumes: Mutex<u64>,
+    resumed: Condvar,
+}
+
+impl RunOwner {
+    fn now(&self) -> RunId {
+        RunId(NonZeroU64::new(self.run.load(Ordering::Acquire)))
+    }
+
+    fn set(&self, run: RunId) {
+        self.run
+            .store(run.0.map_or(0, NonZeroU64::get), Ordering::Release);
+    }
+
+    /// Whether `run` has ended; no run never does.
+    fn has_ended(&self, run: RunId) -> bool {
+        run.0.is_some() && run != self.now()
+    }
+
+    /// The suspension in progress, read under the core's lock.
+    fn suspension(&self) -> Resume {
+        Resume(*self.resumes.lock())
+    }
+
+    fn end_suspension(&self) {
+        *self.resumes.lock() += 1;
+        self.resumed.notify_all();
+    }
+
+    /// Until `suspension` has ended.
+    fn wait(&self, suspension: Resume) {
+        let mut resumes = self.resumes.lock();
+        while *resumes == suspension.0 {
+            self.resumed.wait(&mut resumes);
+        }
+    }
+}
+
+/// [`StreamCoreLock::dispatch`]'s answer.
+#[must_use]
+pub enum Dispatch {
+    /// The entry ran, or was dropped: what the bus is answered.
+    Done(isize),
+    /// The run is suspended at a put ([`ValueMatch::Put`]), which C makes
+    /// holding the core: the entry goes in once that is over, the gate
+    /// holding nothing until then.
+    Wait(Resume),
+}
+
+/// The suspension a [`Dispatch::Wait`] waits out.
+pub struct Resume(u64);
+
+/// Where the run stands between entries.
+enum RunState<P> {
+    /// As its flags and command say.
+    Running,
+    /// In matchInput, at a put the record layer makes outside the core
+    /// ([`ValueMatch::Put`]): only that put's [`Entry::LinkPut`] goes on
+    /// from here.
+    Suspended(Suspension<P>),
+}
+
+/// A run's matchInput, stopped at a format whose put it waits for.
+struct Suspension<P> {
+    /// The format's offset in the running list's code.
+    format: usize,
+    /// matchInput's `delta` there.
+    delta: isize,
+    caller: MatchCaller,
+    put: P,
+}
+
+/// Where a matchInput goes back to once it is done.
+#[derive(Clone, Copy)]
+enum MatchCaller {
+    /// readCallback: `line` bytes of the input are the line, with its
+    /// terminator.
+    Read {
+        status: StreamIoStatus,
+        line: usize,
+        command_start: usize,
+    },
+    /// finishProtocol, reparsing the input for a `@mismatch` handler that
+    /// starts with `in`.
+    Reparse,
+}
+
+/// What a matchInput came to.
+enum Matching<P> {
+    Done(bool),
+    /// The format at `format` waits for `put`, `delta` there.
+    Put {
+        format: usize,
+        delta: isize,
+        put: P,
+    },
 }
 
 /// How an [`Entry`] from a thread that does not hold the core reaches it:
 /// the record layer takes what it must hold before the core (StreamEpics
 /// takes the record), then calls [`StreamCoreLock::dispatch`].
-pub type EntryGate<H> = Box<dyn Fn(&StreamCoreLock<H>, Entry<'_>) -> isize + Send + Sync + 'static>;
+pub type EntryGate<H> =
+    Box<dyn Fn(&StreamCoreLock<H>, RunId, Entry<'_>) -> Dispatch + Send + Sync + 'static>;
 
 impl<H: StreamCoreHooks> StreamCoreLock<H> {
     /// `StreamCore()` for the stream `name` (C's `streamname`, which the
@@ -261,41 +396,67 @@ impl<H: StreamCoreHooks> StreamCoreLock<H> {
         hooks: impl FnOnce(&Weak<Self>) -> H,
         gate: Option<EntryGate<H>>,
     ) -> Arc<Self> {
+        let owner = Arc::new(RunOwner::default());
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
-            core: ReentrantMutex::new(StreamCore::new(name, hooks(me))),
+            core: ReentrantMutex::new(StreamCore::new(name, hooks(me), owner.clone())),
             gate,
+            owner,
         })
     }
 
+    /// `entry`, made now.
     fn enter(&self, entry: Entry<'_>) -> isize {
-        match &self.gate {
+        self.enter_as(self.owner.now(), entry)
+    }
+
+    fn enter_as(&self, run: RunId, entry: Entry<'_>) -> isize {
+        if self.core.is_owned_by_current_thread() {
             // A bus answering inside a request, on the requesting thread,
-            // is behind the gate already.
-            Some(gate) if !self.core.is_owned_by_current_thread() => gate(self, entry),
-            _ => self.dispatch(entry),
+            // is behind the gate already; that thread has no suspension
+            // to wait out but its own, which no entry of its can end.
+            return match self.dispatch(run, entry) {
+                Dispatch::Done(r) => r,
+                Dispatch::Wait(_) => 0,
+            };
+        }
+        loop {
+            let dispatched = match &self.gate {
+                Some(gate) => gate(self, run, entry),
+                None => self.dispatch(run, entry),
+            };
+            match dispatched {
+                Dispatch::Done(r) => return r,
+                Dispatch::Wait(suspension) => self.owner.wait(suspension),
+            }
         }
     }
 
     /// Run `entry` on the core, the lock taken; nothing when the protocol
-    /// was aborted. C tests `Aborted` before it takes the lock; here the
-    /// flags are read under it, as they are only shared through it.
-    pub fn dispatch(&self, entry: Entry<'_>) -> isize {
+    /// was aborted or `run` has ended. C tests `Aborted` before it takes
+    /// the lock; here the flags are read under it, as they are only shared
+    /// through it. The gate can wait out the end of `run` and the start of
+    /// the next, which C's window (AsynDriverInterface.cc:930 to
+    /// StreamCore.cc:961) is too short for.
+    pub fn dispatch(&self, run: RunId, entry: Entry<'_>) -> Dispatch {
         let core = self.lock();
-        if core.has(ABORTED) {
-            return 0;
+        if core.has(ABORTED) || self.owner.has_ended(run) {
+            return Dispatch::Done(0);
         }
         match entry {
+            Entry::LinkPut(status) => core.link_put_callback(status),
+            // only its put's status takes a suspended run on
+            _ if core.suspended() => return Dispatch::Wait(self.owner.suspension()),
             Entry::Lock(status) => core.lock_callback(status),
             Entry::Write(status) => core.write_callback(status),
-            Entry::Read(status, input) => return core.read_callback(status, input),
+            Entry::Read(status, input) => return Dispatch::Done(core.read_callback(status, input)),
             Entry::Event(status) => core.event_callback(status),
             Entry::Connect(status) => core.connect_callback(status),
             Entry::Disconnect(status) => core.disconnect_callback(status),
             Entry::Timer => core.timer_callback(),
             Entry::Exec(status) => core.exec_callback(status),
         }
-        0
+        Dispatch::Done(0)
     }
 
     /// `MutexLock lock(this)`
@@ -345,6 +506,11 @@ impl<H: StreamCoreHooks> StreamCoreLock<H> {
     pub fn exec_callback(&self, status: StreamIoStatus) {
         self.enter(Entry::Exec(status));
     }
+
+    /// The status of the put `run` was suspended at ([`ValueMatch::Put`]).
+    pub fn link_put_callback(&self, run: RunId, status: i32) {
+        self.enter_as(run, Entry::LinkPut(status));
+    }
 }
 
 /// The bus callbacks.
@@ -367,6 +533,10 @@ impl<H: StreamCoreHooks> bus::Client for StreamCoreLock<H> {
 
     fn connect_callback(&self, status: StreamIoStatus) {
         self.enter(Entry::Connect(status));
+    }
+
+    fn async_connect_callback(&self, status: StreamIoStatus) {
+        self.enter_as(RunId(None), Entry::Connect(status));
     }
 
     fn disconnect_callback(&self, status: StreamIoStatus) {
@@ -397,7 +567,76 @@ impl<H: StreamCoreHooks> bus::Client for StreamCoreLock<H> {
 }
 
 /// A compiled command list (see [`StreamCore::commands`]).
-pub type CommandList = RefCell<Arc<StreamBuffer>>;
+pub type CommandList<A> = RefCell<Arc<Code<A>>>;
+
+/// A compiled command list, with the field addresses its `%(FIELD)`
+/// formats name by index. C appends each address to the code itself: a run
+/// holding its list holds the addresses its code was compiled with.
+pub struct Code<A> {
+    buffer: StreamBuffer,
+    field_addresses: Arc<[A]>,
+}
+
+impl<A> Code<A> {
+    /// The addresses of the protocol the list was compiled with, shared by
+    /// its other lists.
+    pub fn field_addresses(&self) -> &[A] {
+        &self.field_addresses
+    }
+}
+
+impl<A> Default for Code<A> {
+    fn default() -> Self {
+        Self {
+            buffer: StreamBuffer::new(),
+            field_addresses: Arc::new([]),
+        }
+    }
+}
+
+impl<A> std::ops::Deref for Code<A> {
+    type Target = StreamBuffer;
+
+    fn deref(&self) -> &StreamBuffer {
+        &self.buffer
+    }
+}
+
+/// The members C's `parse` and `compile` write. [`StreamCore::parse`]
+/// writes a copy of the core's ([`StreamCore::installed`]), which nothing
+/// runs until [`StreamCore::install`] makes it the core's.
+pub struct Parsed<A> {
+    protocolname: StreamBuffer,
+    ignore_extra_input: bool,
+    lock_timeout: u64,
+    write_timeout: u64,
+    reply_timeout: u64,
+    read_timeout: u64,
+    poll_period: u64,
+    max_input: u64,
+    in_terminator_defined: bool,
+    out_terminator_defined: bool,
+    in_terminator: StreamBuffer,
+    out_terminator: StreamBuffer,
+    separator: StreamBuffer,
+    /// `commands`, `onInit`, `onWriteTimeout`, `onReplyTimeout`,
+    /// `onReadTimeout`, `onMismatch`.
+    lists: [Arc<Code<A>>; 6],
+}
+
+impl<A> Parsed<A> {
+    /// The addresses the lists' `%(FIELD)` formats name. A failed compile
+    /// leaves the lists after the one it failed in as they were.
+    pub fn field_addresses(&self) -> impl Iterator<Item = &A> {
+        self.lists.iter().flat_map(|code| code.field_addresses())
+    }
+}
+
+/// The address a compiled `%(FIELD)` format names: `address` is its index
+/// into the addresses of the list it was read from.
+fn field_address<'a, A>(field_addresses: &'a [A], address: &[u8]) -> &'a A {
+    &field_addresses[u32::from_ne_bytes(address.try_into().unwrap()) as usize]
+}
 
 /// `StreamCore`'s members. A member the record layer reads or writes in C
 /// is public.
@@ -421,16 +660,16 @@ pub struct StreamCore<H: StreamCoreHooks> {
     /// The compiled command lists: the protocol and its handlers. A
     /// running protocol holds its own reference, so a reload cannot pull
     /// the code from under it.
-    pub commands: CommandList,
-    pub on_init: CommandList,
-    pub on_write_timeout: CommandList,
-    pub on_reply_timeout: CommandList,
-    pub on_read_timeout: CommandList,
-    pub on_mismatch: CommandList,
+    pub commands: CommandList<H::FieldAddress>,
+    pub on_init: CommandList<H::FieldAddress>,
+    pub on_write_timeout: CommandList<H::FieldAddress>,
+    pub on_reply_timeout: CommandList<H::FieldAddress>,
+    pub on_read_timeout: CommandList<H::FieldAddress>,
+    pub on_mismatch: CommandList<H::FieldAddress>,
     active_command: Cell<u8>,
     /// `commandIndex`: the list running and the offset in it. The list is
     /// held, so a reload cannot pull it from under a running protocol.
-    code: RefCell<Arc<StreamBuffer>>,
+    code: RefCell<Arc<Code<H::FieldAddress>>>,
     command_index: Cell<usize>,
     running_handler: Cell<ProtocolResult>,
     previous_result: Cell<ProtocolResult>,
@@ -442,6 +681,10 @@ pub struct StreamCore<H: StreamCoreHooks> {
     pub input_buffer: RefCell<StreamBuffer>,
     pub input_line: RefCell<StreamBuffer>,
     pub consumed_input: Cell<usize>,
+    /// The protocol starts so far.
+    runs: Cell<u64>,
+    owner: Arc<RunOwner>,
+    run_state: RefCell<RunState<H::LinkPut>>,
 
     pub hooks: H,
 }
@@ -466,7 +709,7 @@ fn c_strcspn(s: CPtr<'_>, reject: &[u8]) -> usize {
 }
 
 impl<H: StreamCoreHooks> StreamCore<H> {
-    fn new(name: &str, hooks: H) -> Self {
+    fn new(name: &str, hooks: H, owner: Arc<RunOwner>) -> Self {
         Self {
             streamname: name.to_string(),
             flags: Cell::new(NONE),
@@ -502,6 +745,9 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             input_buffer: RefCell::new(StreamBuffer::new()),
             input_line: RefCell::new(StreamBuffer::new()),
             consumed_input: Cell::new(0),
+            runs: Cell::new(0),
+            owner,
+            run_state: RefCell::new(RunState::Running),
             hooks,
         }
     }
@@ -656,8 +902,15 @@ impl<H: StreamCoreHooks> StreamCore<H> {
     // Parse the protocol
 
     /// `parse(filename, protocolname)`: `protocolname` may carry
-    /// substitutions, `name(sub1, sub2)`.
-    pub fn parse(&self, filename: &str, protocolname_arg: &[u8]) -> bool {
+    /// substitutions, `name(sub1, sub2)`. C writes the core's members under
+    /// a protocol still running; here `parsed`, for [`Self::install`], as
+    /// far as C writes them when it fails.
+    pub fn parse(
+        &self,
+        parsed: &mut Parsed<H::FieldAddress>,
+        filename: &str,
+        protocolname_arg: &[u8],
+    ) -> bool {
         let mut protocolname = StreamBuffer::from_bytes(protocolname_arg);
         // extract substitutions from protocolname "name ( sub1, sub2 ) "
         let mut i = protocolname.find_byte(b'(', 0);
@@ -708,7 +961,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                     protocolname_arg,
                     b"'\n"
                 ));
-                *self.protocolname.borrow_mut() = protocolname;
+                parsed.protocolname = protocolname;
                 return false;
             }
             protocolname.truncate(-1); // remove ')'
@@ -723,7 +976,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 b"\"\n"
             );
         }
-        *self.protocolname.borrow_mut() = protocolname.clone();
+        parsed.protocolname = protocolname.clone();
         let Some(mut protocol) = protocol::get_protocol(filename, &protocolname) else {
             stream_error(&cmsg!(
                 b"while reading protocol '",
@@ -734,7 +987,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             ));
             return false;
         };
-        if !self.compile(&mut protocol) {
+        if !self.compile(&mut protocol, parsed) {
             stream_error(&cmsg!(
                 b"while compiling protocol '",
                 protocolname_arg,
@@ -748,12 +1001,12 @@ impl<H: StreamCoreHooks> StreamCore<H> {
     }
 
     /// `compile(protocol)`
-    fn compile(&self, protocol: &mut Protocol) -> bool {
+    fn compile(&self, protocol: &mut Protocol, parsed: &mut Parsed<H::FieldAddress>) -> bool {
         let extra_input_names: [&[u8]; 2] = [b"error", b"ignore"];
         const MAX: u64 = 0xFFFF_FFFF;
 
         // default values for protocol variables
-        self.flags.set(self.flags.get() & !IGNORE_EXTRA_INPUT);
+        parsed.ignore_extra_input = false;
         let mut lock_timeout = 5000;
         let mut read_timeout = 100;
         let mut reply_timeout = 1000;
@@ -761,35 +1014,31 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         let mut max_input = 0;
         let mut poll_period = 1000;
         let (mut in_defined, mut out_defined) = (false, false);
-        let store = |lock, read, reply, write, max, poll, ind, outd| {
-            self.lock_timeout.set(lock);
-            self.read_timeout.set(read);
-            self.reply_timeout.set(reply);
-            self.write_timeout.set(write);
-            self.max_input.set(max);
-            self.poll_period.set(poll);
-            self.in_terminator_defined.set(ind);
-            self.out_terminator_defined.set(outd);
+        let store = |parsed: &mut Parsed<H::FieldAddress>, lock, read, reply, write, max, poll| {
+            parsed.lock_timeout = lock;
+            parsed.read_timeout = read;
+            parsed.reply_timeout = reply;
+            parsed.write_timeout = write;
+            parsed.max_input = max;
+            parsed.poll_period = poll;
+            parsed.in_terminator_defined = in_defined;
+            parsed.out_terminator_defined = out_defined;
         };
         store(
+            parsed,
             lock_timeout,
             read_timeout,
             reply_timeout,
             write_timeout,
             max_input,
             poll_period,
-            in_defined,
-            out_defined,
         );
 
         let mut ignore_extra_input = 0u16;
         if !protocol.get_enum_variable(b"extrainput", &mut ignore_extra_input, &extra_input_names) {
             return false;
         }
-
-        if ignore_extra_input != 0 {
-            self.flags.set(self.flags.get() | IGNORE_EXTRA_INPUT);
-        }
+        parsed.ignore_extra_input = ignore_extra_input != 0;
 
         let numbers_ok = protocol.get_number_variable(b"locktimeout", &mut lock_timeout, MAX)
             && protocol.get_number_variable(b"readtimeout", &mut read_timeout, MAX)
@@ -800,14 +1049,13 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             && protocol.get_number_variable(b"replytimeout", &mut poll_period, MAX)
             && protocol.get_number_variable(b"pollperiod", &mut poll_period, MAX);
         store(
+            parsed,
             lock_timeout,
             read_timeout,
             reply_timeout,
             write_timeout,
             max_input,
             poll_period,
-            in_defined,
-            out_defined,
         );
         if !numbers_ok {
             return false;
@@ -837,34 +1085,135 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                     Some(&mut out_defined),
                 ))
             && protocol.get_string_variable(b"separator", &mut separator, None);
-        self.in_terminator_defined.set(in_defined);
-        self.out_terminator_defined.set(out_defined);
-        *self.in_terminator.borrow_mut() = in_terminator;
-        *self.out_terminator.borrow_mut() = out_terminator;
-        *self.separator.borrow_mut() = separator;
+        parsed.in_terminator_defined = in_defined;
+        parsed.out_terminator_defined = out_defined;
+        parsed.in_terminator = in_terminator;
+        parsed.out_terminator = out_terminator;
+        parsed.separator = separator;
         if !strings_ok {
             return false;
         }
 
-        let mut client = Compiler(self);
-        let lists: [(Option<&[u8]>, &CommandList); 6] = [
-            (None, &self.commands),
-            (Some(b"@init"), &self.on_init),
-            (Some(b"@writetimeout"), &self.on_write_timeout),
-            (Some(b"@replytimeout"), &self.on_reply_timeout),
-            (Some(b"@readtimeout"), &self.on_read_timeout),
-            (Some(b"@mismatch"), &self.on_mismatch),
+        let mut client = Compiler {
+            core: self,
+            field_addresses: Vec::new(),
+        };
+        let handlers: [Option<&[u8]>; 6] = [
+            None,
+            Some(b"@init"),
+            Some(b"@writetimeout"),
+            Some(b"@replytimeout"),
+            Some(b"@readtimeout"),
+            Some(b"@mismatch"),
         ];
-        for (handler, list) in lists {
+        let mut codes = Vec::new();
+        let mut ok = true;
+        for handler in handlers {
             let mut code = StreamBuffer::new();
-            let ok = protocol.get_commands(handler, &mut code, &mut client);
-            *list.borrow_mut() = Arc::new(code);
+            ok = protocol.get_commands(handler, &mut code, &mut client);
+            codes.push(code);
             if !ok {
-                return false;
+                break;
             }
         }
+        let field_addresses: Arc<[H::FieldAddress]> = client.field_addresses.into();
+        for (list, buffer) in parsed.lists.iter_mut().zip(codes) {
+            *list = Arc::new(Code {
+                buffer,
+                field_addresses: field_addresses.clone(),
+            });
+        }
 
-        protocol.check_unused()
+        ok && protocol.check_unused()
+    }
+
+    /// The members [`Self::parse`] writes, the core's.
+    pub fn installed(&self) -> Parsed<H::FieldAddress> {
+        Parsed {
+            protocolname: self.protocolname.borrow().clone(),
+            ignore_extra_input: self.flags.get() & IGNORE_EXTRA_INPUT != 0,
+            lock_timeout: self.lock_timeout.get(),
+            write_timeout: self.write_timeout.get(),
+            reply_timeout: self.reply_timeout.get(),
+            read_timeout: self.read_timeout.get(),
+            poll_period: self.poll_period.get(),
+            max_input: self.max_input.get(),
+            in_terminator_defined: self.in_terminator_defined.get(),
+            out_terminator_defined: self.out_terminator_defined.get(),
+            in_terminator: self.in_terminator.borrow().clone(),
+            out_terminator: self.out_terminator.borrow().clone(),
+            separator: self.separator.borrow().clone(),
+            lists: [
+                &self.commands,
+                &self.on_init,
+                &self.on_write_timeout,
+                &self.on_reply_timeout,
+                &self.on_read_timeout,
+                &self.on_mismatch,
+            ]
+            .map(|list| list.borrow().clone()),
+        }
+    }
+
+    /// Make `parsed` the core's members. A protocol still running keeps the
+    /// list it holds.
+    pub fn install(&self, parsed: Parsed<H::FieldAddress>) {
+        *self.protocolname.borrow_mut() = parsed.protocolname;
+        if parsed.ignore_extra_input {
+            self.set_flags(IGNORE_EXTRA_INPUT);
+        } else {
+            self.clear_flags(IGNORE_EXTRA_INPUT);
+        }
+        self.lock_timeout.set(parsed.lock_timeout);
+        self.write_timeout.set(parsed.write_timeout);
+        self.reply_timeout.set(parsed.reply_timeout);
+        self.read_timeout.set(parsed.read_timeout);
+        self.poll_period.set(parsed.poll_period);
+        self.max_input.set(parsed.max_input);
+        self.in_terminator_defined.set(parsed.in_terminator_defined);
+        self.out_terminator_defined
+            .set(parsed.out_terminator_defined);
+        *self.in_terminator.borrow_mut() = parsed.in_terminator;
+        *self.out_terminator.borrow_mut() = parsed.out_terminator;
+        *self.separator.borrow_mut() = parsed.separator;
+        let [
+            commands,
+            on_init,
+            on_write_timeout,
+            on_reply_timeout,
+            on_read_timeout,
+            on_mismatch,
+        ] = parsed.lists;
+        *self.commands.borrow_mut() = commands;
+        *self.on_init.borrow_mut() = on_init;
+        *self.on_write_timeout.borrow_mut() = on_write_timeout;
+        *self.on_reply_timeout.borrow_mut() = on_reply_timeout;
+        *self.on_read_timeout.borrow_mut() = on_read_timeout;
+        *self.on_mismatch.borrow_mut() = on_mismatch;
+    }
+
+    /// A protocol is running: C's `printStatus` shows its `activeCommand`.
+    pub fn running(&self) -> bool {
+        self.active_command.get() != END
+    }
+
+    /// The run an entry made now belongs to.
+    pub fn run_id(&self) -> RunId {
+        self.owner.now()
+    }
+
+    fn suspended(&self) -> bool {
+        matches!(*self.run_state.borrow(), RunState::Suspended(_))
+    }
+
+    /// The run's suspension, ended: only here does a run leave one, for
+    /// its put's status or at the run's end.
+    fn end_suspension(&self) -> Option<Suspension<H::LinkPut>> {
+        let RunState::Suspended(suspension) = self.run_state.replace(RunState::Running) else {
+            return None;
+        };
+        self.owner.end_suspension();
+        Some(suspension)
     }
 
     // Protocol execution /////////////////////////////////////////////////
@@ -880,7 +1229,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
     }
 
     /// `commandIndex = list()`
-    fn run_list(&self, list: &CommandList) {
+    fn run_list(&self, list: &CommandList<H::FieldAddress>) {
         *self.code.borrow_mut() = list.borrow().clone();
         self.command_index.set(0);
     }
@@ -896,6 +1245,9 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             stream_error(&cmsg!(self.name(), b": No businterface attached\n"));
             return false;
         }
+        // entries of the run before this one are dropped from here on
+        self.owner.set(RunId(None));
+        self.end_suspension();
         self.clear_flags(CLEAR_ON_START);
         match start_mode {
             StartMode::StartInit => {
@@ -922,6 +1274,8 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 self.run_list(&self.commands);
             }
         }
+        self.runs.set(self.runs.get() + 1);
+        self.owner.set(RunId(NonZeroU64::new(self.runs.get())));
         self.running_handler.set(ProtocolResult::Success);
         self.hooks.protocol_start_hook(self);
         self.eval_command()
@@ -936,6 +1290,8 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             status.to_str(),
             if self.has(BUS_OWNER) { "" } else { "not " }
         ));
+        // a run that ends waits for no put
+        self.end_suspension();
 
         if status == ProtocolResult::Success && self.has(BUS_PENDING) {
             stream_error(&cmsg!(format!(
@@ -992,11 +1348,10 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                         );
                         *self.code.borrow_mut() = handler;
                         self.command_index.set(1);
-                        if self.match_input() {
-                            self.eval_command();
-                            return;
+                        if let Some(matches) = self.match_input(MatchCaller::Reparse) {
+                            self.reparse_done(matches);
                         }
-                        None
+                        return;
                     } else {
                         Some(&self.on_mismatch)
                     }
@@ -1019,6 +1374,17 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 return;
             }
         }
+        self.finish_unhandled(status);
+    }
+
+    /// finishProtocol's end, with no handler to run.
+    fn finish_unhandled(&self, status: ProtocolResult) {
+        if status != ProtocolResult::Abort {
+            // what comes from here on belongs to no run, as an I/O Intr
+            // record's early input; an aborted run keeps its own, which C
+            // drops (Aborted)
+            self.owner.set(RunId(None));
+        }
         if self.has(BUS_OWNER) {
             self.bus().bus_unlock();
             self.clear_flags(BUS_OWNER);
@@ -1026,6 +1392,16 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         self.bus().bus_finish();
         self.clear_flags(ACCEPT_INPUT | ACCEPT_EVENT);
         self.hooks.protocol_finish_hook(self, status);
+    }
+
+    /// finishProtocol after the `@mismatch` handler's `in` reparsed the
+    /// input.
+    fn reparse_done(&self, matches: bool) {
+        if matches {
+            self.eval_command();
+        } else {
+            self.finish_unhandled(ProtocolResult::ScanError);
+        }
     }
 
     /// `evalCommand`
@@ -1155,12 +1531,12 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         let code = self.code.borrow().clone();
         let mut c = CPtr::at_offset(code.bytes(), self.command_index.get());
         self.output_line.borrow_mut().clear();
-        let ok = self.format_output_from(&mut c);
+        let ok = self.format_output_from(&mut c, code.field_addresses());
         self.command_index.set(c.offset());
         ok
     }
 
-    fn format_output_from(&self, c: &mut CPtr<'_>) -> bool {
+    fn format_output_from(&self, c: &mut CPtr<'_>, fields: &[H::FieldAddress]) -> bool {
         loop {
             let mut command = c.peek();
             c.advance(1);
@@ -1171,7 +1547,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 codes::FORMAT_FIELD | codes::FORMAT => {
                     // code layout:
                     // [field <eos> addrlen AddressStructure] formatstring <eos> StreamFormat [info]
-                    let mut field: Option<(&[u8], &[u8])> = None;
+                    let mut field: Option<(&[u8], &H::FieldAddress)> = None;
                     if command == codes::FORMAT_FIELD {
                         debug!(format!(
                             "StreamCore::formatOutput({}): StreamProtocolParser::redirect_format\n",
@@ -1183,7 +1559,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                         c.advance(2);
                         let start = c.offset().min(c.base().len());
                         let end = (c.offset() + addrlen).min(c.base().len());
-                        field = Some((field_name, &c.base()[start..end]));
+                        field = Some((field_name, field_address(fields, &c.base()[start..end])));
                         c.advance(addrlen);
                     }
                     let formatstring = c.offset();
@@ -1350,18 +1726,18 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         });
         if !printed {
             stream_error(&cmsg!(format!(
-                "{}: Formatting value {} failed\n",
+                "{}: Formatting value {:#} failed\n",
                 self.name(),
-                fmt_c_alt_g(value)
+                CFloat(value).g()
             )));
             return false;
         }
         debug!(
             format!(
-                "StreamCore::printValue({}, %{}, {}): \"",
+                "StreamCore::printValue({}, %{}, {:#}): \"",
                 self.name(),
                 fmt.conv as char,
-                fmt_c_alt_g(value)
+                CFloat(value).g()
             ),
             self.output_line.borrow().expand(),
             b"\"\n"
@@ -1774,10 +2150,34 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             self.input_line.borrow().expand(),
             b"\"\n"
         );
-        let matches = self.match_input();
-        self.input_buffer
-            .borrow_mut()
-            .remove_front(end as usize + termlen);
+        let caller = MatchCaller::Read {
+            status,
+            line: end as usize + termlen,
+            command_start,
+        };
+        if let Some(matches) = self.match_input(caller) {
+            self.match_done(caller, matches);
+        }
+        0
+    }
+
+    /// matchInput's `caller`, after it.
+    fn match_done(&self, caller: MatchCaller, matches: bool) {
+        match caller {
+            MatchCaller::Read {
+                status,
+                line,
+                command_start,
+            } => self.read_done(status, line, command_start, matches),
+            MatchCaller::Reparse => self.reparse_done(matches),
+        }
+    }
+
+    /// readCallback after matchInput: `line` bytes of the input were the
+    /// line, with its terminator.
+    fn read_done(&self, status: StreamIoStatus, line: usize, command_start: usize, matches: bool) {
+        use StreamIoStatus::*;
+        self.input_buffer.borrow_mut().remove_front(line);
         if self.input_buffer.borrow().is_set() {
             debug!(
                 format!(
@@ -1795,7 +2195,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             if status == StreamIoTimeout {
                 // we have not forgotten the timeout
                 self.finish_protocol(ProtocolResult::ReadTimeout);
-                return 0;
+                return;
             }
             if self.has(ASYNC_MODE) {
                 debug!(format!(
@@ -1804,25 +2204,24 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 ));
                 self.command_index.set(command_start);
                 self.eval_in();
-                return 0;
+                return;
             }
             debug!(format!(
                 "StreamCore::readCallback({}) match failure\n",
                 self.name()
             ));
             self.finish_protocol(ProtocolResult::ScanError);
-            return 0;
+            return;
         }
         if status == StreamIoTimeout {
             // we have not forgotten the timeout
             self.finish_protocol(ProtocolResult::ReadTimeout);
-            return 0;
+            return;
         }
         // end input mode and do next command
         //// flags &= ~(AsyncMode|AcceptInput);
         // -- should we tell someone that input has finished? --
         self.eval_command();
-        0
     }
 
     /// Whether `matchInput` reports a mismatch: not in asynchronous mode
@@ -1833,21 +2232,68 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         !self.has(ASYNC_MODE) && self.on_mismatch.borrow().get(0) != IN
     }
 
-    /// `matchInput`
-    fn match_input(&self) -> bool {
-        let code = self.code.borrow().clone();
-        let mut c = CPtr::at_offset(code.bytes(), self.command_index.get());
-        let matches = self.match_input_from(&mut c);
-        self.command_index.set(c.offset());
-        matches
+    /// `matchInput`: `None` when the run is suspended at a put
+    /// ([`ValueMatch::Put`]), which goes on to `caller` once its status is
+    /// in ([`Self::link_put_callback`]).
+    fn match_input(&self, caller: MatchCaller) -> Option<bool> {
+        self.consumed_input.set(0);
+        self.match_input_at(self.command_index.get(), 0, None, caller)
     }
 
-    fn match_input_from(&self, c: &mut CPtr<'_>) -> bool {
-        let mut delta: isize = 0;
+    /// matchInput from the command at `at`, `delta` there; `put` is the
+    /// put the format there waits for, with its status.
+    fn match_input_at(
+        &self,
+        at: usize,
+        delta: isize,
+        put: Option<(H::LinkPut, i32)>,
+        caller: MatchCaller,
+    ) -> Option<bool> {
+        let code = self.code.borrow().clone();
+        let mut c = CPtr::at_offset(code.bytes(), at);
+        match self.match_input_from(&mut c, code.field_addresses(), delta, put) {
+            Matching::Done(matches) => {
+                self.command_index.set(c.offset());
+                Some(matches)
+            }
+            Matching::Put { format, delta, put } => {
+                self.run_state.replace(RunState::Suspended(Suspension {
+                    format,
+                    delta,
+                    caller,
+                    put,
+                }));
+                None
+            }
+        }
+    }
 
-        self.consumed_input.set(0);
+    /// The status of the put the run is suspended at: its format's
+    /// matchValue ends, then matchInput and its caller go on from there.
+    fn link_put_callback(&self, status: i32) {
+        let Some(Suspension {
+            format,
+            delta,
+            caller,
+            put,
+        }) = self.end_suspension()
+        else {
+            return;
+        };
+        if let Some(matches) = self.match_input_at(format, delta, Some((put, status)), caller) {
+            self.match_done(caller, matches);
+        }
+    }
 
+    fn match_input_from(
+        &self,
+        c: &mut CPtr<'_>,
+        fields: &[H::FieldAddress],
+        mut delta: isize,
+        mut put: Option<(H::LinkPut, i32)>,
+    ) -> Matching<H::LinkPut> {
         loop {
+            let at = c.offset();
             let mut command = c.peek();
             c.advance(1);
             if command == codes::EOS {
@@ -1855,7 +2301,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             }
             match command {
                 codes::FORMAT_FIELD | codes::FORMAT => {
-                    let mut field: Option<(&[u8], &[u8])> = None;
+                    let mut field: Option<(&[u8], &H::FieldAddress)> = None;
                     if command == codes::FORMAT_FIELD {
                         // code layout:
                         // field <eos> addrlen AddressStructure formatstring <eos> StreamFormat [info]
@@ -1865,7 +2311,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                         c.advance(2);
                         let start = c.offset().min(c.base().len());
                         let end = (c.offset() + addrlen).min(c.base().len());
-                        field = Some((field_name, &c.base()[start..end]));
+                        field = Some((field_name, field_address(fields, &c.base()[start..end])));
                         c.advance(addrlen);
                     }
                     // code layout:
@@ -1874,18 +2320,21 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                     *c = protocol::print_string(&mut formatstring, *c);
 
                     let fmt = StreamFormat::extract(c);
-                    debug!(
-                        format!("StreamCore::matchInput({}): format = \"%", self.name()),
-                        formatstring.bytes(),
-                        b"\"\n"
-                    );
+                    if put.is_none() {
+                        // printed when the format was first come to
+                        debug!(
+                            format!("StreamCore::matchInput({}): format = \"%", self.name()),
+                            formatstring.bytes(),
+                            b"\"\n"
+                        );
+                    }
 
                     if fmt.flags & SKIP_FLAG != 0
                         || fmt.type_ == PSEUDO_FORMAT
                         || fmt.type_ == NEEDS_ORIGINAL_FORMAT
                     {
                         let Some(conv) = converter::find(fmt.conv).map(|r| &*r.converter) else {
-                            return false;
+                            return Matching::Done(false);
                         };
                         let mut consumed = match fmt.type_ {
                             UNSIGNED_FORMAT | SIGNED_FORMAT | ENUM_FORMAT => {
@@ -1944,7 +2393,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                     self.name(),
                                     fmt.type_
                                 )));
-                                return false;
+                                return Matching::Done(false);
                             }
                         };
                         if consumed < 0 {
@@ -1954,7 +2403,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                 if self.report_mismatch() {
                                     self.input_mismatch(formatstring.bytes(), None);
                                 }
-                                return false;
+                                return Matching::Done(false);
                             }
                         }
                         self.consumed_input
@@ -1984,7 +2433,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                     b"\"\n"
                                 )),
                             }
-                            return false;
+                            return Matching::Done(false);
                         }
                         let consumed = self.consumed_input.get();
                         let line = self.input_line.borrow();
@@ -2010,7 +2459,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                     b"\")\n"
                                 ));
                             }
-                            return false;
+                            return Matching::Done(false);
                         }
                         if !output
                             .bytes()
@@ -2023,16 +2472,33 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                 drop(line);
                                 self.input_mismatch(formatstring.bytes(), Some(&output));
                             }
-                            return false;
+                            return Matching::Done(false);
                         }
                         self.consumed_input.set(consumed + output.length());
                         continue;
                     }
-                    self.clear_flags(SEPARATOR);
-                    if !self
-                        .hooks
-                        .match_value(self, &fmt, field.map(|(_, address)| address))
-                    {
+                    let matched = match put.take() {
+                        Some((put, status)) => self.hooks.link_put_done(self, put, status),
+                        None => {
+                            self.clear_flags(SEPARATOR);
+                            match self.hooks.match_value(
+                                self,
+                                &fmt,
+                                field.map(|(_, address)| address),
+                            ) {
+                                ValueMatch::Matched => true,
+                                ValueMatch::Failed => false,
+                                ValueMatch::Put(put) => {
+                                    return Matching::Put {
+                                        format: at,
+                                        delta,
+                                        put,
+                                    };
+                                }
+                            }
+                        }
+                    };
+                    if !matched {
                         if self.report_mismatch() {
                             if self.has(SCAN_TRIED) {
                                 self.input_mismatch(formatstring.bytes(), None);
@@ -2055,7 +2521,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                 ));
                             }
                         }
-                        return false;
+                        return Matching::Done(false);
                     }
                     // matchValue() has already removed consumed bytes from inputBuffer
                 }
@@ -2110,7 +2576,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                             ));
                             stream_error(&cmsg!(b"No match for \"", expected(), b"\"\n"));
                         }
-                        return false;
+                        return Matching::Done(false);
                     }
                     if command != line.get(consumed as isize) {
                         if self.report_mismatch() {
@@ -2158,7 +2624,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                                 b"\" was expected\n"
                             ));
                         }
-                        return false;
+                        return Matching::Done(false);
                     }
                     self.consumed_input.set(consumed + 1);
                 }
@@ -2205,9 +2671,9 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                     ));
                 }
             }
-            return false;
+            return Matching::Done(false);
         }
-        true
+        Matching::Done(true)
     }
 
     /// `"%s: Input \"%s%s\" does not match format \"%%%s\"[ (\"%s\")]\n"`
@@ -2400,7 +2866,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 fmt.conv as char
             ),
             line.expand_range(consumed_input as isize, consumed),
-            format!("\" value={}\n", fmt_c_alt_g(*value))
+            format!("\" value={:#}\n", CFloat(*value).g())
         );
         if fmt.flags & FIX_WIDTH_FLAG != 0
             && consumed != fmt.width.wrapping_add(fmt.prec as u64).wrapping_add(1) as isize
@@ -2817,8 +3283,12 @@ pub fn license() -> &'static str {
     )
 }
 
-/// The core as `StreamProtocolParser::Client`, while it compiles.
-struct Compiler<'a, H: StreamCoreHooks>(&'a StreamCore<H>);
+/// The core as `StreamProtocolParser::Client`, while it compiles: the
+/// addresses its `%(FIELD)` formats name, in the order their indices count.
+struct Compiler<'a, H: StreamCoreHooks> {
+    core: &'a StreamCore<H>,
+    field_addresses: Vec<H::FieldAddress>,
+}
 
 impl<H: StreamCoreHooks> protocol::Client for Compiler<'_, H> {
     /// `compileCommand`
@@ -2856,7 +3326,7 @@ impl<H: StreamCoreHooks> protocol::Client for Compiler<'_, H> {
                 true
             }
             b"event" => {
-                if !self.0.bus_supports_event() {
+                if !self.core.bus_supports_event() {
                     stream_error_at(
                         command.line_number(),
                         protocol.filename(),
@@ -2907,10 +3377,15 @@ impl<H: StreamCoreHooks> protocol::Client for Compiler<'_, H> {
     }
 
     fn get_field_address(&mut self, fieldname: &[u8], address: &mut StreamBuffer) -> bool {
-        self.0.hooks.get_field_address(self.0, fieldname, address)
+        let Some(field) = self.core.hooks.get_field_address(self.core, fieldname) else {
+            return false;
+        };
+        address.append(&(self.field_addresses.len() as u32).to_ne_bytes());
+        self.field_addresses.push(field);
+        true
     }
 
     fn name(&self) -> String {
-        self.0.name().to_string()
+        self.core.name().to_string()
     }
 }

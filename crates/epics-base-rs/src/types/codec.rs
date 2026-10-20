@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use std::fmt::Write as _;
+use epics_libcom_rs::cfmt::CFloat;
 use std::time::SystemTime;
 
 use super::{DbFieldType, EpicsValue, PvString, WallTime, c_cast};
@@ -293,11 +293,6 @@ impl<const N: usize> StrBuf<N> {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
-
-    fn as_str(&self) -> &str {
-        // Only `write_str` fills the buffer, and it copies whole `&str`s.
-        std::str::from_utf8(self.as_bytes()).unwrap_or_default()
-    }
 }
 
 impl<const N: usize> std::fmt::Write for StrBuf<N> {
@@ -332,9 +327,9 @@ pub(crate) fn write_cvt_double(
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val > 1e16 || val < -1e16 {
             let p = precision.min(17) as usize;
-            return write_exp_c(out, val, p, p + 7);
+            return write!(out, "{:>w$.p$e}", CFloat(val), w = p + 7);
         }
-        return write_fixed_c(out, val, precision.min(3) as usize);
+        return write!(out, "{:.p$}", CFloat(val), p = precision.min(3) as usize);
     }
     let mut val = val;
     if val < 0.0 {
@@ -371,9 +366,14 @@ pub(crate) fn write_cvt_float(
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val >= 1e8 || val <= -1e8 {
             let p = precision.min(12) as usize;
-            return write_exp_c(out, val as f64, p, p + 6);
+            return write!(out, "{:>w$.p$e}", CFloat(val as f64), w = p + 6);
         }
-        return write_fixed_c(out, val as f64, precision.min(3) as usize);
+        return write!(
+            out,
+            "{:.p$}",
+            CFloat(val as f64),
+            p = precision.min(3) as usize
+        );
     }
     let mut val = val;
     if val < 0.0 {
@@ -428,48 +428,6 @@ fn write_fixed_digits(
         }
     }
     Ok(())
-}
-
-/// C `sprintf("%.*f", precision, val)`, with glibc NaN/Inf spellings.
-fn write_fixed_c(out: &mut impl std::fmt::Write, val: f64, precision: usize) -> std::fmt::Result {
-    if val.is_nan() {
-        return out.write_str("nan");
-    }
-    if val.is_infinite() {
-        return out.write_str(if val < 0.0 { "-inf" } else { "inf" });
-    }
-    write!(out, "{val:.precision$}")
-}
-
-/// C `sprintf("%*.*e", width, precision, val)`: scientific notation with a
-/// signed, ≥2-digit exponent, right-justified in `width`. glibc NaN/Inf
-/// spellings.
-fn write_exp_c(
-    out: &mut impl std::fmt::Write,
-    val: f64,
-    precision: usize,
-    width: usize,
-) -> std::fmt::Result {
-    // `precision` ≤ 17: a sign, 18 digits, the point and `e-308` fit.
-    let mut body = StrBuf::<32>::new();
-    if val.is_nan() {
-        body.write_str("nan")?;
-    } else if val.is_infinite() {
-        body.write_str(if val < 0.0 { "-inf" } else { "inf" })?;
-    } else {
-        // Rust `{:.*e}` rounds the mantissa half-to-even (matching glibc)
-        // and emits `<mantissa>e<exp>` with no exponent sign / leading
-        // zero; reformat the exponent to C's `e±dd`.
-        let mut raw = StrBuf::<32>::new();
-        write!(raw, "{val:.precision$e}")?;
-        let raw = raw.as_str();
-        let (mantissa, exp) = raw.split_once('e').unwrap_or((raw, "0"));
-        let exp_num: i32 = exp.parse().unwrap_or(0);
-        let sign = if exp_num < 0 { '-' } else { '+' };
-        write!(body, "{mantissa}e{sign}{:02}", exp_num.abs())?;
-    }
-    // Right-justify in `width` (C `%*.*e` pads with leading spaces).
-    write!(out, "{:>width$}", body.as_str())
 }
 
 /// RISC alignment padding bytes required between metadata header and value.
@@ -1825,6 +1783,10 @@ mod r57_string_precision_tests {
         // NaN takes the `%.*f` branch (NaN compares false against the e-path
         // thresholds) → unpadded glibc "nan".
         assert_eq!(cvt_double_to_string(f64::NAN, 3), "nan");
+        // glibc prints a NaN's sign bit too.
+        assert_eq!(cvt_double_to_string(-f64::NAN, 3), "-nan");
+        assert_eq!(cvt_double_to_string(-f64::NAN, 10), "             -nan");
+        assert_eq!(cvt_float_to_string(-f32::NAN, 3), "-nan");
         // ±Inf exceeds 1e16 → "%*.*e" branch: glibc spelling right-justified
         // in width = precision + 7 (= 13 here), matching C `cvtDoubleToString`.
         assert_eq!(cvt_double_to_string(f64::INFINITY, 6), "          inf");

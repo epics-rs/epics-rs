@@ -6,9 +6,9 @@
 
 use std::time::Duration;
 
-use epics_base_rs::calc::engine::cvt::{fmt_e, fmt_f, fmt_g};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::data::chantler::{find_material, other_absorption_length_um};
 use crate::db_access::DbMultiMonitor;
@@ -234,7 +234,7 @@ pub fn recalc_filters(
     let z = cfg.material_indices;
     let f = cfg.thicknesses;
     if debug >= 10 {
-        println!("\nRecalcFilters: keV={}", fmt_g(kev, 6, false, false));
+        println!("\nRecalcFilters: keV={}", CFloat(kev).g());
     }
     let abs_len_al = al_absorption_length_microns(kev);
     let abs_len_ti = ti_absorption_length_microns(kev);
@@ -258,9 +258,9 @@ pub fn recalc_filters(
             if debug >= 10 {
                 println!(
                     "       in RecalcFilters {i:3}, Aluminum = {},   Titanium = {},   Glass = {}",
-                    fmt_g(x_al, 6, false, false),
-                    fmt_g(x_ti, 6, false, false),
-                    fmt_g(x_glass, 6, false, false)
+                    CFloat(x_al).g(),
+                    CFloat(x_ti).g(),
+                    CFloat(x_glass).g()
                 );
             }
             let mut x = (-x_al * 1000. / abs_len_al).exp();
@@ -307,7 +307,7 @@ fn sort_decreasing(
         if debug >= 10 {
             let t: Vec<String> = xmit[..NUM_COMBINATIONS / 3]
                 .iter()
-                .map(|&v| fmt_g(v, 6, false, false))
+                .map(|&v| CFloat(v).g().to_string())
                 .collect();
             println!("                   transmit={}", t.join(", "));
         }
@@ -638,7 +638,7 @@ pub async fn run(
                         flags.select = false;
                         let msg = format!(
                             "local energy changed to {}",
-                            fmt_f(ch_local.get_f64().await, 6)
+                            CFloat(ch_local.get_f64().await)
                         );
                         debug.print(2, 360, &msg).await;
                         break State::RecalcBank;
@@ -665,7 +665,7 @@ pub async fn run(
                             poll(&mut monitor, &names, &mut flags).await;
                             flags.local = false;
                             energytimeout = ENERGY_WAIT;
-                            let msg = format!("monochromator energy changed to {}", fmt_f(mono, 6));
+                            let msg = format!("monochromator energy changed to {}", CFloat(mono));
                             debug.print(2, 389, &msg).await;
                         }
                         break State::Idle;
@@ -681,7 +681,7 @@ pub async fn run(
                     if take_first(&mut flags.f, 0..4) {
                         let mut f = [String::new(), String::new(), String::new(), String::new()];
                         for k in 0..4 {
-                            f[k] = fmt_g(ch_f[k].get_f64().await, 6, false, false);
+                            f[k] = CFloat(ch_f[k].get_f64().await).g().to_string();
                         }
                         let msg = format!(
                             "filters thickness changed to f1={}, f2={}, f3={}, f3={}",
@@ -863,7 +863,7 @@ pub async fn run(
                             (xmit, bits) =
                                 recalc_filters(local, &cfg, true, debug.flag.get_i32().await);
                             for (label, x) in ch_label.iter().zip(xmit) {
-                                let _ = label.put_string_sync(&fmt_e(x, 3, false)).await;
+                                let _ = label.put_string_sync(&format!("{:.3e}", CFloat(x))).await;
                             }
                             let _ = ch_bankctl.put_i16_sync(2).await;
                             "filter bank changed value to 2".to_string()

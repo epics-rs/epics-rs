@@ -1526,7 +1526,7 @@ pub fn parse_value_format(arg: Option<&str>) -> Option<ValueFormat> {
         "tree" => ValueFormat::Tree,
         "delta" => ValueFormat::Delta,
         other => {
-            eprintln!("Warning: ignoring unknown format '{other}'");
+            epics_libcom_rs::stderr_println!("Warning: ignoring unknown format '{other}'");
             ValueFormat::Delta
         }
     })

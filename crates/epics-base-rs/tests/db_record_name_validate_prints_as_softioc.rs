@@ -91,7 +91,6 @@ fn load_status(name: &str, body: &str) -> (Arc<PvDatabase>, String, String, bool
 async fn listed(db: &PvDatabase) -> Vec<String> {
     let mut names: Vec<String> = db
         .all_record_names()
-        .await
         .iter()
         .map(|n| n.to_string())
         .collect();

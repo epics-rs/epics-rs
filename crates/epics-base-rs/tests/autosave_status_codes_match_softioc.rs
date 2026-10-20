@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::task::{Reactor, TaskHandle, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::backup::BackupConfig;
+use epics_base_rs::server::autosave::manager::SaveTaskHandle;
 use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager};
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
@@ -81,7 +82,7 @@ const SEQ_FAIL: (f64, u16, u16) = (3.0, 7, 2);
 struct Rig {
     db: Arc<PvDatabase>,
     mgr: Arc<AutosaveManager>,
-    handle: Option<TaskHandle<()>>,
+    handle: Option<SaveTaskHandle>,
     status: EventReader,
     list: EventReader,
 }
@@ -127,17 +128,14 @@ impl Rig {
                     request_pvs: vec!["T:SAVED".into()],
                     backup,
                     macros: HashMap::new(),
-                    macro_string: String::new(),
+                    macro_string: None,
                     search_paths: Vec::new(),
                 },
                 SaveStrategy::Manual,
             );
         }
         let mgr = Arc::new(builder.build().await);
-        let handle = mgr.clone().start(
-            &Reactor::current().expect("the test driver enters an executor"),
-            db.clone(),
-        );
+        let handle = mgr.clone().start(db.clone());
         Self {
             db,
             mgr,
@@ -198,6 +196,7 @@ async fn valid_sav(path: &Path) {
             pv_name: "T:SAVED".into(),
             value: "1".into(),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await

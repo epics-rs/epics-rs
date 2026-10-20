@@ -6,10 +6,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::request::RequestOp;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::StackSizeClass;
@@ -93,7 +95,8 @@ fn the_port_thread_takes_register_port_s_stack_size() {
 }
 
 /// A synchronous port has no C thread, so its `stackSize` is never read
-/// (asynManager.c:2074); the port's own thread keeps Medium.
+/// (asynManager.c:2074); the port's own thread keeps Medium. A blocking
+/// request runs on its caller there, so the probe is submitted.
 #[test]
 fn a_synchronous_port_s_stack_size_is_not_read() {
     let stack = Arc::new(AtomicUsize::new(0));
@@ -112,7 +115,11 @@ fn a_synchronous_port_s_stack_size_is_not_read() {
         ..RuntimeConfig::default()
     };
     let (rt, _jh) = create_port_runtime_unclaimed(device, config).unwrap();
-    rt.port_handle().read_int32_blocking(0, 0).unwrap();
+    rt.port_handle()
+        .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+        .unwrap()
+        .wait_blocking(Duration::from_secs(5))
+        .unwrap();
     let got = stack.load(Ordering::SeqCst);
     let asked = StackSizeClass::Medium.bytes();
     assert!(

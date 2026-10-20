@@ -78,7 +78,9 @@ impl DeviceSupport for EnumProp {
             .unwrap_or(5);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            eprintln!("[ioc] re-keying enum strings, posting DBE_PROPERTY on VAL");
+            epics_libcom_rs::stderr_println!(
+                "[ioc] re-keying enum strings, posting DBE_PROPERTY on VAL"
+            );
             let _ = tx
                 .send(PropertyPost {
                     writes: vec![
@@ -148,7 +150,7 @@ record(mbbi, "RIG:MBBI") {
     .bound_at_init(ioc.servers());
     ioc.run().await;
     let server = server.build().await?;
-    eprintln!("[ioc] serving RIG:MBBI on CA port {port}");
+    epics_libcom_rs::stderr_println!("[ioc] serving RIG:MBBI on CA port {port}");
     server.run().await
 }
 

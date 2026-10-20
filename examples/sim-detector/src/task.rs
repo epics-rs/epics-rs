@@ -61,7 +61,7 @@ impl AcquisitionContext {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (end_acquisition): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (end_acquisition): {e}");
         }
     }
 }
@@ -230,7 +230,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             )
             .await
         {
-            eprintln!("set_params_and_notify error (acquire start): {e}");
+            epics_libcom_rs::stderr_println!("set_params_and_notify error (acquire start): {e}");
         }
 
         let mut num_counter = 0;
@@ -354,12 +354,12 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 )
                 .await
             {
-                eprintln!("set_params_and_notify error (frame update): {e}");
+                epics_libcom_rs::stderr_println!("set_params_and_notify error (frame update): {e}");
             }
 
             // C `getAttributes(pImage->pAttributeList)` (simDetector.cpp:828).
             if let Err(e) = ctx.pool.owner().get_attributes(&mut frame).await {
-                eprintln!("getAttributes error: {e}");
+                epics_libcom_rs::stderr_println!("getAttributes error: {e}");
             }
 
             if config.array_callbacks {

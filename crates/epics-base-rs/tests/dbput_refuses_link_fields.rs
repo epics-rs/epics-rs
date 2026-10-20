@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
-use epics_base_rs::server::autosave::save_set::{RestoreMode, restore_from_entries_with_mode};
+use epics_base_rs::server::autosave::save_set::{
+    CaContext, RestoreMode, restore_from_entries_with_mode,
+};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -171,6 +173,7 @@ async fn autosave_process_mode_restores_a_link_field() {
             pv_name: "R5.INP".into(),
             value: "SRC5.VAL".into(),
             connected: true,
+            array_fprintfs: Vec::new(),
         }],
     )
     .await
@@ -179,7 +182,7 @@ async fn autosave_process_mode_restores_a_link_field() {
     let result = restore_from_entries_with_mode(
         &db,
         &path,
-        RestoreMode::Process,
+        RestoreMode::Process(CaContext::InProcess),
         &epics_base_rs::server::autosave::settings::SrSettings::default(),
     )
     .await

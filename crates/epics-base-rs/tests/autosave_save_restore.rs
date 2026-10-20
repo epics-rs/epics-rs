@@ -16,21 +16,25 @@ async fn test_write_read_roundtrip() {
             pv_name: "TEMP".into(),
             value: value_to_save_str(&EpicsValue::Double(25.5)),
             connected: true,
+            array_fprintfs: Vec::new(),
         },
         SaveEntry {
             pv_name: "MSG".into(),
             value: value_to_save_str(&EpicsValue::String("hello world".into())),
             connected: true,
+            array_fprintfs: Vec::new(),
         },
         SaveEntry {
             pv_name: "COUNT".into(),
             value: value_to_save_str(&EpicsValue::Long(42)),
             connected: true,
+            array_fprintfs: Vec::new(),
         },
         SaveEntry {
             pv_name: "ENUM_PV".into(),
             value: value_to_save_str(&EpicsValue::Enum(3)),
             connected: true,
+            array_fprintfs: Vec::new(),
         },
     ];
 
@@ -59,6 +63,7 @@ async fn test_end_marker_validation() {
         pv_name: "PV1".into(),
         value: "1.0".into(),
         connected: true,
+        array_fprintfs: Vec::new(),
     }];
     write_save_file(&path, &entries).await.unwrap();
     assert!(validate_save_file(&path).await.unwrap());
@@ -92,7 +97,12 @@ async fn test_c_autosave_array_format() {
     let entries = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pv_name, "ARRAY_PV");
-    assert_eq!(entries[0].value, "[1.0,2.0,3.0]");
+    // Kept as C reads it; the marker is what makes it an array.
+    assert_eq!(entries[0].value, "@array@ { \"1.0\" \"2.0\" \"3.0\" }");
+    assert_eq!(
+        parse_save_value(&entries[0].value, &EpicsValue::DoubleArray(vec![].into())),
+        Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
+    );
 }
 
 #[epics_macros_rs::epics_test]
@@ -106,6 +116,7 @@ async fn test_string_with_special_chars() {
             "test \"quoted\" with\\backslash".into(),
         )),
         connected: true,
+        array_fprintfs: Vec::new(),
     }];
 
     write_save_file(&path, &entries).await.unwrap();
@@ -160,11 +171,13 @@ async fn test_disconnected_pv_roundtrip() {
             pv_name: "GOOD_PV".into(),
             value: "1.0".into(),
             connected: true,
+            array_fprintfs: Vec::new(),
         },
         SaveEntry {
             pv_name: "BAD_PV".into(),
             value: String::new(),
             connected: false,
+            array_fprintfs: Vec::new(),
         },
     ];
 
@@ -210,21 +223,34 @@ fn test_enum_array_roundtrip() {
     assert_eq!(parsed, val);
 }
 
+/// An empty array's line as the oracle writes it (reviewer3 d9-d11): the
+/// `DBR_STRING` get of a LONG, SHORT, CHAR or UCHAR one is "", a USHORT one
+/// takes `write_it`'s DBF_CHAR branch and is "" too, the rest print the
+/// zero `ca_array_get` pads with. Either reads back as one zero element
+/// (NORD 1 on the oracle, dbrestore.c:478-536).
 #[test]
 fn test_empty_new_array_types() {
-    for template in &[
-        EpicsValue::ShortArray(vec![].into()),
-        EpicsValue::FloatArray(vec![].into()),
-        EpicsValue::EnumArray(vec![].into()),
+    for (template, text) in [
+        (EpicsValue::LongArray(vec![].into()), ""),
+        (EpicsValue::ShortArray(vec![].into()), ""),
+        (EpicsValue::CharArray(vec![].into()), ""),
+        (EpicsValue::UCharArray(vec![].into()), ""),
+        (EpicsValue::UShortArray(vec![].into()), ""),
+        (EpicsValue::DoubleArray(vec![].into()), "0"),
+        (EpicsValue::FloatArray(vec![].into()), "0"),
+        (EpicsValue::ULongArray(vec![].into()), "0"),
+        (EpicsValue::EnumArray(vec![].into()), "0"),
+        (EpicsValue::Int64Array(vec![].into()), "0"),
+        (EpicsValue::UInt64Array(vec![].into()), "0"),
     ] {
-        let s = value_to_save_str(template);
-        assert_eq!(s, "@array@ {  }");
-        let parsed = parse_save_value(&s, template).unwrap();
-        match (&parsed, template) {
-            (EpicsValue::ShortArray(a), EpicsValue::ShortArray(_)) => assert!(a.is_empty()),
-            (EpicsValue::FloatArray(a), EpicsValue::FloatArray(_)) => assert!(a.is_empty()),
-            (EpicsValue::EnumArray(a), EpicsValue::EnumArray(_)) => assert!(a.is_empty()),
-            _ => panic!("type mismatch"),
-        }
+        let s = value_to_save_str(&template);
+        assert_eq!(s, text, "{template:?}");
+        let parsed = parse_save_value(&s, &template).unwrap();
+        assert_eq!(parsed.count(), 1, "{parsed:?}");
+        assert_eq!(
+            parsed.first_element().and_then(|e| e.to_f64()),
+            Some(0.0),
+            "{parsed:?}"
+        );
     }
 }

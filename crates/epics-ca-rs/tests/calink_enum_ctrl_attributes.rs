@@ -28,7 +28,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkSet};
+use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkRef, LinkSet};
+use epics_base_rs::server::record::OpenLatch;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::mbbi::MbbiRecord;
 use epics_base_rs::types::EpicsValue;
@@ -56,6 +57,9 @@ async fn metadata_when(
     pv: &str,
     ready: impl Fn(&LinkMetadata) -> bool,
 ) -> LinkMetadata {
+    let open = OpenLatch::default();
+    let link = LinkRef::new(pv.as_bytes(), &open);
+    LinkSet::connect_link(resolver, link, None).await;
     assert!(
         resolver
             .wait_for_link_connected(pv, fact_budget::FACT_BUDGET)
@@ -64,7 +68,7 @@ async fn metadata_when(
     );
     let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if let Some(md) = LinkSet::link_metadata(resolver, pv.as_bytes())
+        if let Some(md) = LinkSet::link_metadata(resolver, link)
             && ready(&md)
         {
             return md;

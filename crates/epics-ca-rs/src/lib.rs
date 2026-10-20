@@ -6,6 +6,10 @@
 // point at it. This lint finds the population instead of the sample, and the
 // crate's `clippy -D warnings` gate turns it into a build failure.
 #![warn(unnameable_types)]
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_methods, reason = "tests may take stderr()")
+)]
 #![allow(
     clippy::collapsible_if,
     clippy::map_entry,

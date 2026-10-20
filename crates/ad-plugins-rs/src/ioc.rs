@@ -144,16 +144,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     &source,
                     m.wiring().clone(),
-                    threads_arg(args, 8),
+                    threads_arg(args, 8).with_max_threads(max_threads_arg(args, 9)),
                 );
-                handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
                     m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDStdArraysConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDStdArraysConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -185,9 +184,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     &source,
                     m.wiring().clone(),
-                    threads_arg(args, 8),
+                    threads_arg(args, 8).with_max_threads(max_threads_arg(args, 9)),
                 );
-                handle.set_max_threads(max_threads_arg(args, 9));
 
                 if let Err(e) =
                     m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
@@ -195,7 +193,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDStatsConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDStatsConfigure: wiring failed: {e}");
                 }
 
                 Ok(CommandOutcome::Continue)
@@ -228,16 +226,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     &source,
                     m.wiring().clone(),
-                    threads_arg(args, 8),
+                    threads_arg(args, 8).with_max_threads(max_threads_arg(args, 9)),
                 );
-                handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
                     m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDROIConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDROIConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -370,16 +367,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &source,
                     m.wiring().clone(),
                     max_overlays,
-                    threads_arg(args, 9),
+                    threads_arg(args, 9).with_max_threads(max_threads_arg(args, 10)),
                 );
-                handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
                     m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDOverlayConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDOverlayConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -607,7 +603,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDAttrPlotConfig: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDAttrPlotConfig: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -765,7 +761,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDAttrConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDAttrConfigure: wiring failed: {e}");
                 }
 
                 Ok(CommandOutcome::Continue)
@@ -799,16 +795,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &source,
                     m.wiring().clone(),
                     count_arg(args, 5),
-                    threads_arg(args, 9),
+                    threads_arg(args, 9).with_max_threads(max_threads_arg(args, 10)),
                 );
-                handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
                     m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDROIStatConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDROIStatConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -934,7 +929,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("NDTimeSeriesConfigure: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("NDTimeSeriesConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -990,17 +985,21 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 
                 #[cfg(feature = "pva")]
                 let processor = {
-                    // The processor owns the validating `PvaPvHandle` (built
-                    // with the canonical NTNDArray descriptor); registering a
-                    // clone shares the same `latest`/`subscribers` state with
-                    // the qsrv adapter. Producer posts and server reads flow
-                    // through one validating owner — a frame that does not
-                    // match the descriptor never becomes the served value.
+                    use epics_pva_rs::server::iocsh::{AddPvRefused, pvxs_add_pv};
                     let proc = crate::pva::PvaProcessor::with_plugin_type(
                         pva_pv_name.clone(),
                         plugin_type,
                     );
-                    epics_bridge_rs::qsrv::register_pva_pv_global(&pva_pv_name, proc.handle());
+                    // NDPluginPva adds to pvDatabase's master, which exists
+                    // with no server and names a taken PV its own way
+                    // (NDPluginPva.cpp:176-178); NDPluginPvxs throws pvxs's.
+                    match (pvxs_add_pv(&pva_pv_name, proc.pv()), plugin_type) {
+                        (Ok(()), _) | (Err(AddPvRefused::NoInstance), "NDPluginPva") => {}
+                        (Err(AddPvRefused::Duplicate), "NDPluginPva") => {
+                            return Ok(ctx.cxx_error("couldn't add record to master database"));
+                        }
+                        (Err(e), _) => return Ok(ctx.cxx_error(e)),
+                    }
                     proc
                 };
                 #[cfg(not(feature = "pva"))]
@@ -1022,7 +1021,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                    eprintln!("{name}: wiring failed: {e}");
+                    epics_base_rs::stderr_println!("{name}: wiring failed: {e}");
                 }
                 #[cfg(not(feature = "pva"))]
                 println!("{name}: port={port_name} (stub — enable 'pva' feature)");
@@ -1121,6 +1120,10 @@ where
                     ad_core_rs::plugin::runtime::plugin_threads(0, bytes)
                 }
             };
+            let threads = match max_threads_idx {
+                Some(idx) => threads.with_max_threads(max_threads_arg(args, idx)),
+                None => threads,
+            };
             let (handle, _jh) = factory(
                 &claim,
                 queue_size,
@@ -1131,14 +1134,11 @@ where
                 threads,
                 args,
             );
-            if let Some(idx) = max_threads_idx {
-                handle.set_max_threads(max_threads_arg(args, idx));
-            }
             if let Err(e) = m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate()) {
                 return Ok(ctx.cxx_error(e));
             }
             if let Err(e) = handle.connect_to_array_port(m.wiring()) {
-                eprintln!("{cmd_name}: wiring failed: {e}");
+                epics_base_rs::stderr_println!("{cmd_name}: wiring failed: {e}");
             }
             Ok(CommandOutcome::Continue)
         },
@@ -1353,7 +1353,7 @@ impl AdIoc {
             args[1].clone()
         } else {
             let bin = args.first().map(|s| s.as_str()).unwrap_or("ioc");
-            eprintln!("Usage: {bin} <st.cmd>");
+            epics_base_rs::stderr_println!("Usage: {bin} <st.cmd>");
             std::process::exit(1);
         };
         self.run(&script).await
@@ -1373,8 +1373,8 @@ impl AdIoc {
     ///
     /// Same as [`Self::run`] but uses
     /// [`epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app`] as the protocol runner, serving records over CA (default port 5064) and
-    /// pvAccess (default port 5075) simultaneously. PVA plugin PVs (NTNDArray)
-    /// registered during st.cmd are wired into the PVA server automatically.
+    /// pvAccess (default port 5075) simultaneously. A PVA plugin's NTNDArray
+    /// PV joins the server's `__builtin` store at its `*Configure`.
     #[cfg(feature = "pva")]
     pub async fn run_with_pva(self, script: &str) -> CaResult<()> {
         let app = self.app.unwrap();
@@ -1391,7 +1391,7 @@ impl AdIoc {
             args[1].clone()
         } else {
             let bin = args.first().map(|s| s.as_str()).unwrap_or("ioc");
-            eprintln!("Usage: {bin} <st.cmd>");
+            epics_base_rs::stderr_println!("Usage: {bin} <st.cmd>");
             std::process::exit(1);
         };
         self.run_with_pva(&script).await

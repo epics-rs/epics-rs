@@ -4,14 +4,17 @@
 //! record type the workspace generates a table for, each declared field but
 //! `NAME` and the `DBF_NOACCESS` ones is loaded with a value of its type, and
 //! the load must succeed and the field read back what was loaded.
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 
 use std::collections::HashMap;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::RecordFactory;
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{
-    FieldDesc, Record, Special, dbd_generated as base, shared_menu_choices,
+    DbLinkType, DevSup, Dset, FieldDesc, Record, Special, dbd_generated as base,
+    shared_menu_choices,
 };
 use epics_base_rs::server::records::{
     acalcout::AcalcoutRecord, busy::BusyRecord, scalcout::ScalcoutRecord, sseq::SseqRecord,
@@ -268,6 +271,9 @@ async fn every_nomod_field_is_refused_by_the_gate() {
             }
         }
     }
+    let links = nomod_link_failures().await;
+    cases += links.0;
+    failures.extend(links.1);
     eprintln!("{cases} NOMOD fields");
     assert!(
         failures.is_empty(),
@@ -275,4 +281,115 @@ async fn every_nomod_field_is_refused_by_the_gate() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A device row with a dsxt, so a device-link put passes `dbPutFieldLink`'s
+/// `S_db_noSupport` and `del_record` gates and reaches `SPC_NOMOD`.
+static CENSUS_HW: DevSup = DevSup {
+    name: "devCensusHw",
+    choice: "Census Hw",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(6, &[], true),
+};
+
+struct CensusDevice;
+
+impl DeviceSupport for CensusDevice {
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+    }
+
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    fn dtyp(&self) -> &str {
+        "Census Hw"
+    }
+}
+
+/// A link field's `SPC_NOMOD` waits for the put's hold (`dbPutFieldLink`
+/// removes the old link first, `dbAccess.c:1167-1176`), so each NOMOD link
+/// field takes a CA put: refused, the field reads what was loaded. INP/OUT
+/// once as a device link and once holding a hardware link on a type with no
+/// device row, which C's `dbLinkIsDefined` refuses before the gate.
+async fn nomod_link_failures() -> (usize, Vec<String>) {
+    let mut failures = Vec::new();
+    let mut cases = 0usize;
+    for (record_types, fields) in tables() {
+        for &record_type in record_types {
+            let own = fields(record_type).unwrap_or_else(|| panic!("{record_type}: no table"));
+            for f in base::DB_COMMON_FIELDS.iter().chain(own) {
+                if !f.read_only
+                    || !matches!(
+                        f.declared_dbf,
+                        DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink
+                    )
+                {
+                    continue;
+                }
+                let device = matches!(f.name, "INP" | "OUT");
+                let arms: &[(bool, &str, &str)] = if device {
+                    &[(false, "@census", "@other"), (true, "@census", "@other")]
+                } else {
+                    &[(false, "census", "other")]
+                };
+                for &(with_device, loaded, put) in arms {
+                    cases += 1;
+                    let case = format!("{record_type}.{} (device row {with_device})", f.name);
+                    let mut builder = IocBuilder::new();
+                    for (name, factory) in factories() {
+                        builder = builder.register_record_type(name, factory);
+                    }
+                    let dtyp = if with_device {
+                        builder = builder.register_device_support(record_type, &CENSUS_HW, || {
+                            Box::new(CensusDevice)
+                        });
+                        "field(DTYP, \"Census Hw\")"
+                    } else {
+                        ""
+                    };
+                    let db = builder
+                        .db_string(
+                            &format!(
+                                "record({record_type}, \"nomod\") {{ {dtyp} field({}, \"{loaded}\") }}\n",
+                                f.name
+                            ),
+                            &HashMap::new(),
+                        )
+                        .unwrap()
+                        .load()
+                        .await
+                        .unwrap();
+                    let refused = db
+                        .put_record_field_from_ca("nomod", f.name, EpicsValue::String(put.into()))
+                        .await;
+                    let gate = with_device || !device;
+                    match &refused {
+                        Err(CaError::ReadOnlyField(_)) => {}
+                        Err(_) if !gate => {}
+                        other => failures.push(format!("{case}: put {other:?}")),
+                    }
+                    // A removed PV link keeps its name; C prints the
+                    // `PV_LINK` `dbCaRemoveLink` leaves as "name NPP NMS"
+                    // (`dbStaticLib.c:1947-1951`). A hardware link has no
+                    // lset to remove and keeps its text.
+                    let got = db.get_pv(format!("nomod.{}", f.name));
+                    let kept = match &got {
+                        Ok(EpicsValue::String(s)) if loaded.starts_with('@') => {
+                            s.as_str_lossy() == loaded
+                        }
+                        Ok(EpicsValue::String(s)) => {
+                            s.as_str_lossy().split_whitespace().next() == Some(loaded)
+                        }
+                        _ => false,
+                    };
+                    if !kept {
+                        failures.push(format!("{case}: reads {got:?} after the refused put"));
+                    }
+                }
+            }
+        }
+    }
+    (cases, failures)
 }

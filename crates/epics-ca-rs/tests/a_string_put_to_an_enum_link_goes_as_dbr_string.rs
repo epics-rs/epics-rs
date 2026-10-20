@@ -69,6 +69,8 @@ async fn a_state_name_put_through_a_ca_link_selects_that_state() {
     )
     .await;
     db.initialize_link_locality().await;
+    // The build ran with no `ca` lset: its `dbCaAddLink` pass is this one.
+    db.setup_external_link_opens().await;
     db.setup_cp_links().await;
     db.scan_control().run();
     db.process_cp_links_on_connect().await;

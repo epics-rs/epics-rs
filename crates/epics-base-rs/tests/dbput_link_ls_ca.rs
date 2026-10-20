@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -29,34 +29,38 @@ fn native(name: &[u8]) -> Option<LinkDbfType> {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for Remote {
-    fn is_connected(&self, name: &[u8]) -> bool {
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        let name = link.name;
         native(name).is_some()
     }
-    fn put_admission(&self, name: &[u8]) -> PutAdmission {
+    fn put_admission(&self, link: LinkRef<'_>) -> PutAdmission {
+        let name = link.name;
         match native(name) {
             Some(_) => PutAdmission::Connected,
             None => PutAdmission::Refused,
         }
     }
-    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, _name: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _name: LinkRef<'_>) -> Option<EpicsValue> {
         None
     }
     async fn put_value(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
+        let name = link.name;
         self.puts
             .lock()
             .unwrap()
             .push((String::from_utf8_lossy(name).into_owned(), value));
         Ok(())
     }
-    fn link_metadata(&self, name: &[u8]) -> Option<LinkMetadata> {
+    fn link_metadata(&self, link: LinkRef<'_>) -> Option<LinkMetadata> {
+        let name = link.name;
         native(name).map(|t| LinkMetadata {
             dbf_type: Some(t),
             element_count: Some(1),

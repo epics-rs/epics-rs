@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use epics_base_rs::server::autosave::error::AutosaveError;
 use epics_base_rs::server::autosave::macros::MacroContext;
 use epics_base_rs::server::autosave::request::{
-    self, RequestEntry, dedup_entries, load_request_file_with_search_paths, pv_names,
+    self, RequestEntry, load_request_file_with_search_paths, pv_names,
 };
 
 /// Load `name` with `dir` as the one `set_requestfile_path`, where C
@@ -122,15 +122,14 @@ fn test_comments_and_blanks() {
     assert_eq!(pv_names(&entries), vec!["PV1", "PV2"]);
 }
 
+/// C `readReqFile` appends every PV line, a repeated one included
+/// (save_restore.c:3650-3672).
 #[test]
-fn test_duplicate_pv_dedup() {
+fn test_duplicate_pv_kept() {
     let content = "PV1\nPV2\nPV1\nPV3\n";
     let ctx = MacroContext::new();
     let entries = request::parse_request_string(content, &ctx, "test.req").unwrap();
-    let deduped = dedup_entries(entries);
-    let names = pv_names(&deduped);
-    // PV1 last occurrence wins, so it should appear where the last one was but in order
-    assert_eq!(names, vec!["PV2", "PV1", "PV3"]);
+    assert_eq!(pv_names(&entries), vec!["PV1", "PV2", "PV1", "PV3"]);
 }
 
 #[test]

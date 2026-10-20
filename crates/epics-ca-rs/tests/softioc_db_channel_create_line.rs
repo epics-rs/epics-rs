@@ -49,6 +49,13 @@ impl Ioc {
     /// softioc-rs on `db` and `port`, returned once it printed `iocRun`, or
     /// `None` when it lost the port first: RSRV binds in iocInit.
     fn start(db: &str, port: u16) -> Option<Ioc> {
+        // Nothing answers there, so a CA link's search never reaches this
+        // IOC's server and creates the channel once more.
+        Self::start_searching(db, port, "192.0.2.1")
+    }
+
+    /// [`Self::start`] with its CA links searching `addr_list`.
+    fn start_searching(db: &str, port: u16, addr_list: &str) -> Option<Ioc> {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.db");
         std::fs::write(&path, db).expect("write db");
@@ -61,9 +68,7 @@ impl Ioc {
             .arg("-d")
             .arg(&path)
             .env("EPICS_CA_SERVER_PORT", port.to_string())
-            // Nothing answers there, so a CA link's search never reaches this
-            // IOC's server and creates the channel once more.
-            .env("EPICS_CA_ADDR_LIST", "192.0.2.1")
+            .env("EPICS_CA_ADDR_LIST", addr_list)
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
             .stdin(Stdio::piped())
@@ -246,4 +251,27 @@ fn an_async_inp_put_with_an_unknown_filter_prints_two_lines_and_the_refusal() {
     assert!(refusal.is_some() && refusal < echo, "heard:\n{heard:#?}");
     let last_filter = heard.iter().rposition(|l| l.contains(FILTER_LINE)).unwrap();
     assert!(Some(last_filter) < refusal, "heard:\n{heard:#?}");
+}
+
+/// Two links on one name are two `caLink`s, and each prints the line three
+/// times: at link init, at its dbContext open and at RSRV's CREATE_CHAN for
+/// the search that reaches this IOC. softIoc R7.0.10 prints six.
+#[test]
+fn two_ca_links_on_one_refused_name_print_three_lines_each() {
+    let heard = named_port::on_a_named_port(|port| {
+        let mut ioc = Ioc::start_searching(
+            r#"record(ai, "Y") {}
+record(ao, "A") { field(OUT, "Y.VAL{\"bad\":{}}") }
+record(ao, "B") { field(OUT, "Y.VAL{\"bad\":{}}") }
+"#,
+            port,
+            &format!("127.0.0.1:{port}"),
+        )?;
+        let mut heard = ioc.console.clone();
+        while filter_lines(&heard) < 6 {
+            heard.extend(ioc.read_until(FILTER_LINE)?);
+        }
+        ioc.finish().map(|rest| [heard, rest].concat())
+    });
+    assert_eq!(filter_lines(&heard), 6, "heard:\n{heard:#?}");
 }

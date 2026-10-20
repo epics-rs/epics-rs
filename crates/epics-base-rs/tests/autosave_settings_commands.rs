@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — its one hand-built tokio runtime ran in a suite that passed under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-base-rs --test autosave_settings_commands` (3/3).
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — its one hand-built tokio runtime ran in a suite that passed under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-base-rs --test autosave_settings_commands` (4/4).
 //! C's `save_restoreSet_*` setters (save_restore.c:453-491) write the
 //! globals the save task and the restores read; two of them print.
 
@@ -47,14 +47,24 @@ fn child_settings() {
     run(&lines.split(';').collect::<Vec<_>>());
 }
 
-fn stdout_of(lines: &str) -> Vec<String> {
-    let name = "child_settings";
+fn child_output(lines: &str) -> std::process::Output {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "child_settings",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD, lines)
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    out
+}
+
+fn stdout_of(lines: &str) -> Vec<String> {
+    let name = "child_settings";
+    let out = child_output(lines);
     let prefix = format!("test {name} ... ");
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -117,5 +127,25 @@ fn the_permissions_and_a_refused_timeout_are_printed() {
             "save_restore: File permissions set to 0640",
             "save_restoreCallbackTimeout must be either negative (forever) or >= 4 seconds",
         ]
+    );
+}
+
+/// set_saveTask_priority (save_restore.c:2636-2646): epicsPrintf's refusal
+/// outside epicsThreadPriorityMin..Max, and C's default of 20 kept.
+#[test]
+fn a_task_priority_out_of_range_is_refused() {
+    let s = run(&["set_saveTask_priority(100)", "set_saveTask_priority(-1)"]);
+    assert_eq!(s.task_priority(), 20);
+    let s = run(&["set_saveTask_priority(99)"]);
+    assert_eq!(s.task_priority(), 99);
+    let out = child_output("set_saveTask_priority(100)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.starts_with("save_restore - "))
+            .collect::<Vec<_>>(),
+        ["save_restore - priority must be >= 0 and <= 99"],
+        "{out:?}"
     );
 }

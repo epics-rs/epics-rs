@@ -724,6 +724,9 @@ pub struct ProcessEffects {
     /// A forced poll no C GET_INFO asks for: it prints nothing and posts
     /// even an unchanged status. A C GET_INFO is a [`MotorCommand::Poll`].
     pub request_poll: bool,
+    /// The pass leaves through C `goto process_exit` (motorRecord.cc:1379,
+    /// 1425, 1454), past do_work and the RLNK put at 1495.
+    pub process_exit: bool,
     /// Not consulted: FLNK is gated solely on DMOV at process exit
     /// (C motorRecord.cc:1509-1510, `if (dmov != 0) recGblFwdLink`) —
     /// the record core neither sets nor reads this. Retained only so

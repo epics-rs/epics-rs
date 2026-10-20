@@ -25,6 +25,7 @@ use crate::runtime::task::BlockingBridge;
 use crate::server::database::{PvDatabase, parse_pv_name};
 use crate::server::record::{ProcessCompletion, PutRefused, ambient_write_origin_scope};
 use crate::types::EpicsValue;
+use epics_libcom_rs::cfmt::CFloat;
 
 /// Start `run` as a task once the database has finished its PINI pass.
 ///
@@ -45,9 +46,78 @@ pub fn spawn_program<F, Fut, E>(
     bridge.spawn(async move {
         db.wait_for_pini().await;
         if let Err(e) = run(db).await {
-            eprintln!("{program} error: {e}");
+            crate::stderr_println!("{program} error: {e}");
         }
     });
+}
+
+/// A program's macro table (`PROG::macros`, `seq_mac.c`), built as `seq`
+/// builds it: the `program` statement's parameters, then the command line's
+/// over them (`seq_main.c:93-96`).
+#[derive(Debug, Default, Clone)]
+pub struct SeqMacros(Vec<(String, Option<String>)>);
+
+impl SeqMacros {
+    pub fn new(params: &str, macro_def: &str) -> Self {
+        let mut macros = Self::default();
+        macros.parse(params);
+        macros.parse(macro_def);
+        macros
+    }
+
+    /// `seqMacParse`: a value ends at a blank or a comma, and parsing stops
+    /// at the first thing that is neither a name nor a separator. A name
+    /// given without a value keeps the value it had.
+    pub fn parse(&mut self, mac_str: &str) {
+        fn blanks(s: &str) -> &str {
+            s.trim_start_matches(' ')
+        }
+        let mut s = mac_str;
+        while !s.is_empty() {
+            s = blanks(s);
+            // `seqMacParseName`
+            if !s.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                break;
+            }
+            let len = s
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(s.len());
+            let (name, rest) = s.split_at(len);
+            let at = match self.0.iter().position(|(n, _)| n == name) {
+                Some(at) => at,
+                None => {
+                    self.0.push((name.to_string(), None));
+                    self.0.len() - 1
+                }
+            };
+            s = blanks(rest);
+            if let Some(rest) = s.strip_prefix(',') {
+                s = rest;
+                continue;
+            }
+            let Some(rest) = s.strip_prefix('=') else {
+                break;
+            };
+            s = blanks(rest);
+            // `seqMacParseValue`
+            let len = s.find([' ', ',']).unwrap_or(s.len());
+            let (value, rest) = s.split_at(len);
+            self.0[at].1 = Some(value.to_string());
+            let Some(rest) = blanks(rest).strip_prefix(',') else {
+                break;
+            };
+            s = rest;
+        }
+    }
+
+    /// `seqMacValGet`: `None` for a name never defined or never given a
+    /// value.
+    pub fn value(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| v.as_deref())
+    }
 }
 
 /// `DEFAULT_TIMEOUT` (`seqCom.h:44`): how long a `SYNC` put or get waits.
@@ -335,7 +405,7 @@ impl SeqPv {
             self.report(format_args!(
                 "pvPut({},SYNC,{:.6}): user error (timeout must be positive)",
                 self.var,
-                tmo.as_secs_f64()
+                CFloat(tmo.as_secs_f64())
             ));
             return Err(PvStat::Error);
         }
@@ -491,6 +561,46 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn the_command_line_overrides_the_program_parameters() {
+        let m = SeqMacros::new("P=xxx:, M=m9, Y_OFF=35", "P=a:,Y_OFF=40");
+        assert_eq!(m.value("P"), Some("a:"));
+        assert_eq!(m.value("M"), Some("m9"));
+        assert_eq!(m.value("Y_OFF"), Some("40"));
+        assert_eq!(m.value("Q"), None);
+    }
+
+    #[test]
+    fn a_name_without_a_value_keeps_the_one_it_had() {
+        let m = SeqMacros::new("A=1", "A, B");
+        assert_eq!(m.value("A"), Some("1"));
+        assert_eq!(m.value("B"), None);
+    }
+
+    #[test]
+    fn an_empty_value_is_a_value() {
+        let m = SeqMacros::new("P=xxx:", "P=,H= ");
+        assert_eq!(m.value("P"), Some(""));
+        assert_eq!(m.value("H"), Some(""));
+    }
+
+    /// A value ends at a blank; what follows it is not a comma, so
+    /// `seqMacParse` stops there.
+    #[test]
+    fn parsing_stops_where_the_grammar_breaks() {
+        let m = SeqMacros::new("", "P=a b,Q=1");
+        assert_eq!(m.value("P"), Some("a"));
+        assert_eq!(m.value("Q"), None);
+        let m = SeqMacros::new("", "_X=1,Y=2");
+        assert_eq!(m.value("_X"), None);
+        assert_eq!(m.value("Y"), None);
+        let m = SeqMacros::new("", "X:1,Y=2");
+        assert_eq!(m.value("Y"), None);
+        let m = SeqMacros::new("", " A = 1 , B_2=x=y");
+        assert_eq!(m.value("A"), Some("1"));
+        assert_eq!(m.value("B_2"), Some("x=y"));
+    }
 
     /// Poll until `probe` holds, or give up.
     async fn eventually(probe: impl Fn() -> bool) -> bool {

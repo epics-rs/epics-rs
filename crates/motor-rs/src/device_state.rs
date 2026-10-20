@@ -1,5 +1,6 @@
 use asyn_rs::interfaces::motor::MotorStatus;
 use asyn_rs::trace::TraceMask;
+use epics_libcom_rs::cfmt::CFloat;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,6 +12,21 @@ use crate::trace::MotorTrace;
 pub struct StampedStatus {
     pub seq: u64,
     pub status: MotorStatus,
+}
+
+/// The stamps of one address's records list, which its cache and every
+/// mailbox bound to it take: no stamp repeats there, whichever axis is at
+/// the address.
+#[derive(Debug, Clone, Default)]
+struct Stamps(Arc<std::sync::atomic::AtomicU64>);
+
+impl Stamps {
+    /// The next stamp, past `seen` as well.
+    fn after(&self, seen: u64) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let next = |last: u64| last.max(seen) + 1;
+        next(self.0.update(SeqCst, SeqCst, next))
+    }
 }
 
 /// Delay request with unique ID for stale timer prevention.
@@ -59,6 +75,9 @@ pub struct MotorDeviceState {
     /// The `seq` [`Self::update_values`] last took: `needUpdate` is
     /// `latest_status` past it.
     consumed_seq: u64,
+    /// Where `latest_status` stamps come from: the list the record is bound
+    /// to, or its own while bound to none.
+    stamps: Stamps,
     pub expired_delay_id: Option<u64>,
     /// The CDIR a model-1 driver left in `mr->cdir` while polling this
     /// record's move ([`AsynMotor::poll_in_motion`]), for the record's next
@@ -74,10 +93,10 @@ pub struct MotorDeviceState {
 }
 
 /// One process a callback asked for, with what that pass reads.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Callback {
     /// `statusCallback` or a finished move: `needUpdate` with this status.
-    Status(MotorStatus),
+    Status(StampedStatus),
     /// The settle delay's `callbackFunc` (motorRecord.cc:460-480).
     Delay(u64),
 }
@@ -112,10 +131,10 @@ impl MotorDeviceState {
     /// C `statusCallback` (devMotorAsyn.c:743-770): copy the post, and ask
     /// for a process unless a move is pending. Before the gate opens it only
     /// copies, with `needUpdate`. True when the caller must pulse io_intr.
-    pub fn status_callback(&mut self, status: &MotorStatus) -> bool {
-        self.callbacks.status = status.clone();
+    pub fn status_callback(&mut self, status: &StampedStatus) -> bool {
+        self.callbacks.status = status.status.clone();
         if !self.callbacks.accepting {
-            self.set_need_update(status.clone());
+            self.latest_status = Some(status.clone());
             return false;
         }
         if self.callbacks.move_request_pending > 0 {
@@ -154,7 +173,7 @@ impl MotorDeviceState {
         if callbacks.move_request_pending > 0 {
             return false;
         }
-        let status = callbacks.status.clone();
+        let status = self.stamp(self.callbacks.status.clone());
         self.queue(Callback::Status(status));
         true
     }
@@ -169,7 +188,7 @@ impl MotorDeviceState {
     /// lost with DMOV 0. A put pass here never consumes the mailbox
     /// (`determine_event`), so the move dispatches.
     pub fn get_info(&mut self) {
-        self.set_need_update(self.callbacks.status.clone());
+        self.latest_status = Some(self.stamp(self.callbacks.status.clone()));
     }
 
     /// The settle delay expired. True when the caller must pulse io_intr;
@@ -215,7 +234,7 @@ impl MotorDeviceState {
     /// process.
     pub fn begin_callback_pass(&mut self) {
         match self.callbacks.queued.pop_front() {
-            Some(Callback::Status(status)) => self.set_need_update(status),
+            Some(Callback::Status(status)) => self.latest_status = Some(status),
             Some(Callback::Delay(id)) => self.expired_delay_id = Some(id),
             None => {}
         }
@@ -242,8 +261,9 @@ impl MotorDeviceState {
     /// init-time `update_values` (motorRecord.cc:690): the axis' cache, or
     /// C's calloc-zeroed status for a record bound to no axis.
     pub fn init_status(&mut self) -> MotorStatus {
+        let stamps = &self.stamps;
         let stamped = self.latest_status.get_or_insert_with(|| StampedStatus {
-            seq: 1,
+            seq: stamps.after(0),
             status: MotorStatus::default(),
         });
         self.consumed_seq = stamped.seq;
@@ -256,9 +276,11 @@ impl MotorDeviceState {
             .is_some_and(|s| s.seq != self.consumed_seq)
     }
 
-    fn set_need_update(&mut self, status: MotorStatus) {
-        let seq = self.latest_status.as_ref().map_or(1, |s| s.seq + 1);
-        self.latest_status = Some(StampedStatus { seq, status });
+    /// `status` under a new stamp from the record's list.
+    fn stamp(&self, status: MotorStatus) -> StampedStatus {
+        let seen = self.latest_status.as_ref().map_or(0, |s| s.seq);
+        let seq = self.stamps.after(seen);
+        StampedStatus { seq, status }
     }
 
     fn queue(&mut self, callback: Callback) {
@@ -299,13 +321,13 @@ impl Model2Params {
 
     /// C `paramDump` (paramLib.c:299-317).
     pub fn dump(&self, out: &mut dyn std::fmt::Write) {
-        use epics_base_rs::calc::engine::cvt::fmt_f;
+        use epics_libcom_rs::cfmt::CFloat;
         let params = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(out, "Number of parameters is: {MOTOR_AXIS_NUM_PARAMS}");
         for i in 0..MOTOR_AXIS_NUM_PARAMS {
             let _ = match params.get(&i) {
                 Some(WriteValue::Float64(v)) => {
-                    writeln!(out, "Parameter {i} is a double, value {}", fmt_f(*v, 6))
+                    writeln!(out, "Parameter {i} is a double, value {}", CFloat(*v))
                 }
                 Some(WriteValue::Int32(v)) => {
                     writeln!(out, "Parameter {i} is an integer, value {v}")
@@ -322,14 +344,25 @@ pub type RecordId = usize;
 /// The records bound to one axis, C's `registerInterruptUser` list on its
 /// `motorStatus` parameter: every status the poller posts reaches each of
 /// them (devMotorAsyn.c:376-387, asynMotorAxis.cpp:316-322).
+///
+/// C defect, not copied: a `motor_interface.h` axis has one paramLib
+/// callback slot (paramLib.c:229), which each devMotorSim init_record
+/// retakes (devMotorSim.c:173), drvAsynMotorConfigure's included
+/// (drvMotorAsyn.c:412); the records bound before the last never process
+/// from the driver again, and a move leaves their DMOV 0.
 #[derive(Clone, Default)]
 pub struct AxisSubscribers(Arc<Mutex<Subscribed>>);
 
 #[derive(Default)]
 struct Subscribed {
+    stamps: Stamps,
     /// The axis' parameter cache: what `readGenericPointer` returns to a
     /// record that binds after the poller primed it.
     latest: Option<StampedStatus>,
+    /// The axis's status parameters as its poller last set them, posted or
+    /// not: what every poll of the axis writes into, on the poller or a
+    /// controller port's thread.
+    status: MotorStatus,
     records: Vec<Bound>,
 }
 
@@ -362,8 +395,11 @@ impl AxisSubscribers {
         trace: Arc<MotorTrace>,
     ) -> RecordId {
         let mut subscribed = self.lock();
-        if let (Some(latest), Ok(mut ds)) = (&subscribed.latest, device_state.lock()) {
-            ds.seed(latest);
+        if let Ok(mut ds) = device_state.lock() {
+            ds.stamps = subscribed.stamps.clone();
+            if let Some(latest) = &subscribed.latest {
+                ds.seed(latest);
+            }
         }
         subscribed.records.push(Bound {
             device_state,
@@ -371,6 +407,17 @@ impl AxisSubscribers {
             trace,
         });
         subscribed.records.len() - 1
+    }
+
+    /// [`Self::set_status`]'s last.
+    pub(crate) fn status(&self) -> MotorStatus {
+        self.lock().status.clone()
+    }
+
+    /// Set the axis's status parameters without a callback. Only its
+    /// poller's `Axis::stage` and construction set them.
+    pub(crate) fn set_status(&self, status: MotorStatus) {
+        self.lock().status = status;
     }
 
     /// How many records are bound; their ids are `0..len`.
@@ -382,33 +429,39 @@ impl AxisSubscribers {
         self.len() == 0
     }
 
-    /// Fill the cache and every bound mailbox without a callback: the
-    /// poller's startup poll.
-    pub fn store(&self, status: StampedStatus) {
+    /// Fill the cache alone, the axis status `readGenericPointer` returns
+    /// to a record that binds later (asynMotorController.cpp:505-525): what
+    /// an axis's constructor set, which calls no record back
+    /// (asynMotorAxis.cpp:31-68).
+    pub fn store(&self, status: MotorStatus) {
         let mut subscribed = self.lock();
-        for bound in &subscribed.records {
-            if let Ok(mut ds) = bound.device_state.lock() {
-                ds.seed(&status);
-            }
-        }
-        subscribed.latest = Some(status);
+        let seq = subscribed.stamps.after(0);
+        subscribed.latest = Some(StampedStatus { seq, status });
     }
 
     /// Fill the cache and run every bound record's `statusCallback`; the
     /// pulses the processes it asked for are owed.
-    pub fn post(&self, status: StampedStatus) -> Pulses {
+    pub fn post(&self, status: MotorStatus) -> Pulses {
         let mut subscribed = self.lock();
+        let seq = subscribed.stamps.after(0);
+        let status = StampedStatus { seq, status };
         let mut pulses = Pulses::new();
         for bound in &subscribed.records {
             if let Ok(mut ds) = bound.device_state.lock() {
                 print_status_callback(&bound.trace, &ds, &status.status);
-                if ds.status_callback(&status.status) {
+                if ds.status_callback(&status) {
                     pulses.push(bound.io_intr.clone());
                 }
             }
         }
         subscribed.latest = Some(status);
         pulses
+    }
+
+    /// The stamp of the cache's last fill.
+    #[cfg(test)]
+    pub(crate) fn stamp(&self) -> u64 {
+        self.lock().latest.as_ref().map_or(0, |latest| latest.seq)
     }
 
     /// The CDIR a model-1 driver wrote into `record` while polling its move.
@@ -457,8 +510,8 @@ fn print_status_callback(trace: &MotorTrace, ds: &MotorDeviceState, status: &Mot
         format_args!(
             "{} devMotorAsyn::statusCallback new value=[p:{:.6},e:{:.6},s:{:x}] {}{}\n",
             trace.record(),
-            status.position,
-            status.encoder_position,
+            CFloat(status.position),
+            CFloat(status.encoder_position),
             crate::flags::MstaFlags::from_status(status).bits(),
             if ds.need_update() { 'N' } else { ' ' },
             if ds.callbacks.move_request_pending > 0 {
@@ -475,16 +528,6 @@ mod tests {
     use super::*;
     use crate::flags::MotorCommand;
 
-    fn stamped(seq: u64, position: f64) -> StampedStatus {
-        StampedStatus {
-            seq,
-            status: MotorStatus {
-                position,
-                ..Default::default()
-            },
-        }
-    }
-
     fn seq_of(state: &SharedDeviceState) -> Option<u64> {
         state.lock().unwrap().latest_status.as_ref().map(|s| s.seq)
     }
@@ -500,6 +543,16 @@ mod tests {
             position,
             ..Default::default()
         }
+    }
+
+    /// `statusCallback` with a post of `position` from the list `ds` draws
+    /// its stamps from.
+    fn call_back(ds: &mut MotorDeviceState, position: f64) -> bool {
+        let posted = StampedStatus {
+            seq: ds.stamps.after(0),
+            status: at(position),
+        };
+        ds.status_callback(&posted)
     }
 
     /// The position the next io_intr pass reads, if it reads a status.
@@ -523,11 +576,11 @@ mod tests {
     #[test]
     fn an_axis_with_no_record_keeps_its_post_for_the_first_to_bind() {
         let axis = AxisSubscribers::new();
-        assert!(axis.post(stamped(4, 1.5)).is_empty());
+        assert!(axis.post(at(1.5)).is_empty());
         let state = accepting();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         assert_eq!(axis.attach(state.clone(), tx, Arc::default()), 0);
-        assert_eq!(seq_of(&state), Some(4));
+        assert_eq!(seq_of(&state), Some(1));
         assert!(
             rx.try_recv().is_err(),
             "binding does not process the record"
@@ -535,14 +588,19 @@ mod tests {
     }
 
     #[test]
-    fn store_fills_the_mailbox_without_a_callback() {
+    fn store_fills_the_cache_alone() {
         let axis = AxisSubscribers::new();
-        let state = accepting();
+        let bound = accepting();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        axis.attach(bound.clone(), tx, Arc::default());
+        axis.store(at(2.0));
+        assert_eq!(seq_of(&bound), None);
+        assert!(rx.try_recv().is_err());
+        let later = accepting();
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        axis.attach(state.clone(), tx, Arc::default());
-        axis.store(stamped(2, 0.0));
-        assert_eq!(seq_of(&state), Some(2));
-        assert_eq!(pass(&state), None);
+        axis.attach(later.clone(), tx, Arc::default());
+        let latest = later.lock().unwrap().latest_status.clone().unwrap();
+        assert_eq!(latest.status.position, 2.0);
     }
 
     #[test]
@@ -553,8 +611,8 @@ mod tests {
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
         assert_eq!(axis.attach(a.clone(), tx_a, Arc::default()), 0);
         assert_eq!(axis.attach(b.clone(), tx_b, Arc::default()), 1);
-        assert_eq!(axis.post(stamped(2, 1.0)).len(), 2);
-        assert_eq!(axis.post(stamped(3, 2.0)).len(), 2);
+        assert_eq!(axis.post(at(1.0)).len(), 2);
+        assert_eq!(axis.post(at(2.0)).len(), 2);
         for state in [&a, &b] {
             assert_eq!(pass(state), Some(1.0));
             assert_eq!(pass(state), Some(2.0));
@@ -562,11 +620,36 @@ mod tests {
         }
     }
 
+    /// A finished move's needUpdate draws from the record's list, so the
+    /// address's next post is still new to the record.
+    #[test]
+    fn a_post_after_a_finished_move_is_new_to_the_record() {
+        let axis = AxisSubscribers::new();
+        let state = accepting();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        axis.attach(state.clone(), tx, Arc::default());
+        let read = |state: &SharedDeviceState| {
+            let mut ds = state.lock().unwrap();
+            ds.begin_callback_pass();
+            ds.update_values().map(|status| status.position)
+        };
+        axis.post(at(1.0));
+        assert_eq!(read(&state), Some(1.0));
+        {
+            let mut ds = state.lock().unwrap();
+            ds.move_queued();
+            assert!(ds.move_done(&move_to()));
+        }
+        assert_eq!(read(&state), Some(1.0));
+        axis.post(at(3.0));
+        assert_eq!(read(&state), Some(3.0));
+    }
+
     #[test]
     fn a_post_before_the_gate_copies_with_need_update_and_asks_no_process() {
         let state = new_shared_state();
         let mut ds = state.lock().unwrap();
-        assert!(!ds.status_callback(&at(3.0)));
+        assert!(!call_back(&mut ds, 3.0));
         assert_eq!(ds.latest_status.as_ref().unwrap().status.position, 3.0);
         assert!(ds.callbacks.queued.is_empty());
     }
@@ -575,8 +658,8 @@ mod tests {
     fn each_pass_reads_its_own_post_in_order() {
         let state = accepting();
         let mut ds = state.lock().unwrap();
-        assert!(ds.status_callback(&at(1.0)));
-        assert!(ds.status_callback(&at(2.0)));
+        assert!(call_back(&mut ds, 1.0));
+        assert!(call_back(&mut ds, 2.0));
         drop(ds);
         assert_eq!(pass(&state), Some(1.0));
         assert_eq!(pass(&state), Some(2.0));
@@ -587,8 +670,8 @@ mod tests {
         let state = accepting();
         let mut ds = state.lock().unwrap();
         ds.move_queued();
-        assert!(!ds.status_callback(&at(1.0)));
-        assert!(!ds.status_callback(&at(2.0)));
+        assert!(!call_back(&mut ds, 1.0));
+        assert!(!call_back(&mut ds, 2.0));
         assert!(ds.move_done(&move_to()));
         drop(ds);
         assert_eq!(pass(&state), Some(2.0));
@@ -602,9 +685,9 @@ mod tests {
         ds.move_queued();
         ds.move_queued();
         assert!(!ds.move_done(&move_to()));
-        assert!(!ds.status_callback(&at(5.0)));
+        assert!(!call_back(&mut ds, 5.0));
         assert!(ds.move_done(&move_to()));
-        assert!(ds.status_callback(&at(6.0)), "nothing pending");
+        assert!(call_back(&mut ds, 6.0), "nothing pending");
         drop(ds);
         assert_eq!(pass(&state), Some(5.0));
         assert_eq!(pass(&state), Some(6.0));
@@ -619,7 +702,7 @@ mod tests {
         ds.set_motordevcom();
         ds.move_queued();
         assert!(!ds.move_done(&move_to()));
-        assert!(ds.status_callback(&at(1.0)));
+        assert!(call_back(&mut ds, 1.0));
         drop(ds);
         assert_eq!(pass(&state), Some(1.0));
         assert_eq!(pass(&state), None);
@@ -641,7 +724,7 @@ mod tests {
     fn a_delay_expiry_takes_its_turn_behind_the_posts_before_it() {
         let state = accepting();
         let mut ds = state.lock().unwrap();
-        assert!(ds.status_callback(&at(1.0)));
+        assert!(call_back(&mut ds, 1.0));
         ds.delay_expired(7);
         drop(ds);
         assert_eq!(pass(&state), Some(1.0));

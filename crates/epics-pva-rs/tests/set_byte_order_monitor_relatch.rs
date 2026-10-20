@@ -52,7 +52,7 @@ fn nt_scalar(v: f64) -> PvField {
 struct StreamingSource;
 
 impl ChannelSource for StreamingSource {
-    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         vec!["dut".into()]
     }
     async fn has_pv(&self, n: &[u8]) -> bool {

@@ -12,6 +12,7 @@ use epics_ca_rs::client::{
 use epics_ca_rs::copt::{self, CTool, scan_i32};
 use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
+use epics_libcom_rs::cfmt::CFloat;
 use std::time::SystemTime;
 
 /// Owner of every C-scanned option argument in this binary (see
@@ -86,7 +87,7 @@ Example: caget -a -f8 my_channel another_channel
   (uses wide output format, doubles are printed as %f with precision of 8)
 
 "#,
-        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        timeout = CFloat(epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS),
         max = epics_ca_rs::copt::CA_PRIORITY_MAX,
     )
 }
@@ -1059,7 +1060,7 @@ async fn main() {
     // C's ONE stderr warning for a timed-out read phase (`caget.c:229-231`,
     // `:243-244`) — it does not name the PV and does not stop the print loop.
     if results.iter().any(|r| r.timed_out) {
-        eprintln!("Read operation timed out: some PV data was not read.");
+        epics_libcom_rs::stderr_println!("Read operation timed out: some PV data was not read.");
     }
 
     let sep = fmt.field_separator;

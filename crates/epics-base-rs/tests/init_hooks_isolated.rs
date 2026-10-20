@@ -40,15 +40,21 @@ struct Network(Arc<AtomicUsize>);
 
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for Network {
-    fn is_connected(&self, _name: &[u8]) -> bool {
+    fn is_connected(&self, _name: epics_base_rs::server::database::LinkRef<'_>) -> bool {
         self.0.fetch_add(1, Ordering::SeqCst);
         true
     }
-    async fn get_value(&self, _name: &[u8]) -> Option<epics_base_rs::types::EpicsValue> {
+    async fn get_value(
+        &self,
+        _name: epics_base_rs::server::database::LinkRef<'_>,
+    ) -> Option<epics_base_rs::types::EpicsValue> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Some(epics_base_rs::types::EpicsValue::Double(7.0))
     }
-    fn get_cached_value(&self, _name: &[u8]) -> Option<epics_base_rs::types::EpicsValue> {
+    fn get_cached_value(
+        &self,
+        _name: epics_base_rs::server::database::LinkRef<'_>,
+    ) -> Option<epics_base_rs::types::EpicsValue> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Some(epics_base_rs::types::EpicsValue::Double(7.0))
     }

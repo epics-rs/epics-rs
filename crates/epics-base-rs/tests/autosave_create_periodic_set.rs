@@ -49,8 +49,7 @@ async fn interval(period: i64) -> Duration {
     let dir = tempfile::tempdir().unwrap();
     let holder = holder(&dir);
     create_periodic_set(&holder, &Arc::new(PvDatabase::new()), period);
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = builder.build().await;
+    let mgr = holder.lock().unwrap().manager.clone().unwrap();
     match &mgr.sets()[0].0.methods()[..] {
         [SaveStrategy::Periodic { interval }] => *interval,
         other => panic!("expected one periodic method, got {other:?}"),
@@ -74,11 +73,10 @@ async fn the_set_saves_every_period() {
     db.add_record("IOC:setpoint", Box::new(AoRecord::new(1.5)))
         .await
         .unwrap();
+    // The create starts the holder's manager and task; a second manager
+    // would share its op queue and race it.
     create_periodic_set(&holder, &db, 4);
-    let builder = holder.lock().unwrap().into_builder();
-    let mgr = Arc::new(builder.build().await);
-    let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
-    let _task = mgr.clone().start(&reactor, db.clone());
+    let mgr = holder.lock().unwrap().manager.clone().unwrap();
 
     let sav = dir.path().join("settings.sav");
     let mut saves = 0;

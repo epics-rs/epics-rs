@@ -449,7 +449,7 @@ async fn main() {
     {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("pvxvct-rs: {e}");
+            epics_libcom_rs::stderr_println!("pvxvct-rs: {e}");
             std::process::exit(1);
         }
     };
@@ -468,7 +468,7 @@ async fn main() {
     {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("pvxvct-rs: {e}");
+            epics_libcom_rs::stderr_println!("pvxvct-rs: {e}");
             std::process::exit(1);
         }
     };
@@ -482,14 +482,14 @@ async fn main() {
 
     if args.verbose {
         for f in &filters.peers {
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
                 "pvxvct-rs: peer filter {}/{}",
                 Ipv4Addr::from(f.addr),
                 Ipv4Addr::from(f.mask)
             );
         }
         for p in &filters.pvnames {
-            eprintln!("pvxvct-rs: pv filter {p:?}");
+            epics_libcom_rs::stderr_println!("pvxvct-rs: pv filter {p:?}");
         }
     }
 
@@ -518,8 +518,11 @@ fn refuse_without_a_reactor(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>)
     for ep in endpoints {
         let dest = ep.to_endpoint();
         match dest.iface {
-            Some(iface) => eprintln!("pvxvct-rs: would collect {} on {iface}", dest.addr),
-            None => eprintln!("pvxvct-rs: would collect {}", dest.addr),
+            Some(iface) => epics_libcom_rs::stderr_println!(
+                "pvxvct-rs: would collect {} on {iface}",
+                dest.addr
+            ),
+            None => epics_libcom_rs::stderr_println!("pvxvct-rs: would collect {}", dest.addr),
         }
     }
     let shown = match (filters.client_only, filters.server_only) {
@@ -527,7 +530,7 @@ fn refuse_without_a_reactor(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>)
         (_, true) => "BEACON only",
         _ => "SEARCH and BEACON",
     };
-    eprintln!(
+    epics_libcom_rs::stderr_println!(
         "pvxvct-rs: would show {shown}, {} peer filter(s), {} PV filter(s)",
         filters.peers.len(),
         filters.pvnames.len()
@@ -559,26 +562,26 @@ async fn sniff(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>) {
         let collector = match manager.collect(&reactor, &dest) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("pvxvct-rs: bind {}:{}: {e}", ep.addr, ep.port);
+                epics_libcom_rs::stderr_println!("pvxvct-rs: bind {}:{}: {e}", ep.addr, ep.port);
                 std::process::exit(1);
             }
         };
         let rx = match collector.add_listener(&dest) {
             Ok(rx) => rx,
             Err(e) => {
-                eprintln!("pvxvct-rs: listen {}:{}: {e}", ep.addr, ep.port);
+                epics_libcom_rs::stderr_println!("pvxvct-rs: listen {}:{}: {e}", ep.addr, ep.port);
                 std::process::exit(1);
             }
         };
         if ep.addr.is_multicast() {
-            eprintln!(
+            epics_libcom_rs::stderr_println!(
                 "pvxvct-rs: listening on {}:{} (multicast, iface {})",
                 ep.addr,
                 ep.port,
                 ep.iface.as_deref().unwrap_or("0.0.0.0")
             );
         } else {
-            eprintln!("pvxvct-rs: listening on {}:{}", ep.addr, ep.port);
+            epics_libcom_rs::stderr_println!("pvxvct-rs: listening on {}:{}", ep.addr, ep.port);
         }
         collectors.push(collector);
         let f = filters.clone();

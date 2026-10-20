@@ -123,16 +123,28 @@ impl Drop for SyncLockHeld {
     }
 }
 
-/// The driver's input EOS for [`crate::port_handle::PortHandle::input_eos`],
+/// The driver's input EOS for [`crate::port_handle::PortHandle::get_input_eos`],
 /// which a reader on the port thread (an interrupt callback inside the
 /// driver's read) needs while the driver is borrowed: what `get_input_eos`
-/// answers for each device. The actor republishes it after every driver
-/// `set_input_eos` it makes ([`PortActor::set_input_eos`]), and nothing else
-/// writes it.
+/// answers for each device, refusal included, since C's callers test it
+/// (AsynDriverInterface.cc:450-457, :1166-1187). The actor republishes it
+/// after every driver `set_input_eos` it makes ([`PortActor::set_input_eos`])
+/// and every layer it pushes ([`PortActor::install_octet_interpose`]), and
+/// nothing else writes it.
 #[derive(Clone, Default)]
 pub(crate) struct InputEos {
     multi_device: bool,
-    by_key: Arc<parking_lot::RwLock<HashMap<i32, Vec<u8>>>>,
+    by_key: Arc<parking_lot::RwLock<HashMap<i32, EosAnswer>>>,
+}
+
+/// One device's `getInputEos` answer and who gave it: C's EOS layer prints a
+/// FLOW line on the asking user (asynInterposeEos.c:340-341), a driver's own
+/// answer prints none (asynPortDriver.cpp:2782-2788).
+#[derive(Clone)]
+enum EosAnswer {
+    Layer(Vec<u8>),
+    Driver(Vec<u8>),
+    Refused(AsynStatus, String),
 }
 
 impl InputEos {
@@ -141,35 +153,56 @@ impl InputEos {
             multi_device: driver.base().flags.multi_device,
             by_key: Arc::default(),
         };
-        eos.publish(driver);
+        eos.publish(driver, -1);
         eos
     }
 
-    /// The terminator `get_input_eos` gives a user at `addr`.
-    pub(crate) fn get(&self, addr: i32) -> Vec<u8> {
-        let key = crate::port::eos_device_key(self.multi_device, addr);
-        self.by_key.read().get(&key).cloned().unwrap_or_default()
+    /// What `get_input_eos` answers `user`, a user linked to the port. An addr
+    /// no device was published for resolves to the port, as C `findInterface`
+    /// falls back to the port's interface (asynManager.c:1494-1502).
+    pub(crate) fn get(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        let key = crate::port::eos_device_key(self.multi_device, user.addr);
+        let answer = {
+            let by_key = self.by_key.read();
+            by_key.get(&key).or_else(|| by_key.get(&-1)).cloned()
+        };
+        match answer {
+            Some(EosAnswer::Layer(eos)) => {
+                crate::interpose::eos::trace_get_eos(user, &eos);
+                Ok(eos)
+            }
+            Some(EosAnswer::Driver(eos)) => Ok(eos),
+            Some(EosAnswer::Refused(status, message)) => Err(AsynError::Status { status, message }),
+            None => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "getInputEos: no driver behind this port".into(),
+            }),
+        }
     }
 
-    /// Every device's readback, not only the one set: a driver may keep one
+    /// Every device's readback, not only `addr`'s: a driver may keep one
     /// terminator for all its addresses (Prologix's single `++eos`).
-    fn publish(&self, driver: &dyn PortDriver) {
+    fn publish(&self, driver: &dyn PortDriver, addr: i32) {
         let devices = if self.multi_device {
             0..driver.base().max_addr as i32
         } else {
             0..0
         };
         let known: Vec<i32> = self.by_key.read().keys().copied().collect();
-        let readback: HashMap<i32, Vec<u8>> = std::iter::once(-1)
+        let readback: HashMap<_, _> = [-1, addr]
+            .into_iter()
             .chain(devices)
             .chain(known)
-            .map(|key| {
-                (
-                    key,
-                    driver
-                        .get_input_eos(&AsynUser::default().with_addr(key))
-                        .unwrap_or_default(),
-                )
+            .map(|addr| {
+                let user = AsynUser::default().with_addr(addr);
+                let answer = match driver.get_input_eos(&user) {
+                    Ok(eos) if driver.base().interpose_octet.input_eos(&user).is_some() => {
+                        EosAnswer::Layer(eos)
+                    }
+                    Ok(eos) => EosAnswer::Driver(eos),
+                    Err(e) => EosAnswer::Refused(e.status(), e.message()),
+                };
+                (crate::port::eos_device_key(self.multi_device, addr), answer)
             })
             .collect();
         *self.by_key.write() = readback;
@@ -188,6 +221,7 @@ pub(crate) struct ActorLink {
     pub(crate) devices: crate::port::DeviceTable,
     pub(crate) sync_lock: SyncLock,
     pub(crate) input_eos: InputEos,
+    pub(crate) lend: Arc<Lend>,
 }
 
 impl ActorLink {
@@ -204,6 +238,7 @@ impl ActorLink {
             devices: crate::port::DeviceTable::detached(),
             sync_lock: SyncLock::default(),
             input_eos: InputEos::default(),
+            lend: Lend::new("unowned".into()),
         }
     }
 }
@@ -236,18 +271,342 @@ pub(crate) fn current_actor() -> Option<ActorId> {
     CURRENT_ACTOR.with(|cur| cur.get())
 }
 
+/// The port taken by a thread that is not its own, as C's callers take it:
+/// `queueRequest` on a synchronous port runs `processUser` on the caller
+/// under `synchronousLock` (asynManager.c:1579-1581), `lockPort` takes that
+/// lock on the caller (:1800), a CANBLOCK port's `queueLockPort` leaves its
+/// port thread waiting in the callback while the caller calls the driver
+/// (:1858-1914), and the `pasynManager` direct calls and a driver's `lock()`
+/// (asynPortDriver.cpp:3858) run on their caller. The actor reaches such a
+/// request in its queue like any other, parks itself here and sends the
+/// claimed request to its waiter, which holds it until it gives it back.
+pub(crate) struct Lend {
+    port: Arc<str>,
+    slot: std::sync::Mutex<LendSlot>,
+    returned: tokio::sync::Notify,
+}
+
+enum LendSlot {
+    /// On the actor's own thread.
+    Home,
+    /// Parked for the thread the actor sent the claimed request to.
+    Offered(Box<PortActor>),
+    /// That thread holds it; `None` while one of its steps is inside.
+    Held(Option<Box<PortActor>>),
+    /// Given back, for the actor to resume with.
+    Back(Box<PortActor>),
+}
+
+impl Lend {
+    pub(crate) fn new(port: Arc<str>) -> Arc<Self> {
+        Arc::new(Self {
+            port,
+            slot: std::sync::Mutex::new(LendSlot::Home),
+            returned: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, LendSlot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The actor's side: park for `handoff`'s thread and wait to be given back.
+    async fn hand_off(&self, actor: Box<PortActor>, handoff: Handoff) -> Box<PortActor> {
+        *self.slot() = LendSlot::Offered(actor);
+        if handoff.reply.send(Ok(handoff.claimed)).is_err()
+            && let LendSlot::Offered(actor) = std::mem::replace(&mut *self.slot(), LendSlot::Home)
+        {
+            return actor;
+        }
+        loop {
+            let returned = self.returned.notified();
+            let mut returned = std::pin::pin!(returned);
+            returned.as_mut().enable();
+            {
+                let mut slot = self.slot();
+                if matches!(*slot, LendSlot::Back(_)) {
+                    let LendSlot::Back(actor) = std::mem::replace(&mut *slot, LendSlot::Home)
+                    else {
+                        unreachable!()
+                    };
+                    return actor;
+                }
+            }
+            returned.await;
+        }
+    }
+
+    /// The side of the thread the claimed request went to.
+    pub(crate) fn take(&self) {
+        let mut slot = self.slot();
+        match std::mem::replace(&mut *slot, LendSlot::Home) {
+            LendSlot::Offered(actor) => *slot = LendSlot::Held(Some(actor)),
+            _ => unreachable!("the actor sends a lend its request only once it is parked"),
+        }
+    }
+
+    pub(crate) fn give_back(&self) {
+        {
+            let mut slot = self.slot();
+            match std::mem::replace(&mut *slot, LendSlot::Home) {
+                LendSlot::Held(Some(mut actor)) => {
+                    actor.dequeue_at_release();
+                    *slot = LendSlot::Back(actor);
+                }
+                _ => unreachable!("only the holder gives the actor back, between its steps"),
+            }
+        }
+        self.returned.notify_one();
+    }
+
+    /// One step of the holder on the actor. A step made from inside another
+    /// — a driver calling back into its own port — finds it taken, and is
+    /// refused as it is on the port's own thread.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut PortActor) -> R) -> AsynResult<R> {
+        let actor = match &mut *self.slot() {
+            LendSlot::Held(actor) => actor.take(),
+            _ => None,
+        }
+        .ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "a request on port {} from inside that port's own driver call: a driver \
+                 cannot make a blocking request to itself. Call the driver method directly \
+                 instead of going back through the port.",
+                self.port
+            ),
+        })?;
+        /// Puts the actor back on every exit from the step, unwinding too.
+        struct PutBack<'a>(&'a Lend, Option<Box<PortActor>>);
+        impl Drop for PutBack<'_> {
+            fn drop(&mut self) {
+                if let LendSlot::Held(slot) = &mut *self.0.slot() {
+                    *slot = self.1.take();
+                }
+            }
+        }
+        let mut back = PutBack(self, Some(actor));
+        let actor = back.1.as_deref_mut().expect("set above");
+        Ok(f(actor))
+    }
+
+    /// The driver as the holder of a `lock()` reaches it.
+    pub(crate) fn with_driver<D: PortDriver, R>(
+        &self,
+        f: impl FnOnce(&mut D) -> R,
+    ) -> AsynResult<Option<R>> {
+        self.with(|actor| {
+            let driver: &mut dyn std::any::Any = actor.driver.as_mut();
+            driver.downcast_mut::<D>().map(f)
+        })
+    }
+}
+
+/// A request the actor claimed for the thread it lends itself to, or one a
+/// thread already holding the port runs in place — C's recursive
+/// `synchronousLock` (asynManager.c:1579-1581) and `queueLockPort`'s count
+/// (:1872-1876).
+pub(crate) struct Claimed {
+    op: RequestOp,
+    user: AsynUser,
+    priority: QueuePriority,
+}
+
+impl Claimed {
+    pub(crate) fn in_place(op: RequestOp, user: AsynUser) -> Self {
+        Self {
+            priority: request_priority(&op, &user),
+            op,
+            user,
+        }
+    }
+}
+
+/// What [`PortActor::process_one`] leaves the loop to do with a lend request.
+struct Handoff {
+    claimed: Claimed,
+    reply: oneshot::Sender<AsynResult<Claimed>>,
+}
+
+/// The queue band of a request: C derives it from the KIND of request, never
+/// from a field a caller has to remember to set. `asynRecord` picks
+/// `asynQueuePriorityConnect` from `pmsg->callbackType == callbackConnect`
+/// (asynRecord.c:561-565), and `asynCommonSyncIO`'s connect/disconnect pass
+/// the constant literally (asynCommonSyncIO.c:142, :154).
+/// `CDispatch::ConnectQueue` is that kind, and it already fixes the connected
+/// waiver ([`queue_gate`]) — the band is taken from it for the same
+/// reason, so a connect cannot sort below a sustained High scan stream because
+/// its caller built a `#[default]` Medium user.
+///
+/// Every other class keeps the user's own band: C's HOSTINFO put is a
+/// `callbackSetOption` that asynRecord *escalates* to Connect by hand
+/// (:566-569), and that escalation still arrives through
+/// [`AsynUser::queue_even_if_not_connected`].
+fn request_priority(op: &RequestOp, user: &AsynUser) -> QueuePriority {
+    match PortActor::c_dispatch(op) {
+        CDispatch::ConnectQueue => QueuePriority::Connect,
+        CDispatch::Direct | CDispatch::Queued => user.priority,
+    }
+}
+
+/// Whether C runs `op` on its caller's thread rather than queueing it for
+/// the port thread: one of `pasynManager`'s direct calls, `lockPort`, or a
+/// driver's `lock()` ([`CDispatch::Direct`]).
+pub(crate) fn runs_on_caller(op: &RequestOp) -> bool {
+    PortActor::c_dispatch(op) == CDispatch::Direct
+}
+
+/// The actor as the code running a request reaches it: owned by its own
+/// thread, or lent ([`Lend`]) and borrowed for each step, so that a request
+/// the steps make back into their own port finds it free.
+enum Access<'a> {
+    Owned(&'a mut PortActor),
+    Lent(&'a Lend),
+}
+
+impl Access<'_> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut PortActor) -> R) -> AsynResult<R> {
+        match self {
+            Access::Owned(actor) => Ok(f(actor)),
+            Access::Lent(lend) => lend.with(f),
+        }
+    }
+}
+
+/// A request run by the thread the actor is lent to, or in place by one
+/// already holding it: on a synchronous port, C `queueRequest`'s gate
+/// (asynManager.c:1555-1577) first, on the caller, as C runs it.
+pub(crate) fn run_lent(lend: &Lend, claimed: Claimed) -> AsynResult<RequestResult> {
+    let Claimed { op, user, priority } = claimed;
+    let mut access = Access::Lent(lend);
+    access.with(|actor| actor.lent_gate(&op, &user, priority))??;
+    run_claimed(&mut access, &op, user)
+}
+
+/// A claimed request from the user's linkage to its block settlement — the
+/// part of [`PortActor::process_one`] that runs on whichever thread holds the
+/// actor.
+fn run_claimed(
+    access: &mut Access<'_>,
+    op: &RequestOp,
+    mut user: AsynUser,
+) -> AsynResult<RequestResult> {
+    let callback = PortActor::c_dispatch(op) != CDispatch::Direct;
+    // C runs a callback and a `lockPort` span under `synchronousLock`
+    // (asynManager.c:830, :909, :1581, :1800); a direct manager call
+    // takes no port lock.
+    let held = access.with(|actor| {
+        // A request ran, so the queue state may have moved (it could have
+        // enabled a device): C's `queueStateChange` rescan (:870). A *parked*
+        // request does not set this — that is what keeps the loop from
+        // spinning on a device that is still disabled.
+        actor.rescan_parked = true;
+        // Connect the user to the port it is about to run on, so every layer
+        // the request passes through can trace through it — C's `pasynUser →
+        // pport/pdevice` linkage, which `asynPrint`/`asynPrintIO` resolve the
+        // trace config from (`findTracePvt`, asynManager.c:548-553). The actor
+        // is the single owner of the linkage: an interpose has no other handle
+        // on the port, and a user that never reached a port traces nothing.
+        actor.link_user(&mut user);
+        (callback || matches!(op, RequestOp::LockPort(_))).then(|| actor.sync_lock.hold())
+    })?;
+    let result = dispatch(access, &mut user, op);
+    drop(held);
+    if callback {
+        access.with(|actor| actor.settle_block(&user))?;
+    }
+    result
+}
+
+/// One request on the port: the ops that make calls of their own (a cell's
+/// body, a `lockPort` span) make each as a step, every other op is one step.
+fn dispatch(
+    access: &mut Access<'_>,
+    user: &mut AsynUser,
+    op: &RequestOp,
+) -> AsynResult<RequestResult> {
+    let token = user.block_token;
+    match op {
+        RequestOp::Cell(cell) => {
+            cell.run(&mut ActorCalls(access, token));
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::CellInline(cell) => {
+            cell.run_inline(&mut ActorCalls(access, token));
+            Ok(RequestResult::write_ok())
+        }
+        RequestOp::LockPort(call) => lock_port(access, user, call),
+        _ => access.with(|actor| actor.dispatch_io(user, op))?,
+    }
+}
+
+/// C `lockPort` … `unlockPort` around the caller's calls (asynManager.c:1778-1830).
+fn lock_port(
+    access: &mut Access<'_>,
+    user: &mut AsynUser,
+    call: &crate::request::PortLockCall,
+) -> AsynResult<RequestResult> {
+    access.with(|actor| {
+        let port = &actor.driver.base().port_name;
+        // C `lockPort` traces as its caller before it looks (:1789), and
+        // refuses only a destroyed port (:1790-1795).
+        user.print(
+            crate::trace::TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{port} lockPort\n"),
+        );
+        if actor.driver.base().is_defunct() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: "asynManager:lockPort: port has been shut down".into(),
+            });
+        }
+        Ok(())
+    })??;
+    let result = match call.take() {
+        Some(f) => {
+            f(&mut ActorCalls(access, user.block_token));
+            Ok(RequestResult::write_ok())
+        }
+        None => Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port lock call carries no closure".into(),
+        }),
+    };
+    access.with(|actor| {
+        user.print(
+            crate::trace::TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} unlockPort\n", actor.driver.base().port_name),
+        )
+    })?;
+    result
+}
+
 /// Message sent from [`super::port_handle::PortHandle`] to the actor.
 pub(crate) struct ActorMessage {
     pub op: RequestOp,
     pub user: AsynUser,
     pub cancel: CancelToken,
-    /// The waiter's reply; `None` for a [`RequestOp::Cell`], which has none.
-    pub reply: Option<oneshot::Sender<AsynResult<RequestResult>>>,
+    pub reply: Reply,
     pub seq: u64,
     pub priority: QueuePriority,
     /// Where the message sorts ahead of `seq`. Set only by
     /// [`PortActor::enqueue_message`], which knows the port.
     rank: Rank,
+}
+
+/// Whom a request answers.
+pub(crate) enum Reply {
+    /// A [`RequestOp::Cell`], whose body and `unrun` are its answer.
+    Cell,
+    /// A waiter for the result.
+    Result(oneshot::Sender<AsynResult<RequestResult>>),
+    /// A waiter that runs the claimed request itself, with the actor lent
+    /// to it ([`Lend`]).
+    Lend(oneshot::Sender<AsynResult<Claimed>>),
 }
 
 impl ActorMessage {
@@ -257,31 +616,26 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<RequestResult>>,
     ) -> Self {
-        // C derives the queue band from the KIND of request, never from a
-        // field a caller has to remember to set: `asynRecord` picks
-        // `asynQueuePriorityConnect` from `pmsg->callbackType ==
-        // callbackConnect` (asynRecord.c:561-565), and `asynCommonSyncIO`'s
-        // connect/disconnect pass the constant literally
-        // (asynCommonSyncIO.c:142, :154). `CDispatch::ConnectQueue` is that
-        // kind, and it already fixes the connected waiver
-        // ([`PortActor::queue_gate`]) — the heap key is taken from it here for
-        // the same reason, so a connect cannot sort below a sustained High
-        // scan stream because its caller built a `#[default]` Medium user.
-        //
-        // Every other class keeps the user's own band: C's HOSTINFO put is a
-        // `callbackSetOption` that asynRecord *escalates* to Connect by hand
-        // (:566-569), and that escalation still arrives through
-        // [`AsynUser::queue_even_if_not_connected`].
-        let dispatch = PortActor::c_dispatch(&op);
-        let priority = match dispatch {
-            CDispatch::ConnectQueue => QueuePriority::Connect,
-            CDispatch::Direct | CDispatch::Queued => user.priority,
-        };
+        Self::answering(op, user, cancel, Reply::Result(reply))
+    }
+
+    /// A request whose waiter runs it with the actor lent ([`Lend`]).
+    pub(crate) fn lending(
+        op: RequestOp,
+        user: AsynUser,
+        cancel: CancelToken,
+        reply: oneshot::Sender<AsynResult<Claimed>>,
+    ) -> Self {
+        Self::answering(op, user, cancel, Reply::Lend(reply))
+    }
+
+    fn answering(op: RequestOp, user: AsynUser, cancel: CancelToken, reply: Reply) -> Self {
+        let priority = request_priority(&op, &user);
         Self {
             op,
             user,
             cancel,
-            reply: Some(reply),
+            reply,
             seq: next_seq(),
             priority,
             rank: Rank::Arrival,
@@ -300,7 +654,7 @@ impl ActorMessage {
         Self {
             user,
             cancel: cell.token().clone(),
-            reply: None,
+            reply: Reply::Cell,
             seq,
             priority: request.priority,
             rank: Rank::Arrival,
@@ -314,13 +668,15 @@ impl ActorMessage {
     /// a [`RequestOp::Cell`] runs its `unrun` with it — C's `timeoutUser` —
     /// since a cell has no waiter. The one exit every never-ran path takes.
     fn refuse(self, e: AsynError) {
-        match self.op {
-            RequestOp::Cell(cell) => cell.leave(self.seq, e),
-            _ => {
-                if let Some(reply) = self.reply {
-                    let _ = reply.send(Err(e));
-                }
+        match (self.op, self.reply) {
+            (RequestOp::Cell(cell), _) => cell.leave(self.seq, e),
+            (_, Reply::Result(reply)) => {
+                let _ = reply.send(Err(e));
             }
+            (_, Reply::Lend(reply)) => {
+                let _ = reply.send(Err(e));
+            }
+            (_, Reply::Cell) => {}
         }
     }
 
@@ -714,6 +1070,9 @@ pub(crate) struct PortActor {
     /// with no message, so queueing one allocates nothing.
     cells: Arc<CellQueue>,
     heap: BinaryHeap<ActorMessage>,
+    /// The request taken off the queue at a lend's give back, run next
+    /// ([`Self::dequeue_at_release`]).
+    dequeued: Option<ActorMessage>,
     /// The requests a block holder ([`BlockBook`], in the cell queue) holds
     /// back. devGpib takes the device form of a block for an SRQ transaction
     /// (devSupportGpib.c:1216), so a port-wide-only model stalls every other
@@ -772,6 +1131,7 @@ pub(crate) struct PortActor {
     rescanned_exceptions: u64,
     sync_lock: SyncLock,
     input_eos: InputEos,
+    lend: Arc<Lend>,
 }
 
 /// A cell still queued when the actor goes runs its body as refused: a cell
@@ -781,6 +1141,7 @@ impl Drop for PortActor {
         self.cells.close();
         let queued = std::mem::take(&mut self.heap)
             .into_iter()
+            .chain(self.dequeued.take())
             .chain(std::mem::take(&mut self.parked))
             .chain(std::mem::take(&mut self.pending_while_blocked));
         for msg in queued {
@@ -811,12 +1172,14 @@ impl PortActor {
         let flags = driver.base().flags;
         let cells = Arc::new(CellQueue::for_port(flags.can_block, flags.multi_device));
         let input_eos = InputEos::of(&*driver);
+        let lend = Lend::new(Arc::clone(&driver.base().port_name));
         Self {
             id: ActorId::new(),
             driver,
             rx,
             cells,
             heap: BinaryHeap::new(),
+            dequeued: None,
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
             rescan_parked: false,
@@ -826,6 +1189,7 @@ impl PortActor {
             rescanned_exceptions: seen_exceptions,
             sync_lock: SyncLock::default(),
             input_eos,
+            lend,
         }
     }
 
@@ -841,15 +1205,31 @@ impl PortActor {
             devices: self.driver.base().device_table(),
             sync_lock: self.sync_lock.clone(),
             input_eos: self.input_eos.clone(),
+            lend: Arc::clone(&self.lend),
         }
     }
 
-    /// The driver's `setInputEos`, and the one writer of [`InputEos`]: its
-    /// readers see the driver's terminator as of the last set, refused or not.
+    /// The driver's `setInputEos`, and with [`Self::install_octet_interpose`]
+    /// the one writer of [`InputEos`]: its readers see the driver's terminator
+    /// as of the last set, refused or not.
     fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         let set = self.driver.set_input_eos(user, eos);
-        self.input_eos.publish(&*self.driver);
+        self.input_eos.publish(&*self.driver, user.addr);
         set
+    }
+
+    /// A layer pushed onto `addr`'s octet chain, which can change what that
+    /// device's `getInputEos` answers: C's EOS layer answers it itself
+    /// (asynInterposeEos.c:314-344) where the driver below may refuse.
+    fn install_octet_interpose(
+        &mut self,
+        addr: i32,
+        layer: Box<dyn crate::interpose::OctetInterpose>,
+    ) {
+        self.driver
+            .base_mut()
+            .install_octet_interpose_addr(addr, layer);
+        self.input_eos.publish(&*self.driver, addr);
     }
 
     /// A fixture's registration: the connect `new` armed runs now, as C's
@@ -878,41 +1258,46 @@ impl PortActor {
     /// Run the actor loop. Returns when the channel is closed (all senders dropped).
     /// Calls `shutdown()` on the driver before returning.
     #[cfg(test)]
-    fn run(mut self) {
+    fn run(self) {
         let _scope = ActorScope::enter(self.id);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
-        rt.block_on(async {
+        let lend = Arc::clone(&self.lend);
+        let mut actor = Box::new(self);
+        let mut actor = rt.block_on(async move {
             loop {
                 // Drain all pending messages into the heap
-                self.drain_channel();
-                self.rescan_parked();
-                self.drop_left();
+                actor.drain_channel();
+                actor.rescan_parked();
+                actor.drop_left();
 
-                if self.heap.is_empty() {
+                if actor.idle() {
                     // No work — wait for a message or a queued cell.
-                    let cells = Arc::clone(&self.cells);
+                    let cells = Arc::clone(&actor.cells);
                     tokio::select! {
-                        msg = self.rx.recv() => match msg {
-                            Some(msg) => self.enqueue_message(msg),
+                        msg = actor.rx.recv() => match msg {
+                            Some(msg) => actor.enqueue_message(msg),
                             None => break,
                         },
                         _ = cells.pushed() => {}
                     }
                     // Drain any more that arrived
-                    self.drain_channel();
-                    self.rescan_parked();
-                    self.drop_left();
+                    actor.drain_channel();
+                    actor.rescan_parked();
+                    actor.drop_left();
                 }
 
                 // Process one eligible request from the heap
-                self.process_one();
-                self.port_thread_auto_connect();
+                if let Some(handoff) = actor.process_one() {
+                    actor = lend.hand_off(actor, handoff).await;
+                }
+                actor.port_thread_auto_connect();
             }
+            actor
         });
-        let _ = self.driver.shutdown();
+        let _ = actor.driver.shutdown();
     }
 
     /// Run the actor loop with a dedicated shutdown channel.
@@ -935,7 +1320,7 @@ impl PortActor {
     /// shutdown signal — which conflated "the creator dropped its handle" with
     /// "shut this port down" and killed ports that the registry still held a
     /// live `PortHandle` for.
-    pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
+    pub fn run_with_shutdown(self, mut shutdown_rx: mpsc::Receiver<()>) {
         // Publish our identity for the whole life of the actor thread: every
         // `PortDriver` method we dispatch below runs on this thread, so a
         // driver that calls back into its own port through a `PortHandle` can
@@ -949,20 +1334,22 @@ impl PortActor {
             .enable_time()
             .build()
             .unwrap();
-        rt.block_on(async {
+        let lend = Arc::clone(&self.lend);
+        let mut actor = Box::new(self);
+        let mut actor = rt.block_on(async move {
             // The registration connect armed in `new`, ahead of every request.
-            self.registration_pass();
+            actor.registration_pass();
             // Once every PortRuntimeHandle is gone no explicit shutdown can
             // ever arrive, so the (now permanently ready) shutdown branch is
             // disabled rather than spun on.
             let mut can_be_shut_down = true;
             loop {
                 // Drain all pending messages into the heap
-                self.drain_channel();
-                self.rescan_parked();
-                self.drop_left();
+                actor.drain_channel();
+                actor.rescan_parked();
+                actor.drop_left();
 
-                if self.heap.is_empty() {
+                if actor.idle() {
                     // Wait for a message, an explicit shutdown, or the
                     // connect-retry deadline. The timer arm is what makes the
                     // autonomous reconnect work with NO queued traffic (C's
@@ -970,12 +1357,12 @@ impl PortActor {
                     // Connect-priority request to the port thread,
                     // asynManager.c:3283-3297); here the actor IS the port
                     // thread, so it wakes itself.
-                    let retry_at = self.driver.base().connect_retry_at;
-                    let cells = Arc::clone(&self.cells);
+                    let retry_at = actor.driver.base().connect_retry_at;
+                    let cells = Arc::clone(&actor.cells);
                     tokio::select! {
-                        msg = self.rx.recv() => {
+                        msg = actor.rx.recv() => {
                             match msg {
-                                Some(m) => self.enqueue_message(m),
+                                Some(m) => actor.enqueue_message(m),
                                 // Unreachable: the last PortHandle is gone.
                                 None => break,
                             }
@@ -996,24 +1383,27 @@ impl PortActor {
                         _ = sleep_until_opt(retry_at) => {}
                     }
                     // Drain any more that arrived
-                    self.drain_channel();
-                    self.rescan_parked();
-                    self.drop_left();
+                    actor.drain_channel();
+                    actor.rescan_parked();
+                    actor.drop_left();
                 }
 
                 // Run any due connect retry before servicing the queue: a
                 // request dequeued now would otherwise see a port that the
                 // timer was about to bring back up.
-                self.service_connect_timer();
+                actor.service_connect_timer();
 
                 // Process one eligible request from the heap
-                self.process_one();
+                if let Some(handoff) = actor.process_one() {
+                    actor = lend.hand_off(actor, handoff).await;
+                }
 
                 // C `portThread`'s post-drain auto-connect, run on every wake.
-                self.port_thread_auto_connect();
+                actor.port_thread_auto_connect();
             }
+            actor
         });
-        let _ = self.driver.shutdown();
+        let _ = actor.driver.shutdown();
     }
 
     /// C `portConnectTimerCallback` + `portConnectProcessCallback`
@@ -1642,7 +2032,26 @@ impl PortActor {
         self.heap.push(msg);
     }
 
-    fn process_one(&mut self) {
+    /// C's port thread at a holder's release ([`Lend::give_back`]): it took
+    /// the queue's head while the port was held and waits at the lock with it
+    /// (asynManager.c:894-910), so that one request gets the port ahead of
+    /// anything queued after, the holder's next lock included
+    /// (specsAnalyser.cpp:617-619). It holds one at a time.
+    fn dequeue_at_release(&mut self) {
+        self.drain_channel();
+        self.dequeued = self.dequeued.take().or_else(|| self.heap.pop());
+    }
+
+    fn pop_next(&mut self) -> Option<ActorMessage> {
+        self.dequeued.take().or_else(|| self.heap.pop())
+    }
+
+    /// Nothing for [`Self::process_one`] to take.
+    fn idle(&self) -> bool {
+        self.dequeued.is_none() && self.heap.is_empty()
+    }
+
+    fn process_one(&mut self) -> Option<Handoff> {
         // A port whose link is owned by another object — an IP-server child port,
         // whose socket the parent's accept loop assigns and clears — can change
         // connection state with no request of its own having run. The owner wakes
@@ -1654,10 +2063,7 @@ impl PortActor {
         // already in sync (its own `set_connected` published the edge), so this
         // is a no-op for them.
         self.driver.base_mut().sync_connection_edge();
-        let msg = match self.heap.pop() {
-            Some(m) => m,
-            None => return,
-        };
+        let msg = self.pop_next()?;
 
         // The queue-wait deadline is not the port thread's: C's timer thread
         // unlinks the request (asynManager.c:649-703) while this thread may be
@@ -1665,7 +2071,7 @@ impl PortActor {
         // own timer here. A deadline, an `AQR` cancel and the dequeue below race
         // through one CAS on the token, and exactly one of them wins.
         if msg.is_gone() {
-            return;
+            return None;
         }
 
         // Everything down to `begin_running` is C's *queued* phase — the request
@@ -1691,9 +2097,13 @@ impl PortActor {
         let multi_device = self.driver.base().flags.multi_device;
         if let Some(connect) = queue_gate(&msg.op, &msg.user, multi_device) {
             if !self.driver.base().flags.can_block {
-                if let Err(e) = self.synchronous_gate(&msg, connect) {
+                // A lend runs C's synchronous branch on its own thread
+                // ([`Self::lent_gate`]), as C does.
+                if !matches!(msg.reply, Reply::Lend(_))
+                    && let Err(e) = self.synchronous_gate(&msg.user, msg.priority, connect)
+                {
                     msg.refuse(e);
-                    return;
+                    return None;
                 }
             } else {
                 // C drains the Connect queue *before* `autoConnectDevice`
@@ -1710,11 +2120,11 @@ impl PortActor {
                 // :858-863).
                 if self.driver.base().queue_gate().check(connect).is_err() {
                     self.parked.push(msg);
-                    return;
+                    return None;
                 }
                 if let Err(e) = self.driver.base().check_queue(msg.user.addr, connect) {
                     msg.refuse(e);
-                    return;
+                    return None;
                 }
                 // C `portThread`'s per-request DEVICE checks (asynManager.c:877-888):
                 // the half of the device state `check_queue` deliberately leaves to
@@ -1741,7 +2151,7 @@ impl PortActor {
                         .is_err()
                     {
                         self.parked.push(msg);
-                        return;
+                        return None;
                     }
                     // :879-888 — auto-connect has already run above (C calls it at
                     // :879); a device still down diverts the request to its
@@ -1762,7 +2172,7 @@ impl PortActor {
                             .is_err()
                     {
                         msg.time_out(self.driver.base().port_name.to_string());
-                        return;
+                        return None;
                     }
                 }
             }
@@ -1778,7 +2188,7 @@ impl PortActor {
         // which case it must be dropped, reporting the outcome that won.
         match msg.claim() {
             Claim::Run => {}
-            Claim::Gone => return,
+            Claim::Gone => return None,
             Claim::Left => {
                 let e = if msg.cancel.is_timed_out() {
                     AsynError::QueueTimeout {
@@ -1791,7 +2201,7 @@ impl PortActor {
                     }
                 };
                 msg.refuse(e);
-                return;
+                return None;
             }
         }
         let ActorMessage {
@@ -1799,6 +2209,7 @@ impl PortActor {
             mut user,
             cancel,
             reply,
+            priority,
             ..
         } = msg;
         // From here the request is running (C `callbackActive`): a concurrent
@@ -1813,24 +2224,12 @@ impl PortActor {
         // The two clocks are separate in C too (`pasynUser->timeout` vs
         // `queueRequest`'s `timeout` argument, `AsynUser::queue_timeout` here).
 
-        // A request ran, so the queue state may have moved (it could have enabled
-        // a device): C's `queueStateChange` rescan (:870). A *parked* request
-        // does not set this — that is what keeps the loop from spinning on a
-        // device that is still disabled.
-        self.rescan_parked = true;
-
-        // Connect the user to the port it is about to run on, so every layer the
-        // request passes through can trace through it — C's `pasynUser →
-        // pport/pdevice` linkage, which `asynPrint`/`asynPrintIO` resolve the
-        // trace config from (`findTracePvt`, asynManager.c:548-553). The actor
-        // is the single owner of the linkage: an interpose has no other handle on
-        // the port, and a user that never reached a port traces nothing.
-        self.link_user(&mut user);
-        let callback = Self::c_dispatch(&op) != CDispatch::Direct;
         // C `portThread` announces the callback it is about to run
-        // (asynManager.c:904). A direct manager call never reaches it, and a
+        // (asynManager.c:904) — a `queueLockPort` callback too, before it waits
+        // there for its caller. A direct manager call never reaches it, and a
         // port without ASYN_CANBLOCK has no thread: its line is the gate's.
-        if callback && self.driver.base().flags.can_block {
+        if Self::c_dispatch(&op) != CDispatch::Direct && self.driver.base().flags.can_block {
+            self.link_user(&mut user);
             user.print(
                 crate::trace::TraceMask::FLOW,
                 file!(),
@@ -1841,18 +2240,17 @@ impl PortActor {
                 ),
             );
         }
-
-        // C runs a callback and a `lockPort` span under `synchronousLock`
-        // (asynManager.c:830, :909, :1581, :1800); a direct manager call
-        // takes no port lock.
-        let held =
-            (callback || matches!(op, RequestOp::LockPort(_))).then(|| self.sync_lock.hold());
-        let result = self.dispatch_io(&mut user, &op);
-        drop(held);
-        if callback {
-            self.settle_block(&user);
-        }
-        if let Some(reply) = reply {
+        let reply = match reply {
+            Reply::Lend(reply) => {
+                return Some(Handoff {
+                    claimed: Claimed { op, user, priority },
+                    reply,
+                });
+            }
+            reply => reply,
+        };
+        let result = run_claimed(&mut Access::Owned(self), &op, user);
+        if let Reply::Result(reply) = reply {
             let _ = reply.send(result);
         }
 
@@ -1863,6 +2261,7 @@ impl PortActor {
         // brings a dead line up on the new configuration a waived
         // `asynSetOption`/`asynSetEos`/HOSTINFO repoint just wrote, and equally
         // what brings a re-enabled port back up with no request at all (R15-46).
+        None
     }
 
     /// Link a request's user to the port before any driver sees it: the trace
@@ -1949,11 +2348,12 @@ impl PortActor {
         user.trace = self.user_trace();
         let port = &self.driver.base().port_name;
         let mask = crate::trace::TraceMask::ERROR;
+        // C prints through `pasynTrace->vprint`, which has no source (:476).
         match result {
             Err(e) => user.print(
                 mask,
-                file!(),
-                line!(),
+                "",
+                0,
                 format_args!(
                     "{port} {addr} autoConnect could not connect: {}\n",
                     e.message_display()
@@ -1961,8 +2361,8 @@ impl PortActor {
             ),
             Ok(()) => user.print(
                 mask,
-                file!(),
-                line!(),
+                "",
+                0,
                 format_args!("{port} {addr} port is now connected\n"),
             ),
         }
@@ -1974,8 +2374,13 @@ impl PortActor {
     /// A down device is auto-connected and refused only below Connect priority
     /// and without `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:1570-1577) —
     /// a Connect-priority request is how such a device comes up.
-    fn synchronous_gate(&mut self, msg: &ActorMessage, connect: ConnectCheck) -> AsynResult<()> {
-        let addr = msg.user.addr;
+    fn synchronous_gate(
+        &mut self,
+        user: &AsynUser,
+        priority: QueuePriority,
+        connect: ConnectCheck,
+    ) -> AsynResult<()> {
+        let addr = user.addr;
         let base = self.driver.base();
         base.queue_gate()
             .check(connect)
@@ -1986,7 +2391,7 @@ impl PortActor {
             if let Some(trace) = self.user_trace() {
                 trace.print(
                     crate::port::dp_common_key(base.flags.multi_device, addr).unwrap_or(-1),
-                    msg.user.reason as i32,
+                    user.reason as i32,
                     crate::trace::TraceMask::FLOW,
                     file!(),
                     line!(),
@@ -1997,9 +2402,9 @@ impl PortActor {
                 .map_err(AsynError::into_queue_refusal)?;
         }
         if connect != ConnectCheck::SynchronousLock
-            && msg.priority < QueuePriority::Connect
-            && msg.user.reason != crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED
-            && !self.auto_connect_device(addr, msg.user.reason)
+            && priority < QueuePriority::Connect
+            && user.reason != crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED
+            && !self.auto_connect_device(addr, user.reason)
         {
             return self
                 .driver
@@ -2008,6 +2413,28 @@ impl PortActor {
                 .map_err(AsynError::into_queue_refusal);
         }
         Ok(())
+    }
+
+    /// The gate a lent request passes on its caller's thread, with the actor
+    /// in hand. On a port without `ASYN_CANBLOCK` it is C's whole
+    /// synchronous branch, printed and auto-connected on the caller as
+    /// asynManager.c:1555-1577 does; a `CANBLOCK` lend already passed the
+    /// port thread's gate before the actor was handed over.
+    fn lent_gate(
+        &mut self,
+        op: &RequestOp,
+        user: &AsynUser,
+        priority: QueuePriority,
+    ) -> AsynResult<()> {
+        self.driver.base_mut().sync_connection_edge();
+        let base = self.driver.base();
+        if base.flags.can_block {
+            return Ok(());
+        }
+        match queue_gate(op, user, base.flags.multi_device) {
+            Some(connect) => self.synchronous_gate(user, priority, connect),
+            None => Ok(()),
+        }
     }
 
     /// C `autoConnectDevice` (asynManager.c:706-741) — the single owner of
@@ -2362,7 +2789,7 @@ impl PortActor {
                 // owns the driver, so the install lands between transfers instead
                 // of racing one; the addr rides the request's own user, which is
                 // C's `pasynUser`-selects-the-device linkage.
-                self.driver.base_mut().install_octet_interpose_addr(
+                self.install_octet_interpose(
                     user.addr,
                     Box::new(crate::interpose::echo::EchoInterpose::new()),
                 );
@@ -2375,7 +2802,7 @@ impl PortActor {
                 // actor-owned install point, same per-device addr, as the echo
                 // layer above: `asynInterposeDelay("gpib",4,0.01)` slows device 4
                 // and leaves the rest of the bus at full speed.
-                self.driver.base_mut().install_octet_interpose_addr(
+                self.install_octet_interpose(
                     user.addr,
                     Box::new(crate::interpose::delay::DelayInterpose::new(*delay)),
                 );
@@ -2390,7 +2817,7 @@ impl PortActor {
                 // any time after configure — the same actor-owned install point
                 // as the echo and delay layers. The terminators themselves
                 // arrive later, through `asynOctetSetInputEos`.
-                self.driver.base_mut().install_octet_interpose_addr(
+                self.install_octet_interpose(
                     user.addr,
                     Box::new(crate::interpose::eos::EosInterpose::with_processing(
                         crate::interpose::eos::EosConfig::default(),
@@ -2402,7 +2829,7 @@ impl PortActor {
             }
             RequestOp::PushFlushInterpose { flush_timeout } => {
                 // C `asynInterposeFlushConfig` (asynInterposeFlush.c:66-91).
-                self.driver.base_mut().install_octet_interpose_addr(
+                self.install_octet_interpose(
                     user.addr,
                     Box::new(crate::interpose::flush::FlushTimeoutInterpose::new(
                         *flush_timeout,
@@ -2647,13 +3074,9 @@ impl PortActor {
                 result.data = Some(self.report_port(*level, *sync_locked).into_bytes());
                 Ok(result)
             }
-            RequestOp::Cell(cell) => {
-                cell.run(&mut ActorCalls(self, user.block_token));
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::CellInline(cell) => {
-                cell.run_inline(&mut ActorCalls(self, user.block_token));
-                Ok(RequestResult::write_ok())
+            // The ops that make calls of their own; [`dispatch`] owns them.
+            RequestOp::Cell(_) | RequestOp::CellInline(_) | RequestOp::LockPort(_) => {
+                dispatch(&mut Access::Owned(self), user, op)
             }
             RequestOp::WithDriver(call) => match call.take() {
                 Some(f) => {
@@ -2665,36 +3088,6 @@ impl PortActor {
                     message: "driver call carries no closure".into(),
                 }),
             },
-            RequestOp::LockPort(call) => {
-                let port = self.driver.base().port_name.clone();
-                let trace = |actor: &Self, what: &str| {
-                    actor.driver.base().trace_print(
-                        crate::trace::TraceMask::FLOW,
-                        format_args!("{port} {what}\n"),
-                    );
-                };
-                // C `lockPort` traces before it looks (:1789), and refuses only
-                // a destroyed port (:1790-1795).
-                trace(self, "lockPort");
-                if self.driver.base().is_defunct() {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disabled,
-                        message: "asynManager:lockPort: port has been shut down".into(),
-                    });
-                }
-                let result = match call.take() {
-                    Some(f) => {
-                        f(&mut ActorCalls(self, user.block_token));
-                        Ok(RequestResult::write_ok())
-                    }
-                    None => Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "port lock call carries no closure".into(),
-                    }),
-                };
-                trace(self, "unlockPort");
-                result
-            }
             RequestOp::SetInputEos { eos } => {
                 // C parity: asynRecord IEOS write at asynRecord.c:1964-1967
                 // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
@@ -2761,15 +3154,11 @@ impl PortActor {
                 // /timeout) read returned clean (no INVALID, UDF-clearing).
                 let (alarm_status, alarm_severity) =
                     combine_read_alarm(status, alarm_status, alarm_severity);
-                // Carry the device read status (C pasynUser->auxStatus) to the
-                // device-support consumer so it can gate the value store the way
-                // C processAi does (store iff result.status == asynSuccess,
-                // devAsynInt32.c:848-855). Kept distinct from `status` (the
-                // op/request outcome) so the network reply path — which keys on
-                // `status` to emit an Error reply — is unaffected.
-                let mut out = r.with_alarm(alarm_status, alarm_severity, ts);
-                out.aux_status = status;
-                Ok(out)
+                // A non-success status fails the read, value kept, as C's
+                // getXxxParam does: device support then stores nothing
+                // (devAsynInt32.c:848-855) and a plain caller sees the failure.
+                let out = r.with_alarm(alarm_status, alarm_severity, ts);
+                self.driver.base().param_status_read(user, op, out, status)
             }
             other => other,
         }
@@ -2777,17 +3166,18 @@ impl PortActor {
 }
 
 /// The port a [`RequestOp::Cell`] runs against: each call is dispatched on
-/// the actor thread with no queue and no gate, as C's callback calls the
-/// driver's interfaces directly while it owns the port. Each call is made as
-/// the running request's user — C's callback passes its own `pasynUser` —
-/// so a block it takes is held by that request's block identity.
-struct ActorCalls<'a>(&'a mut PortActor, Option<u64>);
+/// whichever thread holds the actor, with no queue and no gate, as C's
+/// callback calls the driver's interfaces directly while it owns the port.
+/// Each call is made as the running request's user — C's callback passes its
+/// own `pasynUser` — so a block it takes is held by that request's block
+/// identity.
+struct ActorCalls<'b, 'a>(&'b mut Access<'a>, Option<u64>);
 
-impl PortCalls for ActorCalls<'_> {
+impl PortCalls for ActorCalls<'_, '_> {
     fn call(&mut self, op: &RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
         user.block_token = self.1;
-        self.0.link_user(&mut user);
-        self.0.dispatch_io(&mut user, op)
+        self.0.with(|actor| actor.link_user(&mut user))?;
+        dispatch(self.0, &mut user, op)
     }
 }
 
@@ -2803,27 +3193,7 @@ fn set_params(
 ) -> Option<AsynError> {
     let mut failed = None;
     for u in updates {
-        let outcome = match u {
-            crate::request::ParamSetValue::Value {
-                reason,
-                addr,
-                value,
-            } => base.set_param_value(*reason, *addr, value.clone()),
-            crate::request::ParamSetValue::UInt32Digital {
-                reason,
-                addr,
-                value,
-                mask,
-                interrupt_mask,
-            } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
-            crate::request::ParamSetValue::Status {
-                reason,
-                addr,
-                status,
-                alarm_status,
-                alarm_severity,
-            } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
-        };
+        let outcome = base.set_param(u);
         // The setter printed C's reportSetParamErrors line.
         if let Err(e) = outcome {
             failed.get_or_insert(e);
@@ -3251,25 +3621,46 @@ mod tests {
         // devAsynInt32.c:844-847), not a clean (UDF-clearing) read.
         let mut drv = TestDriver::new();
         drv.base.params.set_int32(0, 0, 5).unwrap(); // define VAL
-        drv.base
-            .params
-            .set_param_status(0, 0, AsynStatus::Error, 0, 0)
-            .unwrap();
+        drv.base.params.set_status(0, 0, AsynStatus::Error).unwrap();
         let tx = spawn_actor(drv);
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
+        let e = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap_err();
+        // The read fails with the parameter's status and keeps its value, as
+        // C getIntegerParam returns both (asynPortDriver.cpp:307-309).
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(
+            e.message(),
+            "asynPortDriver:readInt32: status=3, function=0, name=VAL, value=5"
+        );
+        let result = e.failed_read().unwrap();
         assert_eq!(result.int_val, Some(5));
         assert_eq!(result.alarm_status, al::READ_ALARM);
         assert_eq!(result.alarm_severity, al::SEV_INVALID);
-        // The transport status is also carried as aux_status (distinct from the
-        // op-level `status`, which stays Success) so device support can gate the
-        // value store on it — C processAi (devAsynInt32.c:848-855).
-        assert_eq!(result.aux_status, AsynStatus::Error);
+    }
+
+    /// A parameter's status fails an octet read inside the read's own status,
+    /// the copied string kept (asynPortDriver.cpp:2615-2623).
+    #[test]
+    fn actor_octet_read_fails_on_param_status() {
+        let mut drv = TestDriver::new();
+        drv.base.params.set_string(2, 0, "abc").unwrap();
+        drv.base
+            .params
+            .set_status(2, 0, AsynStatus::Timeout)
+            .unwrap();
+        let tx = spawn_actor(drv);
+
+        let user = AsynUser::new(2).with_timeout(Duration::from_secs(1));
+        let op = crate::request::OctetReadOp::Read { buf_size: 40 }.into_op();
+        let read = crate::request::octet_outcome(send_and_wait(&tx, op, user));
+        let (data, status) = read.into_parts();
+        assert_eq!(data, b"abc\0");
+        let e = status.unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Timeout);
         assert_eq!(
-            result.status,
-            AsynStatus::Success,
-            "op-level status stays Success so the network reply path is unaffected"
+            e.message(),
+            "asynPortDriver:readOctet: status=1, function=2, name=MSG, value=abc"
         );
     }
 
@@ -3631,7 +4022,7 @@ mod tests {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
                 cancel: CancelToken::new(),
-                reply: Some(reply),
+                reply: Reply::Result(reply),
                 seq,
                 priority: QueuePriority::Medium,
                 rank: Rank::Band(QueuePriority::Medium),
@@ -3784,7 +4175,7 @@ mod tests {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
                 cancel: CancelToken::new(),
-                reply: Some(reply),
+                reply: Reply::Result(reply),
                 seq,
                 priority,
                 rank: Rank::Band(priority),
@@ -4540,7 +4931,9 @@ mod tests {
     /// (asynManager.c:469-478, :778-786): one error-trace line per change of
     /// outcome, the port's and its devices' attempts sharing the one
     /// `previousConnectStatus`, and the retry timer's attempt
-    /// (`portConnectProcessCallback`, :3299) reports nothing.
+    /// (`portConnectProcessCallback`, :3299) reports nothing. It prints
+    /// through `pasynTrace->vprint` on the user `connectAttempt` connected to
+    /// the device (:747-755), so the source is C's `[:0]`.
     #[test]
     fn auto_connect_reports_once_per_change_of_outcome() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4593,6 +4986,10 @@ mod tests {
         let trace = services.trace();
         trace.register_port("acrep", true);
         trace.set_trace_mask(Some("acrep"), crate::trace::TraceMask::ERROR);
+        trace.set_trace_info_mask(
+            Some("acrep"),
+            crate::trace::TraceInfoMask::PORT | crate::trace::TraceInfoMask::SOURCE,
+        );
         let dir = tempfile::tempdir().expect("fixture root");
         let path = dir.path().join("acrep.log");
         trace.set_trace_file(
@@ -4627,7 +5024,7 @@ mod tests {
         assert!(!attempt(&mut actor));
         assert_eq!(
             log()
-                .matches("acrep -1 autoConnect could not connect: no line\n")
+                .matches("[acrep,-1,0] [:0] acrep -1 autoConnect could not connect: no line\n")
                 .count(),
             1,
             "{:?}",
@@ -4639,12 +5036,17 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(3);
         actor.driver.base_mut().stamp_auto_connect_attempt(-1, past);
         assert!(actor.auto_connect_port());
-        assert_eq!(log().matches("acrep -1 port is now connected\n").count(), 1);
+        assert_eq!(
+            log()
+                .matches("[acrep,-1,0] [:0] acrep -1 port is now connected\n")
+                .count(),
+            1
+        );
         fail.store(true, Ordering::SeqCst);
         assert!(!attempt(&mut actor));
         assert_eq!(
             log()
-                .matches("acrep 1 autoConnect could not connect: no device\n")
+                .matches("[acrep,1,0] [:0] acrep 1 autoConnect could not connect: no device\n")
                 .count(),
             1,
             "{:?}",
@@ -4653,7 +5055,12 @@ mod tests {
         fail.store(false, Ordering::SeqCst);
         assert!(attempt(&mut actor));
         assert!(attempt(&mut actor));
-        assert_eq!(log().matches("acrep 1 port is now connected\n").count(), 1);
+        assert_eq!(
+            log()
+                .matches("[acrep,1,0] [:0] acrep 1 port is now connected\n")
+                .count(),
+            1
+        );
         assert_eq!(log().lines().count(), 4, "{:?}", log());
     }
 
@@ -5624,15 +6031,11 @@ mod tests {
             val,
             0,
             crate::error::AsynStatus::Disconnected,
-            0,
-            0,
         )]);
         publish(vec![crate::request::ParamSetValue::status(
             val,
             0,
             crate::error::AsynStatus::Success,
-            0,
-            0,
         )]);
 
         assert_eq!(

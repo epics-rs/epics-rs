@@ -384,6 +384,61 @@ fn a_port_without_octet_is_refused() {
     );
 }
 
+/// A protocol with an in terminator on a port with no EOS layer: C's
+/// connectToBus warns when getInputEos fails (AsynDriverInterface.cc:444-457).
+/// The oracle's first two lines are its streamReload releasing the old
+/// interface; C's first attach runs before the protocol is parsed.
+#[test]
+fn a_port_without_eos_support_warns_at_connect() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let handle = port("P", octet_transport_capabilities());
+    handle
+        .submit_blocking(RequestOp::Connect, AsynUser::new(0))
+        .unwrap();
+    let (client, _calls) = rec_terminated("rec", Some(b"\r"), None);
+    let (found, lines) = attach(&client, "P");
+    assert!(found.is_some());
+    assert_eq!(lines, oracle("noeos")[2..]);
+}
+
+/// C's getInputEos is a direct call with no queued request, so connectToBus
+/// does not wait for another user that owns the device.
+#[test]
+fn connect_asks_the_eos_while_another_user_owns_the_device() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let handle = port("P", octet_transport_capabilities());
+    handle
+        .submit_blocking(RequestOp::Connect, AsynUser::new(0))
+        .unwrap();
+    let (first, calls) = rec_terminated("first", None, None);
+    let (held, _) = attach(&first, "P");
+    let held = held.unwrap();
+    assert!(held.bus().lock_request(5000));
+    assert_eq!(
+        calls.locks.recv_timeout(WAIT),
+        Ok(StreamIoStatus::StreamIoSuccess)
+    );
+
+    let (done_tx, done) = channel();
+    std::thread::spawn(move || {
+        let (client, _calls) = rec_terminated("rec", Some(b"\r"), None);
+        let (found, lines) = attach(&client, "P");
+        let _ = done_tx.send((found.is_some(), lines));
+    });
+    let attached = done.recv_timeout(Duration::from_secs(2));
+    assert!(held.bus().unlock());
+    let (found, lines) = attached.expect("connectToBus waited for the device's owner");
+    assert!(found);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "rec: warning: No input EOS support."),
+        "{lines:?}"
+    );
+}
+
 /// One protocol's bus ownership, as C's lockRequest/lockHandler/unlock print
 /// it, with another user's request on the device held from the lock until
 /// the unlock.
@@ -1002,15 +1057,16 @@ fn disconnect_for_good(handle: &asyn_rs::port_handle::PortHandle) {
 
 /// A connected [`Script`] port called `name`, and its book.
 fn script(name: &str) -> (asyn_rs::port_handle::PortHandle, Arc<Mutex<Book>>) {
-    script_with(name, false)
+    script_with(name, false, false)
 }
 
 /// [`script`], its reads handed to the octet interrupt users if
 /// `octet_interrupts`, as asynOctetBase's `interruptProcess`, under the
-/// EOS layer an IP port has.
+/// EOS layer an IP port has if `eos_layer`.
 fn script_with(
     name: &str,
     octet_interrupts: bool,
+    eos_layer: bool,
 ) -> (asyn_rs::port_handle::PortHandle, Arc<Mutex<Book>>) {
     let flags = PortFlags {
         can_block: true,
@@ -1018,8 +1074,8 @@ fn script_with(
     };
     let book = Arc::new(Mutex::new(Book::default()));
     let mut base = PortDriverBase::new(name, 1, flags, InterfaceMask::ALL, InterfaceMask::ALL);
-    if octet_interrupts {
-        base.octet_interrupt_process = true;
+    base.octet_interrupt_process = octet_interrupts;
+    if eos_layer {
         base.install_octet_interpose(Box::new(EosInterpose::default()));
     }
     let manager = PortManager::new();
@@ -2063,7 +2119,21 @@ fn intr_rec(
     Calls,
     Arc<dyn Client>,
 ) {
-    let (handle, book) = script_with(name, true);
+    intr_rec_on(script_with(name, true, true), name, in_terminator)
+}
+
+/// [`intr_rec`] on the port `script` built.
+fn intr_rec_on(
+    (handle, book): (asyn_rs::port_handle::PortHandle, Arc<Mutex<Book>>),
+    name: &str,
+    in_terminator: Option<&[u8]>,
+) -> (
+    asyn_rs::port_handle::PortHandle,
+    Arc<Mutex<Book>>,
+    bus::BusInterface,
+    Calls,
+    Arc<dyn Client>,
+) {
     let (client, calls) = rec_terminated("rec", in_terminator, None);
     let (bus, _) = attach(&client, name);
     let bus = bus.unwrap();
@@ -2208,6 +2278,78 @@ fn a_device_terminator_is_cut_off_without_a_protocol_one() {
         reads_then_timeout(&calls),
         (
             vec![(Success, OwnedReadInput::Bytes(b"3\n".to_vec()), -1)],
+            (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+        )
+    );
+}
+
+/// Where getInputEos fails, a cut terminator is not given back
+/// (:1165-1177): the input goes on as it came.
+#[test]
+fn a_refused_eos_is_not_given_back() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let (handle, book) = script_with("IN", true, false);
+    let (client, calls) = rec_terminated("rec", Some(b"\r\n"), None);
+    let (bus, _) = attach(&client, "IN");
+    let bus = bus.unwrap();
+    assert!(bus.bus().supports_async_read());
+    input(&handle, &book, b"12", EomReason::EOS);
+    assert_eq!(
+        reads_then_timeout(&calls),
+        (
+            vec![(Success, OwnedReadInput::Bytes(b"12".to_vec()), -1)],
+            (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+        )
+    );
+}
+
+/// Where getInputEos fails, no terminator is cut off and the input does
+/// not end (:1180-1199).
+#[test]
+fn a_refused_eos_is_not_cut_off() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let (handle, book) = script_with("IO", true, false);
+    let (client, calls) = rec_terminated("rec", None, None);
+    let (bus, _) = attach(&client, "IO");
+    let bus = bus.unwrap();
+    assert!(bus.bus().supports_async_read());
+    input(&handle, &book, b"12\r\n", EomReason::empty());
+    assert_eq!(
+        reads_then_timeout(&calls),
+        (
+            vec![(Success, OwnedReadInput::Bytes(b"12\r\n".to_vec()), -1)],
+            (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+        )
+    );
+}
+
+/// A refused getInputEos neither gives a cut terminator back (:1166-1177)
+/// nor cuts one off (:1184-1197): the input is passed on as read, and wants
+/// more.
+#[test]
+fn a_refused_device_terminator_leaves_the_input_as_read() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let (handle, book, _bus, calls, _client) =
+        intr_rec_on(script_with("IR1", true, false), "IR1", Some(b"\r\n"));
+    assert!(handle.get_input_eos(&AsynUser::new(0)).is_err());
+    input(&handle, &book, b"12", EomReason::EOS);
+    assert_eq!(
+        reads_then_timeout(&calls),
+        (
+            vec![(Success, OwnedReadInput::Bytes(b"12".to_vec()), -1)],
+            (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
+        )
+    );
+    let (handle, book, _bus, calls, _client) =
+        intr_rec_on(script_with("IR2", true, false), "IR2", None);
+    input(&handle, &book, b"12\r\n", EomReason::empty());
+    assert_eq!(
+        reads_then_timeout(&calls),
+        (
+            vec![(Success, OwnedReadInput::Bytes(b"12\r\n".to_vec()), -1)],
             (IoTimeout, OwnedReadInput::Bytes(Vec::new()), 0)
         )
     );

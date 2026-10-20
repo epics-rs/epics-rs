@@ -135,9 +135,14 @@ impl asyn_rs::interfaces::motor::AsynMotor for Recorder {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+    fn poll(
+        &mut self,
+        _: &AsynUser,
+        status: &mut asyn_rs::interfaces::motor::MotorStatus,
+    ) -> AsynResult<()> {
         self.push(MotorCommand::Poll)?;
-        Ok(Default::default())
+        *status = Default::default();
+        Ok(())
     }
 }
 
@@ -856,8 +861,13 @@ impl asyn_rs::interfaces::motor::AsynMotor for Encoder {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
-        Ok(Default::default())
+    fn poll(
+        &mut self,
+        _: &AsynUser,
+        status: &mut asyn_rs::interfaces::motor::MotorStatus,
+    ) -> AsynResult<()> {
+        *status = Default::default();
+        Ok(())
     }
 }
 
@@ -1828,9 +1838,14 @@ impl asyn_rs::interfaces::motor::AsynMotor for Servoed {
     fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+    fn poll(
+        &mut self,
+        _: &AsynUser,
+        status: &mut asyn_rs::interfaces::motor::MotorStatus,
+    ) -> AsynResult<()> {
         self.0.lock().unwrap().push("poll".into());
-        Ok(asyn_rs::interfaces::motor::MotorStatus::default())
+        *status = asyn_rs::interfaces::motor::MotorStatus::default();
+        Ok(())
     }
 }
 

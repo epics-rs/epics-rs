@@ -17,6 +17,7 @@ use std::sync::Arc;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
+use epics_libcom_rs::cfmt::CFloat;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
 use ad_core_rs::plugin::channel::NDArrayOutput;
@@ -83,7 +84,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: xrt_ioc <st.cmd>");
+        epics_libcom_rs::stderr_println!("Usage: xrt_ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -141,7 +142,7 @@ async fn main() -> CaResult<()> {
                     sim_config.nrays,
                     sim_config.screen_nx,
                     sim_config.screen_nz,
-                    sim_config.energy_bandwidth * 100.0,
+                    CFloat(sim_config.energy_bandwidth * 100.0),
                 );
 
                 let claim =

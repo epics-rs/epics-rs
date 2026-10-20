@@ -156,7 +156,7 @@ impl ActiveBackend {
         } else {
             (Self::Select(select::SelectBackend::new()?), "select")
         };
-        eprintln!("epics-rs: readiness poller {poller}: {name} backend ({why})");
+        crate::stderr_println!("epics-rs: readiness poller {poller}: {name} backend ({why})");
         Ok(backend)
     }
 
@@ -227,7 +227,7 @@ fn rtems_kqueue_usable() -> (bool, String) {
         }
         // Not a third answer (see `parse_override`), but the operator set
         // something and is owed the reason it did nothing.
-        eprintln!(
+        crate::stderr_println!(
             "epics-rs: EPICS_RTEMS_KQUEUE={} is neither 1/yes/true nor 0/no/false; \
              the RTEMS version rule decides",
             raw.trim()
@@ -706,7 +706,9 @@ fn poll_loop(inner: &Arc<Inner>) {
                 // `eprintln!` for the reason `ActiveBackend::new` uses it: a
                 // poller dying is a diagnostic that must not depend on a
                 // `tracing` subscriber being installed.
-                eprintln!("epics-rs: readiness poller cannot wait, shutting down: {e}");
+                crate::stderr_println!(
+                    "epics-rs: readiness poller cannot wait, shutting down: {e}"
+                );
                 break;
             }
         }

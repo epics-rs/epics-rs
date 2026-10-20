@@ -74,8 +74,13 @@ fn strip_colour(text: &str) -> String {
 }
 
 /// softioc-rs run on `st.cmd` in a directory holding `files`: its stdout
-/// and its colour-stripped stderr.
+/// and its colour-stripped stderr. A port taken before the IOC bound it is
+/// drawn again.
 fn softioc(files: &[(&str, &str)]) -> (String, String) {
+    named_port::on_a_named_port(|port| softioc_on(files, port))
+}
+
+fn softioc_on(files: &[(&str, &str)], port: u16) -> Option<(String, String)> {
     let dir = tempfile::tempdir().expect("tempdir");
     for (name, text) in files {
         std::fs::write(dir.path().join(name), text).unwrap();
@@ -85,10 +90,7 @@ fn softioc(files: &[(&str, &str)]) -> (String, String) {
         .arg("st.cmd")
         .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env(
-            "EPICS_CA_SERVER_PORT",
-            named_port::free_for_tcp_and_udp().to_string(),
-        )
+        .env("EPICS_CA_SERVER_PORT", port.to_string())
         .env(
             "EPICS_CA_REPEATER_PORT",
             named_port::free_for_tcp_and_udp().to_string(),
@@ -96,10 +98,13 @@ fn softioc(files: &[(&str, &str)]) -> (String, String) {
         .stdin(Stdio::null())
         .output()
         .expect("softioc-rs");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        strip_colour(&String::from_utf8_lossy(&out.stderr)),
-    )
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    (!named_port::verdict::rs_ioc_port_was_taken(&stderr, port)).then(|| {
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            strip_colour(&stderr),
+        )
+    })
 }
 
 #[test]

@@ -21,6 +21,7 @@
 //!   the established TCP circuit, expecting the Rust server to
 //!   answer with SEARCH_RESPONSE on the same circuit.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "client")]
 
 mod interop_helpers;

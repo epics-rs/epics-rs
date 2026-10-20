@@ -182,7 +182,7 @@ fn target_information() {
         Ok(s) => print!("{s}"),
         Err((partial, what)) => {
             print!("{partial}");
-            eprintln!("\x1b[31;1mERROR\x1b[0m: {what}");
+            epics_libcom_rs::stderr_println!("\x1b[31;1mERROR\x1b[0m: {what}");
             std::process::exit(1);
         }
     }
@@ -218,7 +218,7 @@ async fn main() {
     // `(s)`, which pvput and pvcall do not have. It returns 1; a
     // clap-required argument would have exited 2.
     if args.pv_names.is_empty() {
-        eprintln!("No pv name(s) specified. ('pvinfo -h' for help.)");
+        epics_libcom_rs::stderr_println!("No pv name(s) specified. ('pvinfo -h' for help.)");
         std::process::exit(1);
     }
 
@@ -291,14 +291,14 @@ async fn main() {
                 // One Timeout line for the batch (tools/info.cpp:113-115).
                 Err(epics_pva_rs::error::PvaError::Timeout) => timed_out = true,
                 Err(e) => {
-                    eprintln!("{pv_name}: {e}");
+                    epics_libcom_rs::stderr_println!("{pv_name}: {e}");
                     failed = true;
                 }
             }
         })
         .await;
     if timed_out {
-        eprintln!("Timeout");
+        epics_libcom_rs::stderr_println!("Timeout");
         std::process::exit(1);
     }
     if failed {

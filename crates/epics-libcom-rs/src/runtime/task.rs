@@ -1778,7 +1778,7 @@ thread_local! {
 /// how `target-cfg-gate` finds them: a test that runs the binary must be
 /// declared under a cfg where the call is compiled out.
 pub fn refuse_backend(message: &str) -> ! {
-    eprintln!("{message}");
+    crate::stderr_println!("{message}");
     std::process::exit(1)
 }
 
@@ -1835,12 +1835,24 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// than a rule to remember at each spawn. A thread that starts outside it is
 /// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
+    prepare_current_thread();
+    band_and_register(priority)
+}
+
+/// [`enter_ioc_thread`] for C's process thread (`osdThread.c:406-412`), which
+/// `once()` lists at EPICS priority 0 and never reschedules: no scheduler call.
+fn enter_process_thread() {
+    prepare_current_thread();
+    thread_registry::register_current(ThreadPriority::Custom(0), PriorityApplied::Disabled);
+}
+
+/// What every listed thread does first, banded or not.
+fn prepare_current_thread() {
     name_current_thread();
     build_park_state();
     build_drive_state();
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
-    band_and_register(priority)
 }
 
 /// `parking_lot_core` builds a thread's park state on its first park, and
@@ -1908,9 +1920,9 @@ fn band_and_register(priority: ThreadPriority) -> PriorityApplied {
 pub const MAIN_THREAD_NAME: &str = "_main_";
 
 /// C `epicsThreadGetNameSelf` (`osdThread.c:972-981`): the calling thread's
-/// row name, so a thread [`register_main_thread`] listed answers `_main_`
-/// however it was spawned. A thread with no row keeps its `std` name (a
-/// runtime worker); one with neither gets C's `createImplicit` row.
+/// row name, so the [`run_on_main_thread`] thread answers `_main_`. A thread
+/// with no row keeps its `std` name (a runtime worker); one with neither gets
+/// C's `createImplicit` row.
 pub fn thread_name_self() -> String {
     if let Some(name) = thread_registry::current_name() {
         return name;
@@ -1922,25 +1934,87 @@ pub fn thread_name_self() -> String {
     thread_registry::current_name().expect("register_current_implicit installed a row")
 }
 
-/// Put the calling thread on the thread list as C's `_main_`.
+/// Run `job` on C's `_main_` thread (`osdThread.c:406-412`), the one thread a
+/// C IOC runs its `main` on: the startup script, `iocInit` with the
+/// `afterIocRunning` queue it drains, and `iocsh(NULL)`.
 ///
-/// C's `epicsThreadInit` runs `once()` under a `pthread_once`
-/// (`osdThread.c:406-412`): it builds a `threadInfo` for the first thread to
-/// touch the epicsThread API, names it `_main_`, gives it EPICS priority 0 and
-/// `ellAdd`s it to `pthreadList` — without touching that thread's scheduling.
-/// In a C IOC that thread is the one running `iocsh()`, which is why
-/// `epicsThreadShowAll` there always lists the shell's own thread.
-///
-/// [`enter_ioc_thread`] cannot stand in for this. It bands the thread to the
-/// priority it is handed, which C never does to `_main_`, and it takes the
-/// row's name from `std::thread::current().name()` — `None`, and so `noname`,
-/// for a shell started with a bare `std::thread::spawn`.
-///
-/// Idempotent for the reason C's guard is a `pthread_once`: a process has one
-/// `_main_`. The row leaves the list when the registering thread ends, which
-/// is where C's thread-specific-data destructor removes it.
-pub fn register_main_thread() {
-    thread_registry::register_main();
+/// Jobs run one at a time, in the order handed over — the statement order of
+/// one `main` — so a prompt queued while the script still runs opens after
+/// it, and the thread list holds one `_main_` row for the process's life.
+/// Started by the first call. A job that panics drops its result, as a thread
+/// of its own would have, and the next job still runs.
+pub fn run_on_main_thread<R, F>(
+    job: F,
+) -> std::io::Result<crate::runtime::sync::oneshot::Receiver<R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = crate::runtime::sync::oneshot::channel();
+    main_thread::submit(Box::new(move || {
+        let _ = tx.send(job());
+    }))?;
+    Ok(rx)
+}
+
+mod main_thread {
+    use super::{MAIN_THREAD_NAME, MandatoryThread, StackSizeClass};
+    use std::sync::Mutex;
+    use std::sync::mpsc::Sender;
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    static QUEUE: Mutex<Option<Sender<Job>>> = Mutex::new(None);
+
+    thread_local! {
+        /// Set on the thread [`start`] spawned, for as long as it serves.
+        static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// On the serving `_main_`, hand the queue on: the next [`submit`]
+    /// starts another.
+    pub(super) fn retire_if_current() {
+        if SERVING.replace(false) {
+            *QUEUE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn submit(job: Job) -> std::io::Result<()> {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_none() {
+            *queue = Some(start()?);
+        }
+        queue
+            .as_ref()
+            .expect("started above")
+            .send(job)
+            .map_err(|_| std::io::Error::other("the _main_ thread has ended"))
+    }
+
+    /// `Iocsh` on RTEMS because base raises `_main_` to it
+    /// (`posix/rtems_init.c:1002`): a thread that inherits `POSIX_Init`'s
+    /// band runs one level above idle, behind every scan thread. Elsewhere C's
+    /// `_main_` is the process thread, never rescheduled. `Big` because a
+    /// shell's commands reach record processing and device support, the depth
+    /// the callback bands get.
+    fn start() -> std::io::Result<Sender<Job>> {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        #[cfg(target_os = "rtems")]
+        let thread = MandatoryThread::new(
+            MAIN_THREAD_NAME,
+            super::ThreadPriority::Iocsh,
+            StackSizeClass::Big,
+        );
+        #[cfg(not(target_os = "rtems"))]
+        let thread = MandatoryThread::process_thread(MAIN_THREAD_NAME, StackSizeClass::Big);
+        thread.try_spawn(move || {
+            SERVING.set(true);
+            for job in rx {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            }
+        })?;
+        Ok(tx)
+    }
 }
 
 /// Push `std::thread::current().name()` down to the OS thread object.
@@ -2119,6 +2193,30 @@ pub fn suspend_self() {
     current_suspension().suspend();
 }
 
+/// A thread that cannot proceed (C `cantProceed`, `cantProceed.c:54-72`), from
+/// the moment it knows to its park. A `_main_` hands its job queue on in
+/// [`Self::begin`], before it releases anything waiting on it, so a job
+/// submitted after that is new work and starts a `_main_` of its own; the jobs
+/// already queued behind it stay there, as the thread's own next statements do
+/// in C.
+#[must_use = "a thread that cannot proceed parks"]
+pub struct ForeverPark(());
+
+impl ForeverPark {
+    pub fn begin() -> Self {
+        main_thread::retire_if_current();
+        Self(())
+    }
+
+    /// Suspend, and suspend again whenever `epicsThreadResume` wakes the
+    /// thread (`cantProceed.c:70-71`): one that cannot proceed must not run on.
+    pub fn park(self) -> ! {
+        loop {
+            suspend_self();
+        }
+    }
+}
+
 /// C `epicsThreadResume(id)` (`osdThread.c:797-802`) on a handle a
 /// subsystem stored for itself — `dbBkpt.c`'s `pnode->taskid`, resumed by
 /// `dbc`/`dbs` (`dbBkpt.c:518`, `:547`).
@@ -2284,20 +2382,6 @@ mod thread_registry {
             priority,
             applied,
         );
-    }
-
-    /// C's `once()` row (`osdThread.c:406-412`): `_main_`, EPICS priority 0,
-    /// on the list without a scheduling change. Guarded like C's
-    /// `pthread_once` because a process has one `_main_`.
-    pub(super) fn register_main() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            push(
-                super::MAIN_THREAD_NAME.to_string(),
-                ThreadPriority::Custom(0),
-                PriorityApplied::Disabled,
-            );
-        });
     }
 
     /// The one place a row is built, so which entry point made a row cannot
@@ -2900,8 +2984,8 @@ fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
     if nominal.contains(&oss) {
         return None;
     }
-    eprintln!("{}", einval_status_line("pthread_attr_setschedparam"));
-    eprintln!("{}", einval_status_line("pthread_create"));
+    crate::stderr_println!("{}", einval_status_line("pthread_attr_setschedparam"));
+    crate::stderr_println!("{}", einval_status_line("pthread_create"));
     Some(std::io::Error::from_raw_os_error(libc::EINVAL))
 }
 
@@ -3518,7 +3602,8 @@ where
 /// threads) is closed by signature rather than by a source sweep.
 pub struct MandatoryThread {
     name: String,
-    priority: ThreadPriority,
+    /// `None` for `Self::process_thread`, which RTEMS does not build.
+    priority: Option<ThreadPriority>,
     stack: StackSizeClass,
 }
 
@@ -3528,7 +3613,18 @@ impl MandatoryThread {
     pub fn new(name: impl Into<String>, priority: ThreadPriority, stack: StackSizeClass) -> Self {
         Self {
             name: name.into(),
-            priority,
+            priority: Some(priority),
+            stack,
+        }
+    }
+
+    /// C's process thread (`osdThread.c:406-412`): no band, so it keeps the
+    /// scheduling of the thread that creates it, and a priority-0 row.
+    #[cfg(not(target_os = "rtems"))]
+    fn process_thread(name: impl Into<String>, stack: StackSizeClass) -> Self {
+        Self {
+            name: name.into(),
+            priority: None,
             stack,
         }
     }
@@ -3587,9 +3683,9 @@ impl MandatoryThread {
     {
         let priority = self.priority;
         if stack.refused() {
-            eprintln!("{}", einval_status_line("pthread_attr_setstacksize"));
+            crate::stderr_println!("{}", einval_status_line("pthread_attr_setstacksize"));
         }
-        if let Some(refused) = fifo_attr_refusal(priority) {
+        if let Some(refused) = priority.and_then(fifo_attr_refusal) {
             return Err(refused);
         }
         let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
@@ -3602,7 +3698,12 @@ impl MandatoryThread {
             .stack_size(stack.bytes())
             .spawn(move || {
                 let _charge = charge;
-                let _ = enter_ioc_thread(priority);
+                match priority {
+                    Some(priority) => {
+                        let _ = enter_ioc_thread(priority);
+                    }
+                    None => enter_process_thread(),
+                }
                 drop(started);
                 f()
             })?;
@@ -3657,7 +3758,7 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
 /// the knob's default is not a weaker exit, it is an unsound one, and the
 /// deviation is in the exit rather than in the invariant.
 fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
-    eprintln!("{}", mandatory_thread_failure_message(name, err));
+    crate::stderr_println!("{}", mandatory_thread_failure_message(name, err));
     std::process::abort()
 }
 
@@ -5349,14 +5450,19 @@ mod tests {
                 .0
         };
         let prologue = body_of("pub fn enter_ioc_thread(");
+        // Both prologues, banded and not, share one preparation.
+        for entry in [prologue, body_of("fn enter_process_thread(")] {
+            assert!(entry.contains("prepare_current_thread();"), "{entry}");
+        }
+        let prepare = body_of("fn prepare_current_thread(");
         assert!(
-            prologue.contains("#[cfg(target_os = \"vxworks\")]"),
+            prepare.contains("#[cfg(target_os = \"vxworks\")]"),
             "the census registration must stay gated to the one OS whose \
              backend needs it; `epics-rtems-boot` is a dependency of this \
              package on that target only"
         );
         assert!(
-            prologue.contains("epics_rtems_boot::stats::register_task();"),
+            prepare.contains("epics_rtems_boot::stats::register_task();"),
             "VxWorks gives an RTP no task enumerator, so `dump_tasks` and \
              `stack_report` list exactly what announced itself here"
         );
@@ -5441,63 +5547,90 @@ mod tests {
         );
     }
 
-    /// C's `once()` row, all four of its boundaries in one test because they
-    /// share one process-wide guard: `pthread_once` fires for the first caller
-    /// only, so a second test calling [`register_main_thread`] would be
-    /// asserting against the first test's row rather than its own.
-    ///
-    /// Run on a bare `std::thread::spawn` because that is the shape the shell
-    /// threads have — no `Builder::name`, so `std::thread::current().name()`
-    /// is `None` and the row's name can only come from this call.
+    /// C's `_main_`: every job runs on one thread, which is listed once, at
+    /// C's priority 0 — across jobs and past a job that panics — until a job
+    /// cannot proceed. That thread stays listed, suspended, and the next job
+    /// starts a `_main_` of its own. One test because the thread is
+    /// process-wide.
     #[test]
-    fn the_main_row_is_cs_once_row() {
+    fn main_jobs_share_one_main_row() {
         let main_rows = || {
             thread_report()
                 .into_iter()
                 .filter(|t| t.name() == "_main_")
-                .count()
+                .collect::<Vec<_>>()
         };
-        assert_eq!(main_rows(), 0, "nothing registers `_main_` on its own");
+        assert!(main_rows().is_empty(), "nothing lists `_main_` on its own");
 
-        let before = sched_calls_made();
-        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
-        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            register_main_thread();
-            registered_tx.send(thread_name_self()).unwrap();
-            finish_rx.recv().unwrap();
-            // C's guard is per process, not per thread: the second call adds
-            // nothing.
-            register_main_thread();
-            registered_tx.send(thread_name_self()).unwrap();
-            finish_rx.recv().unwrap();
-        });
-
+        let probe = || {
+            run_on_main_thread(|| (thread_name_self(), thread_registry::os_thread_id()))
+                .unwrap()
+                .blocking_recv()
+                .unwrap()
+        };
+        let (name, first) = probe();
+        assert_eq!(name, "_main_");
+        let rows = main_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(
-            registered_rx.recv().unwrap(),
-            "_main_",
-            "an unnamed shell thread's every name query answers its row"
-        );
-        let row = thread_by_name("_main_").expect("listed while the shell runs");
-        assert_eq!(row.epics_priority(), 0, "C's `_main_` is EPICS priority 0");
-        assert_eq!(
-            sched_calls_made(),
-            before,
-            "registering `_main_` must ask the scheduler for nothing"
-        );
-        assert_eq!(main_rows(), 1);
-
-        finish_tx.send(()).unwrap();
-        registered_rx.recv().unwrap();
-        assert_eq!(main_rows(), 1, "one process, one `_main_`");
-
-        finish_tx.send(()).unwrap();
-        join.join().unwrap();
-        assert_eq!(
-            main_rows(),
+            rows[0].epics_priority(),
             0,
-            "the row is reaped where C's thread-specific-data destructor \
-             removes it — when the thread holding it ends"
+            "C's `_main_` is EPICS priority 0"
+        );
+
+        let panicked = run_on_main_thread(|| panic!("a job that panics")).unwrap();
+        assert!(panicked.blocking_recv().is_err(), "its result is dropped");
+        let (_, after) = probe();
+        assert_eq!(after, first, "every job, before and after, on one thread");
+        assert_eq!(main_rows().len(), 1, "and one row for it");
+
+        let (began_tx, began_rx) = std::sync::mpsc::channel();
+        drop(
+            run_on_main_thread(move || {
+                let park = ForeverPark::begin();
+                began_tx.send(()).unwrap();
+                park.park()
+            })
+            .unwrap(),
+        );
+        began_rx.recv().unwrap();
+        let (name, fresh) = probe();
+        assert_eq!(name, "_main_");
+        assert_ne!(fresh, first, "a fresh _main_ took the job after the park");
+        let rows = main_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            (0..500).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                main_rows()
+                    .iter()
+                    .any(|row| row.os_id() == first && row.is_suspended())
+            }),
+            "{rows:?}"
+        );
+    }
+
+    /// The `_main_` thread is created at `Iocsh` on RTEMS, the band
+    /// `posix/rtems_init.c:1002` gives it, and with no band elsewhere. Source
+    /// inspection, because the RTEMS arm does not build here.
+    #[test]
+    fn the_main_thread_takes_the_iocsh_band_on_rtems_only() {
+        let src = include_str!("task.rs");
+        let start = src
+            .find("    fn start() -> std::io::Result<Sender<Job>> {")
+            .unwrap();
+        let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
+        let rtems = body
+            .split_once("#[cfg(target_os = \"rtems\")]")
+            .and_then(|(_, after)| after.split_once("#[cfg(not(target_os = \"rtems\"))]"))
+            .unwrap_or_else(|| panic!("{body}"));
+        assert!(rtems.0.contains("super::ThreadPriority::Iocsh,"), "{body}");
+        assert!(
+            rtems
+                .1
+                .trim_start()
+                .starts_with("let thread = MandatoryThread::process_thread("),
+            "{body}"
         );
     }
 

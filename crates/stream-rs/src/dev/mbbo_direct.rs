@@ -1,6 +1,7 @@
 //! `devmbboDirectStream.c`: the StreamDevice interface for mbboDirect
 //! records.
 
+use epics_base_rs::server::database::HeldInstance;
 use epics_base_rs::server::recgbl::{EventMask, rec_gbl_reset_alarms};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, DbLinkType, DevSup, Dset, Record,
@@ -164,16 +165,13 @@ impl StreamRecordType for MbboDirect {
 
     /// `write_mbbo`: the bug also corrupts the next write to VAL after an
     /// I/O error, so the record is never left in INVALID_ALARM.
-    fn read_write(
-        &self,
-        stream: &Stream,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
-    ) -> i64 {
-        let status = stream.read_write(record, common);
-        if common.nsev == AlarmSeverity::Invalid {
-            common.nsev = AlarmSeverity::Major;
-        }
+    fn read_write(&self, stream: &Stream, held: &HeldInstance<'_>) -> i64 {
+        let status = stream.read_write(held);
+        held.with(|_, common| {
+            if common.nsev == AlarmSeverity::Invalid {
+                common.nsev = AlarmSeverity::Major;
+            }
+        });
         status
     }
 }

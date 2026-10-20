@@ -5,7 +5,7 @@
 //! `realtime-ca-ioc` installed its CA link set after the build, so its PINI
 //! pass found none.
 
-use epics_base_rs::server::database::LinkSet;
+use epics_base_rs::server::database::{LinkRef, LinkSet};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use std::collections::HashMap;
@@ -15,14 +15,15 @@ struct RemoteLset;
 
 #[epics_base_rs::async_trait]
 impl LinkSet for RemoteLset {
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         true
     }
-    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         (name == b"REMOTE:PV").then_some(EpicsValue::Double(7.0))
     }
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-        self.get_cached_value(name)
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        self.get_cached_value(link)
     }
 }
 

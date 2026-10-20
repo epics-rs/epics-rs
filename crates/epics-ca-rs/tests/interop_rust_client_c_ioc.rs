@@ -11,6 +11,7 @@
 //! build whose listeners are tokio's, not from anything the C `softIoc` side
 //! does.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "client-core")]
 
 // RTEMS-EXEC-MODEL-ALLOW(9): measured, not argued — every case here is

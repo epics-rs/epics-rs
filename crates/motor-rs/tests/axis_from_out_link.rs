@@ -17,7 +17,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::builder::{AxisSetup, MotorBuilder};
-use motor_rs::device_state::{AxisSubscribers, StampedStatus};
+use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::MotorAxis;
 use motor_rs::devices::{
     device_support_factory, devices, model1_device, motor_interface_device, register_axis,
@@ -32,6 +32,15 @@ static SIM: DevSup = motor_interface_device("devTestSim", "TestSim");
 
 /// A model-2 port with no axis open: a record on it never reaches a write.
 fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandle {
+    asyn_port(name, num_axes, asyn_rs::port::InterfaceMask::UNMIGRATED_ALL)
+}
+
+/// A bare asyn port with `interfaces` and no parameters, in asynManager.
+fn asyn_port(
+    name: &str,
+    num_axes: usize,
+    interfaces: asyn_rs::port::InterfaceMask,
+) -> asyn_rs::port_handle::PortHandle {
     use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 
     struct Axisless(PortDriverBase);
@@ -48,7 +57,7 @@ fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandl
         name,
         num_axes,
         PortFlags::default(),
-        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        interfaces,
         asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
     ));
     let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
@@ -57,7 +66,9 @@ fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandl
         asyn_rs::runtime::config::RuntimeConfig::default(),
     )
     .unwrap();
-    runtime.port_handle().clone()
+    let handle = runtime.port_handle().clone();
+    claim.publish(handle.clone(), &open_owner()).unwrap();
+    handle
 }
 
 fn sim(card: i32, signal: i32) -> TraceUser {
@@ -73,13 +84,10 @@ fn sim(card: i32, signal: i32) -> TraceUser {
 /// `init_record` only reads that cache.
 fn axis(user: TraceUser, position: f64) {
     let subscribers = AxisSubscribers::new();
-    subscribers.store(StampedStatus {
-        seq: 1,
-        status: MotorStatus {
-            position,
-            done: true,
-            ..MotorStatus::default()
-        },
+    subscribers.store(MotorStatus {
+        position,
+        done: true,
+        ..MotorStatus::default()
     });
     register_axis(unpolled(user, subscribers)).unwrap();
 }
@@ -256,13 +264,10 @@ async fn a_motor_interface_record_opens_its_axis_at_init() {
             signal,
         };
         let subscribers = AxisSubscribers::new();
-        subscribers.store(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                position: 70.0,
-                done: true,
-                ..MotorStatus::default()
-            },
+        subscribers.store(MotorStatus {
+            position: 70.0,
+            done: true,
+            ..MotorStatus::default()
         });
         register_axis(unpolled(user, subscribers)).is_ok()
     });
@@ -317,28 +322,55 @@ record(motor, "I:m2") { field(DTYP, "TestSim") field(OUT, "@asyn(X,0)") }
     }
 }
 
-/// devMotorAsyn.c:285-291 then `bad:` — the record loads, prints on the
-/// unconnected user's (global) trace, and is left with PACT set.
-#[tokio::test]
-async fn an_asyn_record_whose_port_was_never_created_loads_and_dies_at_init() {
-    let path = std::env::temp_dir().join(format!("motor-noport-{}", std::process::id()));
+/// The text an unconnected asynUser prints on the global trace while `fut`
+/// runs, each line without its timestamp.
+async fn global_trace_of<T>(
+    tag: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
+    let path = std::env::temp_dir().join(format!("motor-{tag}-{}", std::process::id()));
     let file = std::fs::File::create(&path).unwrap();
     PortManager::global()
         .trace_manager()
         .set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
-    let db = boot(
-        r##"
-record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED,0)") }
-"##,
-    )
-    .await;
+    let out = fut.await;
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    assert!(
-        text.lines()
-            .any(|l| l
-                .ends_with("devMotorAsyn::init_record, C:m connectDevice failed to NEVER_CREATED")),
-        "{text:?}"
+    let tails = text
+        .lines()
+        .map(|l| l.splitn(3, ' ').nth(2).unwrap().to_owned())
+        .collect();
+    (out, tails)
+}
+
+/// motorRecord's init_record still sends both dial limits after `bad:`
+/// (motorRecord.cc:717-718), and a user with no port cannot queue them.
+fn unqueued(name: &str) -> String {
+    format!(
+        "devMotorAsyn::build_trans: {name} error calling queueRequest, asynManager::queueRequest asynUser not associated with a port"
+    )
+}
+
+/// devMotorAsyn.c:285-291 then `bad:` — the record loads, prints on the
+/// unconnected user's (global) trace, and is left with PACT set.
+#[tokio::test]
+async fn an_asyn_record_whose_port_was_never_created_loads_and_dies_at_init() {
+    let (db, trace) = global_trace_of(
+        "noport",
+        boot(
+            r##"
+record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED,0)") }
+"##,
+        ),
+    )
+    .await;
+    assert_eq!(
+        trace,
+        [
+            "devMotorAsyn::init_record, C:m connectDevice failed to NEVER_CREATED".to_owned(),
+            unqueued("C:m"),
+            unqueued("C:m"),
+        ]
     );
     assert_eq!(field(&db, "C:m.PACT"), EpicsValue::Char(1));
 }
@@ -347,17 +379,21 @@ record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED,
 /// the errlog with its `errorMessage`.
 #[tokio::test]
 async fn an_asyn_record_with_a_bad_link_says_so_and_dies_at_init() {
-    let (db, lines) = errlog_of(boot(
-        r##"
+    let ((db, lines), trace) = global_trace_of(
+        "badlink",
+        errlog_of(boot(
+            r##"
 record(motor, "D:m") { field(DTYP, "asynMotor") field(OUT, "@NEVER_CREATED") }
 "##,
-    ))
+        )),
+    )
     .await;
     assert!(
         lines.iter().any(|l| l
             == "devMotorAsyn::init_record D:m bad link invalid INST_IO Must be asyn(<port> <addr> <timeout>)userParams"),
         "{lines:?}"
     );
+    assert_eq!(trace, [unqueued("D:m"), unqueued("D:m")]);
     assert_eq!(field(&db, "D:m.PACT"), EpicsValue::Char(1));
 }
 
@@ -595,6 +631,47 @@ record(motor, "I:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(SHORT,2)") }
     // reset (motorRecord.cc:747).
     assert_eq!(field(&db, "I:m.STAT"), EpicsValue::Short(0));
     assert_eq!(field(&db, "I:m.SEVR"), EpicsValue::Short(0));
+}
+
+/// devMotorAsyn.c:293-337: connectDevice reaches any asyn port, so a record
+/// on one with no motor axes runs init_record on to the first interface or
+/// motor drvInfo the port lacks, and takes `bad:` there.
+#[tokio::test]
+async fn an_asyn_record_on_a_port_with_no_motor_axes_dies_where_c_s_init_stops() {
+    use asyn_rs::port::InterfaceMask;
+    let tails = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.splitn(3, ' ').nth(2).unwrap().to_owned())
+            .collect()
+    };
+    asyn_port("NOTMOTOR", 1, InterfaceMask::UNMIGRATED_ALL);
+    asyn_port(
+        "OCTETONLY",
+        1,
+        InterfaceMask::COMMON.or(InterfaceMask::OCTET),
+    );
+    let (not_motor, octet) = (Capture::of("NOTMOTOR"), Capture::of("OCTETONLY"));
+    let db = boot(
+        r##"
+record(motor, "J:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NOTMOTOR,0)") }
+record(motor, "K:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(OCTETONLY,0)") }
+"##,
+    )
+    .await;
+    assert_eq!(
+        tails(not_motor.lines()),
+        [
+            "asynPortDriver:drvUserCreate: addr=0, cannot find parameter MOTOR_MOVE_REL",
+            "devMotorAsyn::findDrvInfo, J:m drvUserCreate failed for MOTOR_MOVE_REL",
+        ]
+    );
+    assert_eq!(
+        tails(octet.lines()),
+        ["devMotorAsyn::init_record, K:m find int32 interface failed"]
+    );
+    assert_eq!(field(&db, "J:m.PACT"), EpicsValue::Char(1));
+    assert_eq!(field(&db, "K:m.PACT"), EpicsValue::Char(1));
 }
 
 /// drvMotorAsyn.c:762-775: a model-2 port has no address check in
@@ -954,13 +1031,10 @@ record(motor, "E:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(EARLY,0)") fie
 async fn a_record_in_comm_alarm_sends_no_command() {
     register_controller_port(&open_owner(), "COMM", 1, ()).unwrap();
     let subscribers = AxisSubscribers::new();
-    subscribers.store(StampedStatus {
-        seq: 1,
-        status: MotorStatus {
-            done: true,
-            comms_error: true,
-            ..MotorStatus::default()
-        },
+    subscribers.store(MotorStatus {
+        done: true,
+        comms_error: true,
+        ..MotorStatus::default()
     });
     let (poll_tx, _poll_rx) = mpsc::channel(16);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -1001,13 +1075,10 @@ record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(COMM,0)") fiel
 #[tokio::test]
 async fn a_model1_record_in_comm_alarm_still_sends_its_move() {
     let subscribers = AxisSubscribers::new();
-    subscribers.store(StampedStatus {
-        seq: 1,
-        status: MotorStatus {
-            done: true,
-            comms_error: true,
-            ..MotorStatus::default()
-        },
+    subscribers.store(MotorStatus {
+        done: true,
+        comms_error: true,
+        ..MotorStatus::default()
     });
     let (poll_tx, _poll_rx) = mpsc::channel(16);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -1061,13 +1132,10 @@ async fn a_move_start_pass_commits_and_resets_the_alarm() {
     for port in ["MVAL0", "MVAL1"] {
         register_controller_port(&open_owner(), port, 1, ()).unwrap();
         let subscribers = AxisSubscribers::new();
-        subscribers.store(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                done: true,
-                comms_error: true,
-                ..MotorStatus::default()
-            },
+        subscribers.store(MotorStatus {
+            done: true,
+            comms_error: true,
+            ..MotorStatus::default()
         });
         let (poll_tx, _poll_rx) = mpsc::channel(16);
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();

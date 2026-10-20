@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkHolder, LinkOpen, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkHolder, LinkOpen, LinkPutOp, LinkRef, LinkSet, PvDatabase,
+};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -22,7 +24,8 @@ struct Opens {
 
 #[async_trait::async_trait]
 impl LinkSet for Opens {
-    fn open_link(&self, _: LinkHolder<'_>, name: &[u8]) -> LinkOpen {
+    fn open_link(&self, _: LinkHolder<'_>, link: LinkRef<'_>) -> LinkOpen {
+        let name = link.name;
         self.opened
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());
@@ -32,19 +35,19 @@ impl LinkSet for Opens {
             LinkOpen::Lset
         }
     }
-    fn is_connected(&self, _: &[u8]) -> bool {
+    fn is_connected(&self, _: LinkRef<'_>) -> bool {
         self.calls.fetch_add(1, Ordering::Relaxed);
         false
     }
-    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         None
     }
-    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         None
     }
-    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: LinkRef<'_>, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Err("down".into())
     }
@@ -138,4 +141,31 @@ async fn a_put_opened_without_an_lset_reads_as_constant() {
         0,
         "the lset was reached"
     );
+}
+
+/// FLNK is no device link: once a put left it with no lset, the next put
+/// fails `dbLinkIsDefined` with `S_db_badHWaddr` before `dbAddLink`
+/// (`dbAccess.c:1168-1174`), clearing it included, and the field keeps its
+/// text. FLNK lives in the `dbCommon` cache, not a link slot.
+#[epics_macros_rs::epics_test]
+async fn a_forward_link_left_with_no_lset_refuses_the_next_put() {
+    let lset = Arc::new(Opens::default());
+    let db = ioc(lset.clone()).await;
+    let nope = r#"{pva:{pv:"OL:NOPE", local:true}}"#;
+    db.put_record_field_from_ca_no_notify("OL:FL", "FLNK", EpicsValue::String(nope.into()))
+        .await
+        .unwrap();
+    let opens = lset.opened.lock().len();
+    for text in [r#"{pva:"OL:Q"}"#, ""] {
+        let put = db
+            .put_record_field_from_ca_no_notify("OL:FL", "FLNK", EpicsValue::String(text.into()))
+            .await;
+        assert!(put.is_err(), "{text:?}: {put:?}");
+        assert_eq!(
+            db.get_pv("OL:FL.FLNK").unwrap(),
+            EpicsValue::String(nope.into()),
+            "{text:?}"
+        );
+    }
+    assert_eq!(lset.opened.lock().len(), opens, "a refused put opened");
 }

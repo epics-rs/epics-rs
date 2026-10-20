@@ -20,6 +20,7 @@ fn entry(name: &str, value: &str, connected: bool) -> SaveEntry {
         pv_name: name.into(),
         value: value.into(),
         connected,
+        array_fprintfs: Vec::new(),
     }
 }
 

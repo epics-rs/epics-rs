@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 
+use crate::cfmt::CFloat;
 use crate::runtime::sync::{CMutex, PriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
@@ -517,14 +518,14 @@ impl Taskwd {
         for task in tasks.iter() {
             let check_in = match task.check_in {
                 CheckIn::Unbounded => "unbounded".to_string(),
-                CheckIn::Every(d) => format!("{:.1}s", d.as_secs_f64()),
+                CheckIn::Every(d) => format!("{:.1}s", CFloat(d.as_secs_f64())),
             };
             out(&format!(
                 "{:width$} {:>9} {:>12} {:>11.1}s {:>8}",
                 task.info.name,
                 if task.suspended { "Suspended" } else { "Ok" },
                 check_in,
-                now.saturating_duration_since(task.last_move).as_secs_f64(),
+                CFloat(now.saturating_duration_since(task.last_move).as_secs_f64()),
                 if task.callback.is_some() { "yes" } else { "-" }
             ));
         }

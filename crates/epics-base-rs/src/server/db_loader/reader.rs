@@ -10,6 +10,7 @@
 //! holds the rest of the line when the file is pushed.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -313,19 +314,10 @@ impl Feed {
         }
         // Bytes, not text: C `fgets` hands its lexer whatever the file
         // holds, and `dbLoadRecords` loads a record whose name is not UTF-8.
-        let content = match std::fs::read(&identity) {
-            Ok(content) => content,
-            // C `fopen`s a directory and its first `fgets` fails, which
-            // `db_yyinput` takes for the end of an empty file.
-            Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => Vec::new(),
-            Err(e) => {
-                return Err(CaError::DbParseError {
-                    line: 0,
-                    token: String::new(),
-                    message: format!("cannot read '{named}': {e}"),
-                });
-            }
-        };
+        // A failed read is `db_yyinput`'s end of file, as a directory's
+        // first `fgets` is.
+        let mut content = Vec::new();
+        let _ = (&opened.file).read_to_end(&mut content);
         self.files.push(InputFile {
             identity: Some(identity),
             frame: DbIncludeFrame {

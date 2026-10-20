@@ -12,6 +12,7 @@ ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "dep:epics-pva-rs", "dep:epics-br
 ad-core-rs = { workspace = true }
 ad-plugins-rs = { workspace = true, optional = true }
 asyn-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 motor-rs = { workspace = true, optional = true }
 optics-rs = { workspace = true, optional = true }
 rand = "0.9"

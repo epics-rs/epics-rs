@@ -236,12 +236,15 @@ impl PvaLinkRegistry {
     }
 
     /// Undo one [`Self::attach_record`]: pvxs `~pvaLink` erasing itself
-    /// from `pvaLinkChannel::links` (`pvxs/ioc/pvalink_link.cpp:27-35`).
-    pub fn detach_record(&self, config: &PvaLinkConfig, record: &[u8]) {
+    /// from `pvaLinkChannel::links` (`pvxs/ioc/pvalink_link.cpp:27-35`). The
+    /// last record leaving closes the channel, as `~pvaLinkChannel` erases
+    /// it from `linkGlobal->channels` (`pvxs/ioc/pvalink_channel.cpp:95-99`);
+    /// `true` then.
+    pub fn detach_record(&self, config: &PvaLinkConfig, record: &[u8]) -> bool {
         let mut channels = self.channel_records.write();
         let key = key_of(config);
         let Some(records) = channels.get_mut(&key) else {
-            return;
+            return false;
         };
         let record = RecordName::from(record);
         if let Some(n) = records.get_mut(&record) {
@@ -250,9 +253,12 @@ impl PvaLinkRegistry {
                 records.remove(&record);
             }
         }
-        if records.is_empty() {
-            channels.remove(&key);
+        if !records.is_empty() {
+            return false;
         }
+        channels.remove(&key);
+        self.map.write().remove(&key);
+        true
     }
 
     /// Exact lookup for the full config's `RegistryKey`. Returns

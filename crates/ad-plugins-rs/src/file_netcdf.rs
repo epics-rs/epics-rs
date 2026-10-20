@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttributeList};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{FileAttributes, NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{FileAttributes, NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
 
@@ -46,11 +46,7 @@ const DIM_WITHOUT_VARIABLE: &str = "This is a netCDF dimension but not a netCDF 
 /// `MAX_ATTRIBUTE_STRING_SIZE` (netCDF-3 spelled the same limit as the
 /// `attrStringSize` dimension).
 const ATTR_STRING_SIZE: usize = 256;
-/// Records the exact `NDDataType` ordinal on `array_data`, so read-back does
-/// not have to infer the type from the HDF5 element width. netCDF-4 has the
-/// full signed/unsigned set, so this only disambiguates what the file already
-/// says; the root-level `dataType` global attribute carries the same value for
-/// netCDF readers, which have no per-variable place to look.
+/// C's global attribute holding the `NDDataType` ordinal (NDFileNetCDF.cpp:92).
 const DTYPE_ATTR: &str = "dataType";
 
 /// A fixed-length, null-terminated ASCII string of `N` bytes — libhdf5's
@@ -378,12 +374,6 @@ impl OpenFile {
             NDDataType::Float64 => create_record_var::<f64>,
         };
         let array_data = create(&file, VAR_NAME, &record_dims, multiple)?;
-        array_data
-            .new_attr::<i32>()
-            .shape(())
-            .create(DTYPE_ATTR)
-            .and_then(|a| a.write_numeric(&(data_type as i32)))
-            .map_err(map_h5)?;
         array_data.attach_scale(0, &frame_scale).map_err(map_h5)?;
         for (axis, scale) in dim_scales.iter().enumerate() {
             array_data.attach_scale(axis + 1, scale).map_err(map_h5)?;
@@ -461,18 +451,17 @@ impl OpenFile {
 }
 
 impl NDFileWriter for NetcdfWriter {
-    fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
+        // NDFileNetCDF.cpp:64-67
+        mode.refuse_read_or_append("NDFileNetCDF")?;
         self.open = None;
         self.current_path = Some(path.to_path_buf());
         // C `openFile` clears `pFileAttributes`, gets the plugin's set and
         // copies this frame's list on top (NDFileNetCDF.cpp:72-77).
         self.file_attributes.open(&self.plugin_attributes, array);
-        // C: NDPluginFile opens Single with `NDFileModeWrite` and Capture/Stream
-        // with `NDFileModeWrite | NDFileModeMultiple` (NDPluginFile.cpp:245, :281,
-        // :335) — this writer reports supportsMultipleArrays, so those two modes
-        // always carry the Multiple bit, which alone makes numArrays unlimited
+        // The Multiple bit alone makes numArrays unlimited
         // (NDFileNetCDF.cpp:117-119) however many frames the file ends with.
-        let multiple = mode != NDFileMode::Single;
+        let multiple = mode.contains(NDFileOpenMode::MULTIPLE);
         self.open = Some(OpenFile::define(
             path,
             multiple,
@@ -509,72 +498,11 @@ impl NDFileWriter for NetcdfWriter {
         open.file.close().map_err(map_h5)
     }
 
+    /// C `readFile` returns asynError (NDFileNetCDF.cpp:491-496).
     fn read_file(&mut self) -> ADResult<NDArray> {
-        let path = self
-            .current_path
-            .as_ref()
-            .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let file = H5File::open(path)
-            .map_err(|e| ADError::UnsupportedConversion(format!("netCDF-4 open error: {e}")))?;
-        let ds = file.dataset(VAR_NAME).map_err(|e| {
-            ADError::UnsupportedConversion(format!("dataset '{VAR_NAME}' not found: {e}"))
-        })?;
-
-        // `array_data` is `[frames, dim[n-1], … dim[0]]`: drop the frame axis
-        // and undo the reversal to get NDArray dimension order back.
-        let shape = ds.shape();
-        if shape.is_empty() {
-            return Err(ADError::UnsupportedConversion(format!(
-                "'{VAR_NAME}' has no frame axis"
-            )));
-        }
-        let dims: Vec<NDDimension> = shape[1..]
-            .iter()
-            .rev()
-            .map(|&s| NDDimension::new(s))
-            .collect();
-
-        let data_type = ds
-            .attr(DTYPE_ATTR)
-            .ok()
-            .and_then(|a| a.read_numeric::<i32>().ok())
-            .and_then(|v| NDDataType::from_ordinal(v as u8))
-            .ok_or_else(|| {
-                ADError::UnsupportedConversion(format!(
-                    "'{VAR_NAME}' carries no {DTYPE_ATTR} attribute"
-                ))
-            })?;
-
-        // The first frame only, as the netCDF-3 reader returned record 0.
-        let mut starts = vec![0usize; shape.len()];
-        starts[0] = 0;
-        let mut counts = shape.clone();
-        counts[0] = 1;
-
-        macro_rules! read_typed {
-            ($t:ty, $variant:ident) => {{
-                let data = ds.read_slice::<$t>(&starts, &counts).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("netCDF-4 read error: {e}"))
-                })?;
-                let mut arr = NDArray::new(dims, data_type);
-                arr.data = NDDataBuffer::$variant(data);
-                Ok(arr)
-            }};
-        }
-
-        match data_type {
-            NDDataType::Int8 => read_typed!(i8, I8),
-            NDDataType::UInt8 => read_typed!(u8, U8),
-            NDDataType::Int16 => read_typed!(i16, I16),
-            NDDataType::UInt16 => read_typed!(u16, U16),
-            NDDataType::Int32 => read_typed!(i32, I32),
-            NDDataType::UInt32 => read_typed!(u32, U32),
-            NDDataType::Int64 => read_typed!(i64, I64),
-            NDDataType::UInt64 => read_typed!(u64, U64),
-            NDDataType::Float32 => read_typed!(f32, F32),
-            NDDataType::Float64 => read_typed!(f64, F64),
-        }
+        Err(ADError::UnsupportedConversion(
+            "NDFileNetCDF cannot read".into(),
+        ))
     }
 
     fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
@@ -679,7 +607,8 @@ impl NDPluginProcess for NetcdfFileProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-    use ad_core_rs::plugin::file_base::NDPluginFileBase;
+    use ad_core_rs::ndarray::NDDimension;
+    use ad_core_rs::plugin::file_base::{NDFileMode, NDPluginFileBase};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -692,6 +621,28 @@ mod tests {
             prefix,
             n
         ))
+    }
+
+    /// C `openFile` refuses NDFileModeRead (NDFileNetCDF.cpp:64), so ReadFile
+    /// fails at the open.
+    #[test]
+    fn read_file_is_refused_at_the_open() {
+        let path = temp_path("nc_read_refused");
+        let mut writer = NetcdfWriter::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE, &arr)
+            .unwrap();
+        writer.write_file(&Arc::new(arr)).unwrap();
+        writer.close_file().unwrap();
+        let mut proc = NetcdfFileProcessor::new();
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
+        std::fs::remove_file(&path).ok();
     }
 
     fn make_u8(dims: &[usize], fill: impl Fn(usize) -> u8) -> NDArray {
@@ -712,7 +663,9 @@ mod tests {
     fn write_frames(prefix: &str, mode: NDFileMode, frames: &[NDArray]) -> PathBuf {
         let path = temp_path(prefix);
         let mut writer = NetcdfWriter::new();
-        writer.open_file(&path, mode, &frames[0]).unwrap();
+        writer
+            .open_file(&path, crate::test_util::opened(mode), &frames[0])
+            .unwrap();
         for f in frames {
             writer.write_file(&Arc::new(f.clone())).unwrap();
         }
@@ -720,10 +673,20 @@ mod tests {
         path
     }
 
+    /// Record 0 of `array_data` (`[frames, dim[n-1], … dim[0]]`), in NDArray
+    /// dimension order.
     fn read_back(path: &Path) -> NDArray {
-        let mut writer = NetcdfWriter::new();
-        writer.current_path = Some(path.to_path_buf());
-        writer.read_file().unwrap()
+        let file = H5File::open(path).unwrap();
+        let ds = file.dataset(VAR_NAME).unwrap();
+        let dims = ds.shape()[1..]
+            .iter()
+            .rev()
+            .map(|&s| NDDimension::new(s))
+            .collect();
+        let data = crate::test_util::read_native(&ds, Some(1));
+        let mut arr = NDArray::new(dims, data.data_type());
+        arr.data = data;
+        arr
     }
 
     /// C creates the file in `openFile` (NDFileNetCDF.cpp:84-85), so a path
@@ -737,7 +700,11 @@ mod tests {
         let mut writer = NetcdfWriter::new();
 
         let arr = make_u8(&[4, 4], |_| 0);
-        assert!(writer.open_file(&path, NDFileMode::Single, &arr).is_err());
+        assert!(
+            writer
+                .open_file(&path, NDFileOpenMode::WRITE, &arr)
+                .is_err()
+        );
         assert!(writer.open.is_none());
         assert!(writer.write_file(&Arc::new(arr)).is_err());
     }
@@ -749,7 +716,13 @@ mod tests {
         let path = temp_path("nc_arc");
         let mut writer = NetcdfWriter::new();
         let arr = Arc::new(make_u8(&[4, 4], |_| 0));
-        writer.open_file(&path, NDFileMode::Capture, &arr).unwrap();
+        writer
+            .open_file(
+                &path,
+                NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                &arr,
+            )
+            .unwrap();
         writer.write_file(&arr).unwrap();
         assert_eq!(Arc::strong_count(&arr), 1);
         assert_eq!(writer.open.as_ref().unwrap().records, 1);
@@ -1119,6 +1092,21 @@ mod tests {
             vec![4, 3],
             "read_file must undo the reversal"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C puts `dataType` on the file only (NDFileNetCDF.cpp:92), not on
+    /// `array_data`.
+    #[test]
+    fn array_data_carries_no_data_type_attribute() {
+        let path = write_frames(
+            "nc_no_dtype",
+            NDFileMode::Single,
+            &[make_u8(&[4, 3], |_| 0)],
+        );
+        let file = H5File::open(&path).unwrap();
+        let names = file.dataset(VAR_NAME).unwrap().attr_names().unwrap();
+        assert!(!names.iter().any(|n| n == "dataType"), "{names:?}");
         std::fs::remove_file(&path).ok();
     }
 

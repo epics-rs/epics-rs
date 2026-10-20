@@ -81,11 +81,11 @@ impl<'a> RecordWriter<'a> {
 ///
 /// The single owner of the generate-then-load step for this crate. Both
 /// `mqttZ2mXxx` and `mqttDriverConfigure` build `.db` text from `st.cmd`
-/// arguments, and both must answer a failure the same way: print it, keep
-/// going so the remaining records still land, and end in `Err` so `on error`
-/// in `st.cmd` fires instead of the IOC booting while `dbl` lists nothing
-/// (epics-base#498 / UI-105). `what` prefixes the messages with the iocsh
-/// command the operator typed.
+/// arguments, and both must answer a failure the same way: keep going so the
+/// remaining records still land, and end in an `Err` holding every message,
+/// which the shell prints, so `on error` in `st.cmd` fires instead of the IOC
+/// booting while `dbl` lists nothing (epics-base#498 / UI-105). `what`
+/// prefixes the messages with the iocsh command the operator typed.
 pub(crate) fn load_generated_db(
     what: &str,
     db_string: &str,
@@ -102,9 +102,7 @@ pub(crate) fn load_generated_db(
                 if let Err(e) =
                     db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                 {
-                    let msg = format!("{what}: apply_fields for {}: {e}", def.name);
-                    eprintln!("{msg}");
-                    deferred.push(msg);
+                    deferred.push(format!("{what}: apply_fields for {}: {e}", def.name));
                     continue;
                 }
                 // Record + loaded common fields in one call: the creation sink
@@ -114,23 +112,19 @@ pub(crate) fn load_generated_db(
                 let load = RecordLoad::from_common_fields(common_fields);
                 ctx.block_on(async {
                     if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
-                        let msg = format!("{what}: register '{}' skipped: {e}", def.name);
-                        eprintln!("{msg}");
-                        deferred.push(msg);
+                        deferred.push(format!("{what}: register '{}' skipped: {e}", def.name));
                     }
                 });
             }
             Err(e) => {
-                let msg = format!("{what}: create_record({}): {e}", def.record_type);
-                eprintln!("{msg}");
-                deferred.push(msg);
+                deferred.push(format!("{what}: create_record({}): {e}", def.record_type));
             }
         }
     }
-    match deferred.len() {
-        0 => Ok(()),
-        1 => Err(deferred.remove(0)),
-        n => Err(format!("{} (+{} more)", deferred[0], n - 1)),
+    if deferred.is_empty() {
+        Ok(())
+    } else {
+        Err(deferred.join("\n"))
     }
 }
 
@@ -183,7 +177,7 @@ mod tests {
         w.end();
         load_generated_db("mqttDriverConfigure", &good, &ctx).unwrap();
         assert_eq!(
-            ctx.block_on(async { ctx.db().all_record_names().await }),
+            ctx.db().all_record_names(),
             vec!["TEST:MQTT:Conn".to_string()]
         );
 
@@ -196,11 +190,7 @@ mod tests {
         let err = load_generated_db("mqttDriverConfigure", &bad, &ctx).unwrap_err();
         assert!(err.starts_with("mqttDriverConfigure:"), "{err}");
         // Nothing new landed.
-        assert_eq!(
-            ctx.block_on(async { ctx.db().all_record_names().await })
-                .len(),
-            1
-        );
+        assert_eq!(ctx.db().all_record_names().len(), 1);
     }
 
     #[test]

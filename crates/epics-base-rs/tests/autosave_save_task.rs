@@ -22,7 +22,7 @@ fn config(dir: &std::path::Path) -> SaveSetConfig {
         request_pvs: vec!["TEMP".into()],
         backup: BackupConfig { enable_savb: false },
         macros: HashMap::new(),
-        macro_string: String::new(),
+        macro_string: None,
         search_paths: Vec::new(),
     }
 }
@@ -47,9 +47,8 @@ async fn start(
         builder = builder.add_set(config(dir), m);
     }
     let mgr = Arc::new(builder.build().await);
-    let reactor = epics_base_rs::runtime::task::Reactor::current().unwrap();
     // Detached; `shutdown` ends the task.
-    drop(mgr.clone().start(&reactor, db.clone()));
+    drop(mgr.clone().start(db.clone()));
     mgr
 }
 

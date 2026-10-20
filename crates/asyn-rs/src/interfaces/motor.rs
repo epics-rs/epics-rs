@@ -143,7 +143,9 @@ pub struct MotorStatus {
     /// True if the last move has completed.
     pub done: bool,
     /// True if the motor is currently moving: the poller's pace (C
-    /// `poll(&moving)`), not a status bit.
+    /// `poll(&moving)`), not a status bit. A failed poll paces on what it
+    /// left here, as phytronAxis::poll still reports `!motorStatusDone_`
+    /// (phytronAxisMotor.cpp:1868-1869).
     pub moving: bool,
     /// MSTA bit 10 RA_MOVING, C `motorStatusMoving_`. Off by default: C
     /// starts it at 0 and only drivers that set that parameter raise it.
@@ -375,7 +377,8 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         acceleration: f64,
     ) -> AsynResult<()>;
 
-    /// Move a relative distance.
+    /// Move a relative distance. No default: a C driver's `move(relative=1)`
+    /// sends its own relative command, never a poll-then-absolute move.
     fn move_relative(
         &mut self,
         user: &AsynUser,
@@ -383,17 +386,7 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         min_velocity: f64,
         velocity: f64,
         acceleration: f64,
-    ) -> AsynResult<()> {
-        // Default: convert to absolute using current position from poll
-        let status = self.poll(user)?;
-        self.move_absolute(
-            user,
-            status.position + distance,
-            min_velocity,
-            velocity,
-            acceleration,
-        )
-    }
+    ) -> AsynResult<()>;
 
     /// Move at a constant velocity (jog).
     /// Default implementation uses move_absolute to a very large target.
@@ -515,17 +508,25 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         Ok(())
     }
 
-    /// Poll the motor for current status.
-    fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
+    /// Poll the motor into `status`: the axis's status parameters as the
+    /// poller last set them, which a C poll sets in place. What it wrote
+    /// before an `Err` stays set, as a C poll's sets before it bails, with
+    /// [`AsynMotor::poll_failure`]'s bits raised over them.
+    fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()>;
 
     /// A model-1 `set_status` with a move in motion (`nodeptr != 0`):
     /// `cdir` is the moving record's CDIR, which the C driver reads and may
     /// overwrite through `nodeptr->mrecord` (drvSC800.cc:279-282,
     /// drvOms58.cc:642-649); the record reads what is left. The motor task
     /// calls it in place of [`AsynMotor::poll`] while it holds the move.
-    fn poll_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+    fn poll_in_motion(
+        &mut self,
+        user: &AsynUser,
+        cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
         let _ = cdir;
-        self.poll(user)
+        self.poll(user, status)
     }
 
     /// Whether the model-1 device support forces the record's NTM to NO at
@@ -549,20 +550,12 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
     /// `motorStatusCommsError_`), and the bits reach the record as MSTA.
     fn poll_failure(&self) -> PollFailure;
 
-    /// After a failed poll, the status it had set before it bailed, without
-    /// [`AsynMotor::poll_failure`]'s bits: C `set_status` storing
-    /// `motor_info->status` at its exit on RETRY (drvMM3000.cc:313-334), or
-    /// an asyn poll's `setIntegerParam` calls before its error label. The
-    /// next post carries it. None leaves the last status.
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        None
-    }
-
-    /// After a failed poll, the `*moving` C's poll still reports, which
-    /// paces the poller: phytronAxis::poll's `!motorStatusDone_`
-    /// (phytronAxisMotor.cpp:1868-1869). None paces on the last status.
-    fn failed_poll_moving(&self) -> Option<bool> {
-        None
+    /// Whether the C axis constructor ends in `callParamCallbacks`, which
+    /// lowers the `statusChanged_` asynMotorAxis's constructor raised
+    /// (asynMotorAxis.cpp:29, :316-322). Raised, the first poll that calls
+    /// back posts even a status equal to the constructor's.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        false
     }
 
     /// The status fields the write method just called set, in order. The
@@ -630,6 +623,18 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
     }
 }
 
+/// A model-1 driver's axis (motordrvCom.cc), which only a motor task runs.
+pub trait Model1Motor: AsynMotor {
+    /// What the driver's `motor_init` read with `set_status`, at the point
+    /// it reads it among the axis's init queries (drvSoloist.cc:734,
+    /// drvMVP2001.cc:720). C motor_task makes no read of its own before the
+    /// records initialise: this is the axis's first status, taken once. A
+    /// failed read is what `set_status`'s failure exit stores: the status
+    /// `motor_init` prepared (EA_PRESENT, GAIN_SUPPORT) with that driver's
+    /// RETRY or COMM_ERR bits (drvMCDC2805.cc:236-251, :368-369).
+    fn take_init_status(&mut self) -> MotorStatus;
+}
+
 /// [`AsynMotor::move_to_home_task`]'s work. It applies sets on the
 /// controller port through its argument, which takes the controller lock as
 /// C's `pC_->lock(); setXxxParam(); callParamCallbacks(); pC_->unlock();`.
@@ -660,6 +665,16 @@ mod tests {
             self.0 = p;
             Ok(())
         }
+        fn move_relative(
+            &mut self,
+            _: &AsynUser,
+            _distance: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
         fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
             Ok(())
         }
@@ -669,8 +684,8 @@ mod tests {
         fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-            Ok(MotorStatus::default())
+        fn poll(&mut self, _: &AsynUser, _: &mut MotorStatus) -> AsynResult<()> {
+            Ok(())
         }
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR

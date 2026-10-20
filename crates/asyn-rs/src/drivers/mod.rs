@@ -89,6 +89,37 @@ pub(crate) fn errno_text(e: &std::io::Error) -> String {
     }
 }
 
+/// A serial transfer failure in C's words, `"<device> <op> error: <why>"` as
+/// asynError, for an OS error a read, write or flush surfaced as
+/// [`crate::error::AsynError::Io`]; a write keeps the count it moved first.
+/// `why` is the backend's: POSIX prints `strerror(errno)`
+/// (drvAsynSerialPort.c:835, :957), Win32 the `GetLastError()` number
+/// (drvAsynSerialPortWin32.c:523, :621, :677).
+pub(crate) fn transfer_failure(
+    e: crate::error::AsynError,
+    device: &str,
+    op: &str,
+    why: fn(&std::io::Error) -> String,
+) -> crate::error::AsynError {
+    use crate::error::{AsynError, AsynStatus};
+    match e {
+        AsynError::Io(err) => AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} {op} error: {}", why(&err)),
+        },
+        AsynError::PartialWrite { source, nbytes } => {
+            transfer_failure(*source, device, op, why).with_partial_write(nbytes)
+        }
+        other => other,
+    }
+}
+
+/// C-Win32's `%ld` of `GetLastError()`.
+#[cfg(any(windows, test))]
+pub(crate) fn last_error_code(e: &std::io::Error) -> String {
+    e.raw_os_error().unwrap_or(0).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +215,37 @@ mod tests {
         assert_eq!(wait_millis(Duration::from_millis(1)), 1);
         assert_eq!(wait_millis(Duration::from_micros(1500)), 1);
         assert_eq!(wait_millis(Duration::from_millis(250)), 250);
+    }
+
+    /// C-Win32 prints the bare `GetLastError()` number, `"%s read error: %ld"`
+    /// / `"%s write error: %ld"` / `"%s flush error: %ld"`
+    /// (drvAsynSerialPortWin32.c:621, :523, :677); a write keeps its count and
+    /// a timeout passes through with no text (:535, :644).
+    #[test]
+    fn a_win32_transfer_failure_is_worded_by_its_last_error_number() {
+        use crate::error::{AsynError, AsynStatus};
+        let denied = || AsynError::Io(std::io::Error::from_raw_os_error(5));
+        let e = transfer_failure(denied(), "COM1", "read", last_error_code);
+        assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "COM1 read error: 5");
+        let e = transfer_failure(
+            denied().with_partial_write(3),
+            "COM1",
+            "write",
+            last_error_code,
+        );
+        assert_eq!(e.message(), "COM1 write error: 5");
+        assert_eq!(e.partial_write(), Some(3));
+        let e = transfer_failure(denied(), "COM1", "flush", last_error_code);
+        assert_eq!(e.message(), "COM1 flush error: 5");
+        let timeout = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: String::new(),
+        }
+        .with_partial_write(2);
+        let e = transfer_failure(timeout, "COM1", "write", last_error_code);
+        assert_eq!(e.status(), AsynStatus::Timeout);
+        assert_eq!(e.message(), "");
+        assert_eq!(e.partial_write(), Some(2));
     }
 }

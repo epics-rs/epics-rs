@@ -2409,7 +2409,7 @@ mod destruction_tests {
         db.add_pv("D:pv", EpicsValue::Double(1.0))
             .await
             .expect("fresh name registers");
-        let pv = db.find_pv("D:pv").await.expect("just registered");
+        let pv = db.find_pv("D:pv").expect("just registered");
         let mut reader = pv
             .add_subscriber(7, DbFieldType::Double, u16::MAX)
             .expect("first subscriber");

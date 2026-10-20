@@ -36,10 +36,8 @@ const INFO: &str = "owner=test-source pid=4242";
 struct InfoSource;
 
 impl ChannelSource for InfoSource {
-    fn list_pvs(
-        &self,
-    ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send {
-        async { vec!["dut".into()] }
+    fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+        vec!["dut".into()]
     }
     fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let n = RecordName::from(n);
@@ -138,11 +136,8 @@ async fn default_source_leaves_report_info_none() {
     #[derive(Clone)]
     struct PlainSource;
     impl ChannelSource for PlainSource {
-        fn list_pvs(
-            &self,
-        ) -> impl std::future::Future<Output = Vec<epics_base_rs::types::RecordName>> + Send
-        {
-            async { vec!["dut".into()] }
+        fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
+            vec!["dut".into()]
         }
         fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
             let n = RecordName::from(n);

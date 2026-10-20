@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
@@ -120,8 +121,13 @@ fn put_under_hold(
             let rec = held
                 .record(names.iter().position(|n| *n == pv).unwrap())
                 .unwrap();
-            held.put_record_field_from_ca_no_notify(rec, field, EpicsValue::String(expr.into()))
-                .expect("the put is accepted");
+            held.put_record_field_from_ca_no_notify(
+                rec,
+                field,
+                EpicsValue::String(expr.into()),
+                PutSplit::DbPutField,
+            )
+            .expect("the put is accepted");
         }
         assert_eq!(heard(sink), before, "nothing is printed under the hold");
         assert_eq!(stdout.map(Stdout::so_far), printed, "nor on stdout");

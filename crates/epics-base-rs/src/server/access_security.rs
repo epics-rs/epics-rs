@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::error::{CaError, CaResult};
 use crate::server::pv::SubscribeRefused;
 
@@ -1560,7 +1562,7 @@ impl AccessSecurityConfig {
                     (false, AsgDump::Rules) => b"",
                 });
                 let value = state.value(inp.index);
-                out.extend_from_slice(format!(" value={}\n", c_percent_f(value)).as_bytes());
+                out.extend_from_slice(format!(" value={}\n", CFloat(value)).as_bytes());
             }
             for (index, rule) in asg.rules.iter().enumerate().filter(|(_, r)| !r.ignore) {
                 let access = match rule.access {
@@ -2418,18 +2420,6 @@ fn dump_groups(out: &mut Vec<u8>, kind: &[u8], groups: &HashMap<Vec<u8>, Vec<Vec
     }
 }
 
-/// glibc `%f`.
-fn c_percent_f(v: f64) -> String {
-    let sign = if v.is_sign_negative() { "-" } else { "" };
-    if v.is_nan() {
-        format!("{sign}nan")
-    } else if v.is_infinite() {
-        format!("{sign}inf")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
 /// C `asDumpFP` prints names, links and CALC with `%s`: the bytes as stored.
 fn push_all(out: &mut Vec<u8>, parts: &[&[u8]]) {
     for p in parts {
@@ -2720,7 +2710,7 @@ pub async fn read_acf(path: impl AsRef<std::path::Path>) -> CaResult<AccessSecur
 }
 
 pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
-    parse_acf_reporting(content.as_ref(), &|line| eprintln!("{line}"))
+    parse_acf_reporting(content.as_ref(), &|line| crate::stderr_println!("{line}"))
 }
 
 /// [`parse_acf`] with asLib.y's `yyerror` and `yywarn` lines handed to

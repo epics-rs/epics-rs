@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -90,7 +91,7 @@ pub fn parse_db_file_with_breaktables(
     // The include layer and the record parser both report through the
     // same owner, so a recoverable failure in either reaches the caller
     // as one set — see [`DbFaults`].
-    parse_db_opened_with_breaktables(&DbOpenedFile::taken_outright(path), macros, config)
+    parse_db_opened_with_breaktables(&DbOpenedFile::taken_outright(path)?, macros, config)
 }
 
 /// [`parse_db_file_with_breaktables`] for a file that came through
@@ -131,8 +132,9 @@ pub fn expand_includes(
     config: &DbLoadConfig,
     faults: &mut DbFaults,
 ) -> CaResult<Vec<u8>> {
+    let opened = DbOpenedFile::taken_outright(path)?;
     let mut feed = Feed::files(macros, config, std::mem::take(faults));
-    if let Err(e) = feed.open(&DbOpenedFile::taken_outright(path)) {
+    if let Err(e) = feed.open(&opened) {
         *faults = feed.into_parts().1;
         return Err(e);
     }
@@ -458,8 +460,7 @@ fn dequote(name: &[u8]) -> Vec<u8> {
 /// C `dbOpenFile` (`dbLexRoutines.c:166-193`) — the single rule every
 /// `.db` file name is resolved by, whether it arrives as the top-level
 /// `dbLoadRecords` argument (`:282`), an `include` directive (`:450`
-/// `dbIncludeNew`) or a `.substitutions` template (`dbLoadTemplate`
-/// driving `dbLoadRecords`).
+/// `dbIncludeNew`) or a `.substitutions` file (`dbLoadTemplate.y:369`).
 ///
 /// A bare open happens ONLY when the path list is empty or the name
 /// already carries a separator; otherwise the list is walked in order
@@ -468,12 +469,26 @@ fn dequote(name: &[u8]) -> Vec<u8> {
 /// `dbReadCOM` (`:244-253`) installs `"."`, which is the same file the
 /// bare open reaches, so the empty-list branch here matches it.
 ///
-/// Both C callers run `db_expand_file_name` (`macEnvExpand`) on the
-/// name immediately before calling `dbOpenFile` — `dbReadCOM`
-/// (`:276`) and `dbIncludeNew` (`:449`) — so the expansion is done
-/// here, once, rather than at each caller.
-pub fn db_open_file(filename: &str, path_list: &[PathBuf]) -> Option<PathBuf> {
-    db_open_file_located(filename, path_list).map(|opened| opened.resolved)
+/// A hit is a file that opens, C's `fopen`: one that is there but will
+/// not open is passed over for the next entry. `Err` is the last open's
+/// error, the `errno` `dbLoadTemplate` prints.
+pub fn db_open_file(filename: &str, path_list: &[PathBuf]) -> std::io::Result<DbOpenedFile> {
+    let open = |resolved: PathBuf, found_under: Option<String>| {
+        Ok(DbOpenedFile {
+            file: File::open(&resolved)?,
+            resolved,
+            named: filename.to_owned(),
+            found_under,
+        })
+    };
+    if path_list.is_empty() || filename.contains('/') || filename.contains('\\') {
+        return open(PathBuf::from(filename), None);
+    }
+    // the list is not empty, so the first entry's open replaces this
+    let none_tried = Err(std::io::ErrorKind::NotFound.into());
+    path_list.iter().fold(none_tried, |opened, dir| {
+        opened.or_else(|_| open(dir.join(filename), Some(dir.display().to_string())))
+    })
 }
 
 /// A `.db` file the loader has opened, in the three parts C keeps
@@ -489,9 +504,11 @@ pub fn db_open_file(filename: &str, path_list: &[PathBuf]) -> Option<PathBuf> {
 /// canonical one. A port that carries only the resolved `PathBuf` cannot
 /// say what C says: it has already lost the operator's spelling, so it
 /// would name a file in words the `st.cmd` does not contain.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DbOpenedFile {
-    /// The path to actually read. Nothing prints this.
+    /// C's `FILE *`, which is what makes the name found.
+    pub file: File,
+    /// The path that was opened. Nothing prints this.
     pub resolved: PathBuf,
     /// C `inputFile.filename` — the name as written, after
     /// `macEnvExpand`. Every diagnostic names the file with this.
@@ -504,36 +521,21 @@ pub struct DbOpenedFile {
 impl DbOpenedFile {
     /// A path the caller resolved for itself, with no search-path entry
     /// behind it — C's `dbReadCOM` arm that is handed an open `FILE *`.
-    pub fn taken_outright(path: &Path) -> Self {
-        Self {
+    pub fn taken_outright(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: File::open(path)?,
             resolved: path.to_path_buf(),
             named: path.display().to_string(),
             found_under: None,
-        }
+        })
     }
 }
 
-/// [`db_open_file`] keeping everything C's caller keeps — see
-/// [`DbOpenedFile`].
+/// The open of `dbReadCOM` (`dbLexRoutines.c:276`) and `dbIncludeNew`
+/// (`:449`): `macEnvExpand` the name, then [`db_open_file`]. `None` is
+/// either one's NULL.
 pub fn db_open_file_located(filename: &str, path_list: &[PathBuf]) -> Option<DbOpenedFile> {
-    let named = db_expand_file_name(filename)?;
-    let filename = named.as_str();
-    if path_list.is_empty() || filename.contains('/') || filename.contains('\\') {
-        let direct = PathBuf::from(filename);
-        return direct.exists().then(|| DbOpenedFile {
-            resolved: direct,
-            named: named.clone(),
-            found_under: None,
-        });
-    }
-    path_list.iter().find_map(|dir| {
-        let candidate = dir.join(filename);
-        candidate.exists().then(|| DbOpenedFile {
-            resolved: candidate,
-            named: named.clone(),
-            found_under: Some(dir.display().to_string()),
-        })
-    })
+    db_open_file(&db_expand_file_name(filename)?, path_list).ok()
 }
 
 /// C `macEnvExpand` (`macEnv.c:21-30`) — `macDefExpand(str, NULL)`, i.e.
@@ -772,6 +774,8 @@ mod db_open_file_tests {
         let on_list = tempfile::tempdir().unwrap();
         std::fs::write(on_list.path().join("Cargo.toml"), "").unwrap();
         let empty = tempfile::tempdir().unwrap();
+        let db_open_file =
+            |name, list: &[PathBuf]| db_open_file(name, list).ok().map(|o| o.resolved);
 
         // No separator, list set: the list wins over the same-named
         // file in the CWD.
@@ -839,18 +843,18 @@ mod db_open_file_tests {
 
         let raw = format!("$({key})/common.db");
         assert_eq!(
-            db_open_file(&raw, &[]),
+            db_open_file_located(&raw, &[]).map(|o| o.resolved),
             Some(dir.path().join("common.db")),
             "environment reference in a bare name must expand"
         );
         let placeholder = format!("$({key},undefined)/common.db");
         assert_eq!(
-            db_open_file(&placeholder, &[]),
+            db_open_file_located(&placeholder, &[]).map(|o| o.resolved),
             Some(dir.path().join("common.db")),
             "the .db reader's undefined-placeholder must re-expand here"
         );
         // Undefined everywhere is C's NULL return: no file, no open.
-        assert_eq!(db_open_file("$(NO_SUCH_VAR_HERE)/common.db", &[]), None);
+        assert!(db_open_file_located("$(NO_SUCH_VAR_HERE)/common.db", &[]).is_none());
 
         // SAFETY: same serial group.
         unsafe { std::env::remove_var(key) };

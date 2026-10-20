@@ -98,19 +98,18 @@ async fn main() -> CaResult<()> {
     let composite = CompositeSource::new();
     QsrvMount {
         store,
-        enabled: true,
         acf: acf.clone(),
     }
     .install_channel_sources(&db, &composite)
     .map_err(epics_base_rs::error::CaError::InvalidValue)?;
 
-    let pv_list = composite.list_pvs().await;
-    eprintln!("qsrv-ioc: dual-protocol IOC");
-    eprintln!("  CA  port: {ca_port}");
-    eprintln!("  PVA port: {pva_port}");
-    eprintln!("  PVs ({}):", pv_list.len());
+    let pv_list = composite.list_pvs();
+    epics_base_rs::stderr_println!("qsrv-ioc: dual-protocol IOC");
+    epics_base_rs::stderr_println!("  CA  port: {ca_port}");
+    epics_base_rs::stderr_println!("  PVA port: {pva_port}");
+    epics_base_rs::stderr_println!("  PVs ({}):", pv_list.len());
     for pv in &pv_list {
-        eprintln!("    {pv}");
+        epics_base_rs::stderr_println!("    {pv}");
     }
 
     // ── Simulator ──

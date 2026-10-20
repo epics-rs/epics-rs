@@ -25,6 +25,9 @@ impl AsynMotor for Axis {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -37,8 +40,9 @@ impl AsynMotor for Axis {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(self.0.lock().unwrap().clone())
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.0.lock().unwrap().clone();
+        Ok(())
     }
 }
 
@@ -77,7 +81,7 @@ fn a_poll_sets_the_axis_status_in_the_controller_ports_params() {
         setup.poll_loop.run_startup_pass();
         setup
     };
-    let _setup = build();
+    let setup = build();
     assert_eq!(port.read_float64_blocking(index::POSITION, 1).unwrap(), 3.5);
     assert_eq!(
         port.read_float64_blocking(index::ENCODER_POSITION, 1)
@@ -104,6 +108,9 @@ fn a_poll_sets_the_axis_status_in_the_controller_ports_params() {
         low_limit: true,
         ..MotorStatus::default()
     };
+    // One controller's axis at a time: the address is the first's until it
+    // drops.
+    drop(setup);
     let _setup = build();
     assert_eq!(
         port.read_float64_blocking(index::POSITION, 1).unwrap(),
@@ -159,6 +166,9 @@ impl AsynMotor for Counted {
     fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
         Ok(())
     }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         Ok(())
     }
@@ -171,9 +181,10 @@ impl AsynMotor for Counted {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
     }
-    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         *self.0.lock().unwrap() += 1;
-        Ok(MotorStatus::default())
+        *status = MotorStatus::default();
+        Ok(())
     }
 }
 

@@ -62,24 +62,25 @@ fn general_time_records_read_as_softioc_does() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("t.db"), DB).unwrap();
     std::fs::write(dir.path().join("st.cmd"), SCRIPT).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .current_dir(dir.path())
-        .arg("st.cmd")
-        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env(
-            "EPICS_CA_SERVER_PORT",
-            named_port::free_for_tcp_and_udp().to_string(),
-        )
-        .env(
-            "EPICS_CA_REPEATER_PORT",
-            named_port::free_for_tcp_and_udp().to_string(),
-        )
-        .stdin(Stdio::null())
-        .output()
-        .expect("softioc-rs");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A port taken before the IOC bound it is drawn again.
+    let (stdout, stderr) = named_port::on_a_named_port(|port| {
+        let out = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
+            .current_dir(dir.path())
+            .arg("st.cmd")
+            .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CA_SERVER_PORT", port.to_string())
+            .env(
+                "EPICS_CA_REPEATER_PORT",
+                named_port::free_for_tcp_and_udp().to_string(),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .expect("softioc-rs");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (!named_port::verdict::rs_ioc_port_was_taken(&stderr, port))
+            .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), stderr))
+    });
     let lines: Vec<&str> = stdout.lines().collect();
     let dbgf: Vec<&str> = lines
         .windows(2)

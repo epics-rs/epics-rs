@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase, RecordLoad};
+use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase, RecordLoad};
 use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -67,22 +67,25 @@ impl CountingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for CountingLset {
-    fn is_connected(&self, name: &[u8]) -> bool {
+    fn is_connected(&self, link: LinkRef<'_>) -> bool {
+        let name = link.name;
         self.cache
             .lock()
             .contains_key(std::str::from_utf8(name).unwrap())
     }
 
-    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+    async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name, None).await;
+        self.connect_link(link, None).await;
         self.cache
             .lock()
             .get(std::str::from_utf8(name).unwrap())
             .cloned()
     }
 
-    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+    fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
+        let name = link.name;
         self.cache
             .lock()
             .get(std::str::from_utf8(name).unwrap())
@@ -91,9 +94,10 @@ impl LinkSet for CountingLset {
 
     async fn connect_link(
         &self,
-        name: &[u8],
+        link: LinkRef<'_>,
         _: Option<epics_base_rs::server::database::CaLinkInit>,
     ) {
+        let name = link.name;
         self.opened
             .lock()
             .push(String::from_utf8_lossy(name).into_owned());

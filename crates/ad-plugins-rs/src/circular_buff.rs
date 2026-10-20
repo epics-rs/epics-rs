@@ -278,6 +278,18 @@ impl CircularBuffer {
     /// post-trigger frame is forwarded individually. The returned
     /// [`PushResult::forward`] holds the frames to send downstream this call.
     pub fn push(&mut self, array: Arc<NDArray>) -> PushResult {
+        self.push_copied(&array, |a| Some(Arc::clone(a)))
+    }
+
+    /// [`push`](Self::push) recording what `copy` makes of the frame, as C
+    /// records `pNDArrayPool->copy(pArray, NULL, 1)` (:137). `copy` runs once
+    /// the trigger is settled, only while running; a frame it cannot copy is
+    /// not recorded (:138, :198-200).
+    pub fn push_copied(
+        &mut self,
+        array: &Arc<NDArray>,
+        copy: impl FnOnce(&Arc<NDArray>) -> Option<Arc<NDArray>>,
+    ) -> PushResult {
         let mut result = PushResult::default();
 
         // C `:121-203` — "Are we running?". EVERYTHING below (the trigger
@@ -295,7 +307,7 @@ impl CircularBuffer {
         // latched trigger (soft trigger, or a previous frame's) short-circuits
         // the calc; otherwise the calc runs and its outcome is posted.
         if !self.triggered {
-            let fired = self.evaluate_trigger(&array, &mut result);
+            let fired = self.evaluate_trigger(array, &mut result);
             // C `:132` posts the trigger flag on every frame that evaluated the
             // trigger calc, whether it fired or not.
             result.params.triggered = Some(i32::from(fired));
@@ -306,6 +318,10 @@ impl CircularBuffer {
                 self.trigger();
             }
         }
+
+        let Some(array) = copy(array) else {
+            return result;
+        };
 
         if !self.triggered {
             // C `:142-155` — no trigger yet: the frame joins the pre-trigger ring.
@@ -683,14 +699,15 @@ impl NDPluginProcess for CircularBuffProcessor {
         }
     }
 
-    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
-        // C copies the frame into its own pool so the driver's array can be
-        // released (NDPluginCircularBuff.cpp:137); a shared immutable Arc
-        // needs no copy, the ring just holds a reference.
+        // The ring holds copies in this plugin's pool (NDPluginCircularBuff.cpp:
+        // 137), so a pre-trigger ring is charged here, not to the driver's pool.
         let mut state = self.state.lock();
-        let push_result = state.buffer.push(Arc::clone(array));
+        let push_result = state
+            .buffer
+            .push_copied(array, |a| pool.alloc_copy(a).ok().map(Arc::new));
 
         // The buffer reports exactly the parameters C assigns for this frame
         // (see `FrameParams`); the processor only maps them onto indices. A
@@ -1837,20 +1854,39 @@ mod tests {
         assert_eq!(r2.params.control, Some(1), "still acquiring");
     }
 
-    /// The ring holds the frame it was handed; C copies through its pool
-    /// (NDPluginCircularBuff.cpp:137) only so the driver's array can be
-    /// released, which a shared `Arc` does not need.
+    /// The ring holds a copy in the plugin's pool (NDPluginCircularBuff.cpp:
+    /// 137), and a frame the pool cannot copy is not recorded, though the
+    /// trigger it settled still posts (:131-138).
     #[test]
-    fn the_ringed_frame_is_the_input_arc_itself() {
+    fn the_ringed_frame_is_a_copy_in_the_plugin_pool() {
         use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
-        let p = CircularBuffProcessor::new(1, 1, TriggerCondition::default(), 100);
+        let mut p = CircularBuffProcessor::new(1, 1, TriggerCondition::default(), 100);
+        p.params.current_image = Some(11);
+        p.params.triggered = Some(12);
         p.buffer().start();
-        let pool = NDArrayPool::new(0);
         let input = Arc::new(NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8));
+
+        let pool = NDArrayPool::new(0);
         p.process_array(&input, &pool);
-        assert!(Arc::ptr_eq(&p.buffer().pre_buffer_front().unwrap(), &input));
-        assert_eq!(pool.num_alloc_buffers(), 0);
+        let ringed = p.buffer().pre_buffer_front().unwrap();
+        assert!(!Arc::ptr_eq(&ringed, &input));
+        assert_eq!(ringed.pool_id(), pool.id());
+        assert_eq!(pool.num_alloc_buffers(), 1);
+
+        p.buffer().start();
+        let full = NDArrayPool::new(1);
+        let r = p.process_array(&input, &full);
+        assert!(p.buffer().pre_buffer_front().is_none());
+        let reasons: Vec<usize> = r
+            .param_updates
+            .iter()
+            .filter_map(|u| match u {
+                ad_core_rs::plugin::runtime::ParamUpdate::Int32 { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, vec![12]);
     }
 
     #[test]

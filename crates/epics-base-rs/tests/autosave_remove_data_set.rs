@@ -40,9 +40,10 @@ fn outputs_of(dir: &Path, line: &str) -> (Vec<String>, Vec<String>) {
     (stdout, errlog)
 }
 
-/// `$LINE`, `;`-separated, in an iocsh whose manager, with status prefix
-/// `P:`, has the manual set of `s.req` (`A`), saving under `$CHILD`;
-/// `t.req` and `u.req` name `A` too.
+/// `$LINE`, `;`-separated, in an iocsh whose running manager, with status
+/// prefix `P:`, has the manual set of `s.req` (`A`), saving under
+/// `$CHILD`; `t.req` and `u.req` name `A` too. Each line's ops are served
+/// before the next line runs.
 #[test]
 fn child_remove() {
     let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
@@ -56,7 +57,7 @@ fn child_remove() {
         h.save_file_path = Some(dir.clone());
         h.request_file_paths = vec![dir.clone()];
     }
-    rt.block_on(async {
+    let mgr = rt.block_on(async {
         db.add_record("A", Box::new(AoRecord::new(1.5)))
             .await
             .unwrap();
@@ -75,15 +76,19 @@ fn child_remove() {
                     request_pvs: Vec::new(),
                     backup: BackupConfig::default(),
                     macros: Default::default(),
-                    macro_string: String::new(),
+                    macro_string: None,
                     search_paths: vec![dir.clone()],
                 },
                 SaveStrategy::Manual,
             )
             .build()
             .await;
-        holder.lock().unwrap().manager = Some(Arc::new(mgr));
+        let mgr = Arc::new(mgr);
+        holder.lock().unwrap().manager = Some(mgr.clone());
+        mgr
     });
+    let _task = mgr.clone().start(db.clone());
+    let handle = rt.handle().clone();
     let line = std::env::var(LINE).unwrap();
     let bridge = {
         let _guard = rt.enter();
@@ -97,6 +102,7 @@ fn child_remove() {
         }
         for line in line.split(';') {
             shell.execute_line(line).unwrap();
+            handle.block_on(mgr.ops_served());
         }
     })
     .join()
@@ -148,6 +154,25 @@ fn a_bad_or_unknown_filename_is_refused() {
             "../save_restore.c:do_remove_data_set Couldn't find 't.req'",
         ]
     );
+}
+
+/// C finds the list by `strcmp` on its request file name (:2678), so a
+/// spelling of the same path is not that list.
+#[test]
+fn a_list_is_found_by_its_exact_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, errlog) = outputs_of(
+        dir.path(),
+        "remove_data_set(\"./s.req\");remove_data_set(\"s.req/\");save_restoreShow(0)",
+    );
+    assert_eq!(
+        errlog,
+        [
+            "../save_restore.c:do_remove_data_set Couldn't find './s.req'",
+            "../save_restore.c:do_remove_data_set Couldn't find 's.req/'",
+        ]
+    );
+    assert!(lists(&out).contains(&"  s.req: "), "{out:?}");
 }
 
 /// A new list takes the first free status PV slot (:2466-2470), which a

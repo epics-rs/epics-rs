@@ -107,7 +107,7 @@ impl TaskState {
     }
 
     /// C computeImage: the image is computed into pRaw_ and converted into
-    /// pArrays[0] (simDetector.cpp:694-699). `None` when the pool refused a
+    /// `pArrays[0]` (simDetector.cpp:694-699). `None` when the pool refused a
     /// buffer; it has printed its limit line.
     fn compute_frame(
         &mut self,

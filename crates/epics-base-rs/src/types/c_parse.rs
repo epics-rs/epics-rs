@@ -458,7 +458,7 @@ fn outside_band(v: u64, max: u64) -> Option<u64> {
 /// field becomes 1); this owner refuses without writing — puts here are atomic.
 fn parse_ulong_via_double(s: &str) -> Row {
     let stored = |v: u32| Row::Stored(EpicsValue::ULong(v));
-    let d = scan_int(s, 0);
+    let d = scan_int(s.as_bytes(), 0);
     let int_value = if d.any {
         let parsed = (|| {
             let v = u64::try_from(d.magnitude?).ok()?;
@@ -521,8 +521,7 @@ struct Digits {
 /// `base == 0` is `strtol`'s auto-detect, which is what `dbConvertBase` gives
 /// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
 /// scans as the single digit `0` and leaves `x10` for the extraneous test.
-fn scan_int(s: &str, mut base: u32) -> Digits {
-    let b = s.as_bytes();
+fn scan_int(b: &[u8], mut base: u32) -> Digits {
     let mut i = 0;
     while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
@@ -532,27 +531,32 @@ fn scan_int(s: &str, mut base: u32) -> Digits {
         i += 1;
     }
 
-    // Base detection, `dbConvertBase == 0`. A prefix only counts when a digit of
-    // that base follows it; otherwise the leading `0` is itself the number and
-    // the `x`/`b` is trailing text. `0b` is binary on the reference toolchain
-    // (glibc implements the C23 binary literal in `strtol` base 0, measured:
-    // `caput REC.PREC 0b11` stores 3).
-    if base == 0 {
-        base = 10;
-        if i < b.len() && b[i] == b'0' {
-            let next = b.get(i + 1).map(|c| c.to_ascii_lowercase());
-            let after = b.get(i + 2).copied();
-            if next == Some(b'x') && after.is_some_and(|c| c.is_ascii_hexdigit()) {
-                base = 16;
-                i += 2;
-            } else if next == Some(b'b') && after.is_some_and(|c| c == b'0' || c == b'1') {
-                base = 2;
-                i += 2;
-            } else {
-                // The leading `0` is a valid octal digit and is consumed by the loop.
-                base = 8;
-            }
+    // The base prefix: `0x` under base 0 and 16, `0b` under base 0 and 2. The
+    // `0b` is glibc's C23 binary literal, which EPICS gets because it builds
+    // with `_GNU_SOURCE` (`CONFIG.Common.linuxCommon`; measured: `caput
+    // REC.PREC 0b11` stores 3). A prefix only counts when a digit of that base
+    // follows it; otherwise the leading `0` is itself the number and the
+    // `x`/`b` is trailing text.
+    if b.get(i) == Some(&b'0') {
+        let next = b.get(i + 1).map(u8::to_ascii_lowercase);
+        let after = b.get(i + 2).copied();
+        if matches!(base, 0 | 16)
+            && next == Some(b'x')
+            && after.is_some_and(|c| c.is_ascii_hexdigit())
+        {
+            base = 16;
+            i += 2;
+        } else if matches!(base, 0 | 2)
+            && next == Some(b'b')
+            && after.is_some_and(|c| c == b'0' || c == b'1')
+        {
+            base = 2;
+            i += 2;
         }
+    }
+    if base == 0 {
+        // A leading `0` is a valid octal digit and is consumed by the loop.
+        base = if b.get(i) == Some(&b'0') { 8 } else { 10 };
     }
 
     let mut magnitude = Some(0u128);
@@ -604,30 +608,52 @@ fn ulong_from(d: &Digits) -> Option<u64> {
 
 /// C `strtol(s, &end, 0)` plus `epicsParseLong`'s status.
 fn parse_long(s: &str) -> Option<i64> {
-    long_from(&scan_int(s, 0))
+    long_from(&scan_int(s.as_bytes(), 0))
 }
 
 /// C `strtoul(s, &end, 0)` plus `epicsParseULong`'s status.
 fn parse_ulong(s: &str) -> Option<u64> {
-    ulong_from(&scan_int(s, 0))
+    ulong_from(&scan_int(s.as_bytes(), 0))
 }
 
-/// C `atol` (glibc `strtol(s, NULL, 10)`): total, as autosave's array
-/// restore uses it; no digits is 0 and `ERANGE` saturates at `long`.
+/// C `strtol(s, &end, base)` as EPICS gets it on Linux: glibc with
+/// `_GNU_SOURCE` and a 64-bit `long`. The value and the end offset; `ERANGE`
+/// saturates at `i64::MIN`/`i64::MAX` and nothing converted is `(0, 0)`.
+/// `base` is 0 or 2..=36 (anything else panics).
+pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (i64, usize) {
+    let d = scan_int(s.as_ref(), base);
+    if !d.any {
+        return (0, 0);
+    }
+    let v = long_from(&d).unwrap_or(if d.negative { i64::MIN } else { i64::MAX });
+    (v, d.end)
+}
+
+/// C `strtoul(s, &end, base)`, likewise: a leading `-` negates modulo 2^64,
+/// and `ERANGE` is `u64::MAX` whatever the sign.
+pub fn strtoul(s: impl AsRef<[u8]>, base: u32) -> (u64, usize) {
+    let d = scan_int(s.as_ref(), base);
+    if !d.any {
+        return (0, 0);
+    }
+    (ulong_from(&d).unwrap_or(u64::MAX), d.end)
+}
+
+/// C `atoi`, which glibc implements as `(int) strtol(s, NULL, 10)`: an
+/// out-of-range value is the saturated `long` truncated to `int`, so
+/// `2147483648` is `INT_MIN` and `99999999999999999999` is -1.
+pub fn atoi(s: impl AsRef<[u8]>) -> i32 {
+    strtol(s, 10).0 as i32
+}
+
+/// C `atol` (glibc `strtol(s, NULL, 10)`), as autosave's array restore uses it.
 pub fn atol(s: &str) -> i64 {
-    let d = scan_int(s, 10);
-    long_from(&d).unwrap_or(match (d.any, d.negative) {
-        (false, _) => 0,
-        (true, true) => i64::MIN,
-        (true, false) => i64::MAX,
-    })
+    strtol(s, 10).0
 }
 
-/// C `strtoul(s, NULL, 0)`: total; no digits is 0 and `ERANGE` is
-/// `ULONG_MAX`.
+/// C `strtoul(s, NULL, 0)`.
 pub fn strtoul_auto(s: &str) -> u64 {
-    let d = scan_int(s, 0);
-    ulong_from(&d).unwrap_or(if d.any { u64::MAX } else { 0 })
+    strtoul(s, 0).0
 }
 
 /// `if (c && !units) return S_stdlib_extraneous;`, after the trailing
@@ -639,13 +665,13 @@ fn extraneous(s: &str, end: usize) -> bool {
 }
 
 fn strict_long(s: &str, base: u32) -> Option<i64> {
-    let d = scan_int(s, base);
+    let d = scan_int(s.as_bytes(), base);
     let v = long_from(&d)?;
     (!extraneous(s, d.end)).then_some(v)
 }
 
 fn strict_ulong(s: &str, base: u32) -> Option<u64> {
-    let d = scan_int(s, base);
+    let d = scan_int(s.as_bytes(), base);
     let v = ulong_from(&d)?;
     (!extraneous(s, d.end)).then_some(v)
 }
@@ -1069,5 +1095,115 @@ mod tests {
             NumericField::of(DbFieldType::Double),
             Some(NumericField::Double)
         );
+    }
+
+    #[test]
+    fn strtol_strtoul_atoi_match_glibc_with_gnu_source() {
+        // gcc -D_GNU_SOURCE on glibc 2.39: (input, base, strtol, end,
+        // strtoul, end).
+        const STRTO: &[(&str, u32, i64, usize, u64, usize)] = &[
+            ("  -17x", 10, -17, 5, 18446744073709551599, 5),
+            ("+0x1F", 0, 31, 5, 31, 5),
+            ("+0x1F", 10, 0, 2, 0, 2),
+            ("+0x1F", 16, 31, 5, 31, 5),
+            ("0x", 0, 0, 1, 0, 1),
+            ("0x", 16, 0, 1, 0, 1),
+            ("0xg", 16, 0, 1, 0, 1),
+            ("0b101", 0, 5, 5, 5, 5),
+            ("0b101", 10, 0, 1, 0, 1),
+            ("0b101", 16, 45313, 5, 45313, 5),
+            ("0b101", 2, 5, 5, 5, 5),
+            ("0B2", 2, 0, 1, 0, 1),
+            ("010", 0, 8, 3, 8, 3),
+            ("010", 10, 10, 3, 10, 3),
+            ("09", 0, 0, 1, 0, 1),
+            (
+                "9223372036854775808",
+                10,
+                9223372036854775807,
+                19,
+                9223372036854775808,
+                19,
+            ),
+            (
+                "-9223372036854775808",
+                10,
+                i64::MIN,
+                20,
+                9223372036854775808,
+                20,
+            ),
+            (
+                "-9223372036854775809",
+                10,
+                i64::MIN,
+                20,
+                9223372036854775807,
+                20,
+            ),
+            (
+                "18446744073709551616",
+                10,
+                9223372036854775807,
+                20,
+                18446744073709551615,
+                20,
+            ),
+            ("-1", 10, -1, 2, 18446744073709551615, 2),
+            ("-18446744073709551615", 10, i64::MIN, 21, 1, 21),
+            (
+                "-18446744073709551616",
+                10,
+                i64::MIN,
+                21,
+                18446744073709551615,
+                21,
+            ),
+            (
+                "99999999999999999999999999999999999999999",
+                10,
+                9223372036854775807,
+                41,
+                18446744073709551615,
+                41,
+            ),
+            ("", 10, 0, 0, 0, 0),
+            (" +", 10, 0, 0, 0, 0),
+            ("-", 10, 0, 0, 0, 0),
+            ("\t\n\x0b\x0c\r7", 10, 7, 6, 7, 6),
+            (
+                "0xffffffffffffffff",
+                0,
+                9223372036854775807,
+                18,
+                18446744073709551615,
+                18,
+            ),
+            (
+                "0x10000000000000000",
+                16,
+                9223372036854775807,
+                19,
+                18446744073709551615,
+                19,
+            ),
+            ("Zz", 36, 1295, 2, 1295, 2),
+        ];
+        const ATOI: &[(&str, i32)] = &[
+            ("  -17x", -17),
+            ("99999999999999999999999999999999999999999", -1),
+            ("2147483647", 2147483647),
+            ("2147483648", -2147483648),
+            ("-2147483649", 2147483647),
+            ("4294967297", 1),
+            ("", 0),
+        ];
+        for &(s, base, l, l_end, u, u_end) in STRTO {
+            assert_eq!(strtol(s, base), (l, l_end), "strtol({s:?}, {base})");
+            assert_eq!(strtoul(s, base), (u, u_end), "strtoul({s:?}, {base})");
+        }
+        for &(s, v) in ATOI {
+            assert_eq!(atoi(s), v, "atoi({s:?})");
+        }
     }
 }

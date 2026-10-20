@@ -130,80 +130,23 @@ fn digit_value(c: u8) -> Option<u32> {
     (c as char).to_digit(36)
 }
 
-/// The scan shared by `strtoul` and `strtol`: returns the magnitude (clamped
-/// at `u64::MAX` on overflow), the sign, the overflow flag and the end
-/// offset, which stays at the start when no digit was read.
-fn strto_scan(s: CPtr<'_>, base: u32) -> (u64, bool, bool, usize) {
-    let start = s.offset();
-    let mut i = 0;
-    while c_isspace(s.at(i) as i32) {
-        i += 1;
-    }
-    let mut neg = false;
-    if s.at(i) == b'+' || s.at(i) == b'-' {
-        neg = s.at(i) == b'-';
-        i += 1;
-    }
-    let mut base = base;
-    if (base == 0 || base == 16)
-        && s.at(i) == b'0'
-        && (s.at(i + 1) | 0x20) == b'x'
-        && digit_value(s.at(i + 2)).is_some_and(|d| d < 16)
-    {
-        i += 2;
-        base = 16;
-    } else if base == 0 {
-        base = if s.at(i) == b'0' { 8 } else { 10 };
-    }
-    let mut value: u64 = 0;
-    let mut overflow = false;
-    let mut any = false;
-    while let Some(d) = digit_value(s.at(i)).filter(|&d| d < base) {
-        any = true;
-        match value
-            .checked_mul(base as u64)
-            .and_then(|v| v.checked_add(d as u64))
-        {
-            Some(v) => value = v,
-            None => overflow = true,
-        }
-        i += 1;
-    }
-    if !any {
-        // "0x" with no hex digit after it: the 0 was read, the x was not.
-        return (0, false, false, start);
-    }
-    if overflow {
-        value = u64::MAX;
-    }
-    (value, neg, overflow, start + i)
+/// The bytes from `s` on; the zero tail past the slice stops a scan as the
+/// slice end does.
+fn rest<'a>(s: &CPtr<'a>) -> &'a [u8] {
+    s.base().get(s.offset()..).unwrap_or(&[])
 }
 
 /// `strtoul(s, &end, base)` with a 64-bit `unsigned long`: the value and the
-/// end offset.
+/// end offset, which stays at `s` when nothing converted.
 pub fn c_strtoul(s: CPtr<'_>, base: u32) -> (u64, usize) {
-    let (v, neg, overflow, end) = strto_scan(s, base);
-    if overflow {
-        return (u64::MAX, end);
-    }
-    (if neg { v.wrapping_neg() } else { v }, end)
+    let (v, end) = epics_base_rs::types::c_parse::strtoul(rest(&s), base);
+    (v, s.offset() + end)
 }
 
 /// `strtol(s, &end, base)` with a 64-bit `long`.
 pub fn c_strtol(s: CPtr<'_>, base: u32) -> (i64, usize) {
-    let (v, neg, overflow, end) = strto_scan(s, base);
-    let v = if neg {
-        if overflow || v > i64::MAX as u64 + 1 {
-            i64::MIN
-        } else {
-            (v as i64).wrapping_neg()
-        }
-    } else if overflow || v > i64::MAX as u64 {
-        i64::MAX
-    } else {
-        v as i64
-    };
-    (v, end)
+    let (v, end) = epics_base_rs::types::c_parse::strtol(rest(&s), base);
+    (v, s.offset() + end)
 }
 
 /// `sscanf(s, "%<width>x%n", &c, &n)` as glibc reads it: `None` when no
@@ -322,6 +265,20 @@ mod tests {
             c_strtol(CPtr::new(b"-99999999999999999999"), 0),
             (i64::MIN, 21)
         );
+    }
+
+    #[test]
+    fn strtol_reads_0b_as_binary_like_glibc_with_gnu_source() {
+        // g++ defines _GNU_SOURCE, so glibc 2.39's C23 strtol takes `0b`.
+        assert_eq!(ul(b"0b101", 0), (5, 5));
+        assert_eq!(c_strtol(CPtr::new(b"-0b11"), 2), (-3, 5));
+        assert_eq!(ul(b"0b2", 0), (0, 1));
+        assert_eq!(
+            c_strtol(CPtr::at_offset(b"x -99999999999999999999", 1), 10),
+            (i64::MIN, 23)
+        );
+        assert_eq!(ul(b"x", 0), (0, 0));
+        assert_eq!(c_strtoul(CPtr::at_offset(b"ab", 1), 16), (11, 2));
     }
 
     #[test]

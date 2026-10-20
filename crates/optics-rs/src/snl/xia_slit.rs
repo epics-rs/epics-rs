@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::stdlib::c_isspace;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tracing::{debug, error, info};
@@ -137,10 +138,16 @@ pub struct ParsedFifoResponse {
     pub words: Vec<String>,
 }
 
-/// Parse a raw FIFO line into words and extract the HSC ID.
+/// Parse a raw FIFO line into words and extract the HSC ID: C's
+/// `sscanf(scratch, "%s %s ...")` words, split on C white space only, and
+/// `sscanf(word1, "%%%s", id)` (xia_slit.st:1033-1035).
 pub fn parse_fifo_line(line: &str) -> ParsedFifoResponse {
-    let line = line.trim();
-    let words: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+    let line = line.trim_matches(c_isspace);
+    let words: Vec<String> = line
+        .split(c_isspace)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
     let id = words
         .first()
         .and_then(|w| w.strip_prefix('%'))
@@ -151,6 +158,14 @@ pub fn parse_fifo_line(line: &str) -> ParsedFifoResponse {
         id,
         words,
     }
+}
+
+/// The ID `sscanf(reply, "%%%s", id)` reads, white space allowed on either
+/// side of the `%`. Where it converts nothing C compares the `id` left from
+/// before, a defect not copied.
+fn reply_id(reply: &str) -> Option<&str> {
+    let rest = reply.trim_start_matches(c_isspace).strip_prefix('%')?;
+    xiahsc::scan_word(rest).map(|(id, _)| id)
 }
 
 /// Classify a parsed FIFO response.
@@ -172,9 +187,13 @@ pub enum FifoResponseKind {
     Unknown,
 }
 
-/// Classify a parsed FIFO response into a kind.
+/// Classify a parsed FIFO response into a kind (xia_slit.st:1245-1345). Each
+/// number is `sscanf(word, "%d")`; where that converts nothing C goes on with
+/// the stale `error`/`pos_a`/`pos_b` from before, a C defect not copied: the
+/// error is unknown and the position reply unrecognized.
 pub fn classify_fifo_response(parsed: &ParsedFifoResponse) -> FifoResponseKind {
     let n = parsed.words.len();
+    let int = |i: usize| xiahsc::scan_int(&parsed.words[i]).map(|(v, _)| v);
     if n == 0 {
         return FifoResponseKind::Empty;
     }
@@ -182,11 +201,7 @@ pub fn classify_fifo_response(parsed: &ParsedFifoResponse) -> FifoResponseKind {
         return FifoResponseKind::Ok;
     }
     if n >= 2 && parsed.words[1] == "ERROR;" {
-        let code = if n >= 3 {
-            parsed.words[2].parse::<i32>().ok()
-        } else {
-            None
-        };
+        let code = if n >= 3 { int(2) } else { None };
         return FifoResponseKind::Error { code };
     }
     if n == 2 && parsed.words[1] == "BUSY;" {
@@ -194,19 +209,13 @@ pub fn classify_fifo_response(parsed: &ParsedFifoResponse) -> FifoResponseKind {
     }
     if n == 4
         && parsed.words[3] == "DONE;"
-        && let (Ok(a), Ok(b)) = (
-            parsed.words[1].parse::<i32>(),
-            parsed.words[2].parse::<i32>(),
-        )
+        && let (Some(a), Some(b)) = (int(1), int(2))
     {
         return FifoResponseKind::PositionDone { pos_a: a, pos_b: b };
     }
     if n == 5
         && parsed.words[1] == "OK"
-        && let (Ok(a), Ok(b)) = (
-            parsed.words[2].parse::<i32>(),
-            parsed.words[3].parse::<i32>(),
-        )
+        && let (Some(a), Some(b)) = (int(2), int(3))
     {
         return FifoResponseKind::PositionOk { pos_a: a, pos_b: b };
     }
@@ -827,6 +836,22 @@ pub async fn run<R, W>(
         read_line_timeout(reader, buf, RESPONSE_TIMEOUT).await
     }
 
+    /// C's `while (!s_sevr) { READ_HSC(); INPUT_TO_FIFO(); }`: queue replies
+    /// until a read times out. A move first drops each reply naming the axis
+    /// it moves, `skip` (xia_slit.st:943-951, 976-984).
+    async fn drain_to_fifo<R2: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R2,
+        buf: &mut String,
+        fifo: &mut ResponseFifo,
+        skip: Option<&str>,
+    ) {
+        while let Ok(line) = read_line_timeout(reader, buf, Duration::from_millis(100)).await {
+            if skip.is_none() || reply_id(&line) != skip {
+                fifo.push(line);
+            }
+        }
+    }
+
     fn publish_status(ctrl: &XiaSlitController, tx: &watch::Sender<XiaSlitActorStatus>) {
         let _ = tx.send(XiaSlitActorStatus {
             state: ctrl.state,
@@ -842,13 +867,32 @@ pub async fn run<R, W>(
         });
     }
 
-    /// Read register value from a response line. Expects `%<ID> R <value>`.
-    fn parse_register_value(line: &str) -> Option<i32> {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        if words.len() >= 3 {
-            words[2].parse::<i32>().ok()
-        } else {
-            None
+    /// One register read, `"%*s %*s %d"` converting one (xia_slit.st:516-550,
+    /// 796-851); `None` is C's `++error`, which a timeout's empty reply also
+    /// reaches.
+    async fn read_register<
+        R2: tokio::io::AsyncBufRead + Unpin,
+        W2: tokio::io::AsyncWrite + Unpin,
+    >(
+        writer: &mut W2,
+        reader: &mut R2,
+        buf: &mut String,
+        id: &str,
+        reg: u8,
+    ) -> Option<i32> {
+        let cmd = HscCommand::ReadRegister(id.to_string(), reg);
+        match send_and_read(writer, reader, buf, &cmd).await {
+            Ok(line) => {
+                let value = xiahsc::scan_register(&line);
+                if value.is_none() {
+                    debug!("Could not read {id} register {reg}: {line:?}");
+                }
+                value
+            }
+            Err(e) => {
+                debug!("Error reading {id} register {reg}: {e}");
+                None
+            }
         }
     }
 
@@ -907,13 +951,7 @@ pub async fn run<R, W>(
                     send_cmd(&mut writer, &HscCommand::PositionInquiry("ALL".to_string())).await;
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
-                // Drain any responses into the FIFO
-                while let Ok(line) =
-                    read_line_timeout(&mut buf_reader, &mut line_buf, Duration::from_millis(100))
-                        .await
-                {
-                    ctrl.fifo.push(line);
-                }
+                drain_to_fifo(&mut buf_reader, &mut line_buf, &mut ctrl.fifo, None).await;
 
                 ctrl.state = XiaSlitState::InitLimits;
                 publish_status(&ctrl, &status_tx);
@@ -923,110 +961,84 @@ pub async fn run<R, W>(
                 let mut read_error = false;
 
                 // Read H step delay
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.h_id.clone(),
-                        xiahsc::register::MOTOR_STEP_DELAY,
-                    ),
+                    &ctrl.h_id,
+                    xiahsc::register::MOTOR_STEP_DELAY,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.h_config.step_delay = v;
-                        }
+                    Some(v) => {
+                        ctrl.h_config.step_delay = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading H step delay: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 // Read H gear backlash
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::GEAR_BACKLASH),
+                    &ctrl.h_id,
+                    xiahsc::register::GEAR_BACKLASH,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.h_config.gear_backlash = v;
-                        }
+                    Some(v) => {
+                        ctrl.h_config.gear_backlash = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading H backlash: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 // Read H control word
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::CONTROL_WORD),
+                    &ctrl.h_id,
+                    xiahsc::register::CONTROL_WORD,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.h_config.csw = v;
-                            ctrl.h_csw = Some(ControlStatusWord::from_raw(v));
-                        }
+                    Some(v) => {
+                        ctrl.h_config.csw = v;
+                        ctrl.h_csw = Some(ControlStatusWord::from_raw(v));
                     }
-                    Err(e) => {
-                        debug!("Error reading H CSW: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 // Read H outer limit
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.h_id.clone(),
-                        xiahsc::register::OUTER_MOTION_LIMIT,
-                    ),
+                    &ctrl.h_id,
+                    xiahsc::register::OUTER_MOTION_LIMIT,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.h_config.outer_limit = v;
-                        }
+                    Some(v) => {
+                        ctrl.h_config.outer_limit = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading H outer limit: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 // Read H origin
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.h_id.clone(), xiahsc::register::ORIGIN_POSITION),
+                    &ctrl.h_id,
+                    xiahsc::register::ORIGIN_POSITION,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.h_config.origin = v;
-                        }
+                    Some(v) => {
+                        ctrl.h_config.origin = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading H origin: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 if !read_error {
@@ -1036,106 +1048,80 @@ pub async fn run<R, W>(
                 // Read V parameters
                 read_error = false;
 
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::CONTROL_WORD),
+                    &ctrl.v_id,
+                    xiahsc::register::CONTROL_WORD,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.v_config.csw = v;
-                            ctrl.v_csw = Some(ControlStatusWord::from_raw(v));
-                        }
+                    Some(v) => {
+                        ctrl.v_config.csw = v;
+                        ctrl.v_csw = Some(ControlStatusWord::from_raw(v));
                     }
-                    Err(e) => {
-                        debug!("Error reading V CSW: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::GEAR_BACKLASH),
+                    &ctrl.v_id,
+                    xiahsc::register::GEAR_BACKLASH,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.v_config.gear_backlash = v;
-                        }
+                    Some(v) => {
+                        ctrl.v_config.gear_backlash = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading V backlash: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.v_id.clone(),
-                        xiahsc::register::MOTOR_STEP_DELAY,
-                    ),
+                    &ctrl.v_id,
+                    xiahsc::register::MOTOR_STEP_DELAY,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.v_config.step_delay = v;
-                        }
+                    Some(v) => {
+                        ctrl.v_config.step_delay = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading V step delay: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(
-                        ctrl.v_id.clone(),
-                        xiahsc::register::OUTER_MOTION_LIMIT,
-                    ),
+                    &ctrl.v_id,
+                    xiahsc::register::OUTER_MOTION_LIMIT,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.v_config.outer_limit = v;
-                        }
+                    Some(v) => {
+                        ctrl.v_config.outer_limit = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading V outer limit: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
-                match send_and_read(
+                match read_register(
                     &mut writer,
                     &mut buf_reader,
                     &mut line_buf,
-                    &HscCommand::ReadRegister(ctrl.v_id.clone(), xiahsc::register::ORIGIN_POSITION),
+                    &ctrl.v_id,
+                    xiahsc::register::ORIGIN_POSITION,
                 )
                 .await
                 {
-                    Ok(ref line) => {
-                        if let Some(v) = parse_register_value(line) {
-                            ctrl.v_config.origin = v;
-                        }
+                    Some(v) => {
+                        ctrl.v_config.origin = v;
                     }
-                    Err(e) => {
-                        debug!("Error reading V origin: {e}");
-                        read_error = true;
-                    }
+                    None => read_error = true,
                 }
 
                 if !read_error {
@@ -1229,6 +1215,13 @@ pub async fn run<R, W>(
                         ctrl.h_busy = true;
                     }
                     ctrl.h_is_moving = true;
+                    drain_to_fifo(
+                        &mut buf_reader,
+                        &mut line_buf,
+                        &mut ctrl.fifo,
+                        Some(&ctrl.h_id),
+                    )
+                    .await;
                     let (pos_a, pos_b) = ctrl.h_raw_positions();
                     let cmd = HscCommand::Move(ctrl.h_id.clone(), pos_a, pos_b);
                     if let Err(e) = send_cmd(&mut writer, &cmd).await {
@@ -1250,6 +1243,13 @@ pub async fn run<R, W>(
                         ctrl.v_busy = true;
                     }
                     ctrl.v_is_moving = true;
+                    drain_to_fifo(
+                        &mut buf_reader,
+                        &mut line_buf,
+                        &mut ctrl.fifo,
+                        Some(&ctrl.v_id),
+                    )
+                    .await;
                     let (pos_a, pos_b) = ctrl.v_raw_positions();
                     let cmd = HscCommand::Move(ctrl.v_id.clone(), pos_a, pos_b);
                     if let Err(e) = send_cmd(&mut writer, &cmd).await {
@@ -1267,15 +1267,7 @@ pub async fn run<R, W>(
                     let _ = send_cmd(&mut writer, &HscCommand::PositionInquiry("ALL".to_string()))
                         .await;
                     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-                    while let Ok(line) = read_line_timeout(
-                        &mut buf_reader,
-                        &mut line_buf,
-                        Duration::from_millis(100),
-                    )
-                    .await
-                    {
-                        ctrl.fifo.push(line);
-                    }
+                    drain_to_fifo(&mut buf_reader, &mut line_buf, &mut ctrl.fifo, None).await;
                 }
 
                 // Process FIFO entries
@@ -1438,6 +1430,252 @@ pub async fn run<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `process_response` (xia_slit.st:1033-1035, 1245-1345): the words are
+    /// `sscanf("%s %s %s %s %s %s")`'s, split on C white space only, and each
+    /// number is `sscanf(word, "%d")`.
+    #[test]
+    fn fifo_reply_words_are_c_sscanf() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        for (line, kind) in [
+            ("%H-1 ERROR; 6;", FifoResponseKind::Error { code: Some(6) }),
+            ("%H-1 ERROR;", FifoResponseKind::Error { code: None }),
+            (
+                "%H-1 500; 600 DONE;",
+                FifoResponseKind::PositionDone {
+                    pos_a: 500,
+                    pos_b: 600,
+                },
+            ),
+            (
+                "%H-1 OK 12abc 7 x",
+                FifoResponseKind::PositionOk {
+                    pos_a: 12,
+                    pos_b: 7,
+                },
+            ),
+            (
+                "%H-1 4294967297 5 DONE;",
+                FifoResponseKind::PositionDone {
+                    pos_a: if lp64 { 1 } else { i32::MAX },
+                    pos_b: 5,
+                },
+            ),
+            // C reuses a stale `pos_a` when `%d` converts nothing; not copied.
+            ("%H-1 x 5 DONE;", FifoResponseKind::Unknown),
+            ("%H-1\u{a0}BUSY;", FifoResponseKind::Unknown),
+            ("%H-1 BUSY;", FifoResponseKind::Busy),
+        ] {
+            assert_eq!(
+                classify_fifo_response(&parse_fifo_line(line)),
+                kind,
+                "{line:?}"
+            );
+        }
+    }
+
+    struct Rig {
+        cmd_tx: tokio::sync::mpsc::Sender<XiaSlitActorCommand>,
+        status_rx: watch::Receiver<XiaSlitActorStatus>,
+        seen_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        /// Lines the device sends unasked.
+        unasked: tokio::sync::mpsc::UnboundedSender<String>,
+        actor: tokio::task::JoinHandle<()>,
+    }
+
+    /// The actor against a device answering the H outer-limit (`R 1`) and
+    /// origin (`R 2`) reads with `outer` and `origin`, V's with 8400 and 500,
+    /// every other register read with 0, and nothing else; `seen_rx` gets each command. Returns
+    /// once init is over.
+    async fn rig(outer: &'static str, origin: &'static str) -> Rig {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (actor_io, dev_io) = tokio::io::duplex(4096);
+        let (actor_r, actor_w) = tokio::io::split(actor_io);
+        let (dev_r, mut dev_w) = tokio::io::split(dev_io);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(line) = out_rx.recv().await {
+                let _ = dev_w.write_all(format!("{line}\r\n").as_bytes()).await;
+            }
+        });
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let replies = out_tx.clone();
+        tokio::spawn(async move {
+            let mut dev_r = tokio::io::BufReader::new(dev_r);
+            let mut buf = Vec::new();
+            while dev_r.read_until(b'\r', &mut buf).await.unwrap_or(0) > 0 {
+                let cmd = String::from_utf8_lossy(&buf).trim().to_string();
+                buf.clear();
+                let id = cmd[1..].split(' ').next().unwrap_or("").to_string();
+                let reply = match cmd.as_str() {
+                    "!H-1 R 1" => Some(outer.to_string()),
+                    "!H-1 R 2" => Some(origin.to_string()),
+                    "!V-1 R 1" => Some("%V-1 OK 8400".to_string()),
+                    "!V-1 R 2" => Some("%V-1 OK 500".to_string()),
+                    c if c.contains(" R ") => Some(format!("%{id} OK 0")),
+                    _ => None,
+                };
+                if let Some(reply) = reply {
+                    let _ = replies.send(reply);
+                }
+                let _ = seen_tx.send(cmd);
+            }
+        });
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, status_rx) = watch::channel(XiaSlitActorStatus {
+            state: XiaSlitState::Startup,
+            h_readback: SlitAxisReadback::default(),
+            v_readback: SlitAxisReadback::default(),
+            h_busy: false,
+            v_busy: false,
+            error: NO_ERROR,
+            error_msg: String::new(),
+            enabled: true,
+            h_csw: None,
+            v_csw: None,
+        });
+        let config = XiaSlitActorConfig {
+            h_id: "H-1".into(),
+            v_id: "V-1".into(),
+            h_orient: HOrient::LeftRight,
+            v_orient: VOrient::TopBottom,
+        };
+        let actor = tokio::spawn(run(config, actor_r, actor_w, cmd_rx, status_tx));
+        let mut status_rx = status_rx;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            status_rx.wait_for(|s| s.state == XiaSlitState::Idle),
+        )
+        .await
+        .expect("init did not finish")
+        .unwrap();
+        Rig {
+            cmd_tx,
+            status_rx,
+            seen_rx,
+            unasked: out_tx,
+            actor,
+        }
+    }
+
+    /// `rig`, then ask for a horizontal move: `true` when the move went out,
+    /// `false` when the soft limits refused it.
+    async fn h_move_after_init(outer: &'static str, origin: &'static str, l: f64, r: f64) -> bool {
+        let Rig {
+            cmd_tx,
+            mut status_rx,
+            mut seen_rx,
+            actor,
+            ..
+        } = rig(outer, origin).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            cmd_tx
+                .send(XiaSlitActorCommand::SetHBlades(l, r))
+                .await
+                .unwrap();
+            loop {
+                tokio::select! {
+                    cmd = seen_rx.recv() => if cmd.unwrap().starts_with("!H-1 M ") {
+                        return true;
+                    },
+                    _ = status_rx.changed() => if status_rx.borrow().error == ERROR_SOFT_LIMITS {
+                        return false;
+                    },
+                }
+            }
+        })
+        .await
+        .expect("the move neither went out nor was refused");
+        actor.abort();
+        outcome
+    }
+
+    /// glibc's `sscanf(reply, "%%%s", id)` on each row.
+    #[test]
+    fn reply_id_is_c_sscanf() {
+        for (reply, id) in [
+            ("%H1 OK;", Some("H1")),
+            (" %H1 OK;", Some("H1")),
+            ("% H1 OK;", Some("H1")),
+            ("\t%H1\r\n", Some("H1")),
+            ("%%H1", Some("%H1")),
+            ("%H1;", Some("H1;")),
+            ("%", None),
+            ("H1 OK;", None),
+            ("", None),
+        ] {
+            assert_eq!(reply_id(reply), id, "{reply:?}");
+        }
+    }
+
+    /// Before it sends a move, `start_H_move` / `start_V_move` reads the
+    /// input dry and drops each reply whose `"%%%s"` names the moving axis
+    /// (xia_slit.st:943-951, 976-984): a `DONE` left from before must not end
+    /// the new move, and the other axis's reply read with it is still
+    /// processed.
+    #[tokio::test]
+    async fn a_move_drops_the_queued_replies_for_its_axis() {
+        for (vertical, set) in [
+            (false, XiaSlitActorCommand::SetHBlades(-1.1, 2.0)),
+            (true, XiaSlitActorCommand::SetVBlades(-1.1, 2.0)),
+        ] {
+            let (moving, other) = if vertical {
+                ("V-1", "H-1")
+            } else {
+                ("H-1", "V-1")
+            };
+            let Rig {
+                cmd_tx,
+                mut status_rx,
+                mut seen_rx,
+                unasked,
+                actor,
+            } = rig("%H-1 OK 8400", "%H-1 OK 500").await;
+            let status = tokio::time::timeout(Duration::from_secs(20), async {
+                // The status after the locate that follows init has read.
+                status_rx.changed().await.unwrap();
+                for line in [
+                    format!(" %{moving} 100 200 DONE;"),
+                    format!("%{other} 300 400 DONE;"),
+                ] {
+                    unasked.send(line).unwrap();
+                }
+                cmd_tx.send(set).await.unwrap();
+                let sent = format!("!{moving} M ");
+                while !seen_rx.recv().await.unwrap().starts_with(&sent) {}
+                // The moving poll's locate and the status after its read.
+                while seen_rx.recv().await.unwrap() != "!ALL P" {}
+                status_rx.borrow_and_update();
+                status_rx.changed().await.unwrap();
+                status_rx.borrow().clone()
+            })
+            .await
+            .expect("the move or the poll after it did not go out");
+            actor.abort();
+            let (busy, moved, kept) = if vertical {
+                (status.v_busy, status.v_readback, status.h_readback)
+            } else {
+                (status.h_busy, status.h_readback, status.v_readback)
+            };
+            assert!(busy, "{moving}");
+            assert_eq!(moved.blade_a_rb, 0.0, "{moving}");
+            assert_ne!(kept.blade_a_rb, 0.0, "{moving}");
+        }
+    }
+
+    /// `"%*s %*s %d" == 1` (xia_slit.st:796-813): glibc takes `500;` as the
+    /// origin, so the left blade's low limit is `RAW_TO_DIAL(0, 500)`.
+    #[tokio::test]
+    async fn an_origin_reply_is_scanned_as_c_percent_d() {
+        assert!(h_move_after_init("%H-1 OK 8400", "%H-1 OK 500;", -1.1, 2.0).await);
+    }
+
+    /// A reply the scan cannot convert is C's `++error`, and with it the
+    /// H limits stay as they were (xia_slit.st:816).
+    #[tokio::test]
+    async fn an_unscanned_register_reply_keeps_the_old_limits() {
+        assert!(!h_move_after_init("%H-1 OK 8400", "%H-1 OK", 0.0, 15.0).await);
+    }
 
     // -- ResponseFifo tests --
 

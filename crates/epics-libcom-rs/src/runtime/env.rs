@@ -14,7 +14,9 @@
 //! `ENV_PARAM`s — C reads those with a plain `getenv` and its caller owns the
 //! fallback, so this port does too.
 
-use super::stdlib::epics_parse_double;
+use std::ffi::c_long;
+
+use super::stdlib::{epics_parse_double, scanf_long};
 
 /// One row of C's `ENV_PARAM` table (`envDefs.h:41-45`): a parameter name and
 /// the default compiled in from `configure/CONFIG_ENV`.
@@ -65,7 +67,7 @@ impl EnvParam {
     /// C's stderr line first; an *unresolvable* one (empty value and empty
     /// default) prints nothing, because `envGetConfigParam` returned NULL before
     /// `sscanf` ever ran.
-    pub fn long(&self) -> Option<i64> {
+    pub fn long(&self) -> Option<c_long> {
         let text = self.get()?;
         let text = truncate_to_c_buffer(&text);
         match sscanf_long(text) {
@@ -86,10 +88,30 @@ impl EnvParam {
     ///
     /// i.e. a rejected value leaves the compiled default standing. The `50` in
     /// C's source is a hand-copy of the table; here it comes from the table.
-    pub fn long_or_default(&self) -> i64 {
+    pub fn long_or_default(&self) -> c_long {
         self.long()
             .or_else(|| sscanf_long(self.default))
             .unwrap_or(0)
+    }
+
+    /// C `envGetInetAddrConfigParam` (`envSubr.c:247-265`) — `aToIPAddr` with
+    /// port 0 over the resolved value's first 127 bytes, keeping the address.
+    ///
+    /// `None` is C's -1. A value that does not resolve also prints C's stderr
+    /// line first; an unresolvable parameter prints nothing, as for [`Self::long`].
+    pub fn inet_addr(&self) -> Option<std::net::Ipv4Addr> {
+        let text = self.get()?;
+        let text = truncate_to_c_buffer(&text);
+        match super::socket::a_to_ip_addr(text, 0) {
+            Some((addr, _)) => Some(*addr.ip()),
+            None => {
+                crate::stderr_println!(
+                    "Unable to find an IP address or valid host name in {}={text}",
+                    self.name
+                );
+                None
+            }
+        }
     }
 
     /// C `envGetDoubleConfigParam` (`envSubr.c:191-211`) — `epicsScanDouble` over
@@ -146,23 +168,23 @@ impl EnvParam {
     /// Setting "EPICS_CA_SERVER_PORT" = 5064
     /// ```
     pub fn inet_port(&self, fallback: u16) -> u16 {
-        let mut port = match self.long() {
+        let port = match self.long() {
             Some(v) => v,
             None => {
                 crate::stderr_println!("EPICS Environment \"{}\" integer fetch failed", self.name);
                 crate::stderr_println!("setting \"{}\" = {fallback}", self.name);
-                i64::from(fallback)
+                c_long::from(fallback)
             }
         };
 
-        if port <= i64::from(IPPORT_USERRESERVED) || port > i64::from(u16::MAX) {
-            crate::stderr_println!("EPICS Environment \"{}\" out of range", self.name);
-            port = i64::from(fallback);
-            crate::stderr_println!("Setting \"{}\" = {fallback}", self.name);
+        match u16::try_from(port) {
+            Ok(port) if u32::from(port) > IPPORT_USERRESERVED => port,
+            _ => {
+                crate::stderr_println!("EPICS Environment \"{}\" out of range", self.name);
+                crate::stderr_println!("Setting \"{}\" = {fallback}", self.name);
+                fallback
+            }
         }
-
-        // Range-checked above, so the cast cannot truncate.
-        port as u16
     }
 
     /// The compiled default read as a port, at compile time.
@@ -246,36 +268,10 @@ fn truncate_to_c_buffer(raw: &str) -> &str {
     &raw[..end]
 }
 
-/// Parse the leading integer out of a string the way C `sscanf("%ld")`
-/// does: skip leading whitespace, accept an optional `+`/`-` sign, read
-/// the run of decimal digits, and ignore any trailing garbage suffix.
-///
-/// Returns `None` when no digit is found (C `sscanf` returns 0 matches).
-fn sscanf_long(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    // Skip leading whitespace (C `isspace`: space, \t, \n, \v, \f, \r).
-    while i < bytes.len() && crate::runtime::stdlib::c_isspace(bytes[i] as char) {
-        i += 1;
-    }
-    let mut neg = false;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        neg = bytes[i] == b'-';
-        i += 1;
-    }
-    let start = i;
-    let mut value: i64 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add((bytes[i] - b'0') as i64);
-        i += 1;
-    }
-    if i == start {
-        // No digits — sscanf matched nothing.
-        return None;
-    }
-    Some(if neg { -value } else { value })
+/// C `sscanf(text, "%ld", pLong) == 1` (`envSubr.c:314`), as libcom's glibc
+/// `%ld`.
+fn sscanf_long(text: &str) -> Option<c_long> {
+    scanf_long(text, 10).map(|(v, _)| v)
 }
 
 /// C `epicsPrtEnvParams` (`envSubr.c:383-392`) — every parameter EPICS Base
@@ -537,6 +533,11 @@ mod tests {
         assert_eq!(sscanf_long("not_a_number"), None);
         assert_eq!(sscanf_long(""), None);
         assert_eq!(sscanf_long("   "), None);
+        assert_eq!(sscanf_long("\u{a0}5064"), None);
+        // glibc's `%ld` is `strtol`, saturating at C `long`'s bounds.
+        if c_long::BITS == 64 {
+            assert_eq!(sscanf_long("-9223372036854775809"), Some(c_long::MIN));
+        }
     }
 
     /// C `sscanf` skips leading whitespace by `isspace`, which includes the

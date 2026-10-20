@@ -17,6 +17,7 @@
 //! from each other.
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use epics_libcom_rs::runtime::stdlib::{long_to_int, scanf_long, scanf_ulong, ulong_to_uint};
 
 /// C's `epicsStrCaseCmp(key, ...)` dispatch, as the one normalisation both
 /// halves of a driver's option interface enter through.
@@ -63,57 +64,35 @@ pub fn option_value(value: &str) -> String {
 }
 
 /// C `sscanf(val, "%d", &n)` — the grammar every numeric option key is parsed
-/// with (baud, bits on Win32).
+/// with (baud, bits on Win32), as libcom's glibc `%d`.
 ///
-/// `%d` is a *prefix* parse: it skips leading whitespace, takes an optional sign
+/// `%d` is a *prefix* parse: it skips leading `isspace`, takes an optional sign
 /// and the run of decimal digits that follows, and stops at the first character
 /// that is not one — the trailing text is left in the stream, not rejected. So C
 /// reads `"9600x"` as 9600 and `" -1 "` as -1, where Rust's `str::parse::<i32>`
 /// rejects both. `None` is C's `sscanf(...) != 1`: no digits at all, which every
-/// caller reports as [`bad_number`].
-///
-/// A digit run that overflows `int` is undefined in C; it saturates here rather
-/// than becoming a `None` that C would never produce (the caller then rejects it
-/// on its own terms — an unsupported data rate, say).
+/// caller reports as [`bad_number`]. An overflow is glibc's `(int)strtol`.
 pub fn sscanf_int(value: &str) -> Option<i32> {
-    let s = value.trim_start();
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let run: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if run.is_empty() {
-        return None;
-    }
-    let magnitude: i64 = run.parse().unwrap_or(i64::from(i32::MAX) + 1);
-    let signed = if negative { -magnitude } else { magnitude };
-    Some(signed.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+    let (v, _) = scanf_long(value, 10)?;
+    Some(long_to_int(v))
 }
 
 /// C `sscanf(val, "%u", &n)` — the grammar of the unsigned option keys (the
-/// break duration, the RS-485 RTS delays).
+/// break duration, the RS-485 RTS delays), as libcom's glibc `%u`.
 ///
-/// The same prefix parse as [`sscanf_int`] on the unsigned domain. Deviation,
-/// stated: C's `%u` accepts a leading `-` and wraps it around the unsigned
-/// range, so `"break -1"` asks C for a 4294967295 ms break. That is a C
-/// pathology, not a contract; a negative value is `None` here and the caller
-/// reports [`bad_number`], which is what C's own `sscanf` returns for every
-/// other malformed value.
+/// C defect not copied: `%u` takes a leading `-` and wraps it around the
+/// unsigned range, so `"break -1"` asks C for a 4294967295 ms (49-day) break. A
+/// negative value is `None` here and the caller reports [`bad_number`].
 pub fn sscanf_uint(value: &str) -> Option<u32> {
-    let s = value.trim_start();
-    if s.starts_with('-') {
-        return None;
-    }
-    let digits = s.strip_prefix('+').unwrap_or(s);
-    let run: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if run.is_empty() {
-        return None;
-    }
-    Some(
-        run.parse::<u64>()
-            .unwrap_or(u64::from(u32::MAX))
-            .min(u64::from(u32::MAX)) as u32,
-    )
+    sscanf_uint_prefix(value).map(|(v, _)| v)
+}
+
+/// [`sscanf_uint`] with the byte count `%u` consumed, for a format that scans
+/// on after the number.
+pub fn sscanf_uint_prefix(value: &str) -> Option<(u32, usize)> {
+    let (v, end) = scanf_ulong(value, 10)?;
+    let negative = value.as_bytes()[..end].contains(&b'-');
+    (!negative).then(|| (ulong_to_uint(v), end))
 }
 
 /// C's diagnostic for a value that carries no number at all —
@@ -293,6 +272,17 @@ mod tests {
         assert_eq!(sscanf_int("fast"), None);
         assert_eq!(sscanf_int("x9600"), None);
         assert_eq!(sscanf_int("-"), None);
+        assert_eq!(sscanf_int("\u{a0}9600"), None, "C isspace only");
+
+        // glibc stores `(int)strtol(...)`: saturated at `long`, then narrowed.
+        let lp64 = std::ffi::c_long::BITS == 64;
+        assert_eq!(
+            sscanf_int("99999999999"),
+            Some(if lp64 { 1_215_752_191 } else { i32::MAX })
+        );
+        if lp64 {
+            assert_eq!(sscanf_int("9223372036854775808"), Some(-1));
+        }
     }
 
     #[test]
@@ -304,6 +294,15 @@ mod tests {
         assert_eq!(sscanf_uint("on"), None);
         // Stated deviation from C's wrap-around %u.
         assert_eq!(sscanf_uint("-1"), None);
+        // `(unsigned)strtoul(...)`, as glibc stores it.
+        assert_eq!(
+            sscanf_uint("99999999999"),
+            Some(if std::ffi::c_long::BITS == 64 {
+                1_215_752_191
+            } else {
+                u32::MAX
+            })
+        );
     }
 
     /// One case per branch of C's three-way break rule crossed with the latch

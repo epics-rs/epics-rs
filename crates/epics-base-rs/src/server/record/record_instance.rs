@@ -900,26 +900,11 @@ fn gated(severity: i16, limit: f64) -> f64 {
 /// meaning is read back with [`AlarmSeverity::from_u16`] and the C nonzero
 /// enable with `!= 0`.
 ///
-/// A numeric value has already been wrapped to `epicsEnum16` upstream
-/// (`EpicsValue::convert_to(Enum)`, the one owner of C's double→enum cast); this
-/// only reinterprets its bit pattern. A `String` is a db-load / internal-link
-/// label (a client string put is rejected-or-resolved by `putStringMenu`
-/// upstream), resolved to its ordinal here.
+/// The value has already been typed by `coerce_common_field`: a label or
+/// index string through the one menu converter, a number wrapped to
+/// `epicsEnum16`; this only reinterprets its bit pattern.
 fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
-    match value {
-        EpicsValue::String(s) => match s.as_str_lossy().as_ref() {
-            "NO_ALARM" => 0,
-            "MINOR" => 1,
-            "MAJOR" => 2,
-            "INVALID" => 3,
-            other => other
-                .parse::<i64>()
-                .ok()
-                .map(|n| n as u16 as i16)
-                .unwrap_or(0),
-        },
-        other => other.to_f64().unwrap_or(0.0) as i64 as u16 as i16,
-    }
+    value.to_f64().unwrap_or(0.0) as i64 as u16 as i16
 }
 
 /// The STORED type of a `dbCommon` field — the variant its
@@ -931,7 +916,9 @@ fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
 /// arms take the string verbatim.
 fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option<DbFieldType> {
     Some(match name {
-        "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
+        // The analog severity menus are `epicsEnum16`; their arms read the
+        // bit pattern through `menu_ordinal_raw`.
+        "SCAN" | "SSCN" | "PINI" | "HHSV" | "HSV" | "LSV" | "LLSV" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" | "OLDSIMM" => DbFieldType::Short,
         // The analog-alarm limits and the hysteresis margin are the one row

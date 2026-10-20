@@ -55,6 +55,7 @@ use asyn_rs::sync_io::SyncIOHandle;
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_base_rs::types::c_parse;
 
 use crate::datatype::{self, ModbusDataType};
 use crate::driver::{
@@ -1621,37 +1622,14 @@ enum RegisterRun {
     StopAtFailure,
 }
 
-/// Parse a drvUser `=N` string-length suffix the way C does
-/// (drvModbusAsyn.cpp:398-404): `strtol(suffix, &endptr, 0)` then reject if
-/// `endptr[0] != '\0'` (trailing junk) or the value is negative. Base 0 means
-/// `0x`/`0X` → hex, a leading `0` → octal, otherwise decimal. An empty suffix
-/// (`TYPE=`) parses as 0, which C accepts. Returns the parsed non-negative
-/// length, or `None` if C would reject the suffix. The caller stashes the
-/// length as the per-record octet cap (C `drvUser->len`).
-fn parse_drvuser_string_len(suffix: &str) -> Option<i64> {
-    // C `strtol` skips leading whitespace and honours a leading sign; a real
-    // drvInfo carries neither, but mirror the accept set so parity holds.
-    let s = suffix.trim_start_matches([' ', '\t']);
-    if s.is_empty() {
-        // `strtol("")` returns 0 with `endptr` at the terminator → C accepts.
-        return Some(0);
-    }
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let value = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse::<i64>().ok()?
-    };
-    let value = if negative { -value } else { value };
-    (value >= 0).then_some(value)
+/// The drvUser `=N` string length (drvModbusAsyn.cpp:397-404):
+/// `int len = strtol(suffix, &endptr, 0)`, refused when `endptr[0] != '\0'`
+/// or `len < 0`. `None` is C's refusal; the caller stashes the length as the
+/// per-record octet cap (C `drvUser->len`).
+fn parse_drvuser_string_len(suffix: &str) -> Option<i32> {
+    let (v, end) = c_parse::strtol(suffix, 0);
+    let len = c_parse::long_to_int(v);
+    (end == suffix.len() && len >= 0).then_some(len)
 }
 
 impl PortDriver for ModbusPortDriver {
@@ -2377,11 +2355,11 @@ fn parse_configure_args(args: &[ArgValue]) -> Result<ConfigureArgs, String> {
         _ => Err(format!("argument {i} must be an integer")),
     };
     let dt_str = s(6)?;
+    // drvModbusAsyn.cpp:3120 `atoi`. C hands an index past the table to the
+    // constructor unchecked, which later reads `modbusDataTypes[]` out of
+    // bounds; that defect is not copied.
     let data_type = if dt_str.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        dt_str
-            .parse::<i32>()
-            .ok()
-            .and_then(ModbusDataType::from_i32)
+        ModbusDataType::from_i32(c_parse::atoi(&dt_str))
             .ok_or_else(|| format!("invalid data type index '{dt_str}'"))?
     } else {
         ModbusDataType::from_type_string(&dt_str)
@@ -4080,6 +4058,14 @@ mod tests {
         assert_eq!(parse_drvuser_string_len("5x"), None);
         assert_eq!(parse_drvuser_string_len("-3"), None);
         assert_eq!(parse_drvuser_string_len("-"), None);
+        // libcom `strtol`: C `isspace`, the glibc `0b` prefix, nothing
+        // converted leaves `endptr` at the blanks, and `len` is an `int`.
+        assert_eq!(parse_drvuser_string_len("  "), None);
+        assert_eq!(parse_drvuser_string_len("\u{0b}5"), Some(5));
+        assert_eq!(parse_drvuser_string_len("0b11"), Some(3));
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(parse_drvuser_string_len("4294967301"), Some(5));
+        }
     }
 
     /// Absolute-mode `read_int32`: the record's asyn `addr` is the absolute
@@ -7861,6 +7847,21 @@ mod tests {
             ArgValue::Int(0),
             ArgValue::Int(5),
             ArgValue::String("4".into()),
+            ArgValue::Int(0),
+        ]))
+        .unwrap()
+        .config()
+        .unwrap();
+        assert_eq!(cfg.data_type, ModbusDataType::UInt16);
+        // C `atoi` stops at the first non-digit.
+        let cfg = parse_configure_args(&args(vec![
+            ArgValue::String("P".into()),
+            ArgValue::String("O".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(4),
+            ArgValue::Int(0),
+            ArgValue::Int(5),
+            ArgValue::String("4 # UINT16".into()),
             ArgValue::Int(0),
         ]))
         .unwrap()

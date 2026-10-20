@@ -2979,21 +2979,9 @@ fn hag_members(members: &[Vec<u8>], at_load: bool) -> Vec<Vec<u8>> {
 
 /// `aToIPAddr` for one HAG host: its IPv4 dotted quad, or `None`.
 fn resolve_hag_host(m: &str) -> Option<Vec<u8>> {
-    use std::net::ToSocketAddrs;
-    match format!("{m}:0").to_socket_addrs() {
-        // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
-        // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
-        // quad. Taking `iter.next()` blindly would store an IPv6 address on a
-        // dual-stack host that resolves `::1` first (e.g. `localhost` on many
-        // CI runners) — an entry no IPv4 CA peer could ever match. A host with
-        // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
-        // C does when `aToIPAddr` yields nothing.
-        Ok(iter) => iter
-            .filter(|sa| sa.is_ipv4())
-            .map(|sa| sa.ip().to_string().into_bytes())
-            .next(),
-        Err(_) => None,
-    }
+    // C `aToIPAddr(host, 0, …)` then `"%u.%u.%u.%u"` (asLibRoutines.c:1243-1260).
+    let (addr, _) = crate::runtime::socket::a_to_ip_addr(m, 0)?;
+    Some(addr.ip().to_string().into_bytes())
 }
 
 /// asLib.y `'(' tokenSTRING ')'`: a UAG/HAG/ASG head, an `INP*` link or a
@@ -3883,6 +3871,21 @@ ASG(DEFAULT) {
             config.check_access("DEFAULT", "127.0.0.1", "alice"),
             AccessLevel::ReadWrite,
             "the peer IP matches the resolved HAG"
+        );
+    }
+
+    /// `asHagAddHost` stores what `aToIPAddr` makes of the host
+    /// (asLibRoutines.c:1243-1260): `%u` is decimal, a port is dropped, and a
+    /// bare number is a raw address.
+    #[test]
+    fn hag_host_under_as_check_client_ip_is_c_a_to_ip_addr() {
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let config = parse_acf("HAG(lab) { \"010.0.0.1\", \"1.2.3.4:5\", \"16909061\" }\n");
+        set_as_check_client_ip(false);
+        assert_eq!(
+            config.unwrap().hag[b"lab".as_slice()],
+            bs(&["10.0.0.1", "1.2.3.4", "1.2.3.5"])
         );
     }
 

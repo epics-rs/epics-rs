@@ -97,6 +97,8 @@
 
 use std::io::Write as _;
 
+use epics_base_rs::types::c_parse;
+
 use crate::cli::IntStyle;
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -479,55 +481,26 @@ pub const CA_PRIORITY_MAX: u8 = 99;
 /// precision `-e`/`-f`/`-g` will accept.
 pub const VALID_DOUBLE_DIGITS: i32 = 18;
 
-/// The digit run C's `%d`/`%u`/`%lu` conversions consume: leading
-/// whitespace, an optional `+`/`-`, then decimal digits, stopping at the
-/// first non-digit and IGNORING whatever trails (`"3x"` scans as `3`).
-/// `None` when no digit was consumed — C's `sscanf(...) != 1`.
-///
-/// The magnitude is accumulated in 64 bits (C uses `strtoul`, which clamps
-/// to `ULONG_MAX`); the caller narrows it to the width of its own format.
-fn scan_digits(s: &str) -> Option<(bool, u64)> {
-    let mut chars = s.trim_start().chars().peekable();
-    let neg = match chars.peek() {
-        Some('+') => {
-            chars.next();
-            false
-        }
-        Some('-') => {
-            chars.next();
-            true
-        }
-        _ => false,
-    };
-    let digits: String = chars.take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    Some((neg, digits.parse::<u64>().unwrap_or(u64::MAX)))
-}
-
-/// C `sscanf("%u")`: the magnitude truncates to 32 bits and a leading `-`
-/// negates modulo 2^32. Probed on the compiled C (`sscanf.c` driver):
-/// `"-1" → 4294967295`, `"99999999999" → 1215752191`, `"5000000000" →
-/// 705032704`, `"3x" → 3`, `"abc" → no conversion`.
+/// C `sscanf("%u")`: libcom's glibc `%u`, the `unsigned long` `strtoul`
+/// returns narrowed to 32 bits, so a leading `-` wraps and `"3x"` is `3`.
 pub fn scan_u32(s: &str) -> Option<u32> {
-    let (neg, mag) = scan_digits(s)?;
-    let mag = mag as u32;
-    Some(if neg { mag.wrapping_neg() } else { mag })
+    let (v, _) = c_parse::scanf_ulong(s, 10)?;
+    Some(c_parse::ulong_to_uint(v))
 }
 
-/// C `sscanf("%d")`: identical 32-bit truncation to [`scan_u32`], read as
-/// signed. Probed: `"-3" → -3`, `"5000000000" → 705032704`.
+/// C `sscanf("%d")`: libcom's glibc `%d`, `strtol`'s `long` narrowed to `int`.
 pub fn scan_i32(s: &str) -> Option<i32> {
-    scan_u32(s).map(|v| v as i32)
+    let (v, _) = c_parse::scanf_long(s, 10)?;
+    Some(c_parse::long_to_int(v))
 }
 
 /// C `sscanf("%lu")` (`camonitor.c:269`, into an `unsigned long reqElems`):
-/// 64-bit, so — unlike [`scan_u32`] — a large magnitude is NOT truncated.
-/// Probed: `"-3" → 18446744073709551613`, `"99999999999" → 99999999999`.
+/// unlike [`scan_u32`] nothing is narrowed past C's `unsigned long`.
 pub fn scan_u64(s: &str) -> Option<u64> {
-    let (neg, mag) = scan_digits(s)?;
-    Some(if neg { mag.wrapping_neg() } else { mag })
+    let (v, _) = c_parse::scanf_ulong(s, 10)?;
+    // Through u128: `c_ulong` is u64 or u32 by target, and either direct
+    // conversion is a same-type one somewhere.
+    Some(u128::from(v) as u64)
 }
 
 /// C `epicsScanDouble` (`epicsStdlib.h:203`) = `!epicsParseDouble(str, to, NULL)`.
@@ -1231,7 +1204,7 @@ mod tests {
     }
 
     /// The three C conversions differ, and the difference is observable.
-    /// Probed with a gcc driver against glibc:
+    /// Probed with a gcc driver against glibc (LP64):
     ///   "-3"          %d → -3          %u → 4294967293  %lu → 2^64-3
     ///   "5000000000"  %d → 705032704   %u → 705032704   %lu → 5000000000
     ///   "3x"          all → 3 (trailing garbage ignored)
@@ -1240,21 +1213,37 @@ mod tests {
     fn digit_scanners_match_glibc_sscanf() {
         assert_eq!(scan_i32("-3"), Some(-3));
         assert_eq!(scan_u32("-3"), Some(4_294_967_293));
-        assert_eq!(scan_u64("-3"), Some(u64::MAX - 2));
 
-        assert_eq!(scan_i32("5000000000"), Some(705_032_704));
-        assert_eq!(scan_u32("5000000000"), Some(705_032_704));
-        assert_eq!(scan_u64("5000000000"), Some(5_000_000_000));
-
-        assert_eq!(scan_u32("99999999999"), Some(1_215_752_191));
-        assert_eq!(scan_u64("99999999999"), Some(99_999_999_999));
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(scan_u64("-3"), Some(u64::MAX - 2));
+            assert_eq!(scan_i32("5000000000"), Some(705_032_704));
+            assert_eq!(scan_u32("5000000000"), Some(705_032_704));
+            assert_eq!(scan_u64("5000000000"), Some(5_000_000_000));
+            assert_eq!(scan_u32("99999999999"), Some(1_215_752_191));
+            assert_eq!(scan_u64("99999999999"), Some(99_999_999_999));
+        } else {
+            assert_eq!(scan_u64("-3"), Some(4_294_967_293));
+            assert_eq!(scan_i32("5000000000"), Some(i32::MAX));
+            assert_eq!(scan_u32("5000000000"), Some(u32::MAX));
+            assert_eq!(scan_u64("5000000000"), Some(u64::from(u32::MAX)));
+        }
 
         for s in ["3x", "  3  ", "+3"] {
             assert_eq!(scan_i32(s), Some(3), "{s}");
         }
-        for s in ["abc", "", "-", "+", "x3"] {
+        for s in ["abc", "", "-", "+", "x3", "+-1", "\u{a0}7"] {
             assert_eq!(scan_i32(s), None, "{s}");
             assert_eq!(scan_u64(s), None, "{s}");
+        }
+        assert_eq!(scan_i32("\u{0b}7"), Some(7));
+
+        // vfscanf saturates through strtol/strtoul before it narrows, so an
+        // overflow is not the low bits of the magnitude.
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(scan_i32("9223372036854775808"), Some(-1));
+            assert_eq!(scan_i32("-9223372036854775809"), Some(0));
+            assert_eq!(scan_u32("-99999999999999999999"), Some(u32::MAX));
+            assert_eq!(scan_u64("-99999999999999999999"), Some(u64::MAX));
         }
     }
 
@@ -1330,8 +1319,10 @@ mod tests {
         // camonitor's %lu keeps 64 bits where caget's %d truncates.
         let m = matches_of(&["caget", "-#", "5000000000"]);
         let cam = CTool::new("camonitor");
-        assert_eq!(cam.scan(&m).req_elems_ulong("max_elements"), 5_000_000_000);
-        assert_eq!(n(&["caget", "-#", "5000000000"]), 705_032_704);
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(cam.scan(&m).req_elems_ulong("max_elements"), 5_000_000_000);
+            assert_eq!(n(&["caget", "-#", "5000000000"]), 705_032_704);
+        }
     }
 
     /// Any non-zero level selects `ca_client_status` mode, so the `%u` wrap

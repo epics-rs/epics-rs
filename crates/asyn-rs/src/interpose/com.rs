@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 
+use crate::drivers::option_parse::{sscanf_int, sscanf_uint};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use crate::trace::TraceMask;
@@ -138,59 +139,6 @@ fn hash_hex_upper(v: i32) -> String {
     } else {
         format!("0X{v:X}")
     }
-}
-
-/// C `sscanf(val, "%d", &x)`: skip leading whitespace, take an optional sign and
-/// then a run of decimal digits, stopping at the first character that cannot
-/// continue the number. A match of zero digits is `sscanf` returning 0, i.e. C's
-/// "Bad number" branch. `"9600 baud"` therefore reads 9600, and `"abc"` reads
-/// nothing.
-///
-/// Deviation: a digit run that overflows `i32` is undefined behaviour in C; here
-/// it is rejected as "Bad number" rather than silently wrapping.
-fn scan_int(s: &str) -> Option<i32> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && epics_libcom_rs::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let start = i;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let first_digit = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == first_digit {
-        return None;
-    }
-    s[start..i].parse::<i32>().ok()
-}
-
-/// C `sscanf(val, "%u", &x)` — as [`scan_int`], into an unsigned.
-///
-/// Deviation: C's `%u` accepts a leading `-` and wraps ("-1" becomes
-/// 4294967295, which as a break length would sleep for 49 days). A negative run
-/// is rejected here as "Bad number".
-fn scan_uint(s: &str) -> Option<u32> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && epics_libcom_rs::runtime::stdlib::c_isspace(b[i] as char) {
-        i += 1;
-    }
-    let start = i;
-    if i < b.len() && b[i] == b'+' {
-        i += 1;
-    }
-    let first_digit = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == first_digit {
-        return None;
-    }
-    s[start..i].parse::<u32>().ok()
 }
 
 /// C `sscanf(val, "%g", &x)` — the longest prefix that forms a float, after
@@ -952,7 +900,7 @@ impl ComPortOptions {
             // :494-521 — the rate goes out big-endian in four bytes, and the
             // server echoes the rate it actually applied. C fails the call when
             // they differ rather than silently running at the wrong speed.
-            let Some(b) = scan_int(val) else {
+            let Some(b) = sscanf_int(val) else {
                 return Err(asyn_error("Bad number"));
             };
             let baud = b as u32;
@@ -975,7 +923,7 @@ impl ComPortOptions {
             Ok(())
         } else if key.eq_ignore_ascii_case("bits") {
             // :522-541
-            let Some(b) = scan_int(val) else {
+            let Some(b) = sscanf_int(val) else {
                 return Err(asyn_error("Bad number"));
             };
             let mut r = [0u8; 1];
@@ -1111,7 +1059,7 @@ impl ComPortOptions {
             let break_len = if val.is_empty() {
                 0
             } else {
-                let Some(n) = scan_uint(val) else {
+                let Some(n) = sscanf_uint(val) else {
                     return Err(asyn_error("Bad number"));
                 };
                 n
@@ -2260,19 +2208,23 @@ mod tests {
     /// `asynSetOption(port, "baud", "\vBAUD")` sets the baud rate on a C IOC.
     #[test]
     fn a_leading_vertical_tab_is_whitespace_as_it_is_to_c() {
-        assert_eq!(scan_int("\u{0b}9600"), Some(9600));
-        assert_eq!(scan_uint("\u{0b}250ms"), Some(250));
+        assert_eq!(sscanf_int("\u{0b}9600"), Some(9600));
+        assert_eq!(sscanf_uint("\u{0b}250ms"), Some(250));
     }
 
     #[test]
     fn scan_helpers_match_sscanf() {
-        assert_eq!(scan_int("9600"), Some(9600));
-        assert_eq!(scan_int("  -12xyz"), Some(-12));
-        assert_eq!(scan_int("+7"), Some(7));
-        assert_eq!(scan_int("abc"), None);
-        assert_eq!(scan_int(""), None);
-        assert_eq!(scan_uint("250ms"), Some(250));
-        assert_eq!(scan_uint("x"), None);
+        assert_eq!(sscanf_int("9600"), Some(9600));
+        assert_eq!(sscanf_int("  -12xyz"), Some(-12));
+        assert_eq!(sscanf_int("+7"), Some(7));
+        assert_eq!(sscanf_int("abc"), None);
+        assert_eq!(sscanf_int(""), None);
+        assert_eq!(sscanf_uint("250ms"), Some(250));
+        assert_eq!(sscanf_uint("x"), None);
+        // asynInterposeCom.c:497 `%d` stores glibc's `(int)strtol`.
+        if std::ffi::c_long::BITS == 64 {
+            assert_eq!(sscanf_int("99999999999"), Some(1_215_752_191));
+        }
         assert_eq!(scan_float("2"), Some(2.0));
         assert_eq!(scan_float("1.5abc"), Some(1.5));
         assert_eq!(scan_float("nope"), None);

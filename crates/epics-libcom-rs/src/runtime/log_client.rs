@@ -14,7 +14,7 @@
 //! missing or out-of-range environment variable.
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -190,27 +190,24 @@ fn get_config() -> Result<SocketAddr, IocLogError> {
         );
         return Err(IocLogError::NoServerConfigured);
     };
-    if !(0..=i64::from(u16::MAX)).contains(&port) {
+    let Ok(port) = u16::try_from(port) else {
         crate::stderr_println!(
             "iocLog: EPICS environment variable \"{}\" out of range",
             EPICS_IOC_LOG_PORT.name()
         );
         return Err(IocLogError::NoServerConfigured);
-    }
-    // C `envGetInetAddrConfigParam` fails on an unset or unparsable value, and
-    // `EPICS_IOC_LOG_INET`'s compiled default is empty — so an IOC that was
+    };
+    // `EPICS_IOC_LOG_INET`'s compiled default is empty, so an IOC that was
     // never told where its log server is reports the variable undefined rather
     // than connecting somewhere.
-    let inet = EPICS_IOC_LOG_INET.get().unwrap_or_default();
-    let Ok(addr) = inet.trim().parse::<Ipv4Addr>() else {
+    let Some(addr) = EPICS_IOC_LOG_INET.inet_addr() else {
         crate::stderr_println!(
             "iocLog: EPICS environment variable \"{}\" undefined",
             EPICS_IOC_LOG_INET.name()
         );
         return Err(IocLogError::NoServerConfigured);
     };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(SocketAddr::new(IpAddr::V4(addr), port as u16))
+    Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
 /// C `iocLogInit` (`iocLog.c:121-142`).
@@ -411,6 +408,32 @@ mod tests {
         assert_eq!(get_config(), Err(IocLogError::NoServerConfigured));
         unsafe {
             std::env::remove_var("EPICS_IOC_LOG_PORT");
+        }
+    }
+
+    /// `envGetInetAddrConfigParam` reads the server through `aToIPAddr` and
+    /// keeps only its address (`envSubr.c:257-262`).
+    #[test]
+    #[serial(ioc_log)]
+    fn the_inet_is_read_as_c_a_to_ip_addr() {
+        for (inet, want) in [
+            ("010.0.0.1", "10.0.0.1:7004"),
+            ("1.2.3.4:5", "1.2.3.4:7004"),
+            ("16909060", "1.2.3.4:7004"),
+            ("localhost", "127.0.0.1:7004"),
+        ] {
+            unsafe {
+                std::env::set_var("EPICS_IOC_LOG_INET", inet);
+                std::env::remove_var("EPICS_IOC_LOG_PORT");
+            }
+            assert_eq!(
+                get_config().map(|a| a.to_string()),
+                Ok(want.to_string()),
+                "{inet}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("EPICS_IOC_LOG_INET");
         }
     }
 

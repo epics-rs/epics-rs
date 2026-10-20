@@ -400,32 +400,36 @@ pub(crate) fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAdd
     }
 }
 
-/// Parse `EPICS_CAS_BEACON_ADDR_LIST` (or fall back to `EPICS_CA_ADDR_LIST`)
-/// and join every multicast group (224.0.0.0/4) on `INADDR_ANY`. Any address
-/// that isn't multicast is silently skipped. A join failure is reported and
-/// never aborts: the repeater keeps running for unicast/broadcast beacons.
+/// Read `EPICS_CAS_BEACON_ADDR_LIST` (or fall back to `EPICS_CA_ADDR_LIST`)
+/// through `addAddrToChannelAccessAddressList` and `removeDuplicateAddresses`
+/// (`repeater.cpp:545-550`), and join every multicast group (224.0.0.0/4) on
+/// `INADDR_ANY`. A join failure is reported and never aborts: the repeater
+/// keeps running for unicast/broadcast beacons.
 ///
 /// `default_port` is the repeater port C passes to
 /// `addAddrToChannelAccessAddressList` (`repeater.cpp:533-534`) and which
 /// therefore appears in the failure line, since C renders the address with
 /// `ipAddrToDottedIP` — `a.b.c.d:port` (`osiSock.c:166-169`).
 pub(crate) fn join_beacon_multicast_groups(sock: &socket2::Socket, default_port: u16, diag: Diag) {
-    let list = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST
+    use epics_base_rs::runtime::env_table::{EPICS_CA_ADDR_LIST, EPICS_CAS_BEACON_ADDR_LIST};
+    // C writes `if (!add(BEACON)) add(CA)`, and `add` returns 0 when it added
+    // something, so C takes EPICS_CA_ADDR_LIST only when the beacon list was
+    // used — the inverse of its own comment, "if no result, take
+    // CA_ADDR_LIST". That C defect is not copied.
+    let Some((list, param)) = EPICS_CAS_BEACON_ADDR_LIST
         .get()
-        .or_else(|| epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get());
-    let Some(list) = list else {
+        .map(|l| (l, EPICS_CAS_BEACON_ADDR_LIST))
+        .or_else(|| EPICS_CA_ADDR_LIST.get().map(|l| (l, EPICS_CA_ADDR_LIST)))
+    else {
         return;
     };
-    for token in list.split_whitespace() {
-        // Split the optional :port suffix; the address decides whether we
-        // join, the port only spells the diagnostic the way C does.
-        let (host, port) = match token.rsplit_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().unwrap_or(default_port)),
-            None => (token, default_port),
-        };
-        let Ok(addr) = host.parse::<Ipv4Addr>() else {
+    let tokens =
+        crate::iocinf::add_addr_to_channel_access_address_list(&list, param.name(), default_port);
+    for token in crate::iocinf::remove_duplicate_addresses(tokens, |t| t.sock) {
+        let SocketAddr::V4(group) = token.sock else {
             continue;
         };
+        let (addr, port) = (*group.ip(), group.port());
         if !addr.is_multicast() {
             continue;
         }
@@ -933,6 +937,43 @@ mod tests {
         assert_eq!(
             reason,
             sock_err_string(&io::Error::from_raw_os_error(libc::EADDRINUSE))
+        );
+    }
+    /// The beacon list is read by `addAddrToChannelAccessAddressList`
+    /// (repeater.cpp:545-550), so a group is any `aToIPAddr` form: `%u` is
+    /// decimal and a bare number is a raw address. Each is seen joined by
+    /// the second join failing.
+    #[test]
+    fn beacon_groups_are_read_as_c_a_to_ip_addr() {
+        use std::sync::{Arc, Mutex};
+
+        // 224.0.2.4 with a leading zero, and 224.0.2.7 as a raw number.
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "0224.0.2.4 3758096903") };
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
+            if let Some(rest) = line.strip_prefix("caR: Socket mcast join to ") {
+                sink.lock()
+                    .expect("errlog sink")
+                    .push(rest.split(' ').next().unwrap_or("").to_string());
+            }
+        });
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("probe socket");
+        join_beacon_multicast_groups(&sock, 5065, Diag::new(0));
+        join_beacon_multicast_groups(&sock, 5065, Diag::new(0));
+        epics_base_rs::runtime::log::errlog_flush();
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+
+        assert_eq!(
+            *seen.lock().expect("errlog sink"),
+            ["224.0.2.4:5065", "224.0.2.7:5065"]
         );
     }
 }

@@ -1765,22 +1765,6 @@ fn compute_mask_shift(mask: u32) -> u32 {
     32
 }
 
-/// Parse an `info(...)` tag value as a boolean.
-///
-/// Truthy: non-empty and not `0` / `no` / `false` (case-insensitive).
-/// Mirrors the broader EPICS convention; C asyn uses `atoi` directly
-/// (`devAsynInt32.c:330` — `enableCallbacks = atoi(callbackString)`),
-/// which only treats `"0"` / non-numeric as falsey. Our parse is a
-/// strict superset for the documented `"1"` / `"0"` values and
-/// additionally accepts the human-friendly `"Y"` / `"true"` forms.
-fn parse_info_bool(raw: &str) -> bool {
-    let v = raw.trim();
-    !v.is_empty()
-        && !v.eq_ignore_ascii_case("0")
-        && !v.eq_ignore_ascii_case("no")
-        && !v.eq_ignore_ascii_case("false")
-}
-
 fn asyn_to_ca_error(e: AsynError) -> CaError {
     CaError::Protocol(e.to_string())
 }
@@ -4717,16 +4701,11 @@ impl DeviceSupport for AsynDeviceSupport {
         // `asynDbGetInfo(pr, "asyn:INITIAL_READBACK")` at
         // devAsynInt32.c:329, devAsynFloat64.c:218,
         // devAsynInt64.c:257, devAsynUInt32Digital.c:286,
-        // devAsynOctet.c:337+357, devAsynXXXArray.cpp:172.
-        // C semantics: a non-NULL info-string is fed through `atoi`,
-        // any non-zero numeric result enables the flag — which means
-        // "0", "0x0", "00" disable; "1", "Y" (atoi → 0!), garbage
-        // strings (atoi → 0) disable. We use the broader EPICS-style
-        // "truthy / falsey" parse here so values like "Y" or "true"
-        // also work (they would NOT work under strict atoi parity,
-        // but the broader parse is a strict superset for "1" / "0").
+        // devAsynOctet.c:337+357, devAsynXXXArray.cpp:172: each is
+        // `atoi(...)`, and only a non-zero result enables.
+        use epics_base_rs::types::c_parse::atoi;
         if let Some(raw) = info.get("asyn:READBACK") {
-            self.set_asyn_readback(parse_info_bool(raw));
+            self.set_asyn_readback(atoi(raw) != 0);
         }
         // The scalar outputs read at init whatever it says, and no input or
         // array dset reads at all.
@@ -4734,7 +4713,7 @@ impl DeviceSupport for AsynDeviceSupport {
             .get("asyn:INITIAL_READBACK")
             .filter(|_| self.output && self.dset == Dset::Octet)
         {
-            self.set_initial_readback(parse_info_bool(raw));
+            self.set_initial_readback(atoi(raw) != 0);
         }
         // `ringSize = atoi(sizeString)` (devAsynInt32.c:361-362): text that
         // is no number is 0. A negative size crashes C (a NULL or negative
@@ -11435,6 +11414,41 @@ mod tests {
             assert!(
                 ads.io_intr_receiver().is_none(),
                 "value {falsey:?} must not enable readback"
+            );
+        }
+    }
+
+    /// Both tags are `atoi(...) != 0` (devAsynInt32.c:330, devAsynOctet.c:338,
+    /// :358): a word is 0, and a number may carry blanks, a sign and a tail.
+    #[test]
+    fn readback_tags_are_c_atoi() {
+        let mut rows = vec![
+            ("1", true),
+            (" 1", true),
+            ("\u{b}+2", true),
+            ("-1", true),
+            ("1x", true),
+            ("Y", false),
+            ("true", false),
+            ("on", false),
+            ("00", false),
+            ("0x1", false),
+            ("0.5", false),
+        ];
+        // glibc's (int)strtol keeps the low 32 bits where long is 64.
+        rows.push(("4294967296", std::ffi::c_long::BITS != 64));
+        let mut ads = make_adapter(ScanType::Passive);
+        (ads.output, ads.dset) = (true, Dset::Octet);
+        for (raw, want) in rows {
+            let info = std::collections::HashMap::from([
+                ("asyn:READBACK".to_string(), raw.to_string()),
+                ("asyn:INITIAL_READBACK".to_string(), raw.to_string()),
+            ]);
+            ads.apply_record_info(&info);
+            assert_eq!(
+                (ads.asyn_readback, ads.initial_readback),
+                (want, want),
+                "{raw:?}"
             );
         }
     }

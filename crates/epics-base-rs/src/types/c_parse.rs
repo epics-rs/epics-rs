@@ -46,8 +46,8 @@
 
 use crate::error::{CaError, CaResult};
 pub use crate::runtime::stdlib::{
-    atoi, atol, long_to_int, strtol, strtol_errno, strtoll, strtoll_errno, strtoul, strtoul_auto,
-    strtoul_errno, strtoull, strtoull_errno, ulong_to_uint,
+    atoi, atol, long_to_int, scanf_long, scanf_ulong, strtol, strtol_errno, strtoll, strtoll_errno,
+    strtoul, strtoul_auto, strtoul_errno, strtoull, strtoull_errno, ulong_to_uint,
 };
 use crate::types::{DbFieldType, EpicsValue};
 use std::ffi::{c_long, c_ulong};

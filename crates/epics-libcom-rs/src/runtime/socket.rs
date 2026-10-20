@@ -64,7 +64,7 @@
 //! rather than papering over it.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 
 /// Options applied to a fresh socket around its bind (see the module docs).
@@ -351,6 +351,98 @@ pub fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
 /// one, so it may be `0` or left over from an earlier call, as it is in C.
 pub fn host_to_ip_addr(name: &str) -> Result<Ipv4Addr, io::Error> {
     sys::host_to_ip_addr(name)
+}
+
+/// C `aToIPAddr` (`aToIPAddr.c:75-194`): its six `sscanf` patterns in C's
+/// order — dotted quad, quad `:` port, raw number, raw number `:` port, host
+/// name, host name `:` port. `%u` is decimal and wraps as glibc's
+/// `(unsigned) strtoul`, so `010.0.0.1` is 10.0.0.1, and on LP64 a port of
+/// 2^32+N is N. The second member is the host name when the address came from
+/// [`host_to_ip_addr`], for a caller that re-resolves it.
+pub fn a_to_ip_addr(s: &str, default_port: u16) -> Option<(SocketAddrV4, Option<&str>)> {
+    use super::stdlib::{c_isspace, scanf_ulong, ulong_to_uint};
+    use std::ffi::c_ulong;
+
+    fn blank(s: &str) -> bool {
+        s.trim_start_matches(c_isspace).is_empty()
+    }
+    /// A whitespace directive, then a literal character.
+    fn lit(s: &str, c: char) -> Option<&str> {
+        s.trim_start_matches(c_isspace).strip_prefix(c)
+    }
+    fn lu(s: &str) -> Option<(c_ulong, &str)> {
+        scanf_ulong(s, 10).map(|(v, end)| (v, &s[end..]))
+    }
+    fn u(s: &str) -> Option<(u32, &str)> {
+        lu(s).map(|(v, rest)| (ulong_to_uint(v), rest))
+    }
+    /// `addrArrayToUL` refuses a part above 0xff, after all four are read.
+    fn quad(s: &str) -> Option<(Option<Ipv4Addr>, &str)> {
+        let (a, s) = u(s)?;
+        let (b, s) = u(lit(s, '.')?)?;
+        let (c, s) = u(lit(s, '.')?)?;
+        let (d, s) = u(lit(s, '.')?)?;
+        let part = |p: u32| u8::try_from(p).ok();
+        let ip = (|| Some(Ipv4Addr::new(part(a)?, part(b)?, part(c)?, part(d)?)))();
+        Some((ip, s))
+    }
+    /// A raw address above 0xffffffff is refused; where `long` is 32 bits,
+    /// `strtoul` saturated at 0xffffffff instead.
+    fn raw(v: c_ulong) -> Option<Ipv4Addr> {
+        u32::try_from(u128::from(v)).ok().map(Ipv4Addr::from)
+    }
+    /// `initIPAddr` refuses a port above 0xffff.
+    fn sock(ip: Ipv4Addr, port: u32, name: Option<&str>) -> Option<(SocketAddrV4, Option<&str>)> {
+        Some((SocketAddrV4::new(ip, u16::try_from(port).ok()?), name))
+    }
+
+    // " %u . %u . %u . %u %7s " == 4, then " %u . %u . %u . %u : %u %7s" >= 5,
+    // where a sixth conversion is detritus and the end.
+    if let Some((ip, rest)) = quad(s) {
+        if blank(rest) {
+            return sock(ip?, default_port.into(), None);
+        }
+        if let Some((port, rest)) = lit(rest, ':').and_then(u) {
+            return if blank(rest) {
+                sock(ip?, port, None)
+            } else {
+                None
+            };
+        }
+    }
+    // " %lu %7s " == 1, then " %lu : %u %7s " >= 2.
+    if let Some((v, rest)) = lu(s) {
+        if blank(rest) {
+            return sock(raw(v)?, default_port.into(), None);
+        }
+        if let Some((port, rest)) = lit(rest, ':').and_then(u) {
+            return if blank(rest) {
+                sock(raw(v)?, port, None)
+            } else {
+                None
+            };
+        }
+    }
+    // " %511[^:] %s " == 1, then " %511[^:] : %u %s " >= 2; a name that does
+    // not resolve in the first falls through to the second.
+    let s = s.trim_start_matches(c_isspace);
+    let end = s.find(':').unwrap_or(s.len()).min(511);
+    // Cut inside a character, the rest starts with a byte `%s` takes and `:`
+    // does not match, so neither pattern can succeed.
+    if end == 0 || !s.is_char_boundary(end) {
+        return None;
+    }
+    let (name, rest) = s.split_at(end);
+    if blank(rest) {
+        if let Ok(ip) = host_to_ip_addr(name) {
+            return sock(ip, default_port.into(), Some(name));
+        }
+    }
+    let (port, rest) = u(lit(rest, ':')?)?;
+    if !blank(rest) {
+        return None;
+    }
+    sock(host_to_ip_addr(name).ok()?, port, Some(name))
 }
 
 /// [`host_to_ip_addr`] through `std`'s resolver, for the targets whose C
@@ -955,6 +1047,53 @@ mod tests {
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// Rows from libCom's own `aToIPAddr` with default port 5064.
+    #[test]
+    fn a_to_ip_addr_is_c_sscanf() {
+        let mut rows = vec![
+            ("010.0.0.1", Some("10.0.0.1:5064")),
+            ("1.2.3.4:5", Some("1.2.3.4:5")),
+            (" 1 . 2 . 3 . 4 ", Some("1.2.3.4:5064")),
+            ("1.2.3.4 : 5064", Some("1.2.3.4:5064")),
+            ("1.2.3.4 :5", Some("1.2.3.4:5")),
+            ("1.2.3.4:+5", Some("1.2.3.4:5")),
+            ("1.2.3.4:65535", Some("1.2.3.4:65535")),
+            ("1.2.3.4:65536", None),
+            ("1.2.3.4:5064x", None),
+            ("1.2.3.4:5 6", None),
+            ("1.2.3.4:", None),
+            ("1.2.3.256", None),
+            ("-1.2.3.4", None),
+            ("16909060", Some("1.2.3.4:5064")),
+            ("16909060:5064", Some("1.2.3.4:5064")),
+            ("4294967295", Some("255.255.255.255:5064")),
+            ("localhost", Some("127.0.0.1:5064")),
+            (" localhost", Some("127.0.0.1:5064")),
+            ("localhost:5065", Some("127.0.0.1:5065")),
+            ("localhost:5065 x", None),
+            ("localhost:-1", None),
+            ("::1", None),
+            ("fe80::1", None),
+            ("", None),
+        ];
+        if std::ffi::c_ulong::BITS == 64 {
+            rows.extend([
+                ("1.2.3.4:4294972360", Some("1.2.3.4:5064")),
+                ("4294967306.0.0.1", Some("10.0.0.1:5064")),
+                ("-4294967286.0.0.1", Some("10.0.0.1:5064")),
+                ("4294967296", None),
+                ("16909060:4294972360", Some("1.2.3.4:5064")),
+                ("localhost:4294972360", Some("127.0.0.1:5064")),
+            ]);
+        }
+        for (s, want) in rows {
+            let got = a_to_ip_addr(s, 5064).map(|(a, _)| a.to_string());
+            assert_eq!(got.as_deref(), want, "{s:?}");
+        }
+        assert_eq!(a_to_ip_addr(" localhost", 0).unwrap().1, Some("localhost"));
+        assert_eq!(a_to_ip_addr("16909060:1", 0).unwrap().1, None);
     }
 
     /// Read the flag back off the socket, because "the call returned `Ok`" and

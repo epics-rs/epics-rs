@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::runtime::socket;
 
-use super::option_parse::{invalid_option_value, parse_yn_option};
+use super::option_parse::{invalid_option_value, parse_yn_option, sscanf_int};
 use super::wait_millis;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -233,17 +233,10 @@ fn parse_host_port(addr_part: &str, orig_spec: &str) -> AsynResult<(String, u16,
             message: format!("expected ':port' after IPv6 bracket: '{orig_spec}'"),
         })?;
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
-        let port: u16 = parts[0].parse().map_err(|_| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("invalid port number: '{}'", parts[0]),
-        })?;
-        let local_port = if parts.len() > 1 {
-            Some(parts[1].parse::<u16>().map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("invalid local port: '{}'", parts[1]),
-            })?)
-        } else {
-            None
+        let port = scan_port(parts[0], "port number")?;
+        let local_port = match parts.get(1) {
+            Some(p) => Some(scan_port(p, "local port")?),
+            None => None,
         };
         return Ok((host, port, local_port));
     }
@@ -265,21 +258,26 @@ fn parse_host_port(addr_part: &str, orig_spec: &str) -> AsynResult<(String, u16,
         });
     }
 
-    let port: u16 = parts[1].parse().map_err(|_| AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("invalid port number: '{}'", parts[1]),
-    })?;
-
-    let local_port = if parts.len() > 2 {
-        Some(parts[2].parse::<u16>().map_err(|_| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("invalid local port: '{}'", parts[2]),
-        })?)
-    } else {
-        None
+    let port = scan_port(parts[1], "port number")?;
+    let local_port = match parts.get(2) {
+        Some(p) => Some(scan_port(p, "local port")?),
+        None => None,
     };
 
     Ok((host, port, local_port))
+}
+
+/// C `sscanf(cp, ":%d", &port)` (drvAsynIPPort.c:334, :340), after the colon.
+///
+/// C defect not copied: C hands the `int` to `htons`, so port 70000 connects
+/// to 4464 and -1 to 65535. A value outside `u16` is refused here.
+fn scan_port(text: &str, what: &str) -> AsynResult<u16> {
+    sscanf_int(text)
+        .and_then(|v| u16::try_from(v).ok())
+        .ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("invalid {what}: '{text}'"),
+        })
 }
 
 /// Internal I/O state holding the transport socket.
@@ -2268,6 +2266,35 @@ mod tests {
     #[test]
     fn test_parse_invalid_port_number() {
         assert!(IpPortConfig::parse("host:abc").is_err());
+    }
+
+    /// Both ports are C `sscanf(cp, ":%d")` (drvAsynIPPort.c:334, :340): a
+    /// prefix scan that skips whitespace and takes a sign.
+    #[test]
+    fn ports_are_read_as_c_percent_d() {
+        let ports = |spec: &str| {
+            IpPortConfig::parse(spec)
+                .map(|c| (c.port, c.local_port))
+                .map_err(|_| ())
+        };
+        assert_eq!(ports("host:5025x"), Ok((5025, None)));
+        assert_eq!(ports("host:+5025:6000x"), Ok((5025, Some(6000))));
+        assert_eq!(ports("host:\t5025"), Ok((5025, None)));
+        assert_eq!(ports("host:5025x:6000:7"), Ok((5025, Some(6000))));
+        assert_eq!(ports("[::1]:5025x:6000x"), Ok((5025, Some(6000))));
+        if std::ffi::c_long::BITS == 64 {
+            // glibc's (int)strtol keeps the low 32 bits.
+            assert_eq!(ports("host:4294972321"), Ok((5025, None)));
+        }
+        for bad in [
+            "host:5025:",
+            "host:x5025",
+            "host:70000",
+            "host:-1",
+            "host:5025:-1",
+        ] {
+            assert_eq!(ports(bad), Err(()), "{bad}");
+        }
     }
 
     #[test]

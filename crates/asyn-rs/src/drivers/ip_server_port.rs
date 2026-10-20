@@ -64,7 +64,7 @@ use crate::drivers::ip_port::{
     BoundNextRead, DrvAsynIPPort, OWNED_NONBLOCKING, is_nonfatal_read_timeout, maxchars_zero_error,
     nonblock_failure_text, socket_poll_timeout, write_with_retry,
 };
-use crate::drivers::option_parse::parse_yn_option;
+use crate::drivers::option_parse::{parse_yn_option, sscanf_uint_prefix};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interfaces::InterfaceType;
@@ -166,49 +166,58 @@ pub struct IpServerConfig {
 impl IpServerConfig {
     /// Parse a `drvAsynIPServerPortConfigure`-style spec.
     ///
-    /// Syntax: `"host:port [tcp|udp]"`. Matches C `sscanf(":%u %5s",
-    /// &portNumber, protocol)` in `drvAsynIPServerPort.c:603`; only
-    /// `tcp` (default) and `udp` are accepted. Unknown trailing
-    /// tokens are rejected. The host may be IPv4 (`0.0.0.0`,
-    /// `127.0.0.1`, or specific NIC IP); IPv6 bracket form
-    /// `[::]:port` is also accepted.
+    /// Syntax: `"host:port [tcp|udp]"`, read as C reads it: the host up to the
+    /// first colon, then `sscanf(cp, ":%u %5s", &portNumber, protocol)`
+    /// (`drvAsynIPServerPort.c:602-603`), so `"host:5025udp"` is UDP. Only
+    /// `tcp` (default) and `udp` are accepted (:612-621). The IPv6 bracket form
+    /// `[::]:port` is an rs addition.
     pub fn parse(spec: &str) -> AsynResult<Self> {
         let trimmed = spec.trim();
-        let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.is_empty() {
-            return Err(AsynError::Status {
+        let (host, after) = if let Some(rest) = trimmed.strip_prefix('[') {
+            let end = rest.find(']').ok_or_else(|| AsynError::Status {
                 status: AsynStatus::Error,
-                message: "empty IP server port spec".into(),
-            });
-        }
+                message: format!("missing closing bracket in IPv6 address: '{spec}'"),
+            })?;
+            let after = rest[end + 1..]
+                .strip_prefix(':')
+                .ok_or_else(|| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("missing port after bracketed IPv6 address: '{spec}'"),
+                })?;
+            (&rest[..end], after)
+        } else {
+            trimmed.split_once(':').ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("missing port in '{spec}' (expected host:port)"),
+            })?
+        };
+        let invalid_port = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("invalid port in '{spec}'"),
+        };
+        let (port, end) = sscanf_uint_prefix(after).ok_or_else(invalid_port)?;
+        // C defect not copied: `htons(tty->portNumber)` (:422) truncates, so
+        // 70000 binds 4464. A value outside `u16` is refused.
+        let port = u16::try_from(port).map_err(|_| invalid_port())?;
 
-        let mut protocol = IpServerProtocol::Tcp;
-        // Strip the optional protocol token from the tail. C asyn
-        // accepts only `tcp` / `udp` (case-insensitive); anything
-        // else is rejected — see drvAsynIPServerPort.c:612-621.
-        if tokens.len() == 2 {
-            let last = tokens.last().unwrap().to_ascii_uppercase();
-            match last.as_str() {
-                "TCP" => {
-                    protocol = IpServerProtocol::Tcp;
-                    tokens.pop();
-                }
-                "UDP" => {
-                    protocol = IpServerProtocol::Udp;
-                    tokens.pop();
-                }
+        // `" %5s"`: the next whitespace-delimited run, which may touch the port.
+        let mut rest = after[end..].split_whitespace();
+        let protocol = match rest.next() {
+            None => IpServerProtocol::Tcp,
+            Some(token) => match token.to_ascii_lowercase().as_str() {
+                "tcp" => IpServerProtocol::Tcp,
+                "udp" => IpServerProtocol::Udp,
                 _ => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!(
-                            "unknown protocol token '{}' in '{spec}' (expected tcp or udp)",
-                            tokens.last().unwrap()
+                            "unknown protocol token '{token}' in '{spec}' (expected tcp or udp)"
                         ),
                     });
                 }
-            }
-        }
-        if tokens.len() != 1 {
+            },
+        };
+        if rest.next().is_some() {
             // Intentionally stricter than C: `sscanf(":%u %5s", ...)`
             // (drvAsynIPServerPort.c:603) reads the port and one protocol
             // token and silently ignores any trailing garbage. Rejecting
@@ -219,44 +228,9 @@ impl IpServerConfig {
                 message: format!("unexpected tokens after host:port in '{spec}'"),
             });
         }
-        let addr_part = tokens[0];
-
-        // Reuse the host:port parser shape from ip_port — we accept
-        // IPv6 bracket form too.
-        let (host, port) = if let Some(rest) = addr_part.strip_prefix('[') {
-            let end = rest.find(']').ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("missing closing bracket in IPv6 address: '{spec}'"),
-            })?;
-            let host = rest[..end].to_string();
-            let port_part = rest[end + 1..]
-                .strip_prefix(':')
-                .ok_or_else(|| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("missing port after bracketed IPv6 address: '{spec}'"),
-                })?;
-            let port: u16 = port_part.parse().map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("invalid port in '{spec}'"),
-            })?;
-            (host, port)
-        } else {
-            let (host, port_part) =
-                addr_part
-                    .rsplit_once(':')
-                    .ok_or_else(|| AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("missing port in '{spec}' (expected host:port)"),
-                    })?;
-            let port: u16 = port_part.parse().map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("invalid port in '{spec}'"),
-            })?;
-            (host.to_string(), port)
-        };
 
         Ok(Self {
-            bind_host: host,
+            bind_host: host.to_string(),
             bind_port: port,
             protocol,
             max_clients: DEFAULT_MAX_CLIENTS,
@@ -3427,6 +3401,45 @@ mod tests {
     #[test]
     fn parse_rejects_missing_port() {
         assert!(IpServerConfig::parse("0.0.0.0").is_err());
+    }
+
+    /// C `sscanf(cp, ":%u %5s")` after the first colon (drvAsynIPServerPort.c:
+    /// 602-603): `%u` is a prefix scan and `' '` matches no blank at all, so
+    /// the protocol may touch the number.
+    #[test]
+    fn parse_reads_port_and_protocol_as_c_sscanf() {
+        let read = |spec: &str| {
+            IpServerConfig::parse(spec)
+                .map(|c| (c.bind_host, c.bind_port, c.protocol))
+                .map_err(|_| ())
+        };
+        let ok = |host: &str, port, protocol| Ok((host.to_string(), port, protocol));
+        assert_eq!(
+            read("host:5025udp"),
+            ok("host", 5025, IpServerProtocol::Udp)
+        );
+        assert_eq!(read("host: 5025"), ok("host", 5025, IpServerProtocol::Tcp));
+        assert_eq!(
+            read("host:+5025 UDP"),
+            ok("host", 5025, IpServerProtocol::Udp)
+        );
+        if std::ffi::c_ulong::BITS == 64 {
+            // glibc's (unsigned)strtoul keeps the low 32 bits.
+            assert_eq!(
+                read("host:4294972321"),
+                ok("host", 5025, IpServerProtocol::Tcp)
+            );
+        }
+        for bad in [
+            "host:5025x",
+            "host:5025:6000",
+            "host:",
+            "host:x",
+            "host:-1",
+            "host:70000",
+        ] {
+            assert_eq!(read(bad), Err(()), "{bad}");
+        }
     }
 
     #[test]

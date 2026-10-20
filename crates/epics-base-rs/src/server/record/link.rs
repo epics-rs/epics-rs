@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use crate::error::{CaError, CaResult, CalcSaid, LinkRefusal, LinkWhy};
 use crate::runtime::json_string::{decode_json_string, decode_json_string_token};
+use crate::runtime::stdlib::{c_isspace, scanf_long};
 use crate::server::database::LinkSerial;
 use crate::server::recgbl::ReportString;
 use crate::server::record::AlarmSeverity;
@@ -4101,7 +4102,7 @@ fn hw_scan(text: &str) -> Option<HwLink> {
     loop {
         // The literal blank in C's format matches any run of whitespace,
         // including none — which is why `#C1S2` is a valid VME link.
-        rest = rest.trim_start();
+        rest = rest.trim_start_matches(c_isspace);
         if rest.is_empty() {
             break;
         }
@@ -4115,11 +4116,11 @@ fn hw_scan(text: &str) -> Option<HwLink> {
         // decides, and no bus name contains a non-letter.
         let id = chars.next()?;
         // A letter with no number is C's odd `ret`.
-        let (value, after) = scan_c_integer(chars.as_str())?;
-        nums[count] = value;
+        let (value, end) = scanf_long(chars.as_str(), 0)?;
+        nums[count] = i64::from(value);
         count += 1;
         hwid.push(id);
-        rest = after;
+        rest = &chars.as_str()[end..];
     }
 
     // C narrows `int hwnums[]` to the width of the destination member, and
@@ -4190,51 +4191,6 @@ fn hw_scan(text: &str) -> Option<HwLink> {
         },
         _ => return None,
     })
-}
-
-/// One `%i` conversion: leading whitespace, an optional sign, then the
-/// longest `strtol`-base-0 prefix — `0x`/`0X` hex, a leading `0` octal,
-/// otherwise decimal. Returns the value and the text after it, because `%i`
-/// stops at the first character that cannot continue the number and C's
-/// format resumes scanning right there.
-///
-/// A digit run too long for the destination is C's undefined behaviour
-/// (`%i` overflowing an `int`); it saturates here so the syntax still
-/// parses, and the narrowing to the bus member decides what is stored.
-fn scan_c_integer(s: &str) -> Option<(i64, &str)> {
-    let s = s.trim_start();
-    let (negative, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) = if let Some(hex) = body
-        .strip_prefix("0x")
-        .or_else(|| body.strip_prefix("0X"))
-        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
-    {
-        (16, hex)
-    } else if let Some(octal) = body.strip_prefix('0') {
-        (8, octal)
-    } else {
-        (10, body)
-    };
-    let end = digits
-        .find(|c: char| !c.is_digit(radix))
-        .unwrap_or(digits.len());
-    if end == 0 {
-        // `strtol` has already consumed the leading `0` as the value, so
-        // `#C0S1` is card 0 and `#C0x` is card 0 followed by junk.
-        return if radix == 8 { Some((0, digits)) } else { None };
-    }
-    let magnitude = i64::from_str_radix(&digits[..end], radix).unwrap_or(i64::MAX);
-    Some((
-        if negative {
-            magnitude.wrapping_neg()
-        } else {
-            magnitude
-        },
-        &digits[end..],
-    ))
 }
 
 /// The **one** process-class modifier a link carries.
@@ -5156,6 +5112,17 @@ mod json_link_tests {
             }
         );
         assert_eq!(hw("#V7 S3 @p").render(), "#V7 S3 @p");
+    }
+
+    /// `%i` is glibc's under EPICS's `_GNU_SOURCE`: the C23 `0b` prefix
+    /// counts, and a bare `0x`/`0b` is consumed with its `0` (measured on
+    /// glibc 2.39: `#C0xS2` scans C=0 S=2).
+    #[test]
+    fn a_hw_number_is_glibc_scanf_i() {
+        assert_eq!(hw("#C0b11 S2").render(), "#C3 S2 @");
+        assert_eq!(hw("#C0xS2").render(), "#C0 S2 @");
+        assert_eq!(hw("#C-0b S2").render(), "#C0 S2 @");
+        assert_eq!(parse_link_v2("#C\u{a0}1 S2"), ParsedLink::None);
     }
 
     #[test]

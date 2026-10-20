@@ -230,24 +230,13 @@ impl PvList {
     /// service). Mirrors C ca-gateway's `aToIPAddr` pass at pvlist load
     /// time (`gateAs.cc:488–509`):
     ///
-    /// - Tokens that are already **IPv4**-address literals are kept verbatim.
-    ///   IPv6 literals are dropped, mirroring C `aToIPAddr` (which parses only
-    ///   IPv4 forms and rejects a `:`-leading literal): C never creates a
-    ///   host-scoped deny for any IPv6 address. A dropped IPv6 literal is
-    ///   treated like an unresolvable host (collapses to a global deny when it
-    ///   is the rule's only token).
-    /// - Hostnames are resolved via `tokio::net::lookup_host` and reduced to a
-    ///   **single IPv4 address — the first one returned**. C ca-gateway resolves
-    ///   each DENY FROM token through `aToIPAddr` → `hostToIPAddr`, which sets
-    ///   an `AF_INET` hint and breaks after the first `getaddrinfo` result
-    ///   (`osdSock.c:250-267`), then stores exactly one dotted-decimal IPv4
-    ///   address (`gateAs.cc:493-503`). Expanding a multi-homed name into one
-    ///   entry per address — including secondary A records and IPv6 — would
-    ///   deny strictly more peers than C, so we keep only the first IPv4 to
-    ///   match C's single-address selection. A name with no IPv4 record
-    ///   resolves to nothing in C (the `AF_INET` lookup fails) and is dropped
-    ///   here for the same reason.
-    /// - A hostname that fails to resolve is logged at `WARN` level and
+    /// - Each token goes through libcom `aToIPAddr` with port 0 and is stored as
+    ///   the dotted IPv4 address `ipAddrToDottedIP` prints, its `:port` cut off
+    ///   (`gateAs.cc:489-496`). So `010.0.0.1` is stored as `10.0.0.1`,
+    ///   `1.2.3.4:5` as `1.2.3.4`, and a host name as the first IPv4 address
+    ///   `hostToIPAddr`'s `AF_INET` lookup returns. An IPv6 literal is no
+    ///   `aToIPAddr` form, so C never builds a host-scoped deny for one.
+    /// - A token `aToIPAddr` refuses is logged at `WARN` level and
     ///   dropped from this rule's host set, mirroring C's pass-1 omission
     ///   (`gateAs.cc:504-507` — the unresolved host is simply not appended).
     ///   If a rule's hosts **all** fail to resolve, its `from_hosts` ends
@@ -267,62 +256,25 @@ impl PvList {
                 }
                 let tokens = std::mem::take(from_hosts);
                 for token in tokens {
-                    // Already an IPv4 literal? Preserve verbatim. C
-                    // `aToIPAddr` (libcom aToIPAddr.c:97-173) parses only
-                    // dotted/raw IPv4 forms; its host-name fallback uses
-                    // `sscanf("%511[^:]")`, which matches zero characters for
-                    // a `:`-leading IPv6 literal, so `aToIPAddr("::1")` fails
-                    // outright. The `from_hosts` invariant after this pass is
-                    // "IPv4 dotted strings only".
-                    if token.parse::<std::net::Ipv4Addr>().is_ok() {
-                        from_hosts.push(token);
-                        continue;
-                    }
-                    // An IPv6 literal is NOT a usable host-scoped deny in C:
-                    // `aToIPAddr` rejects it (above) and the `hostToIPAddr`
-                    // fallback is AF_INET-only (osdSock.c:250-267), so C never
-                    // builds a scoped deny for any IPv6 address. Treat it
-                    // exactly like C's `aToIPAddr` failure — drop the token; if
-                    // it is the rule's only host the rule collapses to a global
-                    // deny (gateAs.cc:540-556).
-                    if token.parse::<std::net::IpAddr>().is_ok() {
-                        tracing::warn!(
-                            host = %token,
-                            "pvlist DENY FROM: IPv6 literal is not a host-scoped \
-                             deny in C (aToIPAddr is IPv4-only) — host dropped; if \
-                             it is the rule's only host the rule collapses to a \
-                             global deny (matches C gateAs.cc:540-556)"
-                        );
-                        continue;
-                    }
-                    // Hostname — resolve to a single IPv4 address. Append `:0`
-                    // as the required port sentinel for lookup_host. C's
-                    // hostToIPAddr is AF_INET and keeps only the first result
-                    // (osdSock.c:250-267 / gateAs.cc:493-503), so take the
-                    // first IPv4 address and ignore the rest (including any
-                    // IPv6 records, which C's AF_INET lookup never returns).
-                    match tokio::net::lookup_host(format!("{token}:0")).await {
-                        Ok(addrs) => {
-                            match addrs.map(|sa| sa.ip()).find(std::net::IpAddr::is_ipv4) {
-                                Some(ip) => from_hosts.push(ip.to_string()),
-                                None => tracing::warn!(
-                                    hostname = %token,
-                                    "pvlist DENY FROM: hostname resolved to no IPv4 address \
-                                     — host dropped (C hostToIPAddr is AF_INET-only); if it is \
-                                     the rule's only host the rule collapses to a global deny \
-                                     (matches C gateAs.cc:540-556)"
-                                ),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                hostname = %token,
-                                error = %e,
-                                "pvlist DENY FROM: cannot resolve hostname \
-                                 — host dropped; if it is the rule's only host the \
-                                 rule collapses to a global deny (matches C gateAs.cc:540-556)"
-                            );
-                        }
+                    // Off the runtime: `hostToIPAddr` blocks in `getaddrinfo`.
+                    let lookup = token.clone();
+                    let ip = match tokio::task::spawn_blocking(move || {
+                        epics_base_rs::runtime::socket::a_to_ip_addr(&lookup, 0)
+                            .map(|(addr, _)| *addr.ip())
+                    })
+                    .await
+                    {
+                        Ok(ip) => ip,
+                        Err(e) => std::panic::resume_unwind(e.into_panic()),
+                    };
+                    match ip {
+                        Some(ip) => from_hosts.push(ip.to_string()),
+                        None => tracing::warn!(
+                            hostname = %token,
+                            "pvlist DENY FROM: cannot resolve host name \
+                             — host dropped; if it is the rule's only host the \
+                             rule collapses to a global deny (matches C gateAs.cc:504-507, :540-556)"
+                        ),
                     }
                 }
             }
@@ -754,30 +706,14 @@ fn parse_order_directive<'a>(
     }
 }
 
-/// Parse a leading signed decimal integer prefix exactly like C
-/// `sscanf(token, "%d", &lev)`: an optional `+`/`-` sign followed by one or
-/// more decimal digits is consumed, and any trailing non-numeric bytes are
-/// ignored (`0junk` → `0`, `1foo` → `1`, `-1tail` → `-1`). Returns `None`
-/// when no digit follows the optional sign — the case where C `sscanf`
-/// returns 0 and the caller applies the `lev=1` fallback. Tokens reach here
-/// already split on whitespace, so there is no leading whitespace for
-/// `sscanf` to skip.
+/// C `sscanf(token, "%d", &lev)` through libcom's glibc `%d`: trailing bytes
+/// are ignored (`0junk` → `0`, `-1tail` → `-1`) and an overflow is
+/// `(int) strtol`'s. `None` is no conversion, where the caller applies C's
+/// `lev=1` fallback.
 fn sscanf_int_prefix(token: &[u8]) -> Option<i32> {
-    let bytes = token;
-    let mut end = 0;
-    if matches!(bytes.first(), Some(b'+' | b'-')) {
-        end = 1;
-    }
-    let digits_start = end;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == digits_start {
-        return None; // no digits after optional sign → C sscanf returns != 1
-    }
-    // A prefix that overflows `i32` is degenerate input C leaves undefined; map
-    // it to the same no-conversion fallback rather than guessing C's wrap.
-    std::str::from_utf8(&token[..end]).ok()?.parse::<i32>().ok()
+    use epics_base_rs::runtime::stdlib::{long_to_int, scanf_long};
+    let (v, _) = scanf_long(token, 10)?;
+    Some(long_to_int(v))
 }
 
 /// Parse the optional trailing `[asg [asl]]` of an ALLOW/PATTERN/PV/ALIAS
@@ -1534,6 +1470,25 @@ mod tests {
     /// level 1, silently raising `0junk` from ASL 0 to ASL 1 — a stricter
     /// access level than C installs. Only a token with no integer prefix
     /// (`typo`) takes the level-1 fallback.
+    /// glibc `%d` is `(int) strtol`: an overflow wraps where `long` is 64
+    /// bits and saturates where it is 32, and `\v` is skipped as blank.
+    #[test]
+    fn parse_asl_overflow_is_glibc_percent_d() {
+        let lp64 = std::ffi::c_long::BITS == 64;
+        for (token, want) in [
+            ("2147483648", if lp64 { i32::MIN } else { i32::MAX }),
+            ("-2147483649", if lp64 { i32::MAX } else { i32::MIN }),
+            ("99999999999", if lp64 { 1_215_752_191 } else { i32::MAX }),
+            ("\u{b}5", 5),
+        ] {
+            let list = parse_pvlist(format!("PV.* ALLOW grp {token}")).unwrap();
+            let PvListEntry::Allow { asl, .. } = &list.entries[0] else {
+                panic!("{token:?}: expected Allow");
+            };
+            assert_eq!(*asl, Some(want), "{token:?}");
+        }
+    }
+
     #[test]
     fn parse_asl_numeric_prefix_matches_c_sscanf() {
         for (token, want) in [("0junk", 0), ("1foo", 1), ("-1tail", -1), ("2tail", 2)] {
@@ -1962,6 +1917,18 @@ mod tests {
         assert!(list.is_host_denied("PV:x", &PolicyHost::for_test("192.0.2.1")));
         // Other IPs are not denied.
         assert!(!list.is_host_denied("PV:x", &PolicyHost::for_test("192.0.2.2")));
+    }
+
+    /// A DENY FROM token is stored as `aToIPAddr` then `ipAddrToDottedIP`
+    /// leave it: dotted decimal, its port cut off (gateAs.cc:489-496).
+    #[tokio::test]
+    async fn resolve_hosts_stores_c_a_to_ip_addr_dotted_ip() {
+        let mut list = parse_pvlist("PV.* DENY FROM 1.2.3.4:5 010.0.0.1 16909060").unwrap();
+        list.resolve_hosts().await;
+        let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] else {
+            panic!("expected Deny");
+        };
+        assert_eq!(from_hosts, &["1.2.3.4", "10.0.0.1", "1.2.3.4"]);
     }
 
     /// A hostname in DENY FROM is resolved and the resolved IP denies

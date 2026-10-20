@@ -589,6 +589,39 @@ pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (c_long, usize) {
     strto(s.as_ref(), base)
 }
 
+/// One glibc `scanf` integer conversion into a `long` — `%i` is base 0, `%d`
+/// base 10, `%x` 16, `%o` 8 — with the end offset. vfscanf hands its digits
+/// to [`strtol`], so an out-of-range value is `strtol`'s and a `%d`/`%hd`
+/// narrows it as [`long_to_int`] does; but it takes a `0x` (base 0 or 16) or
+/// `0b` (base 0) prefix before it sees that no digit follows, so a bare one
+/// is consumed with its `0`. `None` is a matching failure.
+pub fn scanf_long(s: impl AsRef<[u8]>, base: u32) -> Option<(c_long, usize)> {
+    scanf(s.as_ref(), base)
+}
+
+/// [`scanf_long`] for `%u`/`%lu`, through [`strtoul`]: a leading `-` negates
+/// modulo `unsigned long`, and `%u` narrows as [`ulong_to_uint`] does.
+pub fn scanf_ulong(s: impl AsRef<[u8]>, base: u32) -> Option<(c_ulong, usize)> {
+    scanf(s.as_ref(), base)
+}
+
+fn scanf<T: CInt>(s: &[u8], base: u32) -> Option<(T, usize)> {
+    let (v, end) = strto(s, base);
+    if end == 0 {
+        return None;
+    }
+    let mut start = s.iter().take_while(|&&c| c_isspace(c as char)).count();
+    start += usize::from(matches!(s.get(start), Some(b'+' | b'-')));
+    let bare_prefix = end == start + 1
+        && s[start] == b'0'
+        && match s.get(end) {
+            Some(b'x' | b'X') => base == 0 || base == 16,
+            Some(b'b' | b'B') => base == 0,
+            _ => false,
+        };
+    Some((v, end + usize::from(bare_prefix)))
+}
+
 /// C `strtoul(s, &end, base)`, likewise at `unsigned long`'s width; `ERANGE`
 /// is `c_ulong::MAX` whatever the sign.
 pub fn strtoul(s: impl AsRef<[u8]>, base: u32) -> (c_ulong, usize) {
@@ -696,6 +729,26 @@ pub fn epics_str_hash(s: impl AsRef<[u8]>, seed: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measured with glibc 2.39, `-D_GNU_SOURCE`, `sscanf(s, "%i%n")`.
+    #[test]
+    fn scanf_i_matches_glibc_with_gnu_source() {
+        let i = |s| scanf_long(s, 0);
+        assert_eq!(i("0xS"), Some((0, 2)));
+        assert_eq!(i("0bS"), Some((0, 2)));
+        assert_eq!(i(" -0x S"), Some((0, 4)));
+        assert_eq!(i("0b11 "), Some((3, 4)));
+        assert_eq!(i("0x1g"), Some((1, 3)));
+        assert_eq!(i("00x"), Some((0, 2)));
+        assert_eq!(i("5x"), Some((5, 1)));
+        assert_eq!(i("\u{0b}1"), Some((1, 2)));
+        assert_eq!(i("\u{a0}1"), None);
+        assert_eq!(i("-"), None);
+        // `%d` takes no prefix; `%x` takes `0x` but `b` is its digit.
+        assert_eq!(scanf_long("0x", 10), Some((0, 1)));
+        assert_eq!(scanf_long("0xS", 16), Some((0, 2)));
+        assert_eq!(scanf_long("0bS", 16), Some((11, 2)));
+    }
 
     #[test]
     fn strtol_strtoul_atoi_match_glibc_with_gnu_source() {

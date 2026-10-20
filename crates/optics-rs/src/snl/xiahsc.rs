@@ -24,6 +24,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::stdlib::{c_isspace, long_to_int, scanf_long};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -225,153 +227,67 @@ impl fmt::Display for HscCommand {
 // Serial Protocol — Responses
 // ---------------------------------------------------------------------------
 
-/// Parsed HSC-1 response.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HscResponse {
-    /// Command acknowledged: `%<ID> OK;`
-    Ok(String),
-    /// Device is busy: `%<ID> BUSY;`
-    Busy(String),
-    /// Position report with DONE status: `%<ID> <posA> <posB> DONE;`
-    Position { id: String, pos_a: i32, pos_b: i32 },
-    /// Position report with OK status: `%<ID> OK <posA> <posB>`
-    PositionOk { id: String, pos_a: i32, pos_b: i32 },
-    /// Error report: `%<ID> ERROR; [<code>]`
-    Error { id: String, code: Option<i32> },
-    /// Register read response: `%<ID> R <value>`
-    /// The actual format is `%<ID> R <reg> <value>` but typically
-    /// the parsed form after skipping the first two words yields the value.
-    RegisterValue { id: String, value: i32 },
-    /// Module identity response.
-    Identity { id: String, info: String },
-    /// Unparseable response.
-    Unknown(String),
+/// C `sscanf`'s `%s` (and `%*s`): white space skipped, then one run of
+/// non-white-space; `None` when the input ends first.
+pub(crate) fn scan_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start_matches(c_isspace);
+    let end = s.find(c_isspace).unwrap_or(s.len());
+    (end > 0).then(|| s.split_at(end))
 }
 
-impl HscResponse {
-    /// Extract the module ID from the response, if present.
-    pub fn id(&self) -> Option<&str> {
-        match self {
-            HscResponse::Ok(id)
-            | HscResponse::Busy(id)
-            | HscResponse::Position { id, .. }
-            | HscResponse::PositionOk { id, .. }
-            | HscResponse::Error { id, .. }
-            | HscResponse::RegisterValue { id, .. }
-            | HscResponse::Identity { id, .. } => Some(id),
-            HscResponse::Unknown(_) => None,
-        }
-    }
+/// C `sscanf`'s `%d`: glibc's `(int)strtol(s, NULL, 10)`.
+pub(crate) fn scan_int(s: &str) -> Option<(i32, &str)> {
+    let (v, end) = scanf_long(s, 10)?;
+    Some((long_to_int(v), &s[end..]))
 }
 
-/// Parse a raw HSC response line into a structured response.
-///
-/// HSC responses start with `%<ID>` followed by space-delimited fields.
-/// Leading/trailing whitespace is stripped before parsing.
-pub fn parse_response(line: &str) -> HscResponse {
-    let line = line.trim();
-    if line.is_empty() {
-        return HscResponse::Unknown(String::new());
-    }
+/// The `"%*s %*s"` every reply scan starts with: the ID word and one more.
+fn skip_two_words(line: &str) -> Option<&str> {
+    let (_, rest) = scan_word(line)?;
+    scan_word(rest).map(|(_, rest)| rest)
+}
 
-    let words: Vec<&str> = line.split_whitespace().collect();
-    if words.is_empty() {
-        return HscResponse::Unknown(line.to_string());
-    }
+/// A register read's value: `sscanf(hsc_response, "%*s %*s %d", &v) == 1`
+/// (xiahsc.st:544-584, xia_slit.st:516-550 and 796-851).
+pub fn scan_register(line: &str) -> Option<i32> {
+    scan_int(skip_two_words(line)?).map(|(v, _)| v)
+}
 
-    // First word should start with '%'
-    let id = if let Some(stripped) = words[0].strip_prefix('%') {
-        stripped.to_string()
-    } else {
-        // Some responses may not have the '%' prefix
-        return HscResponse::Unknown(line.to_string());
+/// What `get_readback_positions` makes of a position-inquiry reply
+/// (xiahsc.st:788-819).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readback {
+    /// `"%*s %*s %d %d"` converted both.
+    Position(i32, i32),
+    /// Otherwise `"%*s %*s %s"` read exactly `BUSY;`.
+    Busy,
+    /// Anything else, which C only traces.
+    NotUnderstood,
+}
+
+pub fn scan_readback(line: &str) -> Readback {
+    let Some(rest) = skip_two_words(line) else {
+        return Readback::NotUnderstood;
     };
-
-    match words.len() {
-        1 => HscResponse::Unknown(line.to_string()),
-        2 => match words[1] {
-            "OK;" => HscResponse::Ok(id),
-            "BUSY;" => HscResponse::Busy(id),
-            s if s.starts_with("ERROR;") => HscResponse::Error { id, code: None },
-            _ => HscResponse::Unknown(line.to_string()),
-        },
-        3 => {
-            if words[1] == "ERROR;" {
-                let code = words[2].parse::<i32>().ok();
-                HscResponse::Error { id, code }
-            } else {
-                // Could be register read: %<ID> <reg_word> <value>
-                // Format from HSC: `%<ID> R <value>` after R command
-                if let Ok(value) = words[2].parse::<i32>() {
-                    HscResponse::RegisterValue { id, value }
-                } else {
-                    HscResponse::Unknown(line.to_string())
-                }
-            }
-        }
-        4 => {
-            if words[3] == "DONE;" {
-                // Position report: %<ID> <posA> <posB> DONE;
-                if let (Ok(a), Ok(b)) = (words[1].parse::<i32>(), words[2].parse::<i32>()) {
-                    HscResponse::Position {
-                        id,
-                        pos_a: a,
-                        pos_b: b,
-                    }
-                } else {
-                    HscResponse::Unknown(line.to_string())
-                }
-            } else {
-                HscResponse::Unknown(line.to_string())
-            }
-        }
-        5 => {
-            if words[1] == "OK" {
-                // Position with OK status: %<ID> OK <posA> <posB> DONE;
-                if let (Ok(a), Ok(b)) = (words[2].parse::<i32>(), words[3].parse::<i32>()) {
-                    HscResponse::PositionOk {
-                        id,
-                        pos_a: a,
-                        pos_b: b,
-                    }
-                } else {
-                    HscResponse::Unknown(line.to_string())
-                }
-            } else {
-                HscResponse::Unknown(line.to_string())
-            }
-        }
-        _ => HscResponse::Unknown(line.to_string()),
+    if let Some((a, tail)) = scan_int(rest)
+        && let Some((b, _)) = scan_int(tail)
+    {
+        return Readback::Position(a, b);
+    }
+    match scan_word(rest) {
+        Some(("BUSY;", _)) => Readback::Busy,
+        _ => Readback::NotUnderstood,
     }
 }
 
-/// Validate that a response line matches the expected command ID.
-///
-/// Compares characters of the command (after '!') with the response (after '%')
-/// up to the first space. Returns `true` if the ID portion matches.
+/// C `validateResponse` (xiahsc.st:978-1006): the command's ID, its bytes
+/// from the second to the first space, against the reply's bytes at the same
+/// offsets. The reply's first byte and what follows the ID go unread, so
+/// `%H-12345` answers `!H-1234`.
 pub fn validate_response(command: &str, response: &str) -> bool {
-    let response = response.trim();
-    if response.is_empty() {
-        return false;
-    }
-
-    // Extract command ID: skip '!' prefix, take up to first space
-    let cmd_id = command
-        .strip_prefix('!')
-        .unwrap_or(command)
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-
-    // Extract response ID: skip '%' prefix, take up to first space
-    let resp_id = response
-        .strip_prefix('%')
-        .unwrap_or(response)
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-
-    cmd_id == resp_id
+    let id = command.as_bytes().get(1..).unwrap_or_default();
+    let id = &id[..id.iter().position(|&b| b == b' ').unwrap_or(id.len())];
+    response.as_bytes().get(1..=id.len()) == Some(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -388,39 +304,29 @@ pub fn dial_to_raw(dial: f64, origin: i32) -> i32 {
     (dial * STEPS_PER_MM + 0.5 + origin as f64) as i32
 }
 
-/// Validate an HSC module ID string.
-///
-/// C tries `sscanf` against `XIAHSC-%c-%d` then `%c-%d` (both hyphenated). When
-/// `allow_bare` is set it also accepts the hyphen-less `%c%d` (CNNNN) form: only
-/// xia_slit has that third `sscanf` (xia_slit.st:681); xiahsc has just the two
-/// hyphenated forms (xiahsc.st:444-449), so it must pass `allow_bare = false`.
-/// The `XIAHSC-` prefix path always requires the inner hyphen (C format 1).
+/// Validate an HSC module ID string: C's `sscanf(id, "XIAHSC-%c-%d%s", ...)`
+/// converting exactly two, else `"%c-%d%s"` (xiahsc.st:444-451), else, only
+/// where `allow_bare` (xia_slit.st:681), `"%c%d%s"`.
 pub fn validate_hsc_id(id: &str, allow_bare: bool) -> bool {
-    if id.is_empty() {
-        return false;
-    }
-    // Format 1: "XIAHSC-C-NNNN" — the inner "C-NNNN" is always hyphenated.
-    if let Some(rest) = id.strip_prefix("XIAHSC-") {
-        return parse_id_suffix(rest, false);
-    }
-    // Format 2: "C-NNNN" (always); Format 3: "CNNNN" (xia_slit only).
-    parse_id_suffix(id, allow_bare)
+    id.strip_prefix("XIAHSC-")
+        .is_some_and(|rest| scan_id(rest, true))
+        || scan_id(id, true)
+        || (allow_bare && scan_id(id, false))
 }
 
-/// Parse the `C-NNNN` (always) or `CNNNN` (only when `allow_bare`) portion.
-fn parse_id_suffix(s: &str, allow_bare: bool) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => {}
-        _ => return false,
-    };
-    let rest: String = chars.collect();
-    // With hyphen: C-NNNN
-    if let Some(num_str) = rest.strip_prefix('-') {
-        return !num_str.is_empty() && num_str.parse::<i32>().is_ok();
+/// `"%c-%d%s"` (or `"%c%d%s"`) converting exactly two: `%c` takes any one
+/// byte, and a word after the number is the `%s` that makes it three.
+fn scan_id(s: &str, hyphen: bool) -> bool {
+    if s.is_empty() || !s.is_char_boundary(1) {
+        return false;
     }
-    // Without hyphen: CNNNN — only valid where the bare form is allowed.
-    allow_bare && !rest.is_empty() && rest.parse::<i32>().is_ok()
+    let rest = &s[1..];
+    let rest = match (hyphen, rest.strip_prefix('-')) {
+        (false, _) => rest,
+        (true, Some(rest)) => rest,
+        (true, None) => return false,
+    };
+    scan_int(rest).is_some_and(|(_, tail)| scan_word(tail).is_none())
 }
 
 /// Decode the HSC control/status word into individual flags.
@@ -939,53 +845,22 @@ impl HscController {
         self.v_limits = AxisLimits::from_hsc_params(self.v_origin, self.v_outer_limit);
     }
 
-    /// Process a response from the serial port, updating internal state.
-    pub fn process_response(&mut self, response: &HscResponse) {
-        match response {
-            HscResponse::Ok(_) => {
-                // Command acknowledged, nothing to do.
-            }
-            HscResponse::Busy(id) => {
-                if id == &self.h_id {
-                    self.h_busy = true;
-                } else if id == &self.v_id {
-                    self.v_busy = true;
-                }
-            }
-            HscResponse::Position { id, pos_a, pos_b } => {
-                if id == &self.h_id {
-                    self.process_h_position(*pos_a, *pos_b);
-                } else if id == &self.v_id {
-                    self.process_v_position(*pos_a, *pos_b);
-                }
-            }
-            HscResponse::PositionOk { id, pos_a, pos_b } => {
-                if id == &self.h_id {
-                    self.process_h_position(*pos_a, *pos_b);
-                } else if id == &self.v_id {
-                    self.process_v_position(*pos_a, *pos_b);
-                }
-            }
-            HscResponse::Error { id, code } => {
-                let (err, msg) = classify_hsc_error(*code, id);
-                self.error = err;
-                self.error_msg = msg;
-                // Mark the axis as idle on error
-                if id == &self.h_id {
-                    self.h_busy = false;
-                } else if id == &self.v_id {
-                    self.v_busy = false;
-                }
-            }
-            HscResponse::RegisterValue { .. } => {
-                // Handled inline during init.
-            }
-            HscResponse::Identity { .. } => {
-                // Informational only.
-            }
-            HscResponse::Unknown(_) => {
-                // Unparseable, ignore.
-            }
+    /// A horizontal position-inquiry reply, as `get_readback_positions`
+    /// applies it (xiahsc.st:788-819).
+    pub fn process_h_readback(&mut self, readback: Readback) {
+        match readback {
+            Readback::Position(a, b) => self.process_h_position(a, b),
+            Readback::Busy => self.h_busy = true,
+            Readback::NotUnderstood => {}
+        }
+    }
+
+    /// The vertical reply (xiahsc.st:831-862).
+    pub fn process_v_readback(&mut self, readback: Readback) {
+        match readback {
+            Readback::Position(a, b) => self.process_v_position(a, b),
+            Readback::Busy => self.v_busy = true,
+            Readback::NotUnderstood => {}
         }
     }
 }
@@ -1083,7 +958,7 @@ pub async fn run<R, W>(
     async fn read_response<R2: tokio::io::AsyncBufRead + Unpin>(
         reader: &mut R2,
         buf: &mut String,
-    ) -> Result<HscResponse, std::io::Error> {
+    ) -> Result<(), std::io::Error> {
         buf.clear();
         let n =
             epics_base_rs::runtime::task::timeout(RESPONSE_TIMEOUT, reader.read_line(buf)).await;
@@ -1092,7 +967,7 @@ pub async fn run<R, W>(
                 std::io::ErrorKind::UnexpectedEof,
                 "serial port closed",
             )),
-            Ok(Ok(_)) => Ok(parse_response(buf)),
+            Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1109,7 +984,7 @@ pub async fn run<R, W>(
         reader: &mut R2,
         buf: &mut String,
         cmd: &HscCommand,
-    ) -> Result<HscResponse, std::io::Error> {
+    ) -> Result<(), std::io::Error> {
         send_cmd(writer, cmd).await?;
         read_response(reader, buf).await
     }
@@ -1188,13 +1063,13 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(HscResponse::RegisterValue { value, .. }) => {
-                        ctrl.h_outer_limit = value;
-                    }
-                    Ok(resp) => {
-                        debug!("Unexpected response reading H outer limit: {:?}", resp);
-                        read_error = true;
-                    }
+                    Ok(()) => match scan_register(&line_buf) {
+                        Some(value) => ctrl.h_outer_limit = value,
+                        None => {
+                            debug!("Could not read H outer limit: {line_buf:?}");
+                            read_error = true;
+                        }
+                    },
                     Err(e) => {
                         warn!("Error reading H outer limit: {e}");
                         read_error = true;
@@ -1210,13 +1085,13 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(HscResponse::RegisterValue { value, .. }) => {
-                        ctrl.h_origin = value;
-                    }
-                    Ok(resp) => {
-                        debug!("Unexpected response reading H origin: {:?}", resp);
-                        read_error = true;
-                    }
+                    Ok(()) => match scan_register(&line_buf) {
+                        Some(value) => ctrl.h_origin = value,
+                        None => {
+                            debug!("Could not read H origin: {line_buf:?}");
+                            read_error = true;
+                        }
+                    },
                     Err(e) => {
                         warn!("Error reading H origin: {e}");
                         read_error = true;
@@ -1239,13 +1114,13 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(HscResponse::RegisterValue { value, .. }) => {
-                        ctrl.v_outer_limit = value;
-                    }
-                    Ok(resp) => {
-                        debug!("Unexpected response reading V outer limit: {:?}", resp);
-                        read_error = true;
-                    }
+                    Ok(()) => match scan_register(&line_buf) {
+                        Some(value) => ctrl.v_outer_limit = value,
+                        None => {
+                            debug!("Could not read V outer limit: {line_buf:?}");
+                            read_error = true;
+                        }
+                    },
                     Err(e) => {
                         warn!("Error reading V outer limit: {e}");
                         read_error = true;
@@ -1261,13 +1136,13 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(HscResponse::RegisterValue { value, .. }) => {
-                        ctrl.v_origin = value;
-                    }
-                    Ok(resp) => {
-                        debug!("Unexpected response reading V origin: {:?}", resp);
-                        read_error = true;
-                    }
+                    Ok(()) => match scan_register(&line_buf) {
+                        Some(value) => ctrl.v_origin = value,
+                        None => {
+                            debug!("Could not read V origin: {line_buf:?}");
+                            read_error = true;
+                        }
+                    },
                     Err(e) => {
                         warn!("Error reading V origin: {e}");
                         read_error = true;
@@ -1490,10 +1365,10 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(ref resp) => {
+                    Ok(()) => {
                         let cmd_str = HscCommand::PositionInquiry(ctrl.h_id.clone()).to_serial();
                         if validate_response(&cmd_str, &line_buf) {
-                            ctrl.process_response(resp);
+                            ctrl.process_h_readback(scan_readback(&line_buf));
                         } else {
                             debug!("H position response ID mismatch");
                         }
@@ -1512,10 +1387,10 @@ pub async fn run<R, W>(
                 )
                 .await
                 {
-                    Ok(ref resp) => {
+                    Ok(()) => {
                         let cmd_str = HscCommand::PositionInquiry(ctrl.v_id.clone()).to_serial();
                         if validate_response(&cmd_str, &line_buf) {
-                            ctrl.process_response(resp);
+                            ctrl.process_v_readback(scan_readback(&line_buf));
                         } else {
                             debug!("V position response ID mismatch");
                         }
@@ -1718,98 +1593,82 @@ mod tests {
 
     // -- Response parsing tests --
 
+    /// `xiahsc.st:444-451` and the `%c%d%s` third form at `xia_slit.st:681`:
+    /// `%c` takes any byte, `%d` skips white space and wraps, and a `%s`
+    /// match makes the count 3.
     #[test]
-    fn parse_ok() {
-        assert_eq!(
-            parse_response("%H-1234 OK;"),
-            HscResponse::Ok("H-1234".into())
-        );
-    }
-
-    #[test]
-    fn parse_busy() {
-        assert_eq!(
-            parse_response("%V-5678 BUSY;"),
-            HscResponse::Busy("V-5678".into())
-        );
-    }
-
-    #[test]
-    fn parse_position_done() {
-        assert_eq!(
-            parse_response("%H-1234 500 600 DONE;"),
-            HscResponse::Position {
-                id: "H-1234".into(),
-                pos_a: 500,
-                pos_b: 600,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_position_ok() {
-        assert_eq!(
-            parse_response("%H-1234 OK 500 600 DONE;"),
-            HscResponse::PositionOk {
-                id: "H-1234".into(),
-                pos_a: 500,
-                pos_b: 600,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_error_no_code() {
-        assert_eq!(
-            parse_response("%H-1234 ERROR;"),
-            HscResponse::Error {
-                id: "H-1234".into(),
-                code: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_error_with_code() {
-        assert_eq!(
-            parse_response("%H-1234 ERROR; 5"),
-            HscResponse::Error {
-                id: "H-1234".into(),
-                code: Some(5),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_register_value() {
-        assert_eq!(
-            parse_response("%H-1234 R 4400"),
-            HscResponse::RegisterValue {
-                id: "H-1234".into(),
-                value: 4400,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_empty() {
-        assert_eq!(parse_response(""), HscResponse::Unknown(String::new()));
-    }
-
-    #[test]
-    fn parse_no_prefix() {
-        match parse_response("no prefix here") {
-            HscResponse::Unknown(_) => {}
-            other => panic!("Expected Unknown, got {:?}", other),
+    fn hsc_id_is_c_sscanf() {
+        for (id, bare, ok) in [
+            ("XIAHSC-H-1234", false, true),
+            ("H-1234", false, true),
+            ("H- 1234", false, true),
+            ("1-5", false, true),
+            ("--5", false, true),
+            ("H-+5", false, true),
+            ("H-1234 ", false, true),
+            ("H-99999999999", false, true),
+            ("XIAHSC-H- 7\t", false, true),
+            ("H-12a", false, false),
+            ("H-1234 x", false, false),
+            ("H-", false, false),
+            ("H-+", false, false),
+            (" H-1", false, false),
+            ("\u{e9}-5", false, false),
+            ("H1234", false, false),
+            ("H1234", true, true),
+            ("H 1234", true, true),
+            ("XIAHSC-H1234", true, false),
+            ("HX", true, false),
+        ] {
+            assert_eq!(validate_hsc_id(id, bare), ok, "{id:?} bare={bare}");
         }
     }
 
+    /// `sscanf(hsc_response, "%*s %*s %d", ...) == 1` (xiahsc.st:544-584):
+    /// two words skipped, then glibc `%d`, whatever follows.
     #[test]
-    fn parse_whitespace_trimmed() {
-        assert_eq!(
-            parse_response("  %H-1 OK;  \n"),
-            HscResponse::Ok("H-1".into())
-        );
+    fn register_reply_is_c_sscanf() {
+        for (line, v) in [
+            ("%H-1234 R 4400", Some(4400)),
+            ("%H-1234 R 4400;\n", Some(4400)),
+            ("%H-1234 R 4400 x", Some(4400)),
+            ("%H-1234 R -12", Some(-12)),
+            ("%H-1234 OK\t 7", Some(7)),
+            // `(int)strtol`: LP64 wraps, a 32-bit long saturates first.
+            (
+                "%H-1234 R 4294967297",
+                Some(if std::ffi::c_long::BITS == 64 {
+                    1
+                } else {
+                    i32::MAX
+                }),
+            ),
+            ("%H-1234 4400", None),
+            ("%H-1234 R x", None),
+            ("", None),
+        ] {
+            assert_eq!(scan_register(line), v, "{line:?}");
+        }
+    }
+
+    /// `get_readback_positions` (xiahsc.st:788-819): `"%*s %*s %d %d"`, else
+    /// a third word of exactly `BUSY;`.
+    #[test]
+    fn readback_reply_is_c_sscanf() {
+        for (line, r) in [
+            ("%H-1234 OK 500 600 DONE;", Readback::Position(500, 600)),
+            ("%H-1234 OK 500 600", Readback::Position(500, 600)),
+            ("%H-1234 P -5 6;\r\n", Readback::Position(-5, 6)),
+            ("%H-1234 500 600 DONE;", Readback::NotUnderstood),
+            ("%H-1234 OK 500 DONE;", Readback::NotUnderstood),
+            ("%H-1234 P BUSY;", Readback::Busy),
+            ("%H-1234 P BUSY; 1", Readback::Busy),
+            ("%H-1234 BUSY;", Readback::NotUnderstood),
+            ("%H-1234 P BUSY", Readback::NotUnderstood),
+            ("", Readback::NotUnderstood),
+        ] {
+            assert_eq!(scan_readback(line), r, "{line:?}");
+        }
     }
 
     // -- Response validation tests --
@@ -1827,6 +1686,24 @@ mod tests {
     #[test]
     fn validate_response_empty() {
         assert!(!validate_response("!H-1234 P", ""));
+    }
+
+    /// C `validateResponse` on each row, glibc-run against `"!H-1234 P"`.
+    #[test]
+    fn validate_response_is_c_prefix_compare() {
+        for (reply, valid) in [
+            ("%H-12345 500 600 DONE;", true),
+            ("XH-1234 500 600", true),
+            ("%H-1234;", true),
+            ("%H-1234 OK\r\n", true),
+            (" %H-1234 500 600", false),
+            ("H-1234 500 600", false),
+            ("Z%H-1234", false),
+            ("%H-12", false),
+            ("%h-1234 OK", false),
+        ] {
+            assert_eq!(validate_response("!H-1234 P", reply), valid, "{reply:?}");
+        }
     }
 
     // -- HSC ID validation tests --
@@ -1855,9 +1732,10 @@ mod tests {
     fn invalid_hsc_ids() {
         for allow_bare in [false, true] {
             assert!(!validate_hsc_id("", allow_bare));
-            assert!(!validate_hsc_id("1234", allow_bare));
-            assert!(!validate_hsc_id("-1234", allow_bare));
             assert!(!validate_hsc_id("H-", allow_bare));
+            // `%c%d%s` takes '1' (or '-') as the `%c`.
+            assert_eq!(validate_hsc_id("1234", allow_bare), allow_bare);
+            assert_eq!(validate_hsc_id("-1234", allow_bare), allow_bare);
         }
     }
 
@@ -1946,28 +1824,13 @@ mod tests {
     }
 
     #[test]
-    fn controller_process_response_busy() {
+    fn controller_busy_readback() {
         let mut ctrl = HscController::default();
         ctrl.h_id = "H-1".to_string();
         ctrl.v_id = "V-1".to_string();
-        ctrl.process_response(&HscResponse::Busy("H-1".into()));
+        ctrl.process_h_readback(Readback::Busy);
         assert!(ctrl.h_busy);
         assert!(!ctrl.v_busy);
-    }
-
-    #[test]
-    fn controller_process_response_error() {
-        let mut ctrl = HscController::default();
-        ctrl.h_id = "H-1".to_string();
-        ctrl.v_id = "V-1".to_string();
-        ctrl.h_busy = true;
-        ctrl.process_response(&HscResponse::Error {
-            id: "H-1".into(),
-            code: Some(6),
-        });
-        assert!(!ctrl.h_busy);
-        assert_eq!(ctrl.error, 6);
-        assert_eq!(ctrl.error_msg, "Value Out of Range");
     }
 
     #[test]

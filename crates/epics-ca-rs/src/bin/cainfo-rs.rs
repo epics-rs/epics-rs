@@ -382,9 +382,15 @@ mod tests {
         assert_eq!(stat_level("+"), 0);
         // `-0` converts to 0 → normal per-PV mode (not diagnostics).
         assert_eq!(stat_level("-0"), 0);
-        // Overflow truncates mod 2^32 (NOT saturate): probe-confirmed
-        // `sscanf("99999999999","%u") == 1215752191`.
-        assert_eq!(stat_level("99999999999"), 1_215_752_191);
+        // Overflow truncates mod 2^32 where `long` is 64 bits (probe-confirmed
+        // `sscanf("99999999999","%u") == 1215752191`); a 32-bit `strtoul`
+        // saturates first.
+        let want = if std::ffi::c_ulong::BITS == 64 {
+            1_215_752_191
+        } else {
+            u32::MAX
+        };
+        assert_eq!(stat_level("99999999999"), want);
     }
 
     // The decisive mode-selector property: any non-zero `parse_stat_level`

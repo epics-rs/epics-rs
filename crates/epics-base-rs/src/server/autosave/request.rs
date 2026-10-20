@@ -363,10 +363,9 @@ fn read_req_file(
         }
 
         if line.starts_with("file ") || line.starts_with("file\t") {
-            let rest = line[4..].trim();
-            let (file_path, inline_macros) = parse_file_directive(rest);
-
-            let expanded_path = macros.expand_part(&file_path);
+            // C opens the name it splits from the expanded line.
+            let (template_file, new_macro) = c_include_args(eline.trim_start());
+            let inline_macros = include_macro_text(line);
 
             // Merge inline macros in macLib's order: split the RAW text into
             // definitions, THEN expand each value through the parent context
@@ -382,9 +381,8 @@ fn read_req_file(
             // this level after the split, so a comma from inside a value
             // does not end a definition the way C's whole-line expansion
             // lets it.
-            let (template_file, new_macro) = c_include_args(&eline);
             let child_macros = MacroContext::from_defs(
-                MacroContext::defn_pairs(&inline_macros)
+                MacroContext::defn_pairs(inline_macros)
                     .map(|(name, raw)| (name, macros.expand_part(&raw)))
                     .collect(),
                 !new_macro.is_empty(),
@@ -399,7 +397,7 @@ fn read_req_file(
                 );
             }
             match read_req_file(
-                &expanded_path,
+                &template_file,
                 Some(&new_macro),
                 &child_macros,
                 depth + 1,
@@ -431,17 +429,35 @@ fn read_req_file(
     Ok(Some(entries))
 }
 
+/// C `isspace`, which takes the `\v` that `char::is_ascii_whitespace` does not.
+fn c_isspace(c: char) -> bool {
+    matches!(c, ' ' | '\t'..='\r')
+}
+
+/// C `readReqFile`'s split of a `file` line (save_restore.c:3622-3634):
+/// past `file`, whitespace and an opening quote, the name runs to
+/// whitespace, a quote or `#`. A comma does not end it, so in
+/// `file a.req, P=x` the name is `a.req,` and its open fails as C's does.
+/// Returns the name and the text after it.
+fn split_include(line: &str) -> (&str, &str) {
+    let t = line.get(4..).unwrap_or("").trim_start_matches(c_isspace);
+    let t = t
+        .strip_prefix('"')
+        .unwrap_or(t)
+        .trim_start_matches(c_isspace);
+    t.split_at(
+        t.find(|c| c_isspace(c) || c == '"' || c == '#')
+            .unwrap_or(t.len()),
+    )
+}
+
 /// The template file and macro string C's `readReqFile` takes from an
-/// expanded `file` line (save_restore.c:3611-3644), for its trace.
+/// expanded `file` line (save_restore.c:3611-3644).
 fn c_include_args(eline: &str) -> (String, String) {
-    let t = eline.get(4..).unwrap_or("").trim_start();
-    let t = t.strip_prefix('"').unwrap_or(t).trim_start();
-    let end = t
-        .find(|c: char| c.is_ascii_whitespace() || c == '"' || c == '#')
-        .unwrap_or(t.len());
+    let (name, rest) = split_include(eline);
     let mut new_macro = String::new();
-    for c in t[end..].chars() {
-        if c.is_ascii_whitespace() || c == ',' {
+    for c in rest.chars() {
+        if c_isspace(c) || c == ',' {
             if new_macro.len() >= 3 && !new_macro.ends_with(',') {
                 new_macro.push(',');
             }
@@ -455,7 +471,15 @@ fn c_include_args(eline: &str) -> (String, String) {
     if new_macro.len() < 3 {
         new_macro.clear();
     }
-    (t[..end].to_string(), new_macro)
+    (name.to_string(), new_macro)
+}
+
+/// A `file` line's definitions before expansion: the text after
+/// [`split_include`]'s name, less a closing quote and one separating comma.
+fn include_macro_text(line: &str) -> &str {
+    let rest = split_include(line).1;
+    let rest = rest.strip_prefix('"').unwrap_or(rest).trim();
+    rest.strip_prefix(',').unwrap_or(rest).trim_start()
 }
 
 /// C `readReqFile`'s channel name (save_restore.c:3605-3650): the expanded
@@ -466,36 +490,6 @@ fn request_pv_name(expanded: &str) -> Option<&str> {
         .split([' ', '\t', '\n', '\x0B', '\x0C', '\r'])
         .find(|t| !t.is_empty())?;
     (is_valid_first_pv_char(name) || name.starts_with('$')).then_some(name)
-}
-
-/// Parse a file directive: `file <path>[,] [macros]`
-/// Path can be quoted or unquoted. Handles both:
-///   file "name.req", P=$(P)
-///   file name.req,   P=$(P)
-fn parse_file_directive(rest: &str) -> (String, String) {
-    let rest = rest.trim();
-    if rest.starts_with('"') {
-        // Quoted path
-        if let Some(end_quote) = rest[1..].find('"') {
-            let path = rest[1..end_quote + 1].to_string();
-            let after = rest[end_quote + 2..].trim();
-            // Strip leading comma between path and macros
-            let macros = after.strip_prefix(',').unwrap_or(after).trim().to_string();
-            (path, macros)
-        } else {
-            (rest.to_string(), String::new())
-        }
-    } else {
-        // Unquoted: filename ends at first comma or whitespace
-        let end = rest
-            .find(|c: char| c == ',' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        let path = rest[..end].to_string();
-        let after = rest[end..].trim();
-        // Strip leading comma between path and macros
-        let macros = after.strip_prefix(',').unwrap_or(after).trim().to_string();
-        (path, macros)
-    }
 }
 
 #[cfg(test)]
@@ -537,32 +531,27 @@ mod tests {
         assert_eq!(entries[0].expanded_from.as_deref(), Some("$(P)a 0.5"));
     }
 
+    /// The name ends where C's does; the definitions follow it.
     #[test]
-    fn test_parse_file_directive_quoted_with_comma() {
-        let (path, macros) = parse_file_directive("\"ADBase_settings.req\", P=$(P), R=$(R)");
-        assert_eq!(path, "ADBase_settings.req");
-        assert_eq!(macros, "P=$(P), R=$(R)");
-    }
-
-    #[test]
-    fn test_parse_file_directive_unquoted_with_comma() {
-        let (path, macros) = parse_file_directive("NDFile_settings.req,      P=$(P), R=netCDF1:");
-        assert_eq!(path, "NDFile_settings.req");
-        assert_eq!(macros, "P=$(P), R=netCDF1:");
-    }
-
-    #[test]
-    fn test_parse_file_directive_quoted_no_macros() {
-        let (path, macros) = parse_file_directive("\"foo.req\"");
-        assert_eq!(path, "foo.req");
-        assert_eq!(macros, "");
-    }
-
-    #[test]
-    fn test_parse_file_directive_unquoted_space_separated() {
-        let (path, macros) = parse_file_directive("foo.req P=X");
-        assert_eq!(path, "foo.req");
-        assert_eq!(macros, "P=X");
+    fn an_include_line_splits_as_c_reads_it() {
+        for (line, name, defs) in [
+            (
+                "file \"ADBase_settings.req\", P=$(P), R=$(R)",
+                "ADBase_settings.req",
+                "P=$(P), R=$(R)",
+            ),
+            (
+                "file NDFile_settings.req,  P=$(P), R=netCDF1:",
+                "NDFile_settings.req,",
+                "P=$(P), R=netCDF1:",
+            ),
+            ("file \"foo.req\"", "foo.req", ""),
+            ("file foo.req P=X", "foo.req", "P=X"),
+            ("file foo.req#P=X", "foo.req", "#P=X"),
+        ] {
+            assert_eq!(split_include(line).0, name, "{line}");
+            assert_eq!(include_macro_text(line), defs, "{line}");
+        }
     }
 }
 

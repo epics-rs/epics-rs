@@ -51,3 +51,27 @@ async fn common_plugin_settings_resolves_through_common_plugins_paths() {
     );
     assert!(!list.entries.is_empty());
 }
+
+// RTEMS-EXEC-MODEL-ALLOW(1): as above — no CA server, `#[tokio::test]`'s own
+// reactor.
+/// The examples' `commonPlugins_settings.req` names each include quoted, as
+/// C EXAMPLE_commonPlugin_settings.req does: C `readReqFile` keeps a comma
+/// after an unquoted name in the name (save_restore.c:3630-3634).
+#[tokio::test]
+async fn examples_common_plugins_settings_opens_every_include() {
+    // SAFETY: nextest gives each test its own process, and this runs before
+    // any thread is spawned.
+    unsafe { std::env::remove_var("CALC") };
+    let _app =
+        IocApplication::new().autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
+    let mut paths = request_paths();
+    paths.push(PathBuf::from(std::env::var("CALC").unwrap()).join("db"));
+    let macros = MacroContext::from_map([("P".to_string(), "13SIM1:".to_string())].into());
+    let list = load_request_file_with_search_paths("commonPlugins_settings.req", &paths, &macros)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !list.include_unopened,
+        "an included request file is missing"
+    );
+}

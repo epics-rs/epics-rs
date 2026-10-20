@@ -155,3 +155,27 @@ async fn test_include_with_macros() {
     let names = pv_names(&entries);
     assert_eq!(names, vec!["TEST:pv1", "TEST:pv2"]);
 }
+
+/// C `readReqFile` ends an include's name at whitespace, a quote or `#`
+/// (save_restore.c:3630-3634), so a comma right after an unquoted name is
+/// part of it and that include does not open; the quoted form does.
+#[epics_macros_rs::epics_test]
+async fn a_comma_after_an_unquoted_include_name_is_part_of_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("inner.req"), "$(P)pv\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.req"),
+        "M\nfile inner.req, P=A:\nfile \"inner.req\", P=B:\n",
+    )
+    .unwrap();
+
+    let list = load_request_file_with_search_paths(
+        "main.req",
+        &[dir.path().to_path_buf()],
+        &MacroContext::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pv_names(&list.entries), ["M", "B:pv"]);
+    assert!(list.include_unopened);
+}

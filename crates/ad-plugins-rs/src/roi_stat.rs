@@ -1027,6 +1027,9 @@ mod tests {
         );
     }
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — it ran and passed on
+    // the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
+    // -p ad-plugins-rs --all-features`, 729/729).
     /// pool_throughput's ROIStat stage as NDROIStatConfigure builds it: four
     /// quadrants set through the port, each posting its own total.
     #[test]

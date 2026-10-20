@@ -44,8 +44,8 @@
 //!   process the record itself (`VAL` is `pp(TRUE)`, and `dbPutField` processes
 //!   a Passive record), and processing must post.
 //! - [`Drive::Scanned`] — the same record scanned on the named event
-//!   [`SCAN_EVENT`], which the harness posts after each put by processing the
-//!   `event` record [`TRIGGER_PV`]. The put does not process a non-Passive
+//!   `SCAN_EVENT`, which the harness posts after each put by processing the
+//!   `event` record `TRIGGER_PV`. The put does not process a non-Passive
 //!   record (`dbAccess.c:1267-1269`), so processing is the scan's job, not the
 //!   put's, and a missing event can only be a *posting* failure.
 //!
@@ -179,7 +179,7 @@ pub enum Drive {
     /// `record(t, "…") {}` — the put must process the record, and processing
     /// must post.
     Passive,
-    /// `SCAN` `Event` on [`SCAN_EVENT`], posted by the harness — the scan
+    /// `SCAN` `Event` on `SCAN_EVENT`, posted by the harness — the scan
     /// processes, so only posting is under test.
     Scanned,
 }

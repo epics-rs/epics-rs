@@ -154,12 +154,12 @@ struct ClientState {
     channels:       HashMap<sid, ChannelEntry>,     // PV bindings
     subscriptions:  HashMap<AttachId, SubscriptionEntry>,
     channel_access: HashMap<sid, AccessLevel>,
-    next_sid:       AtomicU32,
+    retired:        HashMap<sid, cid>,  // never reissued while a request can name it
     hostname:       HostIdentity,  // Claimed(client name) unless asCheckClientIP / mTLS
     username:       String,
     acf:            Arc<Option<AccessSecurityConfig>>,
     tcp_port:       u16,
-    client_minor_version: u16,
+    minor:          CircuitMinor,  // read as each frame is built
     flow_control:   Arc<FlowControlGate>,
 }
 ```

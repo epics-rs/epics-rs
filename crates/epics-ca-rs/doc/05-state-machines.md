@@ -129,7 +129,7 @@ TransportCommand::CreateChannel
    │
    ▼ TCP connect to server_addr
 TcpStream::connect              ─────▶   accept(), keepalive on
-VERSION+HOST+CLIENT_NAME         ─────▶  cache client_minor_version
+VERSION+HOST+CLIENT_NAME         ─────▶  set the circuit minor
                                           state.hostname = peer.ip()
                                           (or client-supplied if env)
 CREATE_CHAN(cid, pvname)         ─────▶  alloc sid, look up PV

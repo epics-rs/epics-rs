@@ -23,7 +23,7 @@
 use epics_base_rs::runtime::stdlib::{c_isspace, strtod};
 use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::{SeqMacros, spawn_program};
+use epics_base_rs::server::snl::{SeqMacros, seq, spawn_program};
 
 use crate::snl::filter_drive::FilterDriveConfig;
 use crate::snl::flex_combined_motion::FlexConfig;
@@ -74,68 +74,83 @@ enum Program {
 impl Program {
     /// Each arm's parameters are its `.st`'s `program` statement. A macro
     /// with no value reads as "", what `seqMacEval` puts for its `{name}`.
-    fn new(program: &str, macro_def: &str) -> Result<Self, String> {
+    fn new(program: &str, macro_def: &str) -> Result<(Self, SeqMacros), String> {
         let macros = |params| SeqMacros::new(params, macro_def);
         Ok(match program {
             "kohzuCtl" => {
                 let m = macros("P=nda, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::KohzuCtl(KohzuConfig::new(
-                    v("P"),
-                    v("M_THETA"),
-                    v("M_Y"),
-                    v("M_Z"),
-                    geom(v("GEOM")),
-                ))
+                (
+                    Self::KohzuCtl(KohzuConfig::new(
+                        v("P"),
+                        v("M_THETA"),
+                        v("M_Y"),
+                        v("M_Z"),
+                        geom(v("GEOM")),
+                    )),
+                    m,
+                )
             }
             "kohzuCtl_soft" => {
                 let m = macros("P=xxx:, MONO=Kohzu1:, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::KohzuCtlSoft(KohzuSoftConfig::new(
-                    v("P"),
-                    v("MONO"),
-                    v("M_THETA"),
-                    v("M_Y"),
-                    v("M_Z"),
-                    geom(v("GEOM")),
-                ))
+                (
+                    Self::KohzuCtlSoft(KohzuSoftConfig::new(
+                        v("P"),
+                        v("MONO"),
+                        v("M_THETA"),
+                        v("M_Y"),
+                        v("M_Z"),
+                        geom(v("GEOM")),
+                    )),
+                    m,
+                )
             }
             "hrCtl" => {
                 let m = macros("P=xxx:, N=1, M_PHI1=m9, M_PHI2=m10");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::HrCtl(HrConfig::new(v("P"), v("N"), v("M_PHI1"), v("M_PHI2")))
+                (
+                    Self::HrCtl(HrConfig::new(v("P"), v("N"), v("M_PHI1"), v("M_PHI2"))),
+                    m,
+                )
             }
             "ml_monoCtl" => {
                 let m =
                     macros("P=xxx:, M_THETA=m9, M_THETA2=m12, M_Y=m10, M_Z=m11, Y_OFF=35, GEOM=1");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::MlMonoCtl(MlMonoConfig::new(
-                    v("P"),
-                    v("M_THETA"),
-                    v("M_THETA2"),
-                    v("M_Y"),
-                    v("M_Z"),
-                    strtod(v("Y_OFF").as_bytes()).value,
-                ))
+                (
+                    Self::MlMonoCtl(MlMonoConfig::new(
+                        v("P"),
+                        v("M_THETA"),
+                        v("M_THETA2"),
+                        v("M_Y"),
+                        v("M_Z"),
+                        strtod(v("Y_OFF").as_bytes()).value,
+                    )),
+                    m,
+                )
             }
             "orient" => {
                 let m = macros("P=xxx:orient1:,PM=xxx:,mTTH=m9,mTH=m10,mCHI=m11,mPHI=m12");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::Orient(OrientConfig::new(
-                    v("P"),
-                    v("PM"),
-                    v("mTTH"),
-                    v("mTH"),
-                    v("mCHI"),
-                    v("mPHI"),
-                ))
+                (
+                    Self::Orient(OrientConfig::new(
+                        v("P"),
+                        v("PM"),
+                        v("mTTH"),
+                        v("mTH"),
+                        v("mCHI"),
+                        v("mPHI"),
+                    )),
+                    m,
+                )
             }
             "filterDrive" => {
                 let m = macros("NAME=filterDrive, P=TEST:, R=filter:, NUM_FILTERS=8");
                 let v = |name| m.value(name).unwrap_or_default();
                 let mut config = FilterDriveConfig::new(v("P"), v("R"), scan_int(v("NUM_FILTERS")));
                 config.name = v("NAME").to_string();
-                Self::FilterDrive(config)
+                (Self::FilterDrive(config), m)
             }
             "pf4" => {
                 let m = macros("name=pf4,P=,H=,B=,BP=,B1=,B2=,B3=,B4=,M=");
@@ -145,18 +160,27 @@ impl Program {
                 config.mono = v("M").to_string();
                 config.bit_prefix = v("BP").to_string();
                 config.bits = ["B1", "B2", "B3", "B4"].map(|b| v(b).to_string());
-                Self::Pf4(config)
+                (Self::Pf4(config), m)
             }
             "Io" => {
                 let m = macros("P=7idd:Io:,MONO=7id:HHLM:energy_get,VSC=7idd:scaler1");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::Io(IoConfig::new(v("P"), v("MONO"), v("VSC")))
+                (Self::Io(IoConfig::new(v("P"), v("MONO"), v("VSC"))), m)
             }
             "flexCombinedMotion" => {
                 let m =
                     macros("name=flexCombinedMotion,P=xxx:,M=m1,C=cap1,FM=pi:c0:m1,CM=nf:c0:m1");
                 let v = |name| m.value(name).unwrap_or_default();
-                Self::FlexCombinedMotion(FlexConfig::new(v("P"), v("M"), v("C"), v("FM"), v("CM")))
+                (
+                    Self::FlexCombinedMotion(FlexConfig::new(
+                        v("P"),
+                        v("M"),
+                        v("C"),
+                        v("FM"),
+                        v("CM"),
+                    )),
+                    m,
+                )
             }
             _ => {
                 return Err(format!(
@@ -166,43 +190,40 @@ impl Program {
         })
     }
 
-    fn spawn(self, bridge: &BlockingBridge, db: &PvDatabase) {
+    fn spawn(self, macros: &SeqMacros, bridge: &BlockingBridge, db: &PvDatabase) {
         match self {
-            Self::KohzuCtl(config) => spawn_program(bridge, db, "kohzuCtl", move |db| {
+            Self::KohzuCtl(config) => spawn_program(bridge, db, "kohzuCtl", macros, move |db| {
                 crate::snl::kohzu_ctl::run(config, db)
             }),
-            Self::KohzuCtlSoft(config) => spawn_program(bridge, db, "kohzuCtl_soft", move |db| {
-                crate::snl::kohzu_ctl_soft::run(config, db)
-            }),
-            Self::HrCtl(config) => spawn_program(bridge, db, "hrCtl", move |db| {
+            Self::KohzuCtlSoft(config) => {
+                spawn_program(bridge, db, "kohzuCtl_soft", macros, move |db| {
+                    crate::snl::kohzu_ctl_soft::run(config, db)
+                })
+            }
+            Self::HrCtl(config) => spawn_program(bridge, db, "hrCtl", macros, move |db| {
                 crate::snl::hr_ctl::run(config, db)
             }),
-            Self::MlMonoCtl(config) => spawn_program(bridge, db, "ml_monoCtl", move |db| {
+            Self::MlMonoCtl(config) => spawn_program(bridge, db, "ml_monoCtl", macros, move |db| {
                 crate::snl::ml_mono_ctl::run(config, db)
             }),
-            Self::Orient(config) => spawn_program(bridge, db, "orient", move |db| {
+            Self::Orient(config) => spawn_program(bridge, db, "orient", macros, move |db| {
                 crate::snl::orient::run(config, db)
             }),
-            Self::FilterDrive(config) => spawn_program(bridge, db, "filterDrive", move |db| {
-                crate::snl::filter_drive::run(config, db)
-            }),
-            Self::Pf4(config) => spawn_program(bridge, db, "pf4", move |db| {
+            Self::FilterDrive(config) => {
+                spawn_program(bridge, db, "filterDrive", macros, move |db| {
+                    crate::snl::filter_drive::run(config, db)
+                })
+            }
+            Self::Pf4(config) => spawn_program(bridge, db, "pf4", macros, move |db| {
                 crate::snl::pf4::run(config, db)
             }),
-            Self::Io(config) => {
-                bridge.spawn(async move {
-                    if let Err(e) = crate::snl::io::run(config).await {
-                        epics_base_rs::stderr_println!("Io error: {e}");
-                    }
-                });
-            }
-            Self::FlexCombinedMotion(config) => {
-                bridge.spawn(async move {
-                    if let Err(e) = crate::snl::flex_combined_motion::run(config).await {
-                        epics_base_rs::stderr_println!("flexCombinedMotion error: {e}");
-                    }
-                });
-            }
+            Self::Io(config) => seq(bridge, "Io", macros, crate::snl::io::run(config)),
+            Self::FlexCombinedMotion(config) => seq(
+                bridge,
+                "flexCombinedMotion",
+                macros,
+                crate::snl::flex_combined_motion::run(config),
+            ),
         }
     }
 }
@@ -236,8 +257,8 @@ pub fn seq_start(
     bridge: &BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
-    Program::new(program, macro_str)?.spawn(bridge, db);
-    println!("seq {program} started with macros: {macro_str}");
+    let (program, macros) = Program::new(program, macro_str)?;
+    program.spawn(&macros, bridge, db);
     Ok(())
 }
 
@@ -252,7 +273,7 @@ mod tests {
     /// statement defines.
     #[test]
     fn every_program_configures_on_its_program_defaults() {
-        let Ok(Program::KohzuCtl(c)) = Program::new("kohzuCtl", "") else {
+        let Ok((Program::KohzuCtl(c), _)) = Program::new("kohzuCtl", "") else {
             panic!("kohzuCtl")
         };
         assert_eq!(
@@ -260,21 +281,21 @@ mod tests {
             ["nda", "m9", "m10", "m11"]
         );
         assert_eq!(c.geom, Geometry::Standard);
-        let Ok(Program::KohzuCtlSoft(c)) = Program::new("kohzuCtl_soft", "") else {
+        let Ok((Program::KohzuCtlSoft(c), _)) = Program::new("kohzuCtl_soft", "") else {
             panic!("kohzuCtl_soft")
         };
         assert_eq!(
             [&c.prefix, &c.mono, &c.m_theta, &c.m_y, &c.m_z],
             ["xxx:", "Kohzu1:", "m9", "m10", "m11"]
         );
-        let Ok(Program::HrCtl(c)) = Program::new("hrCtl", "") else {
+        let Ok((Program::HrCtl(c), _)) = Program::new("hrCtl", "") else {
             panic!("hrCtl")
         };
         assert_eq!(
             [&c.prefix, &c.n, &c.m_phi1, &c.m_phi2],
             ["xxx:", "1", "m9", "m10"]
         );
-        let Ok(Program::MlMonoCtl(c)) = Program::new("ml_monoCtl", "") else {
+        let Ok((Program::MlMonoCtl(c), _)) = Program::new("ml_monoCtl", "") else {
             panic!("ml_monoCtl")
         };
         assert_eq!(
@@ -282,7 +303,7 @@ mod tests {
             ["xxx:", "m9", "m12", "m10", "m11"]
         );
         assert_eq!(c.y_offset, 35.0);
-        let Ok(Program::Orient(c)) = Program::new("orient", "") else {
+        let Ok((Program::Orient(c), _)) = Program::new("orient", "") else {
             panic!("orient")
         };
         assert_eq!(
@@ -303,7 +324,7 @@ mod tests {
                 "xxx:m12"
             ]
         );
-        let Ok(Program::FilterDrive(c)) = Program::new("filterDrive", "") else {
+        let Ok((Program::FilterDrive(c), _)) = Program::new("filterDrive", "") else {
             panic!("filterDrive")
         };
         assert_eq!(
@@ -311,7 +332,7 @@ mod tests {
             ["filterDrive", "TEST:", "filter:"]
         );
         assert_eq!(c.num_filters, 8);
-        let Ok(Program::Pf4(c)) = Program::new("pf4", "") else {
+        let Ok((Program::Pf4(c), _)) = Program::new("pf4", "") else {
             panic!("pf4")
         };
         assert_eq!(c.name, "pf4");
@@ -320,14 +341,14 @@ mod tests {
             ["", "", "", "", ""]
         );
         assert_eq!(c.bits, ["", "", "", ""]);
-        let Ok(Program::Io(c)) = Program::new("Io", "") else {
+        let Ok((Program::Io(c), _)) = Program::new("Io", "") else {
             panic!("Io")
         };
         assert_eq!(
             [&c.prefix, &c.mono_pv, &c.scaler_pv],
             ["7idd:Io:", "7id:HHLM:energy_get", "7idd:scaler1"]
         );
-        let Ok(Program::FlexCombinedMotion(c)) = Program::new("flexCombinedMotion", "") else {
+        let Ok((Program::FlexCombinedMotion(c), _)) = Program::new("flexCombinedMotion", "") else {
             panic!("flexCombinedMotion")
         };
         assert_eq!(
@@ -342,25 +363,25 @@ mod tests {
     #[test]
     fn macro_text_converts_as_the_st_reads_it() {
         let geom = |def| match Program::new("kohzuCtl", def) {
-            Ok(Program::KohzuCtl(c)) => c.geom,
+            Ok((Program::KohzuCtl(c), _)) => c.geom,
             _ => panic!("kohzuCtl"),
         };
         assert_eq!(geom("GEOM=2.0"), Geometry::Alternate);
         assert_eq!(geom("GEOM=02"), Geometry::Standard);
         assert_eq!(geom("GEOM="), Geometry::Standard);
-        let Ok(Program::KohzuCtlSoft(c)) = Program::new("kohzuCtl_soft", "GEOM=2nd") else {
+        let Ok((Program::KohzuCtlSoft(c), _)) = Program::new("kohzuCtl_soft", "GEOM=2nd") else {
             panic!("kohzuCtl_soft")
         };
         assert_eq!(c.geom, Geometry::Alternate);
         let y_off = |def| match Program::new("ml_monoCtl", def) {
-            Ok(Program::MlMonoCtl(c)) => c.y_offset,
+            Ok((Program::MlMonoCtl(c), _)) => c.y_offset,
             _ => panic!("ml_monoCtl"),
         };
         assert_eq!(y_off("Y_OFF=40mm"), 40.0);
         assert_eq!(y_off("Y_OFF= 4e1"), 40.0);
         assert_eq!(y_off("Y_OFF=mm"), 35.0);
         let filters = |def| match Program::new("filterDrive", def) {
-            Ok(Program::FilterDrive(c)) => c.num_filters,
+            Ok((Program::FilterDrive(c), _)) => c.num_filters,
             _ => panic!("filterDrive"),
         };
         assert_eq!(filters("NUM_FILTERS=+4"), 4);
@@ -372,11 +393,54 @@ mod tests {
     /// The capacitance sensor is `{P}{C}:pos` (`flexCombinedMotion.st:32`).
     #[test]
     fn flex_reads_its_sensor_from_c() {
-        let Ok(Program::FlexCombinedMotion(c)) = Program::new("flexCombinedMotion", "P=F:,C=cap9")
+        let Ok((Program::FlexCombinedMotion(c), _)) =
+            Program::new("flexCombinedMotion", "P=F:,C=cap9")
         else {
             panic!("flexCombinedMotion")
         };
         assert_eq!(c.pos_monitor_pv(), "F:cap9:pos");
+    }
+
+    /// `seq_main.c:67`, `:140-142`: every start posts the sequencer release
+    /// and the spawn on errlog, the thread named by the `name` macro, else by
+    /// the program. Io starts without the PINI wait and posts them the same.
+    #[epics_base_rs::epics_test]
+    async fn every_start_posts_seqs_errlog_lines() {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if m.contains("equencer") {
+                sink.lock().unwrap().push(m.trim_end().to_owned());
+            }
+        });
+        let db = PvDatabase::new();
+        let bridge = BlockingBridge::capture();
+        seq_start("Io", "name=io1", &bridge, &db).unwrap();
+        seq_start("kohzuCtl", "P=T:", &bridge, &db).unwrap();
+        epics_base_rs::runtime::log::errlog_flush();
+        let lines: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let (head, tail) = l.split_once("thread 0x").unwrap_or((l, ""));
+                match tail.split_once(':') {
+                    Some((_, rest)) => format!("{head}thread *:{rest}"),
+                    None => l.clone(),
+                }
+            })
+            .collect();
+        let release = "sevr=info Sequencer release ";
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with(release) && lines[2].starts_with(release));
+        assert_eq!(
+            lines[1],
+            "sevr=info Spawning sequencer program \"Io\", thread *: \"io1\""
+        );
+        assert_eq!(
+            lines[3],
+            "sevr=info Spawning sequencer program \"kohzuCtl\", thread *: \"kohzuCtl\""
+        );
     }
 
     #[test]

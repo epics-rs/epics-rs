@@ -39,7 +39,7 @@ pub fn seq_start(
             let m = SeqMacros::new("name=delayDo,P=xxx:,R=delayDo1", macro_str);
             let v = |name| m.value(name).unwrap_or_default();
             let config = crate::snl::delay_do::DelayDoConfig::new(v("P"), v("R"));
-            spawn_program(bridge, db, "delayDo", move |db| {
+            spawn_program(bridge, db, "delayDo", &m, move |db| {
                 crate::snl::delay_do::run(config, db)
             });
         }
@@ -55,7 +55,7 @@ pub fn seq_start(
                 v("G3"),
                 v("NO"),
             );
-            spawn_program(bridge, db, "femto", move |db| {
+            spawn_program(bridge, db, "femto", &m, move |db| {
                 crate::snl::femto::run(config, db)
             });
         }

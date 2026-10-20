@@ -30,12 +30,12 @@ use epics_libcom_rs::cfmt::CFloat;
 /// Start `run` as a task once the database has finished its PINI pass.
 ///
 /// `run` is the program's `run(config, db)` with the config already bound;
-/// `program` names it in the one error line a failed program leaves, the way
-/// `seq` prints the program name.
+/// `program` and `macros` are what [`seq`] takes.
 pub fn spawn_program<F, Fut, E>(
     bridge: &BlockingBridge,
     db: &PvDatabase,
     program: &'static str,
+    macros: &SeqMacros,
     run: F,
 ) where
     F: FnOnce(PvDatabase) -> Fut + Send + 'static,
@@ -43,12 +43,49 @@ pub fn spawn_program<F, Fut, E>(
     E: std::fmt::Display,
 {
     let db = db.clone();
-    bridge.spawn(async move {
+    seq(bridge, program, macros, async move {
         db.wait_for_pini().await;
-        if let Err(e) = run(db).await {
+        run(db).await
+    });
+}
+
+/// Start `program` as C `seq` does (`seq_main.c:55-145`): the sequencer
+/// release and the spawn go to errlog, the task named by the `name` macro,
+/// else by the program (`:110-115`). A failed program leaves one error line
+/// naming it.
+pub fn seq<Fut, E>(bridge: &BlockingBridge, program: &'static str, macros: &SeqMacros, task: Fut)
+where
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
+    errlog_sev_vprintf(
+        ErrlogSevEnum::Info,
+        format_args!(
+            "Sequencer release {}, compiled {}\n",
+            env!("CARGO_PKG_VERSION"),
+            env!("EPICS_VCS_VERSION_DATE")
+        ),
+    );
+    let thread: Arc<str> = match macros.value("name") {
+        Some(name) if !name.is_empty() => name.into(),
+        _ => program.into(),
+    };
+    // The task's own allocation stands in for C's `epicsThreadId`.
+    let held = Arc::clone(&thread);
+    bridge.spawn(async move {
+        let _thread = held;
+        if let Err(e) = task.await {
             crate::stderr_println!("{program} error: {e}");
         }
     });
+    errlog_sev_vprintf(
+        ErrlogSevEnum::Info,
+        format_args!(
+            "Spawning sequencer program \"{program}\", thread {:p}: \"{thread}\"\n",
+            Arc::as_ptr(&thread).cast::<u8>()
+        ),
+    );
 }
 
 /// A program's macro table (`PROG::macros`, `seq_mac.c`), built as `seq`
@@ -630,7 +667,7 @@ mod tests {
         let db = PvDatabase::new();
         let bridge = BlockingBridge::capture();
         let (started, run) = started_flag();
-        spawn_program(&bridge, &db, "probe", run);
+        spawn_program(&bridge, &db, "probe", &SeqMacros::default(), run);
 
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -651,7 +688,7 @@ mod tests {
         db.mark_pini_done();
         let bridge = BlockingBridge::capture();
         let (started, run) = started_flag();
-        spawn_program(&bridge, &db, "probe", run);
+        spawn_program(&bridge, &db, "probe", &SeqMacros::default(), run);
 
         assert!(eventually(|| started.load(Ordering::Acquire)).await);
     }

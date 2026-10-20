@@ -60,13 +60,14 @@ impl LinkSet for Held {
     async fn put_value_done(
         &self,
         link: LinkRef<'_>,
+        holder: Option<&[u8]>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
         let _ = self.entered.send(());
         // Closed is the release.
         let _ = self.gate.acquire().await;
-        self.inner.put_value_done(link, value, op).await
+        self.inner.put_value_done(link, holder, value, op).await
     }
 }
 

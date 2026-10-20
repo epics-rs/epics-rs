@@ -359,12 +359,13 @@ impl LinkSet for CaLinks {
         value: EpicsValue,
         op: LinkPutOp,
     ) -> Result<(), String> {
-        self.put_value_done(link, value, op).await.1
+        self.put_value_done(link, None, value, op).await.1
     }
 
     async fn put_value_done(
         &self,
         link: LinkRef<'_>,
+        holder: Option<&[u8]>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
@@ -385,9 +386,9 @@ impl LinkSet for CaLinks {
             return (done, unconnected());
         }
         match self.open(link).await {
-            Some(local) => local.write(name, value, op).await,
+            Some(local) => local.write(name, holder, value, op).await,
             None => match self.network() {
-                Some(net) => net.put_value_done(link, value, op).await,
+                Some(net) => net.put_value_done(link, holder, value, op).await,
                 None => (LinkPutDone::Callback, unconnected()),
             },
         }
@@ -636,14 +637,24 @@ impl LocalLink {
     async fn write(
         &self,
         name: &[u8],
+        holder: Option<&[u8]>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
         let native = (self.channel.native_type(), self.channel.element_count());
-        match super::link_put_convert(name, value, native.0, native.1) {
-            Ok(value) => self.channel.write(value, op).await,
-            Err(e) => (LinkPutDone::Inline, Err(e)),
+        let value = match super::link_put_convert(name, value, native.0, native.1) {
+            Ok(value) => value,
+            Err(e) => return (LinkPutDone::Inline, Err(e)),
+        };
+        let written = self.channel.write(value, op).await;
+        // `dbChannelIO::write` throws on a refused `dbChannel_put`, which
+        // `ca_array_put` turns into ECA_PUTFAIL (`dbChannelIO.cpp:92-95`,
+        // `oldChannelNotify.cpp:536`); a put callback's refusal is its
+        // completion status.
+        if op == LinkPutOp::Plain && written.1.is_err() {
+            super::report_put_not_issued(crate::error::ECA_PUTFAIL, holder, name);
         }
+        written
     }
 
     /// `dbcar`'s columns for this link (`dbCaTest.c:95-123`); the host is

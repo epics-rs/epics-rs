@@ -144,6 +144,24 @@ pub enum LinkPutDone {
     NotIssued,
 }
 
+/// C `dbCaTask`'s report of a put `ca_array_put` did not issue
+/// (`dbCa.c:1240-1243`): the status's `ca_message`, then `printLinks`. A put
+/// callback that completes with a failure prints nothing (`putComplete`,
+/// `dbCa.c:1056-1072`).
+pub fn report_put_not_issued(status: u32, holder: Option<&[u8]>, pvname: &[u8]) {
+    crate::runtime::log::errlog_vprintf(format_args!(
+        "dbCaTask ca_array_put {}\n",
+        crate::error::eca::eca_message(status)
+    ));
+    if let Some(holder) = holder {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "{} has DB CA link to {}\n",
+            String::from_utf8_lossy(holder),
+            String::from_utf8_lossy(pvname)
+        ));
+    }
+}
+
 /// C `dbCaPutLinkCallback`'s conversion into `pputNative` (`dbCa.c:572-590`):
 /// the scalar put row when one element goes to a one-element channel, the
 /// array row otherwise, clamped to the channel's `nelements`. A string that
@@ -777,12 +795,18 @@ pub trait LinkSet: Send + Sync {
     /// [`Self::put_value`], saying how its completion arrived, refused or
     /// not. Default: [`LinkPutDone::Callback`], which only a local CA target
     /// can refute.
+    ///
+    /// `holder` names the record the link is in, C `plink->precord`, for
+    /// the lset's own failure report ([`report_put_not_issued`]); `None` for
+    /// a put no record made.
     async fn put_value_done(
         &self,
         link: LinkRef<'_>,
+        holder: Option<&[u8]>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
+        let _ = holder;
         (LinkPutDone::Callback, self.put_value(link, value, op).await)
     }
 

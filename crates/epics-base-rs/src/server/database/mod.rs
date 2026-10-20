@@ -40,7 +40,7 @@ pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
     DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
     LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet,
-    LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert,
+    LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert, report_put_not_issued,
 };
 #[cfg(test)]
 pub(crate) use links::ExternalDone;

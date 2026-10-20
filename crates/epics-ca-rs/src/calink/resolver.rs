@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::DbFieldType;
 use crate::client::{CaChannel, CaClient, ConnFold};
 use arc_swap::ArcSwap;
+use epics_base_rs::error::CaOp;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
     CaLinkInit, CpWorker, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
     LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
-    link_put_convert,
+    link_put_convert, report_put_not_issued,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
@@ -1202,7 +1203,7 @@ impl LinkSet for CaLinkResolver {
         value: EpicsValue,
         op: LinkPutOp,
     ) -> Result<(), String> {
-        self.put_value_done(link, value, op).await.1
+        self.put_value_done(link, None, value, op).await.1
     }
 
     fn put_native(&self, link: LinkRef<'_>) -> Option<(DbFieldType, u32)> {
@@ -1217,6 +1218,7 @@ impl LinkSet for CaLinkResolver {
     async fn put_value_done(
         &self,
         link: LinkRef<'_>,
+        holder: Option<&[u8]>,
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
@@ -1284,7 +1286,10 @@ impl LinkSet for CaLinkResolver {
             LinkPutOp::Async => link.channel.put_as_dbr_callback(dbr_type, &value).map(Some),
         };
         match issued {
-            Err(e) => (LinkPutDone::NotIssued, Err(e.to_string())),
+            Err(e) => {
+                report_put_not_issued(e.to_eca_status(CaOp::Write), holder, name);
+                (LinkPutDone::NotIssued, Err(e.to_string()))
+            }
             Ok(None) => (LinkPutDone::Callback, Ok(())),
             Ok(Some(done)) => (LinkPutDone::Callback, done.await.map_err(|e| e.to_string())),
         }

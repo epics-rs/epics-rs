@@ -1025,10 +1025,16 @@ async fn owner_loop(
                     while let Some((key, write)) = q.take_ready() {
                         let Some(inner) = db.upgrade() else { return };
                         let lset = resolve_lset(&inner, key.channel.scheme);
+                        let holder = key
+                            .link
+                            .rec
+                            .and_then(|rec| inner.record_table.get(rec))
+                            .map(|cell| cell.name().clone());
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
-                            let written = run_put(lset.as_ref(), &key, write).await;
+                            let holder = holder.as_ref().map(|name| name.as_bytes());
+                            let written = run_put(lset.as_ref(), &key, holder, write).await;
                             q2.finish(key, written);
                         });
                     }
@@ -1199,10 +1205,19 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey) -> Written {
 
 /// Perform one dequeued write. The network suspension lives here — on the
 /// owner's spawned task, never on a record-processing thread.
-async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> Written {
+/// The lset reports its own failure, as dbCa and pvxs each do.
+async fn run_put(
+    lset: Option<&DynLinkSet>,
+    key: &LinkKey,
+    holder: Option<&[u8]>,
+    write: WireWrite,
+) -> Written {
     let WireWrite { value, op } = write;
     let (done, result) = match lset {
-        Some(lset) => lset.put_value_done(key.channel.link_ref(), value, op).await,
+        Some(lset) => {
+            lset.put_value_done(key.channel.link_ref(), holder, value, op)
+                .await
+        }
         None => (
             LinkPutDone::Callback,
             Err(format!(
@@ -1211,23 +1226,6 @@ async fn run_put(lset: Option<&DynLinkSet>, key: &LinkKey, write: WireWrite) -> 
             )),
         ),
     };
-    // C reports a failed wire write on the task, via `errlogPrintf`
-    // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
-    // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
-    // (`dbCa.c:1161-1183`). The record has already returned; its alarm came
-    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does. A link
-    // that went down after staging says nothing: the task skips it with
-    // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
-    // A pva link prints its own failure, as pvxs `linkPutDone` does.
-    if let Err(e) = &result
-        && key.channel.scheme == "ca"
-        && lset.is_some_and(|lset| lset.is_connected(key.channel.link_ref()))
-    {
-        crate::runtime::log::errlog_vprintf(format_args!(
-            "dbCa: external link put to '{}' failed: {e}\n",
-            key.channel.name
-        ));
-    }
     let unsent = match op {
         LinkPutOp::Async => done == LinkPutDone::NotIssued,
         LinkPutOp::Plain => result.is_err(),

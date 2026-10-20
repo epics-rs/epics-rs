@@ -182,11 +182,7 @@ impl Program {
                     m,
                 )
             }
-            _ => {
-                return Err(format!(
-                    "unknown program '{program}'. Available: kohzuCtl, kohzuCtl_soft, hrCtl, ml_monoCtl, orient, filterDrive, pf4, Io, flexCombinedMotion"
-                ));
-            }
+            _ => return Err(format!("Can't find sequencer `{program}'.")),
         })
     }
 
@@ -246,7 +242,8 @@ impl Program {
 /// | `Io` | Ion chamber intensity |
 /// | `flexCombinedMotion` | Coarse+fine flexure stage |
 ///
-/// Returns `Ok(())` if the program was found and spawned, or `Err` with a message.
+/// Returns `Ok(())` if the program was found and spawned, or `Err` with
+/// seq_cmd.c's console line for one it does not know.
 ///
 /// Must be called with the runtime access captured for the shell thread (use
 /// `CommandContext::bridge()` from st.cmd startup commands, since st.cmd runs
@@ -443,6 +440,7 @@ mod tests {
         );
     }
 
+    /// seq_cmd.c:162.
     #[test]
     fn test_unknown_program() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -451,9 +449,10 @@ mod tests {
             epics_base_rs::runtime::task::BlockingBridge::capture()
         };
         let db = PvDatabase::new();
-        let result = seq_start("nonexistent", "P=x:", &bridge, &db);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown program"));
+        assert_eq!(
+            seq_start("nonexistent", "P=x:", &bridge, &db),
+            Err("Can't find sequencer `nonexistent'.".to_string())
+        );
     }
 
     /// filterDrive's blade count is the `NUM_FILTERS` macro

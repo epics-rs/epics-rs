@@ -1785,11 +1785,7 @@ impl PvDatabase {
         // A constant delivers nothing over what `dbLoadLink` put in `arg[i]`
         // when the link opened (`lnkCalc.c:459`).
         if crate::server::recgbl::simm::has_const_lset(link) {
-            return (
-                link.constant_value()
-                    .and_then(|value| value.get_convert_f64()),
-                None,
-            );
+            return (None, None);
         }
         let (value, alarm, _) = self.read_link_value_and_alarm(link, reader, false);
         let Some(value) = value.and_then(|value| value.get_convert_f64()) else {
@@ -2196,7 +2192,7 @@ impl PvDatabase {
                     rec_arc.name().as_bytes(),
                     &field,
                 );
-                let open = self.open_external_link(holder, &link)?;
+                let open = self.open_link(holder, &link)?;
                 Some((field, open))
             })
             .collect();
@@ -2224,7 +2220,7 @@ impl PvDatabase {
         );
         let open = instance
             .stored_link_shared(field)
-            .and_then(|link| self.open_external_link(holder, link));
+            .and_then(|link| self.open_link(holder, link));
         if let Some(open) = open {
             self.bind_opened(instance, field, open);
         }
@@ -2358,6 +2354,50 @@ impl PvDatabase {
             self.open_put_link(instance, link_field);
         }
         Ok(())
+    }
+
+    /// C `dbLinkOpen` (`dbLink.c:194-200`) of an init's or a put's `link`.
+    fn open_link(
+        &self,
+        holder: super::LinkHolder<'_>,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<super::LinkOpen> {
+        self.open_json_link(link);
+        self.open_external_link(holder, link)
+    }
+
+    /// The `openLink` of a JSON link whose lset is base's own:
+    /// `lnkState_open`'s `dbStateCreate` (`lnkState.c:110-116`), and
+    /// `lnkCalc_open` (`lnkCalc.c:449-466`), which opens each child,
+    /// `dbLoadLink`s it into `arg[i]` and opens `out`. Only `lnkConst` has a
+    /// `loadScalar`, so no other child, and no failed load, changes `arg[i]`.
+    fn open_json_link(&self, link: &crate::server::record::ParsedLink) {
+        use crate::server::record::{CalcArg, ParsedLink, constant_load_scalar};
+        use crate::types::c_parse::Converted;
+        match link {
+            ParsedLink::State(st) => {
+                self.db_state(&st.name);
+            }
+            ParsedLink::Calc(calc) => {
+                for (i, arg) in calc.args.iter().enumerate() {
+                    let CalcArg::Link(child) = arg else {
+                        continue;
+                    };
+                    self.open_json_link(child);
+                    if let ParsedLink::Constant(c) = &**child
+                        && let Some(Converted::Stored(value)) =
+                            constant_load_scalar(c, DbFieldType::Double)
+                        && let Some(value) = value.to_f64()
+                    {
+                        calc.val.set_arg(i, value);
+                    }
+                }
+                if let Some(out) = &calc.out {
+                    self.open_json_link(out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The lset's [`LinkSet::open_link`](super::LinkSet::open_link) of an
@@ -4528,10 +4568,8 @@ impl PvDatabase {
 
     /// The named `dbState` a `{state:…}` link addresses.
     ///
-    /// C `lnkState_open` (`lnkState.c:110-116`) calls `dbStateCreate` once
-    /// when the link opens at `iocInit`, so the state exists from then on
-    /// whether or not anything ever sets it; get-or-create at first use is
-    /// that rule with the same observable result. The registry is the
+    /// The link's open ([`Self::open_json_link`]) creates it; this finds it
+    /// as `dbStateCreate` does (`dbState.c:50-66`). The registry is the
     /// process-wide one the `sync` channel filter and the `Db State` device
     /// support already share, so all three see one bit per name.
     fn db_state(&self, name: &str) -> Arc<crate::server::database::filters::sync::DbState> {

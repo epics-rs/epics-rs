@@ -436,7 +436,12 @@ async fn main() -> CaResult<()> {
                 ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected macros string".into()),
             };
-            optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())?;
+            // seq_cmd.c:162: a plain printf, and no error status.
+            if let Err(e) =
+                optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())
+            {
+                ctx.console_println(&e);
+            }
             Ok(CommandOutcome::Continue)
         },
     ));

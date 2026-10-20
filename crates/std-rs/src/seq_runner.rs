@@ -59,7 +59,7 @@ pub fn seq_start(
                 crate::snl::femto::run(config, db)
             });
         }
-        other => return Err(format!("seq_start: unknown std program '{other}'")),
+        other => return Err(format!("Can't find sequencer `{other}'.")),
     }
 
     Ok(())
@@ -81,5 +81,19 @@ mod tests {
         let db = PvDatabase::new();
         assert_eq!(seq_start("delayDo", "", &bridge, &db), Ok(()));
         assert_eq!(seq_start("femto", "", &bridge, &db), Ok(()));
+    }
+
+    /// seq_cmd.c:162.
+    #[test]
+    fn an_unknown_program_is_refused_in_seq_cmd_c_s_words() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
+        assert_eq!(
+            seq_start("nonexistent", "", &bridge, &PvDatabase::new()),
+            Err("Can't find sequencer `nonexistent'.".to_string())
+        );
     }
 }

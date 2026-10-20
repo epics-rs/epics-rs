@@ -2817,20 +2817,14 @@ impl PvDatabase {
         // `ca_link_init` to keep the order the eager path had, where the init
         // passes ran at load, ahead of the link worker.
         //
-        // The drain opens with C's `dbInitRecordLinks`: every link is typed,
-        // checked and opened at `iocInit`, not at `dbLoadRecords`. That is
-        // where a `{state:"NAME"}` link's `dbStateCreate` happens — so its
-        // state exists from `iocInit` onward whether or not anything ever
-        // reads it — and it is also where a link the record's device support
-        // cannot take is refused, with the record kept. Measured on softIoc
+        // The drain opens with C's `dbInitRecordLinks`: every link is typed
+        // and checked at `iocInit`, not at `dbLoadRecords`, and a link the
+        // record's device support cannot take is refused, with the record
+        // kept. Its `doResolveLinks` then opens each link, which is where a
+        // `{state:"NAME"}` link's `dbStateCreate` happens. Measured on softIoc
         // R7.0.10: `dbStateShowAll 1` prints nothing after `dbLoadRecords`
         // alone and lists every name any link mentions after `iocInit`, all
         // FALSE, with nothing processed.
-        //
-        // Creating a state on first use alone — which the link read/write
-        // owner still does, because a `dbLoadRecords` AFTER `iocInit` opens
-        // its links then too — agrees on every value but left the registry
-        // empty until a link was touched.
         self.drain_deferred_record_inits(&|line| crate::stderr_println!("{line}"));
         self.ca_link_init();
         // The pass is done and every link's text is final, so the phase becomes
@@ -2880,12 +2874,9 @@ impl PvDatabase {
     /// bad links: eight `ERROR:` lines at `iocInit`, ten names in `dbl` before
     /// and after, and `iocRun: All initialization complete`.
     ///
-    /// The jlink `open` half rides here too, because in C it is the same pass:
-    /// `dbSetLink` (`:2225`) is what calls a jlink's `open`, and it is reached
-    /// only by a link that passed the check. So a `{state:…}` link on a field
-    /// whose device support refuses `JSON_LINK` never creates its `dbState` —
-    /// `lnkState_open` (`lnkState.c:110-116`) is `dbStateCreate`, find-or-create
-    /// (`dbState.c:50-66`), and it is not called at all.
+    /// A link refused here is emptied before `doResolveLinks` opens it, so a
+    /// `{state:…}` link on a field whose device support refuses `JSON_LINK`
+    /// never creates its `dbState`.
     ///
     /// C runs this pass (`prepareLinks`, `iocInit.c:175`) after
     /// `initHookAfterInitDevSup` and before `initDatabase`, so its refusals
@@ -2904,12 +2895,9 @@ impl PvDatabase {
         {
             return;
         }
-        use crate::server::record::{
-            DbLinkType, ParsedLink, declared_link_type, link_type_refusal,
-        };
+        use crate::server::record::{DbLinkType, declared_link_type, link_type_refusal};
         let empty_assigned =
             std::mem::take(&mut *self.inner.empty_link_assignments.lock().unwrap());
-        let states = crate::server::database::filters::sync::db_state_registry();
         for (name, rec) in self.iterate_records() {
             let (record_type, dtyp, fields) = {
                 let inst = rec.read();
@@ -2952,12 +2940,6 @@ impl PvDatabase {
                             work.run(self);
                         }
                     }
-                    continue;
-                }
-                if let ParsedLink::State(state) =
-                    crate::server::record::parse_link_field(&text, ftype)
-                {
-                    states.get_or_create(&state.name);
                 }
             }
             // The record's links are final from here on. `init_links` is the

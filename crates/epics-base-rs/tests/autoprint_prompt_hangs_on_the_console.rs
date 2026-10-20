@@ -61,8 +61,9 @@ fn the_autoprint_prompt_hangs_on_the_console() {
         .unwrap_or_else(|| panic!("{console}"));
     let print = &console[at..];
     assert!(print.contains("NAME: B "), "{print}");
-    // The echo is in bold, so the line is matched past its escapes.
+    // The print races the shell, so the echo after it is either the sleep's
+    // or the next line's; either one starts in bold.
     let prompt = print.find("\n-> ").unwrap_or_else(|| panic!("{print:?}"));
     let rest = print[prompt + 4..].lines().next().unwrap();
-    assert!(rest.contains("echo MARK"), "{print:?}");
+    assert!(rest.starts_with("\x1b[1m"), "{print:?}");
 }

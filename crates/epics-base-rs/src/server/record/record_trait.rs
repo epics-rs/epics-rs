@@ -1017,12 +1017,9 @@ pub enum LinkReadAs {
     Int64,
     /// C `dbGetLink(..., DBR_UINT64, ...)`.
     UInt64,
-    /// C `dbGetLink(..., DBR_ENUM, ...)` into the reader's buffer. Numeric
-    /// sources convert as [`Self::UShort`] does. A one-element `DBF_STRING`
-    /// source is `cvt_st_e` against the SOURCE record; a
-    /// longer one parses element 0 (`getStringUshort`). Where C writes nothing
-    /// (NORD=0) the read delivers an empty `EnumArray`, so the buffer stays the
-    /// reader's and this request can be cached in the plan.
+    /// C `dbGetLink(..., DBR_ENUM, ...)`. Numeric sources convert as
+    /// [`Self::UShort`] does; a `DBF_STRING` source's element 0 is `cvt_st_e`
+    /// against the SOURCE record, and an empty source fails (`S_db_onlyOne`).
     Enum,
     /// C `dbGetLink(..., DBF_CHAR|DBF_UCHAR, buf, 0, &n)` — up to `max_elements`
     /// bytes of the source's char array, taken as the string they spell
@@ -1228,7 +1225,24 @@ impl InputLinkRequest {
         record: &dyn Record,
         soft: Option<crate::server::device_support::SoftDtyp>,
     ) -> Self {
+        use crate::server::device_support::SoftDtyp;
         match soft {
+            // `getCallback` counts its read, `&no_elements = 1`
+            // (`devAiSoftCallback.c:56-65`), at the dset's `dbrType`: VAL's
+            // where the record reads natively (`devLiSoftCallback`'s
+            // `DBR_LONG`).
+            Some(SoftDtyp::Async) => match record.soft_input_request(SoftDtyp::Async) {
+                Self::As(read_as) => {
+                    match read_as
+                        .dbr_type()
+                        .or_else(|| super::record_instance::declared_field_type_of(record, "VAL"))
+                    {
+                        Some(dbr) => Self::As(LinkReadAs::Array { dbr, n_request: 1 }),
+                        None => Self::As(read_as),
+                    }
+                }
+                other => other,
+            },
             Some(soft) => record.soft_input_request(soft),
             None => record.input_link_request("INP"),
         }

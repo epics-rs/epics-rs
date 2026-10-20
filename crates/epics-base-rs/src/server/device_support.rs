@@ -86,9 +86,9 @@ pub enum Dpvt {
 pub struct CallbackPvt {
     /// `devAiSoftCallback.c`'s `smooth`.
     smooth: bool,
-    /// `devBiSoftCallback.c`/`devMbbiSoftCallback.c`'s `buffer.value`,
-    /// written only by a conversion that stores.
-    buffer: u16,
+    /// `buffer.value`, as the last read of one element left it; `None` is
+    /// `add_record`'s calloc'd zero.
+    buffer: Option<crate::types::EpicsValue>,
     /// The notified target as the completion's `getCallback` read it.
     notified: Option<Box<crate::server::database::NotifiedRead>>,
 }
@@ -123,17 +123,25 @@ impl Dpvt {
         }
     }
 
-    /// The devPvt's `buffer.value`; `None` with no devPvt.
-    #[inline(always)]
-    pub fn callback_buffer(&self) -> Option<u16> {
-        self.callback().map(|pvt| pvt.buffer)
-    }
-
-    /// Store a delivered `DBR_ENUM` reading in the devPvt's buffer.
-    #[inline(always)]
-    pub fn keep_buffer(&mut self, value: u16) {
-        if let Self::Callback(pvt) = self {
-            pvt.buffer = value;
+    /// What a SoftCallback `read_xxx` copies VAL from once `getCallback`'s
+    /// `dbChannelGetField(.., &no_elements = 1, ..)` read `value` into the
+    /// devPvt buffer (`devAiSoftCallback.c:56-65`): a read of no elements
+    /// writes nothing, so VAL takes the last reading. Any other dpvt reads
+    /// `value` itself.
+    pub(crate) fn callback_read(
+        &mut self,
+        value: crate::types::EpicsValue,
+    ) -> crate::types::EpicsValue {
+        let Self::Callback(pvt) = self else {
+            return value;
+        };
+        match value.first_element() {
+            Some(read) => pvt.buffer.insert(read).clone(),
+            None if value.is_array() => pvt.buffer.clone().unwrap_or_else(|| {
+                crate::types::EpicsValue::from_bytes(value.db_field_type(), &[0; 8])
+                    .unwrap_or(value)
+            }),
+            None => pvt.buffer.insert(value).clone(),
         }
     }
 

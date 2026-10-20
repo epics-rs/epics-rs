@@ -80,7 +80,7 @@ fn filter_read(suffix: &str, v: EpicsValue) -> EpicsValue {
 /// `dbGet` and `dbCaGetLink` convert from offset 0, and of an empty array
 /// nothing, a failed read.
 #[inline]
-fn element_0(value: EpicsValue) -> Option<EpicsValue> {
+pub(super) fn element_0(value: EpicsValue) -> Option<EpicsValue> {
     if value.is_array() {
         value.first_element()
     } else {
@@ -90,7 +90,7 @@ fn element_0(value: EpicsValue) -> Option<EpicsValue> {
 
 /// C `dbGetLink(..., DBR_DOUBLE, ...)` of one element.
 #[inline]
-fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
+pub(super) fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
     element_0(value).and_then(|s| s.get_convert_f64())
 }
 
@@ -1496,8 +1496,9 @@ impl PvDatabase {
     }
 
     /// [`LinkReadAs::Array`](crate::server::record::LinkReadAs::Array): an array source keeps its first `n_request`
-    /// elements, each converted to `dbr`; a scalar source converts as the
-    /// matching scalar request does.
+    /// elements, each converted to `dbr`; a source of one element converts as
+    /// the matching scalar request does, `dbGet`'s `no_elements == 1` test
+    /// (`dbAccess.c:967`).
     fn array_read_of(
         &self,
         held: Option<&crate::server::database::SetGuard>,
@@ -1507,7 +1508,7 @@ impl PvDatabase {
         mut value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
-        if value.is_array() {
+        if value.is_array() && value.count() != 1 {
             if dbr == DbFieldType::String {
                 return self.dbr_strings_of(value, n_request, render);
             }
@@ -1519,25 +1520,21 @@ impl PvDatabase {
                 .dbr_string_of(link, value, render)
                 .map(EpicsValue::String),
             DbFieldType::Enum => self.enum_read_of(held, link, value),
-            _ => value.get_convert(dbr).ok(),
+            _ => element_0(value)?.get_convert(dbr).ok(),
         }
     }
 
-    /// The `DBR_ENUM` form of a value just read from `link`, or an empty
-    /// `EnumArray` where C writes nothing into the reader's buffer. One string
-    /// is [`cvt_st_e`](crate::server::record::cvt_st_e) against the SOURCE
-    /// record. More elements take `dbGet`'s table, `getStringUshort` on
-    /// element 0; none (NORD=0) is `dbGet`'s `n <= 0` arm, which converts
-    /// nothing and succeeds.
+    /// The `DBR_ENUM` form of element 0 of a value just read from `link`,
+    /// `dbGet`'s scalar convert: a string is
+    /// [`cvt_st_e`](crate::server::record::cvt_st_e) against the SOURCE
+    /// record, and an empty source is `S_db_onlyOne`.
     fn enum_read_of(
         &self,
         held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
     ) -> Option<EpicsValue> {
-        if value.is_array() && value.count() == 0 {
-            return Some(EpicsValue::EnumArray(Vec::new().into()));
-        }
+        let value = element_0(value)?;
         if let Some(s) = crate::server::record::cvt_st_e_input(&value) {
             let crate::server::record::ParsedLink::Db(db) = link else {
                 return None;
@@ -1560,7 +1557,7 @@ impl PvDatabase {
                 }
             };
         }
-        element_0(value)?.get_convert(DbFieldType::Enum).ok()
+        value.get_convert(DbFieldType::Enum).ok()
     }
 
     /// The `DBR_STRING` form of a value just read from `link`: rendered by the

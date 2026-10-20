@@ -336,35 +336,13 @@ impl Record for BiRecord {
         })
     }
 
-    /// The Async dset copies its buffer into VAL; the other soft dsets never
-    /// read `async_buffer`, so taking every delivered value is exact for it.
-    fn soft_input_read(
-        &mut self,
-        value: Option<EpicsValue>,
-        dpvt: &mut crate::server::device_support::Dpvt,
-    ) -> CaResult<()> {
-        match value {
-            None => return Ok(()),
-            // A read that stores nothing (a state name, NORD=0) hands back
-            // the devPvt buffer, not VAL; with no devPvt C never read.
-            Some(EpicsValue::EnumArray(a)) if a.is_empty() => match dpvt.callback_buffer() {
-                Some(buffer) => self.set_val(EpicsValue::Enum(buffer))?,
-                None => return Ok(()),
-            },
-            Some(value) => self.set_val(value)?,
-        }
-        dpvt.keep_buffer(self.val);
-        Ok(())
-    }
-
     /// The Plain dset's `DBR_USHORT` read: VAL is that state index.
     fn soft_input_read_u16(
         &mut self,
         value: u16,
-        dpvt: &mut crate::server::device_support::Dpvt,
+        _dpvt: &mut crate::server::device_support::Dpvt,
     ) -> CaResult<()> {
         self.val = value;
-        dpvt.keep_buffer(value);
         Ok(())
     }
 

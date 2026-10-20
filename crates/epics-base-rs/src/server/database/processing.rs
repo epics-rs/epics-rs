@@ -2330,7 +2330,13 @@ impl PvDatabase {
         };
         let mut alarm = alarm;
         if let Some(value) = value
-            && !deliver_multi_input(record, link.val_field, value, store_raw)
+            && !deliver_multi_input(
+                record,
+                link.val_field,
+                value,
+                store_raw,
+                plan.multi_input_is_db_get_link,
+            )
         {
             read_failed = true;
             alarm = None;
@@ -2383,7 +2389,7 @@ impl PvDatabase {
             crate::server::record::record_instance::NativeRead,
         ),
         (declared, cache_slot): (&'static [(&'static str, &'static str)], usize),
-        sets_link_alarm: bool,
+        db_get_link: bool,
     ) -> bool {
         use super::links::{LinkAlarm, inherit_sevr_msg, local_name};
         let target = db.target();
@@ -2394,8 +2400,14 @@ impl PvDatabase {
         if native.shadowed {
             let pv_name = local_name(&target.record, field);
             if let Some(pv) = self.simple_pv_bytes(&pv_name) {
-                let failed = !deliver_multi_input(record, declared[cache_slot].1, pv.get(), false);
-                if failed && sets_link_alarm {
+                let failed = !deliver_multi_input(
+                    record,
+                    declared[cache_slot].1,
+                    pv.get(),
+                    false,
+                    db_get_link,
+                );
+                if failed && db_get_link {
                     crate::server::recgbl::rec_gbl_set_link_alarm(common, declared[cache_slot].0);
                 }
                 return failed;
@@ -2415,25 +2427,27 @@ impl PvDatabase {
         let alarm = inherits.then(|| LinkAlarm::committed(&instance.common));
         drop(instance);
         let Some(value) = value else {
-            if sets_link_alarm {
+            if db_get_link {
                 crate::server::recgbl::rec_gbl_set_link_alarm(common, declared[cache_slot].0);
             }
             return true;
         };
         let stored = match value {
             Ok(f) => Some(f),
-            Err(value) => match deliver_converted(record, declared[cache_slot].1, value) {
-                Ok(stored) => stored,
-                Err(()) => {
-                    if sets_link_alarm {
-                        crate::server::recgbl::rec_gbl_set_link_alarm(
-                            common,
-                            declared[cache_slot].0,
-                        );
+            Err(value) => {
+                match deliver_converted(record, declared[cache_slot].1, value, db_get_link) {
+                    Ok(stored) => stored,
+                    Err(()) => {
+                        if db_get_link {
+                            crate::server::recgbl::rec_gbl_set_link_alarm(
+                                common,
+                                declared[cache_slot].0,
+                            );
+                        }
+                        return true;
                     }
-                    return true;
                 }
-            },
+            }
         };
         if let Some(f) = stored
             && !native
@@ -2770,12 +2784,14 @@ fn not_read_slot() -> Option<LinkOutcome> {
 ///
 /// `false` is C's non-zero `dbGetLink` status: the source cannot convert to
 /// the requested type (a non-numeric string for a numeric request).
+/// `db_get_link` is [`Record::multi_input_fetch_is_db_get_link`](crate::server::record::Record::multi_input_fetch_is_db_get_link).
 #[inline]
 fn deliver_multi_input(
     record: &mut dyn crate::server::record::Record,
     val_field: &'static str,
     value: EpicsValue,
     store_raw: bool,
+    db_get_link: bool,
 ) -> bool {
     if store_raw {
         // A declared DBR-typed request (printf `%s`, `%ld`) already produced
@@ -2788,7 +2804,7 @@ fn deliver_multi_input(
     // converts in its own frame.
     let f = match value.into_double() {
         Ok(f) => f,
-        Err(value) => match deliver_converted(record, val_field, value) {
+        Err(value) => match deliver_converted(record, val_field, value, db_get_link) {
             Ok(Some(f)) => f,
             Ok(None) => return true,
             Err(()) => return false,
@@ -2800,25 +2816,30 @@ fn deliver_multi_input(
 
 /// [`deliver_multi_input`]'s non-`Double` arm: an array stored whole when
 /// the field takes one, else the scalar the numeric funnel makes of it.
-/// `Ok(None)` is a value stored (or an empty array, which C's `dbGet`
-/// converts nothing of and succeeds); `Err` is a conversion C fails.
+/// `Ok(None)` is a value stored; `Err` is a conversion C fails, which for a
+/// scalar field's `dbGetLink` includes an empty source (`S_db_onlyOne`).
 fn deliver_converted(
     record: &mut dyn crate::server::record::Record,
     val_field: &'static str,
     value: EpicsValue,
+    db_get_link: bool,
 ) -> Result<Option<f64>, ()> {
-    if value.is_array() {
-        if record.put_field_internal(val_field, value.clone()).is_ok() {
-            return Ok(None);
-        }
-        // The target is a scalar field: element 0, as C's one-element
-        // destination takes.
-        return match value.first_element() {
-            Some(v) => v.get_convert_f64().map(Some).ok_or(()),
-            None => Ok(None),
-        };
+    if !db_get_link {
+        return dyn_link_element(value)
+            .get_convert_f64()
+            .map(Some)
+            .ok_or(());
     }
-    value.get_convert_f64().map(Some).ok_or(())
+    if value.is_array() && record.put_field_internal(val_field, value.clone()).is_ok() {
+        return Ok(None);
+    }
+    super::links::link_value_as_f64(value).map(Some).ok_or(())
+}
+
+/// `recDynLinkGet`'s copy out of its `rdlSCALAR` CA buffer (`recDynLink.c:539`):
+/// element 0, and of an empty source the zero the server fills it with.
+fn dyn_link_element(value: EpicsValue) -> EpicsValue {
+    super::links::element_0(value).unwrap_or(EpicsValue::Double(0.0))
 }
 
 /// The record's data guard across the guarded segments of one process cycle.
@@ -7096,6 +7117,7 @@ impl PvDatabase {
                             let _ = if stage_is_soft {
                                 {
                                     let inst = &mut *instance;
+                                    let inp_val = inst.dpvt.callback_read(inp_val);
                                     inst.record.soft_input_read(Some(inp_val), &mut inst.dpvt)
                                 }
                             } else {
@@ -8242,7 +8264,7 @@ impl PvDatabase {
                     if let Some(value) = self.read_link_unprocessed(rec, &link, false).0.value() {
                         out_time_fetched
                             .get_or_insert_with(Vec::new)
-                            .push((value_field, value));
+                            .push((value_field, dyn_link_element(value)));
                     }
                 }
             }
@@ -10931,8 +10953,8 @@ impl PvDatabase {
             }
             Some(read_as) => {
                 // A request at a DBR type delivers the value converted at that
-                // type; only `Double` (and `Enum`'s unwritten buffer) is the
-                // numeric funnel's.
+                // type; only `Double` and `Enum`'s index are the numeric
+                // funnel's.
                 let raw = !matches!(read_as, LinkReadAs::Double | LinkReadAs::Enum);
                 match self.apply_link_read_as(Some(reader.held), link, read_as, value, render) {
                     Some(v) => {

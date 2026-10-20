@@ -1091,9 +1091,9 @@ impl Record for ASubRecord {
     }
 
     /// C `fetch_values` asks `dbGetLink` for the channel's declared FTx with
-    /// `nRequest = NOx` (`aSubRecord.c:283-284`). One element is the scalar
-    /// request; a wider channel is the array one, which converts whatever
-    /// the source is, so no read resolves the source first. `SUBL` is
+    /// `&nRequest = NOx` (`aSubRecord.c:283-284`): a counted read at every
+    /// width, so an empty source delivers nothing rather than failing, and
+    /// no read resolves the source first. `SUBL` is
     /// `dbGetLink(&subl, DBR_STRING, ...)` (`aSubRecord.c:256`).
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
         if link_field == "SUBL" {
@@ -1106,12 +1106,12 @@ impl Record for ASubRecord {
             return InputLinkRequest::As(LinkReadAs::Native);
         };
         let read = ftype_read(channel_ftype(self.fta[idx]));
-        InputLinkRequest::As(match (self.noa[idx], read.dbr_type()) {
-            (n, Some(dbr)) if n > 1 => LinkReadAs::Array {
+        InputLinkRequest::As(match read.dbr_type() {
+            Some(dbr) => LinkReadAs::Array {
                 dbr,
-                n_request: n as usize,
+                n_request: self.noa[idx].max(1) as usize,
             },
-            _ => read,
+            None => read,
         })
     }
 
@@ -1467,7 +1467,10 @@ mod tests {
         rec.put_field("FTC", EpicsValue::Short(0)).unwrap(); // STRING
         assert_eq!(
             rec.input_link_request("INPC"),
-            InputLinkRequest::As(LinkReadAs::String)
+            InputLinkRequest::As(LinkReadAs::Array {
+                dbr: crate::types::DbFieldType::String,
+                n_request: 1
+            })
         );
         rec.put_field("NOC", EpicsValue::Long(16)).unwrap();
         assert_eq!(
@@ -1481,8 +1484,11 @@ mod tests {
         // framework never resolves the target for it.
         assert_eq!(
             rec.input_link_request("INPA"),
-            InputLinkRequest::As(LinkReadAs::Double),
-            "a DOUBLE channel reads DBR_DOUBLE, source unasked"
+            InputLinkRequest::As(LinkReadAs::Array {
+                dbr: crate::types::DbFieldType::Double,
+                n_request: 1
+            }),
+            "a DOUBLE channel reads one DBR_DOUBLE, source unasked"
         );
         assert_eq!(
             rec.input_link_request("SUBL"),

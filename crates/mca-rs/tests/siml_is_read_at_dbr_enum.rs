@@ -2,14 +2,18 @@
 //! (`mcaRecord.c:1106`), which only a read cycle runs. A string source's
 //! `cvt_st_e` asks the source's `put_enum_str`, which stringin has none of,
 //! so even `"5"` fails the read; a number converts, and 70000 wraps to 4464,
-//! which `readValue` answers with SOFT/INVALID.
+//! which `readValue` answers with SOFT/INVALID. The read is the scalar one
+//! (`nRequest` NULL): an empty source is `S_db_onlyOne`, and a string array
+//! is `cvt_st_e` on element 0, which a waveform cannot answer.
 //!
 //! oracleMcaIoc on this database, `dbpf M:<k>.READ 1` then `dbgf`:
 //!
 //! ```text
-//! M:five SIMM NO    LINK/INVALID "field SIML"
-//! M:n1   SIMM YES   NO_ALARM
-//! M:nbig SIMM 4464  SOFT/INVALID
+//! M:five  SIMM NO    LINK/INVALID "field SIML"
+//! M:n1    SIMM YES   NO_ALARM
+//! M:nbig  SIMM 4464  SOFT/INVALID
+//! M:empty SIMM YES   LINK/INVALID "field SIML"
+//! M:two   SIMM NO    LINK/INVALID "field SIML"
 //! ```
 
 // RTEMS-EXEC-MODEL-ALLOW(1): no CA server is built; the reactor is
@@ -38,6 +42,10 @@ record(ao, "S:nbig") { field(VAL, "70000") }
 record(mca, "M:five") { field(SIML, "S:five") field(SIOL, "W") field(NMAX, "4") field(NUSE, "4") field(FTVL, "LONG") }
 record(mca, "M:n1") { field(SIML, "S:n1") field(SIOL, "W") field(NMAX, "4") field(NUSE, "4") field(FTVL, "LONG") }
 record(mca, "M:nbig") { field(SIML, "S:nbig") field(SIOL, "W") field(NMAX, "4") field(NUSE, "4") field(FTVL, "LONG") }
+record(waveform, "W0") { field(FTVL, "DOUBLE") field(NELM, "4") }
+record(waveform, "WS2") { field(FTVL, "STRING") field(NELM, "4") }
+record(mca, "M:empty") { field(SIML, "W0 NPP") field(SIMM, "YES") field(NMAX, "4") }
+record(mca, "M:two") { field(SIML, "WS2 NPP") field(NMAX, "4") }
 "#;
 
 #[tokio::test]
@@ -52,6 +60,12 @@ async fn a_read_cycle_reads_siml_at_dbr_enum() {
         .await
         .unwrap();
     db.ioc_init().await;
+    db.put_pv(
+        "WS2",
+        EpicsValue::StringArray(vec!["1".into(), "2".into()].into()),
+    )
+    .await
+    .unwrap();
     let mut wrong = Vec::new();
     for (rec, simm, alarm) in [
         (
@@ -72,6 +86,24 @@ async fn a_read_cycle_reads_siml_at_dbr_enum() {
             "M:nbig",
             4464,
             (AlarmSeverity::Invalid, alarm_status::SOFT_ALARM, ""),
+        ),
+        (
+            "M:empty",
+            1,
+            (
+                AlarmSeverity::Invalid,
+                alarm_status::LINK_ALARM,
+                "field SIML",
+            ),
+        ),
+        (
+            "M:two",
+            0,
+            (
+                AlarmSeverity::Invalid,
+                alarm_status::LINK_ALARM,
+                "field SIML",
+            ),
         ),
     ] {
         db.put_record_field_from_ca_no_notify(rec, "READ", EpicsValue::Short(1))

@@ -756,13 +756,14 @@ pub mod eca {
         status & 0x7
     }
 
-    /// Human-readable text for an ECA status, mirroring libca `ca_message`.
+    /// Human-readable text for an ECA status: libca `ca_message`
+    /// (`access.cpp:562-572`).
     pub fn eca_message(status: u32) -> &'static str {
         let msg_no = eca_msg_no(status) as usize;
         ECA_MESSAGE_TEXT
             .get(msg_no)
             .copied()
-            .unwrap_or("Unknown ECA status")
+            .unwrap_or("new CA message number known only by server - see caerr.h")
     }
 
     /// Strings copied verbatim from `epics-base/modules/ca/src/client/access.cpp`
@@ -830,6 +831,20 @@ pub mod eca {
         "Virtual circuit connection sequence aborted",
         "Virtual circuit unresponsive",
     ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_number_past_the_table_reads_as_libca_says() {
+            assert_eq!(eca_message(ECA_PUTFAIL), "Channel write request failed");
+            assert_eq!(
+                eca_message(defmsg(CA_K_WARNING, ECA_MESSAGE_TEXT.len() as u32)),
+                "new CA message number known only by server - see caerr.h"
+            );
+        }
+    }
 }
 
 pub(crate) use eca::{

@@ -177,8 +177,8 @@ proptest! {
         prop_assert_eq!(eca_msg_no(code), msg_no);
     }
 
-    /// `eca_message` never panics — for unknown codes it returns the
-    /// "Unknown ECA status" placeholder, which is fine.
+    /// `eca_message` never panics — an unknown code reads as libca's
+    /// "new CA message number" text.
     #[test]
     fn eca_message_total(code in any::<u32>()) {
         let _ = eca_message(code);

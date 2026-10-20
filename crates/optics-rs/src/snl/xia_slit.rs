@@ -1431,6 +1431,10 @@ pub async fn run<R, W>(
 mod tests {
     use super::*;
 
+    // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+    // on the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest
+    // run -p optics-rs --all-features`, 463/463).
+
     /// `process_response` (xia_slit.st:1033-1035, 1245-1345): the words are
     /// `sscanf("%s %s %s %s %s %s")`'s, split on C white space only, and each
     /// number is `sscanf(word, "%d")`.

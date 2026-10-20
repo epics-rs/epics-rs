@@ -19,6 +19,9 @@ fn ordinal(v: EpicsValue) -> f64 {
     v.to_f64().unwrap()
 }
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed on
+// the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
+// -p epics-base-rs --all-features`).
 #[tokio::test]
 async fn a_severity_index_string_is_epics_parse_uint16_base_0() {
     let db = load(r#"record(ai, "A") { field(HHSV, "0x2") field(HSV, " 1 ") field(LSV, "3") }"#)

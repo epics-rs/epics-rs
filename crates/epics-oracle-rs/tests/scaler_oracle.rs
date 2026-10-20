@@ -13,7 +13,7 @@
 //! Requires the built oracle IOC (`EPICS_ORACLE_SCALER_IOC_BIN`, or the default
 //! path) and fails loudly rather than skipping when it is absent.
 
-#![cfg(all(tokio_backend, feature = "scaler"))]
+#![cfg(feature = "scaler")]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};

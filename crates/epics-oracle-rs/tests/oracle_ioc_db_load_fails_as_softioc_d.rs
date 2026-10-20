@@ -15,8 +15,6 @@
 //! The suggestion is C's errlog thread, so where it lands among the
 //! direct lines is timing; it is asserted present, not placed.
 
-#![cfg(tokio_backend)]
-
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 

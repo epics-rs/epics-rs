@@ -115,9 +115,7 @@ port reports, so they keep passing while its field tables are regenerated
 underneath them. The unit half (dbd parsing, case generation, adjudication,
 allowlist staleness) needs no C tree. `tests/oracle.rs` and
 `tests/pva_oracle.rs` boot the real pair, so they need the trees above and fail
-loudly rather than skipping when one is absent; four of `oracle.rs`'s are gated
-off `exec_backend`, where `oracle-ioc` refuses to start and they would have no
-subject.
+loudly rather than skipping when one is absent, on either backend.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
 be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`

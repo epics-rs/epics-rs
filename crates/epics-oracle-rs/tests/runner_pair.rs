@@ -3,13 +3,6 @@
 //! which `nextest --lib` never does for a unit test. `CARGO_BIN_EXE_oracle-ioc`
 //! is the binary cargo handed over, so the pair boots it and not whatever
 //! happens to sit beside the test executable.
-//!
-//! `#![cfg(tokio_backend)]`: these boot `oracle-ioc`, which refuses to start
-//! under the reactor-free `exec_backend`, so they cannot pass there under any
-//! treatment. The `FakeIoc` cases in `runner.rs` stay selected on every
-//! backend.
-
-#![cfg(tokio_backend)]
 
 use std::sync::Once;
 

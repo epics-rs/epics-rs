@@ -27,8 +27,6 @@
 //! the same `build_ioc` path in-process, by `epics-base-rs`'s
 //! `build_ioc_pini_hook`.
 
-#![cfg(tokio_backend)]
-
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 

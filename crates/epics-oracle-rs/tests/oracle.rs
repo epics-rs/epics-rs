@@ -10,39 +10,21 @@
 //! Requires the built C EPICS tree (`EPICS_BASE_BIN`, or the default path). If
 //! it is absent the tests fail loudly rather than skipping — a silently skipped
 //! oracle is exactly the false-clean this project is trying to escape.
-//!
-//! # Four of these have no subject on the reactor-free backend
-//!
-//! The Rust side of the pair is the `oracle-ioc` binary, and it refuses to
-//! start under `exec_backend` — the reactor-free backend, selected on a host
-//! build by `EPICS_RS_BUILD_EXEC_BACKEND=thread` and unconditionally on RTEMS
-//! and VxWorks. The four that boot the pair therefore cannot pass there under
-//! any treatment, so they are gated rather than selected and failed. The rest
-//! stay selected: they assert bucket-accounting and reproducer rules that hold
-//! over an all-ERROR report, which is the harness behaving correctly when a
-//! side is unreachable. `[[test]] required-features` cannot name a
-//! build-script cfg, which is why the gates are on the items and not in
-//! `Cargo.toml`.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived —
 // `the_denominator_probe_uses_the_configuration_under_test` ran and
 // passed on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
 // epics-oracle-rs --all-features`). It reads the dbd, builds no server,
-// and the reactor it obtains comes from `#[tokio::test]` itself. The
-// twelve cases that used to fail in that run boot `oracle-ioc`, which
-// refuses on that backend; they are plain `#[test]`, so the census never
-// counted them, and they now carry `#[cfg(tokio_backend)]` instead.
+// and the reactor it obtains comes from `#[tokio::test]` itself.
 
 use std::collections::BTreeSet;
 
 use epics_oracle_rs::allowlist::Allowlist;
-#[cfg(tokio_backend)]
 use epics_oracle_rs::catool::{CaTools, PutOutcome};
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
 use epics_oracle_rs::ioc::CTools;
-#[cfg(tokio_backend)]
 use epics_oracle_rs::ioc::{Ioc, Pair, Side};
 use epics_oracle_rs::report::{Counts, exit_status, field_coverage, run_failures};
 use epics_oracle_rs::runner::{Runner, workdir};
@@ -90,7 +72,6 @@ fn the_dbd_yields_a_real_denominator() {
 /// Both IOCs boot on the same `.db`, on **different, exclusive** ports, and both
 /// serve the record. This is the load-bearing precondition for everything else:
 /// if the two ever shared a port, a reading could come from the wrong IOC.
-#[cfg(tokio_backend)]
 #[test]
 fn the_pair_boots_on_distinct_ports_and_both_serve_the_record() {
     let t = tools();
@@ -120,7 +101,6 @@ fn the_pair_boots_on_distinct_ports_and_both_serve_the_record() {
 
 /// A PV that does not exist must produce an ERROR on both sides — never an
 /// empty-but-successful reading that the diff would score as agreement.
-#[cfg(tokio_backend)]
 #[test]
 fn an_unconnectable_pv_errors_rather_than_silently_agreeing() {
     let t = tools();
@@ -280,7 +260,6 @@ async fn the_denominator_probe_uses_the_configuration_under_test() {
 /// measurement failure would bury that finding under ERROR instead of scoring
 /// it. Driven against the real pair, because the discriminator is the C tool's
 /// own message.
-#[cfg(tokio_backend)]
 #[test]
 fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
     let t = tools();
@@ -317,7 +296,6 @@ fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
 ///
 /// The readback is asserted alongside, because it is what proves the write
 /// reached the record: a non-completion is not a put that did not happen.
-#[cfg(tokio_backend)]
 #[test]
 fn a_completion_the_server_withholds_is_a_reading_not_a_measurement_failure() {
     let t = tools();
@@ -353,7 +331,6 @@ fn a_completion_the_server_withholds_is_a_reading_not_a_measurement_failure() {
 ///
 /// Both directions on one boot-shaped run, because an exit-0 assertion alone
 /// would still pass if the binary always exited 0.
-#[cfg(tokio_backend)]
 #[test]
 fn the_binary_exits_zero_on_a_clean_run_and_non_zero_on_a_stale_row() {
     let dir = workdir(None).unwrap();

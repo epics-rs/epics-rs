@@ -15,8 +15,6 @@
 //!      ...
 //! ```
 
-#![cfg(tokio_backend)]
-
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 

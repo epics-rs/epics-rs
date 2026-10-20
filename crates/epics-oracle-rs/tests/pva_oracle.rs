@@ -29,27 +29,13 @@
 //! Requires the built pvxs tree (`PVXS_BIN`, or the default path). If it is
 //! absent the tests fail loudly rather than skipping — a silently skipped
 //! oracle is exactly the false-clean this project exists to escape.
-//!
-//! # Five of these have no subject on the reactor-free backend
-//!
-//! The Rust side is `oracle-ioc --pva`, and it refuses to start under
-//! `exec_backend` — the reactor-free backend, selected on a host build by
-//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` and unconditionally on RTEMS and
-//! VxWorks. The five that reach `PvaPair::boot`, through `boot` or through
-//! `sweep`'s real phase, cannot pass there under any treatment and are gated
-//! rather than selected and failed. The four that stay assert per-case
-//! accounting that holds over an all-ERROR report. `[[test]]
-//! required-features` cannot name a build-script cfg, which is why the gates
-//! are on the items.
 
-#[cfg(tokio_backend)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
 use epics_oracle_rs::ioc::{CTools, PvxTools, Side, claim_port};
-#[cfg(tokio_backend)]
 use epics_oracle_rs::ioc::{Ioc, PvaPair};
 use epics_oracle_rs::pvaread::{self, PvaReport};
 use epics_oracle_rs::pvatool::PvaTools;
@@ -91,7 +77,6 @@ fn surface_of(record_type: &str) -> Surface {
 /// plus the channels its assertions name, and `scalcout`'s whole surface stops
 /// spending two minutes on a fallback eleven channels exercise identically. The
 /// record the IOCs load is untouched and still has all 171 fields.
-#[cfg(tokio_backend)]
 fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
     let dbd = Dbd::parse(&trimmed_recordtype(record_type, keep))
         .unwrap_or_else(|e| panic!("the trimmed {record_type} recordtype must parse: {e}"));
@@ -101,7 +86,6 @@ fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
 
 /// One `recordtype(...)` block from the fat `.dbd`, carrying only `keep`'s
 /// fields — verbatim, so every type, size and `special` is the real one.
-#[cfg(tokio_backend)]
 fn trimmed_recordtype(record_type: &str, keep: &[&str]) -> String {
     let text = std::fs::read_to_string(CTools::dbd_path()).expect("the fat dbd must be readable");
     let head = format!("recordtype({record_type}) {{");
@@ -174,7 +158,6 @@ fn sweep_surface(record_type: &str, surface: Surface) -> (Surface, PvaReport) {
 }
 
 /// Boot the pair on a one-record `.db` and hand back the pair plus its tools.
-#[cfg(tokio_backend)]
 fn boot(record_type: &str, rec: &str) -> (PvxTools, PvaPair) {
     let t = tools();
     let dir = workdir(None).expect("workdir");
@@ -190,7 +173,6 @@ fn boot(record_type: &str, rec: &str) -> (PvxTools, PvaPair) {
 /// one shared port would mean a `pvxget` aimed at one could be answered by the
 /// other — and PVA gives no warning when that happens (the search socket sets
 /// SO_REUSEPORT, so the collision binds silently).
-#[cfg(tokio_backend)]
 #[test]
 fn the_pva_pair_boots_on_distinct_ports() {
     let (_t, pair) = boot("ai", "ORACLE:AI");
@@ -260,7 +242,6 @@ fn concurrent_client_tools_do_not_break_each_other() {
 /// `PvaPair::boot` already refuses to return otherwise; this pins the proof
 /// itself, because it is the one guard with no CA analogue and it is invisible
 /// when it silently stops working.
-#[cfg(tokio_backend)]
 #[test]
 fn each_side_is_the_sole_server_on_its_port() {
     let (t, pair) = boot(RT, "ORACLE:BI");
@@ -363,7 +344,6 @@ fn coverage_counts_only_fully_measured_channels() {
 /// `pvxget`/`pvxinfo` errors. Both print the identical counts. Only this text
 /// separates "the harness could not look" from "the port is broken", and
 /// without it the reader of a failed run has a budget and no cause.
-#[cfg(tokio_backend)]
 fn why_unmeasured(report: &PvaReport) -> String {
     let mut n: BTreeMap<String, usize> = BTreeMap::new();
     for case in &report.cases {
@@ -389,7 +369,6 @@ fn why_unmeasured(report: &PvaReport) -> String {
 /// `pvxinfo` silently stopped being run, every test above would still pass
 /// while the separation quietly became fiction — so the readings are checked to
 /// be what those tools actually print.
-#[cfg(tokio_backend)]
 #[test]
 fn each_measured_channel_carries_a_real_type_and_a_real_value_reading() {
     let (_surface, report) = sweep(RT);
@@ -467,7 +446,6 @@ fn the_dbd_derived_shape_matches_the_ground_truth_on_every_measured_channel() {
 /// AGREED would pass every other test in this file while being useless. It is a
 /// lower bound on purpose — the port's PVA divergences are being fixed
 /// concurrently, so any exact count would be wrong by the time it was read.
-#[cfg(tokio_backend)]
 #[test]
 fn at_least_one_channel_agrees() {
     let (_surface, report) = sweep(RT);
@@ -506,7 +484,6 @@ fn at_least_one_channel_agrees() {
 /// What is pinned is NOT how many channels kill the server — pvxs may fix
 /// theirs, and then none do. It is that a channel whose only misfortune was
 /// sharing a batch with a killer is still measured.
-#[cfg(tokio_backend)]
 #[test]
 fn a_channel_that_kills_the_server_does_not_cost_its_batch_mates_their_verdicts() {
     let (_surface, report) = sweep_fields(
@@ -560,7 +537,6 @@ fn a_channel_that_kills_the_server_does_not_cost_its_batch_mates_their_verdicts(
     );
 }
 
-#[cfg(tokio_backend)]
 #[test]
 fn an_unreachable_pv_scores_error_never_agreement() {
     let (t, pair) = boot("ai", "ORACLE:AI");

@@ -5,13 +5,13 @@
 //! predicting it: `from_parts(db, port, ..)` binds the sockets and *then* reports
 //! what it got; the number is a claim the harness holds, never hard-coded.
 //!
-//! Two protocols, selected by `--pva`. The two server types are named in code
-//! spans rather than linked: both are `tokio_backend`-only and this doc block
-//! is rendered in every configuration, so a link out of it resolves in none.
+//! Two protocols, selected by `--pva`. The server types are named in code
+//! spans rather than linked: `CaServer` exists on the tokio backend only, and
+//! this doc block is rendered on both.
 //!
 //! | mode | server | port line |
 //! |---|---|---|
-//! | default | `CaServer` | `ORACLE_IOC_PORT <n>` |
+//! | default | `CaServer` (tokio), `BlockingCaServing` (exec) | `ORACLE_IOC_PORT <n>` |
 //! | `--pva` | `PvaServer` | `ORACLE_IOC_PVA_PORT <n>` (the UDP search port) |
 //!
 //! The two lines are deliberately distinct rather than one reused name: a CA
@@ -26,20 +26,16 @@
 //! an in-process path the C side cannot have would be a difference in the
 //! instrument rather than in the thing being measured.
 
-// On `exec_backend` this program's `main` refuses instead of running, so the
-// argument parsing and the port announcement below are unreachable in that
-// configuration by construction. The default build still lints them in full.
-#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_app::InitializedServers;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServerBuilder;
 use epics_oracle_rs::{port_ioc_builder, register_port_ioc_devices};
-#[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser)]
@@ -102,6 +98,16 @@ fn parse_macro(text: &str) -> Result<(String, String), String> {
 #[cfg(tokio_backend)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run().await
+}
+
+/// The reactor-free arm: the same `run`, parked on the main thread.
+#[cfg(exec_backend)]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    epics_base_rs::runtime::task::block_on_sync(run())?
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Loopback only: the oracle must never answer a real search on this host
@@ -186,30 +192,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // initialProcess and scanRun, so the Rust IOC runs its `iocRun` itself,
     // before serving either protocol.
     let db = Arc::clone(ioc.database());
-    let server = CaServerBuilder::serving(
-        db.clone(),
-        epics_base_rs::server::access_security::new_acf_cell(None),
-        None,
-        None,
-    )
-    .port(args.port)
-    .bound_at_init(ioc.servers());
+    let mut servers = std::mem::take(ioc.servers());
     ioc.run().await;
 
     if args.pva {
         return serve_pva(db, args.port).await;
     }
+    serve_ca(db, args.port, &mut servers).await
+}
 
-    // The server reports the port `iocInit` bound, which the harness checks
-    // against the one it claimed.
-    let server = server.build().await?;
-    let port = server.udp_port();
-
-    // Announce only after the sockets exist. The harness blocks on this line,
-    // so printing it early would race the listener.
-    announce("ORACLE_IOC_PORT", port)?;
-
+/// Serve `db` over CA on the sockets `iocInit` bound, reporting the port the
+/// server holds, which the harness checks against the one it claimed.
+///
+/// Announce only after the sockets exist. The harness blocks on this line, so
+/// printing it early would race the listener.
+#[cfg(tokio_backend)]
+async fn serve_ca(
+    db: Arc<PvDatabase>,
+    port: u16,
+    servers: &mut InitializedServers,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server = CaServerBuilder::serving(
+        db,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .port(port)
+    .bound_at_init(servers)
+    .build()
+    .await?;
+    announce("ORACLE_IOC_PORT", server.udp_port())?;
     server.run().await?;
+    Ok(())
+}
+
+/// The exec arm of [`serve_ca`]: the blocking RSRV on the same sockets,
+/// announced as `CaServer::run` announces. `RsrvServing` would serve them too,
+/// but does not expose the port it serves on.
+#[cfg(exec_backend)]
+async fn serve_ca(
+    db: Arc<PvDatabase>,
+    port: u16,
+    servers: &mut InitializedServers,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use epics_ca_rs::server::blocking_serving::BlockingCaServing;
+    use epics_ca_rs::server::{RSRV_SERVER, RsrvSockets, ServerStats};
+
+    let sockets = servers
+        .take::<RsrvSockets>(RSRV_SERVER)
+        .ok_or_else(|| format!("rsrv_init bound no CA sockets on port {port}"))?;
+    let serving = BlockingCaServing::serve(
+        sockets,
+        db,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        Arc::new(ServerStats::default()),
+    )?;
+    epics_base_rs::server::db_server::announce_serving(RSRV_SERVER);
+    announce("ORACLE_IOC_PORT", serving.udp_port())?;
+    epics_base_rs::runtime::task::spawn_blocking(move || serving.join()).await??;
     Ok(())
 }
 
@@ -227,11 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// least prints `cas WARNING: two or more servers share the same UDP port` —
 /// would here produce a silently misattributed reading, which is the one
 /// outcome this harness exists to never produce.
-#[cfg(tokio_backend)]
-async fn serve_pva(
-    db: Arc<epics_base_rs::server::database::PvDatabase>,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve_pva(db: Arc<PvDatabase>, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let server = PvaServer::from_parts(
         db,
         Some(port),
@@ -249,7 +286,9 @@ async fn serve_pva(
     let (tx, mut rx) = tokio::sync::watch::channel::<
         Option<epics_pva_rs::server_native::ServerReportHandle>,
     >(None);
-    tokio::spawn(async move {
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("serve_pva runs on the reactor");
+    reactor.spawn(async move {
         loop {
             if let Some(handle) = rx.borrow_and_update().clone() {
                 // The UDP search port is what a client needs; the TCP port is
@@ -286,16 +325,4 @@ fn announce(key: &str, port: u16) -> std::io::Result<()> {
     println!("{key} {port}");
     println!("ORACLE_IOC_READY");
     std::io::stdout().flush()
-}
-
-/// The `exec_backend` arm: the oracle binds its port with `CaServer` /
-/// `PvaServer`, and the reactor-free backend compiles neither. It refuses
-/// rather than announcing a port it never bound — a silent half-start here
-/// would be read by the harness as a Rust-side deviation.
-#[cfg(exec_backend)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    epics_base_rs::runtime::task::refuse_backend(
-        "oracle-ioc needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread",
-    )
 }

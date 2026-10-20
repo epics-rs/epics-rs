@@ -1764,7 +1764,6 @@ recordtype(ai) {
     ///
     /// No IOC is booted: the exclusion is decided from the `.dbd` before any
     /// `.db` is written, which is the point of it being static.
-    #[cfg(tokio_backend)]
     #[test]
     fn the_monitor_probe_builds_no_case_for_a_val_the_dbd_forbids_writing() {
         const DBD: &str = r#"

@@ -8,7 +8,7 @@ use crate::server::database::filters::FilterChain;
 use crate::server::record::{
     FieldDeclaration, FieldDesc, RecordInstance, Special, served_element_size,
 };
-use crate::types::{DbfCode, EpicsValue};
+use crate::types::{DbFieldType, DbfCode, EpicsValue};
 
 /// C `dbEntryToAddr`'s two type words for one field (`dbAccess.c:627-649`):
 /// `paddr->field_type`, the `DBF_*` token the `.dbd` declared except on a
@@ -674,6 +674,23 @@ pub fn plain_re_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
     char_view(inst, field).filter(CharView::re_views_plain_channel)
 }
 
+/// pvxs `dbChannelFinalFieldType` before the filters' probe, which C seeds
+/// from `addr.dbr_field_type` (`dbChannel.c:579`): `DBR_CHAR` for a char
+/// address — `$` (`dbChannel.c:486-501`, a link's included) or pvxs's
+/// reshape without it (`ioc/channel.cpp:58-71`) — else `field_type`'s answer.
+pub fn channel_field_type(
+    inst: &RecordInstance,
+    field: &str,
+    string_view: bool,
+    field_type: impl FnOnce() -> Option<DbFieldType>,
+) -> Option<DbFieldType> {
+    if string_view || plain_re_view(inst, field).is_some() {
+        Some(DbFieldType::Char)
+    } else {
+        field_type()
+    }
+}
+
 /// pvxs's `chan.format() == "String"` (`ioc/channel.cpp:40-73`) for a channel
 /// on `field` whose char view is `view`: VAL's `info(Q:form, "String")`, or
 /// the reshape of a link or, without `$`, of a string wider than
@@ -741,18 +758,33 @@ impl DollarView {
     /// `None` where `$` is `S_dbLib_fieldNotFound`.
     pub fn of(inst: &RecordInstance, field: &str, filters: &FilterChain) -> Option<Self> {
         let view = char_view(inst, field)?;
-        let serve = PvaDollar::of(inst, field)?;
-        let pad = if view.source == CharSource::Field && view.truncate {
-            view.no_elements
-        } else {
-            0
-        };
         Some(Self {
-            serve,
-            pad,
+            serve: PvaDollar::of(inst, field)?,
+            pad: Self::pad_of(&view),
             source: view.source,
             final_elements: filters.final_element_count(view.no_elements),
         })
+    }
+
+    /// Of a channel pvxs serves as text without `$` (`ioc/iocsource.cpp:633`)
+    /// and `final_elements` long: read through the char address pvxs
+    /// reshaped it to, `view` ([`plain_re_view`]), which is the one
+    /// `dbChannelCreate` makes for `$`, or through a `DBF_CHAR` field's own.
+    pub fn of_text_channel(view: Option<&CharView>, final_elements: usize) -> Self {
+        Self {
+            serve: PvaDollar::Text,
+            pad: view.map_or(0, Self::pad_of),
+            source: view.map_or(CharSource::Field, |v| v.source),
+            final_elements,
+        }
+    }
+
+    fn pad_of(view: &CharView) -> usize {
+        if view.source == CharSource::Field && view.truncate {
+            view.no_elements
+        } else {
+            0
+        }
     }
 
     /// Of a `$` channel on a `DBF_STRING` value `field_size` chars wide that
@@ -885,6 +917,10 @@ impl DollarView {
 
     /// The text of a [`PvaDollar::Text`] array channel: the image up to its
     /// NUL (`ioc/iocsource.cpp:133-136`).
+    ///
+    /// Not pvxs's `buf[size-1]=0` (`:134`), which drops the last char of a
+    /// full buffer: a C defect, and this read is bounded by the image's
+    /// length, not by a NUL.
     pub fn text(self, value: EpicsValue) -> EpicsValue {
         match self.serve {
             PvaDollar::Text if !self.scalar() => long_string_text(value),

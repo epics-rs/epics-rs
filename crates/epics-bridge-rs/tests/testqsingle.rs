@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(40): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(42): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -1141,6 +1141,50 @@ async fn trapped_single_put_emits_before_after_astrapwrite() {
     assert_eq!(after.status, Some("ok".to_string()), "successful put → ok");
 }
 
+/// pvxs's `SecurityLogger` logs `dbChannelFinalFieldType`
+/// (`ioc/securitylogger.h:43-50`), `DBR_CHAR` on a char address: an lso VAL
+/// with `SIZV` 64 reshaped without `$`, and an lso VAL tagged `Q:form`
+/// under `$`, which serves its text.
+#[tokio::test]
+async fn trapped_char_address_put_logs_dbr_char() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lso, "LS:T") { field(SIZV, "64") }
+               record(lso, "LS:F") { field(SIZV, "64") info(Q:form, "String") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for name in ["LS:T.VAL", "LS:F.VAL$"] {
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name)
+            .with_access(AccessContext::with_identity(
+                Arc::new(TrapStub {
+                    rule_was_trap: true,
+                }),
+                "operator".into(),
+                "host.acme".into(),
+            ));
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let name: &'static str = name;
+        let _handle = capture_listener_for(name, sink.clone());
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::String("hi".into())),
+        ));
+        ch.put(&put).await.expect(name);
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{name}: {events:?}");
+        for e in events {
+            assert_eq!(e.dbr_type, DbFieldType::Char as u16, "{name}");
+        }
+    }
+}
+
 /// A non-trapped PUT (matched rule has no `TRAPWRITE`) dispatches no
 /// asTrapWrite event, but still performs the write.
 #[tokio::test]
@@ -1366,6 +1410,65 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
         EpicsValue::ULong(12),
         "putLongString writes strlen+1 CHAR elements (the NUL counts)"
     );
+}
+
+/// pvxs slices a `Q:form` long string's chars with `arr` before it reads
+/// the text (`getArrayValue`, ioc/iocsource.cpp:122-136). `softIocPVX` 1.5.3
+/// serves these channels of `ABCDEFGH` as `ABCDEFG`, `ABC`, `BCDEFG`, one
+/// char short of these for the NUL it forces into the last element (`:134`).
+///
+/// A regression guard, not fail-first: the bridge already read the filtered
+/// chars before the NT rendered them; only the native source read text first.
+#[tokio::test]
+async fn qform_string_reads_the_sliced_chars() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:cap",
+        Box::new(WaveformRecord::new(8, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    db.get_record("TEST:cap")
+        .expect("record")
+        .write()
+        .set_info("Q:form", "String");
+    db.put_pv(
+        "TEST:cap",
+        EpicsValue::CharArray(b"ABCDEFGH".to_vec().into()),
+    )
+    .await
+    .expect("seed");
+
+    let (lso_db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lso, "TEST:lso") { field(SIZV, "64") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    lso_db
+        .put_pv("TEST:lso", EpicsValue::String("ABCDEFGH".into()))
+        .await
+        .expect("seed");
+
+    for (db, name, text) in [
+        (&db, "TEST:cap", "ABCDEFGH"),
+        (&db, r#"TEST:cap.{"arr":{"e":3}}"#, "ABCD"),
+        (&db, r#"TEST:cap.{"arr":{"s":1}}"#, "BCDEFGH"),
+        (&lso_db, "TEST:lso", "ABCDEFGH"),
+        (&lso_db, r#"TEST:lso.{"arr":{"e":3}}"#, "ABCD"),
+        (&lso_db, r#"TEST:lso.{"arr":{"s":1}}"#, "BCDEFGH"),
+    ] {
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
+        match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
+            PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, text, "{name}"),
+            other => panic!("{name}: expected a string, got {other:?}"),
+        }
+    }
 }
 
 /// Boundary for R17-31: the SAME record without the info tag stays an

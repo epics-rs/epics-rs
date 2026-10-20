@@ -404,6 +404,8 @@ pub(crate) enum View {
     Field,
     /// A `$` channel.
     Dollar(DollarView),
+    /// [`ChannelValue::Text`]: no `$`, read as one.
+    Text(DollarView),
 }
 
 impl View {
@@ -416,7 +418,12 @@ impl View {
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Option<Self> {
         if !string_view {
-            return Some(Self::Field);
+            return Some(
+                match ChannelValue::of_record_channel(instance, field, filters) {
+                    ChannelValue::Text(dollar) => Self::Text(dollar),
+                    _ => Self::Field,
+                },
+            );
         }
         DollarView::of(instance, field, filters).map(Self::Dollar)
     }
@@ -442,7 +449,7 @@ impl View {
         };
         match self {
             Self::Field => chain(value),
-            Self::Dollar(dollar) => {
+            Self::Dollar(dollar) | Self::Text(dollar) => {
                 let image = dollar.render(value);
                 let log = chain(image.clone());
                 dollar.finish(image, log)
@@ -469,11 +476,11 @@ impl View {
         }
     }
 
-    /// The `$` view a monitor's subscriptions read their entries through.
+    /// The char view a monitor's subscriptions read their entries through.
     pub(crate) fn dollar(self) -> Option<DollarView> {
         match self {
             Self::Field => None,
-            Self::Dollar(dollar) => Some(dollar),
+            Self::Dollar(dollar) | Self::Text(dollar) => Some(dollar),
         }
     }
 }
@@ -517,15 +524,14 @@ pub(crate) fn nt_type_for_channel(
 ) -> NtType {
     // The `$` view, decided first, so the single-record and group paths
     // cannot reach different answers for one channel.
-    if let View::Dollar(dollar) = view {
-        return if dollar.scalar() {
-            NtType::Scalar
-        } else {
-            NtType::Dollar(dollar.serve)
-        };
+    match view {
+        View::Dollar(dollar) if dollar.scalar() => return NtType::Scalar,
+        View::Dollar(dollar) => return NtType::Dollar(dollar.serve),
+        View::Text(_) => return NtType::LongString,
+        View::Field => {}
     }
     match ChannelValue::of_channel(instance, field_upper, resolved, filters) {
-        ChannelValue::Text => NtType::LongString,
+        ChannelValue::Text(_) => NtType::LongString,
         ChannelValue::LongStringField => NtType::LongStringField,
         ChannelValue::Shaped(shape) if shape.is_array() => NtType::ScalarArray,
         ChannelValue::Shaped(_) => match resolved {

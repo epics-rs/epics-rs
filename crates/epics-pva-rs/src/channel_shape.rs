@@ -13,7 +13,7 @@
 //! VAL) and as `pvxput` refusing the drive with "Unable to assign string[]
 //! with String".
 
-use epics_base_rs::server::database::char_view::{plain_re_view, pvxs_form_string};
+use epics_base_rs::server::database::char_view::{DollarView, plain_re_view, pvxs_form_string};
 use epics_base_rs::server::database::filters::FilterChain;
 use epics_base_rs::server::database::is_value_field;
 use epics_base_rs::server::record::{FieldDeclaration, Record, RecordInstance};
@@ -186,9 +186,10 @@ pub enum ChannelValue {
     /// `fromDbrType(final_field_type)` in this shape.
     Shaped(ChannelShape),
     /// `TypeCode::String`, `final_field_type == DBR_CHAR && isArray &&
-    /// format == "String"` (`:633`): read as the buffer's text (`:133-136`),
-    /// a string put is `putLongString` (`:601-603`).
-    Text,
+    /// format == "String"` (`:633`): read through its char address as the
+    /// buffer's text (`:124-136`), a string put is `putLongString`
+    /// (`:601-603`).
+    Text(DollarView),
     /// A long string with no room past `MAX_STRING_SIZE + 1`, which pvxs
     /// leaves `DBF_STRING` (`ioc/channel.cpp:58-60`): the buffer read to its
     /// NUL.
@@ -205,12 +206,13 @@ impl ChannelValue {
         filters: &FilterChain,
     ) -> Self {
         Self::decide(instance, field_upper, resolved, filters, || {
-            ChannelShape::of_channel(&*instance.record, field_upper, resolved, filters)
+            channel_final_elements(&*instance.record, field_upper, resolved)
         })
     }
 
     /// [`Self::of_channel`] for a live record, which resolves the value only
-    /// for a VAL tagged `Q:form`, whose element type it asks.
+    /// for a VAL tagged `Q:form`, whose element type it asks, or for a count
+    /// the declaration does not give ([`ChannelShape::of_record_channel`]).
     pub fn of_record_channel(
         instance: &RecordInstance,
         field_upper: &str,
@@ -221,7 +223,13 @@ impl ChannelValue {
         .then(|| instance.client_field_value(field_upper))
         .flatten();
         Self::decide(instance, field_upper, resolved.as_ref(), filters, || {
-            ChannelShape::of_record_channel(instance, field_upper, filters)
+            instance
+                .record
+                .field_native_count(field_upper)
+                .unwrap_or_else(|| {
+                    let value = instance.client_field_value(field_upper);
+                    channel_final_elements(&*instance.record, field_upper, value.as_ref())
+                })
         })
     }
 
@@ -230,17 +238,18 @@ impl ChannelValue {
         field_upper: &str,
         resolved: Option<&EpicsValue>,
         filters: &FilterChain,
-        field_shape: impl FnOnce() -> ChannelShape,
+        field_elements: impl FnOnce() -> u32,
     ) -> Self {
         let view = plain_re_view(instance, field_upper);
         // Still `DBR_STRING`, whatever its `Q:form`.
         if view.is_none() && instance.record.field_is_long_string(field_upper) {
             return Self::LongStringField;
         }
-        let shape = match &view {
-            Some(v) => ChannelShape::of_count(filters.final_element_count(v.no_elements)),
-            None => field_shape(),
-        };
+        let final_elements = filters.final_element_count(match &view {
+            Some(v) => v.no_elements,
+            None => field_elements() as usize,
+        });
+        let shape = ChannelShape::of_count(final_elements);
         // `DBR_CHAR`: the reshaped chars, or a `DBF_CHAR` field — the signed
         // one, as pvxs tests.
         let chars = view.is_some() || matches!(resolved, Some(EpicsValue::CharArray(_)));
@@ -248,7 +257,7 @@ impl ChannelValue {
             && shape.is_array()
             && pvxs_form_string(instance, field_upper, view.as_ref(), false)
         {
-            return Self::Text;
+            return Self::Text(DollarView::of_text_channel(view.as_ref(), final_elements));
         }
         Self::Shaped(shape)
     }

@@ -16,7 +16,7 @@ use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, Ty
 use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{
-    DollarView, PvaDollar, long_string_field_text, long_string_text, plain_re_view,
+    DollarView, PvaDollar, channel_field_type, long_string_field_text, plain_re_view,
 };
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
@@ -170,7 +170,6 @@ impl PvDatabaseSource {
             render,
             property_filters.clone(),
         );
-        let shaped = render.shaper();
         // A post is held by this monitor's ring or by the server's queue
         // behind it, each bounded by the negotiated limit.
         let held = opts.queue_size.saturating_mul(2);
@@ -195,7 +194,7 @@ impl PvDatabaseSource {
                     // event always does (`pLog->mask = caEventMask & select`).
                     let property = ev.mask().intersects(EventMask::PROPERTY);
                     let update =
-                        marked_update(&mut ring, shaped(ev), door.nsec_mask, || door.read());
+                        marked_update(&mut ring, render.shape(ev), door.nsec_mask, || door.read());
                     Prime::gate(&mut prime, property, update)
                 })
             },
@@ -1136,26 +1135,24 @@ fn read_chain(filters: &FilterChain, value: EpicsValue) -> EpicsValue {
 enum ChannelRender {
     /// The value in the channel's [`ChannelShape`].
     Shaped(ChannelShape),
-    /// [`ChannelValue::Text`]: the chars as their text.
-    LongStringText,
     /// A long string with no room past `MAX_STRING_SIZE + 1`: pvxs keeps its
     /// `DBF_STRING` (`ioc/channel.cpp:58-60`), the buffer read to its NUL.
     LongStringField,
-    /// A `$` channel.
+    /// A channel read through its char address: `$`, or
+    /// [`ChannelValue::Text`].
     Dollar(DollarView),
 }
 
 impl ChannelRender {
     /// The event rewrite every post on this channel takes before its fill.
-    fn shaper(self) -> fn(MonitorEvent) -> MonitorEvent {
+    fn shape(self, ev: MonitorEvent) -> MonitorEvent {
         match self {
-            ChannelRender::LongStringText => long_string_shaped,
-            ChannelRender::LongStringField => long_string_field_shaped,
-            ChannelRender::Dollar(d) if d.scalar() => scalar_shaped,
-            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => std::convert::identity,
-            ChannelRender::Dollar(_) => long_string_shaped,
-            ChannelRender::Shaped(ChannelShape::Scalar) => scalar_shaped,
-            ChannelRender::Shaped(ChannelShape::Array) => std::convert::identity,
+            ChannelRender::LongStringField => long_string_field_shaped(ev),
+            ChannelRender::Dollar(d) if d.scalar() => scalar_shaped(ev),
+            ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => ev,
+            ChannelRender::Dollar(d) => text_shaped(d, ev),
+            ChannelRender::Shaped(ChannelShape::Scalar) => scalar_shaped(ev),
+            ChannelRender::Shaped(ChannelShape::Array) => ev,
         }
     }
 
@@ -1168,9 +1165,6 @@ impl ChannelRender {
             ChannelRender::Shaped(shape) => {
                 read_snapshot_chain(filters, snap);
                 shape.shape(snap);
-            }
-            ChannelRender::LongStringText => {
-                snap.value = read_chain(filters, long_string_text(take_value(snap)));
             }
             ChannelRender::LongStringField => {
                 snap.value = read_chain(filters, long_string_field_text(take_value(snap)));
@@ -1215,7 +1209,7 @@ fn record_channel_render(
     Some(
         match ChannelValue::of_record_channel(&inst, &cn.field, filters) {
             ChannelValue::Shaped(shape) => ChannelRender::Shaped(shape),
-            ChannelValue::Text => ChannelRender::LongStringText,
+            ChannelValue::Text(dollar) => ChannelRender::Dollar(dollar),
             ChannelValue::LongStringField => ChannelRender::LongStringField,
         },
     )
@@ -1760,7 +1754,6 @@ impl ChannelSource for PvDatabaseSource {
                         render,
                         property_filters.clone(),
                     );
-                    let shaped = render.shaper();
                     attach_record_pair(
                         &events,
                         &db,
@@ -1778,7 +1771,7 @@ impl ChannelSource for PvDatabaseSource {
                                 plain_record_field(
                                     &mut meta,
                                     &mut layout,
-                                    shaped(ev),
+                                    render.shape(ev),
                                     door.nsec_mask,
                                     || door.read(),
                                 )
@@ -2248,9 +2241,11 @@ fn event_field(snap: Snapshot) -> Option<PvField> {
     Some(snapshot_to_pv_field(&snap))
 }
 
-/// `ev` with its snapshot's elements decoded to the text, in a new `Snapshot`
-/// for the reason [`scalar_shaped`] gives.
-fn long_string_shaped(
+/// `ev` with its snapshot's chars decoded to the text `view` serves
+/// ([`DollarView::text`]), in a new `Snapshot` for the reason
+/// [`scalar_shaped`] gives.
+fn text_shaped(
+    view: DollarView,
     mut ev: epics_base_rs::server::pv::MonitorEvent,
 ) -> epics_base_rs::server::pv::MonitorEvent {
     if matches!(
@@ -2258,12 +2253,12 @@ fn long_string_shaped(
         Some(EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
     ) {
         let value = ev.replace_value(EpicsValue::Long(0));
-        ev.replace_value(long_string_text(value));
+        ev.replace_value(view.text(value));
     }
     ev
 }
 
-/// [`long_string_shaped`] for a [`ChannelRender::LongStringField`].
+/// [`text_shaped`] for a [`ChannelRender::LongStringField`].
 fn long_string_field_shaped(
     mut ev: epics_base_rs::server::pv::MonitorEvent,
 ) -> epics_base_rs::server::pv::MonitorEvent {
@@ -2318,11 +2313,13 @@ where
     // field's current value.
     let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
         let inst = rec.read();
-        // The declaration first: a long-string field is served as the
-        // `LEN` elements it holds, while its address is `DBF_STRING`.
-        let dbf = inst.declared_field_type(&cn.field).or_else(|| {
-            inst.client_field_value(&cn.field)
-                .map(|v| v.db_field_type())
+        // The declaration before the value: a long-string field is served as
+        // the `LEN` elements it holds, while its address is `DBF_STRING`.
+        let dbf = channel_field_type(&inst, &cn.field, cn.string_view, || {
+            inst.declared_field_type(&cn.field).or_else(|| {
+                inst.client_field_value(&cn.field)
+                    .map(|v| v.db_field_type())
+            })
         });
         dbf.map(|t| t as u16).unwrap_or_default()
     } else {
@@ -2471,7 +2468,7 @@ fn record_put_value(
             return Ok((chars, true));
         }
         let inst = rec.read();
-        if ChannelValue::of_record_channel(&inst, &cn.field, filters) == ChannelValue::Text {
+        if let ChannelValue::Text(_) = ChannelValue::of_record_channel(&inst, &cn.field, filters) {
             // Only a field pvxs reshaped takes its chars by the `$` name; a
             // `DBF_CHAR` one already is them.
             return Ok((chars, plain_re_view(&inst, &cn.field).is_some()));
@@ -6064,6 +6061,56 @@ ASG(AUDIT) {
         );
     }
 
+    /// pvxs's `SecurityLogger` logs `dbChannelFinalFieldType`
+    /// (`ioc/securitylogger.h:43-50`), `DBR_CHAR` on a char address: an lso
+    /// VAL with `SIZV` 64 is one under `$` and, reshaped, without it.
+    #[epics_macros_rs::epics_test]
+    async fn native_put_logs_a_char_address_as_dbr_char() {
+        use epics_base_rs::server::access_security::{TrapWriteOp, register_trap_write_listener};
+        use epics_base_rs::types::DbFieldType;
+        use std::sync::Mutex;
+
+        let acf =
+            parse_acf("ASG(AUDIT) {\n RULE(1, READ)\n RULE(1, WRITE, TRAPWRITE)\n}\n").unwrap();
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lso, "LS:T") { field(SIZV, "64") field(ASG, "AUDIT") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new_with_acf(
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.op == TrapWriteOp::BeforeWrite && msg.pv_name.starts_with(b"LS:T") {
+                sink.lock()
+                    .unwrap()
+                    .push((msg.pv_name.to_vec(), msg.dbr_type));
+            }
+        }));
+        for name in ["LS:T.VAL", "LS:T.VAL$"] {
+            source
+                .put_value_ctx(
+                    name,
+                    PvField::Scalar(ScalarValue::String("hi".into())),
+                    make_ctx("lab-pc1", "op", "ca"),
+                )
+                .await
+                .expect(name);
+        }
+        let char = DbFieldType::Char as u16;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(b"LS:T.VAL".to_vec(), char), (b"LS:T.VAL$".to_vec(), char)]
+        );
+    }
+
     /// The gate half: a rule with no `TRAPWRITE` option dispatches
     /// nothing, and the write still lands (C `asActive && trapMask`,
     /// `asLib.h:57-60`).
@@ -7044,6 +7091,57 @@ ASG(PLAIN) {
             dollar_value(source.get_value(b"QF:S").await),
             dollar_text(&long[..39])
         );
+    }
+
+    /// A `Q:form` long string's chars are sliced by `arr` before the text is
+    /// read (`getArrayValue`, `ioc/iocsource.cpp:122-136`), by GET and by
+    /// monitor alike. `softIocPVX` 1.5.3 serves each one char shorter, for
+    /// the NUL it forces into the last element (`:134`).
+    #[epics_macros_rs::epics_test]
+    async fn a_q_form_string_reads_the_sliced_chars() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(waveform, "QC:W") { field(FTVL, "CHAR") field(NELM, "8") info(Q:form, "String") }
+                   record(lso, "QC:S") { field(SIZV, "64") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let channels = [
+            ("QC:W", "ABCDEFGH"),
+            (r#"QC:W.{"arr":{"e":3}}"#, "ABCD"),
+            (r#"QC:W.{"arr":{"s":1}}"#, "BCDEFGH"),
+            ("QC:S", "ABCDEFGH"),
+            (r#"QC:S.{"arr":{"e":3}}"#, "ABCD"),
+            (r#"QC:S.{"arr":{"s":1}}"#, "BCDEFGH"),
+        ];
+        let mut monitors = Vec::new();
+        for (name, _) in channels {
+            monitors.push(source.subscribe(name.as_bytes()).await.expect(name));
+        }
+        db.put_pv_and_post("QC:W", EpicsValue::CharArray(b"ABCDEFGH".to_vec().into()))
+            .await
+            .unwrap();
+        db.put_pv_and_post("QC:S", EpicsValue::String("ABCDEFGH".into()))
+            .await
+            .unwrap();
+        for ((name, want), mut mon) in channels.into_iter().zip(monitors) {
+            let posted = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("a monitor update");
+            assert_eq!(dollar_value(posted), dollar_text(want), "monitor {name}");
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                dollar_text(want),
+                "GET {name}"
+            );
+        }
     }
 
     /// A `$` GET per shape, each the `pvxget -r value` answer of

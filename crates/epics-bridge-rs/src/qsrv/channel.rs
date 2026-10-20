@@ -352,7 +352,7 @@ impl MemberChannel {
         let value = log.value().as_value()?.clone();
         Some(match view {
             View::Field => value,
-            View::Dollar(dollar) => dollar.text(value),
+            View::Dollar(dollar) | View::Text(dollar) => dollar.text(value),
         })
     }
 
@@ -527,7 +527,7 @@ impl BridgeChannel {
         })?;
 
         let instance = rec.read();
-        // One resolution for both views, [`served_value`]: without `$` it is
+        // One resolution for both views, as [`served_value`]: without `$` it is
         // `client_field_value`, the value projected onto the field's DECLARED
         // type, which is what every delivery path serves (reading the DBF off
         // the raw stored variant is what advertised `.PROC` (`DBF_UCHAR`) as
@@ -540,8 +540,8 @@ impl BridgeChannel {
         // `Invalid PV:`, `ioc/channel.cpp:29-38`). Falling through used to
         // fabricate an NTScalar double prototype the client would connect to
         // and then fail every operation against (pvxs#193, server half).
-        let (view, value) = View::of(&instance, &field_upper, string_view, &channel_filters)
-            .and_then(|view| Some((view, served_value(&instance, &field_upper, view)?)))
+        let (view, raw) = View::of(&instance, &field_upper, string_view, &channel_filters)
+            .and_then(|view| Some((view, instance.channel_field_value(&field_upper, false)?)))
             .ok_or_else(|| BridgeError::FieldNotFound {
                 record: String::from_utf8_lossy(record_name).into_owned(),
                 field: if string_view {
@@ -550,6 +550,12 @@ impl BridgeChannel {
                     field_upper.clone()
                 },
             })?;
+        // The field's own type: a char view serves a `DBF_CHAR` field as text.
+        let field_dbf = raw.db_field_type();
+        let value = view.read(
+            raw,
+            &epics_base_rs::server::database::filters::FilterChain::new(),
+        );
         // `pvif::nt_type_for_channel` is the single owner of the NT choice
         // (the port's `getChannelValueType`): the `$` view, a record-declared
         // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) and a
@@ -570,24 +576,28 @@ impl BridgeChannel {
         // dbChannel.h:452) — the channel's final field type after lookup,
         // which covers `dbCommon` fields, not only record-specific ones.
         //
-        // `value` above is `client_field_value`, i.e. already projected onto
+        // `raw` above is `client_field_value`, i.e. already projected onto
         // the field's declared type, so reading the DBF off it IS reading the
         // declaration — and the advertised descriptor agrees with the value the
         // GET path serializes by construction, because both are that one
         // projection. Taking it from the RAW stored variant used to advertise
         // `.PROC` (`DBF_UCHAR`) as a signed byte and every `DBF_MENU` field as
         // a short: agreement with the value, but agreement on the wrong type.
-        // The declaration itself is asked first because a long-string field
-        // is served as the `LEN` elements it holds, while its address is
-        // `DBF_STRING` (`lsiRecord.c::cvt_dbaddr`).
+        // A char address is `DBR_CHAR` whatever it serves; otherwise the
+        // declaration is asked first because a long-string field is served
+        // as the `LEN` elements it holds, while its address is `DBF_STRING`
+        // (`lsiRecord.c::cvt_dbaddr`).
         //
         // The filters' probe has the last word: `ts` serves its numbers as
         // `DBF_ULONG` and its text as `DBF_STRING` (`ts.c:350-362`).
         let value_dbf = channel_filters.final_field_type(
-            instance
-                .declared_field_type(&field_upper)
-                .filter(|_| !string_view)
-                .unwrap_or_else(|| value.db_field_type()),
+            epics_base_rs::server::database::char_view::channel_field_type(
+                &instance,
+                &field_upper,
+                string_view,
+                || instance.declared_field_type(&field_upper),
+            )
+            .unwrap_or(field_dbf),
         );
 
         Ok(Self {

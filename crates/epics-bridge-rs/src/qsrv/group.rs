@@ -1356,7 +1356,7 @@ impl GroupChannel {
         };
         let instance = rec.read();
         matches!(
-            member.value_in(&instance),
+            instance.channel_field_value(&member.field, false),
             Some(epics_base_rs::types::EpicsValue::CharArray(_))
         )
     }

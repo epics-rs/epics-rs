@@ -203,7 +203,7 @@ struct UpstreamSubscription {
     /// The shadow PV's life, which the forwarding tasks follow.
     life: tokio::sync::watch::Receiver<ShadowLife>,
     /// Where a value forwarding task hands a [`ShadowLife::Reviving`] life's
-    /// first event to the [`ChannelEventOwner`].
+    /// first event to the `ChannelEventOwner`.
     first_events: FirstEventTx,
 }
 

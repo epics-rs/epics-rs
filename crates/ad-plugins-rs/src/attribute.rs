@@ -130,6 +130,10 @@ impl NDPluginProcess for AttributeProcessor {
     // NDPluginAttribute.cpp:136; no writeFloat64 override.
     const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
         ad_core_rs::plugin::runtime::WriteEpilogue::Zero;
+    /// `std::max<int>(maxAttributes, 2)` (NDPluginAttribute.cpp:175).
+    fn max_addr(&self) -> usize {
+        self.channels.lock().len().max(2)
+    }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
@@ -250,14 +254,10 @@ pub fn create_attribute_runtime(
     std::thread::JoinHandle<()>,
 ) {
     // C: maxAttributes_ = max(maxAttributes, 1) is the per-frame channel count
-    // and the TS length; the NDPluginDriver base address count is
-    // max(maxAttributes, 2) (NDPluginAttribute.cpp:175,184).
-    let num_channels = max_attributes.max(1) as usize;
-    let num_addr = max_attributes.max(2) as usize;
+    // and the TS length (NDPluginAttribute.cpp:184).
+    let processor = AttributeProcessor::new(max_attributes.max(1) as usize);
 
-    let processor = AttributeProcessor::new(num_channels);
-
-    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
+    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
         claim,
         processor,
         max_memory,
@@ -265,7 +265,6 @@ pub fn create_attribute_runtime(
         blocking_callbacks,
         source,
         wiring,
-        num_addr,
         threads,
     );
 
@@ -275,6 +274,25 @@ pub fn create_attribute_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginAttribute.cpp:175 passes max(maxAttributes, 2) whoever builds
+    /// the plugin.
+    #[test]
+    fn an_attribute_port_has_c_s_addresses() {
+        for (n, addrs) in [(1, 2), (3, 3)] {
+            let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+                &asyn_rs::asyn_record::claim_port(&format!("ATTR_ADDR{n}")).unwrap(),
+                AttributeProcessor::new(n),
+                1_000_000,
+                1,
+                0,
+                "",
+                std::sync::Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+                ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+            );
+            assert_eq!(handle.port_runtime().port_handle().max_addr(), addrs);
+        }
+    }
 
     /// `status = (asynStatus) callParamCallbacks();` (NDPluginAttribute.cpp:136).
     #[test]

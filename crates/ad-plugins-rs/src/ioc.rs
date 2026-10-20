@@ -13,9 +13,7 @@ use ad_core_rs::ioc::{
     gather_arg_defs, max_memory_arg, max_threads_arg, plugin_arg_defs, plugin_arg_defs_to,
     plugin_arg_defs_with_count, register_noop_commands, threads_arg,
 };
-use ad_core_rs::plugin::runtime::{
-    ArraySource, create_plugin_runtime, create_plugin_runtime_multi_addr,
-};
+use ad_core_rs::plugin::runtime::{ArraySource, create_plugin_runtime};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::asyn_record::PortClaim;
 use asyn_rs::manager::{PortManager, claim_port_driver};
@@ -358,7 +356,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_overlays = count_arg(args, 5);
-                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
                     max_memory_arg(args, 7),
@@ -366,7 +364,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     &source,
                     m.wiring().clone(),
-                    max_overlays,
                     threads_arg(args, 9).with_max_threads(max_threads_arg(args, 10)),
                 );
                 if let Err(e) =
@@ -504,7 +501,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_ports = count_arg(args, 3);
-                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     crate::gather::GatherProcessor::new(max_ports),
                     max_memory_arg(args, 5),
@@ -512,7 +509,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     "",
                     m.wiring().clone(),
-                    max_ports,
                     threads_arg(args, 7),
                 );
                 if let Err(e) =
@@ -579,10 +575,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                // Addr 0 always exists, so at least one address even for a
-                // degenerate 0/0 request.
-                let max_addr = n_attributes.max(n_data_blocks).max(1);
-                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     crate::attr_plot::AttrPlotProcessor::new(
                         n_attributes,
@@ -594,7 +587,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     &source,
                     m.wiring().clone(),
-                    max_addr,
                     threads_arg(args, 9),
                 );
                 if let Err(e) =
@@ -908,7 +900,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
                     _ => 1,
                 };
-                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                let (handle, _jh) = create_plugin_runtime(
                     &claim,
                     crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
                     max_memory_arg(args, 7),
@@ -916,11 +908,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     blocking_callbacks,
                     source,
                     m.wiring().clone(),
-                    // C maxAddr = maxSignals + 1 (the 2-D array callback
-                    // address is reserved at addr == maxSignals). C adds 1
-                    // before its `maxSignals < 1` clamp, so maxSignals 0 leaves
-                    // no address for that callback; that C bug is not copied.
-                    max_signals + 1,
                     threads,
                 );
                 if let Err(e) =

@@ -1266,6 +1266,14 @@ pub trait NDPluginProcess: Send + Sync + 'static {
         1
     }
 
+    /// The `maxAddr` C's plugin hands its `NDPluginDriver` constructor
+    /// (NDPluginDriver.cpp:85,90): the port's addresses, each with its own
+    /// parameter list and array output. 1 unless the plugin sizes per-address
+    /// state by a `*Configure` count.
+    fn max_addr(&self) -> usize {
+        1
+    }
+
     /// Register plugin-specific params on the base. Called once during construction.
     fn register_params(
         &mut self,
@@ -2338,7 +2346,6 @@ impl PluginPortDriver {
         queue_size: i32,
         blocking_callbacks: i32,
         source: &ArraySource,
-        max_addr: usize,
         param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
         mut processor: P,
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
@@ -2348,7 +2355,7 @@ impl PluginPortDriver {
     ) -> AsynResult<(Self, Arc<P>, PluginPool)> {
         let mut base = PortDriverBase::new(
             port_name,
-            max_addr,
+            processor.max_addr(),
             P::ASYN_FLAGS,
             P::INTERFACE_MASK | PLUGIN_DRIVER_INTERFACES | ND_ARRAY_DRIVER_INTERFACES,
             P::INTERRUPT_MASK | PLUGIN_DRIVER_INTERRUPTS | ND_ARRAY_DRIVER_INTERRUPTS,
@@ -3314,7 +3321,8 @@ pub fn plugin_threads(priority: i64, stack_size: i64) -> PluginThreads {
     }
 }
 
-/// Create a plugin runtime with control plane (PortActor) and data plane (processing thread).
+/// Create a plugin runtime with control plane (PortActor) and data plane (processing thread),
+/// on a port of the processor's [`NDPluginProcess::max_addr`] addresses.
 ///
 /// Returns:
 /// - `PluginRuntimeHandle` for wiring and control
@@ -3330,35 +3338,34 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
     wiring: Arc<WiringRegistry>,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
-    create_plugin_runtime_multi_addr(
+    create_plugin_runtime_with_output(
         claim,
         processor,
         max_memory,
         queue_size,
         blocking_callbacks,
+        NDArrayOutput::new(),
         source,
         wiring,
-        1,
         threads,
     )
 }
 
-/// Create a plugin runtime with multi-addr support.
-///
-/// `max_addr` specifies the number of addresses (sub-devices) the port supports.
-pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
+/// Create a plugin runtime with a pre-wired output at address 0 (for testing
+/// and direct wiring).
+pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     claim: &asyn_rs::registry::PortClaim,
     processor: P,
     max_memory: usize,
     queue_size: i32,
     blocking_callbacks: i32,
+    output: NDArrayOutput,
     source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
-    max_addr: usize,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
-    let port_name = claim.name();
     let source = source.into();
+    let port_name = claim.name();
     // Param change channel (control plane -> data plane)
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
@@ -3383,7 +3390,6 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         queue_size,
         blocking_callbacks,
         &source,
-        max_addr,
         param_tx,
         processor,
         array_data,
@@ -3393,6 +3399,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     )
     .expect("failed to create plugin port driver");
     let own_pool = plugin_pool.current();
+    let max_addr = driver.base.max_addr;
 
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
@@ -3423,8 +3430,9 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let blocking_mode = Arc::new(AtomicBool::new(blocking_callbacks != 0));
 
     // Shared processor (accessible from data thread)
-    let array_outputs: Vec<_> = (0..max_addr.max(1))
-        .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
+    let array_outputs: Vec<_> = std::iter::once(output)
+        .chain((1..max_addr).map(|_| NDArrayOutput::new()))
+        .map(|output| Arc::new(parking_lot::Mutex::new(output)))
         .collect();
     // B13/G6: register this plugin's outputs so the WiringRegistry is the
     // single source of truth for runtime rewiring (PluginManager::add_plugin
@@ -4392,161 +4400,6 @@ pub fn wire_downstream(upstream: &PluginRuntimeHandle, downstream_sender: NDArra
     upstream.array_output().lock().add(downstream_sender);
 }
 
-/// Create a plugin runtime with a pre-wired output (for testing and direct wiring).
-pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
-    claim: &asyn_rs::registry::PortClaim,
-    processor: P,
-    max_memory: usize,
-    queue_size: i32,
-    blocking_callbacks: i32,
-    output: NDArrayOutput,
-    source: impl Into<ArraySource>,
-    wiring: Arc<WiringRegistry>,
-    threads: PluginThreads,
-) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
-    let port_name = claim.name();
-    let source = source.into();
-    // B14: unbounded so control-plane param changes (e.g. autosave restoring
-    // hundreds of PVs at IOC init) are never silently dropped before the
-    // data plane sees them.
-    let (param_tx, param_rx) = tokio::sync::mpsc::unbounded_channel::<PluginParamMsg>();
-    let handle_param_tx = param_tx.clone();
-
-    let plugin_type_name = processor.plugin_type().to_string();
-    let compression_aware = processor.compression_aware();
-    let array_callbacks_seed = processor.array_callbacks_seed();
-    // Unseeded, the template's VAL 1 (NDArrayBase.template:758) applies.
-    let array_callbacks = ArrayCallbacks::new(array_callbacks_seed.unwrap_or(true));
-    let mut processor = processor;
-    processor.bind_array_callbacks(array_callbacks.clone());
-    let array_data = processor.array_data_handle();
-    let (driver, processor, plugin_pool) = PluginPortDriver::new(
-        port_name,
-        &plugin_type_name,
-        queue_size,
-        blocking_callbacks,
-        &source,
-        1,
-        param_tx,
-        processor,
-        array_data,
-        max_memory,
-        wiring.clone(),
-        threads.max_threads,
-    )
-    .expect("failed to create plugin port driver");
-    let own_pool = plugin_pool.current();
-
-    let ndarray_params = driver.ndarray_params;
-    let plugin_params = driver.plugin_params;
-    let std_array_data_param = driver.std_array_data_param;
-
-    // Fatal for the same reason as `create_plugin_runtime_multi_addr` above:
-    // a constructor-shaped creator has nowhere to report to, and the only
-    // alternative is a handle to a port that does not exist.
-    let hand_on_cell = Arc::clone(&driver.hand_on);
-    let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
-        .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
-
-    let port_handle = port_runtime.port_handle().clone();
-
-    let (array_sender, array_rx) = ndarray_channel(port_name, queue_size.max(1) as usize);
-
-    let enabled = Arc::new(AtomicBool::new(false));
-    let blocking_mode = Arc::new(AtomicBool::new(blocking_callbacks != 0));
-
-    let array_outputs = vec![Arc::new(parking_lot::Mutex::new(output))];
-    // B13: register this plugin's output so the WiringRegistry is the single
-    // source of truth — an output created via this entry point is otherwise
-    // invisible to runtime rewiring.
-    wiring.register_output(port_name, array_outputs[0].clone());
-    // G1/B1: DroppedArrays counter shared with upstream senders.
-    let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
-    // The pre-queue gate: C runs both halves of `driverCallback` on the
-    // producer's thread before `trySend`, so they live with the sender.
-    let admission = array_sender.admission().clone();
-    admission.set_compression_aware(compression_aware);
-    // The processor is shared with the callback threads rather than owned by
-    // `SharedProcessorInner`: the whole point of `&self` on `process_array` is
-    // that it runs off the data loop, outside this mutex.
-    let delivery = Arc::new(Delivery::new(
-        array_outputs.clone(),
-        plugin_pool.clone(),
-        array_callbacks.clone(),
-        std_array_data_param.is_some(),
-        port_handle.clone(),
-    ));
-    let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
-        delivery,
-        attributes: PluginAttributes(Arc::clone(own_pool.owner())),
-        read_attributes: P::READ_ATTRIBUTES,
-        ndarray_params,
-        plugin_params,
-        port_handle,
-        array_counter: 0,
-        std_array_data_param,
-        array_callbacks,
-        dropped_arrays: dropped_arrays_counter,
-        prev_input_array: None,
-        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
-        nd_array_addr: source.addr,
-        num_threads: PLUGIN_NUM_THREADS,
-        threads,
-    }));
-    let _ = hand_on_cell.set(shared.lock().hand_on());
-
-    let data_enabled = enabled.clone();
-    let data_blocking = blocking_mode.clone();
-
-    let mut array_sender = array_sender;
-    array_sender.set_mode_flags(enabled, blocking_mode);
-    // The data loop owns queue replacement; the handle is weak so it does not
-    // keep the channel open past the last real sender.
-    let data_queue_handle = array_sender.self_queue_handle();
-    let data_sender = array_sender.downgrade();
-
-    // Capture wiring info for data loop
-    let sender_port_name = port_name.to_string();
-    let initial_upstream = source.clone();
-
-    let data_jh = MandatoryThread::new(
-        format!("plugin-data-{port_name}"),
-        threads.priority,
-        StackSizeClass::Medium,
-    )
-    .spawn_sized(threads.stack, move || {
-        plugin_data_loop(
-            shared,
-            processor,
-            array_rx,
-            data_queue_handle,
-            data_sender,
-            param_rx,
-            plugin_params,
-            data_enabled,
-            data_blocking,
-            sender_port_name,
-            initial_upstream,
-            wiring,
-        );
-    });
-
-    let handle = PluginRuntimeHandle {
-        port_runtime,
-        array_sender,
-        array_outputs,
-        port_name: port_name.to_string(),
-        param_tx: handle_param_tx,
-        ndarray_params,
-        plugin_params,
-        threads,
-        source,
-        own_pool,
-    };
-
-    (handle, data_jh)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4590,9 +4443,8 @@ mod tests {
             source_guard::production(include_str!("runtime.rs"), source_guard::Comments::Strip);
         assert_eq!(
             prod.matches("MandatoryThread::new(").count(),
-            3,
-            "`create_plugin_runtime_multi_addr`, `create_plugin_runtime_with_output` \
-             and `spawn_worker_pool`"
+            2,
+            "`create_plugin_runtime_with_output` and `spawn_worker_pool`"
         );
         let bare = concat!("thread", "::Builder::new()");
         let strays: Vec<&str> = prod
@@ -4629,6 +4481,7 @@ mod tests {
     /// data plane.
     #[derive(Default)]
     struct ValidatingProcessor {
+        addrs: usize,
         limit: usize,
         twice: usize,
         gain: usize,
@@ -4648,6 +4501,9 @@ mod tests {
         }
         fn plugin_type(&self) -> &str {
             "Validating"
+        }
+        fn max_addr(&self) -> usize {
+            self.addrs
         }
         fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
             self.limit = base.create_param("LIMIT", asyn_rs::param::ParamType::Int32)?;
@@ -5867,7 +5723,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -5932,7 +5787,10 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let processor = ValidatingProcessor::default();
+        let processor = ValidatingProcessor {
+            addrs: 2,
+            ..Default::default()
+        };
         let ids = processor.ids.clone();
         let (mut drv, _, _) = PluginPortDriver::new(
             "POSTADDR",
@@ -5940,7 +5798,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            2,
             tx,
             processor,
             None,
@@ -6156,7 +6013,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             processor,
             None,
@@ -6511,7 +6367,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             processor,
             None,
@@ -6588,6 +6443,9 @@ mod tests {
         fn plugin_type(&self) -> &str {
             "ArraySide"
         }
+        fn max_addr(&self) -> usize {
+            2
+        }
         fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
             let go = base.create_param("GO", asyn_rs::param::ParamType::Int32)?;
             let series = base.create_param("SERIES", asyn_rs::param::ParamType::Float64Array)?;
@@ -6633,7 +6491,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            2,
             tx,
             processor,
             None,
@@ -6677,12 +6534,61 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// C's plugin hands `NDPluginDriver` its own `maxAddr`
+    /// (NDPluginDriver.cpp:85,90), so both entries build that many addresses.
+    #[test]
+    fn the_port_has_the_processors_max_addr() {
+        struct Three;
+        impl NDPluginProcess for Three {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::forward(array, vec![])
+            }
+            fn plugin_type(&self) -> &str {
+                "Three"
+            }
+            fn max_addr(&self) -> usize {
+                3
+            }
+        }
+        let wiring = test_wiring();
+        let (plain, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("THREE_PLAIN").unwrap(),
+            Three,
+            1_000_000,
+            1,
+            0,
+            "",
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let (wired, _jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("THREE_WIRED").unwrap(),
+            Three,
+            1_000_000,
+            1,
+            0,
+            NDArrayOutput::new(),
+            "",
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        for (handle, port) in [(&plain, "THREE_PLAIN"), (&wired, "THREE_WIRED")] {
+            assert_eq!(handle.port_runtime().port_handle().max_addr(), 3, "{port}");
+            // A single-address port resolves every address to its one output.
+            let at = |addr| wiring.output_at(port, addr).unwrap();
+            assert!(!Arc::ptr_eq(&at(0), &at(2)), "{port}");
+        }
+    }
+
     #[test]
     fn an_array_a_write_posts_at_an_address_reaches_only_that_address() {
         let wiring = test_wiring();
         let processor = ArraySide::default();
         let ids = processor.ids.clone();
-        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+        let (up, _up_jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("ARRSIDE_MULTI").unwrap(),
             processor,
             1_000_000,
@@ -6690,7 +6596,6 @@ mod tests {
             0,
             "",
             wiring.clone(),
-            2,
             DEFAULT_PLUGIN_THREADS,
         );
         let (down0, rx0) = ndarray_channel("ARRSIDE_DOWN0", 10);
@@ -6726,7 +6631,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             processor,
             None,
@@ -6778,7 +6682,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -6820,6 +6723,9 @@ mod tests {
         }
         fn plugin_type(&self) -> &str {
             "AddrZeroStatus"
+        }
+        fn max_addr(&self) -> usize {
+            2
         }
         fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
             use asyn_rs::param::ParamType;
@@ -6882,7 +6788,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            2,
             tx,
             processor,
             None,
@@ -6969,7 +6874,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            2,
             tx,
             AddrZeroStatus::<EPILOGUE>::default(),
             None,
@@ -7038,7 +6942,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -7078,7 +6981,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -7124,7 +7026,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -7167,7 +7068,6 @@ mod tests {
             10,
             0,
             &"UP".into(),
-            1,
             tx,
             PassthroughProcessor,
             None,
@@ -7442,6 +7342,9 @@ mod tests {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn max_addr(&self) -> usize {
+                2
+            }
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut result = ProcessResult::forward(array, vec![]);
                 result
@@ -7454,7 +7357,7 @@ mod tests {
             }
         }
         let wiring = test_wiring();
-        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+        let (up, _up_jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("UP_MULTI").unwrap(),
             Posting,
             1_000_000,
@@ -7462,7 +7365,6 @@ mod tests {
             0,
             "",
             wiring.clone(),
-            2,
             DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&up);
@@ -7557,6 +7459,9 @@ mod tests {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn max_addr(&self) -> usize {
+                2
+            }
             fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
                 self.array_callbacks = Some(array_callbacks);
             }
@@ -7593,7 +7498,7 @@ mod tests {
         let gated = Gated::default();
         let gated_frames = gated.gated_frames.clone();
         let wiring = test_wiring();
-        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+        let (up, _up_jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("UP_GATED").unwrap(),
             gated,
             1_000_000,
@@ -7601,7 +7506,6 @@ mod tests {
             0,
             "",
             wiring.clone(),
-            2,
             DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&up);
@@ -7634,16 +7538,30 @@ mod tests {
         // C seeds NDArrayAddr from the constructor argument (:153) and the
         // plugin constructor connects there; an unseeded 0 is what the
         // NDArrayAddress record's init readback then copies over its VAL.
+        struct TwoAddresses;
+        impl NDPluginProcess for TwoAddresses {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn max_addr(&self) -> usize {
+                2
+            }
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::forward(array, vec![])
+            }
+            fn plugin_type(&self) -> &str {
+                "TwoAddresses"
+            }
+        }
         let wiring = test_wiring();
-        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+        let (up, _up_jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("UP_SEED").unwrap(),
-            PassthroughProcessor,
+            TwoAddresses,
             1_000_000,
             10,
             0,
             "",
             wiring.clone(),
-            2,
             DEFAULT_PLUGIN_THREADS,
         );
         enable_callbacks(&up);
@@ -7725,6 +7643,9 @@ mod tests {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
             const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn max_addr(&self) -> usize {
+                2
+            }
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::forward(array, vec![])
             }
@@ -7738,7 +7659,7 @@ mod tests {
         let wiring = test_wiring();
         let mut ups = Vec::new();
         for name in ["UP_A", "UP_B"] {
-            let (up, jh) = create_plugin_runtime_multi_addr(
+            let (up, jh) = create_plugin_runtime(
                 &asyn_rs::asyn_record::claim_port(name).unwrap(),
                 PassthroughProcessor,
                 1_000_000,
@@ -7746,13 +7667,12 @@ mod tests {
                 0,
                 "",
                 wiring.clone(),
-                1,
                 DEFAULT_PLUGIN_THREADS,
             );
             enable_callbacks(&up);
             ups.push((up, jh));
         }
-        let (handle, _jh) = create_plugin_runtime_multi_addr(
+        let (handle, _jh) = create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("GATHERING").unwrap(),
             Gathering,
             1_000_000,
@@ -7760,7 +7680,6 @@ mod tests {
             0,
             "UP_A",
             wiring.clone(),
-            2,
             DEFAULT_PLUGIN_THREADS,
         );
         wiring.subscribe(handle.array_sender(), "UP_A", 0).unwrap();

@@ -656,6 +656,11 @@ impl NDPluginProcess for OverlayProcessor {
     const INTERFACE_MASK: InterfaceMask = InterfaceMask::GENERIC_POINTER;
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
+    /// maxOverlays, one address per slot (NDPluginOverlay.cpp:403).
+    fn max_addr(&self) -> usize {
+        self.slots.lock().len()
+    }
+
     /// C `NDPluginOverlay::writeInt32` drops the base class status
     /// (`NDPluginDriver::writeInt32(pasynUser, value);`, NDPluginOverlay.cpp:508): a refused NDPluginDriver write keeps
     /// its clamp and succeeds. A Position/Center/Size write sets the other
@@ -1907,7 +1912,7 @@ mod tests {
     #[test]
     fn overlay_port_takes_cs_interrupt_clients() {
         use asyn_rs::interfaces::InterfaceType;
-        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
             &asyn_rs::asyn_record::claim_port("OVMASK").unwrap(),
             OverlayProcessor::new(2, vec![]),
             1_000_000,
@@ -1915,7 +1920,6 @@ mod tests {
             0,
             "",
             Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
-            2,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
@@ -1933,6 +1937,22 @@ mod tests {
         assert!(registers(InterfaceType::Int32Array));
         assert!(registers(InterfaceType::GenericPointer));
         assert!(!registers(InterfaceType::Float64Array));
+    }
+
+    /// NDPluginOverlay.cpp:403 passes maxOverlays whoever builds the plugin.
+    #[test]
+    fn an_overlay_port_has_one_address_per_overlay() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("OV_ADDR").unwrap(),
+            OverlayProcessor::new(3, vec![]),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 3);
     }
 
     #[test]

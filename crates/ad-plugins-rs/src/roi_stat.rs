@@ -158,10 +158,13 @@ pub struct ROIStatProcessor {
 }
 
 impl ROIStatProcessor {
-    /// Create a new processor; `rois` seeds the geometry of the first
-    /// addresses. On a port the table holds one ROI per address
-    /// (`register_params`).
-    pub fn new(rois: Vec<ROIStatROI>, ts_num_points: usize) -> Self {
+    /// Create a new processor of `rois.len()` ROIs, C's maxROIs: one per
+    /// address (NDPluginROIStat.cpp:495), and at least one (:502-505). `rois`
+    /// seeds their geometry.
+    pub fn new(mut rois: Vec<ROIStatROI>, ts_num_points: usize) -> Self {
+        if rois.is_empty() {
+            rois.push(ROIStatROI::default());
+        }
         let n = rois.len();
         let results = vec![ROIStatResult::default(); n];
         let ts_buffers = vec![vec![vec![0.0; ts_num_points]; TS_TYPES]; n];
@@ -375,6 +378,11 @@ impl NDPluginProcess for ROIStatProcessor {
     // NDPluginROIStat.cpp:389-390; no writeFloat64 override.
     const WRITE_INT32_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
         ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
+
+    /// maxROIs (NDPluginROIStat.cpp:495).
+    fn max_addr(&self) -> usize {
+        self.state.lock().rois.len()
+    }
 
     /// C `NDPluginROIStat::writeInt32` keeps the base class clamp but replaces its
     /// errorMessage with its own, carrying `getAddress`'s status
@@ -642,24 +650,7 @@ impl NDPluginProcess for ROIStatProcessor {
         &mut self,
         base: &mut PortDriverBase,
     ) -> Result<(), asyn_rs::error::AsynError> {
-        // C's maxROIs is both the port's maxAddr and the ROI count
-        // (NDPluginROIStat.cpp:495, :502-505), so the table is sized from the
-        // address space and an ROI with no address of its own is refused.
         let state = self.state.get_mut();
-        let max_rois = base.max_addr;
-        if state.rois.len() > max_rois {
-            return Err(asyn_rs::error::AsynError::Status {
-                status: asyn_rs::error::AsynStatus::Error,
-                message: format!(
-                    "NDPluginROIStat: {} ROIs for maxAddr {max_rois}",
-                    state.rois.len()
-                ),
-            });
-        }
-        let ts_buffer = vec![vec![0.0; state.ts_num_points]; TS_TYPES];
-        state.rois.resize(max_rois, ROIStatROI::default());
-        state.results.resize(max_rois, ROIStatResult::default());
-        state.ts_buffers.resize(max_rois, ts_buffer);
 
         // Global params
         self.params.reset_all = base.create_param("ROISTAT_RESETALL", ParamType::Int32)?;
@@ -778,10 +769,10 @@ pub fn create_roi_stat_runtime(
     ROIStatParams,
     std::thread::JoinHandle<()>,
 ) {
-    let processor = ROIStatProcessor::new(Vec::new(), 2048);
+    let processor = ROIStatProcessor::new(vec![ROIStatROI::default(); num_rois], 2048);
     let params_handle = processor.params_handle();
 
-    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
+    let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
         claim,
         processor,
         max_memory,
@@ -789,7 +780,6 @@ pub fn create_roi_stat_runtime(
         blocking_callbacks,
         source,
         wiring,
-        num_rois,
         threads,
     );
 
@@ -1010,13 +1000,12 @@ mod tests {
         assert_eq!(port.read_float64_blocking(p.total, 0).unwrap(), 0.0);
     }
 
-    /// pool_throughput once put four ROIs on `create_plugin_runtime`'s one
-    /// address, which C's single maxROIs cannot express.
+    /// C's one maxROIs is both counts (NDPluginROIStat.cpp:495, :502-505),
+    /// whoever builds the plugin.
     #[test]
-    #[should_panic(expected = "NDPluginROIStat: 4 ROIs for maxAddr 1")]
-    fn more_rois_than_addresses_is_refused_by_name() {
-        ad_core_rs::plugin::runtime::create_plugin_runtime(
-            &asyn_rs::asyn_record::claim_port("RS_OVER").unwrap(),
+    fn four_rois_build_a_four_address_port() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("RS_FOUR").unwrap(),
             ROIStatProcessor::new(vec![ROIStatROI::default(); 4], 16),
             1_000_000,
             1,
@@ -1025,6 +1014,7 @@ mod tests {
             Arc::new(WiringRegistry::new()),
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
         );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 4);
     }
 
     // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — it ran and passed on

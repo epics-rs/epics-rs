@@ -451,6 +451,11 @@ impl NDPluginProcess for AttrPlotProcessor {
         .or(InterfaceMask::FLOAT64)
         .or(InterfaceMask::OCTET);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
+    /// `std::max(n_attributes, n_data_blocks)` (NDPluginAttrPlot.cpp:48).
+    fn max_addr(&self) -> usize {
+        let state = self.state.lock();
+        state.n_attributes.max(state.n_data_blocks)
+    }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 
@@ -553,6 +558,23 @@ mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
+
+    /// NDPluginAttrPlot.cpp:48 passes max(n_attributes, n_data_blocks)
+    /// whoever builds the plugin.
+    #[test]
+    fn an_attr_plot_port_has_c_s_addresses() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("ATTRPLOT_ADDR").unwrap(),
+            AttrPlotProcessor::new(3, 10, 5),
+            1_000_000,
+            1,
+            0,
+            "",
+            std::sync::Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 5);
+    }
 
     fn make_array_with_attrs(uid: i32, attrs: &[(&str, f64)]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);

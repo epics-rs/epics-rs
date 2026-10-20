@@ -1825,6 +1825,11 @@ impl NDPluginProcess for StatsProcessor {
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
+    /// NDPluginStats.cpp:777: address 1 carries the time-series point.
+    fn max_addr(&self) -> usize {
+        2
+    }
+
     /// C `NDPluginStats::writeInt32` drops the base class status
     /// (`status = (asynStatus) callParamCallbacks();`, NDPluginStats.cpp:700): a refused NDPluginDriver write keeps
     /// its clamp and succeeds.
@@ -2234,8 +2239,7 @@ pub fn create_stats_runtime(
     let stats_handle = processor.stats_handle();
     let params_handle = processor.params_handle();
 
-    // C maxAddr 2 (NDPluginStats.cpp:777): addr 1 carries the TS point.
-    let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
+    let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
         claim,
         processor,
         max_memory,
@@ -2243,7 +2247,6 @@ pub fn create_stats_runtime(
         blocking_callbacks,
         source,
         wiring,
-        2,
         threads,
     );
 
@@ -2255,6 +2258,22 @@ pub fn create_stats_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NDPluginStats.cpp:777 passes maxAddr 2 whoever builds the plugin.
+    #[test]
+    fn a_stats_port_has_c_s_two_addresses() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("STATS_ADDR").unwrap(),
+            StatsProcessor::new(),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 2);
+    }
 
     /// `status = (asynStatus) callParamCallbacks();` (NDPluginStats.cpp:700).
     #[test]

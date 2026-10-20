@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::channel::ndarray_channel;
-use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, create_plugin_runtime_multi_addr};
+use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, create_plugin_runtime};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::time_series_plugin::TimeSeriesProcessor;
 use asyn_rs::port::DrvUserRequest;
@@ -20,7 +20,7 @@ use asyn_rs::port::DrvUserRequest;
 fn a_tsread_without_array_callbacks_takes_no_unique_id() {
     let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let (ts, _jh) = create_plugin_runtime_multi_addr(
+    let (ts, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("TSAC").unwrap(),
         TimeSeriesProcessor::new(1),
         pool.max_memory(),
@@ -28,7 +28,6 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
         0,
         "",
         wiring.clone(),
-        2,
         DEFAULT_PLUGIN_THREADS,
     );
     let (down, mut rx) = ndarray_channel("TSAC_DOWN", 10);
@@ -95,7 +94,7 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
 #[test]
 fn a_tsread_allocates_from_the_pool_the_last_frame_brought() {
     let wiring = Arc::new(WiringRegistry::new());
-    let (ts, _jh) = create_plugin_runtime_multi_addr(
+    let (ts, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("TSPOOL").unwrap(),
         TimeSeriesProcessor::new(1),
         1_000_000,
@@ -103,7 +102,6 @@ fn a_tsread_allocates_from_the_pool_the_last_frame_brought() {
         0,
         "",
         wiring.clone(),
-        2,
         DEFAULT_PLUGIN_THREADS,
     );
     let (down, mut rx) = ndarray_channel("TSPOOL_DOWN", 10);

@@ -570,6 +570,14 @@ impl NDPluginProcess for TimeSeriesProcessor {
     const WRITE_FLOAT64_EPILOGUE: ad_core_rs::plugin::runtime::WriteEpilogue =
         ad_core_rs::plugin::runtime::WriteEpilogue::AddrAndZero;
 
+    /// `maxSignals+1`, the 2-D series posting at address maxSignals
+    /// (NDPluginTimeSeries.cpp:48-51). C adds the 1 before its
+    /// `maxSignals < 1` clamp (:59-61), leaving maxSignals 0 no address for
+    /// that post; that C bug is not copied.
+    fn max_addr(&self) -> usize {
+        self.state.lock().max_signals + 1
+    }
+
     /// C `NDPluginTimeSeries::writeInt32` (NDPluginTimeSeries.cpp:441-490):
     /// its branch runs inside the write, before `callParamCallbacks`. It keeps
     /// the base class clamp but replaces its errorMessage with its own,
@@ -785,6 +793,23 @@ pub(crate) fn time_series_point(
 mod tests {
     use super::*;
     use ad_core_rs::plugin::runtime::SideParam;
+
+    /// NDPluginTimeSeries.cpp:51 passes maxSignals+1 whoever builds the
+    /// plugin.
+    #[test]
+    fn a_time_series_port_has_c_s_addresses() {
+        let (handle, _jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("TS_ADDR").unwrap(),
+            TimeSeriesProcessor::new(3),
+            1_000_000,
+            1,
+            0,
+            "",
+            Arc::new(ad_core_rs::plugin::wiring::WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
+        assert_eq!(handle.port_runtime().port_handle().max_addr(), 4);
+    }
 
     /// C `getAttributes` on each post (NDPluginTimeSeries.cpp:364, :379),
     /// whether a TSRead write or a filled series made it.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
-use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, create_plugin_runtime_multi_addr};
+use ad_core_rs::plugin::runtime::{DEFAULT_PLUGIN_THREADS, create_plugin_runtime};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::time_series_plugin::TimeSeriesProcessor;
 use asyn_rs::port::DrvUserRequest;
@@ -15,7 +15,7 @@ use asyn_rs::port::DrvUserRequest;
 #[test]
 fn the_circular_buffer_is_counted_on_the_plugin_pool() {
     let wiring = Arc::new(WiringRegistry::new());
-    let (ts, _jh) = create_plugin_runtime_multi_addr(
+    let (ts, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("TSPOOL").unwrap(),
         TimeSeriesProcessor::new(3),
         0,
@@ -23,7 +23,6 @@ fn the_circular_buffer_is_counted_on_the_plugin_pool() {
         0,
         "",
         wiring,
-        4,
         DEFAULT_PLUGIN_THREADS,
     );
     let port = ts.port_runtime().port_handle();
@@ -64,7 +63,7 @@ fn the_circular_buffer_is_counted_on_the_plugin_pool() {
 #[test]
 fn a_new_frame_shape_reallocates_from_the_frame_s_pool() {
     let wiring = Arc::new(WiringRegistry::new());
-    let (ts, _jh) = create_plugin_runtime_multi_addr(
+    let (ts, _jh) = create_plugin_runtime(
         &asyn_rs::asyn_record::claim_port("TSPOOLF").unwrap(),
         TimeSeriesProcessor::new(3),
         0,
@@ -72,7 +71,6 @@ fn a_new_frame_shape_reallocates_from_the_frame_s_pool() {
         0,
         "",
         wiring,
-        4,
         DEFAULT_PLUGIN_THREADS,
     );
     let port = ts.port_runtime().port_handle();

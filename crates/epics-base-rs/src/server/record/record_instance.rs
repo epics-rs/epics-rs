@@ -737,7 +737,102 @@ pub(crate) struct MetadataSnapshot {
 }
 
 /// [`RecordCold::metadata_cache`]: `None` until first built.
-type MetadataCell = Arc<arc_swap::ArcSwapOption<MetadataSnapshot>>;
+type MetadataCell = Arc<arc_swap::ArcSwapOption<CachedMetadata>>;
+
+/// A built [`MetadataSnapshot`] and the source fields it was built from,
+/// as [`RecordInstance::metadata_sources`] reads them.
+pub(crate) struct CachedMetadata {
+    meta: MetadataSnapshot,
+    sources: Box<[KeptSource]>,
+}
+
+impl std::ops::Deref for CachedMetadata {
+    type Target = MetadataSnapshot;
+
+    fn deref(&self) -> &MetadataSnapshot {
+        &self.meta
+    }
+}
+
+/// One metadata-cache source field as [`RecordInstance::metadata_sources`]
+/// reads it. A field keeps one form, so the bits of two numeric types never
+/// meet.
+#[derive(Clone, Copy, PartialEq)]
+enum Source<'a> {
+    Str(&'a [u8]),
+    Bits(u64),
+    Absent,
+}
+
+impl<'a> Source<'a> {
+    fn of_slot(slot: crate::server::record::SlotRef<'a>) -> Self {
+        use crate::server::record::SlotRef as S;
+        match slot {
+            S::Str(s) => Self::Str(s.as_bytes()),
+            S::F64(v) => Self::Bits(v.to_bits()),
+            S::F32(v) => Self::Bits(u64::from(v.to_bits())),
+            S::I8(v) => Self::Bits(*v as u64),
+            S::U8(v) => Self::Bits(u64::from(*v)),
+            S::I16(v) => Self::Bits(*v as u64),
+            S::U16(v) => Self::Bits(u64::from(*v)),
+            S::I32(v) => Self::Bits(*v as u64),
+            S::U32(v) => Self::Bits(u64::from(*v)),
+            S::I64(v) => Self::Bits(*v as u64),
+            S::U64(v) => Self::Bits(*v),
+        }
+    }
+
+    fn of_value(value: Option<&'a EpicsValue>) -> Self {
+        use EpicsValue as V;
+        match value {
+            Some(V::String(s)) => Self::Str(s.as_bytes()),
+            Some(V::Short(v)) => Self::Bits(*v as u64),
+            Some(V::Float(v)) => Self::Bits(u64::from(v.to_bits())),
+            Some(V::Enum(v) | V::UShort(v)) => Self::Bits(u64::from(*v)),
+            Some(V::EnumWithChoices { index, .. }) => Self::Bits(u64::from(*index)),
+            Some(V::Char(v) | V::UChar(v)) => Self::Bits(u64::from(*v)),
+            Some(V::Long(v)) => Self::Bits(*v as u64),
+            Some(V::ULong(v)) => Self::Bits(u64::from(*v)),
+            Some(V::Double(v)) => Self::Bits(v.to_bits()),
+            Some(V::Int64(v)) => Self::Bits(*v as u64),
+            Some(V::UInt64(v)) => Self::Bits(*v),
+            // No metadata source is an array.
+            _ => Self::Absent,
+        }
+    }
+
+    fn of_limit(limit: AlarmLimit) -> Self {
+        match limit {
+            AlarmLimit::Double(v) => Self::Bits(v.to_bits()),
+            AlarmLimit::Long(v) => Self::Bits(v as u64),
+            AlarmLimit::Int64(v) => Self::Bits(v as u64),
+        }
+    }
+
+    fn kept(self) -> KeptSource {
+        match self {
+            Self::Str(s) => KeptSource::Str(s.into()),
+            Self::Bits(v) => KeptSource::Bits(v),
+            Self::Absent => KeptSource::Absent,
+        }
+    }
+
+    fn is(self, kept: &KeptSource) -> bool {
+        match (self, kept) {
+            (Self::Str(s), KeptSource::Str(k)) => s == &**k,
+            (Self::Bits(v), KeptSource::Bits(k)) => v == *k,
+            (Self::Absent, KeptSource::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A [`Source`] as the cache was built from it ([`CachedMetadata::sources`]).
+enum KeptSource {
+    Str(Box<[u8]>),
+    Bits(u64),
+    Absent,
+}
 
 /// Does a write to this field make the record's metadata cache stale?
 ///
@@ -2516,6 +2611,10 @@ pub struct RecordCell {
     /// Set with no borrow of the record, on the line of `name`, which the
     /// cycle reads.
     chain_pact: AtomicBool,
+    /// How many dset calls hold this record lent, its device out
+    /// ([`Self::lend_to_dset`]). Touched only by the set's holder, as
+    /// `borrow` is.
+    lent: std::sync::atomic::AtomicU32,
     /// This record's slot in the database's record table, given at
     /// registration; `None` for a cell no database registered.
     index: Option<crate::server::database::RecordIdx>,
@@ -3518,6 +3617,30 @@ impl RecordCell {
         self.chain_pact.store(was, Ordering::Relaxed);
     }
 
+    /// Whether this thread is inside the record: it holds the record's set
+    /// and has the record borrowed, or lent to a dset call with its device
+    /// out. A driver callback for it cannot run until it is let go.
+    pub(crate) fn busy_on_this_thread(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.lock_record.held_by_this_thread()
+            && (self.borrow.load(Ordering::Relaxed) != 0 || self.lent.load(Ordering::Relaxed) != 0)
+    }
+
+    /// A dset call holds the record lent, its device out; paired with
+    /// [`Self::return_from_dset`]. The caller holds the record's set.
+    pub(crate) fn lend_to_dset(&self) {
+        use std::sync::atomic::Ordering;
+        self.lent
+            .store(self.lent.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+
+    /// The end of a [`Self::lend_to_dset`].
+    pub(crate) fn return_from_dset(&self) {
+        use std::sync::atomic::Ordering;
+        self.lent
+            .store(self.lent.load(Ordering::Relaxed) - 1, Ordering::Relaxed);
+    }
+
     /// Record borrows the calling thread holds, for a test binary's
     /// allocator to tell allocations under a hold from the rest; `0` in
     /// builds without debug assertions.
@@ -3571,6 +3694,7 @@ impl RecordCell {
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             link_opens_owed: std::sync::atomic::AtomicBool::new(true),
             chain_pact: AtomicBool::new(false),
+            lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
             metadata: Arc::clone(&instance.cold.metadata_cache),
@@ -5391,8 +5515,10 @@ struct RecordCold {
     /// [`RecordInstance::notify_field_written`] (or
     /// [`RecordInstance::refresh_metadata_cache`] directly) afterward.
     ///
-    /// All current write paths in `field_io.rs` already do this. If you
-    /// add a new code path that:
+    /// All current write paths in `field_io.rs` already do this, and a lend
+    /// to device code settles it on release
+    /// ([`RecordInstance::settle_metadata_cache`]). If you add a new code
+    /// path that:
     ///
     /// - calls `instance.record.put_field(...)` directly, OR
     /// - mutates record fields from inside `Record::process()`,
@@ -5581,6 +5707,11 @@ pub(crate) struct MonitorPlan {
     fields: &'static [FieldDesc],
     /// Each declared field's [`FieldRead`], by [`FieldIx`].
     reads: Box<[FieldRead]>,
+    /// The declared fields the metadata cache is built from, the
+    /// [`is_metadata_cache_source`] set and `DESC`, with their reads — those
+    /// a lend reaches. A field the type spills to the declared store is only
+    /// written by `put_declared_override`, whose callers refresh the cache.
+    metadata_sources: Box<[(&'static FieldDesc, FieldRead)]>,
     /// [`Record::cycle_hooks`].
     pub(crate) hooks: crate::server::record::CycleHooks,
     /// Whether the type is `sub` or `aSub` — a property of the type, so not
@@ -5767,6 +5898,24 @@ impl MonitorPlan {
                 fixed.push((ix, roles));
             }
         }
+        let reads = FieldRead::table(record);
+        let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
+        let metadata_sources = common
+            .iter()
+            .chain(record.field_list())
+            .zip(&reads)
+            .enumerate()
+            .filter(|(i, (desc, read))| {
+                let declared = || {
+                    let slot = u16::try_from(i.checked_sub(common.len())?).ok()?;
+                    record.declared_store(crate::server::record::FieldSlot(slot))
+                };
+                (is_metadata_cache_source(desc.name) || desc.name == "DESC")
+                    && !(matches!(read, FieldRead::Named)
+                        && declared() == Some(crate::server::record::DeclaredStore::Spill))
+            })
+            .map(|(_, (desc, read))| (desc, *read))
+            .collect();
         let mut plan = Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
@@ -5827,7 +5976,8 @@ impl MonitorPlan {
             hash_desc: declared_desc(field_desc_of(record, "HASH"), "HASH"),
             val_desc: declared_desc(field_desc_of(record, "VAL"), "VAL"),
             fields: record.field_list(),
-            reads: FieldRead::table(record),
+            reads,
+            metadata_sources,
             hooks: record.cycle_hooks(),
             subroutine_kind: SubroutineKind::of(record.record_type()),
         };
@@ -6529,7 +6679,7 @@ pub(crate) fn own_field_snapshot(
     };
     let mut snap =
         super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH);
-    OwnRecord(record).finish_metadata(field, (*meta).clone(), LinkBacking::none(), &mut snap);
+    OwnRecord(record).finish_metadata(field, meta.meta.clone(), LinkBacking::none(), &mut snap);
     Some(snap)
 }
 
@@ -8392,10 +8542,85 @@ impl RecordInstance {
     /// Build the metadata cache from the record as it stands: the end of
     /// `init_record`, after device support's `init` has written its fields
     /// (asyn's `setEnums`) with no notification.
-    pub(crate) fn seed_metadata_cache(&self) -> Arc<MetadataSnapshot> {
-        let meta = Arc::new(self.build_metadata());
+    pub(crate) fn seed_metadata_cache(&self) -> Arc<CachedMetadata> {
+        let mut sources = Vec::with_capacity(self.monitor_plan.metadata_sources.len());
+        self.metadata_sources(|source| {
+            sources.push(source.kept());
+            true
+        });
+        let meta = Arc::new(CachedMetadata {
+            meta: self.build_metadata(),
+            sources: sources.into(),
+        });
         self.cold.metadata_cache.store(Some(Arc::clone(&meta)));
         meta
+    }
+
+    /// The release of a lend that handed the record to code outside the
+    /// field writers ([`HeldInstance::with`], [`AsyncDbHandle::with_instance`]):
+    /// a built cache is rebuilt when its source fields no longer read as it
+    /// was built from, so a source written there reaches the next reader as
+    /// C's `dbGet` reads the field itself.
+    ///
+    /// [`HeldInstance::with`]: crate::server::database::HeldInstance::with
+    /// [`AsyncDbHandle::with_instance`]: crate::server::database::AsyncDbHandle::with_instance
+    pub(crate) fn settle_metadata_cache(&self) {
+        let stale = match &*self.cold.metadata_cache.load() {
+            Some(cached) => {
+                let mut kept = cached.sources.iter();
+                !self.metadata_sources(|source| kept.next().is_some_and(|k| source.is(k)))
+            }
+            None => false,
+        };
+        if stale {
+            self.seed_metadata_cache();
+        }
+    }
+
+    /// The metadata cache's source fields ([`MonitorPlan::metadata_sources`])
+    /// in order, each read where it is stored, until `each` answers `false`;
+    /// whether none did. Only a field the record type serves by name alone
+    /// is read as an [`EpicsValue`].
+    fn metadata_sources(&self, mut each: impl FnMut(Source<'_>) -> bool) -> bool {
+        for &(desc, read) in &self.monitor_plan.metadata_sources {
+            let value;
+            let source = match read {
+                FieldRead::Slot(slot) => self
+                    .record
+                    .slot_ref(crate::server::record::FieldSlot(slot))
+                    .map_or(Source::Absent, Source::of_slot),
+                FieldRead::Common(field) => match (field, &self.common.analog_alarm) {
+                    (CommonField::Desc, _) => Source::Str(self.common.text.desc.as_bytes()),
+                    (CommonField::Hihi, Some(a)) => {
+                        Source::of_limit(a.limit(AlarmLimitField::Hihi))
+                    }
+                    (CommonField::High, Some(a)) => {
+                        Source::of_limit(a.limit(AlarmLimitField::High))
+                    }
+                    (CommonField::Low, Some(a)) => Source::of_limit(a.limit(AlarmLimitField::Low)),
+                    (CommonField::Lolo, Some(a)) => {
+                        Source::of_limit(a.limit(AlarmLimitField::Lolo))
+                    }
+                    (CommonField::Hhsv, Some(a)) => Source::Bits(a.hhsv as u64),
+                    (CommonField::Hsv, Some(a)) => Source::Bits(a.hsv as u64),
+                    (CommonField::Lsv, Some(a)) => Source::Bits(a.lsv as u64),
+                    (CommonField::Llsv, Some(a)) => Source::Bits(a.llsv as u64),
+                    (field, _) => {
+                        value = self.common_field(field);
+                        Source::of_value(value.as_ref())
+                    }
+                },
+                FieldRead::Named => {
+                    value = self.read_named(desc.name);
+                    Source::of_value(value.as_ref())
+                }
+                FieldRead::Unreadable => continue,
+            };
+            if !each(source) {
+                return false;
+            }
+        }
+        true
     }
 
     /// **The** `DBE_PROPERTY` gate: C `dbAccess.c:1330`
@@ -8525,8 +8750,8 @@ impl RecordInstance {
     /// metadata-stable interval.
     fn cached_metadata(&self) -> MetadataSnapshot {
         match self.cold.metadata_cache.load_full() {
-            Some(cached) => (*cached).clone(),
-            None => (*self.seed_metadata_cache()).clone(),
+            Some(cached) => cached.meta.clone(),
+            None => self.seed_metadata_cache().meta.clone(),
         }
     }
 
@@ -14179,6 +14404,7 @@ mod record_cell_layout_tests {
             init_owed,
             link_opens_owed,
             chain_pact,
+            lent,
             index,
             rdes,
             slots,
@@ -18627,5 +18853,134 @@ mod scan_index_result_tests {
             CommonFieldPutResult::ScanChanged { phas, .. } => assert_eq!(phas, 3),
             other => panic!("expected ScanChanged, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod lent_metadata_tests {
+    //! A metadata source written by device code a record is lent to reaches
+    //! the cache by the lend's release, however the type stores the field.
+    use super::*;
+    use crate::server::database::PvDatabase;
+    use crate::server::records::{
+        ai::AiRecord, ao::AoRecord, mbbi::MbbiRecord, mbbo::MbboRecord, sel::SelRecord,
+    };
+
+    async fn db_with(name: &str, record: Box<dyn Record>) -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(name, record).await.unwrap();
+        db.get_record(name).unwrap().read().seed_metadata_cache();
+        db
+    }
+
+    fn cached(db: &PvDatabase, name: &str) -> Arc<CachedMetadata> {
+        let rec = db.get_record(name).unwrap();
+        let inst = rec.read();
+        inst.cold.metadata_cache.load_full().unwrap()
+    }
+
+    fn first_state(db: &PvDatabase, name: &str) -> PvString {
+        cached(db, name).enums.as_ref().unwrap().strings[0].clone()
+    }
+
+    fn mut_as<R: Record>(record: &mut dyn Record) -> &mut R {
+        record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<R>())
+            .unwrap()
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_slot_string_written_in_a_held_lend_reaches_the_cache() {
+        let mut mbbo = MbboRecord::new(0);
+        mbbo.zrst = "SHUT".into();
+        let db = db_with("MO", Box::new(mbbo)).await;
+        db.async_handle().with_held("MO", |held| {
+            held.with(|record, _| mut_as::<MbboRecord>(record).zrst = "OPEN".into())
+        });
+        assert_eq!(first_state(&db, "MO"), "OPEN");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_custom_string_written_in_with_record_reaches_the_cache() {
+        let mut mbbi = MbbiRecord::new(0);
+        mbbi.zrst = "SHUT".into();
+        let db = db_with("MI", Box::new(mbbi)).await;
+        db.async_handle().with_record("MI", |record| {
+            mut_as::<MbbiRecord>(record).zrst = "OPEN".into();
+        });
+        assert_eq!(first_state(&db, "MI"), "OPEN");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_common_alarm_severity_written_in_with_instance_reaches_the_cache() {
+        let db = db_with("AI", Box::new(AiRecord::new(0.0))).await;
+        db.put_record_field_from_ca("AI", "HIHI", EpicsValue::Double(90.0))
+            .await
+            .unwrap();
+        assert!(cached(&db, "AI").alarm.0.is_nan(), "HHSV 0 gates HIHI off");
+        db.async_handle().with_instance("AI", |_, common| {
+            common.analog_alarm.as_mut().unwrap().hhsv = 2;
+        });
+        assert_eq!(cached(&db, "AI").alarm.0, 90.0);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn desc_written_in_a_held_lend_reaches_the_cache() {
+        let db = db_with("AI", Box::new(AiRecord::new(0.0))).await;
+        db.async_handle().with_held("AI", |held| {
+            held.with(|_, common| common.text.desc = "pump".into())
+        });
+        assert_eq!(
+            cached(&db, "AI").display.as_ref().unwrap().description,
+            "pump"
+        );
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_named_scalar_written_through_with_device_reaches_the_cache() {
+        struct Dev;
+        impl crate::server::device_support::DeviceSupport for Dev {
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                Ok(())
+            }
+            fn dtyp(&self) -> &str {
+                "Dev"
+            }
+        }
+        // sel serves HHSV by name alone.
+        let db = db_with("SL", Box::new(SelRecord::default())).await;
+        db.put_record_field_from_ca("SL", "HIHI", EpicsValue::Double(90.0))
+            .await
+            .unwrap();
+        assert!(cached(&db, "SL").alarm.0.is_nan(), "HHSV 0 gates HIHI off");
+        db.get_record("SL").unwrap().write().device = Some(Box::new(Dev));
+        let ran = db.async_handle().with_held("SL", |held| {
+            held.with_device(|record, _, _| mut_as::<SelRecord>(record).hhsv = 2)
+        });
+        assert_eq!(ran, Some(Some(())));
+        assert_eq!(cached(&db, "SL").alarm.0, 90.0);
+        // An ao's PREC is a slot.
+        let db = db_with("AO", Box::new(AoRecord::new(0.0))).await;
+        db.get_record("AO").unwrap().write().device = Some(Box::new(Dev));
+        db.async_handle().with_held("AO", |held| {
+            held.with_device(|record, _, _| mut_as::<AoRecord>(record).prec = 4)
+        });
+        assert_eq!(cached(&db, "AO").display.as_ref().unwrap().precision, 4);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_lend_that_writes_no_source_rebuilds_nothing() {
+        let mut mbbi = MbbiRecord::new(0);
+        mbbi.zrst = "SHUT".into();
+        let db = db_with("MI", Box::new(mbbi)).await;
+        let before = builds();
+        db.async_handle().with_instance("MI", |record, common| {
+            mut_as::<MbbiRecord>(record).val = 1;
+            common.udf = 0;
+        });
+        db.async_handle()
+            .with_held("MI", |held| held.with(|_, common| common.tpro = 0));
+        assert_eq!(builds(), before);
     }
 }

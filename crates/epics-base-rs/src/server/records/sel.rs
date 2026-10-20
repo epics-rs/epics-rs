@@ -246,9 +246,9 @@ impl Record for SelRecord {
         LK => prev[10],
         LL => prev[11],
         NLST => nlst;
-        custom: VAL, SELM, SELN, NVL, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI,
-            INPJ, INPK, INPL, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A,
-            B, C, D, E, F, G, H, I, J, K, L, LALM, ALST, MLST;
+        custom: VAL, SELM, SELN, NVL, INPA, INPB, INPC, INPD, INPE, INPF, INPG, INPH, INPI, INPJ,
+            INPK, INPL, HIHI => hihi, LOLO => lolo, HIGH => high, LOW => low, HHSV, LLSV, HSV, LSV,
+            HYST, ADEL, MDEL, A, B, C, D, E, F, G, H, I, J, K, L, LALM, ALST, MLST;
         spill: PREC, EGU, HOPR, LOPR);
 
     /// What `put_field` stores for `A`..`L`, without the by-name lookups

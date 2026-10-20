@@ -823,7 +823,12 @@ pub enum FieldPut {
 }
 
 impl<'a> HeldInstance<'a> {
+    /// A dset call's hold, the record's device out for the call: marked on
+    /// the record until the hold drops, so a driver callback reaching it
+    /// from inside the call is owed rather than run
+    /// ([`AsyncDbHandle::run_io_intr_callback_with`]).
     pub(crate) fn new(db: &'a PvDatabase, rec: InFrame<'a>, visited: &'a mut ProcStack) -> Self {
+        rec.unframed().lend_to_dset();
         Self {
             db,
             rec,
@@ -834,12 +839,15 @@ impl<'a> HeldInstance<'a> {
 
     fn entry(db: &'a PvDatabase, rec: InFrame<'a>, visited: &'a mut ProcStack) -> Self {
         Self {
+            db,
+            rec,
+            visited: std::cell::RefCell::new(visited),
             hold: Hold::Entry,
-            ..Self::new(db, rec, visited)
         }
     }
 
-    /// The record and its `dbCommon`, borrowed for `f` alone.
+    /// The record and its `dbCommon`, borrowed for `f` alone. A metadata
+    /// field `f` writes reaches the metadata cache when it returns.
     ///
     /// # Panics
     ///
@@ -854,7 +862,9 @@ impl<'a> HeldInstance<'a> {
     ) -> R {
         let mut instance = self.rec.write();
         let instance = &mut *instance;
-        f(&mut *instance.record, &mut instance.common)
+        let r = f(&mut *instance.record, &mut instance.common);
+        instance.settle_metadata_cache();
+        r
     }
 
     /// [`Self::with`] with the record's bound device as well; `None` when
@@ -874,13 +884,14 @@ impl<'a> HeldInstance<'a> {
         let mut instance = self.rec.write();
         let instance = &mut *instance;
         let dev = instance.device.as_mut()?;
-        Some(f(&mut *instance.record, &mut instance.common, &mut **dev))
+        let r = f(&mut *instance.record, &mut instance.common, &mut **dev);
+        instance.settle_metadata_cache();
+        Some(r)
     }
 
     /// [`PvDatabase::post_property`] on this record, inside the hold: C's
     /// `setEnums` and its `db_post_events(DBE_PROPERTY)` from an enum
-    /// callback (devAsynInt32.c:712-766). A field written through
-    /// [`Self::with`] does not reach the metadata cache; one written here does.
+    /// callback (devAsynInt32.c:712-766).
     pub fn put_property(
         &self,
         post: crate::server::device_support::PropertyPost,
@@ -928,6 +939,14 @@ impl<'a> HeldInstance<'a> {
     pub fn db_process(&self, record: impl AsRef<[u8]>) -> DbResult {
         let visited = &mut **self.visited.borrow_mut();
         self.db.process_from_held(record.as_ref(), visited)
+    }
+}
+
+impl Drop for HeldInstance<'_> {
+    fn drop(&mut self) {
+        if self.hold == Hold::DsetCall {
+            self.rec.unframed().return_from_dset();
+        }
     }
 }
 
@@ -1278,6 +1297,7 @@ impl AsyncDbHandle {
         // `write` takes the record's lock set: `dbScanLock`.
         let mut instance = rec.write();
         f(&mut *instance.record);
+        instance.settle_metadata_cache();
         super::field_io::emit_cycle_posts(&mut instance);
     }
 
@@ -1297,6 +1317,7 @@ impl AsyncDbHandle {
         let mut instance = rec.write();
         let instance = &mut *instance;
         let r = f(&mut *instance.record, &mut instance.common);
+        instance.settle_metadata_cache();
         super::field_io::emit_cycle_posts(instance);
         Some(r)
     }
@@ -1314,20 +1335,48 @@ impl AsyncDbHandle {
     /// Nothing runs before `finishDevSup`: devMotorAsyn locks only once its
     /// `init(after)` set `dbScanLockOK` (devMotorAsyn.c:159-162,717), and
     /// drvEtherIP's scan task starts at `initHookAfterScanInit`
-    /// (drvEtherIP.c:1457). A no-op, too, if the record or the database is
-    /// gone.
+    /// (drvEtherIP.c:1457). Nor once the record or the database is gone.
+    /// [`IoIntrRun::Refused`](crate::server::device_support::IoIntrRun::Refused)
+    /// says so, for the caller's own branch: devMotorAsyn's
+    /// `else if (pmsg->command == motorPosition)` (devMotorAsyn.c:728-729).
+    ///
+    /// On a port without `ASYN_CANBLOCK` devMotorAsyn's `queueRequest` runs
+    /// `asynCallback`, and the driver's `statusCallback` with it, inline from
+    /// the dset call (devMotorAsyn.c:641, asynManager.c:1555-1584), where C's
+    /// `dbScanLock` recurses. Here that thread has the record borrowed or its
+    /// device out, so the callback is owed instead: run, in arrival order,
+    /// when the dset call returns, and at the latest before the record's set
+    /// is let go. An asyn output's readback is not such a callback: devAsynInt32
+    /// rings it and processes the record later on a callback thread
+    /// (devAsynInt32.c:580-640), asyn-rs's pump through
+    /// [`PvDatabase::process_record_readback`].
     pub fn run_io_intr_callback_with(
         &self,
         name: impl AsRef<[u8]>,
-        f: impl FnOnce(&HeldInstance<'_>) -> crate::server::device_support::IoIntrAction,
-    ) {
-        use crate::server::device_support::IoIntrAction;
+        f: impl FnOnce(&HeldInstance<'_>) -> crate::server::device_support::IoIntrAction
+        + Send
+        + 'static,
+    ) -> crate::server::device_support::IoIntrRun {
+        use crate::server::device_support::{IoIntrAction, IoIntrRun};
         let name = name.as_ref();
-        if !self
-            .db()
-            .is_some_and(|db| db.scan_control().dev_sup_gate().is_open())
+        let Some(db) = self.db() else {
+            return IoIntrRun::Refused;
+        };
+        if !db.scan_control().dev_sup_gate().is_open() {
+            return IoIntrRun::Refused;
+        }
+        if let Some(rec) = db.get_record(name)
+            && rec.busy_on_this_thread()
         {
-            return;
+            let handle = self.clone();
+            let name = name.to_vec();
+            super::owe_callback(
+                &rec,
+                Box::new(move || {
+                    let _ = handle.run_io_intr_callback_with(name, f);
+                }),
+            );
+            return IoIntrRun::Owed;
         }
         let scan_once = self.with_held(name, |held| {
             let action = f(held);
@@ -1349,21 +1398,28 @@ impl AsyncDbHandle {
                 IoIntrAction::Skip => false,
             }
         });
-        if scan_once == Some(true)
-            && let Some(db) = self.db()
-        {
-            db.scan_once(name);
+        match scan_once {
+            None => IoIntrRun::Refused,
+            Some(scan_once) => {
+                if scan_once {
+                    db.scan_once(name);
+                }
+                IoIntrRun::Ran
+            }
         }
     }
 
     /// [`run_io_intr_callback_with`](Self::run_io_intr_callback_with) the
     /// bound device's own
     /// [`io_intr_callback`](crate::server::device_support::DeviceSupport::io_intr_callback).
-    pub fn run_io_intr_callback(&self, name: impl AsRef<[u8]>) {
+    pub fn run_io_intr_callback(
+        &self,
+        name: impl AsRef<[u8]>,
+    ) -> crate::server::device_support::IoIntrRun {
         self.run_io_intr_callback_with(name, |held| {
             held.with_device(|record, common, dev| dev.io_intr_callback(record, common))
                 .unwrap_or(crate::server::device_support::IoIntrAction::Skip)
-        });
+        })
     }
 
     /// [`with_instance`](Self::with_instance) for device support whose run
@@ -3135,6 +3191,18 @@ impl<'a> DataGuard<'a> {
     /// Give the guard up ahead of work that may lock another record, or this one.
     fn release(&mut self) {
         self.held = None;
+    }
+
+    /// The driver callbacks owed to the record from inside a dset call that
+    /// has returned, its device back ([`InFrame::run_owed_callbacks`]): run
+    /// with the guard given up. Asked through the frame's
+    /// [`InFrame::callbacks_owed`], so a return owed nothing keeps its held
+    /// instance and pays the one test.
+    #[cold]
+    #[inline(never)]
+    fn run_owed_callbacks(&mut self) {
+        self.release();
+        self.rec.run_owed_callbacks();
     }
 }
 
@@ -7300,6 +7368,9 @@ impl PvDatabase {
                             instance.enter_pact();
                             instance.device = Some(dev);
                             guard.release();
+                            if rec.callbacks_owed() {
+                                guard.run_owed_callbacks();
+                            }
                             self.run_reentered_pass(name, guard.rec, visited);
                             instance = guard.hold();
                             dev = instance
@@ -7332,6 +7403,10 @@ impl PvDatabase {
                         if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
                             instance.enter_pact();
                             instance.device = Some(dev);
+                            if rec.callbacks_owed() {
+                                guard.run_owed_callbacks();
+                                instance = guard.hold();
+                            }
                             // A queued read still stamps when the pass asked:
                             // `mcaRecord.c:762-764` ahead of the `return(0)`
                             // at `:778`.
@@ -7386,6 +7461,10 @@ impl PvDatabase {
                             Err(_) => cycle_status.io(Err(DbStatus::FAILED)),
                         }
                         instance.device = Some(dev);
+                        if rec.callbacks_owed() {
+                            guard.run_owed_callbacks();
+                            instance = guard.hold();
+                        }
                         // An input's device raises its alarm in `readValue`,
                         // ahead of the record body.
                         if !plan.output_stage {
@@ -8366,6 +8445,10 @@ impl PvDatabase {
                             // retry / backlash / NTM-stop commands are emitted on exactly
                             // these passes.
                             let read_failed = Self::read_callback_value(instance);
+                            if rec.callbacks_owed() {
+                                guard.run_owed_callbacks();
+                                instance = guard.hold();
+                            }
                             if read_failed {
                                 cycle_status.io(Err(DbStatus::FAILED));
                             }
@@ -8405,6 +8488,9 @@ impl PvDatabase {
                                         // `complete_async_write` ends the cycle there.
                                         instance.enter_pact();
                                         instance.device = Some(dev);
+                                        if rec.callbacks_owed() {
+                                            guard.run_owed_callbacks();
+                                        }
                                         // Not an end: `complete_async_record_inner`
                                         // owns this cycle's tail now, and mints its own
                                         // token from the record when the write lands.
@@ -8425,6 +8511,10 @@ impl PvDatabase {
                                     cycle_status.io(Err(DbStatus::FAILED));
                                 }
                                 instance.device = Some(dev);
+                                if rec.callbacks_owed() {
+                                    guard.run_owed_callbacks();
+                                    instance = guard.hold();
+                                }
                                 apply_device_alarm(instance, false);
                             }
                             None

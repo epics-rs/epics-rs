@@ -88,8 +88,8 @@ impl Record for BiRecord {
         fields:
         RVAL => rval,
         ORAW => oraw;
-        custom: VAL, ZSV, OSV, COSV, ZNAM, ONAM, MASK, LALM, MLST, AFTC, AFVL, SIOL, SVAL, SIML,
-            SIMM, SIMS, SDLY;
+        custom: VAL, ZSV, OSV, COSV, ZNAM => znam, ONAM => onam, MASK, LALM, MLST, AFTC, AFVL, SIOL,
+            SVAL, SIML, SIMM, SIMS, SDLY;
         spill: INP, OLDSIMM, SSCN, SIMPVT);
 
     /// `biRecord.c:100` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.

@@ -852,6 +852,19 @@ pub enum IoIntrAction {
     Skip,
 }
 
+/// Whether [`AsyncDbHandle::run_io_intr_callback_with`](crate::server::database::AsyncDbHandle::run_io_intr_callback_with)
+/// ran the callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoIntrRun {
+    /// It ran under the record's lock.
+    Ran,
+    /// This thread was inside the record: it runs once the record is free.
+    Owed,
+    /// It never runs: before `finishDevSup` (C's `dbScanLockOK` still
+    /// false), or with the record or the database gone.
+    Refused,
+}
+
 /// C `get_ioint_info`'s `cmd`: which of `dbScan.c`'s two calls asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoIntrCmd {

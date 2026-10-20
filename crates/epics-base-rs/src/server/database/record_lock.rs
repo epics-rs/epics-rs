@@ -401,6 +401,9 @@ struct LockSet {
     /// [`Self::owed`] is not empty. Read by every fresh hold, so it shares
     /// `many_holds`' word: the fields before [`Self::trace`] stay one line.
     has_owed: AtomicBool,
+    /// [`Self::callbacks`] is not empty. Read by every outermost release,
+    /// in `has_owed`'s padding.
+    callbacks_owed: AtomicBool,
     /// The mutex guard of the current outermost hold, kept here rather than
     /// in that hold's [`SetGuard`] so that a frame which does not own the
     /// guard can still give the set up and take it back — [`Self::unheld`],
@@ -416,7 +419,16 @@ struct LockSet {
     /// ([`Self::admit_owed`]) before the holder reads any of them. A leaf
     /// lock, taken with or without the set.
     owed: std::sync::Mutex<Vec<Arc<RecordCell>>>,
+    /// Driver callbacks that reached a member record on the holding thread
+    /// while it had the record borrowed or lent to a dset call
+    /// ([`owe_callback`]), in arrival order: the record's frame runs its own
+    /// when the dset call returns ([`InFrame::run_owed_callbacks`]), and the
+    /// outermost release runs whatever is left before the mutex goes.
+    callbacks: std::sync::Mutex<std::collections::VecDeque<(Arc<RecordCell>, OwedCallback)>>,
 }
+
+/// A driver callback [`owe_callback`] deferred: run once its record is free.
+pub(crate) type OwedCallback = Box<dyn FnOnce() + Send>;
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
 // by the thread that holds `lock` (`acquire`'s fresh arm, `SetGuard::drop`'s
@@ -595,6 +607,12 @@ impl LockRecord {
         }
     }
 
+    /// Whether this thread holds the set the record is in. Stable while it
+    /// does: a record cannot leave a held set.
+    pub(crate) fn held_by_this_thread(&self) -> bool {
+        self.set().owner.load(Ordering::Acquire) == thread_key()
+    }
+
     /// See [`LockSet::unheld`]: give up the set this record is in for the
     /// duration of `f`. This thread must hold that set exactly once.
     pub(crate) fn unheld<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -619,6 +637,17 @@ impl LockRecord {
     fn store(&self, set: Set) {
         self.plock_set.store(Self::as_ptr(set), Ordering::Release);
     }
+}
+
+/// Owe `job`, a driver callback for `cell`, to the set this thread holds it
+/// under: C's recursive `dbScanLock` would run it inside the dset call, which
+/// here has the record borrowed or its device out.
+pub(crate) fn owe_callback(cell: &Arc<RecordCell>, job: OwedCallback) {
+    let set = cell.lock_record().set();
+    debug_assert_eq!(set.owner.load(Ordering::Acquire), thread_key());
+    let mut callbacks = set.callbacks.lock().unwrap_or_else(|e| e.into_inner());
+    callbacks.push_back((Arc::clone(cell), job));
+    set.callbacks_owed.store(true, Ordering::Relaxed);
 }
 
 /// Owe `cell`'s pending `cvt_dbaddr` to the set it is in, for that set's next
@@ -708,9 +737,11 @@ fn new_set(id: u64) -> Set {
         depth: AtomicUsize::new(0),
         many_holds: AtomicU32::new(0),
         has_owed: AtomicBool::new(false),
+        callbacks_owed: AtomicBool::new(false),
         held: std::cell::UnsafeCell::new(None),
         trace: AtomicUsize::new(0),
         owed: std::sync::Mutex::new(Vec::new()),
+        callbacks: std::sync::Mutex::new(std::collections::VecDeque::new()),
     }))
 }
 
@@ -986,6 +1017,66 @@ impl LockSet {
         }
     }
 
+    /// The owed callbacks of `of`, or all of them, in arrival order.
+    fn take_callbacks(&self, of: Option<&RecordCell>) -> Vec<OwedCallback> {
+        let mut callbacks = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = match of {
+            None => callbacks.drain(..).map(|(_, job)| job).collect(),
+            Some(cell) => {
+                let mut taken = Vec::new();
+                let mut kept = std::collections::VecDeque::new();
+                for (owner, job) in callbacks.drain(..) {
+                    if std::ptr::eq(&*owner, cell) {
+                        taken.push(job);
+                    } else {
+                        kept.push_back((owner, job));
+                    }
+                }
+                *callbacks = kept;
+                taken
+            }
+        };
+        self.callbacks_owed
+            .store(!callbacks.is_empty(), Ordering::Relaxed);
+        taken
+    }
+
+    /// The outermost release: what the set was owed runs first, still under
+    /// the hold, those callbacks owe in turn included; an unwind leaves it to
+    /// the next holder's release.
+    #[inline(always)]
+    fn release_outermost(&'static self) {
+        if self.callbacks_owed.load(Ordering::Relaxed) {
+            self.run_owed_then_unlock();
+        } else {
+            self.unlock_outermost();
+        }
+    }
+
+    /// Out of line, so that a release whose set was owed nothing makes no
+    /// call it did not make before. A callback that unwinds still gives the
+    /// set up: the release it ran in does not run again.
+    #[cold]
+    #[inline(never)]
+    fn run_owed_then_unlock(&'static self) {
+        struct Unlock(&'static LockSet);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                self.0.unlock_outermost();
+            }
+        }
+        let _unlock = Unlock(self);
+        while !std::thread::panicking() {
+            let jobs = self.take_callbacks(None);
+            if jobs.is_empty() {
+                break;
+            }
+            for job in jobs {
+                job();
+            }
+        }
+    }
+
     /// Release the mutex this thread holds and clear the hold. Only the
     /// owner, at depth 1, may call this.
     fn unlock_outermost(&'static self) {
@@ -1035,10 +1126,11 @@ impl LockSet {
             0,
             "a lock set was given up from inside a many-lock transaction"
         );
-        // The set is retaken on every exit of `f`, an unwind included: the
-        // frame's outer `SetGuard` releases a hold this thread must own.
-        self.unlock_outermost();
+        // The set is retaken on every exit of the release and `f`, an unwind
+        // included: the frame's outer `SetGuard` releases a hold this thread
+        // must own.
         let _retake = Retake { set: self, me };
+        self.release_outermost();
         f()
     }
 
@@ -1107,11 +1199,13 @@ impl Drop for SetGuard {
     fn drop(&mut self) {
         // `depth` counts this thread's live holds, so the one that takes it
         // to zero is the one that gives the mutex up — whichever order the
-        // guards are dropped in.
+        // guards are dropped in. No record of the set is borrowed or lent by
+        // then.
         let depth = self.set.depth.load(Ordering::Relaxed) - 1;
-        self.set.depth.store(depth, Ordering::Relaxed);
-        if depth == 0 {
-            self.set.unlock_outermost();
+        if depth != 0 {
+            self.set.depth.store(depth, Ordering::Relaxed);
+        } else {
+            self.set.release_outermost();
         }
     }
 }
@@ -2541,6 +2635,23 @@ impl<'a> InFrame<'a> {
     pub(crate) fn unframed(&self) -> &'a Arc<RecordCell> {
         self.cell
     }
+
+    /// Whether a member of the frame's set is owed a driver callback.
+    #[inline(always)]
+    pub(crate) fn callbacks_owed(&self) -> bool {
+        self.set.set.callbacks_owed.load(Ordering::Relaxed)
+    }
+
+    /// The driver callbacks this record was owed inside its dset call
+    /// ([`owe_callback`]), run in arrival order now the call has returned.
+    /// The record's borrow must be down and its device back.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn run_owed_callbacks(&self) {
+        for job in self.set.set.take_callbacks(Some(self.cell)) {
+            job();
+        }
+    }
 }
 
 impl FrameGate {
@@ -3434,6 +3545,62 @@ mod tests {
         assert_eq!(set.depth.load(Ordering::Relaxed), 1);
         drop(again);
         assert!(!set.is_locked());
+    }
+
+    /// The park gives the mutex up as the outermost release does, so what
+    /// the set was owed runs first, still under the hold.
+    #[test]
+    fn a_callback_owed_to_the_set_runs_before_the_park_gives_it_up() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "UO:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = log.clone();
+        owe_callback(
+            &cell,
+            Box::new(move || l.lock().unwrap().push(set.is_locked())),
+        );
+        let l = log.clone();
+        cell.unheld(|| l.lock().unwrap().push(set.is_locked()));
+        assert_eq!(*log.lock().unwrap(), [true, false]);
+        drop(outer);
+        assert!(!set.is_locked());
+    }
+
+    /// Boundary: an owed callback unwinds out of the last guard's release.
+    /// That drop does not run again, so the release gives the set up itself.
+    #[test]
+    fn a_panic_inside_an_owed_callback_still_gives_the_set_up() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "OP:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        owe_callback(&cell, Box::new(|| panic!("owed callback unwound")));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(outer)));
+        assert!(r.is_err());
+        assert!(!set.is_locked());
+        assert_eq!(set.owner.load(Ordering::Relaxed), 0);
+        assert_eq!(set.depth.load(Ordering::Relaxed), 0);
+    }
+
+    /// Boundary: the same unwind out of the park's release. The set is
+    /// retaken for the frame's outer guard, which gives it up on the unwind.
+    #[test]
+    fn a_panic_inside_a_callback_owed_at_the_park_leaves_the_set_to_the_outer_guard() {
+        let db = PvDatabase::new();
+        let cell = adopted_cell(&db, "OQ:REC");
+        let outer = db.lock_instance(&cell);
+        let set = cell.lock_record().set();
+        owe_callback(&cell, Box::new(|| panic!("owed callback unwound")));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _outer = outer;
+            cell.unheld(|| ());
+        }));
+        assert!(r.is_err());
+        assert!(!set.is_locked());
+        assert_eq!(set.owner.load(Ordering::Relaxed), 0);
+        assert_eq!(set.depth.load(Ordering::Relaxed), 0);
     }
 
     /// Boundary: a borrow that adds no depth is still refused at the park.

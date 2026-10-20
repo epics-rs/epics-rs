@@ -57,7 +57,7 @@ pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 pub(crate) use record_lock::{
-    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_cvt,
+    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_callback, owe_cvt,
 };
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,

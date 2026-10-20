@@ -341,8 +341,11 @@ impl Record for MbbiRecord {
         RVAL => rval,
         SDEF => sdef;
         custom: VAL, NOBT, ZRVL, ONVL, TWVL, THVL, FRVL, FVVL, SXVL, SVVL, EIVL, NIVL, TEVL,
-            ELVL, TVVL, TTVL, FTVL, FFVL, ZRST, ONST, TWST, THST, FRST, FVST, SXST, SVST, EIST,
-            NIST, TEST, ELST, TVST, TTST, FTST, FFST, ZRSV, ONSV, TWSV, THSV, FRSV, FVSV, SXSV,
+            ELVL, TVVL, TTVL, FTVL, FFVL,
+            ZRST => zrst, ONST => onst, TWST => twst, THST => thst, FRST => frst, FVST => fvst,
+            SXST => sxst, SVST => svst, EIST => eist, NIST => nist, TEST => test, ELST => elst,
+            TVST => tvst, TTST => ttst, FTST => ftst, FFST => ffst,
+            ZRSV, ONSV, TWSV, THSV, FRSV, FVSV, SXSV,
             SVSV, EISV, NISV, TESV, ELSV, TVSV, TTSV, FTSV, FFSV, AFTC, AFVL, UNSV, COSV, ORAW,
             MASK, MLST, LALM, SHFT, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
         spill: INP, OLDSIMM, SSCN, SIMPVT);

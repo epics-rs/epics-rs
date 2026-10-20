@@ -1220,8 +1220,9 @@ impl Record for AcalcoutRecord {
             INPG, INPH, INPI, INPJ, INPK, INPL, INAA, INBB, INCC, INDD, INEE, INFF, INGG, INHH,
             INII, INJJ, INKK, INLL, OUT, INAV, INBV, INCV, INDV, INEV, INFV, INGV, INHV, INIV,
             INJV, INKV, INLV, IAAV, IBBV, ICCV, IDDV, IEEV, IFFV, IGGV, IHHV, IIIV, IJJV, IKKV,
-            ILLV, OUTV, OOPT, ODLY, WAIT, DLYA, DOPT, OCAL, OCLV, OEVT, IVOA, IVOV, EGU, PREC,
-            HOPR, LOPR, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A, B, C,
+            ILLV, OUTV, OOPT, ODLY, WAIT, DLYA, DOPT, OCAL, OCLV, OEVT, IVOA, IVOV,
+            EGU => egu, PREC => prec, HOPR => hopr, LOPR => lopr,
+            HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, ADEL, MDEL, A, B, C,
             D, E, F, G, H, I, J, K, L, AA, BB, CC, DD, EE, FF, GG, HH, II, JJ, KK, LL, NEWM,
             OVAL, OAV, PA, PB, PC, PD, PE, PF, PG, PH, PI, PJ, PK, PL, POVL, LALM, ALST, MLST,
             CACT, CSTAT, AMASK, SIZE, AMEM, PMEM;

@@ -148,8 +148,9 @@ impl Record for AiRecord {
         RVAL => rval,
         ORAW => oraw,
         INIT => init;
-        custom: VAL, PREC, LINR, EGUF, EGUL, EGU, HOPR, LOPR, AOFF, ASLO, SMOO, AFTC, ADEL,
-            MDEL, LALM, AFVL, ALST, MLST, ESLO, EOFF, ROFF, SIOL, SVAL, SIML, SIMM, SIMS, SDLY;
+        custom: VAL, PREC => prec, LINR, EGUF, EGUL, EGU => egu, HOPR => hopr, LOPR => lopr, AOFF,
+            ASLO, SMOO, AFTC, ADEL, MDEL, LALM, AFVL, ALST, MLST, ESLO, EOFF, ROFF, SIOL, SVAL,
+            SIML, SIMM, SIMS, SDLY;
         spill: INP, HIHI, LOLO, HIGH, LOW, HHSV, LLSV, HSV, LSV, HYST, PBRK, LBRK, OLDSIMM,
             SSCN, SIMPVT);
 

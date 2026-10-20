@@ -129,8 +129,8 @@ impl Record for BusyRecord {
         MLST => mlst,
         LALM => lalm,
         OVAL => oval;
-        custom: VAL, OMSL, DOL, HIGH, ZNAM, ONAM, MASK, ZSV, OSV, COSV, SIOL, SIML, SIMM, SIMS,
-            IVOA, IVOV;
+        custom: VAL, OMSL, DOL, HIGH, ZNAM => znam, ONAM => onam, MASK, ZSV, OSV, COSV, SIOL, SIML,
+            SIMM, SIMS, IVOA, IVOV;
         spill: OUT, RPVT, WDPT);
 
     fn acts_before_process(&self) -> bool {

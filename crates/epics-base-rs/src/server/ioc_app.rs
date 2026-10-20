@@ -3809,17 +3809,19 @@ mod io_intr_scan_add_tests {
         use std::sync::atomic::Ordering;
         let (db, seen) = callback_db(None).await;
         let handle = db.async_handle();
+        use crate::server::device_support::IoIntrRun;
         let driver = |handle: crate::server::database::AsyncDbHandle| {
             let t = std::thread::spawn(move || handle.run_io_intr_callback("CB"));
             let id = t.thread().id();
-            t.join().unwrap();
+            assert_eq!(t.join().unwrap(), IoIntrRun::Ran);
             id
         };
 
-        // Before finishDevSup nothing runs.
-        driver(handle.clone());
+        // Before finishDevSup nothing runs, and the caller is told.
+        assert_eq!(handle.run_io_intr_callback("CB"), IoIntrRun::Refused);
         assert_eq!(seen.callbacks.load(Ordering::SeqCst), 0);
         db.scan_control().finish_dev_sup();
+        assert_eq!(handle.run_io_intr_callback("NONE"), IoIntrRun::Refused);
 
         // Skip: the callback ran on the driver thread and nothing processed.
         let id = driver(handle.clone());
@@ -3948,6 +3950,185 @@ mod io_intr_scan_add_tests {
             .snapshot_for_field("VAL")
             .unwrap();
         assert_eq!(snap.enums.unwrap().strings[0].as_str_lossy(), "LABEL");
+    }
+
+    /// A port without `ASYN_CANBLOCK` runs devMotorAsyn's `asynCallback`
+    /// inline from the dset write, and the driver's `statusCallback` from
+    /// inside its write (devMotorAsyn.c:641, 717-726, 755-762): on the
+    /// processing thread, under a recursive `dbScanLock`.
+    mod inline_status_dev {
+        use crate::error::CaResult;
+        use crate::server::database::{AsyncDbHandle, DeviceDoneSource, HeldInstance};
+        use crate::server::device_support::{DevicePost, DeviceSupport, IoIntrAction, WriteStart};
+        use crate::server::recgbl::EventMask;
+        use crate::server::record::{CommonFields, Record};
+        use crate::server::records::ao::AoRecord;
+        use crate::types::EpicsValue;
+        use std::sync::{Arc, Mutex};
+
+        pub struct InlineStatusDev {
+            pub handle: AsyncDbHandle,
+            /// The status the driver calls back with after a write, one
+            /// callback each.
+            pub statuses: Vec<i32>,
+            pub lends: bool,
+            pub log: Arc<Mutex<Vec<String>>>,
+            /// The parameter the port's callback hands the device.
+            pub param: Arc<Mutex<i32>>,
+            pub posts: Vec<DevicePost>,
+        }
+
+        impl InlineStatusDev {
+            fn write_to_port(&mut self) {
+                self.log.lock().unwrap().push("write".into());
+                for &value in &self.statuses {
+                    let param = self.param.clone();
+                    self.handle.run_io_intr_callback_with("SP", move |held| {
+                        held.with_device(|record, common, dev| {
+                            *param.lock().unwrap() = value;
+                            dev.io_intr_callback(record, common)
+                        })
+                        .unwrap_or(IoIntrAction::Skip)
+                    });
+                }
+                self.log.lock().unwrap().push("write returns".into());
+            }
+        }
+
+        impl DeviceSupport for InlineStatusDev {
+            fn dtyp(&self) -> &str {
+                "InlineStatus"
+            }
+            fn io_intr_callback(
+                &mut self,
+                record: &mut dyn Record,
+                _common: &mut CommonFields,
+            ) -> IoIntrAction {
+                let value = *self.param.lock().unwrap();
+                self.log.lock().unwrap().push(format!("callback {value}"));
+                record
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<AoRecord>())
+                    .unwrap()
+                    .rbv = value;
+                self.posts.push(DevicePost {
+                    field: "RBV",
+                    mask: EventMask::VALUE,
+                    value: EpicsValue::Long(value),
+                });
+                IoIntrAction::Skip
+            }
+            fn take_device_posts(&mut self) -> Vec<DevicePost> {
+                std::mem::take(&mut self.posts)
+            }
+            fn lends_held(&self) -> bool {
+                self.lends
+            }
+            fn write_begin_held(
+                &mut self,
+                _held: &HeldInstance<'_>,
+                _done: &DeviceDoneSource<'_>,
+            ) -> CaResult<WriteStart> {
+                self.write_to_port();
+                Ok(WriteStart::Completed)
+            }
+            fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+                self.write_to_port();
+                Ok(())
+            }
+        }
+    }
+
+    /// A status callback from inside the write lands as under C's recursive
+    /// `dbScanLock`: once the dset call returns, in the order the driver
+    /// called back, each value posted ahead of the cycle's monitor.
+    async fn inline_status_lands(lends: bool) {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::recgbl::EventMask;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "SP",
+            Box::new(crate::server::records::ao::AoRecord::new(1.0)),
+        )
+        .await
+        .unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let rec = db.get_record("SP").unwrap();
+            let mut inst = rec.write();
+            inst.common.dtyp = "InlineStatus".into();
+            inst.device = Some(Box::new(inline_status_dev::InlineStatusDev {
+                handle: db.async_handle(),
+                statuses: vec![7, 9],
+                lends,
+                log: log.clone(),
+                param: Arc::default(),
+                posts: Vec::new(),
+            }));
+        }
+        db.scan_control().finish_dev_sup();
+        let mut sub =
+            DbSubscription::subscribe_with_mask(&db, "SP.RBV", 0, EventMask::VALUE.bits())
+                .await
+                .unwrap();
+        while sub.try_recv_event().is_ok() {}
+
+        db.process_record("SP").await.unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["write", "write returns", "callback 7", "callback 9"]
+        );
+        let rec = db.get_record("SP").unwrap();
+        let rbv = rec.read().record.get_field("RBV");
+        assert_eq!(rbv, Some(crate::types::EpicsValue::Long(9)));
+        let mut posted = Vec::new();
+        while let Ok(event) = sub.try_recv_event() {
+            posted.push(event.value().as_value().and_then(|v| v.to_f64()));
+        }
+        // Each callback's post, then the cycle's own: the readback landed
+        // ahead of `monitor`, which posts RBV as it changed (aoRecord.c:544).
+        assert_eq!(posted, [Some(7.0), Some(9.0), Some(9.0)]);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_status_callback_from_inside_the_write_lands() {
+        inline_status_lands(false).await;
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_status_callback_from_inside_a_lent_write_lands() {
+        inline_status_lands(true).await;
+    }
+
+    /// A callback owed from outside any dset call, here a driver thread's own
+    /// hold of the record, runs when that hold lets the set go: the queue is
+    /// empty whenever the set is free.
+    #[epics_macros_rs::epics_test]
+    async fn a_callback_owed_outside_a_dset_call_runs_before_the_set_is_let_go() {
+        use crate::server::device_support::IoIntrAction;
+        let (db, _seen) = callback_db(None).await;
+        db.scan_control().finish_dev_sup();
+        let handle = db.async_handle();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::spawn({
+            let log = log.clone();
+            move || {
+                handle.with_instance("CB", |_, _| {
+                    let inner = log.clone();
+                    let run = handle.run_io_intr_callback_with("CB", move |held| {
+                        held.with(|_, _| inner.lock().unwrap().push("callback"));
+                        IoIntrAction::Skip
+                    });
+                    assert_eq!(run, crate::server::device_support::IoIntrRun::Owed);
+                    log.lock().unwrap().push("hold ends");
+                });
+                log.lock().unwrap().push("returned");
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*log.lock().unwrap(), ["hold ends", "callback", "returned"]);
     }
 
     /// The demotion is scoped to the failure exits: a record that was never on

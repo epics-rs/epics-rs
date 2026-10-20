@@ -348,11 +348,15 @@ pub enum DeclaredStore {
 /// (`every_slot_store_equals_the_name_store`); `SPC_NOMOD` is the runtime
 /// put gate's, not the record's.
 ///
+/// A custom field may name its member (`custom: EGU => egu`): it is read in
+/// place through `slot_ref`, and still stored by the record's `put_field`.
+///
 /// The form without `fields:` maps slots only, for a type not yet migrated:
 /// it has no `declared_store`, and a `read_only:` field gets no `slot_mut`.
 #[macro_export]
 macro_rules! slot_map {
-    // No member: the trait's `slot_ref`/`slot_mut` stand.
+    // No member and nothing read in place: the trait's `slot_ref`/`slot_mut`
+    // stand.
     ($($seg:ident)::+;
      fields:
      $(; custom: $($cfield:ident),* $(,)?)?
@@ -367,9 +371,35 @@ macro_rules! slot_map {
                 spill: $($($sfield),*)?)
         }
     };
+    // No member, but a custom field read in place.
+    ($($seg:ident)::+;
+     fields:
+     ; custom: $($cfield:ident $(=> $cmember:ident $([$ci:expr])?)?),* $(,)?
+     $(; spill: $($sfield:ident),* $(,)?)?) => {
+        fn slot_ref(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::SlotRef<'_>> {
+            use $($seg)::+ as __slots;
+            match slot {
+                $($(__slots::$cfield => Some((&self.$cmember $([$ci])?).into()),)?)*
+                _ => None,
+            }
+        }
+
+        fn declared_store(
+            &self,
+            slot: $crate::server::record::FieldSlot,
+        ) -> ::core::option::Option<$crate::server::record::DeclaredStore> {
+            $crate::declared_store!(slot; $($seg)::+;
+                member: ;
+                custom: $($cfield),*;
+                spill: $($($sfield),*)?)
+        }
+    };
     ($($seg:ident)::+;
      fields: $($field:ident => $member:ident $([$i:expr])?),* $(,)?
-     $(; custom: $($cfield:ident),* $(,)?)?
+     $(; custom: $($cfield:ident $(=> $cmember:ident $([$ci:expr])?)?),* $(,)?)?
      $(; spill: $($sfield:ident),* $(,)?)?) => {
         fn slot_ref(
             &self,
@@ -378,6 +408,7 @@ macro_rules! slot_map {
             use $($seg)::+ as __slots;
             match slot {
                 $(__slots::$field => Some((&self.$member $([$i])?).into()),)*
+                $($($(__slots::$cfield => Some((&self.$cmember $([$ci])?).into()),)?)*)?
                 _ => None,
             }
         }
@@ -8749,7 +8780,10 @@ pub(crate) mod tests {
                         assert!(record.slot_mut(slot).is_some(), "{at}: member not writable");
                     }
                     Some(DeclaredStore::Custom) => {
-                        assert!(record.slot_ref(slot).is_none(), "{at}: custom with a slot");
+                        assert!(
+                            record.slot_mut(slot).is_none(),
+                            "{at}: custom, stored by slot"
+                        );
                         assert!(served || desc.no_access(), "{at}: custom, not served");
                     }
                     Some(DeclaredStore::Spill) => assert!(!served, "{at}: spilt, but served"),

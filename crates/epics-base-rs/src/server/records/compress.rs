@@ -589,8 +589,8 @@ const RESET_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 3] = [
 impl Record for CompressRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::compress;
         fields:;
-        custom: VAL, RES, ALG, PBUF, BALG, NSAM, N, IHIL, ILIL, HOPR, LOPR, PREC, EGU, OFF,
-            NUSE, OUSE, INPN, CVB, INX;
+        custom: VAL, RES, ALG, PBUF, BALG, NSAM, N, IHIL, ILIL, HOPR => hopr, LOPR => lopr,
+            PREC => prec, EGU => egu, OFF, NUSE, OUSE, INPN, CVB, INX;
         spill: INP, BPTR, SPTR, WPTR);
 
     /// C allocates `wptr` with the first `inpn` latch and never frees it

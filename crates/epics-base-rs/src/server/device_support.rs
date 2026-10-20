@@ -480,6 +480,31 @@ pub enum ReadStart {
     ///
     /// [`DeviceDoneSource::again`]: crate::server::database::DeviceDoneSource::again
     Reentered,
+    /// The device half reached the record's `readValue`, whose SIML and SIOL
+    /// reads are link reads ([`Record::reads_simm_in_device_half`]). The
+    /// framework makes them, raises their alarms, and asks again with
+    /// [`DeviceDoneSource::sim_read`] set.
+    ///
+    /// [`Record::reads_simm_in_device_half`]: crate::server::record::Record::reads_simm_in_device_half
+    /// [`DeviceDoneSource::sim_read`]: crate::server::database::DeviceDoneSource::sim_read
+    ReadValue,
+}
+
+/// What C mca `readValue`'s link half decided (`mcaRecord.c:1106-1129`), for
+/// the ask after a [`ReadStart::ReadValue`] answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SimRead {
+    /// SIMM is NO: the device reads.
+    Device,
+    /// SIMM is YES: what the SIOL read delivered, and whether SIOL is a DB
+    /// link, the one kind whose count C takes as `nord` (`:1120`).
+    Siol {
+        fetch: crate::server::recgbl::simm::LinkFetch,
+        db_link: bool,
+    },
+    /// `readValue` returned non-zero before any read: the SIML read failed,
+    /// or SIMM is no menu choice. The alarm is raised.
+    Failed,
 }
 
 /// What a device support `read()` produced.

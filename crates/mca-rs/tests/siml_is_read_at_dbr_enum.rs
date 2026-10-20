@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::{AlarmSeverity, DbLinkType, DevSup, Dset, register_device_row};
+use epics_base_rs::server::record::{AlarmSeverity, DbLinkType, DevSup, Dset};
 use epics_base_rs::types::EpicsValue;
 
 /// `mcaSupport.dbd`'s `device(mca,CONSTANT,devMCA_soft,"Soft Channel")`.
@@ -43,9 +43,9 @@ record(mca, "M:nbig") { field(SIML, "S:nbig") field(SIOL, "W") field(NMAX, "4") 
 #[tokio::test]
 async fn a_read_cycle_reads_siml_at_dbr_enum() {
     let (name, factory) = mca_rs::mca_record_factory();
-    register_device_row("mca", &SOFT_MCA);
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
+        .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca))
         .db_string(DB, &HashMap::new())
         .unwrap()
         .build()

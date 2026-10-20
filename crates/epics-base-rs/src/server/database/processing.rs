@@ -126,7 +126,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult, DbResult, DbStatus};
-use crate::server::record::record_instance::{LinkScanMove, ScanAdd, ScanMove, StampPass};
+use crate::server::record::record_instance::{LinkScanMove, ScanAdd, ScanMove};
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
     RecordInstance, RecordMut, SoftRead, SoftReading, StampPoint,
@@ -435,6 +435,19 @@ impl DeviceDone {
         self.owe(priority, Completion::Write)
     }
 
+    /// [`Self::complete`] on the record's band `delay` from now: C
+    /// `callbackRequestProcessCallbackDelayed(prec->simpvt, prec->prio, prec,
+    /// prec->sdly)`, the SDLY defer of an output's `writeValue`
+    /// (`aoRecord.c:585`).
+    pub(crate) fn complete_after(&self, delay: std::time::Duration) {
+        let done = self.clone();
+        let priority = self.priority();
+        crate::runtime::task::spawn_background(priority, async move {
+            crate::runtime::task::sleep_background(delay).await;
+            let _ = done.complete(priority);
+        });
+    }
+
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
     /// read on `priority`: the record's `process()` again with PACT set, whose
     /// [`DeviceSupport::read`](crate::server::device_support::DeviceSupport::read)
@@ -551,6 +564,7 @@ pub struct DeviceDoneSource<'a> {
     done: &'a DeviceDone,
     pact: bool,
     again: bool,
+    sim_read: Option<crate::server::device_support::SimRead>,
 }
 
 impl<'a> DeviceDoneSource<'a> {
@@ -569,10 +583,17 @@ impl<'a> DeviceDoneSource<'a> {
 
     /// The ask after a [`ReadStart::Reentered`](crate::server::device_support::ReadStart::Reentered)
     /// pass, in the pass that answered it; `pact` is the record's PACT as the
-    /// nested pass left it.
-    pub fn asked_again(done: &'a DeviceDone, pact: bool) -> Self {
+    /// nested pass left it. After a
+    /// [`ReadStart::ReadValue`](crate::server::device_support::ReadStart::ReadValue)
+    /// answer it carries `sim_read`.
+    pub fn asked_again(
+        done: &'a DeviceDone,
+        pact: bool,
+        sim_read: Option<crate::server::device_support::SimRead>,
+    ) -> Self {
         Self {
             again: true,
+            sim_read,
             ..Self::arm(done, pact)
         }
     }
@@ -585,6 +606,7 @@ impl<'a> DeviceDoneSource<'a> {
             done,
             pact,
             again: false,
+            sim_read: None,
         }
     }
 
@@ -598,6 +620,13 @@ impl<'a> DeviceDoneSource<'a> {
     /// pass: C's code after a `send_msg` whose callback ran inline.
     pub fn again(&self) -> bool {
         self.again
+    }
+
+    /// What the record's `readValue` link half decided, on the ask after a
+    /// [`ReadStart::ReadValue`](crate::server::device_support::ReadStart::ReadValue)
+    /// answer.
+    pub fn sim_read(&self) -> Option<&crate::server::device_support::SimRead> {
+        self.sim_read.as_ref()
     }
 
     /// The record's band, C `pr->prio`.
@@ -1961,28 +1990,72 @@ mod cycle_status {
     }
 }
 
-/// Result of the simulation-mode check.
+/// The arm of C's `switch (prec->simm)` a record's `readValue`/`writeValue`
+/// takes, once its `if (!prec->pact)` SIML read has run
+/// ([`PvDatabase::check_simulation_mode`]). An input takes it at the top of
+/// `process()`, an output after `checkAlarms` and the IVOA test.
+enum SimSwitch {
+    /// `menuSimmNO`: the device read/write runs.
+    No,
+    /// The SIML read FAILED and the record's support returns on it before the
+    /// switch ([`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read); `busy` is the only one):
+    ///
+    /// ```c
+    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
+    /// if (status)
+    ///     return(status);      /* before write_busy AND before the SIOL dbPutLink */
+    /// ```
+    ///
+    /// The LINK_ALARM that `dbGetLink`'s `setLinkAlarm` already raised is the
+    /// only one; no SOFT_ALARM and no SIMM_ALARM is added.
+    Aborted,
+    /// The `default:` arm — a SIMM value outside the record's own menu
+    /// (`SimMode::Illegal`):
+    ///
+    /// ```c
+    /// default:
+    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+    ///     status = -1;
+    /// ```
+    ///
+    /// SOFT_ALARM/INVALID is already pending. No device I/O, no SIOL round-trip,
+    /// no SIMM_ALARM, no VAL/UDF change; the record's `process()` ignores the
+    /// `-1` and still runs `checkAlarms`, `monitor` and `recGblFwdLink`.
+    Illegal,
+    /// YES/RAW with `!pact && sdly >= 0`: C raises SIMM_ALARM, then
+    /// `callbackRequestProcessCallbackDelayed(..., sdly)`, `pact = TRUE`, and
+    /// `process()` returns 0 — no value, no monitor, no forward link this
+    /// pass. The SIOL round-trip runs on the delayed pass.
+    Defer {
+        delay: std::time::Duration,
+        sims: i16,
+    },
+    /// YES/RAW on the synchronous branch (`pact || sdly < 0`).
+    Simulate(SimArm),
+}
+
+/// The YES/RAW arm's inputs: the SIOL link, SIMS, whether RAW carries RVAL,
+/// and C's `prec->pact`, which the arm clears.
+struct SimArm {
+    siol: Arc<crate::server::record::ParsedLink>,
+    sims: i16,
+    raw_mode: bool,
+    pact_held: bool,
+}
+
+/// What an input's `readValue` left the cycle to do.
 ///
-/// C handles simulation entirely inside `readValue()` / `writeValue()` —
-/// the device-I/O step — and `process()` ALWAYS runs the rest of the body
-/// (`convert`/OROC/the record's own state machine) plus
-/// `checkAlarms`/`monitor`/`recGblFwdLink(prec)`. SIMM replaces ONLY the
-/// device read/write with the SIOL link, never the record-support body.
-/// The two substitution points differ by direction: an INPUT record's
-/// `readValue()` runs at the START of `process()` (before the body), so
-/// [`SimOutcome::Simulated`] does the SIOL read here and short-circuits;
-/// an OUTPUT record's `writeValue()` runs at the END (after the body has
-/// computed OVAL / armed bo HIGH), so [`SimOutcome::RedirectOutputToSiol`]
-/// lets the uniform flow run the body and redirects only the final write.
+/// SIMM replaces only the device read with the SIOL read; `process()` still
+/// runs `checkAlarms`/`monitor`/`recGblFwdLink(prec)`.
 enum SimOutcome {
     /// SIMM disabled / no simulation link configured: run the record
     /// body normally.
     NotSimulated,
-    /// Simulated INPUT record: the SIOL read + convert already ran here
-    /// (`readValue` precedes the body). The caller must still run the
-    /// forward-link / RPRO tail exactly as `recGblFwdLink` does for a
-    /// real process cycle, but skips the (already-substituted) body. Carries
-    /// the SIOL read's status, `readValue`'s.
+    /// The SIOL read + convert already ran here (`readValue` precedes the
+    /// body). The caller must still run the forward-link / RPRO tail exactly
+    /// as `recGblFwdLink` does for a real process cycle, but skips the
+    /// (already-substituted) body. Carries the SIOL read's status,
+    /// `readValue`'s.
     Simulated(DbResult),
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
     /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
@@ -1992,71 +2065,16 @@ enum SimOutcome {
     /// suppressed, then the ordinary alarm/monitor/forward-link tail — none of
     /// which C's simulation branch skips.
     SimulatedInputStage,
-    /// The `default:` arm of C's `switch (prec->simm)` — a SIMM value outside
-    /// the record's own menu (`SimMode::Illegal`):
-    ///
-    /// ```c
-    /// default:
-    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
-    ///     status = -1;
-    /// ```
-    ///
-    /// SOFT_ALARM/INVALID is already raised into the record's PENDING alarm by
-    /// `check_simulation_mode`. What is left is what C's `readValue`/
-    /// `writeValue` does NOT do on this arm: no device read, no device write, no
-    /// SIOL round-trip, no SIMM_ALARM, no VAL/UDF change. The `-1` it returns is
-    /// not a control-flow abort — the record's `process()` ignores it and still
-    /// runs `checkAlarms`, `monitor` and `recGblFwdLink` — so the cycle's tail
-    /// runs either way. The two record shapes differ only in where the
-    /// suppressed I/O sat: an INPUT's `readValue` precedes the body (nothing of
-    /// the body is left to run), an OUTPUT's `writeValue` follows it (the body
-    /// runs, only the write is suppressed).
-    ///
-    /// `siol` is an INPUT's parsed SIOL, taken under the guard this arm already
-    /// holds: the stamp the cycle owes (`recGblGetTimeStampSimm(.., &prec->siol)`)
-    /// is the only thing that still reads it.
+    /// `readValue` returned before any I/O ([`SimSwitch::Illegal`] or
+    /// [`SimSwitch::Aborted`]); nothing of the body is left to run. `siol` is
+    /// read only for the stamp the cycle owes
+    /// (`recGblGetTimeStampSimm(.., &prec->siol)`).
     IllegalMode {
-        is_output: bool,
-        siol: Option<Arc<crate::server::record::ParsedLink>>,
-    },
-    /// The SIML read FAILED and the record's support ABORTS on it — C
-    /// `writeValue` returns before performing any I/O
-    /// ([`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read); `busy` is the only one):
-    ///
-    /// ```c
-    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
-    /// if (status)
-    ///     return(status);      /* before write_busy AND before the SIOL dbPutLink */
-    /// ```
-    ///
-    /// Like [`Self::IllegalMode`] with `is_output`, this suppresses the cycle's
-    /// output and nothing else: the body runs and `process()` still does
-    /// `checkAlarms` / `monitor` / `recGblFwdLink`. It differs in the alarm — the
-    /// LINK_ALARM that `dbGetLink`'s `setLinkAlarm` already raised is the only
-    /// one; no SOFT_ALARM and no SIMM_ALARM is added, because C never reaches the
-    /// `switch (prec->simm)` that would raise them.
-    AbortedBeforeWrite,
-    /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
-    /// `writeValue` substitutes the device write with
-    /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
-    /// `process()`, AFTER the body (OROC, bo HIGH momentary reset, OVAL).
-    /// Unlike the input read, the output write cannot be done up-front, so
-    /// the caller runs the uniform record body and redirects only the final
-    /// output write to SIOL. Carries the SIOL link, the SIMS severity, and
-    /// the RAW-mode flag (write RVAL vs OVAL).
-    RedirectOutputToSiol {
         siol: Arc<crate::server::record::ParsedLink>,
-        sims: i16,
-        raw_mode: bool,
     },
-    /// Asynchronous simulation: `SIMM`=YES/RAW with `SDLY` >= 0 on the
-    /// fresh (non-continuation) cycle. C `aiRecord.c::readValue` (488-508)
-    /// / `aoRecord.c::writeValue` (571-587) `callbackRequestProcessCallbackDelayed`:
-    /// hold PACT, schedule a re-process `SDLY` seconds out, and post nothing
-    /// this cycle (C `process()` returns 0 on the async-start pass). The
-    /// SIOL round-trip + alarm/monitor tail run on the continuation, which
-    /// re-enters with `is_continuation = true` and takes the synchronous
-    /// branch. The wrapped [`Duration`](std::time::Duration) is the `SDLY` delay.
+    /// [`SimSwitch::Defer`]: the SIOL read and the alarm/monitor tail run on
+    /// the continuation, which re-enters with `is_continuation = true` and
+    /// takes the synchronous branch.
     DeferRead(std::time::Duration),
 }
 
@@ -2867,7 +2885,7 @@ struct OutStage {
     skip_out: bool,
     putf: bool,
     notify: Option<Arc<NotifyWaitSet>>,
-    sim_output: Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
+    sim_output: Option<(Arc<crate::server::record::ParsedLink>, bool)>,
     link_writes: crate::server::record::ProcessActions,
 }
 
@@ -5554,7 +5572,7 @@ impl PvDatabase {
         let tsel = self.cycle_tsel(rec, visited);
         let mut instance = rec.write();
         let begun = instance.common.begin_stamp();
-        instance.stamp_time_begun(begun, tsel, false);
+        instance.stamp_time_begun(begun, tsel);
     }
 
     /// The text every link in [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) held when this
@@ -6814,46 +6832,29 @@ impl PvDatabase {
             }
         }
 
-        // 0.5. Simulation mode check.
+        // 0.5. An input's `readValue()`: C reads SIML and simulates at the top
+        // of `process()`, before the body, so `Simulated` does the SIOL read
+        // here and short-circuits to the forward-link / CP / RPRO tail, which
+        // still runs — returning early without it would silently break every
+        // FLNK / CP chain downstream of any record in SIMM mode. An output's
+        // `writeValue()` follows `checkAlarms` and the IVOA test, so its SIML
+        // read is further down, at that point.
         //
-        // C handles simulation inside `readValue()` / `writeValue()` — the
-        // device-I/O step — then `process()` ALWAYS runs the rest of the
-        // body (`convert` / OROC / the record's own state machine) plus
-        // `checkAlarms` / `monitor` / `recGblFwdLink(prec)`. SIMM replaces
-        // ONLY the device read/write, never the body. The substitution
-        // point differs by direction: an INPUT `readValue()` precedes the
-        // body, so `Simulated` does the SIOL read here and short-circuits;
-        // an OUTPUT `writeValue()` follows the body, so
-        // `RedirectOutputToSiol` falls through to run the uniform body and
-        // redirects only the final output write to SIOL (see below). Either
-        // way the forward-link / CP / RPRO tail still runs — returning early
-        // without it would silently break every FLNK / CP chain downstream
-        // of any record in SIMM mode.
-        //
-        // `sim_output` carries the OUTPUT redirect (SIOL link, SIMS, RAW
-        // flag) from this point to the OUT stage / alarm epilogue below;
-        // `None` for a non-simulated record or a simulated INPUT.
         // The cycle's simulation state, pushed to the record before the body —
         // the twin of `set_fetch_gate_failed`. Written on EVERY cycle of a record
         // that declares the input-stage shape (`false` included), so the flag
         // cannot outlive the cycle it belongs to.
         let mut sim_input_stage = false;
-        // C `writeValue` returned before performing ANY output. `writeValue`
-        // runs at the END of C `process()`, so the body has already run and
-        // only the device / OUT-link / SIOL write is lost. Two C paths reach
-        // it, and both mean exactly this one thing:
-        //   * `switch (prec->simm)` `default:` — `recGblSetSevr(SOFT_ALARM,
-        //     INVALID_ALARM); return -1;`  (`SimOutcome::IllegalMode`)
-        //   * a failed SIML read — `if (status) return status;`
-        //     (`SimOutcome::AbortedBeforeWrite`, busyRecord.c:399-401)
-        let mut sim_write_aborted = false;
         // The PACT the SDLY defer held, released by the SIM continuation arms —
         // carried to whichever `recGblFwdLink` tail this cycle ends at, so the
         // put-notify parked on that window is replayed there (C
         // `dbNotifyCompletion`) instead of being stranded.
         let (sim_outcome, sim_pact_exit) = match plan.simm {
-            Some(simm) if !facts.not_simulating => {
-                self.check_simulation_mode(guard, rec, &simm, visited)
+            Some(simm)
+                if simm.point == crate::server::record::record_instance::SimmPoint::ReadValue
+                    && !facts.not_simulating =>
+            {
+                self.read_value_simulation(guard, rec, &simm, visited)
             }
             _ => (SimOutcome::NotSimulated, no_sim_pact_exit),
         };
@@ -6861,8 +6862,8 @@ impl PvDatabase {
         // owns that debt so no path can leave without either paying it or
         // saying, at the site, that it is handing the cycle to someone else.
         cycle_end.merge_in(sim_pact_exit);
-        let sim_output = match sim_outcome {
-            SimOutcome::NotSimulated => None,
+        match sim_outcome {
+            SimOutcome::NotSimulated => {}
             SimOutcome::Simulated(read) => {
                 cycle_status.io(read);
                 if HOP {
@@ -6871,64 +6872,46 @@ impl PvDatabase {
                 }
                 return self.run_sim_tail(name, cycle_status, cycle_end, guard, visited);
             }
-            SimOutcome::AbortedBeforeWrite => {
-                // C busy `writeValue`: `status = dbGetLink(&prec->siml, ...);
-                // if (status) return status;` — the SIML read failed, so the
-                // routine returns before `write_busy` AND before the SIOL
-                // redirect. `dbGetLink` has already raised LINK_ALARM/INVALID.
-                sim_write_aborted = true;
+            SimOutcome::IllegalMode { siol } => {
+                // The `default:` arm's `return -1`. `readValue` precedes the
+                // body and IS the body's input, so nothing of the body is left
+                // to run. SOFT_ALARM/INVALID is already pending; commit it, post
+                // the monitors and fire the forward link — C `process()` runs
+                // `checkAlarms`, `monitor()` and `recGblFwdLink()` regardless of
+                // the -1.
                 cycle_status.io(Err(DbStatus::FAILED));
-                None
-            }
-            SimOutcome::IllegalMode { is_output, siol } => {
-                // The `default:` arm's `return -1`.
-                cycle_status.io(Err(DbStatus::FAILED));
-                if is_output {
-                    // `writeValue` follows the body, so only the write is lost.
-                    sim_write_aborted = true;
-                    None
-                } else {
-                    // `readValue` precedes the body and IS the body's input, so
-                    // nothing of the body is left to run. SOFT_ALARM/INVALID is
-                    // already pending; commit it, post the monitors and fire the
-                    // forward link — C `process()` runs `checkAlarms`,
-                    // `monitor()` and `recGblFwdLink()` regardless of the -1.
-                    let (tsel, siol_stamp) = match &siol {
-                        Some(siol) => self.read_sim_stamp(rec, siol, visited),
-                        None => (self.cycle_tsel(rec, visited), SiolStamp::Keep),
-                    };
-                    {
-                        let mut instance = rec.write();
-                        sim_process_tail(
-                            &mut instance,
-                            tsel,
-                            siol_stamp,
-                            false,
-                            rec.process_plan(),
-                        );
-                    }
-                    if HOP {
-                        *tail_out = Some(CycleTail::Sim(cycle_status));
-                        return Ok(());
-                    }
-                    return self.run_sim_tail(name, cycle_status, cycle_end, guard, visited);
+                let (tsel, siol_stamp) = self.read_sim_stamp(rec, &siol, visited);
+                {
+                    let mut instance = rec.write();
+                    sim_process_tail(
+                        &mut instance,
+                        tsel,
+                        siol_stamp,
+                        false,
+                        rec.process_plan(),
+                        rec.rdes(),
+                    );
                 }
+                if HOP {
+                    *tail_out = Some(CycleTail::Sim(cycle_status));
+                    return Ok(());
+                }
+                return self.run_sim_tail(name, cycle_status, cycle_end, guard, visited);
             }
             SimOutcome::SimulatedInputStage => {
                 sim_input_stage = true;
-                None
             }
             SimOutcome::DeferRead(delay) => {
-                // C `readValue`/`writeValue` async path: hold PACT and
-                // schedule the SIOL round-trip `SDLY` seconds out. Post
-                // nothing this cycle — C `process()` returns 0 on the
-                // async-start pass (`if (!pact && prec->pact) return 0`), so
-                // no value, no alarm, no monitor, no forward link. The
-                // continuation re-enters via `process_record_continuation`
-                // (`is_continuation = true`) and runs the synchronous branch
-                // + tail. The PACT hold is gated on the scheduled re-entry
-                // that releases it, the same construction-time invariant as
-                // the `ReprocessAfter` ODLY defers.
+                // C `readValue` async path: hold PACT and schedule the SIOL
+                // read `SDLY` seconds out. Post nothing this cycle — C
+                // `process()` returns 0 on the async-start pass (`if (!pact &&
+                // prec->pact) return 0`), so no value, no alarm, no monitor, no
+                // forward link. The continuation re-enters via
+                // `process_record_continuation` (`is_continuation = true`) and
+                // runs the synchronous branch + tail. The PACT hold is gated on
+                // the scheduled re-entry that releases it, the same
+                // construction-time invariant as the `ReprocessAfter` ODLY
+                // defers.
                 {
                     let mut instance = rec.write();
                     instance.simpvt = true;
@@ -6941,12 +6924,7 @@ impl PvDatabase {
                 self.apply_pact_exit(name, cycle_end.take());
                 return Ok(());
             }
-            SimOutcome::RedirectOutputToSiol {
-                siol,
-                sims,
-                raw_mode,
-            } => Some((siol, sims, raw_mode)),
-        };
+        }
         if plan.substitutes_input_stage_when_simulating {
             guard.hold().record.set_simulation_active(sim_input_stage);
         }
@@ -7352,25 +7330,40 @@ impl PvDatabase {
                         // C mca's next `send_msg` after one whose callback ran
                         // inline: each runs its own nested pass, siblings in
                         // this one (mcaRecord.c:630, then the status read).
-                        while let Ok(crate::server::device_support::ReadStart::Reentered) = begun {
-                            instance.enter_pact();
-                            instance.device = Some(dev);
-                            guard.release();
-                            if rec.callbacks_owed() {
-                                guard.run_owed_callbacks();
-                            }
-                            self.run_reentered_pass(name, guard.rec, visited);
+                        // Its `readValue` reads SIML and SIOL between two dset
+                        // calls (`:1106`, `:1118`).
+                        loop {
+                            let sim_read = match begun {
+                                Ok(crate::server::device_support::ReadStart::Reentered) => {
+                                    instance.enter_pact();
+                                    instance.device = Some(dev);
+                                    guard.release();
+                                    if rec.callbacks_owed() {
+                                        guard.run_owed_callbacks();
+                                    }
+                                    self.run_reentered_pass(name, guard.rec, visited);
+                                    None
+                                }
+                                Ok(crate::server::device_support::ReadStart::ReadValue) => {
+                                    instance.device = Some(dev);
+                                    guard.release();
+                                    if rec.callbacks_owed() {
+                                        guard.run_owed_callbacks();
+                                    }
+                                    Some(self.read_value_links(guard.rec, visited))
+                                }
+                                _ => break,
+                            };
                             instance = guard.hold();
                             dev = instance
                                 .device
                                 .take()
                                 .expect("the nested pass puts the device back");
+                            let pact = instance.is_processing();
                             begun = if facts.device_held {
                                 let device_done = instance.device_done.clone();
-                                let done = DeviceDoneSource::asked_again(
-                                    &device_done,
-                                    instance.is_processing(),
-                                );
+                                let done =
+                                    DeviceDoneSource::asked_again(&device_done, pact, sim_read);
                                 guard.release();
                                 let held = HeldInstance::new(self, guard.rec, visited);
                                 let begun = dev.read_begin_held(&held, &done);
@@ -7379,7 +7372,8 @@ impl PvDatabase {
                             } else {
                                 let done = DeviceDoneSource::asked_again(
                                     &instance.device_done,
-                                    instance.is_processing(),
+                                    pact,
+                                    sim_read,
                                 );
                                 dev.read_begin_common(
                                     &mut *instance.record,
@@ -8044,11 +8038,7 @@ impl PvDatabase {
                 // was set before the device time landed.
                 let stamp_after_alarms = if plan.stamps_before_alarms {
                     if !skips_ts_undef {
-                        instance.stamp_time_begun(
-                            begun,
-                            tsel,
-                            plan.stamp_sees_previous_simm(StampPass::First),
-                        );
+                        instance.stamp_time_begun(begun, tsel);
                     }
                     None
                 } else {
@@ -8071,40 +8061,7 @@ impl PvDatabase {
                 // calcout, scalcout and acalcout stamp after `checkAlarms`; none
                 // skips the stamp.
                 if let Some(begun) = stamp_after_alarms {
-                    instance.stamp_time_begun(
-                        begun,
-                        tsel,
-                        plan.stamp_sees_previous_simm(StampPass::First),
-                    );
-                }
-
-                // IVOA gate severity for a redirected SIMM output. C decides
-                // `if (prec->nsev < INVALID_ALARM)` at the `writeValue` call
-                // (aoRecord.c:197) using the severity `checkAlarms` produced —
-                // BEFORE `writeValue` raises SIMM_ALARM. Snapshot the real
-                // (pre-SIMM) pending severity here so a `SIMS=INVALID` never flips
-                // the IVOA decision: with a finite, in-range VAL the IVOA veto must
-                // NOT fire and C still writes OVAL to SIOL. For a non-simulated
-                // record no SIMM_ALARM is raised below, so `nsev` here equals the
-                // committed `sevr`, leaving the IVOA gate unchanged.
-                let real_sev = instance.common.nsev;
-
-                // SIMM simulation severity on a redirected OUTPUT record. C
-                // `writeValue` raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`
-                // AFTER `checkAlarms` (aoRecord.c:196 -> :570 / boRecord.c:219 ->
-                // :436), so a coincident limit/state alarm of equal severity keeps
-                // its stat/amsg (set first; `rec_gbl_set_sevr` is strict-greater).
-                // A simulated INPUT instead raises this inside
-                // `check_simulation_mode` before its body, because `readValue`
-                // precedes the body. Raised here (after the alarm hooks, before the
-                // commit) it still folds into this cycle's committed SEVR.
-                if let Some((_, sims, _)) = &sim_output {
-                    let sev = crate::server::record::AlarmSeverity::from_u16(*sims as u16);
-                    crate::server::recgbl::rec_gbl_set_sevr(
-                        &mut instance.common,
-                        crate::server::recgbl::alarm_status::SIMM_ALARM,
-                        sev,
-                    );
+                    instance.stamp_time_begun(begun, tsel);
                 }
 
                 // NOTE: UDF was already updated before `evaluate_alarms`
@@ -8170,15 +8127,11 @@ impl PvDatabase {
                 // never made — e.g. overwriting VAL with IVOV on a cycle whose only
                 // INVALID came from the failed push.
                 //
-                // Gate on the real (pre-SIMM) severity `real_sev` snapshotted above
-                // — C decides IVOA before `writeValue` raises SIMM_ALARM, so a
-                // `SIMS=INVALID` simulation severity does not trigger the veto (the
-                // committed `sevr` may be INVALID from SIMM while the record's own
-                // alarm is not).
                 // The cycle drives no outputs when the type has no output stage
                 // (`ProcessPlan::output_stage`: C `calcRecord.c::process` has no
                 // OUT lines) or IVOA vetoes them on an INVALID cycle.
-                let skip_out = !plan.output_stage || ivoa_skips_output(instance, real_sev, true);
+                let nsev = instance.common.nsev;
+                let skip_out = !plan.output_stage || ivoa_skips_output(instance, nsev, true);
                 if skip_out && plan.output_stage {
                     cycle_status.write_skipped();
                 }
@@ -8227,6 +8180,50 @@ impl PvDatabase {
 
                 (restamps_after, skip_out, out_time_reads)
             };
+
+            // An output's `writeValue`: on a cycle IVOA lets write, after
+            // `checkAlarms`, it reads SIML (`aoRecord.c:559`,
+            // `busyRecord.c:399`) and takes its arm of `switch (prec->simm)`.
+            // `sim_output` carries the SIOL redirect (link, RAW flag) to the
+            // OUT stage; `sim_write_aborted` is `writeValue` returning before
+            // any write.
+            let mut sim_output = None;
+            let mut sim_write_aborted = false;
+            if let Some(simm) = plan.simm
+                && simm.point == crate::server::record::record_instance::SimmPoint::WriteValue
+                && !skip_out
+                && !facts.not_simulating
+            {
+                let (switch, exit) = self.check_simulation_mode(guard, rec, &simm, visited);
+                cycle_end.merge_in(exit);
+                match switch {
+                    SimSwitch::No => {}
+                    SimSwitch::Aborted | SimSwitch::Illegal => {
+                        sim_write_aborted = true;
+                        cycle_status.io(Err(DbStatus::FAILED));
+                    }
+                    SimSwitch::Defer { delay, sims } => {
+                        // `pact = TRUE` and `process()` returns before
+                        // `monitor()`; the delayed pass is the output's
+                        // completing pass, as an async device's is.
+                        let instance = guard.hold();
+                        raise_simm_alarm(&mut instance.common, sims);
+                        instance.simpvt = true;
+                        instance.enter_pact();
+                        instance.device_done.complete_after(delay);
+                        cycle_end.hand_off_to_async_completion();
+                        return Ok(());
+                    }
+                    SimSwitch::Simulate(arm) => {
+                        let instance = guard.hold();
+                        raise_simm_alarm(&mut instance.common, arm.sims);
+                        if arm.pact_held {
+                            cycle_end.merge_in(instance.leave_pact());
+                        }
+                        sim_output = Some((arm.siol, arm.raw_mode));
+                    }
+                }
+            }
 
             // await 2 (guard-free): output-time input-link (swait DOL) reads. The
             // write lock is released across the reads (a link may target another
@@ -8278,10 +8275,7 @@ impl PvDatabase {
             // so a cycle without an output (a stock `calc`: no OUT stage, no
             // simulation, no write actions) runs none of them, and reads
             // nothing for a `OutLinkSrc` it would hand to no one.
-            let has_output = !skip_out
-                || plan.multi_output_dispatch
-                || sim_output.is_some()
-                || !link_writes.is_empty();
+            let has_output = !skip_out || plan.multi_output_dispatch || !link_writes.is_empty();
             let dispatched = if !has_output {
                 super::links::MultiOutDispatch::default()
             } else {
@@ -8688,7 +8682,7 @@ impl PvDatabase {
         reached_conditional_write: bool,
         skip_out: bool,
         src: super::links::OutLinkSrc<'_>,
-        sim_output: &Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
+        sim_output: &Option<(Arc<crate::server::record::ParsedLink>, bool)>,
         link_writes: crate::server::record::ProcessActions,
         cycle_status: &mut CycleStatus,
         cycle_end: &mut CycleEndGuard<'_>,
@@ -8719,9 +8713,8 @@ impl PvDatabase {
         } else {
             super::links::MultiOutDispatch::default()
         };
-        if sim_output.is_some() {
-            cycle_status
-                .io(self.write_simulated_output_siol(rec, sim_output, skip_out, src, visited));
+        if let Some((siol, raw_mode)) = sim_output {
+            cycle_status.io(self.write_simulated_output_siol(rec, siol, *raw_mode, src, visited));
         }
         if !link_writes.is_empty() {
             match self.execute_link_writes_in(name, rec, link_writes, visited) {
@@ -9168,8 +9161,8 @@ impl PvDatabase {
         // this clear: their FLNK / putf-clear happens later in
         // `complete_async_record_inner` once the device round-trip
         // completes.
-        // The guard holds both releases — `check_simulation_mode`'s SDLY/SIM
-        // continuation and the `is_continuation` arm's — merged. At most one of
+        // The guard holds both releases — the SDLY/SIM continuation's and the
+        // `is_continuation` arm's — merged. At most one of
         // them can carry the parked put. Taking it here disarms the guard, so
         // the release happens once whether the cycle reaches this line or leaves
         // by one of the exits above.
@@ -10155,7 +10148,7 @@ impl PvDatabase {
             // (!Send) parking_lot guard is released before the async OUT
             // writes below. Yields the output work plus the put-notify
             // source fields those writes consume.
-            let (out_info, skip_out, src_putf, src_notify, plan) = {
+            let (out_info, skip_out, device_writes, sim_output, src_putf, src_notify, plan) = {
                 let mut instance = rec.write();
 
                 // UDF update before alarm evaluation (C parity — see the
@@ -10202,12 +10195,7 @@ impl PvDatabase {
                 let stamp_late = if alarms_first {
                     Some(begun)
                 } else {
-                    instance.stamp_time_begun(
-                        begun,
-                        tsel,
-                        rec.process_plan()
-                            .stamp_sees_previous_simm(StampPass::Completion),
-                    );
+                    instance.stamp_time_begun(begun, tsel);
                     None
                 };
 
@@ -10220,12 +10208,7 @@ impl PvDatabase {
                 // Evaluate alarms
                 instance.evaluate_alarms();
                 if let Some(begun) = stamp_late {
-                    instance.stamp_time_begun(
-                        begun,
-                        tsel,
-                        rec.process_plan()
-                            .stamp_sees_previous_simm(StampPass::Completion),
-                    );
+                    instance.stamp_time_begun(begun, tsel);
                 }
 
                 // ---- Output stage. C `process()` performs the record's output
@@ -10241,16 +10224,27 @@ impl PvDatabase {
                 // aoRecord.c:196).
                 let nsev = instance.common.nsev;
                 let skip_out = ivoa_skips_output(&mut instance, nsev, false);
-                // C's second `writeValue`: the device's completing call, then
-                // the alarm it raises there — after the test above, and only on
-                // a cycle that drives the output.
-                if !skip_out {
+                // C's second `writeValue`, on a cycle that drives the output:
+                // its SIMM switch, then on NO the device's completing call and
+                // the alarm it raises there.
+                let sim_switch = match rec.process_plan().simm {
+                    Some(simm) if simm.pact_pass_simulates && !skip_out => {
+                        pact_pass_sim_switch(&mut instance, &simm)
+                    }
+                    _ => SimSwitch::No,
+                };
+                let device_writes = !skip_out && matches!(sim_switch, SimSwitch::No);
+                if device_writes {
                     let inst = &mut *instance;
                     if let Some(dev) = inst.device.as_mut() {
                         dev.async_write_completed_common(&mut *inst.record, &mut inst.common);
                     }
                     apply_device_alarm(&mut instance, is_soft);
                 }
+                let sim_output = match sim_switch {
+                    SimSwitch::Simulate(arm) => Some((arm.siol, arm.raw_mode)),
+                    _ => None,
+                };
 
                 // OEVT: queue the output event when the output fires — same
                 // IVOA-gated event-twin of the OUT write as
@@ -10284,7 +10278,7 @@ impl PvDatabase {
                 // puts nothing (`devAoSoftCallback.c:44-45`).
                 let soft_callback = instance.common.dtyp.soft()
                     == Some(crate::server::device_support::SoftDtyp::Async);
-                let out_value = if skip_out || soft_callback {
+                let out_value = if !device_writes || soft_callback {
                     None
                 } else if !can_dev_write {
                     // Non-output records (scalcout, etc.) with soft OUT link
@@ -10319,7 +10313,15 @@ impl PvDatabase {
                 // a fresh guard is re-taken below for the commit.
                 let src_putf = instance.common.putf;
                 let src_notify = instance.notify.clone();
-                (out_info, skip_out, src_putf, src_notify, rec.process_plan())
+                (
+                    out_info,
+                    skip_out,
+                    device_writes,
+                    sim_output,
+                    src_putf,
+                    src_notify,
+                    rec.process_plan(),
+                )
             };
 
             // Phase 2 — async OUT writes, no record guard held.
@@ -10333,12 +10335,15 @@ impl PvDatabase {
             if let Some((out, out_val)) = out_info {
                 let _ = self.write_out(rec, out, out_val, src, visited);
             }
+            if let Some((siol, raw_mode)) = &sim_output {
+                let _ = self.write_simulated_output_siol(rec, siol, *raw_mode, src, visited);
+            }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
             // returns at `longoutRecord.c:187` only AFTER `writeValue`), and
             // the port's first pass returns from `write_begin` before this
             // point — so an async longout latched on no pass at all.
-            if !skip_out {
+            if device_writes {
                 rec.write().record.after_output_decision();
             }
             self.dispatch_multi_output_values(rec, src, skip_out, plan, visited);
@@ -10563,10 +10568,8 @@ impl PvDatabase {
     /// raised BY the owner rather than by this caller (which violated
     /// `write_out_link_value`'s own single-raise invariant).
     ///
-    /// `sim_output` is `None` for a non-simulated record or a simulated INPUT
-    /// (whose `readValue` ran up-front); `skip_out` carries the IVOA
-    /// Don't_drive veto so the SIOL write is suppressed exactly as the real
-    /// device write would be.
+    /// Reached only through `writeValue`'s YES/RAW arm, which a cycle IVOA
+    /// vetoes never takes.
     ///
     /// Kept as its own `async fn` so the `EpicsValue` it reads out of the
     /// record never enters `process_record_with_links_inner`'s async state —
@@ -10576,21 +10579,16 @@ impl PvDatabase {
     fn write_simulated_output_siol(
         &self,
         rec: InFrame<'_>,
-        sim_output: &Option<(Arc<crate::server::record::ParsedLink>, i16, bool)>,
-        skip_out: bool,
+        siol: &Arc<crate::server::record::ParsedLink>,
+        raw_mode: bool,
         src: super::links::OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> crate::error::DbResult {
-        let Some((siol, _sims, raw_mode)) = sim_output else {
-            return Ok(());
-        };
-        // IVOA Don't_drive veto (C skips `writeValue` entirely) and a
-        // non-writable SIOL (empty / constant — C `dbPutLink` no-op) both
-        // suppress the write.
-        if skip_out || !siol.is_writable_out_link() {
+        // A non-writable SIOL (empty / constant) is C's `dbPutLink` no-op.
+        if !siol.is_writable_out_link() {
             return Ok(());
         }
-        self.write_siol(rec, siol, *raw_mode, src, visited)
+        self.write_siol(rec, siol, raw_mode, src, visited)
     }
 
     /// [`Self::write_simulated_output_siol`] past its gates, out of line so a
@@ -11154,7 +11152,6 @@ impl PvDatabase {
         {
             let mut instance = rec.write();
             instance.rec_gbl_save_simm();
-            instance.simm_before_siml_read = instance.record.simm_value().map(|v| v as i16);
         }
         // `dbTryGetLink`: a CONSTANT (or unset) SIML delivers NOTHING here —
         // its value was loaded into SIMM once, at init (`rec_gbl_init_simm`).
@@ -11699,19 +11696,15 @@ impl PvDatabase {
         }
     }
 
-    /// Check simulation mode for a record. Returns
-    /// `SimOutcome::Simulated` when a simulated INPUT handled the value (the
-    /// caller still runs the forward-link tail),
-    /// `SimOutcome::RedirectOutputToSiol` when a simulated OUTPUT needs the
-    /// uniform body to run first, or `SimOutcome::NotSimulated` when normal
-    /// processing should proceed.
+    /// C `readValue`/`writeValue` up to the arm of `switch (prec->simm)`: the
+    /// `if (!prec->pact)` SIML read (`recGblGetSimm`, or the record's own
+    /// `dbGetLink`) and the SDLY test. Each direction's caller takes it at
+    /// its own C point and performs the arm.
     ///
-    /// The SIM/SDLY continuation arms release the PACT the SDLY defer held (C
-    /// `readValue`/`writeValue` continue with `pact = FALSE`), so the call also
-    /// hands back the [`PactExit`] for that release — the put-notify parked on
-    /// the SDLY window. The caller carries it to the cycle's `recGblFwdLink`
-    /// tail; the release cannot silently drop it (`#[must_use]`), which is what
-    /// stranded it here before.
+    /// The [`PactExit`] it hands back carries the put-notify parked on an SDLY
+    /// window. The caller carries it to the cycle's `recGblFwdLink` tail; the
+    /// release cannot silently drop it (`#[must_use]`), which is what stranded
+    /// it here before.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn check_simulation_mode(
         &self,
@@ -11719,7 +11712,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         simm: &crate::server::record::record_instance::SimmBlock,
         visited: &mut ProcStack,
-    ) -> (SimOutcome, crate::server::record::PactExit) {
+    ) -> (SimSwitch, crate::server::record::PactExit) {
         // The steady cycle: SIMM is NO, SIML is no link that must be read
         // (constant, or PACT held), and no SSCN swap is owed — one cell read
         // and the cached SIML parse, nothing else.
@@ -11733,10 +11726,7 @@ impl PvDatabase {
                     .is_some_and(|cells| cells.simm == 0)
                 && (pact_held || instance.siml_has_const_lset())
             {
-                return (
-                    SimOutcome::NotSimulated,
-                    instance.pact_exit_without_release(),
-                );
+                return (SimSwitch::No, instance.pact_exit_without_release());
             }
         }
         self.simulate_or_resolve(guard, rec, simm, visited)
@@ -11749,7 +11739,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         simm: &crate::server::record::record_instance::SimmBlock,
         visited: &mut ProcStack,
-    ) -> (SimOutcome, crate::server::record::PactExit) {
+    ) -> (SimSwitch, crate::server::record::PactExit) {
         // Read SIML, SIMS, SDLY from the record. SIOL is parsed further down,
         // on the paths that read or write it.
         //
@@ -11801,23 +11791,7 @@ impl PvDatabase {
             // raised `SIMM_ALARM` at NO_ALARM whatever the database asked for
             // — silently, since a menu index of 0 is a legal value.
             let cells = instance.record.simm_cells();
-            let (sims, sdly) = match cells {
-                Some(cells) => (cells.sims, cells.sdly),
-                None => (
-                    instance
-                        .resolve_field_upper_at("SIMS", simm.sims)
-                        .and_then(|v| v.to_menu_index())
-                        .unwrap_or(0),
-                    // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
-                    // "-1.0"). Absent on record types whose SIMM group Rust
-                    // does not yet fully model — default to -1.0
-                    // (synchronous) so the async branch is a no-op there.
-                    instance
-                        .resolve_field_upper_at("SDLY", simm.sdly)
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(-1.0),
-                ),
-            };
+            let (sims, sdly) = sims_and_sdly(instance, simm);
 
             let resolved = siml_link.is_none().then(|| {
                 // `recGblSaveSimm` and `recGblCheckSimm` both return on the
@@ -11855,11 +11829,6 @@ impl PvDatabase {
             }
             (mode, exit)
         });
-        let is_input = simm.is_input;
-        // swait: the simulation replaces the record's input STAGE, not its
-        // whole cycle. Declared by the record, not by a type-name list — the
-        // classification is a property of where C put the SIOL read.
-        let input_stage = rec.process_plan().substitutes_input_stage_when_simulating;
 
         // Read SIML -> update SIMM, but only when PACT is not held. C resolves
         // the simulation mode in `recGblGetSimm` (`dbGetLink(&prec->siml,
@@ -11909,7 +11878,7 @@ impl PvDatabase {
                     )
                 };
                 if aborts {
-                    return (SimOutcome::AbortedBeforeWrite, exit);
+                    return (SimSwitch::Aborted, exit);
                 }
             }
         }
@@ -11928,7 +11897,7 @@ impl PvDatabase {
         });
 
         if !mode.is_simulated() {
-            return (SimOutcome::NotSimulated, no_sim_exit); // menuSimmNO
+            return (SimSwitch::No, no_sim_exit); // menuSimmNO
         }
 
         // C `default:` arm — `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`
@@ -11961,14 +11930,7 @@ impl PvDatabase {
             } else {
                 instance.pact_exit_without_release()
             };
-            let is_output = !is_input;
-            let siol = is_input.then(|| {
-                instance
-                    .sim_link(crate::server::record::SimLink::Siol)
-                    .clone()
-            });
-            drop(instance);
-            return (SimOutcome::IllegalMode { is_output, siol }, exit);
+            return (SimSwitch::Illegal, exit);
         }
 
         // The simulated paths below are the only readers of SIOL.
@@ -11995,16 +11957,134 @@ impl PvDatabase {
         // as C: a non-held entry (fresh cycle, or a `pact=FALSE` re-trigger)
         // with a non-negative SDLY defers the whole SIOL round-trip (input read
         // OR output write — both C paths share this branch) by `SDLY` seconds
-        // and holds PACT; the resulting PACT-held continuation falls through to
-        // the synchronous branch below.
+        // and holds PACT; the resulting PACT-held pass takes the synchronous
+        // branch, whose caller releases PACT after its SIOL I/O.
+        let exit = rec.read().pact_exit_without_release();
         if !pact_held && sdly >= 0.0 {
-            // Reachable only under `!pact_held`: this is the arm that TAKES PACT.
-            let exit = rec.read().pact_exit_without_release();
             return (
-                SimOutcome::DeferRead(crate::runtime::time::duration_from_secs(sdly)),
+                SimSwitch::Defer {
+                    delay: crate::runtime::time::duration_from_secs(sdly),
+                    sims,
+                },
                 exit,
             );
         }
+        (
+            SimSwitch::Simulate(SimArm {
+                siol: siol_link,
+                sims,
+                raw_mode,
+                pact_held,
+            }),
+            exit,
+        )
+    }
+
+    /// C mca `readValue`'s link half (`mcaRecord.c:1106-1129`), for a device
+    /// that answered [`ReadStart::ReadValue`]: the SIML read, which no `pact`
+    /// guards, the arm of `switch (pmca->simm)` it takes, and that arm's SIOL
+    /// read and alarms, SIMM_ALARM after the read.
+    ///
+    /// [`ReadStart::ReadValue`]: crate::server::device_support::ReadStart::ReadValue
+    fn read_value_links(
+        &self,
+        rec: InFrame<'_>,
+        visited: &mut ProcStack,
+    ) -> crate::server::device_support::SimRead {
+        use crate::server::device_support::SimRead;
+        use crate::server::recgbl::simm::SimMode;
+        use crate::server::record::SimLink;
+        let siml = rec.read().sim_link(SimLink::Siml).clone();
+        if !crate::server::recgbl::simm::has_const_lset(&siml)
+            && self.rec_gbl_get_simm(rec, &siml, visited)
+        {
+            return SimRead::Failed;
+        }
+        let (mode, siol, sims) = {
+            let instance = rec.read();
+            let sims = rec
+                .process_plan()
+                .simm
+                .map_or(0, |simm| sims_and_sdly(&instance, &simm).0);
+            (
+                crate::server::recgbl::simm::resolve_sim_mode(&*instance.record),
+                instance.sim_link(SimLink::Siol).clone(),
+                sims,
+            )
+        };
+        let raise = |stat, sevr| {
+            crate::server::recgbl::rec_gbl_set_sevr(&mut rec.write().common, stat, sevr);
+        };
+        match mode {
+            SimMode::No => SimRead::Device,
+            SimMode::Illegal => {
+                raise(
+                    crate::server::recgbl::alarm_status::SOFT_ALARM,
+                    crate::server::record::AlarmSeverity::Invalid,
+                );
+                SimRead::Failed
+            }
+            SimMode::Yes | SimMode::Raw => {
+                let fetch = self.db_get_link_in(rec, "SIOL", &siol, visited);
+                raise(
+                    crate::server::recgbl::alarm_status::SIMM_ALARM,
+                    crate::server::record::AlarmSeverity::from_u16(sims as u16),
+                );
+                SimRead::Siol {
+                    fetch,
+                    db_link: matches!(*siol, crate::server::record::ParsedLink::Db(_)),
+                }
+            }
+        }
+    }
+
+    /// An input's `readValue` at the top of `process()`: the SIML read and the
+    /// arm of `switch (prec->simm)` it takes, with the SIOL read done here when
+    /// the arm simulates.
+    fn read_value_simulation(
+        &self,
+        guard: &mut DataGuard<'_>,
+        rec: InFrame<'_>,
+        simm: &crate::server::record::record_instance::SimmBlock,
+        visited: &mut ProcStack,
+    ) -> (SimOutcome, crate::server::record::PactExit) {
+        let (switch, exit) = self.check_simulation_mode(guard, rec, simm, visited);
+        match switch {
+            SimSwitch::No => (SimOutcome::NotSimulated, exit),
+            // `readValue` returned before any I/O: the `default:` arm, or a
+            // failed SIML read on a record whose support aborts on it.
+            SimSwitch::Aborted | SimSwitch::Illegal => {
+                let siol = rec
+                    .read()
+                    .sim_link(crate::server::record::SimLink::Siol)
+                    .clone();
+                (SimOutcome::IllegalMode { siol }, exit)
+            }
+            SimSwitch::Defer { delay, .. } => (SimOutcome::DeferRead(delay), exit),
+            SimSwitch::Simulate(arm) => {
+                let (outcome, released) = self.simulate_input(rec, arm, visited);
+                (outcome, exit.merge(released))
+            }
+        }
+    }
+
+    /// The YES/RAW arm of an input's `readValue`, on its synchronous branch.
+    fn simulate_input(
+        &self,
+        rec: InFrame<'_>,
+        arm: SimArm,
+        visited: &mut ProcStack,
+    ) -> (SimOutcome, crate::server::record::PactExit) {
+        let SimArm {
+            siol: siol_link,
+            sims,
+            raw_mode,
+            pact_held,
+        } = arm;
+        // swait: the simulation replaces the record's input STAGE, not its
+        // whole cycle. Declared by the record, not by a type-name list — the
+        // classification is a property of where C put the SIOL read.
+        let input_stage = rec.process_plan().substitutes_input_stage_when_simulating;
 
         // INPUT-STAGE record (swait). C `swaitRecord.c:415-422`:
         //
@@ -12067,33 +12147,6 @@ impl PvDatabase {
             return (SimOutcome::SimulatedInputStage, exit);
         }
 
-        // OUTPUT record: C `writeValue` substitutes the device write with the
-        // SIOL write, but it runs at the END of `process()` — after the body
-        // has computed OVAL (OROC) and armed any record state machine (bo HIGH
-        // momentary reset). The output write therefore CANNOT be done here, up
-        // front, the way the input read can: doing so would write the stale
-        // pre-body VAL and skip the body entirely (the divergence this path
-        // closes). Hand the redirect back so the uniform flow runs the body and
-        // the OUT-stage epilogue writes the fresh OVAL/RVAL to SIOL. Clear the
-        // SDLY-held PACT first (C `writeValue` sets `pact = FALSE` on the sync
-        // continuation) so the body runs on an idle record.
-        if !is_input {
-            let exit = if pact_held {
-                let mut instance = rec.write();
-                instance.leave_pact()
-            } else {
-                rec.read().pact_exit_without_release()
-            };
-            return (
-                SimOutcome::RedirectOutputToSiol {
-                    siol: siol_link,
-                    sims,
-                    raw_mode,
-                },
-                exit,
-            );
-        }
-
         // SIMM=YES(1) / SIMM=RAW(2): read the SIOL link into VAL/RVAL. C
         // `readValue` for a SIMM-mode INPUT record goes through `dbGetLink`,
         // which dispatches by link type — a local DB target, a CA target (a
@@ -12105,8 +12158,6 @@ impl PvDatabase {
         // link; the alarm/timestamp/notify tail below now runs for every SIOL
         // link type.
         //
-        // Output records returned `RedirectOutputToSiol` above (the output
-        // write follows the body), so only an INPUT record reaches here — its
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
         let read_status = {
@@ -12121,30 +12172,11 @@ impl PvDatabase {
             // publishes STAT=SIMM_ALARM — while with the default
             // `SIMS = NO_ALARM` nothing is pending, so LINK_ALARM/INVALID lands
             // and the broken SIOL is reported.
-            //
-            // Not every record raises it first, so the ORDER is the record's to
-            // declare, not this site's: `mca` reads SIOL and only then raises
-            // (`mcaRecord.c:1118` then `:1129`), so with `SIMS = INVALID` the
-            // LINK_ALARM wins there and C publishes STAT=LINK_ALARM. That is
-            // [`Record::raises_simm_after_read`]; the default is C's base-record
-            // order and lands here, before the read.
-            let raise_simm = |common: &mut crate::server::record::CommonFields| {
-                let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-                crate::server::recgbl::rec_gbl_set_sevr(
-                    common,
-                    crate::server::recgbl::alarm_status::SIMM_ALARM,
-                    sev,
-                );
-            };
-            let simm_after_read = {
-                let mut instance = rec.write();
-                let after = simm.raises_simm_after_read;
-                debug_assert_eq!(after, instance.record.raises_simm_after_read());
-                if !after {
-                    raise_simm(&mut instance.common);
-                }
-                after
-            };
+            crate::server::recgbl::rec_gbl_set_sevr(
+                &mut rec.write().common,
+                crate::server::recgbl::alarm_status::SIMM_ALARM,
+                crate::server::record::AlarmSeverity::from_u16(sims as u16),
+            );
 
             // Read from SIOL -> SVAL -> VAL/RVAL. Uniform across Db (with
             // locality fallback) / Ca / Pva / constant via `fetch_link`
@@ -12207,13 +12239,6 @@ impl PvDatabase {
                 crate::server::recgbl::simm::LinkFetch::NoData
                 | crate::server::recgbl::simm::LinkFetch::Failed => Fetched::None,
             };
-
-            // The other order (`mcaRecord.c:1118` then `:1129`): the read has
-            // happened, so its LINK_ALARM is already pending and the
-            // equal-severity SIMM_ALARM now loses the tie instead.
-            if simm_after_read {
-                raise_simm(&mut instance.common);
-            }
 
             let target_supports_raw = !matches!(landed, Fetched::None)
                 && raw_mode
@@ -12309,6 +12334,7 @@ impl PvDatabase {
                 siol_stamp,
                 fetch_ok,
                 rec.process_plan(),
+                rec.rdes(),
             );
             if fetch_ok {
                 Ok(())
@@ -12334,6 +12360,74 @@ impl PvDatabase {
 
         (SimOutcome::Simulated(read_status), exit)
     }
+}
+
+/// SIMS and SDLY as `readValue`/`writeValue` read them.
+fn sims_and_sdly(
+    instance: &RecordInstance,
+    simm: &crate::server::record::record_instance::SimmBlock,
+) -> (i16, f64) {
+    match instance.record.simm_cells() {
+        Some(cells) => (cells.sims, cells.sdly),
+        None => (
+            instance
+                .resolve_field_upper_at("SIMS", simm.sims)
+                .and_then(|v| v.to_menu_index())
+                .unwrap_or(0),
+            // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
+            // "-1.0"). Absent on record types whose SIMM group Rust
+            // does not yet fully model — default to -1.0
+            // (synchronous) so the async branch is a no-op there.
+            instance
+                .resolve_field_upper_at("SDLY", simm.sdly)
+                .and_then(|v| v.to_f64())
+                .unwrap_or(-1.0),
+        ),
+    }
+}
+
+/// The arm an output's `writeValue` takes on its PACT pass: `if (!prec->pact)`
+/// skips `recGblGetSimm`, so `switch (prec->simm)` reads the SIMM the first
+/// pass latched (`aoRecord.c:558-580`). Raises the arm's alarm; never
+/// [`SimSwitch::Defer`] or [`SimSwitch::Aborted`].
+fn pact_pass_sim_switch(
+    instance: &mut RecordInstance,
+    simm: &crate::server::record::record_instance::SimmBlock,
+) -> SimSwitch {
+    use crate::server::recgbl::simm::SimMode;
+    match crate::server::recgbl::simm::resolve_sim_mode(&*instance.record) {
+        SimMode::No => SimSwitch::No,
+        SimMode::Illegal => {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                &mut instance.common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+            SimSwitch::Illegal
+        }
+        mode => {
+            let (sims, _) = sims_and_sdly(instance, simm);
+            raise_simm_alarm(&mut instance.common, sims);
+            SimSwitch::Simulate(SimArm {
+                siol: instance
+                    .sim_link(crate::server::record::SimLink::Siol)
+                    .clone(),
+                sims,
+                raw_mode: mode == SimMode::Raw,
+                pact_held: true,
+            })
+        }
+    }
+}
+
+/// `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`, which the YES/RAW arm of an
+/// output's `writeValue` raises first.
+fn raise_simm_alarm(common: &mut crate::server::record::CommonFields, sims: i16) {
+    crate::server::recgbl::rec_gbl_set_sevr(
+        common,
+        crate::server::recgbl::alarm_status::SIMM_ALARM,
+        crate::server::record::AlarmSeverity::from_u16(sims as u16),
+    );
 }
 
 /// What `recGblGetTimeStampSimm`'s simulation arm (`recGbl.c:332-346`) stamps a
@@ -12502,6 +12596,7 @@ fn sim_process_tail(
     siol_stamp: SiolStamp,
     clear_udf: bool,
     plan: &crate::server::record::record_instance::ProcessPlan,
+    rdes: &crate::server::record::record_instance::RecordDesc,
 ) {
     let alarms_first = plan.stamp_point == StampPoint::AfterAlarms;
     // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
@@ -12522,8 +12617,17 @@ fn sim_process_tail(
     // `readValue` returns and whatever its status (waveformRecord.c:144,
     // aaiRecord.c:174, aaoRecord.c:165). They declare that with
     // `clears_udf_unconditionally`, which is the record's own C, not a
-    // framework choice.
-    if clear_udf || instance.record.clears_udf_unconditionally() {
+    // framework choice. ai instead re-derives it from VAL, folding
+    // `readValue`'s 2 into 0 first (`aiRecord.c:158-161`), so a NaN SIOL value
+    // leaves it undefined: the rule a dset's computed read takes.
+    if clear_udf {
+        instance.common.udf = if rdes.rederives_udf_on_computed_read(&*instance.record) {
+            instance.record.value_is_undefined() as u8
+        } else {
+            0
+        };
+    }
+    if instance.record.clears_udf_unconditionally() {
         instance.common.udf = 0;
     }
 

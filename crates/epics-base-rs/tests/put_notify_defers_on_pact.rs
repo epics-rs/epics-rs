@@ -33,9 +33,9 @@
 //! R19-65 (the boundary set below): "PACT ends" is not one site. The deferral
 //! must be consumed by whatever performs the PACT→idle transition, so there is
 //! one test per release owner — `complete_async_record_inner`, the
-//! ODLY/`ReprocessAfter` continuation, and each SIM/SDLY release inside
-//! `check_simulation_mode` (simulated input, simulated output redirect, illegal
-//! SIMM) — each with a put parked on that window and each asserting the record
+//! ODLY/`ReprocessAfter` continuation, and each SIM/SDLY release (simulated
+//! input, simulated output, illegal SIMM) — each with a put parked on that
+//! window and each asserting the record
 //! is still usable afterwards. Before the fix only the first of those replayed;
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
@@ -736,8 +736,8 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
 }
 
 /// `SDLY_AI`: SIMM=YES via SIML, SIOL=42, SDLY≥0 → the fresh cycle holds PACT
-/// and defers the SIOL round-trip. PACT is released inside
-/// `check_simulation_mode`, on the `Simulated` tail.
+/// and defers the SIOL round-trip. PACT is released on the continuation's
+/// `Simulated` tail.
 async fn sdly_input_record() -> PvDatabase {
     let db = PvDatabase::new();
     db.add_record("SW", Box::new(AoRecord::new(1.0)))
@@ -814,8 +814,8 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     assert!(!rec.read().is_processing());
 }
 
-/// Boundary: PACT released by the SIM/SDLY OUTPUT continuation (the
-/// `RedirectOutputToSiol` arm), deferral PRESENT.
+/// Boundary: PACT released by the SIM/SDLY OUTPUT's completing pass, deferral
+/// PRESENT.
 #[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pact() {
     let db = PvDatabase::new();
@@ -848,18 +848,12 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
-    let mut v2 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SIMAO", &mut v2)
-        .await
-        .unwrap();
+    db.complete_async_record("SIMAO").await.unwrap();
 
     await_replayed_value(&db, "SIMAO", 7.0).await;
 
-    let mut v3 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SIMAO", &mut v3)
-        .await
-        .unwrap();
-    expect_callback(rx, "the simulated-output continuation").await;
+    db.complete_async_record("SIMAO").await.unwrap();
+    expect_callback(rx, "the simulated-output completing pass").await;
     assert!(!rec.read().is_processing());
 }
 

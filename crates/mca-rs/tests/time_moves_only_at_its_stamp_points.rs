@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::database::{DeviceDoneSource, PvDatabase};
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
+};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::{EpicsValue, WallTime};
@@ -35,12 +37,18 @@ impl DeviceSupport for Busy {
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         Ok(DeviceInitOutcome::ok())
     }
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+    fn read_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
         let mca = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<McaRecord>())
             .unwrap();
-        mca.run_device_cycle(self);
+        Ok(mca.device_read_begin(self, done))
+    }
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())
     }
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

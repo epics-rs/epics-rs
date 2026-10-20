@@ -693,8 +693,8 @@ impl PactExit {
 
     /// Fold two releases of the same cycle into one token.
     ///
-    /// A simulated SDLY continuation releases PACT inside `check_simulation_mode`
-    /// and again at the `is_continuation` arm; one restart check covers both, so
+    /// A simulated SDLY continuation releases PACT in its simulation arm and
+    /// again at the `is_continuation` arm; one restart check covers both, so
     /// either half owing a restart makes the folded token owe one.
     pub(crate) fn merge(self, other: PactExit) -> PactExit {
         PactExit {
@@ -1100,43 +1100,64 @@ pub(crate) enum ForwardTarget {
 pub(crate) struct SimmBlock {
     pub(crate) sims: Option<&'static FieldDesc>,
     pub(crate) sdly: Option<&'static FieldDesc>,
-    /// C put this type's SIOL read in the INPUT stage: `readValue` reads SIOL
-    /// IN (`aiRecord.c`, `mbbiRecord.c:388-394`, `waveformRecord.c:351`,
-    /// `histogramRecord.c:384`, `mcaRecord.c:1097`, and `aai` through
-    /// `devAaiSoft.c:89`), where `writeValue` writes VAL OUT to it. Answering
-    /// this from the record TYPE NAME meant allocating that name as a `String`
-    /// once per cycle to match against it.
-    pub(crate) is_input: bool,
+    /// Where this type's `process()` reads SIML. Answering it from the record
+    /// TYPE NAME meant allocating that name as a `String` once per cycle to
+    /// match against it.
+    pub(crate) point: SimmPoint,
     /// [`Record::aborts_on_failed_siml_read`].
     pub(crate) aborts_on_failed_siml_read: bool,
-    /// [`Record::raises_simm_after_read`].
-    pub(crate) raises_simm_after_read: bool,
+    /// An output whose `writeValue` switches on SIMM on its PACT pass too:
+    /// `if (!prec->pact)` guards only the `recGblGetSimm` (`aoRecord.c:558`).
+    /// busy's PACT pass is `write_busy` alone (`busyRecord.c:394-397`).
+    pub(crate) pact_pass_simulates: bool,
+}
+
+/// The site of a record type's SIML read in its C `process()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SimmPoint {
+    /// `readValue`, ahead of the body, which reads SIOL IN (`aiRecord.c`,
+    /// `mbbiRecord.c:388-394`, `waveformRecord.c:351`,
+    /// `histogramRecord.c:384`, and `aai` through `devAaiSoft.c:89`).
+    ReadValue,
+    /// `writeValue`, after `checkAlarms` and the IVOA test, which writes VAL
+    /// OUT to SIOL.
+    WriteValue,
+    /// Inside the device half ([`Record::reads_simm_in_device_half`]).
+    Device,
 }
 
 impl SimmBlock {
     fn of(record: &dyn Record) -> Self {
         let rtype = record.record_type();
+        let point = if record.reads_simm_in_device_half() {
+            SimmPoint::Device
+        } else if record.simulation_substitutes_input_stage()
+            || matches!(
+                rtype,
+                "ai" | "bi"
+                    | "mbbi"
+                    | "mbbiDirect"
+                    | "longin"
+                    | "int64in"
+                    | "stringin"
+                    | "lsi"
+                    | "event"
+                    | "waveform"
+                    | "histogram"
+                    | "aai"
+            )
+        {
+            SimmPoint::ReadValue
+        } else {
+            SimmPoint::WriteValue
+        };
         SimmBlock {
             sims: field_desc_of(record, "SIMS"),
             sdly: field_desc_of(record, "SDLY"),
-            is_input: record.simulation_substitutes_input_stage()
-                || matches!(
-                    rtype,
-                    "ai" | "bi"
-                        | "mbbi"
-                        | "mbbiDirect"
-                        | "longin"
-                        | "int64in"
-                        | "stringin"
-                        | "lsi"
-                        | "event"
-                        | "waveform"
-                        | "histogram"
-                        | "aai"
-                        | "mca"
-                ),
+            point,
             aborts_on_failed_siml_read: record.aborts_on_failed_siml_read(),
-            raises_simm_after_read: record.raises_simm_after_read(),
+            pact_pass_simulates: point == SimmPoint::WriteValue
+                && record.uses_recgbl_simm_helpers(),
         }
     }
 }
@@ -1198,7 +1219,6 @@ impl ProcessPlan {
         stamps_before_alarms: true,
         reads_tsel_out_of_line: false,
         works_before_monitor: false,
-        stamps_before_siml_read: false,
         clears_udf: true,
         soft_read_clears_udf: true,
         can_device_write: false,
@@ -1241,7 +1261,6 @@ impl ProcessPlan {
             stamps_before_alarms,
             reads_tsel_out_of_line,
             works_before_monitor,
-            stamps_before_siml_read,
             clears_udf,
             soft_read_clears_udf,
             can_device_write,
@@ -1278,7 +1297,6 @@ impl ProcessPlan {
             && stamps_before_alarms == p.stamps_before_alarms
             && reads_tsel_out_of_line == p.reads_tsel_out_of_line
             && works_before_monitor == p.works_before_monitor
-            && stamps_before_siml_read == p.stamps_before_siml_read
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
             && can_device_write == p.can_device_write
@@ -1300,7 +1318,7 @@ impl ProcessPlan {
             // An INPUT type's simulation substitutes its read and
             // returns before the body; only an output type's SIOL write
             // reaches this stage.
-            || simm.is_some_and(|block| !block.is_input);
+            || simm.is_some_and(|block| block.point == SimmPoint::WriteValue);
         ProcessPlan {
             dset_can_refuse: crate::server::recgbl::dev_sup_process_refusal(rtype).is_some(),
             simm,
@@ -1350,7 +1368,6 @@ impl ProcessPlan {
                 .cycle_hooks()
                 .has(crate::server::record::CycleHooks::HAND_POSTED)
                 || record.stamp_point() == crate::server::record::StampPoint::AfterLinkWrites,
-            stamps_before_siml_read: output_stage && !record.stamps_after_write(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
             can_device_write: record.can_device_write(),
@@ -2416,33 +2433,10 @@ pub(crate) struct ProcessPlan {
     /// Work between the link stage and `monitor()`: the `HAND_POSTED`
     /// drain or the `AfterLinkWrites` stamp.
     pub(crate) works_before_monitor: bool,
-    /// An output whose `recGblGetTimeStampSimm(prec, prec->simm, NULL)` runs
-    /// before `writeValue` reads SIML, so it sees the previous cycle's SIMM
-    /// ([`Record::stamps_after_write`] is the one exception).
-    pub(crate) stamps_before_siml_read: bool,
     pub(crate) clears_udf: bool,
     pub(crate) soft_read_clears_udf: bool,
     /// [`Record::can_device_write`], a literal of the type.
     pub(crate) can_device_write: bool,
-}
-
-/// Which pass of `process()` a stamp belongs to. The completion pass is the
-/// re-entry with `pact` set: `writeValue` returns before `recGblGetSimm`, so
-/// its `recGblGetTimeStampSimm` (`aoRecord.c:228`, `lsoRecord.c:154`) sees the
-/// SIMM the first pass left.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StampPass {
-    First,
-    Completion,
-}
-
-impl ProcessPlan {
-    /// Whether this pass's output stamp sees the SIMM from before the cycle's
-    /// SIML read ([`Self::stamps_before_siml_read`]); never the completion.
-    #[inline(always)]
-    pub(crate) fn stamp_sees_previous_simm(&self, pass: StampPass) -> bool {
-        pass == StampPass::First && self.stamps_before_siml_read
-    }
 }
 
 /// Link parses made while this thread holds a put gate, for the tests that
@@ -5313,10 +5307,6 @@ pub struct RecordInstance {
     /// Revision of everything [`CyclePlan`] was resolved from. Bumped only by
     /// [`Self::invalidate_plan`].
     plan_rev: u32,
-    /// SIMM as it stood before this cycle's SIML read (`rec_gbl_get_simm`), for
-    /// an output's stamp, which C takes before `writeValue` reads SIML. `None`
-    /// while no SIML read has run since the SIML was last put.
-    pub(crate) simm_before_siml_read: Option<i16>,
     /// `(OMSL, OIF)` menu indices, 0 for a type without the field; settled at
     /// construction and by the two put funnels, so the cycle's closed-loop
     /// DOL test reads no field by name.
@@ -7314,15 +7304,11 @@ impl RecordInstance {
         &mut self,
         begun: crate::server::record::StampBegun,
         tsel: crate::server::database::TselStamp,
-        output_before_siml: bool,
     ) {
         let record = &self.record;
-        let before_siml = self.simm_before_siml_read.filter(|_| output_before_siml);
         let stored = tsel.stamp_begun(begun, &self.name, &mut self.common, || {
             !record.simulation_substitutes_input_stage()
-                && before_siml
-                    .or_else(|| record.simm_value())
-                    .is_some_and(|simm| simm != 0)
+                && record.simm_value().is_some_and(|simm| simm != 0)
         });
         if stored {
             self.hand_cycle_stamp();
@@ -7360,9 +7346,6 @@ impl RecordInstance {
                 | "SIMM"
         ) {
             self.invalidate_plan();
-        }
-        if field == "SIML" {
-            self.simm_before_siml_read = None;
         }
     }
 
@@ -7880,7 +7863,6 @@ impl RecordInstance {
             parsed_sdis: LinkCache::none(),
             parsed_tsel: LinkCache::none(),
             parsed_inputs: (0..multi_input_slots).map(|_| None).collect(),
-            simm_before_siml_read: None,
             link_slots,
             cycle_links,
             dol_mode,
@@ -14319,7 +14301,6 @@ mod record_cell_layout_tests {
             udf_alarm,
             cycle_plan,
             plan_rev,
-            simm_before_siml_read,
             dol_mode,
             destroyed,
             pact,

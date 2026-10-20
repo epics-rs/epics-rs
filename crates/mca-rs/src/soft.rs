@@ -15,7 +15,10 @@
 //! called out below.
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::database::DeviceDoneSource;
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
+};
 use epics_base_rs::server::record::Record;
 
 use crate::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack};
@@ -51,8 +54,16 @@ impl DeviceSupport for SoftMca {
     /// The device half of one process cycle, C `mcaRecord.c:509-790`, run by
     /// the record against this dset — see [`crate::record::cycle`] for why it
     /// is invoked from here rather than from `Record::process`.
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        Self::mca(record)?.run_device_cycle(self);
+    fn read_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        Ok(Self::mca(record)?.device_read_begin(self, done))
+    }
+
+    /// [`Self::read_begin`] has run the whole device half.
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())
     }
 
@@ -125,10 +136,10 @@ mod tests {
         (dev, rec)
     }
 
-    /// One process cycle, the way the framework runs it: device support's `read`,
+    /// One process cycle of a record that is not simulated: the device half,
     /// then the record's `process`.
     fn cycle(dev: &mut SoftMca, rec: &mut McaRecord) {
-        dev.read(rec).unwrap();
+        rec.run_device_cycle(dev);
         for action in rec.process().unwrap().actions {
             if let epics_base_rs::server::record::ProcessAction::DeviceCommand { command, args } =
                 action

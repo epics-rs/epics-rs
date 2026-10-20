@@ -44,11 +44,12 @@
 // itself, which the backend does not remove.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use epics_base_rs::server::database::{PvDatabase, RecordLoad};
-use epics_base_rs::server::db_loader::{apply_fields, create_record, parse_db};
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::record::{AlarmSeverity, DbLinkType, DevSup, Dset};
 use epics_base_rs::types::EpicsValue;
 
 /// Every record reads its simulation value from a SIOL that resolves, so no
@@ -86,29 +87,55 @@ record(longin, "LI:INVALID") {
 }
 "#;
 
-async fn load(db: &PvDatabase) {
-    mca_rs::register_mca_record_type();
-    for def in parse_db(DB, &HashMap::new()).unwrap() {
-        let mut rec = create_record(&def.record_type).unwrap();
-        let mut common = Vec::new();
-        apply_fields(&mut rec, &def.fields, &mut common).unwrap();
-        db.add_loaded_record(&def.name, rec, RecordLoad::from_common_fields(common))
-            .await
-            .unwrap();
-    }
+/// `mcaSupport.dbd`'s `device(mca,CONSTANT,devMCA_soft,"Soft Channel")`.
+static SOFT_MCA: DevSup = DevSup {
+    name: "devMCA_soft",
+    choice: "Soft Channel",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 4, 5], false),
+};
+
+async fn build(text: &str) -> Arc<PvDatabase> {
+    let (name, factory) = mca_rs::mca_record_factory();
+    let (db, _) = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca))
+        .db_string(text, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    db
+}
+
+/// A read pass, the only one that reaches `readValue` (`mcaRecord.c:1097`).
+async fn read(db: &PvDatabase, name: &str) {
+    db.put_record_field_from_ca_no_notify(name, "READ", EpicsValue::Short(1))
+        .await
+        .unwrap();
+}
+
+async fn load() -> Arc<PvDatabase> {
+    let db = build(DB).await;
     db.put_pv(
         "SIM:SPEC",
         EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()),
     )
     .await
     .unwrap();
+    db
 }
 
-/// Put SIMM = YES and process once.
+/// Put SIMM = YES and run a pass that reads: an mca's `READ`, a longin's
+/// process.
 async fn simulate(db: &PvDatabase, name: &str) {
     db.put_pv(&format!("{name}.SIMM"), EpicsValue::Short(1))
         .await
         .unwrap();
+    if name.starts_with("MCA") {
+        return read(db, name).await;
+    }
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links(name, &mut v).await.unwrap();
 }
@@ -123,8 +150,7 @@ fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 /// `AlarmSeverity::NoAlarm` and `recGblSetSevr` raised nothing.
 #[tokio::test]
 async fn an_mca_reaches_the_simm_alarm_at_invalid() {
-    let db = PvDatabase::new();
-    load(&db).await;
+    let db = load().await;
 
     simulate(&db, "MCA:INVALID").await;
 
@@ -140,8 +166,7 @@ async fn an_mca_reaches_the_simm_alarm_at_invalid() {
 /// by anything that merely treats a non-`Short` SIMS as "some alarm".
 #[tokio::test]
 async fn an_mca_reaches_the_simm_alarm_at_minor() {
-    let db = PvDatabase::new();
-    load(&db).await;
+    let db = load().await;
 
     simulate(&db, "MCA:MINOR").await;
 
@@ -156,8 +181,7 @@ async fn an_mca_reaches_the_simm_alarm_at_minor() {
 /// still raise nothing, so the fix is not simply "always alarm".
 #[tokio::test]
 async fn an_mca_without_sims_raises_no_simm_alarm() {
-    let db = PvDatabase::new();
-    load(&db).await;
+    let db = load().await;
 
     simulate(&db, "MCA:NONE").await;
 
@@ -171,8 +195,7 @@ async fn an_mca_without_sims_raises_no_simm_alarm() {
 /// The `Short` carrier control: the path that always worked must be untouched.
 #[tokio::test]
 async fn a_longin_still_reaches_the_simm_alarm_at_invalid() {
-    let db = PvDatabase::new();
-    load(&db).await;
+    let db = load().await;
 
     simulate(&db, "LI:INVALID").await;
 

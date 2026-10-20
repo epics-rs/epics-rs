@@ -9,14 +9,13 @@
 //! synchronous branch runs (`pact || sdly < 0`). With the default `SDLY = -1.0`
 //! the read/write is synchronous on the single cycle.
 //!
-//! The Rust port models the async path with `SimOutcome::DeferRead`: the fresh
-//! `check_simulation_mode` holds PACT and schedules a `ReprocessAfter`; the
-//! continuation (`is_continuation = true`, the framework analog of C's entry
-//! `pact`) runs the synchronous SIOL branch + alarm tail and releases PACT.
+//! An input's delayed pass is the continuation (`is_continuation = true`, the
+//! framework analog of C's entry `pact`); an output's is its completing pass
+//! (`complete_async_record`), as an async device write's is.
 //!
-//! These tests drive the continuation directly (`process_record_continuation`,
-//! as the swait/scalcout ODLY tests do) so the assertions are deterministic and
-//! do not race the real timer (`SDLY = 100s` makes it unfireable here).
+//! These tests drive that pass directly (`process_record_continuation`,
+//! `complete_async_record`) so the assertions are deterministic and do not
+//! race the real timer (`SDLY = 100s` makes it unfireable here).
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -276,8 +275,8 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
 
 /// Output record: `SDLY >= 0` defers the SIOL write (`aoRecord.c::writeValue`
 /// shares the same async branch as the input read). On the fresh cycle the
-/// SIOL target keeps its value and PACT is held; the continuation writes VAL to
-/// the target and clears PACT.
+/// SIOL target keeps its value and PACT is held; the completing pass writes VAL
+/// to the target and clears PACT.
 #[epics_macros_rs::epics_test]
 async fn sdly_async_defers_output_sim_write_to_continuation() {
     let db = PvDatabase::new();
@@ -311,11 +310,8 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
         "SIOL target untouched on the delaying cycle (sim write deferred), got {tgt:?}"
     );
 
-    // Continuation: VAL written to the SIOL target, PACT cleared.
-    let mut v2 = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_continuation("SDLYO_AO", &mut v2)
-        .await
-        .unwrap();
+    // Completing pass: VAL written to the SIOL target, PACT cleared.
+    db.complete_async_record("SDLYO_AO").await.unwrap();
 
     let tgt = db.get_pv("SDLYO_TGT").unwrap();
     assert!(

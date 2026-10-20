@@ -307,8 +307,9 @@ impl Record for LsoRecord {
         )
     }
 
-    fn stamps_after_write(&self) -> bool {
-        true
+    /// `lsoRecord.c:154`, after `writeValue` and its SIML read.
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterLinkWrites
     }
 
     /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a

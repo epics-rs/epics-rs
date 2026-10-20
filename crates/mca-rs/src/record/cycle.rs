@@ -15,7 +15,9 @@
 //! invokes on every pass with its [`McaDset`]: the record sends each message
 //! at C's site and decides what each answer, and each failure, means. A read
 //! whose callback re-enters the record splits the pass where C's `send_msg`
-//! returns, and the ask after the nested pass goes on from there. C `:793-841` (ROI sums, preset
+//! returns, and the ask after the nested pass goes on from there; `readValue`
+//! splits it again around the SIML and SIOL reads, which are the framework's
+//! to make (`:1106`, `:1118`). C `:793-841` (ROI sums, preset
 //! stop, commit ACQG, UDF, STIM, alarms, forward link) is the record's
 //! `process()`.
 //!
@@ -26,6 +28,8 @@
 use std::time::SystemTime;
 
 use epics_base_rs::error::CaResult;
+use epics_base_rs::server::database::DeviceDoneSource;
+use epics_base_rs::server::device_support::{ReadStart, SimRead};
 use epics_base_rs::server::record::CommonFields;
 use epics_base_rs::types::{EpicsValue, PvString, WallTime, c_cast};
 use epics_libcom_rs::cfmt::CFloat;
@@ -164,10 +168,15 @@ pub(crate) enum Resume {
     Status,
     /// After the data read (`:777`), which reads the data again.
     Data,
+    /// At `readValue` (`:1097`), whose link reads the framework has made;
+    /// `rdng` is the `pmca->rdng = 0` that follows it on a callback's pass
+    /// (`:756`).
+    ReadValue { rdng: bool },
 }
 
-/// C's nesting is at most three `process` calls deep (one per read trip).
-const RESUME_DEPTH: usize = 3;
+/// C's nesting is at most three `process` calls deep (one per read trip),
+/// and the innermost may stop at `readValue`.
+const RESUME_DEPTH: usize = 4;
 
 /// The open passes' resume points, for [`McaRecord::begin_device_cycle`]'s
 /// ask again.
@@ -202,6 +211,31 @@ pub enum McaStart {
     /// A read's callback ran inline; the pass it re-entered runs nested,
     /// then this pass asks again.
     Reentered,
+    /// The pass reached `readValue`; the framework reads SIML and SIOL, then
+    /// this pass asks again with what they decided.
+    ReadValue,
+}
+
+/// Which ask of a pass [`McaRecord::begin_device_cycle`] answers.
+#[derive(Debug, Clone, Copy)]
+pub enum Ask<'a> {
+    /// The pass's first.
+    First,
+    /// After a `Reentered` answer, once the nested pass has run.
+    Again,
+    /// After a `ReadValue` answer, with what `readValue`'s link half decided.
+    ReadValue(&'a SimRead),
+}
+
+impl<'a> Ask<'a> {
+    /// The ask `done` makes.
+    pub fn of(done: &'a DeviceDoneSource<'_>) -> Self {
+        match done.sim_read() {
+            Some(sim) => Self::ReadValue(sim),
+            None if done.again() => Self::Again,
+            None => Self::First,
+        }
+    }
 }
 
 /// How far one stretch of the device half got.
@@ -211,6 +245,8 @@ pub(crate) enum Step {
     Ended(McaStart),
     /// A send's callback ran inline; the pass goes on from here.
     Nested(Resume),
+    /// The pass reached `readValue`.
+    ReadValue { rdng: bool },
 }
 
 impl McaRecord {
@@ -218,20 +254,21 @@ impl McaRecord {
     /// whose callback ran inline: every message the cycle sends device
     /// support, at C's site and in C's order, and what each answer means.
     /// Device support's `read_begin` calls it on every pass, the re-entered
-    /// ones included, with `again` set on the ask after a `Reentered`
-    /// answer (`DeviceDoneSource::again`), which goes on where that pass
-    /// stopped.
-    pub fn begin_device_cycle(&mut self, dset: &mut impl McaDset, again: bool) -> McaStart {
-        let step = if again {
-            match self.resume.pop() {
-                Some(at) => self.resume_at(at, dset),
+    /// ones included; an ask after a `Reentered` or `ReadValue` answer goes
+    /// on where that pass stopped.
+    pub fn begin_device_cycle(&mut self, dset: &mut impl McaDset, ask: Ask<'_>) -> McaStart {
+        let step = match ask {
+            Ask::First => self.device_head(dset),
+            Ask::Again | Ask::ReadValue(_) => match self.resume.pop() {
+                Some(at) => self.resume_at(at, dset, ask),
                 None => {
-                    debug_assert!(false, "an ask again follows a Reentered answer");
+                    debug_assert!(
+                        false,
+                        "an ask again follows a Reentered or ReadValue answer"
+                    );
                     Step::Ended(McaStart::Synchronous)
                 }
-            }
-        } else {
-            self.device_head(dset)
+            },
         };
         match step {
             Step::Ended(start) => start,
@@ -239,14 +276,45 @@ impl McaRecord {
                 self.resume.push(at);
                 McaStart::Reentered
             }
+            Step::ReadValue { rdng } => {
+                self.resume.push(Resume::ReadValue { rdng });
+                McaStart::ReadValue
+            }
+        }
+    }
+
+    /// [`Self::begin_device_cycle`] as a device's `read_begin` answers it.
+    pub fn device_read_begin(
+        &mut self,
+        dset: &mut impl McaDset,
+        done: &DeviceDoneSource<'_>,
+    ) -> ReadStart {
+        match self.begin_device_cycle(dset, Ask::of(done)) {
+            McaStart::Synchronous => ReadStart::Synchronous,
+            McaStart::Pending => ReadStart::Pending,
+            McaStart::Reentered => ReadStart::Reentered,
+            McaStart::ReadValue => ReadStart::ReadValue,
         }
     }
 
     /// [`Self::begin_device_cycle`] for a device that completes every
-    /// message inside its send.
-    pub fn run_device_cycle(&mut self, dset: &mut impl McaDset) {
-        let start = self.begin_device_cycle(dset, false);
+    /// message inside its send, on a record that is not simulated.
+    #[cfg(test)]
+    pub(crate) fn run_device_cycle(&mut self, dset: &mut impl McaDset) {
+        let mut start = self.begin_device_cycle(dset, Ask::First);
+        if start == McaStart::ReadValue {
+            start = self.begin_device_cycle(dset, Ask::ReadValue(&SimRead::Device));
+        }
         debug_assert_eq!(start, McaStart::Synchronous);
+    }
+
+    /// [`Self::read_data`] on a record that is not simulated.
+    #[cfg(test)]
+    pub(crate) fn read_data_unsimulated(&mut self, dset: &mut impl McaDset) {
+        if let Step::ReadValue { rdng } = self.read_data(dset) {
+            let at = Resume::ReadValue { rdng };
+            self.resume_at(at, dset, Ask::ReadValue(&SimRead::Device));
+        }
     }
 
     /// C `:507-790` from the `reprocess:` label.
@@ -278,8 +346,9 @@ impl McaRecord {
         self.status_read(dset)
     }
 
-    /// C's code after the `send_msg` a nested pass ran inside.
-    fn resume_at(&mut self, at: Resume, dset: &mut impl McaDset) -> Step {
+    /// C's code after the `send_msg` a nested pass ran inside, or after
+    /// `readValue`'s link reads.
+    fn resume_at(&mut self, at: Resume, dset: &mut impl McaDset, ask: Ask<'_>) -> Step {
         match at {
             Resume::Mode => {
                 self.send_start_stop(dset);
@@ -294,7 +363,18 @@ impl McaRecord {
             Resume::Data => {
                 self.read = 0;
                 self.mmap |= M_READ;
-                self.read_value(dset);
+                self.read_value(false)
+            }
+            Resume::ReadValue { rdng } => {
+                let Ask::ReadValue(sim) = ask else {
+                    debug_assert!(false, "a ReadValue answer is asked again with its SimRead");
+                    return Step::Ended(McaStart::Synchronous);
+                };
+                self.finish_read_value(dset, sim);
+                if rdng {
+                    self.rdng = 0;
+                    self.mmap |= M_RDNG;
+                }
                 Step::Ended(McaStart::Synchronous)
             }
         }
@@ -327,10 +407,7 @@ impl McaRecord {
     pub(crate) fn read_data(&mut self, dset: &mut impl McaDset) -> Step {
         if self.rdng != 0 {
             debug_print!(5, "process: get data\n");
-            self.read_value(dset);
-            self.rdng = 0;
-            self.mmap |= M_RDNG;
-            return Step::Ended(McaStart::Synchronous);
+            return self.read_value(true);
         }
         if self.read == 0 {
             return Step::Ended(McaStart::Synchronous);
@@ -362,8 +439,7 @@ impl McaRecord {
             }
         }
         debug_print!(5, "process: get data\n");
-        self.read_value(dset);
-        Step::Ended(McaStart::Synchronous)
+        self.read_value(false)
     }
 
     /// C `:509-659` — everything the record does BEFORE the status read.
@@ -567,17 +643,32 @@ impl McaRecord {
         }
     }
 
-    /// C `readValue` (`:1097-1115`).
-    fn read_value(&mut self, dset: &mut impl McaDset) {
+    /// C `readValue` (`:1097`) up to its SIML read, a link read the pass
+    /// stops for.
+    fn read_value(&mut self, rdng: bool) -> Step {
         // Every read marks every region for recomputation (`:1104`).
         self.newr = NEWR_ALL;
-        let nord = self.nord;
-        match dset.read_array(self) {
+        Step::ReadValue { rdng }
+    }
+
+    /// C `readValue` past its link reads (`:1108-1132`), and its caller's
+    /// `if (status) nack = 1 else MARK(M_VAL)`.
+    fn finish_read_value(&mut self, dset: &mut impl McaDset, sim: &SimRead) {
+        let read = match sim {
+            SimRead::Device => {
+                let nord = self.nord;
+                let read = dset.read_array(self);
+                if self.nord != nord {
+                    self.mmap |= M_NORD;
+                }
+                read
+            }
+            SimRead::Siol { fetch, db_link } => self.land_siol_read(fetch, *db_link),
+            SimRead::Failed => Err(Nack),
+        };
+        match read {
             Ok(()) => self.mmap |= M_VAL,
             Err(Nack) => self.not_acknowledged(),
-        }
-        if self.nord != nord {
-            self.mmap |= M_NORD;
         }
     }
 
@@ -632,13 +723,13 @@ impl McaRecord {
     /// `IDTIM`, not on `VAL`. `VAL` is a spectrum: there is nothing for a limit
     /// to be compared against.
     pub(crate) fn check_dead_time_alarms(&mut self, common: &mut CommonFields) {
-        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
-        use epics_base_rs::server::record::AlarmSeverity;
+        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr, udf_alarm_active};
+        use epics_base_rs::server::record::{AlarmSeverity, Record};
 
-        // C returns before the ladder when the record is undefined (`:968-971`).
-        // The framework raises UDF_ALARM itself (`rec_gbl_check_udf`), which is
+        // C returns before the ladder when `udf == TRUE` (`:968-971`). The
+        // framework raises UDF_ALARM itself (`rec_gbl_check_udf`), which is
         // the other half of that same branch.
-        if common.udf != 0 {
+        if udf_alarm_active(common.udf, self.udf_alarm_on_exact_one()) {
             return;
         }
 

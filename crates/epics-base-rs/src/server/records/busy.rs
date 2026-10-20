@@ -52,9 +52,9 @@ pub struct BusyRecord {
     // (busyRecord.c:389-416) is the bo-shaped OUTPUT redirect: SIML resolves
     // SIMM, SIMM=YES writes VAL out through SIOL instead of the device, and the
     // cycle carries SIMM_ALARM at SIMS. The redirect itself is owned by the
-    // framework (`check_simulation_mode` -> `RedirectOutputToSiol`), which reads
-    // it off these fields — without them the record looks unconfigured and a
-    // simulated busy drives the real output.
+    // framework (`check_simulation_mode` at the `writeValue` point), which
+    // reads it off these fields — without them the record looks unconfigured
+    // and a simulated busy drives the real output.
     pub simm: i16,
     pub siml: PvString,
     pub siol: PvString,

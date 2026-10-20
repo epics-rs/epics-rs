@@ -46,13 +46,14 @@ mod roi;
 use std::any::Any;
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::recgbl::simm::LinkFetch;
 use epics_base_rs::server::record::{
     CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
     InputLinkRequest, LinkReadAs, ProcessAction, ProcessOutcome, Record, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
-pub use cycle::{McaCommand, McaDset, McaRead, McaStart, McaStatus, Nack, Sent, StampSites};
+pub use cycle::{Ask, McaCommand, McaDset, McaRead, McaStart, McaStatus, Nack, Sent, StampSites};
 
 /// C `mcaRecord.c:197` `#define NUM_ROI 32`.
 pub const NUM_ROI: usize = 32;
@@ -488,6 +489,28 @@ impl McaRecord {
         self.land_array_field(value, |r| &mut r.val)
     }
 
+    /// The simulated read's landing (`mcaRecord.c:1117-1121`): `dbGetLink`
+    /// writes the channels it read into `bptr` and leaves the rest, and a DB
+    /// link's count becomes `nord`, unmarked.
+    pub(crate) fn land_siol_read(
+        &mut self,
+        fetch: &LinkFetch,
+        db_link: bool,
+    ) -> Result<(), cycle::Nack> {
+        match fetch {
+            LinkFetch::Value(value) => {
+                let (read, n) = self.land_buffer(value.clone()).map_err(|_| cycle::Nack)?;
+                copy_channels(&mut self.val, &read, n);
+                if db_link {
+                    self.nord = n as i32;
+                }
+                Ok(())
+            }
+            LinkFetch::NoData => Ok(()),
+            LinkFetch::Failed => Err(cycle::Nack),
+        }
+    }
+
     /// Convert a written array to the `FTVL` element type and give it the
     /// record's fixed geometry — `capacity()` channels, zero-filled past what
     /// was written — reporting how many channels the writer actually supplied.
@@ -620,11 +643,16 @@ impl Record for McaRecord {
         "mca"
     }
 
-    /// `readValue` reads SIML at `DBR_ENUM` (`mcaRecord.c:1106`), so a
-    /// source that request cannot convert is a failed read.
+    /// `readValue` reads SIML at `DBR_ENUM` (`mcaRecord.c:1106`) and SIOL at
+    /// `(FTVL, NMAX)` (`:1117-1118`), so a source either request cannot
+    /// convert is a failed read.
     fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
         InputLinkRequest::As(match link_field {
             "SIML" => LinkReadAs::Enum,
+            "SIOL" => LinkReadAs::Array {
+                dbr: self.element_type(),
+                n_request: self.capacity(),
+            },
             _ => LinkReadAs::Native,
         })
     }
@@ -651,22 +679,10 @@ impl Record for McaRecord {
         dbd_generated::MCA_NOACCESS
     }
 
-    /// `mca` raises `SIMM_ALARM` AFTER its SIOL read, not before it.
-    ///
-    /// `mcaRecord.c::readValue` reads the link first — `:1118`
-    /// `dbGetLink(&(pmca->siol), pmca->ftvl, pmca->bptr, NULL, &nRequest)` —
-    /// and runs `recGblSetSevr(pmca, SIMM_ALARM, pmca->sims)` at `:1129`, past
-    /// the `if/else` on SIMM. The base records do the opposite
-    /// (`longinRecord.c:414` then `:416`).
-    ///
-    /// It decides an equal-severity tie, because `recGblSetSevr` is
-    /// strict-greater and a failed `dbGetLink` raises LINK_ALARM/INVALID inside
-    /// itself (`dbLink.c:319-320`). With `SIMS = INVALID` and a broken SIOL, C's
-    /// mca therefore publishes `STAT = LINK_ALARM` / `AMSG = "field SIOL"`
-    /// where a longin publishes `STAT = SIMM_ALARM`.
-    ///
-    /// Read against `mca` at `687d563`.
-    fn raises_simm_after_read(&self) -> bool {
+    /// `readValue` (`mcaRecord.c:1097-1132`) is the last device action of a
+    /// read pass, between `send_msg` calls; a pass that does not read never
+    /// reaches it.
+    fn reads_simm_in_device_half(&self) -> bool {
         true
     }
 
@@ -1052,6 +1068,11 @@ impl Record for McaRecord {
         Some(&PROCESS_POSTED_SET)
     }
 
+    /// C `mcaAlarm` `if (pmca->udf == TRUE)` (`mcaRecord.c:968`).
+    fn udf_alarm_on_exact_one(&self) -> bool {
+        true
+    }
+
     /// C `mcaAlarm` (`:962-1003`) — the analog ladder runs on `IDTIM`, the
     /// instantaneous dead time, not on `VAL`.
     fn check_alarms(&mut self, common: &mut CommonFields) {
@@ -1113,6 +1134,32 @@ pub mod commands {
 
 /// Zero the first `n` elements of a spectrum buffer in place, as C's `memset`
 /// on `bptr`/`pbg` does; the buffer keeps its width.
+/// Copy the first `n` channels of `src`, a buffer of `buf`'s element type,
+/// into `buf`.
+fn copy_channels(buf: &mut EpicsValue, src: &EpicsValue, n: usize) {
+    macro_rules! copy {
+        ($d:expr, $s:expr) => {{
+            let end = n.min($d.len()).min($s.len());
+            $d.make_mut()[..end].clone_from_slice(&$s[..end]);
+        }};
+    }
+    match (buf, src) {
+        (EpicsValue::CharArray(d), EpicsValue::CharArray(s)) => copy!(d, s),
+        (EpicsValue::UCharArray(d), EpicsValue::UCharArray(s)) => copy!(d, s),
+        (EpicsValue::ShortArray(d), EpicsValue::ShortArray(s)) => copy!(d, s),
+        (EpicsValue::UShortArray(d), EpicsValue::UShortArray(s)) => copy!(d, s),
+        (EpicsValue::LongArray(d), EpicsValue::LongArray(s)) => copy!(d, s),
+        (EpicsValue::ULongArray(d), EpicsValue::ULongArray(s)) => copy!(d, s),
+        (EpicsValue::Int64Array(d), EpicsValue::Int64Array(s)) => copy!(d, s),
+        (EpicsValue::UInt64Array(d), EpicsValue::UInt64Array(s)) => copy!(d, s),
+        (EpicsValue::FloatArray(d), EpicsValue::FloatArray(s)) => copy!(d, s),
+        (EpicsValue::DoubleArray(d), EpicsValue::DoubleArray(s)) => copy!(d, s),
+        (EpicsValue::EnumArray(d), EpicsValue::EnumArray(s)) => copy!(d, s),
+        (EpicsValue::StringArray(d), EpicsValue::StringArray(s)) => copy!(d, s),
+        _ => {}
+    }
+}
+
 pub(crate) fn zero_channels(buf: &mut EpicsValue, n: usize) {
     macro_rules! clear {
         ($v:expr, $zero:expr) => {{
@@ -1320,19 +1367,31 @@ mod tests {
         }
     }
 
+    /// One ask of a pass, as the framework makes it of a record that is not
+    /// simulated: a stop at `readValue` is asked again with `SimRead::Device`.
+    fn ask(rec: &mut McaRecord, dset: &mut Trips, ask: cycle::Ask<'_>) -> cycle::McaStart {
+        match rec.begin_device_cycle(dset, ask) {
+            cycle::McaStart::ReadValue => {
+                let device = epics_base_rs::server::device_support::SimRead::Device;
+                rec.begin_device_cycle(dset, cycle::Ask::ReadValue(&device))
+            }
+            start => start,
+        }
+    }
+
     /// One pass's device half that no callback re-enters: its `read_begin`.
     fn pass(rec: &mut McaRecord, dset: &mut Trips) -> cycle::McaStart {
-        rec.begin_device_cycle(dset, false)
+        ask(rec, dset, cycle::Ask::First)
     }
 
     /// One pass as the framework runs it against callbacks that run inline:
     /// each `Reentered` runs the nested pass, then asks again
     /// (`DeviceDoneSource::again`). The passes' ends, innermost first.
     fn nested_pass(rec: &mut McaRecord, dset: &mut Trips, ends: &mut Vec<cycle::McaStart>) {
-        let mut start = rec.begin_device_cycle(dset, false);
+        let mut start = ask(rec, dset, cycle::Ask::First);
         while start == cycle::McaStart::Reentered {
             nested_pass(rec, dset, ends);
-            start = rec.begin_device_cycle(dset, true);
+            start = ask(rec, dset, cycle::Ask::Again);
         }
         ends.push(start);
     }
@@ -1424,10 +1483,10 @@ mod tests {
             ..Default::default()
         };
         let reentered = cycle::McaStart::Reentered;
-        assert_eq!(rec.begin_device_cycle(&mut dset, false), reentered);
-        assert_eq!(rec.begin_device_cycle(&mut dset, false), reentered);
+        assert_eq!(ask(&mut rec, &mut dset, cycle::Ask::First), reentered);
+        assert_eq!(ask(&mut rec, &mut dset, cycle::Ask::First), reentered);
         assert_eq!(
-            rec.begin_device_cycle(&mut dset, false),
+            ask(&mut rec, &mut dset, cycle::Ask::First),
             cycle::McaStart::Synchronous
         );
         assert_eq!(rec.read, 1, "the innermost pass runs before READ clears");
@@ -1438,7 +1497,7 @@ mod tests {
         dset.log.clear();
         for _ in 0..2 {
             assert_eq!(
-                rec.begin_device_cycle(&mut dset, true),
+                ask(&mut rec, &mut dset, cycle::Ask::Again),
                 cycle::McaStart::Synchronous
             );
         }
@@ -1614,7 +1673,7 @@ mod tests {
 
         rec.apply_status(status(false));
         assert_eq!(rec.acqg, 1, "still 1 — the spectrum has not landed yet");
-        rec.read_data(&mut Probe::default());
+        rec.read_data_unsimulated(&mut Probe::default());
         assert_eq!(rec.acqg, 1);
         rec.process().unwrap();
         assert_eq!(rec.acqg, 0, "and only now");
@@ -1761,7 +1820,7 @@ mod tests {
                 fail,
                 ..Default::default()
             };
-            rec.read_data(&mut probe);
+            rec.read_data_unsimulated(&mut probe);
             assert_eq!(probe.sent, vec![McaCommand::Data]);
             assert_eq!(rec.nack, i16::from(fail), "fail={fail}");
             assert_eq!(rec.mmap & cycle::M_VAL == 0, fail, "fail={fail}");
@@ -1779,7 +1838,7 @@ mod tests {
         let time = WallTime::from_unix(946_684_800, 250_000_000);
         let mut rec = loaded(8, &[0; 8]);
         rec.read = 1;
-        rec.read_data(&mut Probe::default());
+        rec.read_data_unsimulated(&mut Probe::default());
         rec.process().unwrap();
         assert!(rec.take_time_stamp_request());
         rec.time_stamped(time);
@@ -1798,7 +1857,7 @@ mod tests {
 
         // C's unset `{0, 0}` TIME.
         rec.read = 1;
-        rec.read_data(&mut Probe::default());
+        rec.read_data_unsimulated(&mut Probe::default());
         assert!(rec.take_time_stamp_request());
         rec.time_stamped(WallTime::UNIX_EPOCH);
         assert_eq!(rec.rtim, 0.0);
@@ -2437,6 +2496,35 @@ mod tests {
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
         assert_eq!(rec.lalm, 0.0, "and the latch is not moved");
+    }
+
+    /// `mcaAlarm` tests `udf == TRUE` (`:968`), so a UDF byte of 2 runs the
+    /// ladder and raises no UDF_ALARM. A process pass never shows it: `:808`
+    /// clears `udf` first, as the framework does before `check_alarms`.
+    #[test]
+    fn a_udf_byte_of_two_runs_the_dead_time_ladder() {
+        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_check_udf};
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let mut rec = McaRecord {
+            idtim: 99.0,
+            hihi: 50.0,
+            hhsv: AlarmSeverity::Major as u16,
+            ..Default::default()
+        };
+        let mut common = CommonFields::default();
+        common.udf = 2;
+        rec.check_alarms(&mut common);
+        rec_gbl_check_udf(
+            &mut common,
+            rec.udf_alarm_on_exact_one(),
+            rec.udf_alarm_severity(),
+            rec.udf_alarm_message(),
+        );
+        assert_eq!(
+            (common.nsta, common.nsev),
+            (alarm_status::HIHI_ALARM, AlarmSeverity::Major)
+        );
     }
 
     // ---- the declaration drives the machinery ----

@@ -24,7 +24,7 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::{EpicsValue, WallTime};
-use mca_rs::record::{McaCommand, McaDset, McaRead, McaRecord, McaStart, McaStatus, Nack, Sent};
+use mca_rs::record::{McaCommand, McaDset, McaRead, McaRecord, McaStatus, Nack, Sent};
 
 static PORT: [DevSup; 1] = [DevSup {
     name: "devMcaPort",
@@ -101,11 +101,7 @@ impl DeviceSupport for DevPort {
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<McaRecord>())
             .unwrap();
-        Ok(match mca.begin_device_cycle(&mut self.port, done.again()) {
-            McaStart::Synchronous => ReadStart::Synchronous,
-            McaStart::Pending => ReadStart::Pending,
-            McaStart::Reentered => ReadStart::Reentered,
-        })
+        Ok(mca.device_read_begin(&mut self.port, done))
     }
     fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())

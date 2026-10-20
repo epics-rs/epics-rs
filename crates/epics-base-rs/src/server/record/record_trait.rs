@@ -4716,15 +4716,6 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         StampPoint::BeforeAlarms
     }
 
-    /// Whether this output's `recGblGetTimeStampSimm(prec, prec->simm, NULL)`
-    /// runs AFTER `writeValue` — only `lsoRecord.c:154`; every other output
-    /// stamps before it (`aoRecord.c:192`, ...). `writeValue` is where
-    /// `recGblGetSimm` reads SIML, so the stamp sees the previous cycle's
-    /// SIMM unless this is true, and this cycle's when it is.
-    fn stamps_after_write(&self) -> bool {
-        false
-    }
-
     /// Whether this record's OUT link should be written after processing.
     /// Defaults to true. Override in calcout / longout to implement OOPT
     /// conditional output (epics-base 7.0.8).
@@ -6444,7 +6435,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// this rule runs.
     ///
     /// Not consulted for a soft-channel INP read: there the framework IS the
-    /// dset, so it owns the clear the way `readLocked` does.
+    /// dset, so it owns the clear the way `readLocked` does. A good SIOL read
+    /// is consulted: `readValue`'s SIMM YES arm returns the same 2.
     fn rederives_udf_on_computed_read(&self) -> bool {
         true
     }
@@ -6962,34 +6954,17 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         true
     }
 
-    /// Whether this record's `readValue` raises `SIMM_ALARM` AFTER its SIOL
-    /// read instead of before it.
+    /// Whether the record reads SIML and SIOL inside its device half rather
+    /// than at a point of `process()` the framework owns: C mca's `readValue`
+    /// (`mcaRecord.c:1097-1132`) runs between `send_msg` calls, and only on a
+    /// pass that reads. Its device answers [`ReadStart::ReadValue`] there; the
+    /// framework makes the two reads, raising SIMM_ALARM after the SIOL read
+    /// (`:1118` then `:1129`), and the record lands the [`SimRead`] it is
+    /// asked again with.
     ///
-    /// `recGblSetSevr` is strict-greater, so the ORDER of the SIMM raise
-    /// against the LINK_ALARM/INVALID that a failed `dbGetLink` raises inside
-    /// itself (`dbLink.c:319` `setLinkAlarm`, reached from `:336`) decides an
-    /// equal-severity tie. With `SIMS = INVALID` and a broken SIOL the record
-    /// publishes whichever of the two was raised FIRST.
-    ///
-    /// The base records raise it first, at the top of the `case menuYesNoYES:`
-    /// arm — `longinRecord.c:414` then `:416` — so they publish
-    /// `STAT = SIMM_ALARM`. That is the default, and it is what the generic
-    /// raise in `check_simulation_mode` performs.
-    ///
-    /// `mca` is the other order: `mcaRecord.c:1118` reads SIOL and only then
-    /// `:1129` runs `recGblSetSevr(pmca, SIMM_ALARM, pmca->sims)`, past the
-    /// `if/else` on SIMM, so the LINK_ALARM raised inside the read WINS the tie
-    /// and C publishes `STAT = LINK_ALARM` with `AMSG = "field SIOL"`.
-    /// (Read against `mca` at `687d563`; that tree records no pin.)
-    ///
-    /// `swait` is the same order but does not answer here — it has its own
-    /// `input_stage` path in `check_simulation_mode`, which already reads
-    /// before it raises (`swaitRecord.c:416` then `:421`).
-    ///
-    /// Declared per record rather than special-cased at the raise site so a
-    /// record type carries its own C ordering; overriding to `true` is the
-    /// whole opt-in.
-    fn raises_simm_after_read(&self) -> bool {
+    /// [`ReadStart::ReadValue`]: crate::server::device_support::ReadStart::ReadValue
+    /// [`SimRead`]: crate::server::device_support::SimRead
+    fn reads_simm_in_device_half(&self) -> bool {
         false
     }
 

@@ -32,6 +32,15 @@ use epics_ca_rs::server::CaServer;
 #[ignore = "needs --features discovery and a multicast-capable non-loopback IPv4 interface; run with --profile interop --run-ignored all"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mdns_server_announce_to_client_discover() {
+    // Without one, the announcer registers no address and the browser
+    // never resolves: a 60 s ChannelNotFound, as in ns-run's lo-only netns.
+    assert!(
+        epics_base_rs::net::iface_v4::enumerate()
+            .unwrap_or_default()
+            .iter()
+            .any(|i| i.is_eligible()),
+        "precondition: no up non-loopback IPv4 interface to announce on"
+    );
     // Build an IOC with a unique mDNS instance name to avoid colliding
     // with any other epics-ca-rs servers running on the developer's
     // machine.

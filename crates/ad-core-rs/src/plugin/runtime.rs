@@ -1567,7 +1567,7 @@ struct SharedProcessorInner {
     prev_input_array: Option<PublishedArray>,
     /// Previous array dimensions, for firing an NDDimensions int32-array
     /// callback when dimensions change (C++ `dimsPrev_`, G8).
-    dims_prev: Vec<i32>,
+    dims_prev: DimsPrev,
     /// Source address selected via the NDArrayAddr PV (C++ `NDArrayAddr`, G6).
     nd_array_addr: i32,
     /// NumThreads as the port's write path accepted it.
@@ -1668,8 +1668,9 @@ impl SharedProcessorInner {
         {
             *slot = d.size as i32;
         }
-        (cur_dims != self.dims_prev).then(|| {
-            self.dims_prev = cur_dims.clone();
+        let mut dims_prev = self.dims_prev.lock();
+        (cur_dims != *dims_prev).then(|| {
+            *dims_prev = cur_dims.clone();
             asyn_rs::request::ParamSetValue::array(
                 self.ndarray_params.array_dimensions,
                 0,
@@ -2306,6 +2307,10 @@ pub const ASYN_MULTIDEVICE: PortFlags = PortFlags {
     ..ASYN_NONE
 };
 
+/// C `dimsPrev_`: written by the data side, read by the port at the
+/// interrupt edge.
+type DimsPrev = Arc<parking_lot::Mutex<Vec<i32>>>;
+
 /// PortDriver implementation for a plugin's control plane.
 #[allow(dead_code)]
 pub struct PluginPortDriver {
@@ -2340,6 +2345,9 @@ pub struct PluginPortDriver {
     /// A plugin built with blocking callbacks has not, so its configure-line
     /// queueSize stands unfloored until it first goes non-blocking.
     callback_threads: bool,
+    /// C `dimsPrev_`, which the frame's dimensions post writes and the
+    /// interrupt edge posts again.
+    dims_prev: DimsPrev,
 }
 
 impl PluginPortDriver {
@@ -2459,6 +2467,11 @@ impl PluginPortDriver {
             owner,
             pool: pool.clone(),
             callback_threads,
+            // NDPluginDriver.cpp:111.
+            dims_prev: Arc::new(parking_lot::Mutex::new(vec![
+                0;
+                crate::ndarray::ND_ARRAY_MAX_DIMS
+            ])),
         };
         Ok((driver, processor, pool))
     }
@@ -2901,7 +2914,18 @@ impl PortDriver for PluginPortDriver {
         &mut self.base
     }
 
+    /// NDDimensions posts only when the dims change (NDPluginDriver.cpp:
+    /// 245-246), so a first frame before the gate left Dimensions_RBV empty
+    /// until they changed. Zeros are the constructor's, never posted.
     fn interrupts_opened(&mut self) {
+        let dims = self.dims_prev.lock().clone();
+        if dims.iter().any(|&d| d != 0) {
+            let _ = self.base.do_callbacks_array(
+                self.ndarray_params.array_dimensions,
+                0,
+                ParamValue::Int32Array(dims.into()),
+            );
+        }
         for post in self.validator.edge_posts() {
             let _ = set_side(&mut self.base, post.into());
         }
@@ -3421,6 +3445,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
     let std_array_data_param = driver.std_array_data_param;
+    let dims_prev = driver.dims_prev.clone();
 
     // Create port runtime (actor thread for param I/O).
     //
@@ -3488,7 +3513,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
+        dims_prev,
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,

@@ -4228,9 +4228,10 @@ mod tests {
     #[test]
     fn a_sweep_runs_past_what_the_port_thread_leaves_queued() {
         // A Low write queued ahead, then the sweep: whether it ran, and the
-        // write's reply as the sweep left it.
+        // write's reply as the sweep left it, read while `tx` keeps the actor
+        // alive (an exiting actor drops a parked write unanswered).
         let behind = |tx: &mpsc::UnboundedSender<ActorMessage>, addr: i32| {
-            let ahead = send(
+            let mut ahead = send(
                 tx,
                 RequestOp::Int32Write { value: 9 },
                 AsynUser::new(0)
@@ -4247,11 +4248,11 @@ mod tests {
                 AsynUser::default(),
             );
             // Bounded, so a sweep that parks fails the case instead of hanging.
-            (ran.recv_timeout(Duration::from_secs(5)).is_ok(), ahead)
+            let ran = ran.recv_timeout(Duration::from_secs(5)).is_ok();
+            (ran, ahead.try_recv())
         };
-        let still_queued = |mut rx: oneshot::Receiver<AsynResult<RequestResult>>| {
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty))
-        };
+        let still_queued =
+            |write: Result<_, _>| matches!(write, Err(oneshot::error::TryRecvError::Empty));
 
         let mut drv = multi_device_driver(true);
         drv.base.init_auto_connect(false);
@@ -4274,10 +4275,10 @@ mod tests {
         drv.base.init_connected(true);
         drv.base.device_state(1).put_auto_connect(false);
         drv.base.device_state(1).put_connected(false);
-        let (ran, mut write) = behind(&spawn_actor(drv), 1);
+        let (ran, write) = behind(&spawn_actor(drv), 1);
         assert!(ran, "device down");
         assert!(
-            write.try_recv().unwrap().unwrap_err().is_queue_timeout(),
+            write.unwrap().unwrap_err().is_queue_timeout(),
             "the dead device's write is answered ahead of the sweep"
         );
 

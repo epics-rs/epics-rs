@@ -10448,8 +10448,10 @@ impl PvDatabase {
     /// not a continuation of an in-flight local chain.
     ///
     /// Private: [`ExternalCpProcess::run_worker`] is the only caller, so a
-    /// link callback can request a process but never run one inline.
-    fn dispatch_external_cp_link(&self, process: &ExternalCpProcess) {
+    /// link callback can request a process but never run one inline; it
+    /// runs one only with the [`CaRunGate`]'s word that every local CP link
+    /// of the holder has had its first event.
+    fn dispatch_external_cp_link(&self, process: &ExternalCpProcess, _: &FirstEventsIn) {
         let target = || {
             self.inner
                 .external_cp_links
@@ -12738,6 +12740,11 @@ impl ExternalCpProcess {
         }
     }
 
+    /// Whether the link is a CP/CPP link, whose events process its holder.
+    pub(crate) fn processes_holder(&self) -> bool {
+        self.processes_holder
+    }
+
     /// Request a process. A request made while one is pending merges into
     /// it, as the OR into `link_action` does. Only a CP/CPP link's
     /// callbacks add `CA_DBPROCESS` (`dbCa.c:866-871`, `:1008-1010`); any
@@ -12817,18 +12824,39 @@ impl ExternalCpProcess {
     }
 
     /// The link's worker: wait for a request, then process the holder in
-    /// the database `db` names at that moment. Never returns. Run it with
-    /// [`PvDatabase::spawn_cp_worker`].
+    /// the database `db` names at that moment, from the first its
+    /// [`CaRunGate`] gives its word for ([`FirstEventsIn`]) on. Never
+    /// returns. Run it with [`PvDatabase::spawn_cp_worker`].
     pub async fn run_worker(&self, db: impl Fn() -> Option<PvDatabase>) {
-        loop {
+        // The word is for good, so it is asked for only until given.
+        let word = loop {
             self.wake.notified().await;
-            self.run_pending(db().as_ref());
+            // The wait must not keep the database alive.
+            let gate = db().map(|db| db.inner.ca_run.clone());
+            if let Some(gate) = gate
+                && let Some(word) = gate.first_events_in(self, &db).await
+            {
+                break word;
+            }
+            self.run_pending(None);
+        };
+        loop {
+            self.run_pending(db().as_ref().map(|db| (db, &word)));
+            self.wake.notified().await;
+        }
+    }
+
+    /// Release the `dbCaRun` wait held here ahead of the process its first
+    /// event requested.
+    fn pass_init(&self) {
+        if self.init_ready.swap(false, Ordering::AcqRel) {
+            drop(std::mem::replace(&mut *self.init.lock(), InitWait::Passed));
         }
     }
 
     /// Take the pending request and, if there was one, process the holder
     /// in `db`.
-    fn run_pending(&self, db: Option<&PvDatabase>) {
+    fn run_pending(&self, db: Option<(&PvDatabase, &FirstEventsIn)>) {
         // Taken before the count, so a ready seen here has its first event's
         // request counted too.
         let init_ready = self.init_ready.swap(false, Ordering::AcqRel);
@@ -12874,10 +12902,15 @@ impl ExternalCpProcess {
         self.served.load(Ordering::SeqCst) >= mark
     }
 
-    fn run_requests(&self, db: Option<&PvDatabase>, pending: bool, init_ready: bool) {
-        let Some(db) = db else { return };
+    fn run_requests(
+        &self,
+        db: Option<(&PvDatabase, &FirstEventsIn)>,
+        pending: bool,
+        init_ready: bool,
+    ) {
+        let Some((db, word)) = db else { return };
         if pending {
-            db.dispatch_external_cp_link(self);
+            db.dispatch_external_cp_link(self, word);
         }
         if init_ready {
             let held = std::mem::replace(&mut *self.init.lock(), InitWait::Passed);
@@ -12928,16 +12961,34 @@ fn seam(at: Seam) {
 /// behind those (`dbCa.c:1209-1236`, `:1312-1319`), so no CP process runs
 /// before every local link added by then has its first event, whenever its
 /// channel opens: each [`CaLinkInit`]'s monitor half.
+///
+/// The gate owns one invariant: no CP process of a holder runs until every
+/// local CP link it holds has had its first event. A link added before
+/// `dbCaRun` holds every CP process until then; a link whose first event
+/// waits for its source's edge sweeps, which C does not have, is released
+/// from that and from `dbCaRun` and holds its own holder's instead
+/// ([`Self::late_link`]). No hold is taken once every CP process is
+/// released, as C's links added after `dbCaRun` hold none, so the gate's
+/// word for a holder ([`FirstEventsIn`]), which a CP process runs on, is
+/// for good.
 #[derive(Default)]
 pub(crate) struct CaRunGate {
     state: parking_lot::Mutex<GateState>,
     /// `dbCaRun` has been called: `GateState::running`, readable on every
     /// link call without the mutex.
     started: std::sync::atomic::AtomicBool,
+    /// [`Self::serviced`], readable on every CP pass without the mutex.
+    all_in: std::sync::atomic::AtomicBool,
     notify: crate::runtime::sync::Notify,
     settled: crate::runtime::sync::Notify,
     /// Signalled by `dbCaRun` and when the last `SubscribeClaim` drops.
     subscribed: crate::runtime::sync::Notify,
+    /// The late links still without their first event.
+    late: parking_lot::Mutex<Vec<super::LinkSerial>>,
+    /// `late`'s length, read on every CP pass without the mutex.
+    late_count: std::sync::atomic::AtomicUsize,
+    /// Signalled whenever a late link has its first event.
+    late_done: crate::runtime::sync::Notify,
 }
 
 #[derive(Default)]
@@ -12951,7 +13002,13 @@ struct GateState {
 impl CaRunGate {
     /// `dbCaRun`.
     pub(crate) async fn run(&self) {
-        self.state.lock().running = true;
+        {
+            let mut state = self.state.lock();
+            state.running = true;
+            if state.unsubscribed == 0 {
+                self.all_in.store(true, Ordering::Release);
+            }
+        }
         self.started
             .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
@@ -13010,6 +13067,9 @@ impl CaRunGate {
         let mut state = self.state.lock();
         state.unsubscribed -= 1;
         if state.unsubscribed == 0 {
+            if state.running {
+                self.all_in.store(true, Ordering::Release);
+            }
             self.subscribed.notify_waiters();
         }
     }
@@ -13017,8 +13077,7 @@ impl CaRunGate {
     /// `dbCaRun` has been called and every local link added before it has
     /// its first event. Never returns to false.
     pub(crate) fn serviced(&self) -> bool {
-        let state = self.state.lock();
-        state.running && state.unsubscribed == 0
+        self.all_in.load(Ordering::Acquire)
     }
 
     /// Wait until [`Self::serviced`].
@@ -13032,6 +13091,115 @@ impl CaRunGate {
             }
             subscribed.await;
         }
+    }
+
+    /// `process`'s link is late: its first event waits for its source's
+    /// edge sweeps. It stops holding `dbCaRun` and every CP process now,
+    /// and holds its holder's until the returned claim drops with that
+    /// event; `None`, holding nothing, once every CP process is released.
+    pub(crate) fn late_link(
+        self: &std::sync::Arc<Self>,
+        process: &ExternalCpProcess,
+    ) -> Option<LateLink> {
+        {
+            // Under the lock `all_in` is set under: before it, or never.
+            let _state = self.state.lock();
+            if self.serviced() {
+                return None;
+            }
+            self.late.lock().push(process.link);
+            self.late_count.fetch_add(1, Ordering::AcqRel);
+        }
+        process.request_init_ready();
+        Some(LateLink {
+            gate: self.clone(),
+            link: process.link,
+        })
+    }
+
+    /// Whether a late link of the holder `link` processes is still
+    /// without its first event.
+    fn holder_late(&self, db: &PvDatabase, link: super::LinkSerial) -> bool {
+        if self.late_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let cp = db.inner.external_cp_links.load();
+        let Some(holder) = cp.link_target(link) else {
+            return false;
+        };
+        self.late.lock().iter().any(|late| {
+            cp.link_target(*late)
+                .is_some_and(|t| t.record == holder.record)
+        })
+    }
+}
+
+mod first_events {
+    use super::{CaRunGate, ExternalCpProcess, PvDatabase};
+
+    /// A [`CaRunGate`]'s word that every local CP link of one holder has
+    /// had its first event, for good: what processing that holder for a CP
+    /// link takes, and only the gate gives.
+    pub(crate) struct FirstEventsIn(());
+
+    impl CaRunGate {
+        /// Wait for the word for `process`'s holder in the database `db`
+        /// names; `None` once there is none. While only the holder's late
+        /// links are owed, `dbCaRun` stops waiting for `process`'s link:
+        /// it waits for the link's first event, not for its process.
+        pub(super) async fn first_events_in(
+            &self,
+            process: &ExternalCpProcess,
+            db: &impl Fn() -> Option<PvDatabase>,
+        ) -> Option<FirstEventsIn> {
+            loop {
+                let serviced = self.subscribed.notified();
+                let mut serviced = std::pin::pin!(serviced);
+                serviced.as_mut().enable();
+                let settled = self.late_done.notified();
+                let mut settled = std::pin::pin!(settled);
+                settled.as_mut().enable();
+                if !self.serviced() {
+                    serviced.await;
+                    continue;
+                }
+                // A request made meanwhile stays pending for the pass after.
+                let woken = process.wake.notified();
+                let mut woken = std::pin::pin!(woken);
+                if !self.holder_late(&db()?, process.link) {
+                    return Some(FirstEventsIn(()));
+                }
+                process.pass_init();
+                std::future::poll_fn(|cx| {
+                    if settled.as_mut().poll(cx).is_ready() || woken.as_mut().poll(cx).is_ready() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+        }
+    }
+}
+
+use first_events::FirstEventsIn;
+
+/// A late link's hold on its holder's CP processes ([`CaRunGate::late_link`]).
+pub(crate) struct LateLink {
+    gate: std::sync::Arc<CaRunGate>,
+    link: super::LinkSerial,
+}
+
+impl Drop for LateLink {
+    fn drop(&mut self) {
+        let mut late = self.gate.late.lock();
+        if let Some(i) = late.iter().position(|l| *l == self.link) {
+            late.swap_remove(i);
+        }
+        drop(late);
+        self.gate.late_count.fetch_sub(1, Ordering::AcqRel);
+        self.gate.late_done.notify_waiters();
     }
 }
 

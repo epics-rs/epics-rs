@@ -144,8 +144,8 @@ fn a_disconnected_port_is_still_swept() {
 
 /// Boundary — a request queued before the edge that does not return, as a
 /// driver call with no timeout on a silent device: the edge's job, which
-/// iocRun's `dbCaRun` step waits for, settles while it runs, and the sweep
-/// still posts once it returns.
+/// iocRun's `dbCaRun` step waits for, settles while it runs, the port owes
+/// the sweep meanwhile, and the sweep still posts once it returns.
 #[tokio::test]
 async fn the_edge_settles_while_a_request_queued_before_it_runs() {
     let gate = InterruptGate::new();
@@ -163,7 +163,16 @@ async fn the_edge_settles_while_a_request_queued_before_it_runs() {
         .await
         .expect("the edge's job waited for the request queued before it");
     assert_eq!(posted.try_recv(), Err(mpsc::TryRecvError::Empty));
+    let sweeps = port.interrupts().edge_sweeps();
+    assert!(!sweeps.is_clear(), "the sweep is owed");
     *hold.0.lock().unwrap() = false;
     hold.1.notify_all();
-    assert_eq!(posted.recv_timeout(Duration::from_secs(5)), Ok(7));
+    tokio::time::timeout(Duration::from_secs(5), sweeps.cleared())
+        .await
+        .expect("the sweep ran");
+    assert_eq!(
+        posted.try_recv(),
+        Ok(7),
+        "posted before the port stopped owing it"
+    );
 }

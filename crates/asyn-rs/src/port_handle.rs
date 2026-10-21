@@ -1326,14 +1326,18 @@ impl PortHandle {
     /// `PINI` writes queued before the edge already run. A synchronous port
     /// is swept before this returns; an `ASYN_CANBLOCK` one only has the
     /// sweep queued behind those writes, since C's `iocRun` never waits for
-    /// it (iocInit.c:259-260).
+    /// it (iocInit.c:259-260). Either is counted on the port's
+    /// [`InterruptManager::edge_sweeps`] until it has run or is dropped
+    /// unrun.
     pub(crate) fn boot_param_callbacks(&self) -> AsynResult<()> {
         // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
         let max_addr = self.max_addr.max(1);
+        let owed = self.interrupts.edge_sweeps().claim();
         let call = DriverCall::new(move |driver| {
             for addr in 0..max_addr {
                 let _ = driver.base_mut().call_param_callbacks(addr);
             }
+            drop(owed);
         });
         let op = RequestOp::WithDriverAfterQueue(call);
         if self.can_block {

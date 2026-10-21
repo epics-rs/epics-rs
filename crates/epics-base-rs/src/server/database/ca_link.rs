@@ -669,7 +669,9 @@ impl LocalLink {
 /// attribute gets `connectionCallback` schedules, then the native
 /// `DBR_TIME` monitor (`dbCa.c:1225-1229`), whose first event is the
 /// channel's value now (`dbSubscriptionIO`). An I/O Intr source is read as
-/// a turn on its own pump, behind every interrupt queued to it before.
+/// a turn on its own pump, behind every interrupt queued to it before; a
+/// `DBF_INLINK` CP/CPP link's, first behind the edge sweeps its device
+/// still owes it, while its holder's CP processes wait for that event.
 /// Only a native input is monitored (`dbCa.c:865-867`): a `DBF_INLINK`
 /// from here, any other link from its first read.
 async fn subscribe(
@@ -678,6 +680,21 @@ async fn subscribe(
     state: Arc<LocalState>,
 ) {
     ca_run.reached().await;
+    let mut first = state.inlink.then_some(FirstEvent::InitReady);
+    if let ChannelTarget::RecordField { record, .. } = &channel.chan.target
+        && state.inlink
+        && state.process.processes_holder()
+        && let Some(sweeps) = super::io_intr_turn::owed_sweeps(record)
+    {
+        // `dbCaRun` waits for this first event, and every CP process for
+        // all of them; C reads the source at once, so a silent device must
+        // hold neither. Only its holder's CP processes wait for it, while
+        // they are still held.
+        if let Some(late) = ca_run.late_link(&state.process) {
+            first = Some(FirstEvent::Late(late));
+        }
+        sweeps.cleared().await;
+    }
     let Some(db) = channel.db() else { return };
     if let ChannelTarget::RecordField { record, .. } = &channel.chan.target {
         db.io_intr_turn(record).await;
@@ -712,14 +729,14 @@ async fn subscribe(
             let _ = state
                 .queue
                 .set((monitor.reader.queue(), monitor.reader.id()));
-            run_monitor(monitor, state).await;
+            run_monitor(monitor, state, first).await;
         }
         // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
         // the link stays without a value. Its init wait is released, where
         // C's `dbCaRun` would wait for it forever.
         Err(e) => {
             tracing::debug!("local CA link subscribe refused: {e:?}");
-            if state.inlink {
+            if let Some(FirstEvent::InitReady) = first {
                 state.process.request_init_ready();
             }
             state.ended.store(true, Ordering::SeqCst);
@@ -728,12 +745,22 @@ async fn subscribe(
     }
 }
 
+/// What a local link's first event owes besides its process.
+enum FirstEvent {
+    /// `CA_INIT_READY`, which `dbCaRun` waits for.
+    InitReady,
+    /// The end of a late link's hold on its holder's CP processes.
+    Late(super::processing::LateLink),
+}
+
 /// C `dbContext`'s event task handing each `dbSubscriptionIO` event to
 /// dbCa's `eventCallback`: refresh the cache, then add `CA_DBPROCESS`
-/// (`dbCa.c:891`, `:958-962`); after a `DBF_INLINK`'s first,
-/// `CA_INIT_READY`.
-async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
-    let mut first = state.inlink;
+/// (`dbCa.c:891`, `:958-962`); after the first, what `first` owes.
+async fn run_monitor(
+    mut monitor: LocalMonitor,
+    state: Arc<LocalState>,
+    mut first: Option<FirstEvent>,
+) {
     // Each event is taken and handed on under `delivery`, never across a
     // suspension.
     while std::future::poll_fn(|cx| {
@@ -752,8 +779,10 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
             // `callStateNotify`'s `ECA_GETFAIL`: dbCa keeps the last value.
             None => tracing::debug!("local CA link event not deliverable, keeping last value"),
         }
-        if std::mem::take(&mut first) {
-            state.process.request_init_ready();
+        match first.take() {
+            Some(FirstEvent::InitReady) => state.process.request_init_ready(),
+            Some(FirstEvent::Late(late)) => drop(late),
+            None => {}
         }
         state.taken.fetch_add(1, Ordering::SeqCst);
         state.process.notify_settled();
@@ -761,7 +790,7 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
     })
     .await
     {}
-    if first {
+    if let Some(FirstEvent::InitReady) = first {
         state.process.monitor_ended();
     }
     state.ended.store(true, Ordering::SeqCst);

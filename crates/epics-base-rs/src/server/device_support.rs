@@ -1081,6 +1081,14 @@ pub trait DeviceSupport: Send + Sync + 'static {
         None
     }
 
+    /// The sweeps the device's driver queued at the interrupt edge and has
+    /// not run, C asynPortDriver's `callbackThread`: a local CP link's first
+    /// event on an I/O Intr record waits until none is owed, so it reads
+    /// what the sweep posted. Default: `None`, a driver with no such sweep.
+    fn edge_sweeps(&self) -> Option<std::sync::Arc<crate::runtime::interrupt_accept::Outstanding>> {
+        None
+    }
+
     /// Whether this device posts monitors itself: after `init_common`,
     /// `get_ioint_info`, `io_intr_callback` and `write_begin_common` the
     /// record's holder posts

@@ -4951,6 +4951,10 @@ impl DeviceSupport for AsynDeviceSupport {
         self.scan_io_rx.take()
     }
 
+    fn edge_sweeps(&self) -> Option<Arc<epics_libcom_rs::runtime::interrupt_accept::Outstanding>> {
+        Some(self.handle.interrupts().edge_sweeps().clone())
+    }
+
     /// An `asyn_readback`-flagged record follows driver-side changes via the
     /// interrupt callback regardless of its `SCAN` (upstream PRs #60 / #208).
     /// Decouple its poll-feedback wiring from the `SCAN` menu so the callback

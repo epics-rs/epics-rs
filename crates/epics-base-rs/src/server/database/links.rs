@@ -5657,8 +5657,11 @@ impl PvDatabase {
     /// PINI.
     ///
     /// It first waits for the jobs `scanRun`'s edge started (the asyn ports'
-    /// boot flush), so every interrupt they queue is on its pump before a
-    /// link's first event takes its turn there.
+    /// boot flush). A synchronous port's sweep has run by then, so every
+    /// interrupt it queued is on its pump before a link's first event takes
+    /// its turn there; a `CANBLOCK` port's is only queued behind the port's
+    /// requests, and a CP link on its I/O Intr records waits for it in its
+    /// own first event, not here.
     pub async fn process_cp_links_on_connect(&self) {
         self.scan_control().interrupt_gate().jobs_settled().await;
         self.inner.ca_run.run().await;

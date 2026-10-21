@@ -5,8 +5,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::runtime::interrupt_accept::Outstanding;
 use crate::runtime::sync::{mpsc, oneshot};
-use crate::server::record::RecordCell;
+use crate::server::record::{RecordCell, ScanType};
+
+/// The edge sweeps `record`'s device still owes it, for a record on I/O Intr
+/// scan: what a CP link's first event waits for before its turn, so the
+/// turn comes behind the interrupts they queue. `None` when none is owed.
+pub(crate) fn owed_sweeps(record: &Arc<RecordCell>) -> Option<Arc<Outstanding>> {
+    let inst = record.read();
+    if inst.common.scan != ScanType::IoIntr {
+        return None;
+    }
+    inst.device
+        .as_ref()?
+        .edge_sweeps()
+        .filter(|sweeps| !sweeps.is_clear())
+}
 
 /// A turn request: answered once the pump has processed every interrupt
 /// queued to it when it took the request.

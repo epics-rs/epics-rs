@@ -52,7 +52,10 @@
 //! start work [`InterruptGate::jobs_settled`] does not see. The database's
 //! `dbCaRun` step runs behind those jobs,
 //! as C's `callbackThread` flush lands well ahead of the CP links' first
-//! events, which only start connecting at `dbCaRun`.
+//! events, which only start connecting at `dbCaRun`. A job that only queues
+//! a sweep behind a port's requests leaves it on the port's own
+//! [`Outstanding`], which the CP links on that port's records wait for
+//! instead, so a silent device holds no `dbCaRun`.
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -75,23 +78,51 @@ pub enum EdgeDone {
 pub struct InterruptGate {
     open: AtomicBool,
     on_open: Mutex<Vec<OnOpen>>,
-    jobs: Arc<Jobs>,
+    /// The running jobs.
+    jobs: Arc<Outstanding>,
 }
 
-/// The gate's running jobs.
+/// A count of work started and not yet done, with a wait for none: a gate's
+/// edge jobs, or the edge sweeps a port has queued and not run.
 #[derive(Default)]
-struct Jobs {
-    running: AtomicUsize,
+pub struct Outstanding {
+    count: AtomicUsize,
     done: crate::runtime::sync::Notify,
 }
 
-/// One running job's count, released when its thread ends, a panic included,
-/// or when the thread never started.
-struct JobClaim(Arc<Jobs>);
+impl Outstanding {
+    /// One more, counted until the claim drops.
+    pub fn claim(self: &Arc<Self>) -> OutstandingClaim {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        OutstandingClaim(self.clone())
+    }
 
-impl Drop for JobClaim {
+    /// Whether none is outstanding.
+    pub fn is_clear(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
+
+    /// Return once none is outstanding.
+    pub async fn cleared(&self) {
+        loop {
+            let done = self.done.notified();
+            let mut done = std::pin::pin!(done);
+            done.as_mut().enable();
+            if self.is_clear() {
+                return;
+            }
+            done.await;
+        }
+    }
+}
+
+/// One [`Outstanding`] count, released when dropped: a job's when its thread
+/// ends, a panic included, or when the thread never started.
+pub struct OutstandingClaim(Arc<Outstanding>);
+
+impl Drop for OutstandingClaim {
     fn drop(&mut self) {
-        if self.0.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.done.notify_waiters();
         }
     }
@@ -152,8 +183,7 @@ impl InterruptGate {
     /// The thread is C asynPortDriver's callback thread's class
     /// (`asynPortDriver.cpp:907`), the work these jobs are.
     pub fn spawn_job(&self, name: &str, job: impl FnOnce() + Send + 'static) {
-        self.jobs.running.fetch_add(1, Ordering::AcqRel);
-        let claim = JobClaim(self.jobs.clone());
+        let claim = self.jobs.claim();
         let _ = crate::runtime::task::spawn_dedicated_thread(
             name.into(),
             crate::runtime::task::ThreadPriority::Medium,
@@ -167,15 +197,7 @@ impl InterruptGate {
 
     /// Return once no job started by [`Self::spawn_job`] is running.
     pub async fn jobs_settled(&self) {
-        loop {
-            let done = self.jobs.done.notified();
-            let mut done = std::pin::pin!(done);
-            done.as_mut().enable();
-            if self.jobs.running.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            done.await;
-        }
+        self.jobs.cleared().await;
     }
 }
 

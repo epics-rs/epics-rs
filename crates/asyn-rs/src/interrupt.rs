@@ -859,6 +859,9 @@ pub struct InterruptSharedState {
     /// the flush path reads it with one atomic load, takes no lock and
     /// frees nothing.
     owner: std::sync::OnceLock<Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>>,
+    /// The edge sweeps queued and not yet run — see
+    /// [`InterruptManager::edge_sweeps`].
+    edge_sweeps: Arc<epics_libcom_rs::runtime::interrupt_accept::Outstanding>,
     /// The interfaces a client may register on: C's `interruptMask`, which
     /// asynPortDriver turns into one `registerInterruptSource` per interface
     /// (asynPortDriver.cpp:4074-4086).
@@ -906,6 +909,7 @@ impl InterruptManager {
                 coalesce_count: AtomicU64::new(0),
                 next_client: AtomicU64::new(0),
                 owner: std::sync::OnceLock::new(),
+                edge_sweeps: Arc::default(),
                 sources,
             }),
         }
@@ -951,6 +955,14 @@ impl InterruptManager {
     /// written before registration.
     pub fn accepting(&self) -> bool {
         self.state.owner.get().is_some_and(|g| g.is_open())
+    }
+
+    /// The port's edge sweeps (C `callbackThread::run`) queued and not yet
+    /// run, each a [`crate::port_handle::PortHandle::boot_param_callbacks`]
+    /// claim: a CP link's first event on an I/O Intr record of this port
+    /// waits for them. A port with no flush never has one.
+    pub fn edge_sweeps(&self) -> &Arc<epics_libcom_rs::runtime::interrupt_accept::Outstanding> {
+        &self.state.edge_sweeps
     }
 
     /// C `getInterruptPvt` (asynManager.c:2460-2500): a client registering on

@@ -380,6 +380,8 @@ pub struct PortHandle {
     devices: crate::port::DeviceTable,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
+    /// See [`crate::port::PortDriverBase::callback_thread`].
+    callback_thread: bool,
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
@@ -418,6 +420,8 @@ pub struct WeakPortHandle {
     devices: crate::port::DeviceTable,
     interrupts: Arc<InterruptManager>,
     can_block: bool,
+    /// See [`crate::port::PortDriverBase::callback_thread`].
+    callback_thread: bool,
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
@@ -448,6 +452,7 @@ impl WeakPortHandle {
             devices: self.devices.clone(),
             interrupts: self.interrupts.clone(),
             can_block: self.can_block,
+            callback_thread: self.callback_thread,
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
@@ -493,6 +498,7 @@ impl PortHandle {
             devices: actor.devices,
             interrupts,
             can_block: false,
+            callback_thread: false,
             multi_device: false,
             max_addr: 1,
             get_address: crate::port::port_get_address,
@@ -517,6 +523,7 @@ impl PortHandle {
             devices: self.devices.clone(),
             interrupts: self.interrupts.clone(),
             can_block: self.can_block,
+            callback_thread: self.callback_thread,
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
@@ -567,6 +574,17 @@ impl PortHandle {
     /// Whether this port can perform blocking I/O.
     pub fn can_block(&self) -> bool {
         self.can_block
+    }
+
+    /// Record the driver's [`crate::port::PortDriverBase::callback_thread`].
+    pub(crate) fn set_callback_thread(&mut self, callback_thread: bool) {
+        self.callback_thread = callback_thread;
+    }
+
+    /// Whether the port is swept at the interrupt edge — see
+    /// [`crate::port::PortDriverBase::callback_thread`].
+    pub(crate) fn has_callback_thread(&self) -> bool {
+        self.callback_thread
     }
 
     /// Record the port's multi-device capability, address count and
@@ -1302,13 +1320,27 @@ impl PortHandle {
         Ok(())
     }
 
-    /// The flush when interrupts open, on the actor: C `callbackThread::run`
-    /// (asynPortDriver.cpp:923-937) is a bare `callParamCallbacks`.
-    pub(crate) fn boot_param_callbacks_blocking(&self, addr: i32) -> AsynResult<()> {
+    /// The flush when interrupts open: C `callbackThread::run`
+    /// (asynPortDriver.cpp:923-937), a bare `callParamCallbacks` of every
+    /// address under one hold of the driver's lock, which in C finds the
+    /// `PINI` writes queued before the edge already run. A synchronous port
+    /// is swept before this returns; an `ASYN_CANBLOCK` one only has the
+    /// sweep queued behind those writes, since C's `iocRun` never waits for
+    /// it (iocInit.c:259-260).
+    pub(crate) fn boot_param_callbacks(&self) -> AsynResult<()> {
+        // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
+        let max_addr = self.max_addr.max(1);
         let call = DriverCall::new(move |driver| {
-            let _ = driver.base_mut().call_param_callbacks(addr);
+            for addr in 0..max_addr {
+                let _ = driver.base_mut().call_param_callbacks(addr);
+            }
         });
-        self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
+        let op = RequestOp::WithDriverAfterQueue(call);
+        if self.can_block {
+            self.try_submit(op, AsynUser::default())?;
+        } else {
+            self.submit_blocking(op, AsynUser::default())?;
+        }
         Ok(())
     }
 

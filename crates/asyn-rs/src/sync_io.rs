@@ -448,6 +448,7 @@ impl SyncIOHandle {
             let result = calls.call(&op, user())?;
             let eoslen = match &op {
                 RequestOp::SetInputEos { eos } | RequestOp::SetOutputEos { eos } => eos.len(),
+                RequestOp::WithDriverAfterQueue(_) => result.nbytes,
                 _ => result.nbytes,
             };
             print_on(

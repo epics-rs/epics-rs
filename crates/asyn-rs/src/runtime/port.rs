@@ -293,6 +293,7 @@ pub fn create_port_runtime_boxed(
 
     let port_name = driver.base().port_name.to_string();
     let can_block = driver.base().flags.can_block;
+    let callback_thread = driver.base().callback_thread;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
     let get_address = driver.base().get_address_rule();
@@ -386,6 +387,7 @@ pub fn create_port_runtime_boxed(
         config.services.trace().clone(),
     );
     port_handle.set_can_block(can_block);
+    port_handle.set_callback_thread(callback_thread);
     port_handle.set_capabilities(multi_device, max_addr, get_address);
     port_handle.set_interfaces(interfaces);
     for hook in runtime_hooks {

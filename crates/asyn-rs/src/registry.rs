@@ -89,10 +89,10 @@ impl PortClaim {
     /// (`ctx.db().scan_control().interrupt_gate()`): the port accepts
     /// callbacks while it is open, and no other gate is read.
     /// A port is ownerless only between construction and this call, and
-    /// reads closed then, so a seed written in the constructor is kept; the
-    /// owner's `false → true` edge flushes it once (C `callbackThread`,
-    /// `asynPortDriver.cpp:923-937`), immediately if the owner is already
-    /// open here.
+    /// reads closed then, so a seed written in the constructor is kept; on an
+    /// asynPortDriver port the owner's `false → true` edge flushes it once (C
+    /// `callbackThread`, `asynPortDriver.cpp:923-937`), immediately if the
+    /// owner is already open here.
     ///
     /// The entry's trace manager is the handle's own — the one the driver was
     /// bound to at `create_port_runtime` — so a mask set through the registry
@@ -113,6 +113,7 @@ impl PortClaim {
         // The asynPortDriver ctor's connectDevice(pasynUserSelf, portName, 0)
         // (asynPortDriver.cpp:4099): the port's own lines print on device 0.
         trace.connect_device(&self.name, 0);
+        let callback_thread = handle.has_callback_thread();
         let registry = self.registry.clone();
         let mut reg = registry.inner.lock().unwrap();
         // Only this claim's own `Drop` frees a claimed slot, so it is still ours.
@@ -123,6 +124,9 @@ impl PortClaim {
             _ => unreachable!("claimed slot {} left its claim", self.name),
         }
         self.published = true;
+        if !callback_thread {
+            return Ok(());
+        }
         // By name, so the gate does not keep a withdrawn port's actor alive.
         let (flush, port) = (registry.clone(), self.name.clone());
         owner.on_open(move || {
@@ -236,8 +240,8 @@ impl PortRegistry {
 
     /// The boot flush of the port `name`. C's `callbackThread` is its own
     /// thread so it does not block the caller that set `interruptAccept`
-    /// (the scan facility on the iocRun path); the sweep uses the port
-    /// actor's blocking bridge, which must not run on the scan/setup thread,
+    /// (the scan facility on the iocRun path); a synchronous port's sweep
+    /// runs on the calling thread, which must not be the scan/setup thread,
     /// so it runs as the owner gate's job.
     fn flush(&self, name: &str) {
         if let Some(entry) = self.get(name) {
@@ -316,13 +320,11 @@ pub fn claim_port(name: &str) -> AsynResult<PortClaim> {
 }
 
 /// Deliver a port's accumulated changed params once: C
-/// `callbackThread::run` (`asynPortDriver.cpp:923-937`). Blocks on the port
-/// actor, so it never runs on the scan or setup thread that opened the gate.
+/// `callbackThread::run` (`asynPortDriver.cpp:923-937`). A synchronous port
+/// is swept on this thread, so it never runs on the scan or setup thread that
+/// opened the gate.
 pub(crate) fn flush_port(handle: &PortHandle) {
-    // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
-    for addr in 0..handle.max_addr().max(1) {
-        let _ = handle.boot_param_callbacks_blocking(addr);
-    }
+    let _ = handle.boot_param_callbacks();
 }
 
 /// An owner that is already open, for a hand-registered port or a test that

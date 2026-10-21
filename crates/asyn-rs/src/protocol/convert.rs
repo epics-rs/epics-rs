@@ -126,7 +126,7 @@ impl From<&RequestOp> for PortCommand {
                 value: value.clone(),
             },
             RequestOp::Report { level, .. } => Self::Report { level: *level },
-            RequestOp::WithDriver(_) => Self::WithDriver,
+            RequestOp::WithDriver(_) | RequestOp::WithDriverAfterQueue(_) => Self::WithDriver,
             RequestOp::LockPort(_) => Self::LockPort,
             RequestOp::Cell(cell) | RequestOp::CellInline(cell) => Self::Callback {
                 connect_queue: cell.connect_queue(),

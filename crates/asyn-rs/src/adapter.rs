@@ -2110,6 +2110,7 @@ macro_rules! op_data {
             fn buffer(op: RequestOp) -> Option<Vec<Self>> {
                 match op {
                     $(RequestOp::$variant { data, .. })|+ => Some(data),
+                    RequestOp::WithDriverAfterQueue(_) => None,
                     _ => None,
                 }
             }
@@ -2303,6 +2304,7 @@ impl<'a> Sent<'a> {
             | RequestOp::Int64ArrayWrite { .. }
             | RequestOp::Float32ArrayWrite { .. }
             | RequestOp::Float64ArrayWrite { .. } => (true, false, 0),
+            RequestOp::WithDriverAfterQueue(_) => (false, true, 0),
             _ => (false, true, 0),
         };
         Sent {
@@ -2340,6 +2342,7 @@ impl<'a> Sent<'a> {
             RequestOp::OctetWrite { data }
             | RequestOp::OctetWriteBinary { data }
             | RequestOp::OctetWriteRead { data, .. } => Some(data),
+            RequestOp::WithDriverAfterQueue(_) => None,
             _ => None,
         }
     }
@@ -2413,6 +2416,7 @@ impl Scalar {
             Some(RequestOp::Int64Write { value }) => Self::Int(*value),
             Some(RequestOp::UInt32DigitalWrite { value, .. }) => Self::UInt(*value),
             Some(RequestOp::Float64Write { value }) => Self::Float(*value),
+            Some(RequestOp::WithDriverAfterQueue(_)) => Self::None,
             _ => Self::None,
         }
     }

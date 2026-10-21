@@ -2034,6 +2034,7 @@ fn return_phase_buffer(plan: &mut IoPlan, op: RequestOp) {
                 *frame = data;
             }
         }
+        RequestOp::WithDriverAfterQueue(_) => {}
         _ => {}
     }
 }

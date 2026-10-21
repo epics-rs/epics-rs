@@ -568,6 +568,11 @@ pub struct PortDriverBase {
     interrupt_mask: InterfaceMask,
     pub params: ParamList,
     pub interrupts: InterruptManager,
+    /// Built by [`Self::new`], as an asynPortDriver, whose constructor starts
+    /// the `callbackThread` that sweeps its params once at the interrupt edge
+    /// (asynPortDriver.cpp:4111-4112). A port that calls `registerPort` itself
+    /// has none.
+    pub(crate) callback_thread: bool,
     /// Whether the port's transport is up — read it with [`Self::is_connected`],
     /// move it with [`Self::set_connected`].
     ///
@@ -822,7 +827,10 @@ impl PortDriverBase {
         interrupt_mask: InterfaceMask,
     ) -> Self {
         flags.multi_device |= max_addr > 1;
-        Self::new_exact_flags(port_name, max_addr, flags, interface_mask, interrupt_mask)
+        let mut base =
+            Self::new_exact_flags(port_name, max_addr, flags, interface_mask, interrupt_mask);
+        base.callback_thread = true;
+        base
     }
 
     /// A base whose flags are registered as given, for the drivers that, like
@@ -846,6 +854,7 @@ impl PortDriverBase {
             interrupt_mask,
             params: ParamList::new(max_addr),
             interrupts: InterruptManager::with_sources(interrupt_mask),
+            callback_thread: false,
             // C `dpCommonInit` (asynManager.c:523): every port starts down and
             // comes up through its driver's connect, which registration queues.
             connected: Connection::Own(Arc::new(AtomicBool::new(false))),

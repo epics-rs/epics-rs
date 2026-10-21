@@ -20,7 +20,8 @@ use crate::port::PortDriver;
 /// code — is refused by the actor rather than silently succeeding.
 pub struct OnceCall<F: ?Sized>(Arc<Mutex<Option<Box<F>>>>);
 
-/// The closure a [`RequestOp::WithDriver`] carries.
+/// The closure a [`RequestOp::WithDriver`] or
+/// [`RequestOp::WithDriverAfterQueue`] carries.
 pub type DriverCall = OnceCall<dyn FnOnce(&mut dyn PortDriver) + Send>;
 
 /// The closure a [`RequestOp::LockPort`] carries.
@@ -1347,6 +1348,13 @@ pub enum RequestOp {
     /// threads do between `lock()` and `unlock()` (asynPortDriver.cpp:3858).
     /// Built by [`crate::port_handle::PortHandle::with_driver`].
     WithDriver(DriverCall),
+    /// [`Self::WithDriver`] run behind every request queued before it rather
+    /// than ahead of them: on an `ASYN_CANBLOCK` port it takes its place in the
+    /// Low band, and is otherwise the same direct call — no gate, no block
+    /// holder, never parked. It is C `callbackThread::run`'s sweep at the
+    /// interrupt edge (asynPortDriver.cpp:923-937), which finds the `PINI`
+    /// writes already run.
+    WithDriverAfterQueue(DriverCall),
     /// C `pasynManager->lockPort` … `unlockPort` (asynManager.c:1778-1808): the
     /// closure calls the port's interfaces with no `queueRequest`, so neither
     /// the enabled nor the connected check runs and no autoconnect is tried —

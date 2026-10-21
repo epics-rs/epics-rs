@@ -536,6 +536,7 @@ fn dispatch(
             Ok(RequestResult::write_ok())
         }
         RequestOp::LockPort(call) => lock_port(access, user, call),
+        RequestOp::WithDriverAfterQueue(_) => access.with(|actor| actor.dispatch_io(user, op))?,
         _ => access.with(|actor| actor.dispatch_io(user, op))?,
     }
 }
@@ -693,6 +694,7 @@ impl ActorMessage {
     fn timeout_user(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.timeout_user(),
+            RequestOp::WithDriverAfterQueue(_) => true,
             _ => true,
         }
     }
@@ -701,6 +703,8 @@ impl ActorMessage {
     fn claim(&self) -> Claim {
         match &self.op {
             RequestOp::Cell(cell) => cell.claim(self.seq),
+            RequestOp::WithDriverAfterQueue(_) if self.cancel.begin_running() => Claim::Run,
+            RequestOp::WithDriverAfterQueue(_) => Claim::Left,
             _ if self.cancel.begin_running() => Claim::Run,
             _ => Claim::Left,
         }
@@ -711,6 +715,7 @@ impl ActorMessage {
     fn is_gone(&self) -> bool {
         match &self.op {
             RequestOp::Cell(cell) => cell.is_gone(self.seq),
+            RequestOp::WithDriverAfterQueue(_) => self.cancel.is_timed_out(),
             _ => self.cancel.is_timed_out(),
         }
     }
@@ -1824,6 +1829,8 @@ impl PortActor {
             // on the driver's own thread: no `queueRequest`, no connected or
             // enabled check. The actor's serial ownership is that mutex.
             | RequestOp::WithDriver(_)
+            // The same lock, taken behind the queue; see `enqueue_message`.
+            | RequestOp::WithDriverAfterQueue(_)
             // `lockPort` (asynManager.c:1778-1808) takes `synchronousLock` and
             // nothing else; the defunct refusal is the dispatch arm's.
             | RequestOp::LockPort(_) => CDispatch::Direct,
@@ -2015,6 +2022,9 @@ impl PortActor {
         // Ranked before a block can divert it: the release re-pushes it as is.
         msg.rank = if !self.driver.base().flags.can_block {
             Rank::Arrival
+        } else if matches!(msg.op, RequestOp::WithDriverAfterQueue(_)) {
+            // Behind everything queued before it, at any band.
+            Rank::Band(QueuePriority::Low)
         } else if Self::c_dispatch(&msg.op) == CDispatch::Direct {
             Rank::Direct
         } else {
@@ -3080,16 +3090,18 @@ impl PortActor {
             RequestOp::Cell(_) | RequestOp::CellInline(_) | RequestOp::LockPort(_) => {
                 dispatch(&mut Access::Owned(self), user, op)
             }
-            RequestOp::WithDriver(call) => match call.take() {
-                Some(f) => {
-                    f(self.driver.as_mut());
-                    Ok(RequestResult::write_ok())
+            RequestOp::WithDriver(call) | RequestOp::WithDriverAfterQueue(call) => {
+                match call.take() {
+                    Some(f) => {
+                        f(self.driver.as_mut());
+                        Ok(RequestResult::write_ok())
+                    }
+                    None => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "driver call carries no closure".into(),
+                    }),
                 }
-                None => Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "driver call carries no closure".into(),
-                }),
-            },
+            }
             RequestOp::SetInputEos { eos } => {
                 // C parity: asynRecord IEOS write at asynRecord.c:1964-1967
                 // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
@@ -3280,7 +3292,7 @@ mod tests {
     use crate::param::ParamType;
     use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
-    use crate::request::OctetReadOp;
+    use crate::request::{DriverCall, OctetReadOp};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -4166,6 +4178,119 @@ mod tests {
         };
         assert_eq!(order(true), vec![2, 3, 1, 0, 4]);
         assert_eq!(order(false), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// C's interrupt-edge sweep finds the requests queued before the edge
+    /// already run (asynPortDriver.cpp:923-937): it pops behind every one of
+    /// them, at any band, and ahead of a Low request queued after it. A
+    /// direct call still overtakes them all.
+    #[test]
+    fn a_sweep_pops_behind_what_was_queued_before_it() {
+        let mk = |op: RequestOp, priority: QueuePriority| {
+            let (reply, _rx) = oneshot::channel();
+            ActorMessage::new(
+                op,
+                AsynUser::new(0).with_priority(priority),
+                CancelToken::new(),
+                reply,
+            )
+        };
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut actor = PortActor::new(Box::new(multi_device_driver(true)), rx);
+        let mut seqs = Vec::new();
+        for msg in [
+            mk(RequestOp::Int32Write { value: 1 }, QueuePriority::Low),
+            mk(RequestOp::Int32Read, QueuePriority::High),
+            mk(
+                RequestOp::WithDriverAfterQueue(DriverCall::spent()),
+                QueuePriority::Medium,
+            ),
+            mk(RequestOp::Int32Read, QueuePriority::Low),
+            mk(
+                RequestOp::WithDriver(DriverCall::spent()),
+                QueuePriority::Low,
+            ),
+        ] {
+            seqs.push(msg.seq);
+            actor.enqueue_message(msg);
+        }
+        let popped: Vec<usize> = std::iter::from_fn(|| actor.heap.pop())
+            .map(|m| seqs.iter().position(|&s| s == m.seq).unwrap())
+            .collect();
+        assert_eq!(popped, vec![4, 1, 0, 2, 3]);
+    }
+
+    /// What the port thread leaves queued does not hold the sweep up, since
+    /// C's `callbackThread` is no `queueRequest` (asynPortDriver.cpp:923-937):
+    /// it runs on a port that is down or disabled, past a disabled device's
+    /// parked request and a dead device's timed-out one, and under another
+    /// user's block.
+    #[test]
+    fn a_sweep_runs_past_what_the_port_thread_leaves_queued() {
+        // A Low write queued ahead, then the sweep: whether it ran, and the
+        // write's reply as the sweep left it.
+        let behind = |tx: &mpsc::UnboundedSender<ActorMessage>, addr: i32| {
+            let ahead = send(
+                tx,
+                RequestOp::Int32Write { value: 9 },
+                AsynUser::new(0)
+                    .with_addr(addr)
+                    .with_priority(QueuePriority::Low),
+            );
+            let (ran_tx, ran) = std::sync::mpsc::channel();
+            let call = DriverCall::new(move |_| {
+                let _ = ran_tx.send(());
+            });
+            let _reply = send(
+                tx,
+                RequestOp::WithDriverAfterQueue(call),
+                AsynUser::default(),
+            );
+            // Bounded, so a sweep that parks fails the case instead of hanging.
+            (ran.recv_timeout(Duration::from_secs(5)).is_ok(), ahead)
+        };
+        let still_queued = |mut rx: oneshot::Receiver<AsynResult<RequestResult>>| {
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+        };
+
+        let mut drv = multi_device_driver(true);
+        drv.base.init_auto_connect(false);
+        drv.base.init_connected(false);
+        let (ran, write) = behind(&spawn_actor(drv), 0);
+        assert!(ran && still_queued(write), "port down");
+
+        let mut drv = multi_device_driver(true);
+        drv.base.set_enabled(false).unwrap();
+        let (ran, write) = behind(&spawn_actor(drv), 0);
+        assert!(ran && still_queued(write), "port disabled");
+
+        let mut drv = multi_device_driver(true);
+        drv.base.disable_addr(1);
+        let (ran, write) = behind(&spawn_actor(drv), 1);
+        assert!(ran && still_queued(write), "device disabled");
+
+        let mut drv = multi_device_driver(true);
+        drv.base.init_auto_connect(false);
+        drv.base.init_connected(true);
+        drv.base.device_state(1).put_auto_connect(false);
+        drv.base.device_state(1).put_connected(false);
+        let (ran, mut write) = behind(&spawn_actor(drv), 1);
+        assert!(ran, "device down");
+        assert!(
+            write.try_recv().unwrap().unwrap_err().is_queue_timeout(),
+            "the dead device's write is answered ahead of the sweep"
+        );
+
+        let tx = spawn_actor(multi_device_driver(true));
+        let mut owner = AsynUser::new(0);
+        owner.block_token = Some(42);
+        send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, owner).unwrap();
+        // The holder is taken when the owner's next callback returns.
+        let mut owner = AsynUser::new(0);
+        owner.block_token = Some(42);
+        send_and_wait(&tx, RequestOp::Int32Read, owner).unwrap();
+        let (ran, write) = behind(&tx, 0);
+        assert!(ran && still_queued(write), "another user's block");
     }
 
     #[test]

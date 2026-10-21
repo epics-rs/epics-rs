@@ -1814,9 +1814,8 @@ impl AlarmPosts {
 }
 
 /// What one process cycle hands to its forward-link tail. The FLNK's own
-/// PUTF and put-notify wait-set ride inside the
-/// [`ForwardTarget`](crate::server::record::record_instance::ForwardTarget)
-/// the tail is handed, so only the target that needs them carries them.
+/// PUTF and put-notify wait-set ride inside the [`ForwardTarget`] the tail
+/// is handed, so only the target that needs them carries them.
 #[derive(Clone, Copy)]
 struct TailCtx<'a> {
     /// The cycle's `ProcessPlan`, so the tail's two type-static

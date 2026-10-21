@@ -964,6 +964,18 @@ impl<'a> HeldInstance<'a> {
         let visited = &mut **self.visited.borrow_mut();
         self.db.process_from_held(record.as_ref(), visited)
     }
+
+    /// C `recGblFwdLink(precord)` on the held record outside a process, as
+    /// swait's `notifyCallback` calls it (swaitRecord.c:378-386): the
+    /// forward link, then the put-notify completion and its restart check
+    /// that a cycle's tail makes.
+    pub fn fwd_link(&self) {
+        let name = self.rec.unframed().name().as_bytes();
+        let visited = &mut **self.visited.borrow_mut();
+        self.db.run_forward_link_tail(name, self.rec, visited);
+        let exit = self.rec.read().pact_exit_without_release();
+        self.db.end_process_cycle(name, self.rec, exit);
+    }
 }
 
 impl Drop for HeldInstance<'_> {

@@ -58,11 +58,23 @@ async fn settle_outv(db: &PvDatabase, want: u16) {
     panic!("W.OUTV never reached {want}: {:?}", db.get_pv("W.OUTV"));
 }
 
+/// Wait until `pv` reads `want`: the output is a CA put.
+async fn settle(db: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..400 {
+        if num(db, pv) == want {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{pv} never reached {want}: {}", num(db, pv));
+}
+
 #[epics_macros_rs::epics_test]
 async fn a_runtime_outn_put_stores_the_name_and_moves_the_output() {
     let db = loaded().await;
+    settle_outv(&db, PV_OK).await;
     process(&db).await;
-    assert_eq!(num(&db, "T1.VAL"), 5.0, "the loaded OUTN");
+    settle(&db, "T1.VAL", 5.0).await;
 
     db.put_pv_no_process("W.OUTN", EpicsValue::String("T2".into()))
         .await
@@ -76,7 +88,7 @@ async fn a_runtime_outn_put_stores_the_name_and_moves_the_output() {
         .await
         .unwrap();
     process(&db).await;
-    assert_eq!(num(&db, "T2.VAL"), 7.0, "the output follows OUTN");
+    settle(&db, "T2.VAL", 7.0).await;
     assert_eq!(num(&db, "T1.VAL"), 5.0, "the old target is left");
 
     // A blank name is no output at all: `special` sets NO_PV and clears the
@@ -89,6 +101,7 @@ async fn a_runtime_outn_put_stores_the_name_and_moves_the_output() {
         .await
         .unwrap();
     process(&db).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(num(&db, "T2.VAL"), 7.0, "a blank OUTN writes nothing");
 }
 
@@ -107,7 +120,7 @@ async fn a_db_put_and_a_numeric_put_store_outn_too() {
     );
     settle_outv(&db, PV_OK).await;
     process(&db).await;
-    assert_eq!(num(&db, "T2.VAL"), 5.0, "dbPut moves the output");
+    settle(&db, "T2.VAL", 5.0).await;
 
     db.put_pv_no_process("W.OUTN", EpicsValue::Double(3.0))
         .await

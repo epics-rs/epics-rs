@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::server::database::{AsyncDbHandle, PostItem, PostRule};
-use crate::server::record::{LinkType, parse_link_v2};
+use crate::server::record::LinkType;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Generation gate for spawned async link-status refreshes, one generation
@@ -445,10 +445,11 @@ pub fn classify_link(
 /// for exactly one of them.
 ///
 /// Six records own link-status fields, not four: `sseq` (DOLV/LNKV/DT/LT/WERR)
-/// and `swait` (PVxV) post theirs from their own `refresh_link_status`, because
-/// their field sets are not one status enum per link. Both post `DBE_VALUE`
-/// alone — `sseqRecord.c:221`, `:240`, `:910`; `swaitRecord.c:527`, `:550`,
-/// `:923` — so a mask change here is only half of that family.
+/// posts its own from `refresh_link_status` and `swait` (PVxV) from its
+/// `recDynLink` callbacks, because their field sets are not one status enum
+/// per link. Both post `DBE_VALUE` alone — `sseqRecord.c:221`, `:240`, `:910`;
+/// `swaitRecord.c:527`, `:550`, `:923` — so a mask change here is only half of
+/// that family.
 pub fn post_link_status(
     ctx: Option<&(crate::types::RecordName, AsyncDbHandle)>,
     generation: &LinkStatusGen,
@@ -526,34 +527,6 @@ pub const SWAIT_PV_STATUS_CHOICES: &[&str] = &["PV OK", "PV BAD", "No PV"];
 pub const SWAIT_PV_OK: i16 = 0;
 pub const SWAIT_PV_NC: i16 = 1;
 pub const SWAIT_NO_PV: i16 = 2;
-
-/// Classify one swait PV name (`INAN`..`INLN`, `DOLN`, `OUTN`) into its
-/// `menu(swaitINAV)` status.
-///
-/// C `swaitRecord.c::init_record` (338-373) and `::special` (507-559) drive
-/// this: a blank name is `NO_PV`, and any other name is set `PV_NC` and handed
-/// to `recDynLinkAddInput`/`AddOutput`, after which `pvSearchCallback`
-/// (901-926) flips it to `PV_OK` once the search connects and back to `PV_NC`
-/// when it does not. epics-base-rs has no CA client, so "connected" is
-/// "resolves to a field on this IOC": a DB-syntax name that addresses a local
-/// record is `PV_OK`, and every name that cannot be resolved here — an unknown
-/// record, a CA/PVA target, a bare constant that is not a PV name at all —
-/// stays at the `PV_NC` C leaves it in until a search succeeds.
-pub fn classify_swait_pv(handle: &AsyncDbHandle, name: impl AsRef<[u8]>) -> i16 {
-    let name = name.as_ref();
-    if crate::server::record::trim_link_text(name).is_empty() {
-        return SWAIT_NO_PV;
-    }
-    // Same `iocInit` boundary as `classify_link`: this only ever runs against
-    // the completed database, so a forward-referenced local record is PV_OK.
-    match parse_link_v2(name).link_type() {
-        LinkType::Db => match handle.link_target_field_type(name) {
-            Some(_) => SWAIT_PV_OK,
-            None => SWAIT_PV_NC,
-        },
-        _ => SWAIT_PV_NC,
-    }
-}
 
 #[cfg(test)]
 mod tests {

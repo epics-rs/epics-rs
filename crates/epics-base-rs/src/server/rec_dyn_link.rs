@@ -40,7 +40,7 @@ pub static REC_DYN_LINK_DEBUG: AtomicI32 = AtomicI32::new(0);
 pub static REC_DYN_LINK_QSIZE: AtomicI32 = AtomicI32::new(256);
 
 /// The iocsh variables `sscanSupport.dbd` declares for `recDynLink.c`.
-pub(crate) fn iocsh_vars() -> Vec<epics_base_rs::server::iocsh::vars::VarDef> {
+pub fn iocsh_vars() -> Vec<epics_base_rs::server::iocsh::vars::VarDef> {
     use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
     vec![
         VarDef {

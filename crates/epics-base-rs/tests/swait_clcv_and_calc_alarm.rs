@@ -157,6 +157,8 @@ async fn r10_67_a_broken_calc_raises_calc_alarm_every_cycle() {
 /// failure. C raises READ_ALARM instead, and nothing else.
 #[epics_macros_rs::epics_test]
 async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
+    // C `callbackInit`: INAN's link events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(1.0)))
         .await
@@ -168,6 +170,13 @@ async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
     w.put_field("INAN", EpicsValue::String("SRC".into()))
         .unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
+    // INAV reads PV OK once INAN's search connects.
+    for _ in 0..400 {
+        if field(&db, "W", "INAV").await == EpicsValue::Enum(0) {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
 
     process(&db, "W").await;
     assert_eq!(alarm(&db, "W").await, (AlarmSeverity::Invalid, CALC_ALARM));

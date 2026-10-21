@@ -1497,8 +1497,8 @@ mod link_cache {
     }
 
     impl PreparedCommonLink {
-        /// `Some` when `field` is one of the `dbCommon` link fields (and
-        /// swait's `OUTN`) and `value` a string.
+        /// `Some` when `field` is one of the `dbCommon` link fields and
+        /// `value` a string.
         pub(crate) fn for_put(field: &str, value: &crate::types::EpicsValue) -> Option<Self> {
             let crate::types::EpicsValue::String(text) = value else {
                 return None;
@@ -1511,7 +1511,6 @@ mod link_cache {
                 ("OUT", LinkFieldType::Out),
                 ("TSEL", LinkFieldType::In),
                 ("SDIS", LinkFieldType::In),
-                ("OUTN", LinkFieldType::Out),
             ]
             .into_iter()
             .find(|(f, _)| f.eq_ignore_ascii_case(field))?;
@@ -4920,7 +4919,6 @@ enum CommonField {
     Hsv,
     Lsv,
     Llsv,
-    Outn,
 }
 
 impl CommonField {
@@ -4974,7 +4972,6 @@ impl CommonField {
             "HSV" => Self::Hsv,
             "LSV" => Self::Lsv,
             "LLSV" => Self::Llsv,
-            "OUTN" => Self::Outn,
             _ => return None,
         })
     }
@@ -10142,14 +10139,6 @@ impl RecordInstance {
                 .analog_alarm
                 .as_ref()
                 .map(|a| EpicsValue::Short(a.llsv)),
-            // swait OUTN is aliased to common.text.out
-            CommonField::Outn => {
-                if self.record.record_type() == "swait" {
-                    Some(EpicsValue::String(self.common.text.out.clone().into()))
-                } else {
-                    None
-                }
-            }
             _ => None,
         }
     }
@@ -10302,9 +10291,14 @@ impl RecordInstance {
         }
         // A soft device is served by the framework, so no device object
         // says nothing about C's `precord->dset`; its devSup row does. A row
-        // with the hook but no object to answer it is `:290-293`'s NULL list.
+        // with the hook but no object to answer it is `:290-293`'s NULL list,
+        // unless the record keeps the list the hook returns.
         let Some(dev) = self.device.as_mut() else {
-            return ScanAdd::Done(Err(Some(if row.is_none() { NO_DSET } else { NO_LIST })));
+            return ScanAdd::Done(match row {
+                None => Err(Some(NO_DSET)),
+                Some(_) if self.record.owns_io_intr_list() => Ok(()),
+                Some(_) => Err(Some(NO_LIST)),
+            });
         };
         if dev.lends_held() {
             return ScanAdd::Owed;
@@ -11390,15 +11384,6 @@ impl RecordInstance {
             "LLSV" => {
                 if let Some(a) = &mut self.common.analog_alarm {
                     a.llsv = menu_ordinal_raw(&value);
-                }
-            }
-            // swait's OUTN, a `DBF_STRING` the port keeps in the OUT slot so the
-            // framework dispatches the output.
-            "OUTN" => {
-                if let Some(link) = link {
-                    std::mem::swap(&mut self.common.text.out, &mut link.text);
-                    // Bare OUT link is NPP — see the "OUT" arm.
-                    self.swap_link_cache("OUT", &mut link.parsed);
                 }
             }
             // C `dbNameToAddr` (dbAccess.c:660-676) resolves the field part

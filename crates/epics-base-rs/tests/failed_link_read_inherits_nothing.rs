@@ -34,9 +34,11 @@
 //! rule, and the two disagree. Measured by reverting the gate in
 //! `read_link_with_alarm` and running this file:
 //! `a_failed_inline_read_does_not_inherit_the_sources_status` fails (STAT 4
-//! where 14 is required) and `a_failed_dynlink_read_does_not_inherit_the_sources_status`
-//! fails (STAT 4 where anything else is required) — those two are the
-//! fails-first proof. `a_failed_deferred_read_does_not_inherit_the_sources_status`
+//! where 14 is required) — the fails-first proof.
+//! `a_failed_dynlink_read_does_not_inherit_the_sources_status` failed too
+//! while swait's INAN was read on that path; it is now read through its
+//! `recDynLink`, so the case guards that link instead.
+//! `a_failed_deferred_read_does_not_inherit_the_sources_status`
 //! PASSES with the gate reverted, because that path raises `setLinkAlarm`
 //! before it folds the collected alarms, so the wrong status arrived second at
 //! equal severity and the strict-greater test dropped it. It is a regression

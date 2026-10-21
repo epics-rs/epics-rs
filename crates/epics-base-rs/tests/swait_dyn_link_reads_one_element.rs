@@ -11,12 +11,19 @@
 //! WE [5,6]  SW A=5 VAL=6   SWD DOLD=5 SWDO=5
 //! WE []     SW A=0 VAL=1   SWD DOLD=0 SWDO=0   all NO_ALARM
 //! ```
+//!
+//! Here each is processed until the phase's value shows: a link takes it on
+//! the monitor after the put.
+
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
+
+const PV_OK: f64 = 0.0;
 
 const DB: &str = r#"
 record(waveform, "WE") { field(FTVL, "DOUBLE") field(NELM, "4") }
@@ -36,13 +43,20 @@ fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
     db.get_record(rec).unwrap().read().common.sevr
 }
 
-async fn phase(db: &PvDatabase, we: Vec<f64>) -> [f64; 4] {
+/// Put WE, then process SW and SWD until SW.A and SWDO read `want`.
+async fn phase(db: &PvDatabase, we: Vec<f64>, want: f64) -> [f64; 4] {
     db.put_record_field_from_ca_no_notify("WE", "VAL", EpicsValue::DoubleArray(we.into()))
         .await
         .unwrap();
-    for rec in ["SW", "SWD"] {
-        let mut visited = epics_base_rs::server::database::ProcStack::new();
-        let _ = db.process_record_with_links(rec, &mut visited).await;
+    for _ in 0..400 {
+        for rec in ["SW", "SWD"] {
+            let mut visited = epics_base_rs::server::database::ProcStack::new();
+            let _ = db.process_record_with_links(rec, &mut visited).await;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        if field(db, "SW", "A") == want && field(db, "SWDO", "VAL") == want {
+            break;
+        }
     }
     [
         field(db, "SW", "A"),
@@ -61,8 +75,15 @@ async fn swait_reads_element_0_and_the_zero_fill_of_an_empty_source() {
         .build()
         .await
         .unwrap();
-    let full = phase(&db, vec![5.0, 6.0]).await;
-    let empty = phase(&db, Vec::new()).await;
+    let statuses = [("SW", "INAV"), ("SWD", "DOLV"), ("SWD", "OUTV")];
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while statuses.iter().any(|(r, f)| field(&db, r, f) != PV_OK)
+        && std::time::Instant::now() < deadline
+    {
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    let full = phase(&db, vec![5.0, 6.0], 5.0).await;
+    let empty = phase(&db, Vec::new(), 0.0).await;
     let alarms = [sevr(&db, "SW"), sevr(&db, "SWD")];
     assert_eq!(
         (full, empty, alarms),

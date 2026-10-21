@@ -13,6 +13,7 @@ pub mod ioc_app;
 pub mod ioc_builder;
 pub mod iocsh;
 pub mod pv;
+pub mod rec_dyn_link;
 pub mod recgbl;
 pub mod record;
 pub mod records;

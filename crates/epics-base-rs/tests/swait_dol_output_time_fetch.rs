@@ -23,16 +23,63 @@
 //! The fetch is at OUTPUT time, not in the input-fetch phase: it happens only
 //! on a cycle whose output fires (ODLY delay-end included), so a non-firing
 //! cycle neither refreshes DOLD nor posts it.
+//!
+//! DOL and OUT are `recDynLink`s: the DOL value is the link's last monitor and
+//! the OUT write is a CA put, so each step below waits for what it reads.
 
-use epics_base_rs::server::database::{PvDatabase, RecordLoad};
+use std::time::Duration;
+
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
 
+const PV_OK: f64 = 0.0;
+
+fn num(db: &PvDatabase, pv: &str) -> f64 {
+    db.get_pv(pv).unwrap().to_f64().unwrap()
+}
+
+async fn wait(ms: u64) {
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Wait until `pv` reads `want`, and fail naming it if it never does.
+async fn settle(db: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..400 {
+        if num(db, pv) == want {
+            return;
+        }
+        wait(5).await;
+    }
+    panic!("{pv} never reached {want}: {}", num(db, pv));
+}
+
+/// A source change reaches DOL on the link's monitor; nothing on the record
+/// shows when it has landed.
+async fn monitor_lands() {
+    wait(300).await;
+}
+
+/// Process W until `pv` reads `want`: what DOL carries shows only on OUT.
+async fn process_until(db: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..400 {
+        let mut v = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links("W", &mut v).await.unwrap();
+        wait(5).await;
+        if num(db, pv) == want {
+            return;
+        }
+    }
+    panic!("{pv} never reached {want}: {}", num(db, pv));
+}
+
 /// swait "W": CALC="A" (VAL := A = 1), OUT→W_TGT, DOLD pre-put to 99 — the
 /// stale value the port used to drive out. `dopt`/`doln`/`oopt`/`odly` per arg.
 async fn swait_db(dopt: i16, doln: &str, oopt: i16, odly: f32) -> PvDatabase {
+    // C `callbackInit`: the links' events are applied on a callback band.
+    epics_base_rs::runtime::task::background_init();
     let db = PvDatabase::new();
     db.add_record("W_SRC", Box::new(AiRecord::new(5.0)))
         .await
@@ -51,15 +98,16 @@ async fn swait_db(dopt: i16, doln: &str, oopt: i16, odly: f32) -> PvDatabase {
         w.put_field("DOLN", EpicsValue::String(doln.into()))
             .unwrap();
     }
+    w.put_field("OUTN", EpicsValue::String("W_TGT".into()))
+        .unwrap();
     w.put_field("DOLD", EpicsValue::Double(99.0)).unwrap();
-    // OUTN as the loader stores it (populates parsed_out).
-    db.add_loaded_record(
-        "W",
-        Box::new(w),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W_TGT".into()))]),
-    )
-    .await
-    .unwrap();
+    db.add_record("W", Box::new(w)).await.unwrap();
+    // `init_record` adds the DOL and OUT links.
+    db.ioc_init().await;
+    settle(&db, "W.OUTV", PV_OK).await;
+    if !doln.is_empty() {
+        settle(&db, "W.DOLV", PV_OK).await;
+    }
     db
 }
 
@@ -73,31 +121,20 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
 async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
     let db = swait_db(1, "W_SRC", 0, 0.0).await;
 
-    let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("W", &mut v).await.unwrap();
-
+    process_until(&db, "W_TGT", 5.0).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(5.0),
         "execOutput fetches DOL into DOLD (swaitRecord.c:767); the pre-put 99 \
-         is overwritten by the link value"
-    );
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(5.0),
-        "DOPT=Use DOL writes DOLD — the freshly fetched 5, not the stale 99 \
-         and not VAL (=1)"
+         is overwritten by the link value, and DOPT=Use DOL writes it — not \
+         the stale 99 and not VAL (=1)"
     );
 
     // The fetch is live on EVERY firing cycle: move the source, re-process.
-    db.put_pv("W_SRC", EpicsValue::Double(6.5)).await.unwrap();
-    let mut v = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("W", &mut v).await.unwrap();
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(6.5),
-        "the next firing cycle re-fetches DOL: OUT follows the source"
-    );
+    db.put_pv_and_post("W_SRC", EpicsValue::Double(6.5))
+        .await
+        .unwrap();
+    process_until(&db, "W_TGT", 6.5).await;
 }
 
 /// DOPT="Use VAL" never reads DOL — C guards the `recDynLinkGet` with
@@ -109,15 +146,11 @@ async fn r9_65_use_val_never_reads_the_dol_link() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
+    settle(&db, "W_TGT", 1.0).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(99.0),
         "DOPT=Use VAL: C never fetches DOL, so the client-put DOLD stands"
-    );
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(1.0),
-        "DOPT=Use VAL writes VAL (=A=1)"
     );
 }
 
@@ -130,11 +163,7 @@ async fn r9_65_use_dol_without_a_link_writes_the_client_put_dold() {
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
 
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(99.0),
-        "no DOL PV configured: the DOLD put by the client is the output value"
-    );
+    settle(&db, "W_TGT", 99.0).await;
 }
 
 /// A cycle whose output does not fire (OOPT="Never") must not read DOL at all
@@ -146,6 +175,7 @@ async fn r9_65_non_firing_cycle_does_not_refresh_dold() {
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v).await.unwrap();
+    wait(100).await;
 
     assert_eq!(
         field(&db, "W", "DOLD").await,
@@ -153,11 +183,7 @@ async fn r9_65_non_firing_cycle_does_not_refresh_dold() {
         "OOPT=Never: execOutput never runs, so DOL is never fetched and DOLD \
          keeps 99"
     );
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(0.0),
-        "OOPT=Never writes no output at all"
-    );
+    assert_eq!(num(&db, "W_TGT"), 0.0, "OOPT=Never writes no output at all");
 }
 
 /// ODLY>0: C schedules `execOutput` on the watchdog, so the DOL fetch happens
@@ -169,6 +195,7 @@ async fn r9_65_odly_fetches_dol_at_delay_end_not_delay_start() {
     // Delaying cycle: C defers execOutput — no fetch, no write.
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W", &mut v1).await.unwrap();
+    wait(100).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(99.0),
@@ -176,26 +203,25 @@ async fn r9_65_odly_fetches_dol_at_delay_end_not_delay_start() {
          execOutput, which the watchdog has not run yet"
     );
     assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(0.0),
+        num(&db, "W_TGT"),
+        0.0,
         "the delay-start cycle writes no output"
     );
 
     // Source moves during the delay window.
-    db.put_pv("W_SRC", EpicsValue::Double(8.0)).await.unwrap();
+    db.put_pv_and_post("W_SRC", EpicsValue::Double(8.0))
+        .await
+        .unwrap();
+    monitor_lands().await;
 
     // Continuation (watchdog cycle) = C's execOutput: fetch DOL, then write.
     let mut v2 = epics_base_rs::server::database::ProcStack::new();
     db.process_record_continuation("W", &mut v2).await.unwrap();
+    settle(&db, "W_TGT", 8.0).await;
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(8.0),
         "the delay-END fetch sees the value the source holds NOW (8), not the \
          one it held when the delay started (5)"
-    );
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(8.0),
-        "the continuation writes the freshly fetched DOLD"
     );
 }

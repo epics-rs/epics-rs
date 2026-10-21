@@ -4705,7 +4705,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// HERE and nowhere else; it must not carry a second, separately-drifting
     /// `is_put_complete` override to say the same thing.
     ///
-    /// Six types gate the call, each transcribing one C line:
+    /// Seven types gate the call, each transcribing its C lines:
     ///
     /// - `busy` (`busyRecord.c:271`): `if ((prec->val == 0) || (prec->oval ==
     ///   0)) recGblFwdLink(prec);`
@@ -4718,6 +4718,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// - `throttle` (`throttleRecord.c:308`): the call is commented out in
     ///   `process()` and fired only from `valuePut`'s real-OUT-write branch
     ///   (`:582`)
+    /// - `swait` (`swaitRecord.c:477`, `:791-795`): `if (!async)` and
+    ///   `execOutput`'s `else`; OUT's put callback makes the rest
+    ///   (`:378-386`)
     ///
     /// Default: true — the standard record, which calls it unconditionally.
     fn should_fire_forward_link(&self) -> bool {
@@ -6268,6 +6271,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Passive. Default: accept.
     fn io_intr_scan_add(&mut self) -> bool {
         true
+    }
+
+    /// The record's own C file defines its dset, whose `get_ioint_info`
+    /// hands back a list the record keeps: swait's `devSWaitIoEvent` answers
+    /// the `ioscanpvt` its `init_record` made (swaitRecord.c:227-231, 295).
+    /// With no device object to ask, `scanAdd` takes the answer from here.
+    /// Default: no list.
+    fn owns_io_intr_list(&self) -> bool {
+        false
     }
 
     /// The link writes a C `special()` performs *itself*, inside `dbPut`.
@@ -9187,8 +9199,8 @@ pub(crate) mod tests {
                 .union(CycleHooks::LINK_CHECK),
             "swait" => CycleHooks::WRITE_POSTED
                 .union(CycleHooks::PUT_REPORT)
-                .union(CycleHooks::INPUT_FETCH)
-                .union(CycleHooks::OUTPUT_HOOKS),
+                .union(CycleHooks::OUTPUT_HOOKS)
+                .union(CycleHooks::CONTEXT),
             "mbbi" | "mbbo" | "lso" | "lsi" => CycleHooks::WRITE_POSTED,
             "transform" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
@@ -9592,15 +9604,7 @@ pub(crate) mod tests {
     #[test]
     fn a_multi_input_store_is_what_put_field_internal_stores() {
         use crate::server::record::dbd_generated::RECORD_TYPES;
-        // `swait` is module-owned, so base's registry does not build it.
-        let make = |record_type: &str| -> Option<Box<dyn Record>> {
-            match record_type {
-                "swait" => Some(Box::new(
-                    crate::server::records::swait::SwaitRecord::default(),
-                )),
-                _ => crate::server::db_loader::create_record(record_type).ok(),
-            }
-        };
+        let make = |record_type: &str| crate::server::db_loader::create_record(record_type).ok();
         let mut reached = Vec::new();
         for record_type in RECORD_TYPES {
             let Some(probe) = make(record_type) else {
@@ -9624,7 +9628,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        for record_type in ["sel", "calcout", "swait"] {
+        for record_type in ["sel", "calcout"] {
             assert!(reached.contains(&record_type), "{record_type} not reached");
         }
     }

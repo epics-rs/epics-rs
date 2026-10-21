@@ -4,7 +4,6 @@ use crate::server::recgbl::PutReport;
 use crate::server::record::record_instance::{LinkScanMove, ScanMove};
 use crate::server::record::{
     AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordCell, RecordInstance,
-    declared_field,
 };
 use crate::server::snapshot::Snapshot;
 use crate::types::{EpicsValue, PvString, RecordName};
@@ -2686,25 +2685,6 @@ impl PvDatabase {
         }
     }
 
-    /// swait's `OUTN` is a `DBF_STRING` (`swaitRecord.dbd:158-165`), so no
-    /// link-field rule applies to its put, but the port keeps the name in the
-    /// OUT slot it dispatches the output through: the name a put stores is
-    /// the link it parses. Made under the hold from the converted value, so
-    /// every put route and request type stores; the relink takes no lock.
-    fn parse_outn_put(
-        &self,
-        rec: &RecordCell,
-        field: &str,
-        value: &EpicsValue,
-    ) -> Option<PreparedCommonLink> {
-        if field != "OUTN" || declared_field(rec.rdes().record_type, field).is_none() {
-            return None;
-        }
-        let mut common = PreparedCommonLink::for_put(field, value)?;
-        common.relink(|parsed, ftype| self.add_link(parsed, ftype));
-        Some(common)
-    }
-
     /// Drop `held`'s gate, then settle the put made under it.
     fn settle_held<T, E: AsRef<CaError>>(
         &self,
@@ -3180,9 +3160,6 @@ impl PvDatabase {
                             PutVia::DbPutField { common, .. } => &mut **common,
                             PutVia::DbPut => &mut no_common,
                         };
-                        if common.is_none() {
-                            *common = self.parse_outn_put(rec, field, &v);
-                        }
                         put_common(&mut instance, field, v, common, &mut burst, tail)
                             .map(|r| common_result = r)
                     }

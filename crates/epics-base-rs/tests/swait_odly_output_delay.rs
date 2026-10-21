@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::{PvDatabase, RecordLoad};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, ScanType};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -69,6 +69,29 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
     db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
 
+/// OUTN put as a client puts it: `special` adds the output `recDynLink`.
+/// Once per test: it is also C's `callbackInit`, since the link's events are
+/// applied on a callback band.
+async fn link_out(db: &PvDatabase, rec: &str, target: &str) {
+    epics_base_rs::runtime::task::background_init();
+    db.put_pv_no_process(&format!("{rec}.OUTN"), EpicsValue::String(target.into()))
+        .await
+        .unwrap();
+    settle(db, &format!("{rec}.OUTV"), 0.0).await;
+}
+
+/// Wait until `pv` reads `want` — the OUT write is a CA put — and fail naming
+/// it if it never does.
+async fn settle(db: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..400 {
+        if db.get_pv(pv).unwrap().to_f64() == Some(want) {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{pv} never reached {want}: {:?}", db.get_pv(pv));
+}
+
 /// ODLY>0: the delaying cycle defers, the continuation drives OUT to OVAL and
 /// posts OEVT exactly once.
 #[epics_macros_rs::epics_test]
@@ -92,14 +115,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(9)).unwrap();
-    // OUTN as the loader stores it, populating parsed_out for output dispatch.
-    db.add_loaded_record(
-        "W_ODLY",
-        Box::new(w),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W_TGT".into()))]),
-    )
-    .await
-    .unwrap();
+    db.add_record("W_ODLY", Box::new(w)).await.unwrap();
+    link_out(&db, "W_ODLY", "W_TGT").await;
 
     // Delaying cycle: ODLY>0 defers. OUT not written, OEVT not posted.
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
@@ -131,12 +148,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
         }
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
-    assert_eq!(
-        db.get_pv("W_TGT").unwrap().to_f64(),
-        Some(42.0),
-        "continuation must drive OUT to OVAL=42 after the ODLY delay"
-    );
+    // Continuation drives OUT to OVAL=42 after the ODLY delay.
+    settle(&db, "W_TGT", 42.0).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,
@@ -170,13 +183,8 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(13)).unwrap();
-    db.add_loaded_record(
-        "W3_ODLY",
-        Box::new(w),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W3_TGT".into()))]),
-    )
-    .await
-    .unwrap();
+    db.add_record("W3_ODLY", Box::new(w)).await.unwrap();
+    link_out(&db, "W3_ODLY", "W3_TGT").await;
 
     // Delaying cycle: PACT held, output deferred.
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
@@ -219,12 +227,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         }
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
-    assert_eq!(
-        db.get_pv("W3_TGT").unwrap().to_f64(),
-        Some(42.0),
-        "continuation drives OUT to OVAL=42 after the delay"
-    );
+    settle(&db, "W3_TGT", 42.0).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,
@@ -259,13 +262,8 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(17)).unwrap();
-    db.add_loaded_record(
-        "W4_ODLY",
-        Box::new(w),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W4_TGT".into()))]),
-    )
-    .await
-    .unwrap();
+    db.add_record("W4_ODLY", Box::new(w)).await.unwrap();
+    link_out(&db, "W4_ODLY", "W4_TGT").await;
 
     // Subscribe to VAL (DBE_VALUE|DBE_LOG) BEFORE processing.
     let mut sub = DbSubscription::subscribe(&db, "W4_ODLY.VAL")
@@ -307,11 +305,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     db.process_record_continuation("W4_ODLY", &mut v2)
         .await
         .unwrap();
-    assert_eq!(
-        db.get_pv("W4_TGT").unwrap().to_f64(),
-        Some(42.0),
-        "continuation drives OUT to OVAL=42 after the delay"
-    );
+    settle(&db, "W4_TGT", 42.0).await;
     let re_post = epics_base_rs::runtime::task::timeout(
         std::time::Duration::from_millis(150),
         sub.recv_f64(),
@@ -408,13 +402,8 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
     // ODLY default 0 → synchronous.
     w.put_field("OEVT", EpicsValue::UShort(11)).unwrap();
-    db.add_loaded_record(
-        "W2_ODLY",
-        Box::new(w),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("W2_TGT".into()))]),
-    )
-    .await
-    .unwrap();
+    db.add_record("W2_ODLY", Box::new(w)).await.unwrap();
+    link_out(&db, "W2_ODLY", "W2_TGT").await;
 
     let mut v = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("W2_ODLY", &mut v)
@@ -426,12 +415,8 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
         }
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
-    assert_eq!(
-        db.get_pv("W2_TGT").unwrap().to_f64(),
-        Some(7.0),
-        "ODLY=0: OUT written to OVAL=7 on the same cycle"
-    );
+    // ODLY=0: OUT written to OVAL=7 from the same cycle.
+    settle(&db, "W2_TGT", 7.0).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,

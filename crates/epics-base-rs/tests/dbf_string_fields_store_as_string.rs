@@ -115,10 +115,11 @@ fn every_dbf_string_field_reports_dbf_string() {
         "a DBF_STRING field stored as another type rejects the .db text C accepts: {wrong:#?}"
     );
     assert_eq!(
-        scanned, 522,
+        scanned, 523,
         "record-owned DBF_STRING fields on this tree; a change here means a \
          field left or joined the sweep and the new count needs reading. \
          507 before scalcout began answering for PAA..PLL, which this port \
-         serves as read-only scalar DBF_STRING (calc#42); 521 with event.SVAL and stringin.SVAL; 522 with scalcout.POSV"
+         serves as read-only scalar DBF_STRING (calc#42); 521 with event.SVAL and stringin.SVAL; 522 with scalcout.POSV; 523 with \
+         swait.OUTN, a record field since it names a recDynLink"
     );
 }

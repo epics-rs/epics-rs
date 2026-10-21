@@ -205,10 +205,7 @@ impl ClientMonitor for LocalClientMonitor {
     async fn next(&mut self) -> Option<Snapshot> {
         loop {
             let event = self.monitor.reader.recv().await?;
-            if let Some(mut snapshot) = self.monitor.state_notify(event) {
-                if self.count != 0 {
-                    snapshot.value.truncate(self.count as usize);
-                }
+            if let Some(snapshot) = self.monitor.state_notify(event, self.count) {
                 return Some(snapshot);
             }
         }

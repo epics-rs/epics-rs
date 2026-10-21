@@ -32,7 +32,8 @@ use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext
 use crate::server::record::ProcessCompletion;
 use crate::server::snapshot::Snapshot;
 use crate::types::{
-    DBR_CTRL_DOUBLE, DbFieldType, EpicsValue, RecordName, decode_dbr, encode_dbr_into,
+    DBR_CTRL_DOUBLE, DbFieldType, EpicsValue, RecordName, dbr_buffer_size, decode_dbr,
+    encode_dbr_into, native_type_for_dbr,
 };
 
 /// dbCa's monitor mask, `ca_add_array_event`'s `DBE_VALUE | DBE_ALARM`
@@ -742,7 +743,8 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
             std::task::Poll::Ready(None) => return std::task::Poll::Ready(false),
             std::task::Poll::Ready(Some(event)) => event,
         };
-        match monitor.state_notify(event) {
+        // dbCa's native monitor is of count 0 (`dbCa.c:1290-1293`).
+        match monitor.state_notify(event, 0) {
             Some(snapshot) => {
                 state.cache.store(Some(Arc::new(snapshot)));
                 state.process.request();
@@ -822,12 +824,7 @@ impl LocalChannel {
         .ok()?;
         let mut buf = Vec::new();
         encode_dbr_into(&mut buf, dbr_type, &snapshot).ok()?;
-        let n = if count == 0 {
-            snapshot.value.count()
-        } else {
-            count
-        };
-        decode_dbr(dbr_type, &buf, n as usize).ok()
+        decode_counted(dbr_type, buf, snapshot.value.count(), count)
     }
 
     /// `dbSubscriptionIO` (`dbSubscriptionIO.cpp:38-56`): `db_add_event`
@@ -1022,8 +1019,8 @@ pub(super) struct LocalMonitor {
 
 impl LocalMonitor {
     /// `dbContext::callStateNotify` (`dbContext.cpp:141-189`): the event as
-    /// a `dbr_type` value of its current element count.
-    pub(super) fn state_notify(&self, event: MonitorEvent) -> Option<Snapshot> {
+    /// a `dbr_type` value of `count` elements, 0 for its current count.
+    pub(super) fn state_notify(&self, event: MonitorEvent, count: u32) -> Option<Snapshot> {
         let mut read = None;
         let update = with_live_options(self.dbr_type, Cow::Owned(event), &mut read, || {
             let db = PvDatabase {
@@ -1032,11 +1029,23 @@ impl LocalMonitor {
             channel_io::get_full_snapshot(&db, &self.target)
         })?;
         let mut log = None;
-        let delivery = update.prepare(&self.stage, 0, &mut log)?;
+        let delivery = update.prepare(&self.stage, count, &mut log)?;
         let mut buf = Vec::new();
         delivery.encode_dbr_into(&mut buf, self.dbr_type).ok()?;
-        decode_dbr(self.dbr_type, &buf, delivery.count() as usize).ok()
+        decode_counted(self.dbr_type, buf, delivery.count(), count)
     }
+}
+
+/// `buf`, an encode of `carried` elements, as the `dbr_type` buffer
+/// `dbChannel_get` fills for `count` (`db_access.c:121-138`): cut to
+/// `count`, or zero padded to it; 0 keeps `carried`, `dbChannel_get_count`.
+fn decode_counted(dbr_type: u16, mut buf: Vec<u8>, carried: u32, count: u32) -> Option<Snapshot> {
+    let n = if count == 0 { carried } else { count } as usize;
+    let size = dbr_buffer_size(dbr_type, native_type_for_dbr(dbr_type).ok()?, n);
+    if buf.len() < size {
+        buf.resize(size, 0);
+    }
+    decode_dbr(dbr_type, &buf, n).ok()
 }
 
 impl From<DbFieldType> for LinkDbfType {

@@ -4950,8 +4950,8 @@ async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
     );
 }
 
-/// R6-9 boundary — `OUTN` exists only on `swait` (it aliases `common.text.out`
-/// there). On any other record type C has no such field, so the put is an
+/// R6-9 boundary — `OUTN` exists only on `swait` (its output `recDynLink`
+/// name). On any other record type C has no such field, so the put is an
 /// `S_dbLib_fieldNotFound` like any other unknown name; the port's `OUTN` arm
 /// used to swallow it.
 #[epics_macros_rs::epics_test]
@@ -4962,13 +4962,12 @@ async fn r6_9_outn_is_swait_only() {
     db.add_record("OUTN_AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.add_loaded_record(
-        "OUTN_SW",
-        Box::new(SwaitRecord::default()),
-        RecordLoad::from_common_fields(vec![("OUTN".into(), EpicsValue::String("TGT".into()))]),
-    )
-    .await
-    .expect("OUTN on swait must still be accepted");
+    db.add_record("OUTN_SW", Box::new(SwaitRecord::default()))
+        .await
+        .unwrap();
+    db.put_pv_no_process("OUTN_SW.OUTN", EpicsValue::String("TGT".into()))
+        .await
+        .expect("OUTN on swait must still be accepted");
 
     let err = db
         .put_pv_no_process("OUTN_AO.OUTN", EpicsValue::String("TGT".into()))
@@ -4976,8 +4975,10 @@ async fn r6_9_outn_is_swait_only() {
         .expect_err("OUTN on a non-swait record is not a field");
     assert!(matches!(err, CaError::FieldNotFound(ref f) if f == "OUTN"));
 
-    let sw = db.get_record("OUTN_SW").unwrap();
-    assert_eq!(sw.read().common.text.out, "TGT");
+    assert_eq!(
+        db.get_pv("OUTN_SW.OUTN").unwrap(),
+        EpicsValue::String("TGT".into())
+    );
 }
 
 /// R6-6 — C `piniProcess` (`iocInit.c:607-626`) sweeps the database once per

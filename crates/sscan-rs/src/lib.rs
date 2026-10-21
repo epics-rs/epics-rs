@@ -48,7 +48,7 @@
     clippy::type_complexity
 )]
 
-pub mod rec_dyn_link;
+pub use epics_base_rs::server::rec_dyn_link;
 pub mod records;
 pub mod save_data;
 pub mod scan_prog;

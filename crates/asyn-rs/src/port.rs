@@ -3094,6 +3094,12 @@ pub trait PortDriver: Any + Send + Sync {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
 
+    /// Runs on the port at each interrupt edge, after the parameter sweep.
+    /// That sweep posts no array (asynPortDriver.cpp:846-865), so an array
+    /// posted while the gate was closed reached no record; a driver posts
+    /// here the arrays that hold its state rather than a frame's data.
+    fn interrupts_opened(&mut self) {}
+
     // --- AsynCommon ---
 
     /// The trivial driver's `pasynCommon->connect`: C's own does its transport

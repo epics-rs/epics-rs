@@ -1091,8 +1091,8 @@ impl ParamPost for Vec<Vec<ParamUpdate>> {
     fn hand_on(&mut self, _array: &Arc<NDArray>) {}
 }
 
-/// The `validate_*` half of an `NDPluginProcess`, callable through the port
-/// driver, which does not know the plugin's type.
+/// The `validate_*` half of an `NDPluginProcess` and its edge posts,
+/// callable through the port driver, which does not know the plugin's type.
 trait ValidateWrite: Send + Sync {
     fn int32(
         &self,
@@ -1120,6 +1120,7 @@ trait ValidateWrite: Send + Sync {
         base: &PortDriverBase,
     ) -> WriteOutcome<String>;
     fn posts_before_write(&self, reason: usize, value: i32) -> bool;
+    fn edge_posts(&self) -> Vec<ParamUpdate>;
 }
 
 impl<P: NDPluginProcess> ValidateWrite for P {
@@ -1166,6 +1167,9 @@ impl<P: NDPluginProcess> ValidateWrite for P {
     }
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         NDPluginProcess::posts_before_write(self, reason, value)
+    }
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        NDPluginProcess::edge_posts(self)
     }
 }
 
@@ -1337,6 +1341,13 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// Return param updates to be written back to the port driver.
     fn on_param_change(&self, _reason: usize, _params: &PluginParamSnapshot) -> ParamChangeResult {
         ParamChangeResult::empty()
+    }
+
+    /// The arrays posted again when the port's interrupts open
+    /// ([`PortDriver::interrupts_opened`]): an axis C builds from a frame,
+    /// which every record dropped if that frame came before the gate.
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        Vec::new()
     }
 
     /// Return a handle to the latest NDArray data for array reads.
@@ -2888,6 +2899,12 @@ impl PortDriver for PluginPortDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    fn interrupts_opened(&mut self) {
+        for post in self.validator.edge_posts() {
+            let _ = set_side(&mut self.base, post.into());
+        }
     }
 
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

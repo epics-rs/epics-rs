@@ -1328,7 +1328,8 @@ impl PortHandle {
     /// sweep queued behind those writes, since C's `iocRun` never waits for
     /// it (iocInit.c:259-260). Either is counted on the port's
     /// [`InterruptManager::edge_sweeps`] until it has run or is dropped
-    /// unrun.
+    /// unrun. [`PortDriver::interrupts_opened`] runs in the same hold, after
+    /// the sweep.
     pub(crate) fn boot_param_callbacks(&self) -> AsynResult<()> {
         // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
         let max_addr = self.max_addr.max(1);
@@ -1337,6 +1338,7 @@ impl PortHandle {
             for addr in 0..max_addr {
                 let _ = driver.base_mut().call_param_callbacks(addr);
             }
+            driver.interrupts_opened();
             drop(owed);
         });
         let op = RequestOp::WithDriverAfterQueue(call);

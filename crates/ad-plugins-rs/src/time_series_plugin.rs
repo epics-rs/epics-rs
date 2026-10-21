@@ -722,6 +722,19 @@ impl NDPluginProcess for TimeSeriesProcessor {
         result
     }
 
+    /// The axis the first frame posted (:422), again: C posts it next only
+    /// on a size, type or setting change, so a first frame that beat
+    /// `interruptAccept` left every record without it. C loses it the same
+    /// way when its first frame wins that race; that C bug is not copied.
+    /// Before any frame, nothing, as C's constructor axis (:160).
+    fn edge_posts(&self) -> Vec<ParamUpdate> {
+        let state = self.state.lock();
+        if state.num_signals_in < 0 {
+            return Vec::new();
+        }
+        state.create_axis_array()
+    }
+
     fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
         self.array_callbacks = array_callbacks;
     }

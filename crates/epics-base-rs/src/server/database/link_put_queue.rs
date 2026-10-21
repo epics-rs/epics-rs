@@ -999,7 +999,7 @@ async fn owner_loop(
         let notified = work.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        {
+        let serviced = {
             let Some(q) = queue.upgrade() else { return };
             match q.network() {
                 Some(reactor) => {
@@ -1054,7 +1054,8 @@ async fn owner_loop(
             // `CA_DBPROCESS` is queued behind every link's monitor queued by
             // then (`dbCa.c:1171-1173`, `:1209-1236`): the queue waits whole,
             // in wake order.
-            if ca_run.as_ref().is_none_or(|gate| gate.serviced()) {
+            let serviced = ca_run.as_ref().is_none_or(|gate| gate.serviced());
+            if serviced {
                 while let Some(slot) = q.take_ready_cp() {
                     slot.poll();
                 }
@@ -1066,8 +1067,13 @@ async fn owner_loop(
             }
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.
-        }
-        match ca_run.as_ref().filter(|gate| !gate.serviced()) {
+            serviced
+        };
+        // The poll's read, not a fresh one: a gate serviced since the poll
+        // skipped the CP slots ends `monitors_serviced` at once, where a
+        // fresh read would park on `work`, which their queued wakes never
+        // signal again.
+        match ca_run.as_ref().filter(|_| !serviced) {
             Some(gate) => {
                 let serviced = gate.monitors_serviced();
                 tokio::pin!(serviced);

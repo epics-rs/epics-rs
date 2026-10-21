@@ -9,9 +9,7 @@ use crate::server::database::LinkBacking;
 use crate::server::event_queue::{EventReader, EventUser, PostBurst};
 use crate::server::pv::{SubscribeRefused, Subscriber};
 use crate::server::recgbl::EventMask;
-use crate::server::snapshot::{
-    ControlInfo, DisplayInfo, EnumInfo, EnumStringForm, PropertySupport,
-};
+use crate::server::snapshot::{EnumStringForm, PropertySupport};
 use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
@@ -709,183 +707,38 @@ impl PactExit {
     }
 }
 
-/// Cached metadata for a record.
+/// Resolve a `Q:form` info-tag value to a `display.form` menu index.
 ///
-/// Stores the result of `populate_display_info` / `populate_control_info` /
-/// `populate_enum_info` so subsequent `snapshot_for_field` calls can skip
-/// rebuilding the metadata. The
-/// cache is rebuilt whenever a metadata-class field is written
-/// (EGU, PREC, HOPR, LOPR, alarm limits, DRVH/DRVL, state strings).
-///
-/// In a CA-only IOC this is a CPU win; in a hybrid CA + PVA IOC where
-/// every snapshot needs full metadata for NTScalar serialization, the
-/// cache eliminates redundant per-event populate work.
-#[derive(Clone, Default)]
-pub(crate) struct MetadataSnapshot {
-    pub display: Option<DisplayInfo>,
-    pub control: Option<ControlInfo>,
-    pub enums: Option<EnumInfo>,
-    /// `(hihi, high, low, lolo)` from [`RecordInstance::explicit_alarm_limits`]
-    /// — the record's OWN bands, which C `get_alarm_double` reads as struct
-    /// members (`calcRecord.c:205-221`). Record-level, not per-field: the
-    /// function ignores the field and answers from `rtype` alone, so which
-    /// FIELDS receive these is still [`RecordInstance::route_field_metadata`]'s
-    /// decision — only the eight `resolve_field` name lookups behind the
-    /// numbers move here, where a rebuild rather than a snapshot pays
-    /// for them.
-    pub alarm: (f64, f64, f64, f64),
-}
-
-/// [`RecordCold::metadata_cache`]: `None` until first built.
-type MetadataCell = Arc<arc_swap::ArcSwapOption<CachedMetadata>>;
-
-/// A built [`MetadataSnapshot`] and the source fields it was built from,
-/// as [`RecordInstance::metadata_sources`] reads them.
-pub(crate) struct CachedMetadata {
-    meta: MetadataSnapshot,
-    sources: Box<[KeptSource]>,
-}
-
-impl std::ops::Deref for CachedMetadata {
-    type Target = MetadataSnapshot;
-
-    fn deref(&self) -> &MetadataSnapshot {
-        &self.meta
-    }
-}
-
-/// One metadata-cache source field as [`RecordInstance::metadata_sources`]
-/// reads it. A field keeps one form, so the bits of two numeric types never
-/// meet.
-#[derive(Clone, Copy, PartialEq)]
-enum Source<'a> {
-    Str(&'a [u8]),
-    Bits(u64),
-    Absent,
-}
-
-impl<'a> Source<'a> {
-    fn of_slot(slot: crate::server::record::SlotRef<'a>) -> Self {
-        use crate::server::record::SlotRef as S;
-        match slot {
-            S::Str(s) => Self::Str(s.as_bytes()),
-            S::F64(v) => Self::Bits(v.to_bits()),
-            S::F32(v) => Self::Bits(u64::from(v.to_bits())),
-            S::I8(v) => Self::Bits(*v as u64),
-            S::U8(v) => Self::Bits(u64::from(*v)),
-            S::I16(v) => Self::Bits(*v as u64),
-            S::U16(v) => Self::Bits(u64::from(*v)),
-            S::I32(v) => Self::Bits(*v as u64),
-            S::U32(v) => Self::Bits(u64::from(*v)),
-            S::I64(v) => Self::Bits(*v as u64),
-            S::U64(v) => Self::Bits(*v),
-        }
-    }
-
-    fn of_value(value: Option<&'a EpicsValue>) -> Self {
-        use EpicsValue as V;
-        match value {
-            Some(V::String(s)) => Self::Str(s.as_bytes()),
-            Some(V::Short(v)) => Self::Bits(*v as u64),
-            Some(V::Float(v)) => Self::Bits(u64::from(v.to_bits())),
-            Some(V::Enum(v) | V::UShort(v)) => Self::Bits(u64::from(*v)),
-            Some(V::EnumWithChoices { index, .. }) => Self::Bits(u64::from(*index)),
-            Some(V::Char(v) | V::UChar(v)) => Self::Bits(u64::from(*v)),
-            Some(V::Long(v)) => Self::Bits(*v as u64),
-            Some(V::ULong(v)) => Self::Bits(u64::from(*v)),
-            Some(V::Double(v)) => Self::Bits(v.to_bits()),
-            Some(V::Int64(v)) => Self::Bits(*v as u64),
-            Some(V::UInt64(v)) => Self::Bits(*v),
-            // No metadata source is an array.
-            _ => Self::Absent,
-        }
-    }
-
-    fn of_limit(limit: AlarmLimit) -> Self {
-        match limit {
-            AlarmLimit::Double(v) => Self::Bits(v.to_bits()),
-            AlarmLimit::Long(v) => Self::Bits(v as u64),
-            AlarmLimit::Int64(v) => Self::Bits(v as u64),
-        }
-    }
-
-    fn kept(self) -> KeptSource {
-        match self {
-            Self::Str(s) => KeptSource::Str(s.into()),
-            Self::Bits(v) => KeptSource::Bits(v),
-            Self::Absent => KeptSource::Absent,
-        }
-    }
-
-    fn is(self, kept: &KeptSource) -> bool {
-        match (self, kept) {
-            (Self::Str(s), KeptSource::Str(k)) => s == &**k,
-            (Self::Bits(v), KeptSource::Bits(k)) => v == *k,
-            (Self::Absent, KeptSource::Absent) => true,
-            _ => false,
-        }
-    }
-}
-
-/// A [`Source`] as the cache was built from it ([`CachedMetadata::sources`]).
-enum KeptSource {
-    Str(Box<[u8]>),
-    Bits(u64),
-    Absent,
-}
-
-/// Does a write to this field make the record's metadata cache stale?
-///
-/// **Cache bookkeeping only** — NOT the `DBE_PROPERTY` gate, which is the
-/// field's own `prop(YES)` declaration ([`RecordInstance::field_posts_property`]).
-/// The two used to be one hand-written list, so every field this port had to
-/// invalidate on became a property event C does not post, and every `prop(YES)`
-/// field nobody had listed posted nothing. They answer different questions and
-/// the sets genuinely differ in both directions: `busy.ZNAM` is a cache source
-/// that C does not mark `prop(YES)` (busy's `.dbd` declares no `prop` at all),
-/// and `histogram.ULIM` is `prop(YES)` yet feeds only the live-computed
-/// `apply_field_metadata_override`.
-///
-/// The rule: **every field read by `populate_display_info`,
-/// `populate_control_info`, or `populate_enum_info` MUST be in this set** —
-/// otherwise the cache serves stale metadata until some other source field is
-/// written. Field name is expected uppercase.
-///
-/// `DESC` feeds `display.description` but is deliberately absent: its
-/// rebuild is owned by the DESC arm of `put_common_field`, the single
-/// writer of `common.text.desc`. The `Q:form` info tag (`populate_display_info` ->
-/// `display.form`) is an immutable load-time tag, not a runtime field, so it
-/// needs no rebuild either.
-fn is_metadata_cache_source(name: &str) -> bool {
-    matches!(
-        name,
-        // `populate_display_info` — units/precision/display limits for the
-        // analog, integer, array and motor arms.
-        "EGU" | "PREC" | "HOPR" | "LOPR" | "HLM" | "LLM"
-        // `populate_control_info` — the ao/longout/int64out drive limits.
-        | "DRVH" | "DRVL"
-        // `explicit_alarm_limits` — the four bands and the four severities
-        // that gate them. C reads these as struct members on every
-        // `get_alarm_double`, so nothing there has to be invalidated; here
-        // they are cached, and a write to any of the eight is what makes the
-        // cached answer wrong.
-        | "HIHI" | "HIGH" | "LOW" | "LOLO"
-        | "HHSV" | "HSV" | "LSV" | "LLSV"
-        // `populate_enum_info` via `Record::enum_state_strings` — bi/bo/busy
-        // two-state names and the sixteen mbbi/mbbo state strings.
-        | "ZNAM" | "ONAM"
-        | "ZRST" | "ONST" | "TWST" | "THST" | "FRST" | "FVST" | "SXST" | "SVST"
-        | "EIST" | "NIST" | "TEST" | "ELST" | "TVST" | "TTST" | "FTST" | "FFST"
-    )
+/// pvxs publishes the fixed seven-entry form menu
+/// (Default/String/Binary/Decimal/Hex/Exponential/Engineering) for every
+/// numeric value and, for the VAL field only, sets `display.form.index`
+/// to the slot whose name equals the field's `Q:form` info tag
+/// (`iocsource.cpp:42-62`, case-sensitive). Unrecognised -> `None` (form
+/// stays 0 = Default), exactly as pvxs leaves the index untouched on no
+/// match.
+fn q_form_index(tag: &str) -> Option<i16> {
+    const FORM_NAMES: [&str; 7] = [
+        "Default",
+        "String",
+        "Binary",
+        "Decimal",
+        "Hex",
+        "Exponential",
+        "Engineering",
+    ];
+    FORM_NAMES
+        .iter()
+        .position(|name| *name == tag)
+        .map(|i| i as i16)
 }
 
 /// One alarm limit for a DBR_AL_DOUBLE response: the value when its
 /// severity threshold is enabled, `NaN` otherwise. Mirrors C
 /// `get_alarm_double`'s `prec->hhsv ? prec->hihi : epicsNAN` — a NONZERO
 /// test on the raw ordinal, so an out-of-range severity still enables the
-/// limit.
-fn gated(severity: i16, limit: f64) -> f64 {
-    if severity != 0 { limit } else { f64::NAN }
+/// limit. The limit is read only when enabled, as C reads it.
+fn gated(severity: i16, limit: impl FnOnce() -> f64) -> f64 {
+    if severity != 0 { limit() } else { f64::NAN }
 }
 
 /// Extract the RAW stored ordinal a put lands in a `menu(menuAlarmSevr)`
@@ -2640,10 +2493,6 @@ pub struct RecordCell {
     /// [`Self::string_typed`] so `dbNameToAddr` reads it with no lock, as C
     /// reads `prec->nelm`. The capacity fields are `SPC_NOMOD`.
     dbaddr_counts: arc_swap::ArcSwap<Vec<(u16, u32)>>,
-    /// The instance's [`RecordCold::metadata_cache`], shared: what the record
-    /// reads of its own metadata from inside its processing
-    /// ([`own_field_snapshot`]), with no lock.
-    metadata: MetadataCell,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
@@ -2702,6 +2551,9 @@ pub(crate) struct RecordDesc {
     process_status: crate::server::record::ProcessStatusRule,
     /// [`Record::string_input_links`].
     string_input_links: &'static [(&'static str, &'static str)],
+    /// [`MetaFields::of`], for a read from inside the record's own
+    /// processing, which has no borrow of the instance's.
+    pub(crate) meta: &'static MetaFields,
 }
 
 impl RecordDesc {
@@ -2782,6 +2634,7 @@ impl RecordDesc {
             raw_soft_read_failure_skips_convert: record.raw_soft_read_failure_skips_convert(),
             process_status: record.process_status_rule(),
             string_input_links: record.string_input_links(),
+            meta: MetaFields::of(record),
         }
     }
 }
@@ -2974,7 +2827,6 @@ fn lean_put_fn(
         || desc.long_string
         || desc.read_only
         || desc.dbf_type.dbf_code() != desc.declared_dbf
-        || is_metadata_cache_source(desc.name)
         || RecordInstance::field_posts_property(Some(desc))
         || super::record_trait::FORCE_GENERAL.contains(&(record_type, desc.name));
     if general {
@@ -3014,8 +2866,6 @@ pub(crate) struct PutAddr {
     udf_defining: bool,
     /// The declaration's half of [`RecordInstance::is_no_mod`].
     no_mod: bool,
-    /// [`is_metadata_cache_source`].
-    cache_source: bool,
     /// [`super::FieldDeclaration::field_is_dbaddr`]: `dbPut` takes its
     /// array arm whatever the request's count.
     dbaddr: bool,
@@ -3023,8 +2873,8 @@ pub(crate) struct PutAddr {
     /// so ([`FieldDesc::unreadable`]) or carried by name alone
     /// ([`RecordInstance::resolves_noaccess_name`]).
     noaccess: bool,
-    /// A write the faac1df1 change test watches: `cache_source`, or a
-    /// `prop(YES)` field ([`RecordInstance::field_posts_property`]).
+    /// A write the faac1df1 change test watches: a `prop(YES)` field
+    /// ([`RecordInstance::field_posts_property`]).
     watched: bool,
     /// The value field when it is `pp(TRUE)`, whose put-time post the
     /// processing cycle makes instead (`dbput_post_put_field`).
@@ -3103,9 +2953,7 @@ impl PutAddr {
                 || is_dbcommon_noaccess(field) || rdes.noaccess.contains(&field),
                 FieldDesc::unreadable,
             ),
-            watched: is_metadata_cache_source(field)
-                || RecordInstance::field_posts_property(addr.desc),
-            cache_source: is_metadata_cache_source(field),
+            watched: RecordInstance::field_posts_property(addr.desc),
             post_suppressed: field == rdes.primary_field && rdes.is_pp(field),
             field: addr,
         }
@@ -3678,7 +3526,6 @@ impl RecordCell {
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
-            metadata: Arc::clone(&instance.cold.metadata_cache),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -4983,8 +4830,6 @@ thread_local! {
     static NAME_BYTE_COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many snapshots reached the delivery loop.
     static DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many times [`RecordInstance::build_metadata`] ran.
-    static METADATA_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many log heads were built.
     static HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// How many times the subscriber set was tested ([`RecordInstance::unwatched`]).
@@ -5002,12 +4847,6 @@ thread_local! {
     /// The fields whose post reached [`RecordInstance::record_value_post_as`]
     /// only to store nothing.
     static STORELESS_POSTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// [`METADATA_BUILDS`] on this thread.
-#[cfg(test)]
-fn builds() -> usize {
-    METADATA_BUILDS.with(std::cell::Cell::get)
 }
 
 /// The `dbCommon` declarations the acknowledge put path posts, so it reads
@@ -5473,52 +5312,10 @@ struct RecordCold {
     /// (`Q:group`, `Q:form`), and IOC-specific extensions. Empty for
     /// records loaded without info(...) clauses.
     info: HashMap<String, String>,
-    /// Cached metadata (display/control/enums) — `None` until built. Seeded
-    /// at the end of `init_record` and rebuilt by
-    /// `RecordInstance::refresh_metadata_cache`, its only writer, whenever a
-    /// metadata-class field (EGU/PREC/HOPR/LOPR/limit/state) is written.
-    ///
-    /// An `ArcSwapOption` so the cache can be rebuilt from a `&self` method
-    /// and read without the record's lock.
-    ///
-    /// # Cache invariant (CONTRACT)
-    ///
-    /// The cache is **only correct under the following contract**: every
-    /// code path that mutates a cache-source field (the set defined in
-    /// the file-private [`is_metadata_cache_source`] predicate) MUST call
-    /// [`RecordInstance::notify_field_written`] (or
-    /// [`RecordInstance::refresh_metadata_cache`] directly) afterward.
-    ///
-    /// All current write paths in `field_io.rs` already do this, and a lend
-    /// to device code settles it on release
-    /// ([`RecordInstance::settle_metadata_cache`]). If you add a new code
-    /// path that:
-    ///
-    /// - calls `instance.record.put_field(...)` directly, OR
-    /// - mutates record fields from inside `Record::process()`,
-    ///   `Record::on_put`, or `Record::special` and that mutation could
-    ///   touch a cache-source field, OR
-    /// - lets a `Box<dyn Record>` implementation expose its own
-    ///   mutation methods that change cache-source fields,
-    ///
-    /// then call `instance.notify_field_written(field_name)` to keep the
-    /// cache consistent. Forgetting will produce a stale snapshot —
-    /// monitors will continue to see the old EGU/PREC/limits until the
-    /// next legitimate cache-source write triggers a rebuild.
-    ///
-    /// # Symmetric note for `populate_*` extensions
-    ///
-    /// If a future change adds a new field to `populate_display_info`,
-    /// `populate_control_info`, or `populate_enum_info`, the new source
-    /// field name MUST also be added to [`is_metadata_cache_source`] so
-    /// writes to it rebuild the cache — unless, like DESC
-    /// (`display.description`), its write owner rebuilds directly (see
-    /// the DESC arm of `put_common_field`). This set says nothing about
-    /// `DBE_PROPERTY`, which the field's own `prop(YES)` declaration
-    /// decides ([`RecordInstance::field_posts_property`]). (The `Q:form`
-    /// -> `display.form` mapping is exempt: it reads an immutable
-    /// load-time info tag, not a runtime field.)
-    metadata_cache: MetadataCell,
+    /// The `Q:form` tag's [`q_form_index`], resolved where
+    /// [`RecordInstance::set_info`] writes the tag, as pvxs reads it once per
+    /// channel (`channel.cpp:43`) and not per get.
+    q_form: Option<i16>,
     /// `DBE_ALARM` when the last epilogue's `recGblResetAlarms` posted the
     /// alarm fields (its return value, `recGbl.c:209-212`), else empty. Set
     /// only by the alarm-moving monitor publication and taken by the same
@@ -5681,13 +5478,10 @@ pub(crate) struct MonitorPlan {
     fields: &'static [FieldDesc],
     /// Each declared field's [`FieldRead`], by [`FieldIx`].
     reads: Box<[FieldRead]>,
-    /// The declared fields the metadata cache is built from, the
-    /// [`is_metadata_cache_source`] set and `DESC`, with their reads — those
-    /// a lend reaches. A field the type spills to the declared store is only
-    /// written by `put_declared_override`, whose callers refresh the cache.
-    metadata_sources: Box<[(&'static FieldDesc, FieldRead)]>,
     /// [`Record::cycle_hooks`].
     pub(crate) hooks: crate::server::record::CycleHooks,
+    /// [`MetaFields::of`], for the rset metadata slots' reads.
+    meta: &'static MetaFields,
     /// Whether the type is `sub` or `aSub` — a property of the type, so not
     /// matched by name every cycle.
     subroutine_kind: Option<SubroutineKind>,
@@ -5873,23 +5667,6 @@ impl MonitorPlan {
             }
         }
         let reads = FieldRead::table(record);
-        let common = crate::server::record::dbd_generated::DB_COMMON_FIELDS;
-        let metadata_sources = common
-            .iter()
-            .chain(record.field_list())
-            .zip(&reads)
-            .enumerate()
-            .filter(|(i, (desc, read))| {
-                let declared = || {
-                    let slot = u16::try_from(i.checked_sub(common.len())?).ok()?;
-                    record.declared_store(crate::server::record::FieldSlot(slot))
-                };
-                (is_metadata_cache_source(desc.name) || desc.name == "DESC")
-                    && !(matches!(read, FieldRead::Named)
-                        && declared() == Some(crate::server::record::DeclaredStore::Spill))
-            })
-            .map(|(_, (desc, read))| (desc, *read))
-            .collect();
         let mut plan = Self {
             posts_value_monitor: record.process_posts_value_monitor(),
             alarm_alone_posts_value: record.alarm_alone_posts_value(),
@@ -5951,8 +5728,8 @@ impl MonitorPlan {
             val_desc: declared_desc(field_desc_of(record, "VAL"), "VAL"),
             fields: record.field_list(),
             reads,
-            metadata_sources,
             hooks: record.cycle_hooks(),
+            meta: MetaFields::of(record),
             subroutine_kind: SubroutineKind::of(record.record_type()),
         };
         plan.value_masked_silent = value_masked
@@ -6116,46 +5893,329 @@ fn enum_string_form_with(
     None
 }
 
-/// The per-field half of C's `dbGet` options — the rset slots, keyed by
-/// field — over the record-level metadata cache. Everything it reads is the
-/// record type's own code and declarations, so a record inside its own
-/// processing serves it from `&dyn Record` ([`own_field_snapshot`]) as C's
-/// lock-free `dbGet` does.
+/// Where a record type declares each field its rset metadata slots read, and
+/// which slots it supplies: found by name once per type, as C's `prec->egu`
+/// is an address, so a read matches no name. Locations only — every read
+/// takes the values as they stand, so nothing here can go stale.
+pub(crate) struct MetaFields {
+    record_type: &'static str,
+    fields: &'static [FieldDesc],
+    /// [`Record::property_support`].
+    slots: PropertySupport,
+    egu: Option<&'static FieldDesc>,
+    prec: Option<&'static FieldDesc>,
+    /// [`graphic_limit_fields`](super::record_trait::graphic_limit_fields).
+    graphic: LimitPair,
+    /// [`control_limit_source`](super::record_trait::control_limit_source):
+    /// its pair, and the pair `DriveWhenSet` falls back to when the first is
+    /// not set.
+    control: (LimitPair, Option<LimitPair>),
+    alarm_arm: super::record_trait::AlarmValArm,
+    /// `HIHI`, `HIGH`, `LOW`, `LOLO`.
+    alarm_limits: [Option<&'static FieldDesc>; 4],
+    /// `HHSV`, `HSV`, `LSV`, `LLSV`.
+    alarm_severities: [Option<&'static FieldDesc>; 4],
+}
+
+/// An upper and a lower limit field.
+type LimitPair = (Option<&'static FieldDesc>, Option<&'static FieldDesc>);
+
+impl MetaFields {
+    /// The table of `record`'s type, built for its first record and shared by
+    /// the rest.
+    pub(crate) fn of<R: Record + ?Sized>(record: &R) -> &'static Self {
+        use super::record_trait::ControlLimitSource as C;
+        static TYPES: std::sync::Mutex<Vec<&'static MetaFields>> =
+            std::sync::Mutex::new(Vec::new());
+        let (record_type, fields) = (record.record_type(), record.field_list());
+        let mut types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&built) = types
+            .iter()
+            .find(|m| m.record_type == record_type && std::ptr::eq(m.fields, fields))
+        {
+            return built;
+        }
+        let at = |name| field_desc_in(fields, name);
+        let pair = |(hi, lo)| (at(hi), at(lo));
+        let built: &'static Self = Box::leak(Box::new(Self {
+            record_type,
+            fields,
+            slots: record.property_support(),
+            egu: at("EGU"),
+            prec: at("PREC"),
+            graphic: pair(super::record_trait::graphic_limit_fields(record_type)),
+            control: match super::record_trait::control_limit_source(record_type) {
+                C::Drive => (pair(("DRVH", "DRVL")), None),
+                C::DriveWhenSet => (pair(("DRVH", "DRVL")), Some(pair(("HOPR", "LOPR")))),
+                C::SoftLimits => (pair(("HLM", "LLM")), None),
+                C::Operator => (pair(("HOPR", "LOPR")), None),
+            },
+            alarm_arm: super::record_trait::alarm_val_arm(record_type),
+            alarm_limits: ["HIHI", "HIGH", "LOW", "LOLO"].map(at),
+            alarm_severities: ["HHSV", "HSV", "LSV", "LLSV"].map(at),
+        }));
+        types.push(built);
+        built
+    }
+}
+
+/// C's `dbGet` options — the rset slots, keyed by field — read from the
+/// record's fields on every call, as C calls the slots. A record inside its
+/// own processing serves them from `&dyn Record` ([`own_field_snapshot`]) as
+/// C's lock-free `dbGet` does.
 pub(crate) trait FieldMetaSource {
     fn rec(&self) -> &dyn Record;
+    /// [`MetaFields::of`] the record's type.
+    fn meta(&self) -> &'static MetaFields;
     /// A field of the record by name; the `FTVL` test reads it.
     fn read_field(&self, field: &str) -> Option<EpicsValue>;
     /// [`RecordInstance::enum_string_form_for`].
     fn enum_string_form(&self, field: &str) -> Option<EnumStringForm>;
+    /// The metadata source field (`PREC`, `EGU`, `HIHI`, ...) declared `desc`.
+    fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue>;
+    /// [`Self::metadata_at`] of a numeric field, as `dbGet(DBR_DOUBLE)`
+    /// delivers it.
+    fn metadata_number(&self, desc: &'static FieldDesc) -> Option<f64> {
+        self.metadata_at(desc)?.to_f64()
+    }
+    /// [`Self::metadata_at`] of a string field.
+    fn metadata_text(&self, desc: &'static FieldDesc) -> Option<PvString> {
+        match self.metadata_at(desc)? {
+            EpicsValue::String(text) => Some(text),
+            _ => None,
+        }
+    }
+    /// `display.description`: dbCommon `DESC`.
+    fn description(&self) -> PvString;
+    /// `display.form`: the `Q:form` info tag.
+    fn q_form_index(&self) -> Option<i16>;
 
-    /// `meta`, the record's cached VAL metadata, finished for `field`.
+    /// The record's VAL metadata into `snap`, read from its fields as they
+    /// stand, as C's `dbGet` calls the rset slots on every read. Returns the
+    /// record's OWN alarm bands `(hihi, high, low, lolo)`, record-level: which
+    /// fields receive them is [`Self::route_field_metadata`]'s decision.
+    fn build_metadata(&self, snap: &mut super::super::snapshot::Snapshot) -> (f64, f64, f64, f64) {
+        self.populate_display_info(snap);
+        self.populate_control_info(snap);
+        self.populate_enum_info(snap);
+        self.explicit_alarm_limits()
+    }
+
+    /// The record-level display metadata: units, precision and display
+    /// limits as C's `get_units` / `get_precision` / `get_graphic_double`
+    /// answer them for the fields their rset lists.
+    ///
+    /// Driven by [`Record::property_support`], not by a `match` on the record
+    /// type. Those were two independent tables answering the same question,
+    /// and nothing kept them in step: `default_property_support` declares
+    /// units and precision for twenty-five record types where the arm list
+    /// here covered nine, so the other sixteen declared the leaf and served
+    /// `""` / `0` — `sel`, `sub`, `dfanout`, `subArray`, `scalcout`,
+    /// `acalcout`, `epid`, `scaler`, `swait`, `sseq`, `seq`, `mca`,
+    /// `histogram`, `transform`, `throttle` and `asyn`. Deriving it from the
+    /// declaration makes "declares the slot" and "supplies the slot"
+    /// one fact rather than two that can disagree.
+    ///
+    /// Precision matters well beyond `caget -d`: it is also what the
+    /// DBF_DOUBLE to DBR_STRING conversion renders with, in C
+    /// (`dbConvert.c:783-786` calls `prset->get_precision` with no field-type
+    /// gate) and here (`codec.rs::convert_value_to_dbr_string`), so a missing
+    /// slot changed the digits of a plain `caget`.
+    ///
+    /// The sources are the same in every C rset that supplies them — `EGU` for
+    /// `get_units` and `PREC` for `get_precision` — so only the graphic pair
+    /// needs a per-type table (`graphic_limit_fields`). Per-FIELD departures
+    /// from the record's own values stay where C puts them, in that record's
+    /// [`Record::field_metadata_override`], which is applied after this and
+    /// wins.
+    fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
+        let meta = self.meta();
+        let slots = meta.slots;
+        if slots.units || slots.precision || slots.graphic_double {
+            let (upper, lower) = if slots.graphic_double {
+                self.metadata_limits(meta.graphic)
+            } else {
+                (0.0, 0.0)
+            };
+            snap.display = Some(super::super::snapshot::DisplayInfo {
+                units: if slots.units {
+                    self.metadata_units()
+                } else {
+                    Default::default()
+                },
+                precision: if slots.precision {
+                    self.metadata_limit(meta.prec) as i16
+                } else {
+                    0
+                },
+                upper_disp_limit: upper,
+                lower_disp_limit: lower,
+                ..Default::default()
+            });
+        }
+        // Apply the `Q:form` display-format hint. The block above builds
+        // `snap.display` for every record type that supplies at least one
+        // display slot — the same set for which pvxs emits
+        // `display.form.choices`. This metadata is record-level (it is the VAL
+        // field's metadata); the VAL-only rule pvxs applies to
+        // `display.form.index` (`iocsource.cpp:53`) is enforced per served
+        // field in `apply_field_metadata_override`.
+        if let Some(display) = snap.display.as_mut() {
+            if let Some(form) = self.q_form_index() {
+                display.form = form;
+            }
+        }
+        // `display.description` from dbCommon DESC — pvxs QSRV fills it
+        // on every metadata populate (iocsource.cpp:306-310), for every
+        // record type including those with no other display source. The
+        // qsrv builders always emit the leaf (defaulting a `None`
+        // display), so creating the DisplayInfo here changes leaf
+        // values, never the wire shape. A DESC write posts no DBE_PROPERTY
+        // (epics-base#785 / UI-106).
+        snap.display
+            .get_or_insert_with(Default::default)
+            .description = self.description();
+    }
+
+    /// The record-level control limits — what C's `get_control_double`
+    /// answers for the fields its rset lists.
+    ///
+    /// Gated on the declared slot for the same reason as
+    /// [`Self::populate_display_info`], and with the same effect: the arm list
+    /// this replaces covered thirteen record types where
+    /// `default_property_support` declares `control_double` for twenty-three,
+    /// so `sel`, `sub`, `dfanout`, `subArray`, `histogram`, `scalcout`,
+    /// `acalcout` and `epid` served 0/0 on `VAL` — a channel whose C rset
+    /// answers the record's own operator range.
+    ///
+    /// Which of the record's fields that range comes from is the one thing
+    /// that varies by type, and it lives in `control_limit_source`.
+    fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
+        let meta = self.meta();
+        if !meta.slots.control_double {
+            return;
+        }
+        let (pair, unset) = meta.control;
+        let (upper, lower) = match (self.metadata_limits(pair), unset) {
+            ((hi, lo), _) if hi > lo => (hi, lo),
+            (_, Some(unset)) => self.metadata_limits(unset),
+            (limits, None) => limits,
+        };
+        snap.control = Some(super::super::snapshot::ControlInfo {
+            upper_ctrl_limit: upper,
+            lower_ctrl_limit: lower,
+        });
+    }
+
+    /// A numeric metadata field (`PREC`, `HOPR`, `DRVH`, ...) as C reads it —
+    /// straight out of record memory, which for C means every field the `.dbd`
+    /// declares.
+    ///
+    /// On an instance through [`RecordInstance::resolve_field`], NOT
+    /// `Record::get_field`, and that is the whole reason this used to read
+    /// zero for the types it now serves: a Rust record implements only the fields it has behaviour for,
+    /// so `sel`, `sub`, `dfanout` and their siblings model no `PREC`/`HOPR`
+    /// cell at all and `get_field` answers `None` for them. Their `.db` values
+    /// live in `declared_overrides`, and their unset defaults in the `.dbd`
+    /// `initial()`, both of which only `resolve_field` reaches.
+    fn metadata_limit(&self, desc: Option<&'static FieldDesc>) -> f64 {
+        desc.and_then(|desc| self.metadata_number(desc))
+            .unwrap_or(0.0)
+    }
+
+    /// [`Self::metadata_limit`] of an upper and a lower limit field.
+    fn metadata_limits(&self, (upper, lower): LimitPair) -> (f64, f64) {
+        (self.metadata_limit(upper), self.metadata_limit(lower))
+    }
+
+    /// `EGU`, the source every ported C `get_units` copies from. Empty for a
+    /// record type whose `.dbd` declares no `EGU` — `seq` and `histogram` have
+    /// none, and C writes nothing into the `dbAccess.c:378` seed for either.
+    fn metadata_units(&self) -> crate::types::PvString {
+        self.meta()
+            .egu
+            .and_then(|desc| self.metadata_text(desc))
+            .unwrap_or_default()
+    }
+
+    /// Populate EnumInfo — C rset `get_enum_strs`.
+    ///
+    /// The table comes from [`Record::enum_state_strings`], the SAME slot the
+    /// string-put converter (`dbConvert.c::putStringEnum`) resolves against, so
+    /// the choice list a client reads and the names it may write are one table
+    /// by construction. It arrives already trimmed to C's `no_str` (bi/bo/busy
+    /// drop an empty ONAM behind a set ZNAM — `boRecord.c:342-352`; mbbi/mbbo
+    /// cut at the last non-empty state — `mbbiRecord.c:262-269`).
+    ///
+    /// The `DBR_STRING` half of the same channel is the record's OTHER rset slot
+    /// (`get_enum_str`), which is not this trimmed list — see
+    /// [`EnumStringForm`]. A record that has no such slot (every record but
+    /// bi/bo/busy/mbbi/mbbo, including the downstream crates' own enum records)
+    /// renders from its label list, which is what C's absent slot amounts to.
+    fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
+        if let Some(strings) = self.rec().enum_state_strings() {
+            snap.enums = Some(match self.rec().enum_slots().map(EnumSlots::form) {
+                Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
+                None => super::super::snapshot::EnumInfo::new(strings),
+            });
+        }
+    }
+
+    /// The four limits C's `get_alarm_double` serves for the fields its rset
+    /// lists — [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields).
+    ///
+    /// Read through [`RecordInstance::resolve_field`], the same unified accessor C's
+    /// `prec->hihi` is. The port stores the eight alarm fields in one of two
+    /// disjoint homes — `common.analog_alarm` for the types with the analog
+    /// ladder (`ai`/`ao`/`calc`/…), the record's own struct for the types
+    /// without it (`dfanout`/`sel`) — and `resolve_field` spans both. Reading
+    /// the ladder slot directly instead would answer NaN for every `dfanout`
+    /// and `sel` no matter how its HIHI/HHSV were set, because those two types
+    /// have no slot at all.
+    fn explicit_alarm_limits(&self) -> (f64, f64, f64, f64) {
+        let meta = self.meta();
+        let limit = |i: usize| self.metadata_limit(meta.alarm_limits[i]);
+        match meta.alarm_arm {
+            super::record_trait::AlarmValArm::Unconditional => {
+                (limit(0), limit(1), limit(2), limit(3))
+            }
+            super::record_trait::AlarmValArm::Gated => {
+                // The raw stored ordinal, NOT clamped to 0..=3: C tests
+                // `prec->hhsv` for NONZERO, so an out-of-range severity still
+                // enables its limit.
+                let [hihi, high, low, lolo] = std::array::from_fn(|i| {
+                    let severity = self.metadata_limit(meta.alarm_severities[i]) as i16;
+                    gated(severity, || limit(i))
+                });
+                (hihi, high, low, lolo)
+            }
+        }
+    }
+
+    /// The record's VAL metadata, finished for `field`.
     fn finish_metadata(
         &self,
         field: &str,
-        meta: MetadataSnapshot,
         backing: LinkBacking<'_>,
         snap: &mut super::super::snapshot::Snapshot,
     ) {
-        let explicit_alarm = meta.alarm;
-        snap.display = meta.display;
-        snap.control = meta.control;
-        snap.enums = meta.enums;
+        let explicit_alarm = self.build_metadata(snap);
 
-        // The cache above is the record's VAL metadata. C routes PER FIELD, so
+        // That is the record's VAL metadata. C routes PER FIELD, so
         // a non-VAL-class field does NOT get VAL's limits — see
         // [`Self::route_field_metadata`], which owns that decision.
         self.route_field_metadata(field, backing, explicit_alarm, snap);
 
         // Per-field RSET metadata (C get_units/get_precision/
         // get_graphic_double/get_control_double/get_alarm_double key on
-        // dbGetFieldIndex) patches the record-level cache for this field.
+        // dbGetFieldIndex) patches the record-level metadata for this field.
         self.apply_field_metadata_override(field, snap);
 
         // DBF_MENU field (a shared menu such as `SCAN`/`OMSL`/`HHSV`/... or
         // a record-specific menu such as `sel.SELM`): carry the menu index
         // as DBR_ENUM and attach its `menu()` choice labels. See
         // `attach_menu_enum`. This overrides any record VAL enum table
-        // copied from the metadata cache above, because a menu field
+        // built above, because a menu field
         // carries its own menu's choices, not the record's VAL state
         // strings.
         self.attach_menu_enum(field, snap);
@@ -6167,15 +6227,14 @@ pub(crate) trait FieldMetaSource {
     }
 
     /// C's rset metadata slots route **per field**, on `dbGetFieldIndex`. The
-    /// port's metadata cache is the record's VAL metadata, and serving it to
-    /// every field is what made a non-VAL field report VAL's limits.
+    /// port builds the record's VAL metadata, and serving it to every field is what made a non-VAL field report VAL's limits.
     ///
     /// Every base record's `get_control_double` / `get_alarm_double` has the
     /// same two-arm shape: a listed set of field indices that take the
     /// record's own limits, and a `default:` arm that hands the field to
     /// `recGblGetControlDouble` / `recGblGetAlarmDouble` — the field TYPE's
     /// numeric range, and four NaN. This routes the `default:` arm; a listed
-    /// field keeps the cache, which already holds exactly the record's own
+    /// field keeps the record-level value, which already holds exactly the record's own
     /// limits (and already distinguishes `ao`'s DRVH/DRVL from `ai`'s
     /// HOPR/LOPR).
     ///
@@ -6226,7 +6285,7 @@ pub(crate) trait FieldMetaSource {
         // (`codec.rs::get_limits` calls `graphic_limits()`/`alarm_limits()`/
         // `control_limits()`, each `then_some`-gated), PVA reads the struct
         // straight (`native_source.rs:226`) under its own leaf mask.
-        let slots = self.rec().property_support();
+        let slots = self.meta().slots;
         let rtype = self.rec().record_type();
         let f: &str = &upper_field(field);
 
@@ -6243,7 +6302,7 @@ pub(crate) trait FieldMetaSource {
 
         // C `get_units`'s "no case" arm — the field the rset tests for and
         // declines to write, leaving `dbAccess.c:378`'s zeroed buffer. The
-        // record-level cache holds `EGU` for every type that supplies the
+        // record-level metadata holds `EGU` for every type that supplies the
         // slot, so this is the step that takes it back off the fields C never
         // gives it to. See [`RecordInstance::units_from_egu`].
         if slots.units {
@@ -6263,10 +6322,10 @@ pub(crate) trait FieldMetaSource {
 
         // C `get_precision`'s link arm, which the port had no arm for at all.
         // All five link-routing types seed `*pprecision = prec->prec` — the
-        // record's own PREC, already in the metadata cache — and overwrite it
+        // record's own PREC, already in the record-level metadata — and overwrite it
         // only when `dbGetPrecision` on the backing link SUCCEEDS
         // (`calcRecord.c:184-203`, `aSubRecord.c:323-348`). So an unresolved or
-        // constant link means "leave the cache alone", which is the `None`
+        // constant link means "leave it alone", which is the `None`
         // arm here.
         if slots.precision {
             let link_precision = link_meta.and_then(|m| m.precision);
@@ -6332,7 +6391,7 @@ pub(crate) trait FieldMetaSource {
 
         // C `get_graphic_double`'s last arm. Unlike control this one has a LINK
         // branch ahead of the recGbl call, so the three answers are: keep the
-        // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
+        // record's own (listed on HOPR/LOPR), the link's limits, or the default arm.
         if slots.graphic_double && !RecordInstance::graphic_explicit_field(rtype, field) {
             let (upper, lower) = if link_backed.is_some() {
                 // `dbGetGraphicLimits` on the backing link. A CONSTANT link has
@@ -6396,17 +6455,15 @@ pub(crate) trait FieldMetaSource {
     /// Apply a record's per-field metadata override (C RSET
     /// `get_units`/`get_precision`/`get_graphic_double`/
     /// `get_control_double`/`get_alarm_double`, all keyed by field)
-    /// over the cached record-level metadata. Shared by the GET and
-    /// monitor snapshot builders. Computed live on every call — never
-    /// cached — so overrides derived from fields outside the
-    /// [`is_metadata_cache_source`] set cannot go stale.
+    /// over the record-level metadata. Shared by the GET and monitor snapshot
+    /// builders.
     ///
     /// This is also where the record-level `Q:form` info tag is narrowed to
     /// the served field: QSRV assigns `display.form.index` only when the
     /// channel addresses the VAL field (`IOCSource::initialize` gates it on
     /// `dbIsValueField(dbChannelFldDes(chan))`, `iocsource.cpp:53`; the form
-    /// *menu*, `form.choices`, is published for every field). The metadata
-    /// cache is per-record, so a channel on `REC.RVAL` of a record carrying
+    /// *menu*, `form.choices`, is published for every field). The record-level
+    /// metadata is per-record, so a channel on `REC.RVAL` of a record carrying
     /// `info(Q:form, "Hex")` used to report Hex where pvxs reports Default.
     /// Every served `Snapshot`, a monitor update's delivery read included,
     /// runs this one owner, so
@@ -6499,7 +6556,7 @@ pub(crate) trait FieldMetaSource {
     /// `DBR_ENUM` form), so the mask is read off the same value the client
     /// receives and no consumer has to re-derive either gate.
     fn assign_property_support(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        snap.properties = self.rec().property_support().narrowed_to_field(
+        snap.properties = self.meta().slots.narrowed_to_field(
             snap.value.db_field_type(),
             menu_choices_of(self.rec(), field).is_some(),
         );
@@ -6607,21 +6664,65 @@ impl FieldMetaSource for RecordInstance {
     fn rec(&self) -> &dyn Record {
         self.record.as_ref()
     }
+    fn meta(&self) -> &'static MetaFields {
+        self.monitor_plan.meta
+    }
     fn read_field(&self, field: &str) -> Option<EpicsValue> {
         self.resolve_field(field)
     }
     fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
         self.enum_string_form_for(field)
     }
+    fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
+        self.read_declared(desc)
+    }
+    /// Through the plan's read of `desc`, so a slot or a `dbCommon` cell
+    /// yields its number with no value built and taken apart; any other read
+    /// is [`Self::read_declared`]'s.
+    fn metadata_number(&self, desc: &'static FieldDesc) -> Option<f64> {
+        let number = match self.monitor_plan.read_of(desc) {
+            FieldRead::Slot(slot) => self
+                .record
+                .get_slot_f64(crate::server::record::FieldSlot(slot)),
+            FieldRead::Common(field) => self.common_number(field),
+            FieldRead::Named | FieldRead::Unreadable => None,
+        };
+        number.or_else(|| self.read_declared(desc)?.to_f64())
+    }
+    /// A string slot's text as it stands; any other read is
+    /// [`Self::read_declared`]'s. `EGU` is no link, so the reader's view is
+    /// the stored text.
+    fn metadata_text(&self, desc: &'static FieldDesc) -> Option<PvString> {
+        let slot = match self.monitor_plan.read_of(desc) {
+            FieldRead::Slot(slot) => self.record.slot_ref(crate::server::record::FieldSlot(slot)),
+            _ => None,
+        };
+        match slot {
+            Some(super::record_trait::SlotRef::Str(text)) => Some(text.clone()),
+            _ => match self.read_declared(desc)? {
+                EpicsValue::String(text) => Some(text),
+                _ => None,
+            },
+        }
+    }
+    fn description(&self) -> PvString {
+        self.common.text.desc.clone()
+    }
+    fn q_form_index(&self) -> Option<i16> {
+        self.cold.q_form
+    }
 }
 
 /// A record read from inside its own processing: its type's code and
 /// nothing behind its lock set.
-struct OwnRecord<'a>(&'a dyn Record);
+struct OwnRecord<'a>(&'a dyn Record, &'static MetaFields);
 
 impl FieldMetaSource for OwnRecord<'_> {
     fn rec(&self) -> &dyn Record {
         self.0
+    }
+    fn meta(&self) -> &'static MetaFields {
+        self.1
     }
     fn read_field(&self, field: &str) -> Option<EpicsValue> {
         self.0.get_field(field)
@@ -6630,20 +6731,30 @@ impl FieldMetaSource for OwnRecord<'_> {
         // `DTYP` lives in dbCommon, behind the lock set.
         enum_string_form_with(self.0, field, || None)
     }
+    fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
+        self.0.get_field(desc.name)
+    }
+    // dbCommon and the info tags are behind the lock set.
+    fn description(&self) -> PvString {
+        PvString::default()
+    }
+    fn q_form_index(&self) -> Option<i16> {
+        None
+    }
 }
 
-/// C `dbGet` of `field` (canonical) of `cell`, from inside that record's own
-/// processing: the value and the field's metadata from `record`, the record
-/// itself, and the metadata cache, which needs no lock. `None` for a field
-/// the record type does not serve itself (dbCommon's) or whose metadata cache
-/// init has not built. A link-backed field gets its C seeds: resolving its
-/// link would read through the lock set this record holds.
+/// C `dbGet` of `field` (canonical) of `record`, from inside that record's
+/// own processing: the value and the field's metadata from `record` itself,
+/// which needs no lock. What lives behind the lock set — dbCommon's `DESC`
+/// and alarm ladder, the info tags — reads as absent. `None` for a field the
+/// record type does not serve itself (dbCommon's). A link-backed field gets
+/// its C seeds: resolving its link would read through the lock set this
+/// record holds. `meta` is the record's [`RecordDesc::meta`].
 pub(crate) fn own_field_snapshot(
-    cell: &RecordCell,
     record: &dyn Record,
+    meta: &'static MetaFields,
     field: &str,
 ) -> Option<super::super::snapshot::Snapshot> {
-    let meta = cell.metadata.load_full()?;
     let value = record.get_field(field)?;
     let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
         record.field_is_long_string(field)
@@ -6653,7 +6764,7 @@ pub(crate) fn own_field_snapshot(
     };
     let mut snap =
         super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH);
-    OwnRecord(record).finish_metadata(field, meta.meta.clone(), LinkBacking::none(), &mut snap);
+    OwnRecord(record, meta).finish_metadata(field, LinkBacking::none(), &mut snap);
     Some(snap)
 }
 
@@ -7903,7 +8014,7 @@ impl RecordInstance {
                 link_backed_metadata_links,
                 link_backed_metadata_input_slot,
                 info: HashMap::new(),
-                metadata_cache: MetadataCell::default(),
+                q_form: None,
                 alarm_reset: crate::server::recgbl::EventMask::NONE,
             }),
         }
@@ -7935,9 +8046,6 @@ impl RecordInstance {
         if self.put_internal_field(field, value.into()).is_err() {
             return;
         }
-        // Snapshot-cache contract, as `post_fields_with_mask`: rebuild
-        // before the monitor snapshot is built.
-        self.notify_field_written(field);
         if post == PostStage::Output {
             self.notify_field(field, crate::server::recgbl::EventMask::VALUE);
         }
@@ -7953,7 +8061,6 @@ impl RecordInstance {
         reset: crate::server::recgbl::EventMask,
     ) {
         if self.put_internal_field(field, value.into()).is_ok() {
-            self.notify_field_written(field);
             self.notify_field(field, crate::server::recgbl::EventMask::VALUE | reset);
         }
     }
@@ -8177,7 +8284,6 @@ impl RecordInstance {
 
     /// [`Self::run_init_pass1`] after the dset init.
     pub(crate) fn finish_init_pass1(&mut self, name: &str, err: &dyn Fn(&str)) {
-        self.seed_metadata_cache();
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return
         // (`S_db_BadSub`, or the empty-SNAM `pact = TRUE; return 0`), so the
@@ -8281,7 +8387,11 @@ impl RecordInstance {
     /// write wins. Used by the .db loader (`info(...)` directive) and
     /// `dbpf`-style tools.
     pub fn set_info(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.cold.info.insert(key.into(), value.into());
+        let (key, value) = (key.into(), value.into());
+        if key == "Q:form" {
+            self.cold.q_form = q_form_index(&value);
+        }
+        self.cold.info.insert(key, value);
     }
 
     /// Every info tag of the record.
@@ -8486,103 +8596,6 @@ impl RecordInstance {
         }
     }
 
-    /// **The** writer of the metadata cache, called after a write of any
-    /// metadata-class field (EGU, PREC, HOPR/LOPR, alarm limits, DRVH/DRVL,
-    /// enum strings, DESC): a cache already built is rebuilt now rather than
-    /// cleared, so a reader that cannot rebuild it — one inside this record's
-    /// own processing — never finds it stale. One not yet built stays
-    /// unbuilt; `seed_metadata_cache` builds it once init has written
-    /// the record.
-    pub fn refresh_metadata_cache(&self) {
-        if self.cold.metadata_cache.load().is_some() {
-            self.seed_metadata_cache();
-        }
-    }
-
-    /// Build the metadata cache from the record as it stands: the end of
-    /// `init_record`, after device support's `init` has written its fields
-    /// (asyn's `setEnums`) with no notification.
-    pub(crate) fn seed_metadata_cache(&self) -> Arc<CachedMetadata> {
-        let mut sources = Vec::with_capacity(self.monitor_plan.metadata_sources.len());
-        self.metadata_sources(|source| {
-            sources.push(source.kept());
-            true
-        });
-        let meta = Arc::new(CachedMetadata {
-            meta: self.build_metadata(),
-            sources: sources.into(),
-        });
-        self.cold.metadata_cache.store(Some(Arc::clone(&meta)));
-        meta
-    }
-
-    /// The release of a lend that handed the record to code outside the
-    /// field writers ([`HeldInstance::with`], [`AsyncDbHandle::with_instance`]):
-    /// a built cache is rebuilt when its source fields no longer read as it
-    /// was built from, so a source written there reaches the next reader as
-    /// C's `dbGet` reads the field itself.
-    ///
-    /// [`HeldInstance::with`]: crate::server::database::HeldInstance::with
-    /// [`AsyncDbHandle::with_instance`]: crate::server::database::AsyncDbHandle::with_instance
-    pub(crate) fn settle_metadata_cache(&self) {
-        let stale = match &*self.cold.metadata_cache.load() {
-            Some(cached) => {
-                let mut kept = cached.sources.iter();
-                !self.metadata_sources(|source| kept.next().is_some_and(|k| source.is(k)))
-            }
-            None => false,
-        };
-        if stale {
-            self.seed_metadata_cache();
-        }
-    }
-
-    /// The metadata cache's source fields ([`MonitorPlan::metadata_sources`])
-    /// in order, each read where it is stored, until `each` answers `false`;
-    /// whether none did. Only a field the record type serves by name alone
-    /// is read as an [`EpicsValue`].
-    fn metadata_sources(&self, mut each: impl FnMut(Source<'_>) -> bool) -> bool {
-        for &(desc, read) in &self.monitor_plan.metadata_sources {
-            let value;
-            let source = match read {
-                FieldRead::Slot(slot) => self
-                    .record
-                    .slot_ref(crate::server::record::FieldSlot(slot))
-                    .map_or(Source::Absent, Source::of_slot),
-                FieldRead::Common(field) => match (field, &self.common.analog_alarm) {
-                    (CommonField::Desc, _) => Source::Str(self.common.text.desc.as_bytes()),
-                    (CommonField::Hihi, Some(a)) => {
-                        Source::of_limit(a.limit(AlarmLimitField::Hihi))
-                    }
-                    (CommonField::High, Some(a)) => {
-                        Source::of_limit(a.limit(AlarmLimitField::High))
-                    }
-                    (CommonField::Low, Some(a)) => Source::of_limit(a.limit(AlarmLimitField::Low)),
-                    (CommonField::Lolo, Some(a)) => {
-                        Source::of_limit(a.limit(AlarmLimitField::Lolo))
-                    }
-                    (CommonField::Hhsv, Some(a)) => Source::Bits(a.hhsv as u64),
-                    (CommonField::Hsv, Some(a)) => Source::Bits(a.hsv as u64),
-                    (CommonField::Lsv, Some(a)) => Source::Bits(a.lsv as u64),
-                    (CommonField::Llsv, Some(a)) => Source::Bits(a.llsv as u64),
-                    (field, _) => {
-                        value = self.common_field(field);
-                        Source::of_value(value.as_ref())
-                    }
-                },
-                FieldRead::Named => {
-                    value = self.read_named(desc.name);
-                    Source::of_value(value.as_ref())
-                }
-                FieldRead::Unreadable => continue,
-            };
-            if !each(source) {
-                return false;
-            }
-        }
-        true
-    }
-
     /// **The** `DBE_PROPERTY` gate: C `dbAccess.c:1330`
     /// `paddr->pfldDes->prop`, read from the field's own declaration.
     ///
@@ -8598,37 +8611,17 @@ impl RecordInstance {
         desc.is_some_and(|d| d.prop)
     }
 
-    /// Hook called by the database after a field is written. If the field is a
-    /// metadata-cache source, the cache is rebuilt from the new value. Posts nothing — a caller that also owes the
-    /// `DBE_PROPERTY` event uses [`Self::notify_field_written_if_changed`].
-    ///
-    /// Field name is automatically uppercased.
-    pub fn notify_field_written(&self, field: &str) {
-        let upper = upper_field(field);
-        if is_metadata_cache_source(&upper) {
-            self.refresh_metadata_cache();
-        }
-    }
-
-    /// Like [`Self::notify_field_written`], plus the `DBE_PROPERTY` post C
-    /// makes from `dbPut` — and both are skipped when the put did not actually
-    /// change the field's value. Mirrors epics-base `faac1df1`: property events
+    /// The `DBE_PROPERTY` post C makes from `dbPut` of a `prop(YES)` field,
+    /// skipped when the put did not actually change the field's value. Mirrors epics-base `faac1df1`: property events
     /// fire only on real changes, not on idempotent writes (the C path compares
     /// `paddr->pfield` against the converted payload before setting the
     /// `propertyUpdate` flag).
     ///
-    /// The two effects have independent gates. Invalidation follows
-    /// `is_metadata_cache_source` (what this port's cache reads); the post
-    /// follows `Self::field_posts_property` (what the `.dbd` declares). A
-    /// field can be either without being both.
-    ///
-    /// `prev` is the value captured BEFORE the put. Callers that don't need the
-    /// change-detection (e.g. internal writers that know the field is neither)
-    /// can keep using [`Self::notify_field_written`].
+    /// `prev` is the value captured BEFORE the put.
     pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = upper_field(field);
         let desc = self.field_desc(&upper);
-        self.written_if_changed(None, &upper, is_metadata_cache_source(&upper), desc, prev);
+        self.written_if_changed(None, &upper, desc, prev);
     }
 
     /// [`Self::notify_field_written_if_changed`] for a settled put target;
@@ -8643,13 +8636,7 @@ impl RecordInstance {
         let PrePut(Some(prev)) = pre else {
             return;
         };
-        self.written_if_changed(
-            Some(burst),
-            field,
-            at.cache_source,
-            at.field.desc,
-            prev.as_ref(),
-        );
+        self.written_if_changed(Some(burst), field, at.field.desc, prev.as_ref());
     }
 
     /// The pre-put value of `field` at `at` for the change test; a field the
@@ -8666,12 +8653,10 @@ impl RecordInstance {
         &mut self,
         burst: Option<&mut PostBurst>,
         upper: &str,
-        cache_source: bool,
         desc: Option<&'static FieldDesc>,
         prev: Option<&EpicsValue>,
     ) {
-        let posts_property = Self::field_posts_property(desc);
-        if !cache_source && !posts_property {
+        if !Self::field_posts_property(desc) {
             return;
         }
         // The SAME reader the put's pre-value was captured with
@@ -8679,60 +8664,24 @@ impl RecordInstance {
         // sees only the record type's own struct, and this port keeps on
         // `CommonFields` a good deal of storage C keeps per record type — the
         // whole analog-alarm ladder among it — so a `caput HIHI` on a calc
-        // compared `None` to `None`, reported "unchanged", and posted neither
-        // the `DBE_PROPERTY` C sends for a `prop(YES)` field nor the cache
-        // invalidation the metadata it feeds depends on.
+        // compared `None` to `None`, reported "unchanged", and did not post
+        // the `DBE_PROPERTY` C sends for a `prop(YES)` field.
         let now = self.resolve_field_stored_at(upper, desc);
         if prev == now.as_ref() {
             return;
         }
-        if cache_source {
-            self.refresh_metadata_cache();
-        }
-        if posts_property {
-            // mirror C dbAccess.c:1395-1396 — the gate `if (propertyUpdate &&
-            // !status)` and the `db_post_events(precord, NULL, DBE_PROPERTY)` it
-            // guards. The NULL field pointer is what makes it record-wide.
-            let mut own;
-            let burst = match burst {
-                Some(burst) => burst,
-                None => {
-                    own = PostBurst::new();
-                    &mut own
-                }
-            };
-            self.post_record_wide(burst, crate::server::recgbl::EventMask::PROPERTY);
-        }
-    }
-
-    /// Returns the cached MetadataSnapshot, building and storing it on
-    /// the first call, so the populate cost is paid at most once per
-    /// metadata-stable interval.
-    fn cached_metadata(&self) -> MetadataSnapshot {
-        match self.cold.metadata_cache.load_full() {
-            Some(cached) => cached.meta.clone(),
-            None => self.seed_metadata_cache().meta.clone(),
-        }
-    }
-
-    fn build_metadata(&self) -> MetadataSnapshot {
-        #[cfg(test)]
-        METADATA_BUILDS.with(|n| n.set(n.get() + 1));
-        let mut tmp = super::super::snapshot::Snapshot::new(
-            EpicsValue::Double(0.0),
-            0,
-            0,
-            std::time::SystemTime::UNIX_EPOCH,
-        );
-        self.populate_display_info(&mut tmp);
-        self.populate_control_info(&mut tmp);
-        self.populate_enum_info(&mut tmp);
-        MetadataSnapshot {
-            display: tmp.display,
-            control: tmp.control,
-            enums: tmp.enums,
-            alarm: self.explicit_alarm_limits(self.record.record_type()),
-        }
+        // mirror C dbAccess.c:1395-1396 — the gate `if (propertyUpdate &&
+        // !status)` and the `db_post_events(precord, NULL, DBE_PROPERTY)` it
+        // guards. The NULL field pointer is what makes it record-wide.
+        let mut own;
+        let burst = match burst {
+            Some(burst) => burst,
+            None => {
+                own = PostBurst::new();
+                &mut own
+            }
+        };
+        self.post_record_wide(burst, crate::server::recgbl::EventMask::PROPERTY);
     }
 
     /// C `dbChannelSpecial(chan) == SPC_NOMOD` — **the single owner of the
@@ -9745,17 +9694,15 @@ impl RecordInstance {
     ///
     /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
     fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
-        let support = self
-            .record
-            .property_support()
-            .narrowed_to_field(value.db_field_type(), false);
+        let meta = self.meta();
+        let support = meta.slots.narrowed_to_field(value.db_field_type(), false);
         if !support.precision {
             return 6;
         }
         self.record
             .field_metadata_override(field)
             .and_then(|ov| ov.precision)
-            .unwrap_or_else(|| self.metadata_limit("PREC") as i16) as u16
+            .unwrap_or_else(|| self.metadata_limit(meta.prec) as i16) as u16
     }
 
     /// The field's declaration — its `dbFldDes`, in C's terms.
@@ -9949,7 +9896,7 @@ impl RecordInstance {
     /// The one finishing pipeline behind every `Snapshot` a read serves
     /// ([`Self::snapshot_for_field`] and the doors around it); a post carries
     /// only a log, and its reader finishes the delivery read here. Every step that shapes a served snapshot — alarm/utag
-    /// carry, the metadata cache, per-field routing and RSET overrides, menu
+    /// carry, the record's metadata, per-field routing and RSET overrides, menu
     /// enums, property support — runs here, so the two paths cannot drift
     /// apart.
     fn finish_field_snapshot(
@@ -9980,9 +9927,7 @@ impl RecordInstance {
         // that raise no message (C's plain `recGblSetSevr` clears namsg).
         snap.alarm.amsg = String::from(&self.common.amsg);
 
-        // Pull display/control/enums from the metadata cache (seeded at init,
-        // rebuilt by every metadata-class field write).
-        self.finish_metadata(field, self.cached_metadata(), backing, &mut snap);
+        self.finish_metadata(field, backing, &mut snap);
         snap
     }
 
@@ -10028,33 +9973,6 @@ impl RecordInstance {
         1u64.wrapping_shl(dig as u32) - 1
     }
 
-    /// Populate DisplayInfo from record fields if applicable.
-    /// Resolve the `Q:form` info-tag value to a `display.form` menu index.
-    ///
-    /// pvxs publishes the fixed seven-entry form menu
-    /// (Default/String/Binary/Decimal/Hex/Exponential/Engineering) for every
-    /// numeric value and, for the VAL field only, sets `display.form.index`
-    /// to the slot whose name equals the field's `Q:form` info tag
-    /// (`iocsource.cpp:42-62`, case-sensitive). Unset or unrecognised ->
-    /// `None` (form stays 0 = Default), exactly as pvxs leaves the index
-    /// untouched on no match.
-    fn q_form_index(&self) -> Option<i16> {
-        const FORM_NAMES: [&str; 7] = [
-            "Default",
-            "String",
-            "Binary",
-            "Decimal",
-            "Hex",
-            "Exponential",
-            "Engineering",
-        ];
-        let tag = self.cold.info.get("Q:form")?;
-        FORM_NAMES
-            .iter()
-            .position(|name| name == tag)
-            .map(|i| i as i16)
-    }
-
     /// The property mask a channel on `field` supplies, without building a
     /// snapshot — what a PVA server needs to decide which NT leaves it may
     /// MARK for a channel it has not read yet (QSRV resolves a group's member
@@ -10072,190 +9990,27 @@ impl RecordInstance {
         )
     }
 
-    /// The record-level display metadata cache: units, precision and display
-    /// limits as C's `get_units` / `get_precision` / `get_graphic_double`
-    /// answer them for the fields their rset lists.
-    ///
-    /// Driven by [`Record::property_support`], not by a `match` on the record
-    /// type. Those were two independent tables answering the same question,
-    /// and nothing kept them in step: `default_property_support` declares
-    /// units and precision for twenty-five record types where the arm list
-    /// here covered nine, so the other sixteen declared the leaf and served
-    /// `""` / `0` — `sel`, `sub`, `dfanout`, `subArray`, `scalcout`,
-    /// `acalcout`, `epid`, `scaler`, `swait`, `sseq`, `seq`, `mca`,
-    /// `histogram`, `transform`, `throttle` and `asyn`. Deriving the cache
-    /// from the declaration makes "declares the slot" and "supplies the slot"
-    /// one fact rather than two that can disagree.
-    ///
-    /// Precision matters well beyond `caget -d`: it is also what the
-    /// DBF_DOUBLE to DBR_STRING conversion renders with, in C
-    /// (`dbConvert.c:783-786` calls `prset->get_precision` with no field-type
-    /// gate) and here (`codec.rs::convert_value_to_dbr_string`), so a missing
-    /// slot changed the digits of a plain `caget`.
-    ///
-    /// The sources are the same in every C rset that supplies them — `EGU` for
-    /// `get_units` and `PREC` for `get_precision` — so only the graphic pair
-    /// needs a per-type table (`graphic_limit_fields`). Per-FIELD departures
-    /// from the record's own values stay where C puts them, in that record's
-    /// [`Record::field_metadata_override`], which is applied after this and
-    /// wins.
-    fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        let slots = self.record.property_support();
-        if slots.units || slots.precision || slots.graphic_double {
-            let (upper, lower) = if slots.graphic_double {
-                let (hi, lo) = super::record_trait::graphic_limit_fields(self.record.record_type());
-                (self.metadata_limit(hi), self.metadata_limit(lo))
-            } else {
-                (0.0, 0.0)
-            };
-            snap.display = Some(super::super::snapshot::DisplayInfo {
-                units: if slots.units {
-                    self.metadata_units()
-                } else {
-                    Default::default()
-                },
-                precision: if slots.precision {
-                    self.metadata_limit("PREC") as i16
-                } else {
-                    0
-                },
-                upper_disp_limit: upper,
-                lower_disp_limit: lower,
-                ..Default::default()
-            });
-        }
-        // Apply the `Q:form` display-format hint. The block above builds
-        // `snap.display` for every record type that supplies at least one
-        // display slot — the same set for which pvxs emits
-        // `display.form.choices`. This cache is record-level (it is the VAL
-        // field's metadata); the VAL-only rule pvxs applies to
-        // `display.form.index` (`iocsource.cpp:53`) is enforced per served
-        // field in `apply_field_metadata_override`.
-        if let Some(display) = snap.display.as_mut() {
-            if let Some(form) = self.q_form_index() {
-                display.form = form;
-            }
-        }
-        // `display.description` from dbCommon DESC — pvxs QSRV fills it
-        // on every metadata populate (iocsource.cpp:306-310), for every
-        // record type including those with no other display source. The
-        // qsrv builders always emit the leaf (defaulting a `None`
-        // display), so creating the DisplayInfo here changes leaf
-        // values, never the wire shape. Cache freshness is owned by the
-        // DESC arm of `put_common_field`, which rebuilds without
-        // posting DBE_PROPERTY (epics-base#785 / UI-106).
-        snap.display
-            .get_or_insert_with(Default::default)
-            .description = self.common.text.desc.clone();
-    }
-
-    /// The record-level control-limit cache — what C's `get_control_double`
-    /// answers for the fields its rset lists.
-    ///
-    /// Gated on the declared slot for the same reason as
-    /// [`Self::populate_display_info`], and with the same effect: the arm list
-    /// this replaces covered thirteen record types where
-    /// `default_property_support` declares `control_double` for twenty-three,
-    /// so `sel`, `sub`, `dfanout`, `subArray`, `histogram`, `scalcout`,
-    /// `acalcout` and `epid` served 0/0 on `VAL` — a channel whose C rset
-    /// answers the record's own operator range.
-    ///
-    /// Which of the record's fields that range comes from is the one thing
-    /// that varies by type, and it lives in `control_limit_source`.
-    fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        use super::record_trait::ControlLimitSource;
-
-        if !self.record.property_support().control_double {
-            return;
-        }
-        let (upper, lower) =
-            match super::record_trait::control_limit_source(self.record.record_type()) {
-                ControlLimitSource::Drive => {
-                    (self.metadata_limit("DRVH"), self.metadata_limit("DRVL"))
-                }
-                ControlLimitSource::DriveWhenSet => {
-                    let (drvh, drvl) = (self.metadata_limit("DRVH"), self.metadata_limit("DRVL"));
-                    if drvh > drvl {
-                        (drvh, drvl)
-                    } else {
-                        (self.metadata_limit("HOPR"), self.metadata_limit("LOPR"))
-                    }
-                }
-                ControlLimitSource::SoftLimits => {
-                    (self.metadata_limit("HLM"), self.metadata_limit("LLM"))
-                }
-                ControlLimitSource::Operator => {
-                    (self.metadata_limit("HOPR"), self.metadata_limit("LOPR"))
-                }
-            };
-        snap.control = Some(super::super::snapshot::ControlInfo {
-            upper_ctrl_limit: upper,
-            lower_ctrl_limit: lower,
-        });
-    }
-
-    /// A numeric metadata field (`PREC`, `HOPR`, `DRVH`, ...) as C reads it —
-    /// straight out of record memory, which for C means every field the `.dbd`
-    /// declares.
-    ///
-    /// Through [`Self::resolve_field`], NOT `Record::get_field`, and that is
-    /// the whole reason this cache used to read zero for the types it now
-    /// serves: a Rust record implements only the fields it has behaviour for,
-    /// so `sel`, `sub`, `dfanout` and their siblings model no `PREC`/`HOPR`
-    /// cell at all and `get_field` answers `None` for them. Their `.db` values
-    /// live in `declared_overrides`, and their unset defaults in the `.dbd`
-    /// `initial()`, both of which only `resolve_field` reaches.
-    fn metadata_limit(&self, field: &str) -> f64 {
-        self.metadata_field(field)
-            .and_then(|v| v.to_f64())
-            .unwrap_or(0.0)
-    }
-
-    /// A metadata source field, read only where the record declares it: C
-    /// reads these out of record memory, so an undeclared one (`EGU` on `bo`)
-    /// is absent, and asking the virtual-name fallback for it is a by-name
-    /// compare on every metadata rebuild.
-    fn metadata_field(&self, field: &str) -> Option<EpicsValue> {
-        let desc = self.field_desc(field)?;
-        self.resolve_field_upper_at(field, Some(desc))
-    }
-
-    /// `EGU`, the source every ported C `get_units` copies from. Empty for a
-    /// record type whose `.dbd` declares no `EGU` — `seq` and `histogram` have
-    /// none, and C writes nothing into the `dbAccess.c:378` seed for either.
-    fn metadata_units(&self) -> crate::types::PvString {
-        match self.metadata_field("EGU") {
-            Some(EpicsValue::String(s)) => s,
-            _ => Default::default(),
-        }
-    }
-
-    /// Populate EnumInfo — C rset `get_enum_strs`.
-    ///
-    /// The table comes from [`Record::enum_state_strings`], the SAME slot the
-    /// string-put converter (`dbConvert.c::putStringEnum`) resolves against, so
-    /// the choice list a client reads and the names it may write are one table
-    /// by construction. It arrives already trimmed to C's `no_str` (bi/bo/busy
-    /// drop an empty ONAM behind a set ZNAM — `boRecord.c:342-352`; mbbi/mbbo
-    /// cut at the last non-empty state — `mbbiRecord.c:262-269`).
-    ///
-    /// The `DBR_STRING` half of the same channel is the record's OTHER rset slot
-    /// (`get_enum_str`), which is not this trimmed list — see
-    /// [`EnumStringForm`]. A record that has no such slot (every record but
-    /// bi/bo/busy/mbbi/mbbo, including the downstream crates' own enum records)
-    /// renders from its label list, which is what C's absent slot amounts to.
-    fn populate_enum_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        if let Some(strings) = self.record.enum_state_strings() {
-            snap.enums = Some(match self.record.enum_slots().map(EnumSlots::form) {
-                Some(form) => super::super::snapshot::EnumInfo::with_string_form(strings, form),
-                None => super::super::snapshot::EnumInfo::new(strings),
-            });
-        }
-    }
-
     /// Get a common field value.
     pub fn get_common_field(&self, name: &str) -> Option<EpicsValue> {
         self.common_field(CommonField::by_name(name)?)
+    }
+
+    /// [`Self::common_field`] as a number: the analog alarm ladder straight
+    /// off its slot, any other cell through its value.
+    fn common_number(&self, field: CommonField) -> Option<f64> {
+        let alarm = self.common.analog_alarm.as_ref();
+        let limit = |field| alarm.map(|a| a.limit(field).as_f64());
+        match field {
+            CommonField::Hihi => limit(AlarmLimitField::Hihi),
+            CommonField::High => limit(AlarmLimitField::High),
+            CommonField::Low => limit(AlarmLimitField::Low),
+            CommonField::Lolo => limit(AlarmLimitField::Lolo),
+            CommonField::Hhsv => alarm.map(|a| a.hhsv.into()),
+            CommonField::Hsv => alarm.map(|a| a.hsv.into()),
+            CommonField::Lsv => alarm.map(|a| a.lsv.into()),
+            CommonField::Llsv => alarm.map(|a| a.llsv.into()),
+            _ => self.common_field(field)?.to_f64(),
+        }
     }
 
     /// The value of the field [`Self::get_common_field`] answers as `field`.
@@ -11464,16 +11219,7 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     // DBF_STRING data field — store the bytes verbatim so a
                     // non-UTF-8 DESC round-trips unchanged.
-                    if self.common.text.desc != s {
-                        self.common.text.desc = s;
-                        // DESC feeds `display.description` (a metadata-cache
-                        // source) but is not property-class — C never marks
-                        // it prop(YES) (epics-base#785) — so refresh the
-                        // cache here at the write owner without posting
-                        // DBE_PROPERTY: the pvxs behavior (fresh on the next
-                        // metadata build, no event).
-                        self.refresh_metadata_cache();
-                    }
+                    self.common.text.desc = s;
                 }
             }
             "PHAS" => {
@@ -12745,11 +12491,9 @@ impl RecordInstance {
         }
 
         // If the record reports it modified a metadata-class field during
-        // process(), rebuild the metadata cache from the new values.
-        // Default impl returns false, so
+        // process(), post DBE_PROPERTY. Default impl returns false, so
         // most records pay zero cost here.
         if self.record.took_metadata_change() {
-            self.refresh_metadata_cache();
             // mirror C db_post_events(precord, NULL, DBE_PROPERTY) after record processing.
             self.post_record_wide(
                 &mut PostBurst::new(),
@@ -13011,39 +12755,6 @@ impl RecordInstance {
         }
     }
 
-    /// The four limits C's `get_alarm_double` serves for the fields its rset
-    /// lists — [`alarm_explicit_fields`](super::record_trait::alarm_explicit_fields).
-    ///
-    /// Read through [`Self::resolve_field`], the same unified accessor C's
-    /// `prec->hihi` is. The port stores the eight alarm fields in one of two
-    /// disjoint homes — `common.analog_alarm` for the types with the analog
-    /// ladder (`ai`/`ao`/`calc`/…), the record's own struct for the types
-    /// without it (`dfanout`/`sel`) — and `resolve_field` spans both. Reading
-    /// the ladder slot directly instead would answer NaN for every `dfanout`
-    /// and `sel` no matter how its HIHI/HHSV were set, because those two types
-    /// have no slot at all.
-    fn explicit_alarm_limits(&self, rtype: &str) -> (f64, f64, f64, f64) {
-        let limit = |name: &str| self.metadata_limit(name);
-        // The raw stored ordinal, NOT clamped to 0..=3: C tests `prec->hhsv`
-        // for NONZERO, so an out-of-range severity still enables its limit.
-        let severity = |name: &str| {
-            self.metadata_field(name)
-                .and_then(|v| v.to_f64())
-                .unwrap_or(0.0) as i16
-        };
-        match super::record_trait::alarm_val_arm(rtype) {
-            super::record_trait::AlarmValArm::Unconditional => {
-                (limit("HIHI"), limit("HIGH"), limit("LOW"), limit("LOLO"))
-            }
-            super::record_trait::AlarmValArm::Gated => (
-                gated(severity("HHSV"), limit("HIHI")),
-                gated(severity("HSV"), limit("HIGH")),
-                gated(severity("LSV"), limit("LOW")),
-                gated(severity("LLSV"), limit("LOLO")),
-            ),
-        }
-    }
-
     /// The fields C's **`get_control_double`** answers with the record's own
     /// cached limits, rather than letting them fall to the `default:` arm.
     ///
@@ -13178,8 +12889,8 @@ impl RecordInstance {
     }
 
     /// The fields C's **`get_graphic_double`** answers with the record's own
-    /// `HOPR`/`LOPR` — which is exactly what the VAL metadata cache already
-    /// holds, so routing must leave them on it.
+    /// `HOPR`/`LOPR` — which is exactly what the record-level VAL metadata
+    /// already holds, so routing must leave them on it.
     ///
     /// The third membership question, and a third distinct set: the alarm arm
     /// lists VAL alone and the control arm lists the eight, but graphic lists
@@ -14337,7 +14048,6 @@ mod record_cell_layout_tests {
             bkpt,
             string_typed,
             dbaddr_counts,
-            metadata,
         });
         packed_in_order(cell);
 
@@ -14570,7 +14280,7 @@ mod property_support_owner_tests {
 }
 
 #[cfg(test)]
-mod metadata_cache_tests {
+mod metadata_tests {
     use super::*;
     use crate::server::records::ai::AiRecord;
 
@@ -14693,52 +14403,14 @@ mod metadata_cache_tests {
     }
 
     #[test]
-    fn metadata_cache_source_set_check() {
-        // Every field `populate_display_info` / `populate_control_info` /
-        // `populate_enum_info` reads.
-        assert!(is_metadata_cache_source("EGU"));
-        assert!(is_metadata_cache_source("PREC"));
-        assert!(is_metadata_cache_source("HOPR"));
-        assert!(is_metadata_cache_source("LOPR"));
-        assert!(is_metadata_cache_source("DRVH"));
-        assert!(is_metadata_cache_source("ZNAM"));
-        assert!(is_metadata_cache_source("ZRST"));
-        assert!(is_metadata_cache_source("FFST"));
-
-        // Every cell `explicit_alarm_limits` reads, now that the cache holds
-        // its answer: the four bands and the four severities that gate them.
-        assert!(is_metadata_cache_source("HIHI"));
-        assert!(is_metadata_cache_source("HIGH"));
-        assert!(is_metadata_cache_source("LOW"));
-        assert!(is_metadata_cache_source("LOLO"));
-        assert!(is_metadata_cache_source("HHSV"));
-        assert!(is_metadata_cache_source("HSV"));
-        assert!(is_metadata_cache_source("LSV"));
-        assert!(is_metadata_cache_source("LLSV"));
-
-        assert!(!is_metadata_cache_source("VAL"));
-        assert!(!is_metadata_cache_source("DESC"));
-        assert!(!is_metadata_cache_source("SCAN"));
-        assert!(!is_metadata_cache_source("PHAS"));
-    }
-
-    #[test]
-    fn cache_starts_empty_then_populates_on_first_snapshot() {
+    fn a_snapshot_serves_the_record_metadata() {
         let inst = ai_instance();
-
-        // Cache starts empty
-        assert!(inst.cold.metadata_cache.load().is_none());
-
-        // First snapshot triggers populate + cache store
         let snap = inst.snapshot_for_field("VAL").unwrap();
         let display = snap.display.expect("ai snapshot must have display");
         assert_eq!(display.units, "degC");
         assert_eq!(display.precision, 2);
         assert_eq!(display.upper_disp_limit, 100.0);
         assert_eq!(display.lower_disp_limit, 0.0);
-
-        // Cache is now populated
-        assert!(inst.cold.metadata_cache.load().is_some());
     }
 
     #[test]
@@ -14790,6 +14462,24 @@ mod metadata_cache_tests {
         inst2.set_info("Q:form", "Nonsense");
         let snap2 = inst2.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap2.display.expect("ai display").form, 0);
+    }
+
+    /// The tag is resolved where it is written: a later `Q:form` write is the
+    /// one served, and another tag's write leaves it.
+    #[test]
+    fn the_last_q_form_write_is_served() {
+        let form = |inst: &RecordInstance| {
+            let snap = inst.snapshot_for_field("VAL").unwrap();
+            snap.display.expect("ai display").form
+        };
+        let mut inst = ai_instance();
+        inst.set_info("Q:form", "Hex");
+        inst.set_info("autosaveFields", "VAL");
+        assert_eq!(form(&inst), 4);
+        inst.set_info("Q:form", "Binary");
+        assert_eq!(form(&inst), 2);
+        inst.set_info("Q:form", "Nonsense");
+        assert_eq!(form(&inst), 0);
     }
 
     /// `info(Q:time:tag)` resolves to pvxs's `nsecMask`
@@ -14918,135 +14608,11 @@ mod metadata_cache_tests {
         );
     }
 
-    #[test]
-    fn cache_hit_returns_same_metadata() {
-        let inst = ai_instance();
-
-        // Prime the cache
-        let snap1 = inst.snapshot_for_field("VAL").unwrap();
-        let display1 = snap1.display.unwrap();
-
-        // Subsequent snapshots return the same cached metadata
-        let snap2 = inst.snapshot_for_field("VAL").unwrap();
-        let display2 = snap2.display.unwrap();
-
-        assert_eq!(display1.units, display2.units);
-        assert_eq!(display1.precision, display2.precision);
-        assert_eq!(display1.upper_disp_limit, display2.upper_disp_limit);
-        assert_eq!(display1.lower_disp_limit, display2.lower_disp_limit);
-    }
-
-    #[test]
-    fn refresh_rebuilds_a_built_cache() {
-        let inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        let built = builds();
-
-        inst.refresh_metadata_cache();
-        assert_eq!(builds(), built + 1);
-        assert!(inst.cold.metadata_cache.load().is_some());
-    }
-
-    #[test]
-    fn refresh_leaves_an_unbuilt_cache_unbuilt() {
-        let inst = ai_instance();
-        let built = builds();
-        inst.refresh_metadata_cache();
-        assert_eq!(builds(), built);
-        assert!(inst.cold.metadata_cache.load().is_none());
-    }
-
-    #[test]
-    fn notify_field_written_invalidates_for_metadata_field() {
-        let inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-
-        let built = builds();
-        // Writing a metadata field rebuilds it
-        inst.notify_field_written("EGU");
-        assert_eq!(builds(), built + 1);
-    }
-
-    #[test]
-    fn notify_field_written_skips_non_metadata_field() {
-        let inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-
-        let built = builds();
-        // Writing a value field does NOT rebuild the cache
-        inst.notify_field_written("VAL");
-        assert_eq!(builds(), built);
-
-        // DESC is not property-class either — its cache invalidation
-        // is owned by the DESC arm of `put_common_field`, not by this
-        // notify path (UI-106).
-        inst.notify_field_written("DESC");
-        assert_eq!(builds(), built);
-    }
-
-    #[test]
-    fn notify_field_written_is_case_insensitive() {
-        let inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-
-        let built = builds();
-        // Lowercase metadata field name still triggers the rebuild
-        inst.notify_field_written("egu");
-        assert_eq!(builds(), built + 1);
-    }
-
-    /// epics-base faac1df1 — `notify_field_written_if_changed` must
-    /// SKIP the cache invalidation when the metadata field's value
-    /// didn't actually change. Otherwise a stream of idempotent puts
-    /// from a CSS panel binds DBE_PROPERTY subscribers to bogus
-    /// "property changed" events on every cycle.
-    #[test]
-    fn notify_field_written_if_changed_skips_when_unchanged() {
-        let mut inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-
-        // Capture prev, do a no-op put, then notify — cache must remain.
-        let built = builds();
-        let prev = inst.record.get_field("EGU");
-        let _ = inst.record.put_field("EGU", prev.clone().unwrap());
-        inst.notify_field_written_if_changed("EGU", prev.as_ref());
-        assert_eq!(
-            builds(),
-            built,
-            "no-op put must not rebuild the metadata cache"
-        );
-    }
-
-    /// And when the value DID change, the cache must invalidate.
-    #[test]
-    fn notify_field_written_if_changed_invalidates_on_real_change() {
-        let mut inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-
-        let prev = inst.record.get_field("EGU");
-        let _ = inst
-            .record
-            .put_field("EGU", EpicsValue::String("kPa".into()));
-        inst.notify_field_written_if_changed("EGU", prev.as_ref());
-        let cached = inst.cold.metadata_cache.load_full().expect("still built");
-        assert_eq!(
-            cached.display.as_ref().unwrap().units,
-            "kPa",
-            "real metadata change must rebuild the cache"
-        );
-    }
-
     /// UI-106 / epics-base#785 — DESC feeds `display.description`
     /// (pvxs fills it on every metadata populate, iocsource.cpp:306-310),
-    /// and a changed DESC refreshes the cache at its write owner so the
-    /// next snapshot serves the new text.
+    /// and the next snapshot after a DESC write serves the new text.
     #[test]
-    fn desc_reaches_display_description_and_a_write_refreshes_it() {
+    fn desc_reaches_display_description_and_a_write_is_served() {
         let mut inst = ai_instance();
         inst.put_common_field("DESC", EpicsValue::String("before".into()))
             .unwrap();
@@ -15055,14 +14621,8 @@ mod metadata_cache_tests {
             snap.display.as_ref().unwrap().description.as_str_lossy(),
             "before"
         );
-        let built = builds();
         inst.put_common_field("DESC", EpicsValue::String("after".into()))
             .unwrap();
-        assert_eq!(
-            builds(),
-            built + 1,
-            "a changed DESC must rebuild the metadata cache"
-        );
         let snap = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(
             snap.display.as_ref().unwrap().description.as_str_lossy(),
@@ -15070,54 +14630,18 @@ mod metadata_cache_tests {
         );
     }
 
-    /// …and an idempotent DESC put must NOT invalidate — same
-    /// discipline as faac1df1 for the property-class fields.
+    /// A field written straight into the record, with no writer told, is
+    /// what the next snapshot serves: C's rset reads it on every `dbGet`.
     #[test]
-    fn an_idempotent_desc_put_keeps_the_cache() {
+    fn a_snapshot_serves_a_metadata_field_written_in_place() {
         let mut inst = ai_instance();
-        inst.put_common_field("DESC", EpicsValue::String("same".into()))
-            .unwrap();
-        let _ = inst.snapshot_for_field("VAL");
-        let built = builds();
-        inst.put_common_field("DESC", EpicsValue::String("same".into()))
-            .unwrap();
-        assert_eq!(
-            builds(),
-            built,
-            "an unchanged DESC must not rebuild the metadata cache"
-        );
-    }
-
-    /// Non-metadata fields don't carry property semantics — the
-    /// `if_changed` variant must never invalidate for them, matching
-    /// the existing `notify_field_written` short-circuit.
-    #[test]
-    fn notify_field_written_if_changed_skips_non_metadata_field() {
-        let mut inst = ai_instance();
-        let _ = inst.snapshot_for_field("VAL");
-        assert!(inst.cold.metadata_cache.load().is_some());
-        // VAL is neither a cache source nor `prop(YES)` — must be skipped
-        // even with a changed value.
-        let built = builds();
-        inst.notify_field_written_if_changed("VAL", None);
-        assert_eq!(builds(), built);
-    }
-
-    #[test]
-    fn cache_picks_up_new_value_after_invalidation() {
-        let mut inst = ai_instance();
-
-        // First snapshot: degC
         let snap1 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap1.display.unwrap().units, "degC");
 
-        // Mutate EGU and invalidate
         let _ = inst
             .record
             .put_field("EGU", EpicsValue::String("mV".into()));
-        inst.notify_field_written("EGU");
 
-        // Second snapshot: mV (rebuilt)
         let snap2 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap2.display.unwrap().units, "mV");
     }
@@ -15873,9 +15397,8 @@ mod metadata_cache_tests {
     }
 
     /// Stub record that simulates a record whose process() mutates an
-    /// internal metadata field. Used to verify that the
-    /// `Record::took_metadata_change()` hook actually triggers cache
-    /// invalidation in `process_local()`.
+    /// internal metadata field and reports it through
+    /// `Record::took_metadata_change()`.
     struct MutatingMetaRecord {
         val: f64,
         egu: String,
@@ -15926,7 +15449,7 @@ mod metadata_cache_tests {
     }
 
     #[test]
-    fn process_local_invalidates_cache_on_took_metadata_change() {
+    fn process_local_serves_metadata_its_process_wrote() {
         let mut inst = RecordInstance::new(
             "MUT",
             MutatingMetaRecord {
@@ -15936,71 +15459,14 @@ mod metadata_cache_tests {
             },
         );
 
-        // Build the cache once with the original EGU
         let snap1 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap1.display.unwrap().units, "V");
-        assert!(inst.cold.metadata_cache.load().is_some());
 
-        // Run process_local — the stub record sets took_change inside process()
+        // The stub record writes EGU inside process().
         let _ = inst.process_local();
 
-        // Rebuilt from the new EGU (took_metadata_change returned true)
-        let cached = inst.cold.metadata_cache.load_full().expect("still built");
-        assert_eq!(
-            cached.display.as_ref().unwrap().units,
-            "kV",
-            "process_local should rebuild the cache when took_metadata_change is true"
-        );
-
-        // Next snapshot picks up the new EGU
         let snap2 = inst.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap2.display.unwrap().units, "kV");
-    }
-
-    /// Stub record that does NOT mutate metadata fields. Verifies the
-    /// default `took_metadata_change` returns false and the cache stays.
-    struct StableMetaRecord {
-        val: f64,
-    }
-    impl Record for StableMetaRecord {
-        fn record_type(&self) -> &'static str {
-            "ai"
-        }
-        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
-            self.val += 1.0;
-            Ok(crate::server::record::ProcessOutcome::complete())
-        }
-        fn get_field(&self, name: &str) -> Option<EpicsValue> {
-            match name {
-                "VAL" => Some(EpicsValue::Double(self.val)),
-                "EGU" => Some(EpicsValue::String("V".into())),
-                "PREC" => Some(EpicsValue::Short(0)),
-                "HOPR" => Some(EpicsValue::Double(0.0)),
-                "LOPR" => Some(EpicsValue::Double(0.0)),
-                _ => None,
-            }
-        }
-        fn put_field(&mut self, _: &str, _: EpicsValue) -> CaResult<()> {
-            Ok(())
-        }
-        fn declared_fields(&self) -> &'static [crate::server::record::FieldDesc] {
-            &[]
-        }
-        // took_metadata_change uses default impl (returns false)
-    }
-
-    #[test]
-    fn process_local_keeps_cache_when_no_metadata_change() {
-        let mut inst = RecordInstance::new("STABLE", StableMetaRecord { val: 0.0 });
-
-        let _ = inst.snapshot_for_field("VAL");
-        let built = builds();
-
-        // Run process_local several times — cache should remain intact
-        let _ = inst.process_local();
-        let _ = inst.process_local();
-        let _ = inst.process_local();
-        assert_eq!(builds(), built);
     }
 
     // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────
@@ -18781,8 +18247,8 @@ mod scan_index_result_tests {
 
 #[cfg(test)]
 mod lent_metadata_tests {
-    //! A metadata source written by device code a record is lent to reaches
-    //! the cache by the lend's release, however the type stores the field.
+    //! A metadata source written by device code a record is lent to is
+    //! served by the next read, however the type stores the field.
     use super::*;
     use crate::server::database::PvDatabase;
     use crate::server::records::{
@@ -18792,18 +18258,22 @@ mod lent_metadata_tests {
     async fn db_with(name: &str, record: Box<dyn Record>) -> Arc<PvDatabase> {
         let db = Arc::new(PvDatabase::new());
         db.add_record(name, record).await.unwrap();
-        db.get_record(name).unwrap().read().seed_metadata_cache();
         db
     }
 
-    fn cached(db: &PvDatabase, name: &str) -> Arc<CachedMetadata> {
+    fn served(db: &PvDatabase, name: &str) -> crate::server::snapshot::Snapshot {
         let rec = db.get_record(name).unwrap();
         let inst = rec.read();
-        inst.cold.metadata_cache.load_full().unwrap()
+        inst.snapshot_for_field("VAL").unwrap()
+    }
+
+    /// `HIHI` as `VAL` serves it.
+    fn hihi(db: &PvDatabase, name: &str) -> f64 {
+        served(db, name).alarm_limits().unwrap().3
     }
 
     fn first_state(db: &PvDatabase, name: &str) -> PvString {
-        cached(db, name).enums.as_ref().unwrap().strings[0].clone()
+        served(db, name).enums.as_ref().unwrap().strings[0].clone()
     }
 
     fn mut_as<R: Record>(record: &mut dyn Record) -> &mut R {
@@ -18814,7 +18284,7 @@ mod lent_metadata_tests {
     }
 
     #[epics_macros_rs::epics_test]
-    async fn a_slot_string_written_in_a_held_lend_reaches_the_cache() {
+    async fn a_slot_string_written_in_a_held_lend_is_served() {
         let mut mbbo = MbboRecord::new(0);
         mbbo.zrst = "SHUT".into();
         let db = db_with("MO", Box::new(mbbo)).await;
@@ -18825,7 +18295,7 @@ mod lent_metadata_tests {
     }
 
     #[epics_macros_rs::epics_test]
-    async fn a_custom_string_written_in_with_record_reaches_the_cache() {
+    async fn a_custom_string_written_in_with_record_is_served() {
         let mut mbbi = MbbiRecord::new(0);
         mbbi.zrst = "SHUT".into();
         let db = db_with("MI", Box::new(mbbi)).await;
@@ -18836,32 +18306,32 @@ mod lent_metadata_tests {
     }
 
     #[epics_macros_rs::epics_test]
-    async fn a_common_alarm_severity_written_in_with_instance_reaches_the_cache() {
+    async fn a_common_alarm_severity_written_in_with_instance_is_served() {
         let db = db_with("AI", Box::new(AiRecord::new(0.0))).await;
         db.put_record_field_from_ca("AI", "HIHI", EpicsValue::Double(90.0))
             .await
             .unwrap();
-        assert!(cached(&db, "AI").alarm.0.is_nan(), "HHSV 0 gates HIHI off");
+        assert!(hihi(&db, "AI").is_nan(), "HHSV 0 gates HIHI off");
         db.async_handle().with_instance("AI", |_, common| {
             common.analog_alarm.as_mut().unwrap().hhsv = 2;
         });
-        assert_eq!(cached(&db, "AI").alarm.0, 90.0);
+        assert_eq!(hihi(&db, "AI"), 90.0);
     }
 
     #[epics_macros_rs::epics_test]
-    async fn desc_written_in_a_held_lend_reaches_the_cache() {
+    async fn desc_written_in_a_held_lend_is_served() {
         let db = db_with("AI", Box::new(AiRecord::new(0.0))).await;
         db.async_handle().with_held("AI", |held| {
             held.with(|_, common| common.text.desc = "pump".into())
         });
         assert_eq!(
-            cached(&db, "AI").display.as_ref().unwrap().description,
+            served(&db, "AI").display.as_ref().unwrap().description,
             "pump"
         );
     }
 
     #[epics_macros_rs::epics_test]
-    async fn a_named_scalar_written_through_with_device_reaches_the_cache() {
+    async fn a_named_scalar_written_through_with_device_is_served() {
         struct Dev;
         impl crate::server::device_support::DeviceSupport for Dev {
             fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -18876,34 +18346,19 @@ mod lent_metadata_tests {
         db.put_record_field_from_ca("SL", "HIHI", EpicsValue::Double(90.0))
             .await
             .unwrap();
-        assert!(cached(&db, "SL").alarm.0.is_nan(), "HHSV 0 gates HIHI off");
+        assert!(hihi(&db, "SL").is_nan(), "HHSV 0 gates HIHI off");
         db.get_record("SL").unwrap().write().device = Some(Box::new(Dev));
         let ran = db.async_handle().with_held("SL", |held| {
             held.with_device(|record, _, _| mut_as::<SelRecord>(record).hhsv = 2)
         });
         assert_eq!(ran, Some(Some(())));
-        assert_eq!(cached(&db, "SL").alarm.0, 90.0);
+        assert_eq!(hihi(&db, "SL"), 90.0);
         // An ao's PREC is a slot.
         let db = db_with("AO", Box::new(AoRecord::new(0.0))).await;
         db.get_record("AO").unwrap().write().device = Some(Box::new(Dev));
         db.async_handle().with_held("AO", |held| {
             held.with_device(|record, _, _| mut_as::<AoRecord>(record).prec = 4)
         });
-        assert_eq!(cached(&db, "AO").display.as_ref().unwrap().precision, 4);
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn a_lend_that_writes_no_source_rebuilds_nothing() {
-        let mut mbbi = MbbiRecord::new(0);
-        mbbi.zrst = "SHUT".into();
-        let db = db_with("MI", Box::new(mbbi)).await;
-        let before = builds();
-        db.async_handle().with_instance("MI", |record, common| {
-            mut_as::<MbbiRecord>(record).val = 1;
-            common.udf = 0;
-        });
-        db.async_handle()
-            .with_held("MI", |held| held.with(|_, common| common.tpro = 0));
-        assert_eq!(builds(), before);
+        assert_eq!(served(&db, "AO").display.as_ref().unwrap().precision, 4);
     }
 }

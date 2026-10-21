@@ -1058,7 +1058,7 @@ impl Record for WaveformRecord {
     /// * `aai` (`:276-291`) / `aao` (`:279-294`) — only `NORD`.
     ///
     /// `VAL` is absent from both lists here: it answers HOPR/LOPR, which is
-    /// what the VAL metadata cache already holds.
+    /// what the record-level VAL metadata already holds.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         let malm = self.malm as f64;
         let nelm = self.nelm as f64;

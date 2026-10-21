@@ -1,7 +1,7 @@
 //! `mca` reaches its declaration through `default_property_support`'s
 //! `_ => NUMERIC` fallback, and the fallback is right — `mcaRecord.c:150-157`
 //! NULLs nothing. What it did not have was a supplier: there is no `"mca"` arm
-//! anywhere in the framework's metadata cache, so every one of the type's
+//! anywhere in the framework's record-level metadata, so every one of the type's
 //! fields carried empty units, and every DBF_DOUBLE outside the four
 //! calibration fields carried precision 0, under a mark saying the record had
 //! answered.
@@ -9,7 +9,7 @@
 //! `mcaRecord.c:884-890` copies `EGU` with no field test at all, and
 //! `:892-907` seeds `pmca->prec` and departs from it only for
 //! `CALO`/`CALS`/`CALQ`/`TTH`. Both are record-level answers; this file is the
-//! cross-crate check that the record-level cache reaches a type declared only
+//! cross-crate check that the record-level metadata reaches a type declared only
 //! by the fallback.
 
 use epics_base_rs::server::record::{Record, RecordInstance};

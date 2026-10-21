@@ -1,4 +1,4 @@
-//! The derived record-level metadata cache serves what the hand-written
+//! The derived record-level metadata serves what the hand-written
 //! `match rtype` arms served.
 //!
 //! `populate_display_info` and `populate_control_info` used to name thirteen

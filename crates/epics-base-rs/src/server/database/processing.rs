@@ -875,8 +875,7 @@ impl<'a> HeldInstance<'a> {
         }
     }
 
-    /// The record and its `dbCommon`, borrowed for `f` alone. A metadata
-    /// field `f` writes reaches the metadata cache when it returns.
+    /// The record and its `dbCommon`, borrowed for `f` alone.
     ///
     /// # Panics
     ///
@@ -891,9 +890,7 @@ impl<'a> HeldInstance<'a> {
     ) -> R {
         let mut instance = self.rec.write();
         let instance = &mut *instance;
-        let r = f(&mut *instance.record, &mut instance.common);
-        instance.settle_metadata_cache();
-        r
+        f(&mut *instance.record, &mut instance.common)
     }
 
     /// [`Self::with`] with the record's bound device as well; `None` when
@@ -913,9 +910,7 @@ impl<'a> HeldInstance<'a> {
         let mut instance = self.rec.write();
         let instance = &mut *instance;
         let dev = instance.device.as_mut()?;
-        let r = f(&mut *instance.record, &mut instance.common, &mut **dev);
-        instance.settle_metadata_cache();
-        Some(r)
+        Some(f(&mut *instance.record, &mut instance.common, &mut **dev))
     }
 
     /// [`PvDatabase::post_property`] on this record, inside the hold: C's
@@ -1326,7 +1321,6 @@ impl AsyncDbHandle {
         // `write` takes the record's lock set: `dbScanLock`.
         let mut instance = rec.write();
         f(&mut *instance.record);
-        instance.settle_metadata_cache();
         super::field_io::emit_cycle_posts(&mut instance);
     }
 
@@ -1346,7 +1340,6 @@ impl AsyncDbHandle {
         let mut instance = rec.write();
         let instance = &mut *instance;
         let r = f(&mut *instance.record, &mut instance.common);
-        instance.settle_metadata_cache();
         super::field_io::emit_cycle_posts(instance);
         Some(r)
     }
@@ -4525,8 +4518,6 @@ impl PvDatabase {
     /// and a monitor event is posted with `DBE_VALUE | DBE_LOG` — the mask C
     /// device support uses for an out-of-process value post
     /// (`db_post_events(precord, &prec->field, DBE_VALUE | DBE_LOG)`).
-    /// Metadata-class writes rebuild the metadata cache via
-    /// `notify_field_written`, honouring the snapshot-cache contract.
     ///
     /// Unlike [`Self::complete_async_record`], this runs *no* alarm /
     /// timestamp / FLNK tail: it is the immediate "push these fields to
@@ -4551,7 +4542,7 @@ impl PvDatabase {
     /// `db_post_events(precord, &precord->val, DBE_PROPERTY)` analogue used
     /// for enum-string table re-propagation (asyn `callbackEnum`,
     /// devAsynInt32.c:712-766). Stores [`crate::server::device_support::PropertyPost::writes`] through the
-    /// internal put, invalidates the metadata cache, and posts a single
+    /// internal put and posts a single
     /// `DBE_PROPERTY` event on [`crate::server::device_support::PropertyPost::post_field`] so subscribers
     /// re-read enum choices / control metadata.
     ///
@@ -4593,15 +4584,8 @@ impl PvDatabase {
         let mut written = Vec::with_capacity(post.writes.len());
         for (field, value) in post.writes {
             self.put_internal_field_opening(inst, &field, value, links)?;
-            // Snapshot-cache contract: a metadata-class write must rebuild
-            // the cache before the monitor snapshot below is built, or the
-            // property event would carry the pre-change enum choices.
-            inst.notify_field_written(&field);
             written.push(field);
         }
-        // Likewise a source the dset wrote in place before it asked for the
-        // post (devOpcua.cpp:710-732).
-        inst.settle_metadata_cache();
         inst.notify_field(&post.post_field, crate::server::recgbl::EventMask::PROPERTY);
         Ok(written)
     }
@@ -4661,9 +4645,6 @@ impl PvDatabase {
                 continue;
             }
             self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
-            // Snapshot-cache contract: a metadata-class write must
-            // rebuild the cache before the monitor snapshot is built.
-            inst.notify_field_written(&field);
             if rule != PostRule::Silent {
                 inst.notify_field(&field, mask);
                 posted.push(field);

@@ -66,7 +66,7 @@ fn epid_operator_window_covers_val_and_cval() {
 }
 
 /// The drive window — the second answer, on the actuator's scale. A record has
-/// one metadata cache, so these four cannot come from it.
+/// one record-level metadata, so these four cannot come from it.
 #[test]
 fn epid_drive_window_covers_oval_and_the_three_gains() {
     let inst = epid();

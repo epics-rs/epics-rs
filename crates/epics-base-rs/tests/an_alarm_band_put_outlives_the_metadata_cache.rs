@@ -1,12 +1,8 @@
-//! The four explicit alarm bands are answered from the record-level metadata
-//! cache, so a write to any of the eight cells behind them must invalidate it.
-//!
-//! C needs no such rule: `get_alarm_double` reads `prec->hihi` and
-//! `prec->hhsv` as struct members on every call (`calcRecord.c:205-221`), so
-//! the served value cannot lag the field. Here the eight `resolve_field` name
-//! lookups moved into `cached_metadata`, which makes staleness the one way
-//! this can be wrong — and the boundary is the ORDER: a snapshot taken BEFORE
-//! the put is what populates the cache the put has to knock down.
+//! The four explicit alarm bands are served from the eight cells behind them
+//! as they stand, as C's `get_alarm_double` reads `prec->hihi` and
+//! `prec->hhsv` as struct members on every call (`calcRecord.c:205-221`). The
+//! boundary is the ORDER: a snapshot taken BEFORE the put must not decide
+//! what one taken after it serves.
 //!
 //! The cases are per-boundary rather than per-record: the band's value, and
 //! the severity that gates it (C serves NaN while the severity is zero, so

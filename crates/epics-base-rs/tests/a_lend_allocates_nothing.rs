@@ -1,9 +1,8 @@
 //! A lend of a record to device code allocates nothing on release, whatever
-//! the type. The release compares the metadata cache's source fields with
-//! what the cache was built from, so every source must read in place: a
-//! string source cloned out by name was a malloc per I/O Intr callback, and
-//! per cycle on the scan thread for a held-API device. Counted with this
-//! binary's own allocator on the calling thread, every string source set.
+//! the type: a release that cloned a string field out by name was a malloc
+//! per I/O Intr callback, and per cycle on the scan thread for a held-API
+//! device. Counted with this binary's own allocator on the calling thread,
+//! every string metadata field set.
 
 mod module_records;
 
@@ -45,7 +44,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// The metadata cache's string sources.
+/// The string fields the metadata reads.
 const STRING_SOURCES: &[&str] = &[
     "DESC", "EGU", "ZNAM", "ONAM", "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST",
     "EIST", "NIST", "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",

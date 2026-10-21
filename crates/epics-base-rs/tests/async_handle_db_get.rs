@@ -175,6 +175,26 @@ async fn db_get_from_inside_a_record_sees_its_own_metadata_writes() {
     assert_eq!(got.precision(), Some(5));
 }
 
+/// Written in place, inside the same hold: the read is of the fields.
+#[epics_macros_rs::epics_test]
+async fn db_get_from_inside_a_record_serves_metadata_it_wrote_in_place() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let mut got = None;
+    h.with_record("AI", |rec| {
+        rec.put_field("EGU", EpicsValue::String("um".into()))
+            .unwrap();
+        rec.put_field("PREC", EpicsValue::Short(5)).unwrap();
+        rec.put_field("HOPR", EpicsValue::Double(20.0)).unwrap();
+        rec.put_field("LOPR", EpicsValue::Double(-20.0)).unwrap();
+        got = h.db_get("AI.VAL", DbFieldType::Double, 1, Some((b"AI", &*rec)));
+    });
+    let got = got.expect("AI.VAL reads");
+    assert_eq!(got.units().map(|u| u.to_string()), Some("um".into()));
+    assert_eq!(got.precision(), Some(5));
+    assert_eq!(got.graphic_limits(), Some((-20.0, 20.0)));
+}
+
 #[epics_macros_rs::epics_test]
 async fn db_get_from_inside_a_record_resolves_a_link_that_reaches_it() {
     let db = ioc().await;

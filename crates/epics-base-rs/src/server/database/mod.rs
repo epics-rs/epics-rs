@@ -3046,7 +3046,11 @@ impl PvDatabase {
         if let Some(own) = policy.own(record)
             && !string_view
         {
-            return crate::server::record::record_instance::own_field_snapshot(record, own, field);
+            return crate::server::record::record_instance::own_field_snapshot(
+                own,
+                record.rdes().meta,
+                field,
+            );
         }
         // 1. Under a short read lock: is this field link-backed at all, and if
         //    so what does its link field currently say. Nothing is resolved

@@ -3870,9 +3870,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// mutated a metadata-class field (EGU/PREC/HOPR/LOPR/HLM/LLM/
     /// alarm limits / DRVH/DRVL / state strings).
     ///
-    /// The framework checks this after every `process()` call and, if
-    /// true, invalidates the record's metadata cache so the next
-    /// snapshot rebuilds from the new values.
+    /// The framework checks this after `process()` and, if true, posts
+    /// `DBE_PROPERTY` so subscribers re-read the metadata.
     ///
     /// Default: `false` — most records never touch metadata fields
     /// during processing. Override only when your record dynamically
@@ -4050,11 +4049,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// `get_units` / `get_precision` / `get_graphic_double` /
     /// `get_control_double` / `get_alarm_double` all key on
     /// `dbGetFieldIndex(paddr)` and fall back to the `recGbl*` defaults
-    /// for unlisted fields. The framework's metadata cache is per
+    /// for unlisted fields. The framework's record-level metadata is per
     /// record (built by `populate_display_info` /
     /// `populate_control_info` from the VAL-class fields); a record
     /// whose RSET serves different metadata for non-VAL fields
-    /// overrides this hook to patch the cached values for that field
+    /// overrides this hook to patch those values for that field
     /// (e.g. the motor record: VELO's display range is VMAX/VBAS, not
     /// HLM/LLM — `motorRecord.cc:3247-3250`).
     ///

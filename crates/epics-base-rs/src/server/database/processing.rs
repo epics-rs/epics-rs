@@ -12677,11 +12677,13 @@ impl Drop for CycleEndGuard<'_> {
 /// process.run_pending(None);
 /// ```
 pub struct ExternalCpProcess {
-    pending: std::sync::atomic::AtomicBool,
-    /// Requests made, counted after each is recorded: `dbCaSync`'s mark.
+    /// Requests made, each recorded by its count: `dbCaSync`'s mark. A
+    /// request is pending while it is above `taken`.
     requested: std::sync::atomic::AtomicU64,
-    /// The `requested` count the last finished pass had seen before it took
-    /// the requests: every request up to it has been served.
+    /// The `requested` count the last pass took.
+    taken: std::sync::atomic::AtomicU64,
+    /// The `taken` of the last finished pass: every request up to it has
+    /// been served.
     served: std::sync::atomic::AtomicU64,
     /// Signalled after each pass and each event handed in, for `dbCaSync`.
     settled: crate::runtime::sync::Notify,
@@ -12724,8 +12726,8 @@ impl ExternalCpProcess {
 
     fn with_init(link: super::LinkRef<'_>, init: InitWait) -> Self {
         Self {
-            pending: std::sync::atomic::AtomicBool::new(false),
             requested: std::sync::atomic::AtomicU64::new(0),
+            taken: std::sync::atomic::AtomicU64::new(0),
             served: std::sync::atomic::AtomicU64::new(0),
             settled: crate::runtime::sync::Notify::new(),
             init_ready: std::sync::atomic::AtomicBool::new(false),
@@ -12745,9 +12747,12 @@ impl ExternalCpProcess {
         if !self.processes_holder {
             return;
         }
-        let merged = self.pending.swap(true, Ordering::AcqRel);
-        self.requested.fetch_add(1, Ordering::SeqCst);
-        if !merged {
+        // Recorded and counted at once: a pass takes a request only by its
+        // count, so none is served without being counted.
+        let before = self.requested.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        seam(Seam::Requested);
+        if before == self.taken.load(Ordering::SeqCst) {
             self.wake.notify_one();
         }
     }
@@ -12825,14 +12830,18 @@ impl ExternalCpProcess {
     /// Take the pending request and, if there was one, process the holder
     /// in `db`.
     fn run_pending(&self, db: Option<&PvDatabase>) {
-        // Counted before the requests are taken, so every request counted
-        // here is taken by this pass or an earlier one.
+        // Taken before the count, so a ready seen here has its first event's
+        // request counted too.
+        let init_ready = self.init_ready.swap(false, Ordering::AcqRel);
         let seen = self.requested.load(Ordering::SeqCst);
-        self.run_requests(db);
+        #[cfg(test)]
+        seam(Seam::Seen);
+        let took = self.taken.swap(seen, Ordering::SeqCst);
+        self.run_requests(db, seen > took, init_ready);
         self.served.fetch_max(seen, Ordering::SeqCst);
         self.settled.notify_waiters();
-        // A request merged into one this pass took, counted after `seen`,
-        // was served but not counted: one more pass counts it.
+        // A request counted after `seen` found an earlier one pending and
+        // sent no wake; this pass did not take it, so the next one does.
         if self.requested.load(Ordering::SeqCst) != seen {
             self.wake.notify_one();
         }
@@ -12866,11 +12875,7 @@ impl ExternalCpProcess {
         self.served.load(Ordering::SeqCst) >= mark
     }
 
-    fn run_requests(&self, db: Option<&PvDatabase>) {
-        // Taken before the request it follows, so a ready seen here has its
-        // first event's request seen too.
-        let init_ready = self.init_ready.swap(false, Ordering::AcqRel);
-        let pending = self.pending.swap(false, Ordering::AcqRel);
+    fn run_requests(&self, db: Option<&PvDatabase>, pending: bool, init_ready: bool) {
         let Some(db) = db else { return };
         if pending {
             db.dispatch_external_cp_link(self);
@@ -12879,6 +12884,38 @@ impl ExternalCpProcess {
             let held = std::mem::replace(&mut *self.init.lock(), InitWait::Passed);
             drop(held);
         }
+    }
+}
+
+/// A point in [`ExternalCpProcess`]'s request/pass handshake where a test
+/// runs the other side, forcing an interleaving two threads hit by chance.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// A request is recorded; whether it wakes the worker is not decided.
+    Requested,
+    /// A pass has read the count and taken nothing.
+    Seen,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEAM_STEP: std::cell::RefCell<Option<(Seam, Box<dyn FnOnce()>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the step a test left at `at`, once.
+#[cfg(test)]
+fn seam(at: Seam) {
+    let step = SEAM_STEP.with_borrow_mut(|step| match step.take() {
+        Some((seam, run)) if seam == at => Some(run),
+        other => {
+            *step = other;
+            None
+        }
+    });
+    if let Some(run) = step {
+        run();
     }
 }
 
@@ -13458,5 +13495,81 @@ mod hop_rule_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod external_cp_process_tests {
+    use std::sync::Arc;
+
+    use super::{ExternalCpProcess, SEAM_STEP, Seam};
+    use crate::server::database::LinkRef;
+    use crate::server::record::{LinkFieldType, LinkProcessPolicy, OpenLatch};
+
+    fn cp_link() -> Arc<ExternalCpProcess> {
+        let open = OpenLatch::ca(LinkProcessPolicy::ChannelProcess, LinkFieldType::In);
+        Arc::new(ExternalCpProcess::new(LinkRef::new(b"SRC", &open)))
+    }
+
+    fn at(seam: Seam, step: impl FnOnce() + 'static) {
+        SEAM_STEP.with_borrow_mut(|s| *s = Some((seam, Box::new(step))));
+    }
+
+    /// One turn of `run_worker`, if it was sent a wake.
+    fn worker_turn(process: &ExternalCpProcess) -> bool {
+        let wake = process.wake.notified();
+        let mut wake = std::pin::pin!(wake);
+        let woken = wake.as_mut().enable();
+        if woken {
+            process.run_pending(None);
+        }
+        woken
+    }
+
+    /// `dbCaSync`'s wait, met once the worker has run every wake sent.
+    fn synced(process: &ExternalCpProcess) -> bool {
+        while worker_turn(process) {}
+        process.served_through(process.request_mark())
+    }
+
+    #[test]
+    fn a_pass_inside_a_merged_request_counts_it() {
+        let process = cp_link();
+        process.request();
+        let worker = process.clone();
+        at(Seam::Requested, move || assert!(worker_turn(&worker)));
+        process.request();
+        assert!(synced(&process));
+    }
+
+    /// The pass runs on a wake sent with nothing requested.
+    #[test]
+    fn a_pass_inside_a_first_request_counts_it() {
+        let process = cp_link();
+        process.request_init_ready();
+        let worker = process.clone();
+        at(Seam::Requested, move || assert!(worker_turn(&worker)));
+        process.request();
+        assert!(synced(&process));
+    }
+
+    #[test]
+    fn a_merged_request_inside_a_pass_gets_the_next() {
+        let process = cp_link();
+        process.request();
+        let requester = process.clone();
+        at(Seam::Seen, move || requester.request());
+        assert!(worker_turn(&process));
+        assert!(synced(&process));
+    }
+
+    #[test]
+    fn a_first_request_inside_a_pass_gets_the_next() {
+        let process = cp_link();
+        process.request_init_ready();
+        let requester = process.clone();
+        at(Seam::Seen, move || requester.request());
+        assert!(worker_turn(&process));
+        assert!(synced(&process));
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "stream-rs"
+name = "epics-stream-rs"
 version.workspace = true
 edition.workspace = true
 description = "Rust port of PSI StreamDevice: protocol parser, buffers and the bus/converter/core boundaries"
@@ -8,6 +8,14 @@ description = "Rust port of PSI StreamDevice: protocol parser, buffers and the b
 license = "LGPL-3.0-or-later"
 authors.workspace = true
 repository.workspace = true
+
+# Library import name kept as `stream_rs` so consumers continue to write
+# `use stream_rs::...` even though the crates.io package is
+# `epics-stream-rs` (the bare `stream-rs` name is taken on crates.io by an
+# unrelated project).
+[lib]
+name = "stream_rs"
+path = "src/lib.rs"
 
 [dependencies]
 asyn-rs = { workspace = true }

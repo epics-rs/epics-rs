@@ -117,6 +117,12 @@ impl AxisSlot {
         axis.as_ref().map(|(senders, _, _)| senders.clone())
     }
 
+    /// The controller whose poller serves the axis here now.
+    fn controller(&self) -> Option<SharedControllerPoll> {
+        let axis = self.axis.lock().unwrap_or_else(|e| e.into_inner());
+        axis.as_ref().map(|(_, _, controller)| controller.clone())
+    }
+
     /// Place an axis of `controller` here: the queue of the axis here before
     /// while a poller still holds it, or else a new one taking `capacity`
     /// poll requests. `None` while another controller's poller holds it: C's
@@ -673,6 +679,25 @@ impl CommandPort {
         }
     }
 
+    /// C init_record's `readGenericPointer` (devMotorAsyn.c:404). On an
+    /// asynMotorController it runs under the driver's lock
+    /// (asynPortDriver.cpp:3290-3292), which the poller holds over a whole
+    /// pass (asynMotorController.cpp:644-694), so a record initialising
+    /// during the startup pass reads what that pass posted. drvMotorAsyn,
+    /// devMotorSim and motordevCom read with no lock (drvMotorAsyn.c:754-790,
+    /// drvMotorSim.c:221-231, motordrvCom.cc:676-700).
+    fn init_status(&self) -> CaResult<MotorStatus> {
+        let controller = match &self.link {
+            AxisLink::Bound { slot, .. } if self.trace.is_controller() => slot.controller(),
+            _ => None,
+        };
+        let _held = controller.as_ref().map(SharedControllerPoll::hold);
+        let mut ds = self.device_state.lock().map_err(|e| {
+            epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
+        })?;
+        Ok(ds.init_status())
+    }
+
     /// Send this record's poll request; a missing axis has no poller.
     fn send_poll(&self, command: PollCommand) {
         if let Ok((axis, _)) = self.axis() {
@@ -744,16 +769,10 @@ impl DeviceSupport for MotorDeviceSupport {
         // autosaved DVAL every boot — the exact failure RSTM/#231 prevent.
         //
         // C init_record reads the status through readGenericPointer, which
-        // only copies the parameter cache the poller's startup poll filled
-        // (asynMotorController.cpp:505-525): no hardware call, and no
-        // failure for a bound axis. An unfilled cache reads as C's
-        // calloc-zeroed status.
-        let status = {
-            let mut ds = self.port.device_state.lock().map_err(|e| {
-                epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
-            })?;
-            ds.init_status()
-        };
+        // only copies the parameter cache (asynMotorController.cpp:505-525):
+        // no hardware call, and no failure for a bound axis. An unfilled
+        // cache reads as C's calloc-zeroed status.
+        let status = self.port.init_status()?;
         self.port.trace.print(
             asyn_rs::trace::TraceMask::IO_DEVICE,
             self.port.trace.update_status_reason(),

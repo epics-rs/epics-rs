@@ -958,8 +958,8 @@ impl InterruptManager {
     }
 
     /// The port's edge sweeps (C `callbackThread::run`) queued and not yet
-    /// run, each a [`crate::port_handle::PortHandle::boot_param_callbacks`]
-    /// claim: a CP link's first event on an I/O Intr record of this port
+    /// run, each a `PortHandle::boot_param_callbacks` claim: a CP link's
+    /// first event on an I/O Intr record of this port
     /// waits for them. A port with no flush never has one.
     pub fn edge_sweeps(&self) -> &Arc<epics_libcom_rs::runtime::interrupt_accept::Outstanding> {
         &self.state.edge_sweeps

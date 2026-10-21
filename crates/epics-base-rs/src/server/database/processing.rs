@@ -12825,7 +12825,7 @@ impl ExternalCpProcess {
 
     /// The link's worker: wait for a request, then process the holder in
     /// the database `db` names at that moment, from the first its
-    /// [`CaRunGate`] gives its word for ([`FirstEventsIn`]) on. Never
+    /// `CaRunGate` gives its word for (`FirstEventsIn`) on. Never
     /// returns. Run it with [`PvDatabase::spawn_cp_worker`].
     pub async fn run_worker(&self, db: impl Fn() -> Option<PvDatabase>) {
         // The word is for good, so it is asked for only until given.

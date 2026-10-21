@@ -1049,6 +1049,10 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     }
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     /// Rows from libCom's own `aToIPAddr` with default port 5064.
     #[test]
     fn a_to_ip_addr_is_c_sscanf() {
@@ -1219,13 +1223,8 @@ mod tests {
     /// A connect to a port nothing listens on must fail rather than hang.
     #[test]
     fn tcp_connect_to_a_closed_port_fails() {
-        // Bind then drop, so the port is real but unowned.
-        let port = {
-            let probe = tcp_listener(localhost(0), SocketOptions::default(), 1).unwrap();
-            probe.local_addr().unwrap().port()
-        };
         let r = tcp_connect(
-            localhost(port),
+            localhost(DEAD_PORT),
             None,
             SocketOptions::default(),
             Duration::from_secs(5),
@@ -1240,12 +1239,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_refusal_found_by_the_poll_keeps_connect_s_own_errno() {
-        let port = {
-            let probe = tcp_listener(localhost(0), SocketOptions::default(), 1).unwrap();
-            probe.local_addr().unwrap().port()
-        };
         let err = tcp_connect(
-            localhost(port),
+            localhost(DEAD_PORT),
             None,
             SocketOptions::default(),
             Duration::from_secs(5),

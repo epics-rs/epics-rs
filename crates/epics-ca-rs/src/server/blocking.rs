@@ -1892,6 +1892,11 @@ mod tests {
     use crate::protocol::ECA_TOLARGE;
     use source_guard::{Comments, production};
     use std::sync::atomic::AtomicUsize;
+
+    /// Privileged port 1: no test can bind it, so a datagram sent there is
+    /// refused. A freed ephemeral port can be taken by a concurrent test.
+    const DEAD_PORT: u16 = 1;
+
     /// The refusal must reach the peer as a protocol message, not as a bare
     /// close. Measured on target, a client past the ceiling completed its
     /// VERSION send and then saw the socket go away with nothing on it.
@@ -3581,11 +3586,8 @@ mod tests {
         let db = seed_db(&[("BLK:RERR", EpicsValue::Double(1.0))]);
         let resp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let resp_addr = resp.local_addr().unwrap();
-        let closed = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
+        resp.connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEAD_PORT))
             .unwrap();
-        resp.connect(closed).unwrap();
         resp.send(b"x").unwrap();
         let resp = Arc::new(resp);
         let rearm = resp.clone();

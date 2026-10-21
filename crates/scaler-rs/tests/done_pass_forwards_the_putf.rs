@@ -12,6 +12,10 @@
 //!   at 5.0 s  SR:TC 2
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — passes on the exec backend
+// (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features --test done_pass_forwards_the_putf`); no CA server is built.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

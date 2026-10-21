@@ -2449,6 +2449,14 @@ pub enum ProcessAction {
     /// putting thread leaves `dbPutField`.
     ScanOnce,
 
+    /// C `if (prec->rpro) { prec->rpro = 0; goto reprocess; }` from inside
+    /// `process()`: mca's own RPRO consume on a pass that withholds
+    /// `recGblFwdLink` (`mcaRecord.c:833-838`). The record cannot see RPRO, so
+    /// it emits this where C makes the test; the executor clears RPRO and, if
+    /// it was set, queues the restart as `recGblFwdLink` does
+    /// (`recGbl.c:297-300`) rather than running it inline.
+    ConsumeRpro,
+
     /// Send a named command to the device support driver.
     /// The framework calls `DeviceSupport::handle_command()` with this data.
     /// Used by scaler to request reset/arm/write_preset operations
@@ -4678,9 +4686,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// `AsyncPendingNotify` answers `false` until its device round-trip is
     /// done. Default: true, the synchronous record that runs to its own tail.
     ///
-    /// One of the two inputs to `complete_put_notify`; see
-    /// [`Self::should_fire_forward_link`] for the other and for the invariant
-    /// they share.
+    /// Read by `finish_cycle`'s put-notify leave; see
+    /// [`Self::should_fire_forward_link`] for the call that leave belongs to.
     fn is_put_complete(&self) -> bool {
         true
     }
@@ -4690,20 +4697,20 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ///
     /// # Invariant (CONTRACT)
     ///
-    /// A cycle completes an outstanding put-notify if and only if it runs
-    /// `recGblFwdLink`. C `recGbl.c:290-303` is why: `if (pdbc->ppn)
-    /// dbNotifyCompletion(pdbc)` sits INSIDE the function a record type
-    /// chooses whether to call, so declining the forward link withholds the
-    /// client's `ca_put_callback` by construction. The two are one decision in
+    /// A cycle completes an outstanding put-notify, restarts a pending RPRO
+    /// and clears PUTF if and only if it runs `recGblFwdLink`. C
+    /// `recGbl.c:290-303` is why: all three sit INSIDE the function a record
+    /// type chooses whether to call, so declining the forward link withholds
+    /// the client's `ca_put_callback` by construction. The two are one decision in
     /// C and must stay one here — mca's own source says so where it makes the
     /// choice: "Process forward-linked record. Tell EPICS dbPutNotify
     /// mechanism that processing is finished." (`mcaRecord.c:820-826`).
     ///
-    /// The single owner of that decision is
-    /// `database::processing::complete_put_notify`, which reads this method
-    /// and [`Self::is_put_complete`] together. A record type states its C gate
-    /// HERE and nowhere else; it must not carry a second, separately-drifting
-    /// `is_put_complete` override to say the same thing.
+    /// The single owner of that decision is `RecordInstance::fwd_link`, the
+    /// only maker of the call's rest; a cycle this method withholds the call
+    /// from has nothing to release the three with. A record type states its C
+    /// gate HERE and nowhere else; it must not carry a second,
+    /// separately-drifting `is_put_complete` override to say the same thing.
     ///
     /// Seven types gate the call, each transcribing its C lines:
     ///

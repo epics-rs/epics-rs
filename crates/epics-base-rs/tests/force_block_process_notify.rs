@@ -117,7 +117,7 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
 /// `dbProcess(precord)` before the matching `dbScanUnlock` (`:257-262`), so
 /// nothing else can run a cycle on the record between the install and the
 /// cycle that install arms. An install placed ahead of the gate opens exactly
-/// that window: a gate-holding put's cycle ends in `complete_put_notify`,
+/// that window: a gate-holding put's cycle ends in `finish_cycle`,
 /// which `take`s whatever wait-set it finds in the slot and `leave`s it —
 /// firing this client's `block=true` completion for a cycle it never
 /// requested, and leaving its own cycle to run unarmed.

@@ -1635,14 +1635,14 @@ impl Drop for ClientAwaitingNotify<'_> {
 struct NotifyClaim<'a> {
     rec: &'a std::sync::Arc<crate::server::record::RecordCell>,
     /// `None` once committed — the record processes under the set and owns its
-    /// release from then on (`complete_put_notify`, C `dbNotifyCompletion`).
+    /// release from then on (`finish_cycle`, C `dbNotifyCompletion`).
     set: Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>,
 }
 
 impl NotifyClaim<'_> {
     /// The put reached its process cycle: hand the wait-set over and stop
     /// releasing it. From here the record's completion owns it
-    /// (`complete_put_notify`, C `dbNotifyCompletion`).
+    /// (`finish_cycle`, C `dbNotifyCompletion`).
     fn commit(mut self) -> std::sync::Arc<crate::server::record::NotifyWaitSet> {
         self.set
             .take()
@@ -3980,7 +3980,7 @@ impl PvDatabase {
         // `dbProcessNotify` takes `dbScanLock(precord)` (dbNotify.c:355) and
         // `processNotifyCommon` assigns `precord->ppn` and calls `dbProcess`
         // before the matching `dbScanUnlock` (`:257-262`). Installing ahead of
-        // the gate let a gate-holding put's cycle reach `complete_put_notify`
+        // the gate let a gate-holding put's cycle reach `finish_cycle`
         // on a slot it did not fill, `take` this client's wait-set and `leave`
         // it -- firing a `block=true` completion for a cycle the client never
         // requested, and leaving this one to run unarmed.
@@ -4780,48 +4780,6 @@ impl PvDatabase {
         // `dbPutField:1268-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
         let processed = self.put_driven_process_split(record_name, split);
-
-        // Is the ORIGINATING record itself still async-pending? Its
-        // wait-set membership is taken + `leave`d at its own completion
-        // (sync-end, or later in `complete_async_record_inner`), so a
-        // lingering `notify` on its instance means its device round-trip
-        // is still in flight. This gates only the originating record's
-        // PUTF clear — independent of whether downstream chain targets
-        // are still pending.
-        //
-        // A fire-and-forget put parked nothing, and a `notify` it sees
-        // on the instance belongs to some other caller's WRITE_NOTIFY —
-        // not evidence about THIS put. Fall through to the guarded
-        // clear; its `!is_processing()` gate already preserves PUTF
-        // across an async-pending device round-trip.
-        let originating_pending = want_notify
-            && self
-                .get_record_no_resolve(record_name)
-                .is_some_and(|rec_arc| rec_arc.read().notify.is_some());
-
-        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
-        // the forward-link dispatch — the marker only lives for the
-        // duration of the put's processing cycle. For SYNCHRONOUS
-        // completions (PACT was cleared by the time
-        // `process_record_with_links` returns) clear it here. For
-        // async-pending records, the clearing happens later in
-        // `complete_async_record_inner` (which runs FLNK as part of
-        // the completion path) so the PUTF marker survives the
-        // device-write round trip.
-        if !originating_pending {
-            // Collect-then-act: clone the handle under a brief map read, drop
-            // the map lock before the per-record write.
-            let rec_arc = {
-                let recs = self.inner.records.read();
-                recs.get(record_name).cloned()
-            };
-            if let Some(rec_arc) = rec_arc {
-                let mut guard = rec_arc.write();
-                if !guard.is_processing() {
-                    guard.common.putf = false;
-                }
-            }
-        }
 
         put_answer(parked, processed)
     }

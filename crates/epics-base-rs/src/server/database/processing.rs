@@ -126,7 +126,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult, DbResult, DbStatus};
-use crate::server::record::record_instance::{LinkScanMove, ScanAdd, ScanMove};
+use crate::server::record::record_instance::{
+    ForwardTarget, FwdLink, FwdLinkRest, LinkScanMove, ScanAdd, ScanMove,
+};
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
     RecordInstance, RecordMut, SoftRead, SoftReading, StampPoint,
@@ -967,14 +969,14 @@ impl<'a> HeldInstance<'a> {
 
     /// C `recGblFwdLink(precord)` on the held record outside a process, as
     /// swait's `notifyCallback` calls it (swaitRecord.c:378-386): the
-    /// forward link, then the put-notify completion and its restart check
-    /// that a cycle's tail makes.
+    /// forward link, the RPRO restart, the PUTF clear and the put-notify
+    /// completion with its restart check that a cycle's tail makes.
     pub fn fwd_link(&self) {
         let name = self.rec.unframed().name().as_bytes();
         let visited = &mut **self.visited.borrow_mut();
-        self.db.run_forward_link_tail(name, self.rec, visited);
+        let rest = self.db.run_forward_link_tail(name, self.rec, visited);
         let exit = self.rec.read().pact_exit_without_release();
-        self.db.end_process_cycle(name, self.rec, exit);
+        self.db.end_process_cycle(name, self.rec, exit, rest);
     }
 }
 
@@ -1554,60 +1556,24 @@ impl AsyncDbHandle {
     }
 }
 
-/// C `dbNotifyCompletion` (`dbNotify.c:445`) reached the way a process cycle
-/// reaches it — through `recGblFwdLink` (`recGbl.c:295`), record support's only
-/// route to it. Take this record's wait-set membership and leave; the
-/// completion oneshot fires on the `leave` that empties the set.
-///
-/// # Invariant (CONTRACT)
-///
-/// A cycle completes an outstanding put-notify IF AND ONLY IF it runs
-/// `recGblFwdLink`. Two things stop it, and **both are read here** so no cycle
-/// tail can consult one and forget the other:
-///
-/// - [`Record::is_put_complete`](crate::server::record::Record::is_put_complete)
-///   — device support took the write async
-///   (`if (!pact && prec->pact) return(0)`), so this pass never reaches the
-///   tail.
-/// - [`Record::should_fire_forward_link`](crate::server::record::Record::should_fire_forward_link)
-///   — the tail was reached and the record type declined it.
-///   `dbNotifyCompletion` sits INSIDE the skipped call, so a suppressed
-///   forward link withholds the `ca_put_callback` too.
-///   `busy` is the clearest case: `busyRecord.c:271` runs the tail only for
-///   `val == 0 || oval == 0`, which is why `caput -c` on a busy record that
-///   stays at 1 is meant to hang until something writes "Done".
-///
-/// Reading them together HERE, rather than at each cycle tail, is what keeps a
-/// record type's C gate to one override: a type states its gate in
-/// `should_fire_forward_link` and gets the notify behaviour for free.
-///
-/// The SDIS-disable bail is C's OTHER `dbNotifyCompletion` caller
-/// (`dbAccess.c:623`), outside `recGblFwdLink` and so deliberately ungated —
-/// it open-codes the take/leave in `process_record_with_links_inner` and does
-/// not come through here.
-///
-/// Idempotent: a record in no put-notify is a no-op.
-/// Cycle-end bookkeeping under the record's data lock.
-///
-/// C `recGblFwdLink:302` clears `putf = FALSE` at the tail of every
-/// synchronous cycle, NOT just the foreign-entry path: a record driven
-/// through an OUT-link propagation (`write_db_link_value` set its putf)
-/// must clear it before returning. Async-pending records skip the clear —
-/// their FLNK / putf-clear happen later, in `complete_async_record_inner`,
-/// once the device round-trip completes.
+/// C `recGblFwdLink`'s put-notify completion and PUTF clear
+/// (`recGbl.c:295`, `:302`), under the record's data lock, for a cycle that
+/// made the call: `FwdLinkRest` comes only from
+/// [`RecordInstance::fwd_link`], so a cycle whose record withheld it keeps
+/// both for the later call (busy at VAL=1, swait's put callback, motor's
+/// DMOV). The RPRO restart between them is [`PvDatabase::rpro_tail`].
 ///
 /// The record `leave`s the wait-set only here, after its full
 /// OUT/FLNK/process-action tail has run — so every PP target it drove has
-/// already joined (`enter`ed). Whether this cycle may leave at all is
-/// `complete_put_notify`'s decision, not this site's: a record reporting
-/// more work (motor mid-move) or declining its forward link (busy at
-/// VAL=1) keeps its membership and leaves on the later cycle that reaches
-/// C's `recGblFwdLink`.
+/// already joined (`enter`ed). A record whose device took the write async
+/// ([`Record::is_put_complete`](crate::server::record::Record::is_put_complete))
+/// keeps its membership for the pass that completes it.
+///
+/// The SDIS-disable bail is C's other `dbNotifyCompletion` and PUTF clear
+/// (`dbAccess.c:575-577`), outside `recGblFwdLink`, and does not come here.
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn finish_cycle(inst: &mut RecordInstance) {
-    if !inst.is_processing() {
-        inst.common.putf = false;
-    }
+fn finish_cycle(inst: &mut RecordInstance, _: FwdLinkRest) {
+    inst.common.putf = false;
     // No wait-set, nothing to leave: the usual cycle ends on this test and
     // never enters the frame the leave needs.
     if inst.notify.is_some() {
@@ -1615,15 +1581,9 @@ fn finish_cycle(inst: &mut RecordInstance) {
     }
 }
 
-fn complete_put_notify(inst: &mut RecordInstance) {
-    if inst.notify.is_some() {
-        leave_put_notify(inst);
-    }
-}
-
 #[inline(never)]
 fn leave_put_notify(inst: &mut RecordInstance) {
-    if !inst.record.is_put_complete() || !inst.record.should_fire_forward_link() {
+    if !inst.record.is_put_complete() {
         return;
     }
     if let Some(ws) = inst.notify.take() {
@@ -2882,12 +2842,12 @@ struct CycleCtx<'c, 'a> {
 enum CycleTail<'c> {
     /// A simulation exit: the FLNK as the record holds it, then the cycle end.
     Sim(CycleStatus),
-    /// The complete pass: the FLNK resolved under the monitor segment's
-    /// guard, the late restamp, the deferred actions, then the cycle end.
+    /// The complete pass: the `recGblFwdLink` resolved under the monitor
+    /// segment's guard, the late restamp, the deferred actions, then the
+    /// cycle end.
     Full {
-        flnk: crate::server::record::record_instance::ForwardTarget,
+        call: Option<FwdLink>,
         plan: &'c crate::server::record::record_instance::ProcessPlan,
-        defers_output: bool,
         restamps: bool,
         actions: crate::server::record::ProcessActions,
         status: CycleStatus,
@@ -3015,7 +2975,7 @@ struct Cont {
 /// What a cycle owes after its hop's target: [`CycleTail`] past the FLNK,
 /// or past the OUT put.
 enum After {
-    Flnk(AfterFlnk),
+    Flnk(AfterFlnk, FwdLinkRest),
     Out(OutRest),
 }
 
@@ -3180,8 +3140,8 @@ pub mod hop_floor {
 /// the `ReprocessAfter` that releases it. The tail's deferred-actions site
 /// dispatches that `ReprocessAfter`; an `execute_process_actions_in` in the
 /// cycle would enlarge its recursive frame (one overflowed the stack in the
-/// deep-chain tests). The held PACT also makes the tail's putf-clear (gated
-/// on `!is_processing()`) a no-op, leaving putf for the continuation.
+/// deep-chain tests). The delaying cycle withholds `recGblFwdLink`, so PUTF
+/// and RPRO stay for the continuation that makes the call.
 #[cfg_attr(not(debug_assertions), inline(always))]
 fn hold_deferred_pact(
     guard: &mut DataGuard<'_>,
@@ -4390,15 +4350,10 @@ impl PvDatabase {
     fn value_put_in(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
         let actions = rec.write().record.delayed_value_put();
         self.execute_process_actions_in(name, rec, actions, visited);
-        let forward = {
-            let mut instance = rec.write();
-            super::field_io::emit_cycle_posts(&mut instance);
-            instance.record.should_fire_forward_link()
-        };
+        super::field_io::emit_cycle_posts(&mut rec.write());
         // `recGblFwdLink` (`:578`) runs ahead of `valuePut`'s stamp and reset.
-        if forward {
-            self.run_forward_link_tail(name, rec, visited);
-            finish_cycle(&mut rec.write());
+        if let Some(rest) = self.run_forward_link_tail(name, rec, visited) {
+            finish_cycle(&mut rec.write(), rest);
         }
         // `checkAlarms` (`:604`) on both arms, ahead of the reset; the stamp
         // the tail takes first reads no alarm state.
@@ -6972,7 +6927,7 @@ impl PvDatabase {
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
         // The epilogue's results, each stored once by the arm that ends it
         // rather than gathered into a tuple and moved out of the block.
-        let tail_flnk;
+        let tail_call;
         let mut tail_actions;
         let tail_defers_output;
         let tail_restamps;
@@ -8114,12 +8069,10 @@ impl PvDatabase {
                     let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
                     let snapshot = crate::server::record::ProcessSnapshot::new();
                     publish_cycle(instance, &snapshot, alarm_posts);
-                    // No forward link of EITHER kind: the comment above is
-                    // C's `return` before `recGblFwdLink`. The external
-                    // half used to escape it, because the tail re-derived
-                    // that half for itself out of the record instead of
-                    // taking the answer this arm hands it.
-                    tail_flnk = crate::server::record::record_instance::ForwardTarget::None;
+                    // No `recGblFwdLink`: the comment above is C's `return`
+                    // before it, so no FLNK of either kind, and the PUTF,
+                    // RPRO and put-notify it would release stay.
+                    tail_call = None;
                     tail_actions = crate::server::record::ProcessActions::new();
                     tail_defers_output = false;
                     tail_restamps = restamps_after;
@@ -8643,8 +8596,8 @@ impl PvDatabase {
                 visited,
             ) {
                 ControlFlow::Break(result) => return result,
-                ControlFlow::Continue((flnk, actions)) => {
-                    tail_flnk = flnk;
+                ControlFlow::Continue((call, actions)) => {
+                    tail_call = call;
                     tail_actions = actions;
                 }
             }
@@ -8656,9 +8609,8 @@ impl PvDatabase {
 
         if HOP {
             *tail_out = Some(CycleTail::Full {
-                flnk: tail_flnk,
+                call: tail_call,
                 plan,
-                defers_output: tail_defers_output,
                 restamps: tail_restamps,
                 actions: tail_actions,
                 status: cycle_status,
@@ -8667,9 +8619,8 @@ impl PvDatabase {
         }
         self.run_full_tail(
             name,
-            &tail_flnk,
+            tail_call,
             plan,
-            tail_defers_output,
             tail_restamps,
             &mut tail_actions,
             &cycle_status,
@@ -8760,13 +8711,7 @@ impl PvDatabase {
         cycle_end: &mut CycleEndGuard<'_>,
         guard: &mut DataGuard<'_>,
         visited: &mut ProcStack,
-    ) -> ControlFlow<
-        CaResult<()>,
-        (
-            crate::server::record::record_instance::ForwardTarget,
-            crate::server::record::ProcessActions,
-        ),
-    > {
+    ) -> ControlFlow<CaResult<()>, (Option<FwdLink>, crate::server::record::ProcessActions)> {
         // The seq record armed its delayed group chain: C `process` has
         // set `pact = TRUE` and returned through `processNextLink`
         // (`seqRecord.c:143`, `:196`), so THIS cycle commits nothing. The
@@ -8823,10 +8768,11 @@ impl PvDatabase {
 
         // An own-stamp type's FLNK is its `valuePut`'s, fired by the drain
         // above; its `process()` has none (`throttleRecord.c:308`).
-        let flnk_name = if plan.hooks.stamps_at_own_reset() {
-            crate::server::record::record_instance::ForwardTarget::None
+        let call = instance.fwd_link();
+        let call = if plan.hooks.stamps_at_own_reset() {
+            call.map(FwdLink::fired)
         } else {
-            instance.forward_target()
+            call
         };
 
         // Put-notify completion is NOT fired here. Firing before the
@@ -8836,12 +8782,11 @@ impl PvDatabase {
         // keeps the originating record in the waitList until the
         // chain settles). The originating record instead `leave`s
         // the wait-set at the END of this function, after every PP
-        // target it drives has joined. See `complete_put_notify`
-        // at the tail.
+        // target it drives has joined. See `finish_cycle` at the tail.
 
         // 3. Notify subscribers, still under the segment's own guard.
         publish_cycle(instance, &cycle_snapshot, cycle_alarm_posts);
-        ControlFlow::Continue((flnk_name, process_actions))
+        ControlFlow::Continue((call, process_actions))
     }
 
     /// C `recGblFwdLink` and what `process()` runs after it, for the cycle a
@@ -8859,42 +8804,20 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         let rec = guard.rec;
-        let (flnk, plan, after) = match tail {
+        let (call, plan, after) = match tail {
             CycleTail::Sim(status) => (
-                rec.read().forward_target(),
+                rec.read().fwd_link(),
                 rec.process_plan(),
                 AfterFlnk::Sim(status),
             ),
             CycleTail::Full {
-                flnk,
+                call,
                 plan,
-                defers_output: true,
-                restamps,
-                mut actions,
-                status,
-            } => {
-                return self.run_full_tail(
-                    name,
-                    &flnk,
-                    plan,
-                    true,
-                    restamps,
-                    &mut actions,
-                    &status,
-                    cycle_end,
-                    guard,
-                    visited,
-                );
-            }
-            CycleTail::Full {
-                flnk,
-                plan,
-                defers_output: false,
                 restamps,
                 actions,
                 status,
             } => (
-                flnk,
+                call,
                 plan,
                 AfterFlnk::Full {
                     restamps,
@@ -8907,7 +8830,9 @@ impl PvDatabase {
             guard.release();
             self.dispatch_event_record(rec);
         }
-        use crate::server::record::record_instance::ForwardTarget;
+        let Some(FwdLink { flnk, rest }) = call else {
+            return self.after_flnk(name, after, None, cycle_end, guard, visited);
+        };
         if let ForwardTarget::Db {
             target,
             putf,
@@ -8925,13 +8850,13 @@ impl PvDatabase {
                 putf,
                 notify,
             };
-            visited.park(cycle_end, After::Flnk(after), hop);
+            visited.park(cycle_end, After::Flnk(after, rest), hop);
             return Ok(());
         } else if !matches!(flnk, ForwardTarget::None) {
             guard.release();
             self.scan_forward_target(rec, &flnk, visited);
         }
-        self.after_flnk(name, after, cycle_end, guard, visited)
+        self.after_flnk(name, after, Some(rest), cycle_end, guard, visited)
     }
 
     /// What a cycle owes once its hop's target has returned `target`: past
@@ -8948,7 +8873,9 @@ impl PvDatabase {
     ) -> CaResult<()> {
         match after {
             After::Out(rest) => self.resume_out(name, rest, target, cycle_end, guard, visited),
-            After::Flnk(after) => self.after_flnk(name, after, cycle_end, guard, visited),
+            After::Flnk(after, rest) => {
+                self.after_flnk(name, after, Some(rest), cycle_end, guard, visited)
+            }
         }
     }
 
@@ -9013,7 +8940,7 @@ impl PvDatabase {
             ControlFlow::Break(result) => return result,
             ControlFlow::Continue(dispatched) => dispatched,
         };
-        let (flnk, actions) = match self.monitor_stage(
+        let (call, actions) = match self.monitor_stage(
             name, rec, plan, dispatched, actions, cycle_end, guard, visited,
         ) {
             ControlFlow::Break(result) => return result,
@@ -9021,9 +8948,8 @@ impl PvDatabase {
         };
         hold_deferred_pact(guard, defers_output, &actions);
         let tail = CycleTail::Full {
-            flnk,
+            call,
             plan,
-            defers_output,
             restamps,
             actions,
             status,
@@ -9032,12 +8958,13 @@ impl PvDatabase {
     }
 
     /// What a cycle owes once its FLNK target has returned: the rest of C
-    /// `recGblFwdLink`, then `process()`'s tail.
+    /// `recGblFwdLink`, if the cycle made it, then `process()`'s tail.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn after_flnk(
         &self,
         name: &[u8],
         after: AfterFlnk,
+        rest: Option<FwdLinkRest>,
         cycle_end: &mut CycleEndGuard<'_>,
         guard: &mut DataGuard<'_>,
         visited: &mut ProcStack,
@@ -9045,9 +8972,11 @@ impl PvDatabase {
         match after {
             AfterFlnk::Sim(status) => {
                 let rec = guard.rec;
-                // `run_forward_link_tail`'s own guard, dropped as it returns.
-                self.rpro_tail(name, &mut DataGuard::new(rec));
-                self.end_process_cycle(name, rec, cycle_end.take());
+                if let Some(rest) = rest {
+                    // `run_forward_link_tail`'s own guard, dropped as it returns.
+                    self.rpro_tail(name, &mut DataGuard::new(rec), rest);
+                }
+                self.end_process_cycle(name, rec, cycle_end.take(), rest);
                 status.frame_result(guard)
             }
             AfterFlnk::Full {
@@ -9055,9 +8984,12 @@ impl PvDatabase {
                 mut actions,
                 status,
             } => {
-                self.rpro_tail(name, guard);
+                if let Some(rest) = rest {
+                    self.rpro_tail(name, guard, rest);
+                }
                 self.finish_full_tail(
                     name,
+                    rest,
                     restamps,
                     &mut actions,
                     &status,
@@ -9081,8 +9013,8 @@ impl PvDatabase {
         visited: &mut ProcStack,
     ) -> CaResult<()> {
         let rec = guard.rec;
-        self.run_forward_link_tail(name, rec, visited);
-        self.end_process_cycle(name, rec, cycle_end.take());
+        let rest = self.run_forward_link_tail(name, rec, visited);
+        self.end_process_cycle(name, rec, cycle_end.take(), rest);
         status.frame_result(guard)
     }
 
@@ -9095,9 +9027,8 @@ impl PvDatabase {
     fn run_full_tail(
         &self,
         name: &[u8],
-        flnk: &crate::server::record::record_instance::ForwardTarget,
+        call: Option<FwdLink>,
         plan: &crate::server::record::record_instance::ProcessPlan,
-        defers_output: bool,
         restamps: bool,
         actions: &mut crate::server::record::ProcessActions,
         status: &CycleStatus,
@@ -9109,24 +9040,20 @@ impl PvDatabase {
         // CP / RPRO tail. Shared with the simulation-mode path so a
         // simulated record runs the exact same `recGblFwdLink`
         // equivalent (C `aiRecord.c:168`).
-        //
-        // Skipped on a `CompleteDeferOutput` (swait ODLY) delaying cycle: the
-        // multi-output / OEVT are already gated out by `should_output()==false`,
-        // and `recGblFwdLink` runs only at delay-END (C `execOutput`) — the
-        // continuation drives the whole tail. The deferred-actions site below
-        // still runs (it dispatches this cycle's `ReprocessAfter`).
-        if !defers_output {
-            self.run_forward_link_tail_with_putf(name, guard, flnk, TailCtx { plan }, visited);
-        }
-        self.finish_full_tail(name, restamps, actions, status, cycle_end, guard, visited)
+        self.run_forward_link_tail_with_putf(name, guard, call, TailCtx { plan }, visited);
+        let rest = call.map(|call| call.rest);
+        self.finish_full_tail(
+            name, rest, restamps, actions, status, cycle_end, guard, visited,
+        )
     }
 
-    /// [`Self::run_full_tail`] past `recGblFwdLink`.
+    /// [`Self::run_full_tail`] past `recGblFwdLink`'s RPRO restart.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn finish_full_tail(
         &self,
         name: &[u8],
+        rest: Option<FwdLinkRest>,
         restamps: bool,
         actions: &mut crate::server::record::ProcessActions,
         status: &CycleStatus,
@@ -9164,18 +9091,8 @@ impl PvDatabase {
             self.execute_process_actions_in(name, rec, std::mem::take(actions), visited);
         }
 
-        // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
-        // tail of every synchronous process cycle, NOT just on the
-        // foreign-entry path. When this record was driven through an
-        // OUT-link propagation (write_db_link_value set our putf), the
-        // target record's own process cycle must clear it before
-        // returning — same lifecycle as the source record's PUTF
-        // (which `put_record_field_from_ca` separately clears at the
-        // foreign-entry boundary, and the async branch clears in
-        // `complete_async_record_inner`). Async-pending records skip
-        // this clear: their FLNK / putf-clear happens later in
-        // `complete_async_record_inner` once the device round-trip
-        // completes.
+        // 9. `recGblFwdLink`'s put-notify completion and PUTF clear, on a
+        // cycle that made the call.
         // The guard holds both releases — the SDLY/SIM continuation's and the
         // `is_continuation` arm's — merged. At most one of
         // them can carry the parked put. Taking it here disarms the guard, so
@@ -9185,29 +9102,32 @@ impl PvDatabase {
         // took them — the gates are the same facts the takes were: an input
         // stage exists only past `fetch_input_stage`'s take, and a set-link
         // list has capacity only if `read_into` took the buffer.
-        finish_cycle(guard.hold());
+        if let Some(rest) = rest {
+            finish_cycle(guard.hold(), rest);
+        }
         guard.release();
         self.apply_pact_exit(name, cycle_end.take());
 
         status.frame_result(guard)
     }
 
-    /// The end of a synchronous process cycle — C `recGblFwdLink`'s tail
-    /// (`recGbl.c:295-302`), after `dbScanFwdLink`:
-    ///
-    /// ```c
-    /// if (pdbc->ppn) dbNotifyCompletion(pdbc);  /* leave the wait-set; queue the restart */
-    /// ...
-    /// pdbc->putf = FALSE;
-    /// ```
-    ///
-    /// The single owner of both halves, so no cycle end can skip them. Open-coded
-    /// at the tail of `process_record_with_links_inner` alone, it was jumped over
-    /// by the two simulation early-returns: a put-notify on a SIMM record never
-    /// left its wait-set (the callback never fired) and PUTF leaked into the next
-    /// scan.
-    fn end_process_cycle(&self, name: &[u8], rec: InFrame<'_>, exit: PactExit) {
-        finish_cycle(&mut rec.write());
+    /// The end of a process cycle outside the full tail: C `recGblFwdLink`'s
+    /// put-notify completion and PUTF clear ([`finish_cycle`]) when the cycle
+    /// made the call, then the restart check. Open-coded at the tail of
+    /// `process_record_with_links_inner` alone, the call's rest was jumped
+    /// over by the two simulation early-returns: a put-notify on a SIMM record
+    /// never left its wait-set (the callback never fired) and PUTF leaked into
+    /// the next scan.
+    fn end_process_cycle(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        exit: PactExit,
+        rest: Option<FwdLinkRest>,
+    ) {
+        if let Some(rest) = rest {
+            finish_cycle(&mut rec.write(), rest);
+        }
         self.apply_pact_exit(name, exit);
     }
 
@@ -9218,7 +9138,7 @@ impl PvDatabase {
     /// **The single owner of the restart-list drain.** Every cycle end routes
     /// through it — including cycles that released no PACT, because a notify
     /// queued behind an in-flight wait-set on an idle record is freed by
-    /// `complete_put_notify` above, not by a PACT release.
+    /// [`finish_cycle`]'s leave, not by a PACT release.
     ///
     /// Queued, not recursed — the same `scanOnce` shape as the RPRO restart.
     /// The pop itself happens inside `restart_next_notify_put`, under the
@@ -9260,21 +9180,21 @@ impl PvDatabase {
     /// `recGblFwdLink(prec)`. The simulation path in
     /// `process_record_with_links_inner` does its own monitor posting,
     /// so this drives the forward-link / CP / RPRO tail that
-    /// `recGblFwdLink` would. `flnk_name` (with its PUTF) is derived
+    /// `recGblFwdLink` would. The call (with its PUTF) is resolved
     /// fresh from the record (a simulated cycle does not change FLNK,
     /// and SIOL reads/writes do not carry a foreign PUTF into the
-    /// chain).
-    fn run_forward_link_tail(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
-        let flnk_name = rec.read().forward_target();
+    /// chain); its rest, if made, is returned for the cycle end.
+    fn run_forward_link_tail(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        visited: &mut ProcStack,
+    ) -> Option<FwdLinkRest> {
+        let call = rec.read().fwd_link();
         let plan = rec.process_plan();
         let mut guard = DataGuard::new(rec);
-        self.run_forward_link_tail_with_putf(
-            name,
-            &mut guard,
-            &flnk_name,
-            TailCtx { plan },
-            visited,
-        );
+        self.run_forward_link_tail_with_putf(name, &mut guard, call, TailCtx { plan }, visited);
+        call.map(|call| call.rest)
     }
 
     /// Steps 4.55 - 7 of the process chain: event-record posting, generic OUTA..OUTP links, FLNK forward
@@ -9286,7 +9206,7 @@ impl PvDatabase {
         &self,
         name: &[u8],
         guard: &mut DataGuard<'_>,
-        flnk: &crate::server::record::record_instance::ForwardTarget,
+        call: Option<FwdLink>,
         src: TailCtx<'_>,
         visited: &mut ProcStack,
     ) {
@@ -9301,21 +9221,22 @@ impl PvDatabase {
         // are NOT part of this tail: C performs a record's output writes inside
         // `process()` BEFORE `monitor()` commits the cycle's alarm, so they run
         // pre-commit in `dispatch_multi_output_values` (see R14-62). This tail
-        // is C's `recGblFwdLink` equivalent only.
+        // is C's `recGblFwdLink` equivalent only, and a record that withheld
+        // the call runs none of it.
+        let Some(FwdLink { flnk, rest }) = call else {
+            return;
+        };
 
         // 5. FLNK — C `dbScanFwdLink` → `dbScanPassive` → `processTarget`,
         // through the single owner that holds the Passive gate.
         // 5b. An external (`pva://`/`ca://`) FLNK goes out through the link
         // set's `scanForward` (pvalink `pvaScanForward`) instead — a
         // process-only trigger of the remote target. Both halves come from the
-        // one resolution `RecordInstance::forward_target` made under the
+        // one resolution `RecordInstance::fwd_link` made under the
         // monitor segment's guard, so the tail re-reads nothing.
-        if !matches!(
-            flnk,
-            crate::server::record::record_instance::ForwardTarget::None
-        ) {
+        if !matches!(flnk, ForwardTarget::None) {
             guard.release();
-            self.scan_forward_target(rec, flnk, visited);
+            self.scan_forward_target(rec, &flnk, visited);
         }
 
         // 7. RPRO: if reprocess requested, clear flag and queue a
@@ -9335,13 +9256,13 @@ impl PvDatabase {
         // to be doing double duty as an escape hatch from the cycle
         // guard, which over-blocked; the guard is frame-scoped now
         // ([`Self::run_process_frame`]), so there is nothing to escape.
-        self.rpro_tail(name, guard);
+        self.rpro_tail(name, guard, rest);
     }
 
     /// Step 7 of [`Self::run_forward_link_tail_with_putf`]: C `recGblFwdLink`'s
-    /// RPRO restart (`recGbl.c:297-300`).
+    /// RPRO restart (`recGbl.c:297-300`), for a cycle that made the call.
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn rpro_tail(&self, name: &[u8], guard: &mut DataGuard<'_>) {
+    fn rpro_tail(&self, name: &[u8], guard: &mut DataGuard<'_>, _: FwdLinkRest) {
         let needs_rpro = {
             let instance = guard.hold();
             if instance.common.rpro != 0 {
@@ -9356,7 +9277,7 @@ impl PvDatabase {
         }
     }
 
-    /// C `dbScanFwdLink` on what [`RecordInstance::forward_target`] resolved.
+    /// C `dbScanFwdLink` on what [`RecordInstance::fwd_link`] resolved.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn scan_forward_target(
         &self,
@@ -9645,8 +9566,10 @@ impl PvDatabase {
     fn drain_cycle_marks(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
         super::field_io::emit_cycle_posts(&mut rec.write());
         if rec.process_plan().hooks.stamps_at_own_reset() {
-            let flnk = rec.read().forward_target();
-            self.scan_forward_target(rec, &flnk, visited);
+            let call = rec.read().fwd_link();
+            if let Some(call) = call {
+                self.scan_forward_target(rec, &call.flnk, visited);
+            }
             self.post_value_put_tail(rec, visited);
         }
     }
@@ -9989,6 +9912,12 @@ impl PvDatabase {
                         self.scan_once(record_name);
                     }
                 }
+                ProcessAction::ConsumeRpro => {
+                    let rpro = std::mem::take(&mut rec.write().common.rpro);
+                    if rpro != 0 {
+                        self.scan_once(record_name);
+                    }
+                }
                 ProcessAction::WriteDbLinkNotify { link_field, value } => {
                     // C `sseqRecord.c` WAITn put-callback dependency: write
                     // the OUT link as a put-WITH-completion and re-enter THIS
@@ -10158,7 +10087,7 @@ impl PvDatabase {
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
         let tsel = self.cycle_tsel(rec, visited);
 
-        let (flnk_name, pact_exit, after_write) = {
+        let (call, pact_exit, after_write) = {
             // Phase 1 — first write guard, confined to this scope so the
             // (!Send) parking_lot guard is released before the async OUT
             // writes below. Yields the output work plus the put-notify
@@ -10392,21 +10321,21 @@ impl PvDatabase {
             // firing now would report WRITE_NOTIFY done while that chain
             // still runs. The originating record `leave`s the wait-set at
             // the END of this function, after every PP target it drives
-            // has joined. See `complete_put_notify` at the tail.
+            // has joined. See `finish_cycle` at the tail.
 
-            let flnk_name = instance.forward_target();
+            let call = instance.fwd_link();
 
             // Notify subscribers, still under this segment's own guard.
             publish_cycle(&mut instance, &cycle_snapshot, cycle_alarm_posts);
 
-            // The FLNK's PUTF rides in `flnk_name` and its put-notify wait-set
+            // The FLNK's PUTF rides in `call` and its put-notify wait-set
             // is read at dispatch (see `ForwardTarget::Db`). On the
             // async-completion path PUTF
             // was set when the put landed on the record; it (and wait-set
             // membership) must propagate through the (now-completing) FLNK
             // chain so an async target reached here also defers
             // WRITE_NOTIFY completion.
-            (flnk_name, pact_exit, after_write)
+            (call, pact_exit, after_write)
         };
 
         // The record's own OUT link and its generic multi-output pairs were
@@ -10426,62 +10355,30 @@ impl PvDatabase {
         // the same single owner (C `dbScanFwdLink` → `dbScanPassive` →
         // `processTarget`).
         // Both halves of the FLNK come from the one resolution
-        // `RecordInstance::forward_target` made under the monitor segment's
+        // `RecordInstance::fwd_link` made under the monitor segment's
         // guard, exactly as on the synchronous tail (C `dbScanFwdLink` →
         // `dbScanPassive` for a DB target, → lset `scanForward` for an
         // external one).
-        self.scan_forward_target(rec, &flnk_name, visited);
+        if let Some(call) = call {
+            self.scan_forward_target(rec, &call.flnk, visited);
+        }
 
         // After the FLNK, as on the synchronous tail.
         if !after_write.is_empty() {
             self.execute_process_actions_in(name, rec, after_write, visited);
         }
 
-        // RPRO: C `recGblFwdLink` consumes a pending reprocess via
-        // `scanOnce` — queued, not recursed. Mirror the synchronous
-        // path: spawn a fresh process pass (clean `visited`).
-        {
-            let needs_rpro = {
-                let mut guard = rec.write();
-                if guard.common.rpro != 0 {
-                    guard.common.rpro = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            if needs_rpro {
-                // C `recGblFwdLink` (`recGbl.c:297-300`).
-                self.scan_once(name);
-            }
-        }
-
-        // C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` after
-        // the forward-link dispatch. The same clearing must happen
-        // at the tail of the async-completion path (this is the moral
-        // equivalent of the synchronous completion path in
-        // `put_record_field_from_ca` which clears after
-        // `process_record_with_links` returns). Without this, a
-        // record that completed an async write triggered by a
-        // CA put would keep `putf=1` forever, leaking into every
-        // subsequent scan-driven process cycle.
-        {
-            let mut guard = rec.write();
-            guard.common.putf = false;
-        }
-
-        // Put-notify completion: the async device round-trip is done and
-        // the full OUT/FLNK/process-action tail above has run, so every PP
-        // target it drove has joined the wait-set. The originating record
-        // now `leave`s; the completion oneshot fires on the `leave` that
-        // empties the set (i.e. once every joined async target has also
-        // completed). `complete_put_notify` `take`s the membership, so a
-        // motor re-entering `complete_async_record_inner` over several
-        // device cycles leaves exactly once — matching the old fire site,
-        // which `take`d its oneshot.
-        {
-            let mut guard = rec.write();
-            complete_put_notify(&mut guard);
+        // The rest of `recGblFwdLink`, on a pass that made the call: the
+        // RPRO restart, the PUTF clear and the put-notify leave. The full
+        // OUT/FLNK/process-action tail above has run, so every PP target it
+        // drove has joined the wait-set; the leave `take`s the membership,
+        // so a motor re-entering `complete_async_record_inner` over several
+        // device cycles leaves exactly once. A pass that withheld the call
+        // (motor short of DMOV, mca still acquiring) keeps all three for the
+        // pass that makes it.
+        if let Some(FwdLink { rest, .. }) = call {
+            self.rpro_tail(name, &mut DataGuard::new(rec), rest);
+            finish_cycle(&mut rec.write(), rest);
         }
 
         // C `dbNotifyCompletion` (dbNotify.c:459-473) → `restartCheck`: the
@@ -12746,7 +12643,8 @@ impl CycleEndGuard<'_> {
     #[cold]
     #[inline(never)]
     fn end_armed(&mut self, exit: crate::server::record::PactExit) {
-        self.db.end_process_cycle(self.name, self.rec, exit);
+        let rest = self.rec.read().fwd_link().map(|call| call.rest);
+        self.db.end_process_cycle(self.name, self.rec, exit, rest);
     }
 }
 

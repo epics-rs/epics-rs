@@ -1003,6 +1003,10 @@ impl Record for McaRecord {
             // The value lands with the stamp.
             self.stamp_sites.stim = true;
             self.mmap |= cycle::M_STIM;
+        } else {
+            // C `:827-839`: still acquiring, the pass withholds `recGblFwdLink`
+            // and so consumes RPRO itself.
+            actions.push(ProcessAction::ConsumeRpro);
         }
 
         Ok(ProcessOutcome::complete_with(actions))

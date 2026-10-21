@@ -918,9 +918,8 @@ pub enum AlarmAck {
 /// that link.
 #[derive(Clone, Copy)]
 pub(crate) enum ForwardTarget {
-    /// Nothing to forward: the record vetoed its own FLNK this cycle
-    /// ([`Record::should_fire_forward_link`]), or `FLNK` is unset / constant /
-    /// hardware — every kind C's `dbScanFwdLink` walks past.
+    /// Nothing to forward: `FLNK` is unset / constant / hardware — every kind
+    /// C's `dbScanFwdLink` walks past.
     None,
     /// A local database record, C `dbScanFwdLink` → `dbScanPassive` →
     /// `processTarget`: the target `dbDbInitLink` bound
@@ -937,6 +936,33 @@ pub(crate) enum ForwardTarget {
     /// dispatch reads FLNK again, as C reads `plink` there.
     External,
 }
+
+/// C `recGblFwdLink` (`recGbl.c:289-303`) as a cycle takes it: the FLNK
+/// `dbScanFwdLink` forwards through, and the rest of the call.
+#[derive(Clone, Copy)]
+pub(crate) struct FwdLink {
+    pub(crate) flnk: ForwardTarget,
+    pub(crate) rest: FwdLinkRest,
+}
+
+impl FwdLink {
+    /// The call with its FLNK already fired by the record (throttle's
+    /// `valuePut`, `throttleRecord.c:578`).
+    pub(crate) fn fired(self) -> Self {
+        Self {
+            flnk: ForwardTarget::None,
+            rest: self.rest,
+        }
+    }
+}
+
+/// What `recGblFwdLink` does past `dbScanFwdLink`: the put-notify
+/// completion, the RPRO restart and the PUTF clear. Only
+/// [`RecordInstance::fwd_link`] makes one, so a cycle whose record withheld
+/// the call ([`Record::should_fire_forward_link`]) has nothing to release
+/// them with.
+#[derive(Clone, Copy)]
+pub(crate) struct FwdLinkRest(());
 
 /// What C's `readValue`/`writeValue` reaches as struct members — `prec->sims`,
 /// `->sdly` — and which stage of the cycle C put the SIOL read in. `siml` and
@@ -7586,28 +7612,34 @@ impl RecordInstance {
         self.selm
     }
 
-    /// This cycle's forward link, resolved from the two things C's
-    /// `dbScanFwdLink` reads: the record's own veto
-    /// ([`Record::should_fire_forward_link`]) and `FLNK`'s parsed kind.
+    /// This cycle's `recGblFwdLink`, `None` when the record withholds it
+    /// ([`Record::should_fire_forward_link`]), else with the forward link
+    /// `FLNK`'s parsed kind resolves to.
     ///
-    /// The single owner of that question. The DB half and the external half
-    /// used to be derived at separate points — the DB name under the monitor
-    /// segment's guard, the external PV by `dispatch_external_forward_link`
-    /// re-taking the record's read lock in the tail — so every record in the
-    /// database paid a second acquisition and a second `should_fire_forward_link`
-    /// call once a cycle, and the two derivations could disagree about a
-    /// record whose veto changed in between.
+    /// The single owner of that question, asked once where C makes the call.
+    /// A withheld call releases nothing, so the source's PUTF reaches the FLNK
+    /// of the later call that the record makes (swait's put callback, motor's
+    /// DMOV, `recGbl.c:295-302`).
     #[inline(always)]
-    pub(crate) fn forward_target(&self) -> ForwardTarget {
-        // The link kind goes first: with nothing to fire (the common empty
-        // FLNK) the record's veto is never asked, as in `dbScanFwdLink`.
-        if self.parsed_flnk.is_constant() {
-            return ForwardTarget::None;
+    pub(crate) fn fwd_link(&self) -> Option<FwdLink> {
+        let rest = FwdLinkRest(());
+        // With nothing to fire (the common empty FLNK) and nothing for the
+        // call to release, the record's veto is never asked.
+        if self.parsed_flnk.is_constant()
+            && !self.common.putf
+            && self.common.rpro == 0
+            && self.notify.is_none()
+        {
+            let flnk = ForwardTarget::None;
+            return Some(FwdLink { flnk, rest });
         }
-        match self.parsed_flnk.link() {
+        if !self.record.should_fire_forward_link() {
+            return None;
+        }
+        let flnk = match self.parsed_flnk.link() {
             // Unbound only before `iocInit`, when C's link is still a
             // PV_LINK with no lset to forward through.
-            ParsedLink::Db(l) if self.record.should_fire_forward_link() => match l.forward() {
+            ParsedLink::Db(l) => match l.forward() {
                 Some(target) => ForwardTarget::Db {
                     target,
                     putf: self.common.putf,
@@ -7615,17 +7647,16 @@ impl RecordInstance {
                 },
                 None => ForwardTarget::None,
             },
-            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_)
-                if self.record.should_fire_forward_link() =>
-            {
+            ParsedLink::Pva(_) | ParsedLink::PvaJson(_) | ParsedLink::Ca(_) => {
                 ForwardTarget::External
             }
             // Constant / Hw / Calc / None carry no forward action.
             _ => ForwardTarget::None,
-        }
+        };
+        Some(FwdLink { flnk, rest })
     }
 
-    /// The `FLNK` [`Self::forward_target`] reads.
+    /// The `FLNK` [`Self::fwd_link`] reads.
     #[inline(always)]
     pub(crate) fn flnk(&self) -> &ParsedLink {
         self.parsed_flnk.link()
@@ -8916,8 +8947,8 @@ impl RecordInstance {
 
     /// Give up a claim on the slot without ever having processed under it.
     ///
-    /// NOT a completion. `complete_put_notify` (`processing.rs:449`, C
-    /// `dbNotifyCompletion`) `leave`s the wait-set because the record
+    /// NOT a completion. `finish_cycle` (C `dbNotifyCompletion`) `leave`s the
+    /// wait-set because the record
     /// contributed a cycle to it; an abandoned claim contributed nothing, so
     /// the set is dropped whole. Its `pending` never reaches zero, and the
     /// client's receiver wakes on the dropped sender — the same release C

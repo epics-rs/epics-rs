@@ -463,8 +463,8 @@ impl Record for BusyRecord {
     //
     // Withholding the client's `ca_put_callback` while VAL stays 1 is
     // `should_fire_forward_link` alone: `dbNotifyCompletion` lives inside the
-    // `recGblFwdLink` the line above declines to call, and the framework reads
-    // the two together in `complete_put_notify`. A second override saying
+    // `recGblFwdLink` the line above declines to call, and the framework makes
+    // that call only through `RecordInstance::fwd_link`. A second override saying
     // `val == 0` here would be the same C fact written twice, which is how the
     // deleted `is_put_complete() == (self.val == 0)` came to say it in the one
     // place the framework then honoured without the forward-link half.

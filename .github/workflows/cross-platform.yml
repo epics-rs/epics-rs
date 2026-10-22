@@ -71,10 +71,8 @@ jobs:
             os: macos-latest
           - name: macos-x86_64
             os: macos-15-intel
-            # A cold-cache build takes 45-47 min (runs 39755262487,
-            # 39770918392), so 75 cancelled the job inside nextest before
-            # its own 30 min step timeout could name a stuck test. No cache
-            # is saved until one run passes.
+            # Cold cache: build 24 min + nextest 14 min (fork run
+            # 39797956905). No cache is saved until one run passes.
             timeout: 95
           # Build ~20 min, then nextest ran 13927 of 17023 tests in 25 min
           # before the 45 min default cancelled the job (run 39710144196).
@@ -141,7 +139,9 @@ jobs:
       # Compiles libs, bins, AND test targets — the surest catch for
       # platform-specific source that isn't `#[cfg]`-gated.
       - name: Build (workspace + tests)
-        run: cargo build --workspace --tests --verbose
+        # No --verbose: with it, three macos-x86_64 runs stopped logging
+        # mid-build at 39-42 min and sat there until the job timeout.
+        run: cargo build --workspace --tests
 
       # `ci` profile (.config/nextest.toml) adds retries for the
       # genuinely flaky network/timing integration suites.

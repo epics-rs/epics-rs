@@ -126,6 +126,7 @@ async fn cnt_abort_leaves_no_delayed_reentry() {
 async fn an_untouched_delayed_start_still_starts_the_count() {
     let server = abort_fixture().await;
 
+    let cnt = std::time::Instant::now();
     put_cnt(&server, 1).await;
 
     let ss = reaches(&server, "SC.SS", EpicsValue::Short(2)).await;
@@ -133,5 +134,11 @@ async fn an_untouched_delayed_start_still_starts_the_count() {
         ss,
         EpicsValue::Short(2),
         "the delayed start must still fire and reach SCALER_STATE_COUNTING"
+    );
+    // C's delayed callback never fires early.
+    assert!(
+        cnt.elapsed() >= Duration::from_secs_f64(DLY),
+        "counting {:?} after the CNT put",
+        cnt.elapsed()
     );
 }

@@ -141,6 +141,7 @@ record(scaler, "TEST:SC3") {
 
     // Start counting with DLY=0.5s
     // special("CNT") sets US=WAITING, then process returns AsyncPendingReprocess
+    let cnt = std::time::Instant::now();
     server
         .put("TEST:SC3.CNT", EpicsValue::Short(1))
         .await
@@ -159,6 +160,12 @@ record(scaler, "TEST:SC3") {
         ss,
         EpicsValue::Short(2),
         "SS should be COUNTING after DLY expires"
+    );
+    // C's delayed callback never fires early.
+    assert!(
+        cnt.elapsed() >= std::time::Duration::from_millis(500),
+        "counting {:?} after the CNT put",
+        cnt.elapsed()
     );
 
     let us = server.get("TEST:SC3.US").await.unwrap();
@@ -716,6 +723,7 @@ record(scaler, "TEST:SC_E2") {
         .await
         .unwrap();
 
+    let cnt = std::time::Instant::now();
     server
         .put("TEST:SC_E2.CNT", EpicsValue::Short(1))
         .await
@@ -738,6 +746,12 @@ record(scaler, "TEST:SC_E2") {
         reaches(&server, "TEST:SC_E2.SS", EpicsValue::Short(2)).await,
         EpicsValue::Short(2),
         "SS == SCALER_STATE_COUNTING: the watchdog started the count with no scan source"
+    );
+    // C's delayed callback never fires early.
+    assert!(
+        cnt.elapsed() >= std::time::Duration::from_millis(500),
+        "counting {:?} after the CNT put",
+        cnt.elapsed()
     );
     assert_eq!(
         server.get("TEST:SC_E2.US").await.unwrap(),

@@ -12,6 +12,7 @@ chrono = "0.4"
 epics-base-rs = { workspace = true }
 epics-libcom-rs = { workspace = true }
 futures-util = "0.3"
+libc = "0.2"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"

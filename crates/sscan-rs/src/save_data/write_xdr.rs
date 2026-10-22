@@ -4,7 +4,7 @@
 //! `writeFailed`, and prints C's message on failure. `write_XDR_Init`'s
 //! endianness probe has no port: `to_be_bytes` is the encoding on every host.
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 
 use epics_libcom_rs::runtime::crt_errno;
 
@@ -159,19 +159,19 @@ impl<W: Write + Seek> Xdr<W> {
                 crt_errno::strerror(&e)
             );
         }
-        // A negative offset is fseek's EINVAL.
-        let seek = match u64::try_from(pos) {
-            Ok(pos) => self.w.seek(SeekFrom::Start(pos)),
-            Err(_) => Err(io::Error::from_raw_os_error(22)),
+        // A negative offset is fseek's EINVAL, an errno with no OS code.
+        let failed = match u64::try_from(pos) {
+            Ok(pos) => self
+                .w
+                .seek(SeekFrom::Start(pos))
+                .err()
+                .map(|e| (crt_errno::errno(&e).unwrap_or(0), crt_errno::strerror(&e))),
+            Err(_) => Some((libc::EINVAL, crt_errno::errno_text(libc::EINVAL))),
         };
-        match seek {
-            Ok(_) => true,
-            Err(e) => {
-                println!(
-                    "writeXDR_setpos: fseek failed, status = -1, errno={}, ('{}')",
-                    crt_errno::errno(&e).unwrap_or(0),
-                    crt_errno::strerror(&e)
-                );
+        match failed {
+            None => true,
+            Some((errno, text)) => {
+                println!("writeXDR_setpos: fseek failed, status = -1, errno={errno}, ('{text}')");
                 false
             }
         }
@@ -225,9 +225,27 @@ mod tests {
         );
     }
 
-    /// `fseek` to a negative offset fails.
+    /// `fseek` to a negative offset fails with C's EINVAL line, on Windows
+    /// too.
     #[test]
     fn setpos_negative_fails() {
+        const CHILD: &str = "SSCAN_SETPOS_NEGATIVE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "save_data::write_xdr::tests::setpos_negative_fails",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{stdout}");
+            let line = "writeXDR_setpos: fseek failed, status = -1, errno=22, ('Invalid argument')";
+            assert!(stdout.lines().any(|l| l == line), "{stdout}");
+            return;
+        }
         let mut x = Xdr::new(Cursor::new(Vec::new()));
         assert!(!x.setpos(-1));
     }

@@ -3863,6 +3863,7 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "futures-util",
+ "libc",
  "parking_lot",
  "tempfile",
  "tokio",

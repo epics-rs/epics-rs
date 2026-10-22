@@ -7,6 +7,9 @@
 //! A `DOLn`/`LNKn` put naming nothing schedules no `checkLinks`, and neither
 //! does a process of a record whose links all resolved.
 
+use epics_base_rs::runtime::task::{
+    BackgroundTaskHandle, CallbackPriority, sleep_background, spawn_background,
+};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -50,6 +53,20 @@ fn drain(rx: &mut EventReader) -> usize {
         n += 1;
     }
     n
+}
+
+/// Whether `rx` has a post 750 ms on the delayed-callback timer after its
+/// next one, read on cbLow. A pass's post wakes this there only once the pass
+/// has re-armed, and the timer fires in deadline order, so a 0.5 s re-arm has
+/// posted by then and a 1 s one has not, however late the host runs both.
+fn reposted_within_750_ms(mut rx: EventReader) -> BackgroundTaskHandle<(EventReader, bool)> {
+    spawn_background(CallbackPriority::Low, async move {
+        drain(&mut rx);
+        rx.recv().await.expect("subscriber open");
+        sleep_background(Duration::from_millis(750)).await;
+        let again = drain(&mut rx) > 0;
+        (rx, again)
+    })
 }
 
 /// The events each of `rxs` gets once every one has `least`, plus any in a
@@ -257,8 +274,6 @@ record(sseq, "Q") {
         .await
         .unwrap()
         .0;
-    // Past init's 1 s pass, so each window holds one of the 0.5 s re-arms.
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1100)).await;
     const STATUS: [&str; 3] = ["DOL1V", "LNK1V", "DOL2V"];
     let mut rxs: Vec<EventReader> = STATUS
         .iter()
@@ -275,15 +290,18 @@ record(sseq, "Q") {
             .unwrap()
         })
         .collect();
+    let mut dol2v = rxs.pop().expect("DOL2V");
     for field in ["WAIT2", "WAIT1", "PROC"] {
         db.put_record_field_from_ca("Q", field, EpicsValue::Short(1))
             .await
             .unwrap();
-        let pass = usize::from(field != "PROC");
-        let got = events(&mut rxs, &[0, 0, pass]).await;
-        assert_eq!(got[..2], [0, 0], "CA status events after the {field} put");
-        if field != "PROC" {
-            assert!(got[2] > 0, "no checkLinks pass after the {field} put");
-        }
+        let (rx, rearmed) = reposted_within_750_ms(dol2v).await.unwrap();
+        dol2v = rx;
+        let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
+        assert_eq!(got, [0, 0], "CA status events after the {field} put");
+        assert!(
+            rearmed,
+            "no checkLinks pass 750 ms after one, after the {field} put"
+        );
     }
 }

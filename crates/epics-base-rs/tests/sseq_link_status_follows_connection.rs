@@ -14,6 +14,7 @@ use epics_base_rs::runtime::task::{
     BackgroundTaskHandle, CallbackPriority, sleep_background, spawn_background,
 };
 use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkRef, LinkSet, PvDatabase};
+use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -112,6 +113,20 @@ fn read_after_750_ms(db: &Arc<PvDatabase>, pv: &'static str) -> BackgroundTaskHa
     })
 }
 
+/// Whether `rx` has a post 750 ms on the delayed-callback timer after its
+/// next one, read on cbLow. A pass's post wakes this there only once the pass
+/// has re-armed, and the timer fires in deadline order, so a 0.5 s re-arm has
+/// posted by then and a 1 s one has not, however late the host runs both.
+fn reposted_within_750_ms(mut rx: EventReader) -> BackgroundTaskHandle<(EventReader, bool)> {
+    spawn_background(CallbackPriority::Low, async move {
+        while rx.try_recv().is_ok() {}
+        rx.recv().await.expect("subscriber open");
+        sleep_background(Duration::from_millis(750)).await;
+        let again = rx.try_recv().is_ok();
+        (rx, again)
+    })
+}
+
 /// Init leaves both CA links `Ext PV NC` with no type; the pass init arms
 /// moves them to `Ext PV OK` and takes the channel's type, with no process.
 #[epics_macros_rs::epics_test]
@@ -165,6 +180,8 @@ async fn a_down_sseq_link_is_rechecked_until_it_connects() {
         span >= Duration::from_millis(1500),
         "five Local PV re-posts in {span:?}"
     );
+    let (mut rx, rearmed) = reposted_within_750_ms(rx).await.unwrap();
+    assert!(rearmed, "no pass 750 ms after a pass");
 
     up.store(true, Ordering::SeqCst);
     settled(&db, "Q:SQ.LNK1V", EXT_OK).await;

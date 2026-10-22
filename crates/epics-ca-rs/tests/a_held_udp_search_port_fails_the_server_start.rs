@@ -54,8 +54,12 @@ async fn a_held_udp_search_port_fails_ioc_init() {
         .run(|_config| async { panic!("the runner must not be started") })
         .await
         .expect_err("iocInit fails on the held port");
+    // Windows refuses the `SO_REUSEADDR` bind with WSAEACCES.
+    let err = err.to_string();
     assert!(
-        err.to_string().contains("Address already in use"),
+        named_port::verdict::held_texts()
+            .iter()
+            .any(|t| err.contains(t.as_str())),
         "got: {err}"
     );
 }

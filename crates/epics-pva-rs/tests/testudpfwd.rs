@@ -70,7 +70,7 @@ impl Mshim {
     }
 
     /// mshim's own report that `listen_port` belonged to somebody else:
-    /// `mshim-rs: bind <addr>: Address already in use`, then exit 1.
+    /// `mshim-rs: bind <addr>: ` and a held-port text, then exit 1.
     fn lost_its_port(&mut self) -> bool {
         let exited = self
             .guard
@@ -80,9 +80,10 @@ impl Mshim {
         let text = std::fs::read_to_string(self.console.path()).unwrap_or_default();
         let prefix = format!("mshim-rs: bind 127.0.0.1:{}: ", self.listen_port);
         exited
-            && text
-                .lines()
-                .any(|l| l.starts_with(&prefix) && l.contains("Address already in use"))
+            && text.lines().any(|l| {
+                l.starts_with(&prefix)
+                    && (named_port::verdict::held_texts().iter()).any(|t| l.contains(t.as_str()))
+            })
     }
 }
 

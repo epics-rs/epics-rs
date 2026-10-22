@@ -10,6 +10,9 @@
 //! `EPICS_RS_BUILD_EXEC_BACKEND` and the target OS. Reading the variable alone
 //! would be wrong on exactly the case the workspace predicate exists for: on
 //! RTEMS and VxWorks it is unset while `exec_backend` is ON.
+//!
+//! It also compiles every `src/snl/*.st` with snc-rs to `$OUT_DIR/<stem>.rs`,
+//! which the companion calling `include_program!("<stem>")` includes.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
@@ -43,4 +46,6 @@ fn main() {
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
+
+    epics_snc_rs::build::compile_dir("src/snl");
 }

@@ -106,8 +106,11 @@ async fn the_script_sees_the_port_the_registrar_holds() {
 
 #[epics_macros_rs::epics_test]
 async fn a_held_search_port_leaves_the_ioc_without_pvaccess() {
-    let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("take a UDP port");
-    pvas_env(held.local_addr().unwrap().port());
+    // pvxs binds the search port on the wildcard with fanout
+    // (`udp_collector.cpp:136-151`), which a plain loopback socket refuses
+    // only on Linux.
+    let held = named_port::HeldPort::closed_udp();
+    pvas_env(held.port);
     let seen = Arc::new(Mutex::new(None));
     let app = pvxs_base_registrar(
         IocApplication::new()

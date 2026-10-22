@@ -1897,10 +1897,20 @@ mod tests {
             Endpoint::parse("224.0.2.3,abc", 5076),
             Err("Invalid input : \"abc\"".to_string())
         );
-        // An empty address goes to the resolver, as `setAddress("")` does.
+        // An empty address goes to the resolver, as `setAddress("")` does:
+        // unix getaddrinfo refuses "", Windows answers with the host's own
+        // addresses, and libevent hands "" to it on both (`evutil.c:1676`).
+        let empty = super::super::sockaddr::set_address("", 5076);
+        if !cfg!(windows) {
+            let err = empty.as_ref().unwrap_err();
+            assert!(err.starts_with("Error resolving \"\" : "), "{err}");
+        }
         for token in [",5", "@eth0"] {
-            let err = Endpoint::parse(token, 5076).unwrap_err();
-            assert!(err.starts_with("Error resolving \"\" : "), "{token}: {err}");
+            assert_eq!(
+                Endpoint::parse(token, 5076).map(|e| e.addr),
+                empty,
+                "{token}"
+            );
         }
     }
 

@@ -568,6 +568,14 @@ fn wait_lines(n: usize) -> Vec<String> {
     }
 }
 
+/// A bus answer the player cannot give. The record waits for it, an @init
+/// protocol inside iocInit, where the test's thread never returns to fail:
+/// end the test's process.
+fn missed(why: String) -> ! {
+    epics_base_rs::stderr_println!("{why}");
+    std::process::exit(101)
+}
+
 /// Run the case as run-epics.sh does: iocInit, the PROC put, and compare
 /// the kept lines and the fields after the run.
 async fn run_case(name: &str) {
@@ -640,15 +648,14 @@ async fn run_case(name: &str) {
             let Some(play) = play(line) else { continue };
             let have = wait_lines(i - drv);
             if have.len() < i - drv {
-                return Err(format!("not reached {line:?}: {have:#?}"));
+                missed(format!("not reached {line:?}: {have:#?}"));
             }
             let client = common::CLIENT.lock().clone().and_then(|c| c.upgrade());
             let Some(client) = client else {
-                return Err(format!("no client to play {line:?}: {have:#?}"));
+                missed(format!("no client to play {line:?}: {have:#?}"));
             };
             play.give(&*client);
         }
-        Ok(())
     });
 
     // run-epics.sh's `*o | *out | *oDirect`
@@ -758,7 +765,7 @@ async fn run_case(name: &str) {
         assert_eq!(epics_base_rs::server::ioc_app::ioc_run(), 0);
         epics_base_rs::runtime::task::sleep(Duration::from_millis(500)).await;
     }
-    player.join().unwrap().unwrap();
+    player.join().unwrap();
     epics_base_rs::runtime::log::errlog_flush();
     wait_lines(want.len() - errlog_want - drv);
     stream_rs::error::set_stream_debug(0);

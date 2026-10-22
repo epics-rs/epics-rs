@@ -98,15 +98,21 @@ impl StreamFormatConverter for TimestampConverter {
             b"'\n"
         );
         let mut buffer = ctime::strftime40(&info, &ctime::localtime(sec));
+        // The fraction fields are the format's, in any second's text; where
+        // this one's is empty (too long, or before 1970 on UCRT) they are
+        // read from the next second's.
+        let next = buffer
+            .is_empty()
+            .then(|| ctime::strftime40(&info, &ctime::localtime(sec.saturating_add(1))));
         // C bug not copied: C never carries, so .9996 as %S.%3f printed the
         // old second with "000". When the finest field rounds up to 1, the
         // second carries and every field prints zeros; otherwise each field
         // is rounded on its own, as C does.
-        if let Some(n) = finest_fraction(&buffer)
+        if let Some(n) = finest_fraction(next.as_deref().unwrap_or(&buffer))
             && format!("{:.n$}", CFloat(frac)).starts_with('1')
         {
             sec += 1;
-            buffer = ctime::strftime40(&info, &ctime::localtime(sec));
+            buffer = next.unwrap_or_else(|| ctime::strftime40(&info, &ctime::localtime(sec)));
         }
         let mut i = output.length() as isize;
         output.append(&buffer);

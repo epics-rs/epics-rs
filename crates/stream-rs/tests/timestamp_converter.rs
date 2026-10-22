@@ -495,15 +495,17 @@ fn a_rounded_fraction_carries_into_the_second() {
     // 2023-12-31 23:59:59.9996 CET
     let line = run("pd\t%T(%Y-%m-%d %H:%M:%S.%3f)\t1704063599.9996");
     assert_eq!(out_text(&line), "2024-01-01 00:00:00.000");
+    // Its floored second, -1, is before 1970, which UCRT refuses.
     let line = run("pd\t%T(%F %T.%3f)\t-0.0004");
-    // On Windows its floored second, before 1970, is formatted before the
-    // carry and refused.
-    let carried = if cfg!(windows) {
-        ""
-    } else {
-        "1970-01-01 01:00:00.000"
-    };
-    assert_eq!(out_text(&line), carried);
+    assert_eq!(out_text(&line), "1970-01-01 01:00:00.000");
+    // 2023-11-15 23:59:59.9996 CET: Wednesday's text is 40 bytes, more
+    // than C's buffer holds, Thursday's 39.
+    let pad = "x".repeat(26);
+    let line = run(&format!("pd\t%T(%A{pad}.%3f)\t1700089199.9996"));
+    assert_eq!(out_text(&line), format!("Thursday{pad}.000"));
+    // inf floors to the last second there is.
+    let line = run("pd\t%T()\tinf");
+    assert_eq!(out_text(&line), "");
     let line = run("pd\t%T(%S.%2f)\t1704063599.994");
     assert_eq!(out_text(&line), "59.99");
 }

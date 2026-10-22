@@ -1,15 +1,17 @@
-//! filterDrive's runner against `filterDrive.db` and `filterBladeNoSensor.db`
-//! blades: the `needRecalc`, `externalIO` and `STATUS_BUSY` clauses of
-//! `waiting` (`filterDrive.st:396-450`).
+//! The compiled `filterDrive.st` on `filterDrive.db` and
+//! `filterBladeNoSensor.db` blades: the `needRecalc`, `externalIO` and
+//! `STATUS_BUSY` clauses of `waiting` (`filterDrive.st:411-465`), and C's
+//! console lines against snc 2.2.9's build of the same program.
 
-use epics_base_rs::runtime::task::{self, BlockingBridge};
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
-use optics_rs::snl::filter_drive::{self, FilterDriveConfig};
+use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+use optics_rs::snl::filter_drive::filterDrive;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,9 +33,16 @@ fn macros(kv: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
+/// The program on the IOC; the scan owner keeps the scan threads up.
+struct Fd {
+    ioc: Arc<PvDatabase>,
+    _scan: ScanOwner,
+    tid: SeqThreadId,
+}
+
 /// The IOC with `n` blades, booted past C's four seconds of `start`/`init`
-/// sleeps.
-async fn boot(n: usize) -> (Arc<PvDatabase>, ScanOwner) {
+/// sleeps and the `update_filters` passes they end in.
+async fn boot(n: usize) -> Fd {
     let mut b = IocBuilder::new()
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
@@ -63,13 +72,27 @@ async fn boot(n: usize) -> (Arc<PvDatabase>, ScanOwner) {
     }
     let ioc = b.build_served().await.unwrap().0;
     let scan = ScanOwner::start(ioc.clone());
-    let db = PvDatabase::clone(&ioc);
-    BlockingBridge::capture().spawn(filter_drive::run(
-        FilterDriveConfig::new("F:", "f:", n as i32),
-        db,
-    ));
-    task::sleep(Duration::from_millis(5000)).await;
-    (ioc, scan)
+    let tid = seq(
+        &filterDrive,
+        &format!("NAME=filterDrive,P=F:,R=f:,NUM_FILTERS={n}"),
+        0,
+        &ioc,
+    )
+    .expect("filterDrive starts");
+    // The first pass computes every blade and clears the busy `init` set;
+    // the passes behind it take milliseconds.
+    let last = format!("F:f:Fi{}:Transmission", n.min(32));
+    let t0 = std::time::Instant::now();
+    while f64_of(&ioc, &last).await == 0.0 || f64_of(&ioc, "F:f:Status").await != 0.0 {
+        assert!(t0.elapsed() < Duration::from_secs(60), "boot never ended");
+        task::sleep(Duration::from_millis(50)).await;
+    }
+    task::sleep(Duration::from_millis(1000)).await;
+    Fd {
+        ioc,
+        _scan: scan,
+        tid,
+    }
 }
 
 async fn put(ioc: &PvDatabase, pv: &str, v: EpicsValue) {
@@ -93,46 +116,185 @@ async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
 /// the init puts set is cleared.
 #[epics_base_rs::epics_test]
 async fn boot_publishes_the_count_and_clears_busy() {
-    let (ioc, _scan) = boot(2).await;
-    assert_eq!(f64_of(&ioc, "F:f:NumFilters").await, 2.0);
-    assert_eq!(f64_of(&ioc, "F:f:Status").await, 0.0);
-    assert_eq!(string_of(&ioc, "F:f:Message").await, "OK");
+    let f = boot(2).await;
+    assert_eq!(f64_of(&f.ioc, "F:f:NumFilters").await, 2.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Status").await, 0.0);
+    assert_eq!(string_of(&f.ioc, "F:f:Message").await, "OK");
+    seq_stop(f.tid);
 }
 
 /// `sync THICK needRecalc`: a thickness change recomputes that blade.
 #[epics_base_rs::epics_test]
 async fn a_thickness_change_recomputes_the_blade() {
-    let (ioc, _scan) = boot(2).await;
-    let before = f64_of(&ioc, "F:f:Fi1:Transmission").await;
-    put(&ioc, "F:f:Fi1:Thickness", EpicsValue::Double(400.0)).await;
+    let f = boot(2).await;
+    let before = f64_of(&f.ioc, "F:f:Fi1:Transmission").await;
+    put(&f.ioc, "F:f:Fi1:Thickness", EpicsValue::Double(400.0)).await;
     task::sleep(Duration::from_millis(500)).await;
-    let after = f64_of(&ioc, "F:f:Fi1:Transmission").await;
+    let after = f64_of(&f.ioc, "F:f:Fi1:Transmission").await;
     assert!(after < before, "{after} after 400 um, {before} before");
+    seq_stop(f.tid);
 }
 
 /// `sync OUTGET externalIO`: a blade moved by something else takes its `Set`
 /// from the readback, and says so.
 #[epics_base_rs::epics_test]
 async fn an_external_out_change_takes_the_blade_set() {
-    let (ioc, _scan) = boot(2).await;
-    put(&ioc, "F:o2", EpicsValue::String("in".into())).await;
+    let f = boot(2).await;
+    put(&f.ioc, "F:o2", EpicsValue::String("in".into())).await;
     task::sleep(Duration::from_millis(500)).await;
-    assert_eq!(f64_of(&ioc, "F:f:Fi2:Set").await, 1.0);
-    assert_eq!(f64_of(&ioc, "F:f:FilterMask").await, 2.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi2:Set").await, 1.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:FilterMask").await, 2.0);
     assert_eq!(
-        string_of(&ioc, "F:f:Message").await,
+        string_of(&f.ioc, "F:f:Message").await,
         "Filter state set by external agent."
     );
+    seq_stop(f.tid);
 }
 
 /// `when (STATUS_BUSY)`: a busy record set from outside runs
 /// `update_filters`, whose `changeFlag` clears it.
 #[epics_base_rs::epics_test]
 async fn an_outside_busy_is_cleared_by_update_filters() {
-    let (ioc, _scan) = boot(2).await;
-    put(&ioc, "F:f:Status", EpicsValue::Enum(1)).await;
+    let f = boot(2).await;
+    put(&f.ioc, "F:f:Status", EpicsValue::Enum(1)).await;
     task::sleep(Duration::from_millis(500)).await;
-    assert_eq!(f64_of(&ioc, "F:f:Status").await, 0.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Status").await, 0.0);
+    seq_stop(f.tid);
+}
+
+/// With no blade enabled the table is one pattern, all out, and both steps
+/// fall back to the current transmission (`filterDrive.st:534-625`).
+#[epics_base_rs::epics_test]
+async fn no_enabled_blade_leaves_one_pattern() {
+    let f = boot(2).await;
+    assert!(f64_of(&f.ioc, "F:f:TransmissionDown").await < 1.0);
+    for pv in ["F:f:Fi1:Enable", "F:f:Fi2:Enable"] {
+        put(&f.ioc, pv, EpicsValue::Enum(0)).await;
+        task::sleep(Duration::from_millis(1000)).await;
+    }
+    for pv in [
+        "F:f:Transmission",
+        "F:f:TransmissionUp",
+        "F:f:TransmissionDown",
+    ] {
+        assert_eq!(f64_of(&f.ioc, pv).await, 1.0, "{pv}");
+    }
+    seq_stop(f.tid);
+}
+
+/// A locked inserted blade is in every pattern and a disabled one in none:
+/// of three blades, the table is blade 1 alone and blades 1 and 2.
+///
+/// The blades go in from the hardware side. A `Set` put races its own
+/// readback, in C too: `SetBusy` wakes `update_filters` before the `OutGet`
+/// CP link has the new output, and the stale `OUTGET` is put back to `Set`.
+#[epics_base_rs::epics_test]
+async fn locked_and_disabled_blades_shape_the_patterns() {
+    let f = boot(3).await;
+    for (pv, v) in [
+        ("F:o1", EpicsValue::String("in".into())),
+        ("F:f:Fi1:Lock", EpicsValue::Enum(1)),
+        ("F:o3", EpicsValue::String("in".into())),
+        ("F:f:Fi3:Enable", EpicsValue::Enum(0)),
+    ] {
+        put(&f.ioc, pv, v).await;
+        task::sleep(Duration::from_millis(1000)).await;
+    }
+    let t1 = f64_of(&f.ioc, "F:f:Fi1:Transmission").await;
+    let t2 = f64_of(&f.ioc, "F:f:Fi2:Transmission").await;
+    assert_eq!(f64_of(&f.ioc, "F:f:FilterMask").await, 1.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Transmission").await, t1);
+    assert_eq!(f64_of(&f.ioc, "F:f:TransmissionUp").await, t1);
+    assert_eq!(f64_of(&f.ioc, "F:f:TransmissionDown").await, t1 * t2);
+    seq_stop(f.tid);
+}
+
+/// A blade in the beam with a NaN thickness leaves the current pattern
+/// unfound (`filterDrive.st:574-580`): the steps fall back to it, and a step
+/// down selects no pattern and moves nothing. Blade 1 goes in from the
+/// hardware side, as in [`locked_and_disabled_blades_shape_the_patterns`].
+///
+/// C defect fixed: C read and printed `fltrsIn[-1]` there.
+#[epics_base_rs::epics_test]
+async fn an_unfound_current_pattern_selects_nothing() {
+    let f = boot(2).await;
+    for (pv, v) in [
+        ("F:f:Debug", EpicsValue::Double(1.0)),
+        ("F:o1", EpicsValue::String("in".into())),
+        ("F:f:Fi1:Thickness", EpicsValue::Double(f64::NAN)),
+    ] {
+        put(&f.ioc, pv, v).await;
+        task::sleep(Duration::from_millis(1000)).await;
+    }
+    assert!(f64_of(&f.ioc, "F:f:TransmissionDown").await.is_nan());
+    put(&f.ioc, "F:f:TransmissionStepDown", EpicsValue::Enum(1)).await;
+    task::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi1:Set").await, 1.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi2:Set").await, 0.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Status").await, 0.0);
+    seq_stop(f.tid);
+}
+
+/// A setpoint below every pattern when none is below 1.0 (both blades 0 um)
+/// keeps the current pattern (`filterDrive.st:672-690`).
+///
+/// C defect fixed: C took `indMin` from the earlier table, where both blades
+/// in was the lowest, and put them in.
+#[epics_base_rs::epics_test]
+async fn no_pattern_below_one_keeps_the_current_one() {
+    let f = boot(2).await;
+    for (pv, v) in [
+        ("F:f:TransmissionSetpoint", 0.0001),
+        ("F:f:TransmissionSetpoint", 1.0),
+        ("F:f:Fi1:Thickness", 0.0),
+        ("F:f:Fi2:Thickness", 0.0),
+        ("F:f:TransmissionSetpoint", 0.5),
+    ] {
+        put(&f.ioc, pv, EpicsValue::Double(v)).await;
+        task::sleep(Duration::from_millis(2000)).await;
+    }
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi1:Set").await, 0.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi2:Set").await, 0.0);
+    assert_eq!(string_of(&f.ioc, "F:f:Message").await, "OK - No change");
+    seq_stop(f.tid);
+}
+
+/// With `MAX_FILTERS` blades, 16 of them disabled, a mask in range takes
+/// its blades (`filterDrive.st:740-767`).
+///
+/// C defect fixed: C bounded the mask by `(1 << 32) - 1`, which x86 makes
+/// `0`, and refused every mask but 0.
+#[epics_base_rs::epics_test]
+async fn a_mask_with_32_blades_takes_its_blades() {
+    let f = boot(32).await;
+    for i in 17..=32 {
+        put(&f.ioc, &format!("F:f:Fi{i}:Enable"), EpicsValue::Enum(0)).await;
+        task::sleep(Duration::from_millis(100)).await;
+    }
+    task::sleep(Duration::from_millis(1000)).await;
+    put(&f.ioc, "F:f:FilterMaskSetpoint", EpicsValue::Double(5.0)).await;
+    task::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(string_of(&f.ioc, "F:f:Message").await, "OK");
+    for (i, set) in [(1, 1.0), (2, 0.0), (3, 1.0)] {
+        assert_eq!(
+            f64_of(&f.ioc, &format!("F:f:Fi{i}:Set")).await,
+            set,
+            "blade {i}"
+        );
+    }
+    seq_stop(f.tid);
+}
+
+/// `NUM_FILTERS` past `MAX_FILTERS` runs `MAX_FILTERS` blades
+/// (`filterDrive.st:342-381`).
+///
+/// C defect fixed: C assigned `THICK[32]`..`OUTGET[32]`, past the arrays.
+#[epics_base_rs::epics_test]
+async fn num_filters_past_max_filters_runs_32_blades() {
+    let f = boot(33).await;
+    assert_eq!(f64_of(&f.ioc, "F:f:NumFilters").await, 32.0);
+    assert_eq!(f64_of(&f.ioc, "F:f:Status").await, 0.0);
+    seq_stop(f.tid);
 }
 
 const CHILD: &str = "FILTER_DRIVE_DEBUG_CHILD";
@@ -222,13 +384,13 @@ async fn debug_prints_c_lines() {
         assert_eq!(trace, c);
         return;
     }
-    drive(2, STAGES).await;
+    seq_stop(drive(2, STAGES).await.tid);
 }
 
 /// `n` blades driven through `stages`, each headed by its mark, and the
 /// IOC they ran on.
-async fn drive(n: usize, stages: &[Stage]) -> (Arc<PvDatabase>, ScanOwner) {
-    let (ioc, scan) = boot(n).await;
+async fn drive(n: usize, stages: &[Stage]) -> Fd {
+    let f = boot(n).await;
     for (stage, puts) in stages {
         println!("=== {stage}");
         for (pv, v) in *puts {
@@ -236,13 +398,13 @@ async fn drive(n: usize, stages: &[Stage]) -> (Arc<PvDatabase>, ScanOwner) {
                 Ok(x) => EpicsValue::Double(x),
                 Err(_) => EpicsValue::String((*v).into()),
             };
-            put(&ioc, pv, value).await;
+            put(&f.ioc, pv, value).await;
             task::sleep(Duration::from_millis(1000)).await;
         }
         task::sleep(Duration::from_millis(1000)).await;
     }
     println!("=== end");
-    (ioc, scan)
+    f
 }
 
 /// The stages of `tests/oracle/filterDrive_debug7.txt`.
@@ -281,48 +443,71 @@ async fn seven_blades_print_c_lines() {
         assert_eq!(trace, c);
         return;
     }
-    drive(7, STAGES7).await;
+    seq_stop(drive(7, STAGES7).await.tid);
 }
 
-/// More free blades than C's table holds: C's line and message, pinned on
-/// this side because C's run is undefined after them.
+/// More free blades than the table holds: C's line and message, an empty
+/// table, and steps and masks that select no pattern
+/// (`filterDrive.st:521-539`).
 ///
-/// C defect not copied: after the line C goes on to `nPerms = 1 << nEnabled`
-/// (`filterDrive.st:519`) and fills `transMis`/`fltrsIn`, sized `MAX_PERMS`
-/// (`:223-224`), past their end.
+/// C defect fixed: C went on to `nPerms = 1 << nEnabled` and filled
+/// `transMis`/`fltrsIn`, sized `MAX_PERMS`, past their end.
 #[epics_base_rs::epics_test]
-async fn seventeen_free_blades_print_too_many() {
+async fn seventeen_free_blades_leave_the_table_empty() {
     if std::env::var_os(CHILD).is_none() {
-        assert_eq!(
-            trace_of("seventeen_free_blades_print_too_many"),
-            [
+        let update = [
+            "filterDrive: ERROR: Too many filters unlocked (17/16).",
+            "ERROR: Could not find current filter index",
+        ];
+        let busy = [
+            "filterDrive: Busy record was set",
+            "filterDrive: entering state: update_filters",
+            update[0],
+            update[1],
+            "filterDrive: clearing busy record.",
+        ];
+        let want: Vec<&str> = [
+            &[
                 "=== debug 1, energy 12",
                 "filterDrive: Energy change detected",
                 "filterDrive: entering state: update_filters",
-                "filterDrive: ERROR: Too many filters unlocked (17/16).",
+            ][..],
+            &update,
+            &[
                 "=== step up at the top",
                 "filterDrive: step up.",
                 "Action = 1",
                 "filterDrive: No more steps up available!",
-                "filterDrive: Next filter pattern is 0000.0000.0000.0000.0,  Transmission = 1.000000e+00",
-                "filterDrive: Busy record was set",
-                "filterDrive: entering state: update_filters",
-                "filterDrive: ERROR: Too many filters unlocked (17/16).",
-                "filterDrive: clearing busy record.",
-                "=== end",
-            ]
+            ],
+            &busy,
+            &[
+                "=== mask 1",
+                "filterDrive: filter mask setpoint changed.",
+                "Action = 3",
+                "filterDrive: Required filter mask: 1",
+                "filterDrive: Adjusted filter mask: 1",
+                "filterDrive: Cannot find the requested filter pattern!",
+            ],
+            &busy,
+            &["=== end"],
+        ]
+        .concat();
+        assert_eq!(
+            trace_of("seventeen_free_blades_leave_the_table_empty"),
+            want
         );
         return;
     }
     let stages: &[Stage] = &[
         ("debug 1, energy 12", &[("F:f:Debug", "1"), ("F:kev", "12")]),
-        // Its update's entry puts the step's message, which the line's
-        // message then replaces.
         ("step up at the top", &[("F:f:TransmissionStepUp", "1")]),
+        ("mask 1", &[("F:f:FilterMaskSetpoint", "1")]),
     ];
-    let (ioc, _scan) = drive(17, stages).await;
+    let f = drive(17, stages).await;
     assert_eq!(
-        string_of(&ioc, "F:f:Message").await,
+        string_of(&f.ioc, "F:f:Message").await,
         "ERROR: Too many unlocked (17/16)"
     );
+    assert_eq!(f64_of(&f.ioc, "F:f:Fi1:Set").await, 0.0);
+    seq_stop(f.tid);
 }

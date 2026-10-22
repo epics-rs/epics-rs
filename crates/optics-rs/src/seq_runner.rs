@@ -20,43 +20,18 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use epics_base_rs::runtime::stdlib::c_isspace;
 use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::{SeqMacros, seq, spawn_program};
+use epics_base_rs::server::snl::{SeqMacros, seq};
 
-use crate::snl::filter_drive::FilterDriveConfig;
-use crate::snl::flex_combined_motion::FlexConfig;
 use crate::snl::io::IoConfig;
-use crate::snl::pf4::Pf4Config;
 
 // `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
 include!(concat!(env!("OUT_DIR"), "/seq_programs.rs"));
 
-/// C `sscanf(s, "%d", &n)` into a variable SNL zeroed: glibc's `strtol`
-/// stored through the `int`, or 0 when no digit converts.
-fn scan_int(s: &str) -> i32 {
-    let s = s.trim_start_matches(c_isspace);
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let end = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    let magnitude = digits[..end]
-        .bytes()
-        .fold(0i128, |n, d| (n * 10 + i128::from(d - b'0')).min(1 << 64));
-    let long = if negative { -magnitude } else { magnitude };
-    long.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
-}
-
 /// An optics program, configured from its macros as its `.st` reads them.
 enum Program {
-    FilterDrive(FilterDriveConfig),
-    Pf4(Pf4Config),
     Io(IoConfig),
-    FlexCombinedMotion(FlexConfig),
 }
 
 impl Program {
@@ -65,42 +40,10 @@ impl Program {
     fn new(program: &str, macro_def: &str) -> Result<(Self, SeqMacros), String> {
         let macros = |params| SeqMacros::new(params, macro_def);
         Ok(match program {
-            "filterDrive" => {
-                let m = macros("NAME=filterDrive, P=TEST:, R=filter:, NUM_FILTERS=8");
-                let v = |name| m.value(name).unwrap_or_default();
-                let mut config = FilterDriveConfig::new(v("P"), v("R"), scan_int(v("NUM_FILTERS")));
-                config.name = v("NAME").to_string();
-                (Self::FilterDrive(config), m)
-            }
-            "pf4" => {
-                let m = macros("name=pf4,P=,H=,B=,BP=,B1=,B2=,B3=,B4=,M=");
-                let v = |name| m.value(name).unwrap_or_default();
-                let mut config = Pf4Config::new(v("P"), v("H"), v("B"));
-                config.name = v("name").to_string();
-                config.mono = v("M").to_string();
-                config.bit_prefix = v("BP").to_string();
-                config.bits = ["B1", "B2", "B3", "B4"].map(|b| v(b).to_string());
-                (Self::Pf4(config), m)
-            }
             "Io" => {
                 let m = macros("P=7idd:Io:,MONO=7id:HHLM:energy_get,VSC=7idd:scaler1");
                 let v = |name| m.value(name).unwrap_or_default();
                 (Self::Io(IoConfig::new(v("P"), v("MONO"), v("VSC"))), m)
-            }
-            "flexCombinedMotion" => {
-                let m =
-                    macros("name=flexCombinedMotion,P=xxx:,M=m1,C=cap1,FM=pi:c0:m1,CM=nf:c0:m1");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::FlexCombinedMotion(FlexConfig::new(
-                        v("P"),
-                        v("M"),
-                        v("C"),
-                        v("FM"),
-                        v("CM"),
-                    )),
-                    m,
-                )
             }
             _ => return Err(format!("Can't find sequencer `{program}'.")),
         })
@@ -108,21 +51,7 @@ impl Program {
 
     fn spawn(self, macros: &SeqMacros, bridge: &BlockingBridge, db: &PvDatabase) {
         match self {
-            Self::FilterDrive(config) => {
-                spawn_program(bridge, db, "filterDrive", macros, move |db| {
-                    crate::snl::filter_drive::run(config, db)
-                })
-            }
-            Self::Pf4(config) => spawn_program(bridge, db, "pf4", macros, move |db| {
-                crate::snl::pf4::run(config, db)
-            }),
             Self::Io(config) => seq(bridge, "Io", macros, crate::snl::io::run(config)),
-            Self::FlexCombinedMotion(config) => seq(
-                bridge,
-                "flexCombinedMotion",
-                macros,
-                crate::snl::flex_combined_motion::run(config),
-            ),
         }
     }
 }
@@ -200,6 +129,17 @@ mod tests {
         db
     }
 
+    /// `filterDrive.db` under `P`, `R=f:`.
+    async fn filter_drive_ioc(p: &str) -> Arc<PvDatabase> {
+        let kev = format!("{p}kev");
+        ioc(
+            &format!("record(ao, \"{kev}\") {{}}\n"),
+            "filterDrive.db",
+            &[("P", p), ("R", "f:"), ("DESC", "fd"), ("KEV", &kev)],
+        )
+        .await
+    }
+
     /// `ml_monoSeq.db` under `P=Y:`, with the `th` the tests pass as
     /// `M_THETA` and the program's default `m12`, `m10` and `m11` motors.
     async fn ml_mono_ioc() -> Arc<PvDatabase> {
@@ -216,23 +156,6 @@ mod tests {
     /// statement defines.
     #[test]
     fn every_program_configures_on_its_program_defaults() {
-        let Ok((Program::FilterDrive(c), _)) = Program::new("filterDrive", "") else {
-            panic!("filterDrive")
-        };
-        assert_eq!(
-            [&c.name, &c.prefix, &c.record],
-            ["filterDrive", "TEST:", "filter:"]
-        );
-        assert_eq!(c.num_filters, 8);
-        let Ok((Program::Pf4(c), _)) = Program::new("pf4", "") else {
-            panic!("pf4")
-        };
-        assert_eq!(c.name, "pf4");
-        assert_eq!(
-            [&c.prefix, &c.hardware, &c.bank, &c.mono, &c.bit_prefix],
-            ["", "", "", "", ""]
-        );
-        assert_eq!(c.bits, ["", "", "", ""]);
         let Ok((Program::Io(c), _)) = Program::new("Io", "") else {
             panic!("Io")
         };
@@ -240,38 +163,6 @@ mod tests {
             [&c.prefix, &c.mono_pv, &c.scaler_pv],
             ["7idd:Io:", "7id:HHLM:energy_get", "7idd:scaler1"]
         );
-        let Ok((Program::FlexCombinedMotion(c), _)) = Program::new("flexCombinedMotion", "") else {
-            panic!("flexCombinedMotion")
-        };
-        assert_eq!(
-            [&c.prefix, &c.motor, &c.cap, &c.fine_motor, &c.coarse_motor],
-            ["xxx:", "m1", "cap1", "pi:c0:m1", "nf:c0:m1"]
-        );
-    }
-
-    /// A macro's text converted as the `.st` converts it: NUM_FILTERS by `%d`
-    /// (`filterDrive.st:341`).
-    #[test]
-    fn macro_text_converts_as_the_st_reads_it() {
-        let filters = |def| match Program::new("filterDrive", def) {
-            Ok((Program::FilterDrive(c), _)) => c.num_filters,
-            _ => panic!("filterDrive"),
-        };
-        assert_eq!(filters("NUM_FILTERS=+4"), 4);
-        assert_eq!(filters("NUM_FILTERS=-1"), -1);
-        assert_eq!(filters("NUM_FILTERS= 3 blades"), 3);
-        assert_eq!(filters("NUM_FILTERS=x"), 0);
-    }
-
-    /// The capacitance sensor is `{P}{C}:pos` (`flexCombinedMotion.st:32`).
-    #[test]
-    fn flex_reads_its_sensor_from_c() {
-        let Ok((Program::FlexCombinedMotion(c), _)) =
-            Program::new("flexCombinedMotion", "P=F:,C=cap9")
-        else {
-            panic!("flexCombinedMotion")
-        };
-        assert_eq!(c.pos_monitor_pv(), "F:cap9:pos");
     }
 
     /// `seq_main.c:67`, `:140-142`: every start posts the sequencer release
@@ -335,14 +226,7 @@ mod tests {
     /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
     #[epics_base_rs::epics_test]
     async fn filter_drive_takes_its_blade_count_from_num_filters() {
-        let db = PvDatabase::new();
-        db.add_record(
-            "F:f:NumFilters",
-            Box::new(epics_base_rs::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.mark_pini_done();
+        let db = filter_drive_ioc("F:").await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start(
             "filterDrive",
@@ -364,14 +248,7 @@ mod tests {
     /// (`filterDrive.st:344-367`).
     #[epics_base_rs::epics_test]
     async fn filter_drive_publishes_a_negative_num_filters() {
-        let db = PvDatabase::new();
-        db.add_record(
-            "N:f:NumFilters",
-            Box::new(epics_base_rs::server::records::ai::AiRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.mark_pini_done();
+        let db = filter_drive_ioc("N:").await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("filterDrive", "P=N:,R=f:,NUM_FILTERS=-1", &bridge, &db).unwrap();
         for _ in 0..300 {

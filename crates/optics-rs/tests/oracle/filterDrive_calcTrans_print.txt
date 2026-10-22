@@ -1,0 +1,19 @@
+# What calcTrans prints, from filterDrive.st's %{ }% block built verbatim
+# with chantler.c (x86_64 glibc) for: (8.0, 100, "Cu", 12),
+# (8.0, 100, "Unobtainium", 1), (0.001, 100, "Cu", 1), (10.0, 25, "Al", 15).
+  species = 'Cu', index = 11
+  density = 8.9600e+00 gm/cm3, thickness = 1.0000e+02 um
+  energy = 8.0000e+00
+  E1 = 7.9026e+00 keV, mu1 = 5.2356e+01
+  E2 = 8.4479e+00 keV, mu2 = 4.3919e+01
+  frac = 0.1786, mu = 5.0849e+01
+  attenuation length ='2.1949e+01' um, transmission=1.0503e-02
+Filter material 'Unobtainium' not found
+Energy '0.001000' not found in filter data
+  species = 'Al', index = 3
+  density = 2.6990e+00 gm/cm3, thickness = 2.5000e+01 um
+  energy = 1.0000e+01
+  E1 = 9.6539e+00 keV, mu1 = 2.8257e+01
+  E2 = 1.0320e+01 keV, mu2 = 2.3131e+01
+  frac = 0.5196, mu = 2.5594e+01
+  attenuation length ='1.4477e+02' um, transmission=8.4140e-01

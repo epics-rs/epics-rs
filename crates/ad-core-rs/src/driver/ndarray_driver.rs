@@ -3679,11 +3679,13 @@ pub(crate) mod tests {
         drv.write_octet(&user, format!("{path}\0").as_bytes())
             .unwrap();
         assert!(target.is_dir());
+        // checkPath re-terminates with the OS separator, '\\' on Windows.
+        let checked = format!("{}{}", target.to_string_lossy(), std::path::MAIN_SEPARATOR);
         assert_eq!(
             drv.port_base
                 .get_string_param(drv.params.file_path, 0)
                 .unwrap(),
-            path.as_bytes()
+            checked.as_bytes()
         );
         assert_eq!(
             drv.port_base

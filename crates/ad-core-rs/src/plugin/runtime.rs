@@ -7122,6 +7122,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("filepath-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("a").to_str().unwrap().to_string();
+        let checked = format!("{path}{}", std::path::MAIN_SEPARATOR);
         let write = |drv: &mut PluginPortDriver| {
             let mut user = AsynUser::new(nd.file_path);
             drv.io_write_octet(&mut user, path.as_bytes()).unwrap();
@@ -7134,17 +7135,17 @@ mod tests {
 
         assert_eq!(
             write(&mut drv),
-            (format!("{path}/"), 0),
+            (checked.clone(), 0),
             "CreateDir 0 creates nothing"
         );
         drv.base.set_int32_param(nd.create_dir, 0, -2).unwrap();
-        assert_eq!(write(&mut drv), (format!("{path}/"), 1));
+        assert_eq!(write(&mut drv), (checked.clone(), 1));
         assert!(std::path::Path::new(&path).is_dir());
         let mut last = None;
         while let Ok(PluginParamMsg::Change(r, _, v)) = rx.try_recv() {
             last = Some((r, v.as_string().map(str::to_string)));
         }
-        assert_eq!(last, Some((nd.file_path, Some(format!("{path}/")))));
+        assert_eq!(last, Some((nd.file_path, Some(checked))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

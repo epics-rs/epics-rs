@@ -2413,10 +2413,9 @@ mod tests {
                 _ => None,
             })
         };
-        for (multi, numbers, names) in [
-            (false, [6, 7, 8], ["/p/f_5", "/p/f_6", "/p/f_7"]),
-            (true, [6, 6, 6], ["/p/f_5", "/p/f_5", "/p/f_5"]),
-        ] {
+        let sep = std::path::MAIN_SEPARATOR;
+        for (multi, numbers, names) in [(false, [6, 7, 8], [5, 6, 7]), (true, [6, 6, 6], [5, 5, 5])]
+        {
             let mut c = capture_controller(multi);
             c.params.full_file_name = Some(FULL_FILE_NAME);
             c.file_base.file_path = "/p/".into();
@@ -2439,7 +2438,7 @@ mod tests {
             );
             assert_eq!(
                 frames.iter().map(|p| name(p)).collect::<Vec<_>>(),
-                names.map(|n| Some(n.to_string())),
+                names.map(|n| Some(format!("/p{sep}f_{n}"))),
                 "multi {multi}"
             );
         }
@@ -3267,6 +3266,12 @@ mod tests {
         c
     }
 
+    /// `base_port`'s first name: checkPath terminates `/d/` with the OS
+    /// separator, as C on Windows does.
+    fn d_f0() -> String {
+        format!("/d{}f_0", std::path::MAIN_SEPARATOR)
+    }
+
     fn write_file(c: &mut FilePluginController<MockWriter>) -> WriteOutcome<i32> {
         let reason = c.params.write_file.unwrap();
         c.write_int32(reason, 1, WriteVerdict::Accept(1), &mut ())
@@ -3290,12 +3295,15 @@ mod tests {
             out.trace,
             error_lines(&[
                 "Mock::openFile cannot open\n",
-                "NDPluginFile::openFileBase Error opening file /d/f_0, status=3\n",
+                &format!(
+                    "NDPluginFile::openFileBase Error opening file {}, status=3\n",
+                    d_f0()
+                ),
             ])
         );
         assert_eq!(
-            message(&c, &out).as_deref(),
-            Some("Error opening file /d/f_0, status=3")
+            message(&c, &out),
+            Some(format!("Error opening file {}, status=3", d_f0()))
         );
         assert_eq!(side_int(&out, c.params.write_status.unwrap()), Some(1));
     }
@@ -3339,12 +3347,12 @@ mod tests {
         let mut c = base_port();
         c.file_base.temp_suffix = ".tmp".into();
         let out = write_file(&mut c);
-        let text = "Error renaming temporary file /d/f_0.tmp to /d/f_0";
+        let text = format!("Error renaming temporary file {0}.tmp to {0}", d_f0());
         assert_eq!(
             out.trace,
             error_lines(&[&format!("NDPluginFile::closeFileBase {text}\n")])
         );
-        assert_eq!(message(&c, &out).as_deref(), Some(text));
+        assert_eq!(message(&c, &out), Some(text));
     }
 
     /// C `createFileName` runs `checkPath` first (asynNDArrayDriver.cpp:203),
@@ -3384,11 +3392,14 @@ mod tests {
         let out = c.write_int32(reason, 1, WriteVerdict::Accept(1), &mut ());
         assert_eq!(
             out.trace,
-            error_lines(&["NDPluginFile::readFileBase Error  file /d/f_0, status=3\n"])
+            error_lines(&[&format!(
+                "NDPluginFile::readFileBase Error  file {}, status=3\n",
+                d_f0()
+            )])
         );
         assert_eq!(
-            message(&c, &out).as_deref(),
-            Some("Error  file /d/f_0, status=3")
+            message(&c, &out),
+            Some(format!("Error  file {}, status=3", d_f0()))
         );
 
         let mut c = base_port();
@@ -3398,7 +3409,10 @@ mod tests {
             out.trace,
             error_lines(&[
                 "Mock::openFile cannot open\n",
-                "NDPluginFile::readFileBase Error opening file /d/f_0, status=3\n",
+                &format!(
+                    "NDPluginFile::readFileBase Error opening file {}, status=3\n",
+                    d_f0()
+                ),
             ])
         );
     }

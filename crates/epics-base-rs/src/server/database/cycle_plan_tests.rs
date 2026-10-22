@@ -25,8 +25,8 @@ struct Scenario {
     steps: &'static [Step],
     /// Device support attached to `T` before the first cycle.
     device: bool,
-    /// Wait after each cycle for continuations the cycle scheduled.
-    settle_ms: u64,
+    /// Wait after each cycle for the continuation it left `T` holding.
+    settle: bool,
     /// The arm each step's cycle ran, `P` for the plain arm and `G` for
     /// General — pinned, so a scenario that stops selecting its arm fails.
     arms: &'static str,
@@ -76,7 +76,7 @@ const BASE: Scenario = Scenario {
     db: "",
     steps: &[],
     device: false,
-    settle_ms: 0,
+    settle: false,
     arms: "",
 };
 
@@ -291,7 +291,7 @@ const SCENARIOS: &[Scenario] = &[
                 field(SDLY, "0.01") field(FLNK, "F") }"#
         ),
         steps: &[&[], &[("T.SIMM", "1")], &[], &[("T.SIMM", "0")], &[]],
-        settle_ms: 80,
+        settle: true,
         ..BASE
     },
     Scenario {
@@ -838,11 +838,19 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             "step {i} process: {:?}",
             r.map_err(|e| e.to_string())
         ));
-        if sc.settle_ms > 0 {
-            let until = std::time::Instant::now() + std::time::Duration::from_millis(sc.settle_ms);
-            while std::time::Instant::now() < until {
+        if sc.settle {
+            // The continuation clears PACT and runs the FLNK tail under T's
+            // lock set, so a free PACT and then that lock is a finished
+            // cycle. A fixed window missed it on a loaded macOS runner.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while db.get_record("T").unwrap().read().is_processing() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "T's continuation never ran"
+                );
                 tokio::task::yield_now().await;
             }
+            drop(db.lock_record("T"));
         }
         arms.push(match db.get_record("T").unwrap().read().ran_arm() {
             CyclePlan::General => 'G',

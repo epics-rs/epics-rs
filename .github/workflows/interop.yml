@@ -129,12 +129,17 @@ jobs:
     # Cache /opt/epics across runs. Cache key bumps when version
     # changes. ~3 GB; full first-time build ~12 min, cache restore
     # ~30 s.
+    #
+    # With its submodules, as the release tarball ships it: `pvget` is
+    # pvAccessCPP's (modules/pvAccess), and a bare clone builds base without
+    # it. `-pva` keeps the submodule-less trees cached before that from
+    # restoring.
     - name: Restore epics-base cache
       id: cache-epics
       uses: actions/cache@v4
       with:
         path: /opt/epics-base
-        key: epics-base-${{ env.EPICS_BASE_VERSION }}-ubuntu-latest
+        key: epics-base-${{ env.EPICS_BASE_VERSION }}-pva-ubuntu-latest
 
     - name: Build epics-base if cache miss
       if: steps.cache-epics.outputs.cache-hit != 'true'
@@ -142,7 +147,8 @@ jobs:
         sudo mkdir -p /opt/epics-base
         sudo chown $USER /opt/epics-base
         cd /tmp
-        git clone --depth 1 --branch ${{ env.EPICS_BASE_VERSION }} \
+        git clone --depth 1 --recurse-submodules --shallow-submodules \
+          --branch ${{ env.EPICS_BASE_VERSION }} \
           https://github.com/epics-base/epics-base.git
         cd epics-base
         make -j2
@@ -261,8 +267,9 @@ jobs:
         sudo ldconfig
 
     # A cache that restores but cannot load is an infra error, not twelve
-    # failing tests: run each pvxs CLI once, and check each tree loads its
-    # own libpvxs. `-x` passes on a tree whose RUNPATH dangles.
+    # failing tests: run each pvxs CLI and base's pvget once, and check each
+    # pvxs tree loads its own libpvxs. `-x` passes on a tree whose RUNPATH
+    # dangles.
     - name: Smoke-run the reference binaries
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
@@ -271,6 +278,7 @@ jobs:
         ldd /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget | grep -q '/opt/pvxs-tls/lib/'
         /opt/pvxs-tls/bin/${HOST_ARCH}/pvxget -h > /dev/null
         /opt/pvxs-tls/bin/${HOST_ARCH}/pvxinfo -D | grep -q EPICS_PVA_TLS_KEYCHAIN
+        /opt/epics-base/bin/${HOST_ARCH}/pvget -h > /dev/null 2>&1
 
     # The `auth::tls` PKCS#12 tests shell out to `openssl pkcs12 -export
     # -legacy`, which fails, not skips, without the legacy provider.
@@ -317,6 +325,8 @@ jobs:
       #     step above); `require_tool` fails the test if a binary is
       #     missing.
       #   gw_upstream_unresponsive_window:  the softIoc under $EPICS_BASE.
+      #   attributes_file_over_ca:  caput/caget and pvAccessCPP's pvget under
+      #     $EPICS_BASE (the submodule build above).
       #   pyepics_caget_via_libca_against_rust_ioc:  pyepics (step above).
       #   auth::tls PKCS#12 tests:  the runner's openssl 3.x CLI with the
       #     legacy provider.

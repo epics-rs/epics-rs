@@ -832,8 +832,6 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
         }
         let mut visited = super::ProcStack::new();
         let r = db.process_record_with_links("T", &mut visited).await;
-        // C's holder of `T CP` processes on the dbCa worker.
-        db.ca_sync().await;
         out.push(format!(
             "step {i} process: {:?}",
             r.map_err(|e| e.to_string())
@@ -852,6 +850,10 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             }
             drop(db.lock_record("T"));
         }
+        // C's holder of `T CP` processes on the dbCa worker, for the
+        // continuation's post too (`aiRecord.c:166`), so the sync comes after
+        // the settle.
+        db.ca_sync().await;
         arms.push(match db.get_record("T").unwrap().read().ran_arm() {
             CyclePlan::General => 'G',
             CyclePlan::ConstSoftIn => 'P',

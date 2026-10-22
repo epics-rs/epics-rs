@@ -5,9 +5,7 @@
 #![allow(dead_code)] // each test binary uses its own part
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use epics_base_rs::reference::{ReferenceTree, reference_root};
 use epics_snc_rs::analysis::analyse_program;
 use epics_snc_rs::driver::Snc;
 use epics_snc_rs::parser::parse_program;
@@ -84,8 +82,12 @@ pub fn render(name: &str) -> String {
 /// Preprocess `st` as the EPICS build does, from a fresh `O.*` directory
 /// next to (symlinks of) the source directory's entries, so `../x` includes
 /// resolve as there. Returns the scratch dir, the `.i` file's directory
-/// and its name.
+/// and its name. Unix only, as are the gcc-comparing tests that call it.
+#[cfg(unix)]
 pub fn preprocess(st: &Path) -> (tempfile::TempDir, PathBuf, String) {
+    use epics_base_rs::reference::{ReferenceTree, reference_root};
+    use std::process::Command;
+
     let base = reference_root(ReferenceTree::Base);
     let seq = reference_root(ReferenceTree::Modules).join("sequencer");
     let src = st.parent().expect("source dir");

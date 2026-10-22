@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -187,8 +188,9 @@ fn prim_type(tag: &str) -> &'static str {
     }
 }
 
-/// `{"pv", offsetof(struct seqg_vars, x), "x", P_INT, 1, 4, 0, 1, 0, 0}`.
-fn channel(row: &str) -> String {
+/// `{"pv", offsetof(struct seqg_vars, x), "x", P_INT, 1, 4, 0, 1, 0, 0}`,
+/// its event flag by the name in `flags`.
+fn channel(row: &str, flags: &BTreeMap<String, String>) -> String {
     let body = row
         .trim()
         .strip_prefix('{')
@@ -214,15 +216,21 @@ fn channel(row: &str) -> String {
         "DEFAULT_QUEUE_SIZE" => "seqg_rt::DEFAULT_QUEUE_SIZE",
         n => n,
     };
+    let ef_id = match f[6].as_str() {
+        "0" => "seqg_rt::EfId(0)".to_string(),
+        n => flags
+            .get(n)
+            .unwrap_or_else(|| panic!("event flag {n}"))
+            .clone(),
+    };
     format!(
         "seqg_rt::SeqChan {{ ch_name: {ch_name}, var: |v| &v.{place}, var_name: {}, \
-         var_type: seqg_rt::PrimType::{}, count: {}, event_num: {}, ef_id: seqg_rt::EfId({}), \
+         var_type: seqg_rt::PrimType::{}, count: {}, event_num: {}, ef_id: {ef_id}, \
          monitored: {monitored}, queue_size: {queue_size}, queue_index: {} }},\n",
         literal(&f[2]),
         prim_type(&f[3]),
         f[4],
         f[5],
-        f[6],
         f[9]
     )
 }
@@ -291,6 +299,13 @@ fn get<'a>(fields: &'a [(String, String)], label: &str) -> &'a str {
 /// C snc's tables, from `/* Tables */` through the program table, as Rust
 /// text.
 fn c_tables_as_rust(c: &str) -> String {
+    // `static const EF_ID name = n;` by n
+    let flags: BTreeMap<String, String> = c
+        .lines()
+        .filter_map(|l| l.strip_prefix("static const EF_ID ")?.strip_suffix(';'))
+        .filter_map(|d| d.split_once(" = "))
+        .map(|(name, n)| (n.to_string(), name.to_string()))
+        .collect();
     let start = c
         .find("/************************ Tables")
         .expect("C output has tables");
@@ -343,7 +358,7 @@ fn c_tables_as_rust(c: &str) -> String {
                         }
                     }
                 } else {
-                    rows.push(channel(line));
+                    rows.push(channel(line, &flags));
                 }
             }
             out += &format!(

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::driver::Snc;
+use crate::driver::{Exit, Snc};
 use crate::gen_ss_code::{gen_funcdef, gen_ss_code};
 use crate::gen_tables::gen_tables;
 use crate::rust_out::{self, Expr, Field, Fn, Item, Stmt, Struct};
@@ -21,7 +21,7 @@ const NM_VARS: &str = "seqg_vars";
 const NM_STATIC_VARS: &str = "seqg_static_vars";
 
 /// C `generate_code`: the program's Rust, written to the output.
-pub fn generate_code(snc: &mut Snc, ast: &Ast, prg: &Program) {
+pub fn generate_code(snc: &mut Snc, ast: &Ast, prg: &Program) -> Result<(), Exit> {
     let prog = &ast[prg.prog];
     let name = prg.name.as_deref().unwrap_or_default();
 
@@ -47,7 +47,7 @@ pub fn generate_code(snc: &mut Snc, ast: &Ast, prg: &Program) {
     let vars = gen_var_struct(snc, ast, prg);
     section(&mut body, vars);
     // gen_func_decls: Rust needs no function declarations
-    let ss_code = gen_ss_code(snc, ast, prg);
+    let ss_code = gen_ss_code(snc, ast, prg)?;
     section(&mut body, ss_code);
     let tables = gen_tables(snc, ast, prg);
     section(&mut body, tables);
@@ -77,6 +77,7 @@ pub fn generate_code(snc: &mut Snc, ast: &Ast, prg: &Program) {
         },
     ];
     snc.gen_code(format_args!("{}", rust_out::print(&items)));
+    Ok(())
 }
 
 /// C `gen_init_reg`: the program's registrar.

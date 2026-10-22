@@ -166,12 +166,13 @@ fn gen_channel(ast: &Ast, cp: ChanId, num_event_flags: u32) -> Expr {
         ),
         _ => (var_place(ast, chan.var, Expr::atom("v")), String::new()),
     };
-    let ef_num = match chan.sync {
+    // the flag's constant, which a flag only sync'd uses nowhere else
+    let ef_id = match chan.sync {
         Some(ef) => match &ast[ef].chan {
-            VarChan::EvFlag(flag) => flag.index,
+            VarChan::EvFlag(_) => Expr::atom(ast[ef].name.as_deref().unwrap_or_default()),
             other => unreachable!("sync'd to {other:?}"),
         },
-        None => 0,
+        None => Expr::call("seqg_rt::EfId", vec![Expr::atom("0")]),
     };
     let TypeKind::Prim(prim) = ast[ast.base_type(var.type_)].kind else {
         unreachable!("channel of a non-primitive variable");
@@ -203,10 +204,7 @@ fn gen_channel(ast: &Ast, cp: ChanId, num_event_flags: u32) -> Expr {
             "event_num",
             Expr::Atom((num_event_flags + var.index + chan.index + 1).to_string()),
         ),
-        (
-            "ef_id",
-            Expr::call("seqg_rt::EfId", vec![Expr::Atom(ef_num.to_string())]),
-        ),
+        ("ef_id", ef_id),
         ("monitored", Expr::Atom(chan.monitor.to_string())),
         ("queue_size", queue_size),
         ("queue_index", Expr::Atom(queue_index.to_string())),

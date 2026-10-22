@@ -173,7 +173,7 @@ impl Snc {
         }
 
         let prg = prg.expect("parse_program returns None only after an error");
-        gen_code::generate_code(self, &ast, &prg);
+        gen_code::generate_code(self, &ast, &prg)?;
 
         if let Err(e) = self.close_output() {
             self.report(format_args!(

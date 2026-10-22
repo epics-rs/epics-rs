@@ -423,6 +423,14 @@ pub fn tail(s: impl CSrc, n: isize) -> CharPtr {
     Some(rest.expect("string offset outside the buffer"))
 }
 
+/// C's `s[n]` of a C string: byte `n` of the buffer, read as `tail` reads.
+/// A literal or a copy ends at its last byte, so its end is the terminator.
+pub fn char_at(s: impl CSrc, n: isize) -> c_char {
+    let n = usize::try_from(n).ok();
+    let b = s.with_c_buffer(|b| n.and_then(|n| b.get(n).copied().or((n == b.len()).then_some(0))));
+    b.expect("string offset outside the buffer") as c_char
+}
+
 /// `printf`, through the IOC's stdout.
 pub fn printf(fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
     let errno = io::Error::last_os_error();
@@ -1485,6 +1493,29 @@ mod tests {
         assert_eq!(t(40), b"");
         assert_eq!(&*tail("abc", 3).unwrap(), b"");
         assert_eq!(&*tail(Some(Arc::from(&b"a\0bc"[..])), 2).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn a_char_at_reads_the_buffer_past_the_terminator() {
+        // reviewer4's tailc.c: s[3] after "abcdef" then "xy"
+        let v = <SeqVar<SeqString>>::zeroed();
+        strcpy(&v, "abcdef");
+        strcpy(&v, "xy");
+        assert_eq!(char_at(&v, 3), b'd' as c_char);
+        assert_eq!(char_at(&v, 2), 0);
+        // snc-rs reads s+1+2 as tail(&s, 1 + 2), and s+1+6 as C does
+        assert_eq!(&*tail(&v, 1 + 2).unwrap(), b"def");
+        strcpy(&v, "abcdef");
+        assert_eq!(&*tail(&v, 1 + 6).unwrap(), b"");
+        // the terminator a literal or a copy has after its bytes
+        assert_eq!(char_at("abc", 3), 0);
+        assert_eq!(char_at(tail("abc", 1), 2), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "string offset outside the buffer")]
+    fn a_char_at_past_the_terminator_of_a_literal_panics() {
+        char_at("abc", 4);
     }
 
     #[test]

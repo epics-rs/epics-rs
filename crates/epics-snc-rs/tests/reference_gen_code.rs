@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
 use epics_snc_rs::gen_code::{gen_var_decl, generate_code};
-use epics_snc_rs::gen_ss_code::variadic_fixed_args;
+use epics_snc_rs::gen_ss_code::{CDecl, escaped_decl, escaped_var_type, variadic_fixed_args};
 use epics_snc_rs::types::{Ast, Extra, NodeId, NodeTag, child};
 use epics_snc_rs::var_types::TypeKind;
 
@@ -81,7 +81,7 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
     // pvPutCompleteArray is defined nowhere in seq or base
     (
         "sequencer/examples/parallel/control.st",
-        "control.st:37: error[E0061]: this function takes 2 arguments but 4 arguments were supplied",
+        "control.st:37: error: snc-rs does not support testing a value of unknown type",
     ),
     (
         "sequencer/examples/small/pvTimeStamp.st",
@@ -91,10 +91,10 @@ const EXPECTED_FAILURES: &[(&str, &str)] = &[
         "sequencer/test/validate/pvGet.st",
         "pvGet.st:26: error: snc-rs does not support assignment to a foreign variable",
     ),
-    // the stub cannot see that the escaped `char pvname[]` is a buffer
+    // the escaped `char pvname[]` buffer is passed by value
     (
         "ip/ipApp/src/Keithley2kDMM.st",
-        "Keithley2kDMM.st:277: error[E0308]: mismatched types: expected `&_`, found `i32`",
+        "Keithley2kDMM.st:277: error[E0308]: mismatched types: expected `&_`, found `[i8; 256]`",
     ),
     (
         "motor/modules/motorNewport/newportApp/src/MM4005_trajectoryScan.st",
@@ -167,7 +167,8 @@ fn generate(st: &Path, opts: &[&str]) -> Outcome {
     run.snc.set_output(Box::new(sink.clone()));
     let prg = run.prg.as_ref().expect("program");
     if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        generate_code(&mut run.snc, &run.ast, prg)
+        // C snc builds every program here, so its generator never exits
+        generate_code(&mut run.snc, &run.ast, prg).expect("snc bug")
     })) {
         let message = panic
             .downcast_ref::<String>()
@@ -191,8 +192,13 @@ fn generate(st: &Path, opts: &[&str]) -> Outcome {
 struct Foreign {
     /// called, with the argument counts of the calls
     funcs: BTreeMap<String, BTreeSet<usize>>,
+    /// the escaped-C declaration of a called function
+    decls: BTreeMap<String, CDecl>,
     /// read, with the most subscripts a use applies
     values: BTreeMap<String, usize>,
+    /// the Rust element type and dimension count of a read value's
+    /// escaped-C declaration
+    value_types: BTreeMap<String, (&'static str, usize)>,
 }
 
 fn foreign_names(ast: &Ast) -> Foreign {
@@ -211,6 +217,9 @@ fn foreign_names(ast: &Ast) -> Foreign {
         let callee = node.child(child::FUNC_EXPR).expect("callee");
         if let Some(name) = undeclared(callee) {
             let argc = ast.list(node.child(child::FUNC_ARGS)).count();
+            if let Some(decl) = escaped_decl(ast, &name) {
+                foreign.decls.insert(name.clone(), decl);
+            }
             foreign.funcs.entry(name).or_default().insert(argc);
             callees.insert(callee);
         }
@@ -239,6 +248,11 @@ fn foreign_names(ast: &Ast) -> Foreign {
         if let Some(name) = undeclared(var).filter(|_| dims > 0) {
             let most = foreign.values.entry(name).or_default();
             *most = (*most).max(dims);
+        }
+    }
+    for name in foreign.values.keys() {
+        if let Some(decl) = escaped_var_type(ast, name) {
+            foreign.value_types.insert(name.clone(), decl);
         }
     }
     foreign
@@ -298,21 +312,41 @@ fn stub_companion(foreign: &Foreign, c: &HashSet<String>) -> String {
             continue;
         }
         let argc = *argcs.iter().next().unwrap();
-        let mut params = vec!["_: impl Sized"; argc];
+        let decl = foreign.decls.get(name);
+        // a parameter its prototype types takes that type, as the call
+        // converts to it
+        let typed = decl
+            .and_then(|d| d.params.as_ref())
+            .filter(|p| p.len() == argc);
+        let mut params: Vec<String> = (0..argc)
+            .map(|i| match typed.and_then(|p| p[i]) {
+                Some(t) => format!("_: {t}"),
+                None => "_: impl Sized".into(),
+            })
+            .collect();
         // gen_ss_code passes a variadic function's rest as one slice
         if let Some(fixed) = variadic_fixed_args(name) {
             params.truncate(fixed);
             params.push(if name.ends_with("scanf") {
-                "_: &[&dyn ScanTarget]"
+                "_: &[&dyn ScanTarget]".into()
             } else {
-                "_: &[CArg<'_>]"
+                "_: &[CArg<'_>]".into()
             });
         }
-        s += &format!("pub fn {name}({}) -> i32 {{ 0 }}\n", params.join(", "));
+        let ret = decl.and_then(|d| d.ret).unwrap_or("i32");
+        s += &format!(
+            "pub fn {name}({}) -> {ret} {{ Default::default() }}\n",
+            params.join(", ")
+        );
     }
-    for (name, &dims) in &foreign.values {
+    for (name, &used) in &foreign.values {
         if !c.contains(name) && !foreign.funcs.contains_key(name) {
-            let (mut ty, mut value) = (String::from("i32"), String::from("0"));
+            let (t, dims) = foreign
+                .value_types
+                .get(name)
+                .copied()
+                .unwrap_or(("i32", used));
+            let (mut ty, mut value) = (t.to_string(), format!("0 as {t}"));
             for _ in 0..dims {
                 (ty, value) = (format!("[{ty}; 256]"), format!("[{value}; 256]"));
             }

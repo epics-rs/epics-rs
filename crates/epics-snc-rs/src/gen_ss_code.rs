@@ -9,7 +9,7 @@
 //! written out.
 
 use crate::builtin::{CONST_SYMBOLS, ConstType, FUNC_SYMBOLS, Param as BuiltinParam, ParamType};
-use crate::driver::Snc;
+use crate::driver::{Exit, Snc};
 use crate::gen_code::{
     CClass, c_bracket_balance, c_classes, escaped_key, escaped_lit, gen_var_decl, line_comment,
     value_type, vars,
@@ -38,11 +38,11 @@ const C_CHAR: &str = "std::ffi::c_char";
 /// and ss `a_0_b` state `c`. Here a state's functions are module
 /// `seqg_ss_<ss>`'s `seqg_event_<state>` and the like, each name built
 /// from one SNL name unique in its scope.
-pub fn gen_ss_code(snc: &mut Snc, ast: &Ast, prg: &Program) -> Vec<Item> {
+pub fn gen_ss_code(snc: &mut Snc, ast: &Ast, prg: &Program) -> Result<Vec<Item>, Exit> {
     let prog = &ast[prg.prog];
     let mut out = Vec::new();
     doc(&mut out, "Program init func".into());
-    out.push(Item::Fn(gen_prog_init(snc, ast, prg.prog)));
+    out.push(Item::Fn(gen_prog_init(snc, ast, prg.prog)?));
     if let Some(entry) = prog.child(child::PROG_ENTRY) {
         doc(&mut out, "Program entry func".into());
         out.push(Item::Fn(gen_entex_func(snc, ast, NM_ENTRY.into(), entry)));
@@ -93,7 +93,7 @@ pub fn gen_ss_code(snc: &mut Snc, ast: &Ast, prg: &Program) -> Vec<Item> {
     }
     // generate_code puts the empty line before the section
     out.remove(0);
-    out
+    Ok(out)
 }
 
 /// C `gen_funcdef`. snc-rs refuses function definitions; the body is
@@ -140,7 +140,7 @@ fn variadic(name: &str) -> Option<(usize, bool)> {
     })
 }
 
-/// A parameter of a C library function `epics_seq_rs::c` supplies.
+/// A parameter of a C function's prototype.
 #[derive(Clone, Copy)]
 enum CParam {
     /// a string read, passed as it is
@@ -149,6 +149,32 @@ enum CParam {
     Dst,
     /// a number, converted to this type
     Num(&'static str),
+}
+
+/// The prototype in scope where SNL code calls C function `name`, by which
+/// gcc converts the arguments and types the call: the library's for one
+/// `epics_seq_rs::c` supplies, else the program's escaped-C declaration. A
+/// parameter or result that declaration does not spell in keywords is
+/// `None`.
+fn c_prototype(ast: &Ast, name: &str) -> (Vec<Option<CParam>>, Option<Ty>) {
+    if let Some((params, ret)) = prototype(name) {
+        return (params.iter().copied().map(Some).collect(), Some(ret));
+    }
+    let Some(decl) = escaped_decl(ast, name) else {
+        return (Vec::new(), None);
+    };
+    let params = decl.params.unwrap_or_default();
+    let ret = decl.ret.map(|t| {
+        if t == "()" {
+            Ty::Unit
+        } else {
+            Ty::Num(t.into())
+        }
+    });
+    (
+        params.into_iter().map(|p| p.map(CParam::Num)).collect(),
+        ret,
+    )
 }
 
 /// The prototype of a C library function `epics_seq_rs::c` supplies, by
@@ -182,7 +208,7 @@ fn doc(out: &mut Vec<Item>, text: String) {
 /// C `gen_prog_func(prog, "init", NM_INIT, gen_prog_init_body)`: the
 /// initializers of the variables with program lifetime (C
 /// `gen_user_var_init`).
-fn gen_prog_init(snc: &mut Snc, ast: &Ast, prog: NodeId) -> Fn {
+fn gen_prog_init(snc: &mut Snc, ast: &Ast, prog: NodeId) -> Result<Fn, Exit> {
     let mut g = Gen::new(snc, ast, Context::Global);
     g.has_env = false;
     let mut body = Vec::new();
@@ -199,6 +225,14 @@ fn gen_prog_init(snc: &mut Snc, ast: &Ast, prog: NodeId) -> Fn {
                 ),
             );
         } else {
+            // C gen_builtin_func asserts before it writes the call
+            if let Some((call, name)) = first_builtin_call(ast, init) {
+                g.snc.assert_at_node(
+                    false,
+                    &ast[call],
+                    format_args!("calling built-in function {name} not allowed here\n"),
+                )?;
+            }
             g.var_init(vp, init, &mut body);
         }
     }
@@ -213,17 +247,33 @@ fn gen_prog_init(snc: &mut Snc, ast: &Ast, prog: NodeId) -> Fn {
             }
         }
     }
-    Fn {
+    Ok(Fn {
         public: false,
         name: NM_INIT.into(),
         params: vec![param(g.uses.var, "seqg_var", "&seqg_vars")],
         ret: None,
         body,
-    }
+    })
 }
 
 fn decl_init(ast: &Ast, vp: VarId) -> Option<NodeId> {
     ast[vp].decl.and_then(|d| ast[d].child(child::DECL_INIT))
+}
+
+/// The first built-in function call in `ep` in the order C writes code,
+/// and the function's name.
+fn first_builtin_call(ast: &Ast, ep: NodeId) -> Option<(NodeId, &'static str)> {
+    let node = &ast[ep];
+    if node.tag == NodeTag::EFunc
+        && let Some(callee) = node.child(child::FUNC_EXPR)
+        && let Extra::Builtin(fi) = ast[callee].extra
+    {
+        return Some((ep, FUNC_SYMBOLS[fi].name));
+    }
+    node.children
+        .iter()
+        .flat_map(|&c| ast.list(c))
+        .find_map(|c| first_builtin_call(ast, c))
 }
 
 /// `name: ty`, the name `_`-prefixed when the body does not use it.
@@ -265,10 +315,7 @@ fn gen_event_func(snc: &mut Snc, ast: &Ast, name: String, whens: Option<NodeId>)
         let cond = ast[tp].child(child::WHEN_COND);
         g.comment(cond.unwrap_or(tp), &None, &mut body);
         let test = match cond {
-            Some(c) => {
-                let v = g.expr(c);
-                truth(v)
-            }
+            Some(c) => g.truth(c),
             None => Expr::atom("true"),
         };
         let Extra::When(when) = &ast[tp].extra else {
@@ -397,6 +444,33 @@ struct Val {
     ty: Ty,
 }
 
+/// C's pointer `s + n` into a C string `s`, kept as `s` and the offset
+/// until it is read: a tail of a tail would stop at the first terminator,
+/// where C reads on.
+struct StrAt {
+    base: StrBase,
+    off: Option<Val>,
+}
+
+enum StrBase {
+    /// a `string` or `char` array variable, or an element of one
+    Buffer(Place),
+    /// a `char *` or a literal
+    Value(Val),
+}
+
+impl StrAt {
+    fn plus(self, n: Val) -> StrAt {
+        StrAt {
+            base: self.base,
+            off: Some(match self.off {
+                None => n,
+                Some(off) => binop(Tok::Add, off, n),
+            }),
+        }
+    }
+}
+
 /// What a place holds.
 #[derive(Clone, Copy)]
 enum PlaceTy {
@@ -478,39 +552,253 @@ fn c_code(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Every `name (...)` in the program's escaped C: the code of its
+/// statement before `name`, and the code between the parentheses.
+fn escaped_fn_uses(ast: &Ast, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let name = name.as_bytes();
+    let mut uses = Vec::new();
+    for n in ast.nodes.iter().filter(|n| n.tag == NodeTag::TText) {
+        let code = c_code(n.token.text());
+        for i in 0..code.len() {
+            if !code[i..].starts_with(name)
+                || i > 0 && is_ident(code[i - 1])
+                || code.get(i + name.len()).is_some_and(|&b| is_ident(b))
+            {
+                continue;
+            }
+            let rest = code[i + name.len()..].trim_ascii_start();
+            if rest.first() != Some(&b'(') {
+                continue;
+            }
+            let mut depth = 0;
+            let close = rest.iter().position(|&b| {
+                depth += match b {
+                    b'(' => 1,
+                    b')' => -1,
+                    _ => 0,
+                };
+                depth == 0
+            });
+            if let Some(close) = close {
+                let start = code[..i].iter().rposition(|b| b";{}".contains(b));
+                let start = start.map_or(0, |s| s + 1);
+                uses.push((code[start..i].to_vec(), rest[1..close].to_vec()));
+            }
+        }
+    }
+    uses
+}
+
 /// Whether the program's escaped C declares or defines `name` with a
 /// `...` parameter, which no Rust function the companion writes can take.
 fn escaped_variadic(ast: &Ast, name: &str) -> bool {
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    ast.nodes
+    escaped_fn_uses(ast, name)
         .iter()
-        .filter(|n| n.tag == NodeTag::TText)
-        .any(|n| {
-            let code = c_code(n.token.text());
-            let name = name.as_bytes();
-            (0..code.len()).any(|i| {
-                if !code[i..].starts_with(name)
-                    || i > 0 && is_ident(code[i - 1])
-                    || code.get(i + name.len()).is_some_and(|&b| is_ident(b))
-                {
-                    return false;
-                }
-                let rest = code[i + name.len()..].trim_ascii_start();
-                if rest.first() != Some(&b'(') {
-                    return false;
-                }
-                let mut depth = 0;
-                let close = rest.iter().position(|&b| {
-                    depth += match b {
-                        b'(' => 1,
-                        b')' => -1,
-                        _ => 0,
-                    };
-                    depth == 0
-                });
-                close.is_some_and(|c| rest[1..c].trim_ascii_end().ends_with(b"..."))
+        .any(|(_, params)| params.trim_ascii_end().ends_with(b"..."))
+}
+
+/// A function's declaration in the program's escaped C, in the Rust types
+/// its keywords spell, each `None` where they spell none: the types the
+/// companion's function takes and returns.
+pub struct CDecl {
+    pub ret: Option<&'static str>,
+    /// `None` for `()`, which declares no prototype
+    pub params: Option<Vec<Option<&'static str>>>,
+}
+
+/// `name`'s declaration in the program's escaped C, by which gcc types and
+/// converts a call: the result of its first declaration, the parameters of
+/// its first prototype.
+pub fn escaped_decl(ast: &Ast, name: &str) -> Option<CDecl> {
+    let uses = escaped_fn_uses(ast, name);
+    let mut decls = uses
+        .iter()
+        .filter_map(|(spec, params)| Some((decl_specs(spec)?, params)))
+        .peekable();
+    let ret = c_spec_type(&decls.peek()?.0);
+    let params = decls.find_map(|(_, params)| c_params(params));
+    Some(CDecl { ret, params })
+}
+
+/// The Rust type of variable `name` by its first declaration in the
+/// program's escaped C, when keywords spell an arithmetic one, and the
+/// count of its array dimensions.
+pub fn escaped_var_type(ast: &Ast, name: &str) -> Option<(&'static str, usize)> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let n = name.as_bytes();
+    let texts = ast.nodes.iter().filter(|n| n.tag == NodeTag::TText);
+    let decls = texts.flat_map(|node| {
+        let code = c_code(node.token.text());
+        (0..code.len())
+            .filter(|&i| {
+                code[i..].starts_with(n)
+                    && (i == 0 || !is_ident(code[i - 1]))
+                    && code.get(i + n.len()).is_none_or(|&b| !is_ident(b))
             })
-        })
+            .filter_map(|i| var_decl(&code, i, n.len()))
+            .collect::<Vec<_>>()
+    });
+    decls.into_iter().next().flatten()
+}
+
+/// The type of `ep`, a variable or an element of one, by the variable's
+/// escaped-C declaration, applying `subscripts` more subscripts.
+fn escaped_value_ty(ast: &Ast, ep: NodeId, subscripts: usize) -> Ty {
+    let node = &ast[ep];
+    match (node.tag, &node.extra) {
+        (NodeTag::EVar, Extra::Var(vp)) if ast[ast[*vp].type_].kind == TypeKind::None => {
+            match escaped_var_type(ast, ast[*vp].name.as_deref().unwrap_or_default()) {
+                Some((t, dims)) if dims == subscripts => Ty::Num(t.into()),
+                _ => Ty::Foreign,
+            }
+        }
+        (NodeTag::ESubscr, _) => match node.child(child::SUBSCR_OPERAND) {
+            Some(operand) => escaped_value_ty(ast, operand, subscripts + 1),
+            None => Ty::Foreign,
+        },
+        (NodeTag::EParen, _) => match node.child(child::PAREN_EXPR) {
+            Some(e) => escaped_value_ty(ast, e, subscripts),
+            None => Ty::Foreign,
+        },
+        _ => Ty::Foreign,
+    }
+}
+
+/// What `code` declares the name at `code[at..at + len]` as, if a variable
+/// at its top level: its Rust type when keywords spell an arithmetic one,
+/// and its array dimensions.
+fn var_decl(code: &[u8], at: usize, len: usize) -> Option<Option<(&'static str, usize)>> {
+    let depth = |s: &[u8], open, close| {
+        s.iter()
+            .map(|&b| (b == open) as i32 - (b == close) as i32)
+            .sum::<i32>()
+    };
+    let start = code[..at]
+        .iter()
+        .rposition(|b| b";{}".contains(b))
+        .map_or(0, |s| s + 1);
+    let prefix = std::str::from_utf8(&code[start..at]).ok()?;
+    if depth(&code[..at], b'{', b'}') != 0 || depth(prefix.as_bytes(), b'(', b')') != 0 {
+        return None;
+    }
+    let mut rest = code[at + len..].trim_ascii_start();
+    let mut dims = 0;
+    while rest.first() == Some(&b'[') {
+        rest = rest[rest.iter().position(|&b| b == b']')? + 1..].trim_ascii_start();
+        dims += 1;
+    }
+    if !matches!(rest.first(), Some(b'=' | b',' | b';')) || rest.starts_with(b"==") {
+        return None;
+    }
+    // the specifiers, then the declarators before this one
+    let (spec, own) = match prefix.rsplit_once(',') {
+        Some((before, own)) => {
+            let head = before.split(',').next().unwrap_or_default();
+            let words: Vec<&str> = head
+                .split_whitespace()
+                .take_while(|w| C_QUALIFIERS.contains(w) || C_TYPE_WORDS.contains(w))
+                .collect();
+            (Some(words).filter(|w| !w.is_empty())?, own)
+        }
+        None => (decl_specs(prefix.as_bytes())?, ""),
+    };
+    let pointer = own.contains('*') || spec.iter().any(|w| w.contains('*'));
+    let ty = c_spec_type(&spec).filter(|&t| t != "()" && !pointer);
+    Some(ty.map(|t| (t, dims)))
+}
+
+/// The words of the declaration specifiers before a declarator, or `None`
+/// when `spec`, the code of its statement before the name, is not that: a
+/// call's has an operator, a parenthesis or a statement keyword.
+fn decl_specs(spec: &[u8]) -> Option<Vec<&str>> {
+    let spec = std::str::from_utf8(spec).ok()?;
+    let words: Vec<&str> = spec
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let spec_word = |w: &&str| {
+        w.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_*".contains(&b))
+            && !matches!(*w, "return" | "else" | "do" | "goto" | "sizeof" | "typedef")
+    };
+    (!words.is_empty() && words.iter().all(spec_word)).then_some(words)
+}
+
+/// The Rust type of each parameter a parameter list declares, or `None` for
+/// `()`, which declares no prototype.
+fn c_params(params: &[u8]) -> Option<Vec<Option<&'static str>>> {
+    let params = std::str::from_utf8(params).ok()?.trim();
+    let mut depth = 0;
+    let top_comma = |c: char| {
+        depth += match c {
+            '(' => 1,
+            ')' => -1,
+            _ => 0,
+        };
+        c == ',' && depth == 0
+    };
+    match params {
+        "" => None,
+        "void" => Some(Vec::new()),
+        _ => Some(params.split(top_comma).map(c_param_type).collect()),
+    }
+}
+
+/// The Rust type of a parameter declaration of an arithmetic type: a
+/// pointer, an array or a function is passed as it is.
+fn c_param_type(param: &str) -> Option<&'static str> {
+    if param.contains(['*', '[', '(']) {
+        return None;
+    }
+    let mut words: Vec<&str> = param.split_whitespace().collect();
+    // the parameter's name
+    if words
+        .last()
+        .is_some_and(|w| !C_QUALIFIERS.contains(w) && !C_TYPE_WORDS.contains(w))
+    {
+        words.pop();
+    }
+    c_spec_type(&words).filter(|&t| t != "()")
+}
+
+const C_QUALIFIERS: [&str; 6] = [
+    "static", "extern", "inline", "register", "const", "volatile",
+];
+
+const C_TYPE_WORDS: [&str; 9] = [
+    "signed", "unsigned", "int", "short", "long", "char", "float", "double", "void",
+];
+
+/// The Rust type C declaration specifiers name, if they are keywords of an
+/// arithmetic type or `void`.
+fn c_spec_type(words: &[&str]) -> Option<&'static str> {
+    let mut words: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| !C_QUALIFIERS.contains(w))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let (signed, unsigned) = (words.contains(&"signed"), words.contains(&"unsigned"));
+    words.retain(|w| !matches!(*w, "signed" | "unsigned" | "int"));
+    Some(match (words.as_slice(), unsigned) {
+        ([], false) => "i32",
+        ([], true) => "u32",
+        (["short"], false) => "i16",
+        (["short"], true) => "u16",
+        (["long"] | ["long", "long"], false) => "i64",
+        (["long"] | ["long", "long"], true) => "u64",
+        (["char"], true) => "u8",
+        (["char"], false) if signed => "i8",
+        (["char"], false) => "std::ffi::c_char",
+        (["float"], false) => "f32",
+        (["double"], false) => "f64",
+        (["void"], false) => "()",
+        _ => return None,
+    })
 }
 
 /// The frame of the construct whose `{` follows `code`.
@@ -774,8 +1062,7 @@ impl<'a> Gen<'a> {
             NodeTag::SWhile => {
                 self.comment(sp, ctx, out);
                 let line = line_comment(self.snc, node);
-                let cond = self.expr(c(child::WHILE_COND));
-                let cond = truth(cond);
+                let cond = self.truth(c(child::WHILE_COND));
                 self.loops.push(Frame::Loop(Vec::new()));
                 let body = self.branch(c(child::WHILE_STMT), &line);
                 self.loops.pop();
@@ -791,8 +1078,8 @@ impl<'a> Gen<'a> {
                 if let Some(init) = node.child(child::FOR_INIT) {
                     self.expr_stmt(init, out);
                 }
-                let cond = node.child(child::FOR_COND).map(|cond| self.expr(cond));
-                let cond = cond.map(truth).filter(|c| !is_true(c));
+                let cond = node.child(child::FOR_COND).map(|cond| self.truth(cond));
+                let cond = cond.filter(|c| !is_true(c));
                 let mut iter = Vec::new();
                 if let Some(it) = node.child(child::FOR_ITER) {
                     self.expr_stmt(it, &mut iter);
@@ -893,8 +1180,7 @@ impl<'a> Gen<'a> {
         let ast = self.ast;
         let node = &ast[sp];
         let line = line_comment(self.snc, node);
-        let cond = self.expr(node.child(child::IF_COND).expect("if condition"));
-        let cond = truth(cond);
+        let cond = self.truth(node.child(child::IF_COND).expect("if condition"));
         let then = self.branch(node.child(child::IF_THEN).expect("if body"), &line);
         let els = match node.child(child::IF_ELSE) {
             Some(e) if ast[e].tag == NodeTag::SIf => Some(Box::new(self.if_expr(e))),
@@ -932,8 +1218,7 @@ impl<'a> Gen<'a> {
                 return self.incdec_stmt(c(0), sym, out);
             }
             NodeTag::ETernop => {
-                let cond = self.expr(c(child::TERNOP_COND));
-                let cond = truth(cond);
+                let cond = self.truth(c(child::TERNOP_COND));
                 let mut then = Vec::new();
                 self.expr_stmt(c(child::TERNOP_THEN), &mut then);
                 let mut els = Vec::new();
@@ -1216,7 +1501,7 @@ impl<'a> Gen<'a> {
                 };
                 let ty = match ast[ast[vp].type_].kind {
                     TypeKind::EvFlag => Ty::Rt("EfId"),
-                    _ => Ty::Foreign,
+                    _ => escaped_value_ty(ast, ep, 0),
                 };
                 Val {
                     e: Expr::atom(ast[vp].name.as_deref().unwrap_or_default()),
@@ -1225,11 +1510,14 @@ impl<'a> Gen<'a> {
             }
             NodeTag::ESubscr => {
                 // an element of something that is not an SNL array
-                let base = self.expr(c(child::SUBSCR_OPERAND));
+                let base = self.str_operand(c(child::SUBSCR_OPERAND));
                 let index = self.expr(c(child::SUBSCR_INDEX));
-                Val {
-                    e: base.e.index(usize_index(index)),
-                    ty: Ty::Foreign,
+                match base {
+                    Ok(at) => self.char_at(at.plus(index)),
+                    Err(base) => Val {
+                        e: base.e.index(usize_index(index)),
+                        ty: escaped_value_ty(ast, ep, 0),
+                    },
                 }
             }
             NodeTag::EConst => match node.extra {
@@ -1266,33 +1554,21 @@ impl<'a> Gen<'a> {
                         }
                     }
                     Tok::Andand | Tok::Oror => {
-                        let l = self.expr(lhs);
-                        let r = self.expr(rhs);
+                        let l = self.truth(lhs);
+                        let r = self.truth(rhs);
                         Val {
-                            e: Expr::binary(truth(l), op_str(sym), truth(r)),
+                            e: Expr::binary(l, op_str(sym), r),
                             ty: Ty::Bool,
                         }
                     }
+                    Tok::Add => match self.add(ep) {
+                        Ok(at) => self.read_at(at),
+                        Err(v) => v,
+                    },
                     _ => {
                         let l = self.expr(lhs);
                         let r = self.expr(rhs);
-                        let (ls, rs) = (self.is_c_string(lhs, &l.ty), self.is_c_string(rhs, &r.ty));
-                        if sym == Tok::Add && (ls && is_integer(&r.ty) || is_integer(&l.ty) && rs) {
-                            let (s, n) = if ls { (l, r) } else { (r, l) };
-                            return Val {
-                                e: Expr::call(
-                                    "seqg_rt::c::tail",
-                                    vec![s.e, conv(n, &Ty::Num("isize".into()))],
-                                ),
-                                ty: Ty::CharPtr,
-                            };
-                        }
-                        let pointer = |ty: &Ty| matches!(ty, Ty::Ref | Ty::CharPtr | Ty::Str);
-                        if matches!(sym, Tok::Add | Tok::Sub) && (pointer(&l.ty) || pointer(&r.ty))
-                        {
-                            self.refuse(ep, "pointer arithmetic");
-                        }
-                        binop(sym, l, r)
+                        self.arith(ep, sym, l, r)
                     }
                 }
             }
@@ -1311,17 +1587,17 @@ impl<'a> Gen<'a> {
                             ty: Ty::Ref,
                         }
                     }
-                    Tok::Asterisk => Val {
-                        e: Expr::unary("*", self.expr(operand).e),
-                        ty: Ty::Foreign,
+                    Tok::Asterisk => match self.str_operand(operand) {
+                        Ok(at) => self.char_at(at),
+                        Err(v) => Val {
+                            e: Expr::unary("*", v.e),
+                            ty: Ty::Foreign,
+                        },
                     },
-                    Tok::Not => {
-                        let v = self.expr(operand);
-                        Val {
-                            e: not(v),
-                            ty: Ty::Bool,
-                        }
-                    }
+                    Tok::Not => Val {
+                        e: self.not(operand),
+                        ty: Ty::Bool,
+                    },
                     Tok::Tilde => {
                         let v = promoted(self.expr(operand));
                         Val {
@@ -1336,11 +1612,11 @@ impl<'a> Gen<'a> {
             }
             NodeTag::EPost => self.incdec_value(c(child::POST_OPERAND), sym, false),
             NodeTag::ETernop => {
-                let cond = self.expr(c(child::TERNOP_COND));
-                let cond = truth(cond);
+                let cond = self.truth(c(child::TERNOP_COND));
                 let a = self.expr(c(child::TERNOP_THEN));
                 let b = self.expr(c(child::TERNOP_ELSE));
                 let (a, b, ty) = if is_numeric(&a.ty) && is_numeric(&b.ty) {
+                    self.refuse_unknown_with_int(ep, &a.ty, &b.ty);
                     operands(a, b)
                 } else if a.ty == Ty::CharPtr || b.ty == Ty::CharPtr {
                     (conv(a, &Ty::CharPtr), conv(b, &Ty::CharPtr), Ty::CharPtr)
@@ -1470,8 +1746,7 @@ impl<'a> Gen<'a> {
             }
             _ => None,
         };
-        let proto = c_name.and_then(prototype);
-        let params = proto.as_ref().map_or(&[][..], |(params, _)| params);
+        let (params, ret) = c_name.map_or((Vec::new(), None), |name| c_prototype(ast, name));
         let variadic = c_name.and_then(variadic);
         if let Some(name) = c_name
             && variadic.is_none()
@@ -1485,7 +1760,7 @@ impl<'a> Gen<'a> {
         match variadic {
             Some((fixed, scans)) if args.len() >= fixed => {
                 for (i, &a) in args[..fixed].iter().enumerate() {
-                    out.push(self.c_arg(a, params.get(i).copied()).into());
+                    out.push(self.c_arg(a, params.get(i).copied().flatten()).into());
                 }
                 let rest = args[fixed..]
                     .iter()
@@ -1501,13 +1776,13 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 for (i, a) in args.into_iter().enumerate() {
-                    out.push(self.c_arg(a, params.get(i).copied()).into());
+                    out.push(self.c_arg(a, params.get(i).copied().flatten()).into());
                 }
             }
         }
         Val {
             e: Expr::Call(Box::new(f.e), out),
-            ty: proto.map_or(Ty::Foreign, |(_, ret)| ret),
+            ty: ret.unwrap_or(Ty::Foreign),
         }
     }
 
@@ -1579,15 +1854,6 @@ impl<'a> Gen<'a> {
             e: Expr::Method(Box::new(g.env()), method.clone(), args),
             ty: builtin_type(fsym.name),
         };
-        // All builtin functions require seqg_env. C asserts this and
-        // exits; reporting it refuses the program as well.
-        if self.cx == Context::Global {
-            self.snc.error_at_node(
-                node,
-                format_args!("calling built-in function {} not allowed here\n", fsym.name),
-            );
-            return done(self, args);
-        }
         if !self.has_env {
             self.snc.error_at_node(
                 node,
@@ -1637,6 +1903,10 @@ impl<'a> Gen<'a> {
                     }
                 },
                 Some(a) => match pp.type_ {
+                    // a `FALSE`-defaulted flag is tested
+                    ParamType::Other if pp.default_value == Some("FALSE") => {
+                        args.push(self.truth(a).into());
+                    }
                     ParamType::Other => {
                         let v = self.expr(a);
                         args.push(other_arg(pp, v, fsym.name, after_pv_array).into());
@@ -1669,6 +1939,8 @@ impl<'a> Gen<'a> {
             (NodeTag::EVar, Extra::Var(vp)) if ast[ast[*vp].type_].kind == TypeKind::EvFlag => {
                 Expr::atom(ast[*vp].name.as_deref().unwrap_or_default())
             }
+            // C reads the null e_const of a literal and crashes on efSet(0);
+            // that defect is not copied
             _ => {
                 self.snc.error_at_node(
                     node,
@@ -1882,13 +2154,157 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Whether `ep`, of type `ty`, is a C string `+ n` can step into: a
-    /// `char *`, a literal, or a `string` or `char` array variable.
-    fn is_c_string(&self, ep: NodeId, ty: &Ty) -> bool {
-        match ty {
-            Ty::Str | Ty::CharPtr => true,
-            Ty::Ref => self.is_char_buffer(ep),
-            _ => false,
+    /// `ep`, `s + n` kept as a [`StrAt`] when `s` is a C string.
+    fn add(&mut self, ep: NodeId) -> Result<StrAt, Val> {
+        let node = &self.ast[ep];
+        let l = self.str_operand(node.child(child::BINOP_LEFT).expect("addend"));
+        let r = self.str_operand(node.child(child::BINOP_RIGHT).expect("addend"));
+        match (l, r) {
+            (Ok(at), Err(n)) | (Err(n), Ok(at)) if is_integer(&n.ty) => Ok(at.plus(n)),
+            (l, r) => {
+                let read = |v: Result<StrAt, Val>| v.map_or_else(|v| v, |at| self.read_at(at));
+                let (l, r) = (read(l), read(r));
+                Err(self.arith(ep, Tok::Add, l, r))
+            }
+        }
+    }
+
+    /// `ep` as a C string `+ n` can step into, a `char *`, a literal, a
+    /// `string` or `char` array variable or an earlier `s + n`; anything
+    /// else translated.
+    fn str_operand(&mut self, ep: NodeId) -> Result<StrAt, Val> {
+        let ast = self.ast;
+        let node = &ast[ep];
+        if self.is_char_buffer(ep) {
+            return Ok(StrAt {
+                base: StrBase::Buffer(self.place(ep)),
+                off: None,
+            });
+        }
+        let v = match node.tag {
+            NodeTag::EParen => {
+                return self.str_operand(node.child(child::PAREN_EXPR).expect("operand"));
+            }
+            NodeTag::EBinop if node.token.symbol == Tok::Add => match self.add(ep) {
+                Ok(at) => return Ok(at),
+                Err(v) => v,
+            },
+            _ => self.expr(ep),
+        };
+        match v.ty {
+            Ty::Str | Ty::CharPtr => Ok(StrAt {
+                base: StrBase::Value(v),
+                off: None,
+            }),
+            _ => Err(v),
+        }
+    }
+
+    /// C's pointer `at` read as a string: one `tail` from its base.
+    fn read_at(&self, at: StrAt) -> Val {
+        let base = match at.base {
+            StrBase::Buffer(place) => self.read(place),
+            StrBase::Value(v) => v,
+        };
+        match at.off {
+            None => base,
+            Some(n) => Val {
+                e: Expr::call(
+                    "seqg_rt::c::tail",
+                    vec![base.e, conv(n, &Ty::Num("isize".into()))],
+                ),
+                ty: Ty::CharPtr,
+            },
+        }
+    }
+
+    /// The character C's pointer `at` points to.
+    fn char_at(&self, at: StrAt) -> Val {
+        let off = at.off.unwrap_or(Val {
+            e: Expr::atom("0"),
+            ty: Ty::Int,
+        });
+        match at.base {
+            StrBase::Buffer(place) => {
+                let elem = self
+                    .elem_kind(place.ty, place.multi)
+                    .expect("a char buffer");
+                self.read(index_place(&place, elem, off))
+            }
+            StrBase::Value(v) => Val {
+                e: Expr::call(
+                    "seqg_rt::c::char_at",
+                    vec![v.e, conv(off, &Ty::Num("isize".into()))],
+                ),
+                ty: Ty::Num(C_CHAR.into()),
+            },
+        }
+    }
+
+    /// A binary arithmetic operator; C's other pointer arithmetic is
+    /// refused.
+    fn arith(&mut self, ep: NodeId, op: Tok, l: Val, r: Val) -> Val {
+        let pointer = |ty: &Ty| matches!(ty, Ty::Ref | Ty::CharPtr | Ty::Str);
+        if matches!(op, Tok::Add | Tok::Sub) && (pointer(&l.ty) || pointer(&r.ty)) {
+            self.refuse(ep, "pointer arithmetic");
+        }
+        self.refuse_unknown_with_int(ep, &l.ty, &r.ty);
+        binop(op, l, r)
+    }
+
+    /// `ep` as a Rust `bool`, as C tests it against zero, refused when its
+    /// type is unknown: a Rust value compares with `0` only if it is an
+    /// integer.
+    fn truth(&mut self, ep: NodeId) -> Expr {
+        let v = self.tested(ep);
+        let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
+        match v.ty {
+            Ty::Bool => v.e,
+            Ty::Int | Ty::Float => match literal_is_zero(&v.e) {
+                Some(z) => Expr::atom(if z { "false" } else { "true" }),
+                None => Expr::binary(v.e, "!=", zero(v.ty == Ty::Float)),
+            },
+            Ty::Num(t) => Expr::binary(v.e, "!=", zero(is_float(&t))),
+            Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
+            Ty::CharPtr => v.e.method("is_some", Vec::new()),
+            Ty::Str | Ty::Ref => Expr::atom("true"),
+            Ty::Foreign | Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
+        }
+    }
+
+    /// C's `!ep`, refused as [`Gen::truth`] refuses.
+    fn not(&mut self, ep: NodeId) -> Expr {
+        let v = self.tested(ep);
+        let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
+        match v.ty {
+            Ty::Bool => Expr::unary("!", v.e),
+            Ty::Int | Ty::Float => match literal_is_zero(&v.e) {
+                Some(z) => Expr::atom(if z { "true" } else { "false" }),
+                None => Expr::binary(v.e, "==", zero(v.ty == Ty::Float)),
+            },
+            Ty::Num(t) => Expr::binary(v.e, "==", zero(is_float(&t))),
+            Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
+            Ty::CharPtr => v.e.method("is_none", Vec::new()),
+            Ty::Str | Ty::Ref => Expr::atom("false"),
+            Ty::Foreign | Ty::Unit => Expr::binary(v.e, "==", zero(false)),
+        }
+    }
+
+    /// `ep` for [`Gen::truth`] and [`Gen::not`], refused when its type is
+    /// unknown.
+    fn tested(&mut self, ep: NodeId) -> Val {
+        let v = self.expr(ep);
+        if v.ty == Ty::Foreign {
+            self.refuse(ep, "testing a value of unknown type");
+        }
+        v
+    }
+
+    /// An integer constant stays an untyped literal beside a value whose
+    /// type snc-rs does not know, which builds only if that is an integer.
+    fn refuse_unknown_with_int(&mut self, ep: NodeId, a: &Ty, b: &Ty) {
+        if matches!((a, b), (Ty::Int, Ty::Foreign) | (Ty::Foreign, Ty::Int)) {
+            self.refuse(ep, "an integer constant with a value of unknown type");
         }
     }
 
@@ -2278,16 +2694,19 @@ fn int_fits(v: i128, t: &str) -> bool {
 /// `target`.
 fn conv(v: Val, target: &Ty) -> Expr {
     match target {
+        // named, so that a companion function taking another type does not
+        // build; `_` where the value's Rust type may already be `t`
         Ty::Num(t) => match v.ty {
             Ty::Int => adapt_int(v.e, t),
             Ty::Float if is_float(t) => v.e,
             Ty::Num(s) if s == *t => v.e,
-            Ty::Bool if is_float(t) => v.e.cast("i32").cast("_"),
+            Ty::Num(_) | Ty::Float => v.e.cast(t),
+            Ty::Bool if is_float(t) => v.e.cast("i32").cast(t),
+            Ty::Bool => v.e.cast(t),
             Ty::Rt(r) => rt_int(v.e, r).cast("_"),
             Ty::Ref | Ty::Str | Ty::CharPtr | Ty::Unit => v.e,
-            _ => v.e.cast("_"),
+            Ty::Foreign => v.e.cast("_"),
         },
-        Ty::Bool => truth(v),
         Ty::CharPtr => match v.ty {
             Ty::Str => {
                 let bytes = match v.e {
@@ -2303,40 +2722,6 @@ fn conv(v: Val, target: &Ty) -> Expr {
             _ => v.e,
         },
         _ => v.e,
-    }
-}
-
-/// `v` as a Rust `bool`, as C tests a value against zero.
-fn truth(v: Val) -> Expr {
-    let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
-    match v.ty {
-        Ty::Bool => v.e,
-        Ty::Int | Ty::Float => match literal_is_zero(&v.e) {
-            Some(z) => Expr::atom(if z { "false" } else { "true" }),
-            None => Expr::binary(v.e, "!=", zero(v.ty == Ty::Float)),
-        },
-        Ty::Num(t) => Expr::binary(v.e, "!=", zero(is_float(&t))),
-        Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "!=", zero(false)),
-        Ty::CharPtr => v.e.method("is_some", Vec::new()),
-        Ty::Str | Ty::Ref => Expr::atom("true"),
-        Ty::Foreign | Ty::Unit => Expr::binary(v.e, "!=", zero(false)),
-    }
-}
-
-/// C's `!v`.
-fn not(v: Val) -> Expr {
-    let zero = |float: bool| Expr::atom(if float { "0.0" } else { "0" });
-    match v.ty {
-        Ty::Bool => Expr::unary("!", v.e),
-        Ty::Int | Ty::Float => match literal_is_zero(&v.e) {
-            Some(z) => Expr::atom(if z { "true" } else { "false" }),
-            None => Expr::binary(v.e, "==", zero(v.ty == Ty::Float)),
-        },
-        Ty::Num(t) => Expr::binary(v.e, "==", zero(is_float(&t))),
-        Ty::Rt(r) => Expr::binary(rt_int(v.e, r), "==", zero(false)),
-        Ty::CharPtr => v.e.method("is_none", Vec::new()),
-        Ty::Str | Ty::Ref => Expr::atom("false"),
-        Ty::Foreign | Ty::Unit => Expr::binary(v.e, "==", zero(false)),
     }
 }
 
@@ -2487,7 +2872,6 @@ fn other_arg(pp: &BuiltinParam, v: Val, func: &str, after_pv_array: bool) -> Exp
     let num = |t: &str| Ty::Num(t.into());
     match pp.default_value {
         Some("DEFAULT_TIMEOUT") => conv(v, &num("f64")),
-        Some("FALSE") => truth(v),
         // the completion flags: an array variable, or NULL
         Some("NULL") => match v.ty {
             _ if is_null(&v) => Expr::atom("None"),
@@ -2633,11 +3017,36 @@ mod tests {
     /// `src`'s state set code and the diagnostics generating it gave.
     fn translate(src: &str) -> (String, String) {
         let (mut snc, ast, prg) = analysed(src);
-        let code = rust_out::print(&gen_ss_code(&mut snc, &ast, &prg));
+        let items = gen_ss_code(&mut snc, &ast, &prg).expect("no snc bug");
+        let code = rust_out::print(&items);
         (
             code,
             String::from_utf8_lossy(snc.diagnostics()).into_owned(),
         )
+    }
+
+    #[test]
+    fn a_builtin_call_in_a_global_initializer_stops_as_c_asserts() {
+        let (mut snc, ast, prg) = analysed(
+            "program p\nevflag ef = 1;\nint y;\nassign y to \"y\";\nint x = pvIndex(y);\n\
+             int z = pvIndex(y) + pvConnected(y);\nss s {\nstate a {\nwhen () {} state a\n}\n}\n",
+        );
+        assert_eq!(gen_ss_code(&mut snc, &ast, &prg).err(), Some(Exit(1)));
+        assert_eq!(
+            String::from_utf8_lossy(snc.diagnostics()),
+            "t.st:2: error: event flag 'ef' cannot be initialized\n\
+             t.st:5: snc bug (assertion failed): calling built-in function pvIndex not allowed here\n"
+        );
+    }
+
+    #[test]
+    fn a_literal_event_flag_argument_is_an_error_where_c_crashes() {
+        let (_, diag) =
+            translate("program p\nss s {\nstate a {\nwhen () {\nefSet(0);\n} state a\n}\n}\n");
+        assert_eq!(
+            diag,
+            "t.st:5: error: argument 1 to built-in function efSet must be an event flag\n"
+        );
     }
 
     #[test]
@@ -2691,11 +3100,11 @@ mod tests {
             "seqg_var.i.get() as u32 == 0xFFFFFFFFu32",
             "seqg_var.p.get().is_some()",
             "seqg_var.u.set(0xFFFFFFFFu32)",
-            "seqg_var.d.set(3000000000i64 as _)",
+            "seqg_var.d.set(3000000000i64 as f64)",
             "seqg_var.p.set(None)",
-            "seqg_var.d.set(10i64 as _)",
-            "seqg_var.d.set(0x7FFFFFFFFFFFFFFFi64 as _)",
-            "seqg_var.d.set(18446744073709551615u64 as _)",
+            "seqg_var.d.set(10i64 as f64)",
+            "seqg_var.d.set(0x7FFFFFFFFFFFFFFFi64 as f64)",
+            "seqg_var.d.set(18446744073709551615u64 as f64)",
             "seqg_var.u.set(7)",
         ] {
             assert!(code.contains(line), "{line}\n{code}");
@@ -2752,7 +3161,7 @@ mod tests {
         );
         assert_eq!(diag, "");
         assert!(
-            code.contains("seqg_var.d.set(2.0 * sqrt(seqg_var.i.get() as _))"),
+            code.contains("seqg_var.d.set(2.0 * sqrt(seqg_var.i.get() as f64))"),
             "{code}"
         );
         assert!(code.contains("epicsThreadSleep(1.0);"), "{code}");
@@ -2777,7 +3186,7 @@ mod tests {
         );
         assert_eq!(diag, "");
         assert!(
-            code.contains("seqg_var.n.set(usize::wrapping_add(strlen(&seqg_var.s), 1) as _)"),
+            code.contains("seqg_var.n.set(usize::wrapping_add(strlen(&seqg_var.s), 1) as i32)"),
             "{code}"
         );
         assert!(
@@ -2831,7 +3240,7 @@ mod tests {
         ))
         .expect("read state_coll.st");
         let (mut snc, ast, prg) = analysed(&src);
-        let mut items = gen_ss_code(&mut snc, &ast, &prg);
+        let mut items = gen_ss_code(&mut snc, &ast, &prg).expect("no snc bug");
         items.extend(crate::gen_tables::gen_tables(&mut snc, &ast, &prg));
         assert_eq!(String::from_utf8_lossy(snc.diagnostics()), "");
         assert_names_unique(&items);
@@ -2848,8 +3257,8 @@ mod tests {
         assert_eq!(diag, "");
         for want in [
             "seqg_var.u.modify(|v| *v = u32::wrapping_sub(*v, 1));",
-            "seqg_var.h.modify(|v| *v = (*v as i32 + 1) as _);",
-            "seqg_var.c.modify(|v| *v = (*v as i32 - 1) as _);",
+            "seqg_var.h.modify(|v| *v = (*v as i32 + 1) as i16);",
+            "seqg_var.c.modify(|v| *v = (*v as i32 - 1) as u8);",
             "seqg_var.u.set(u32::wrapping_add(u32::wrapping_mul(seqg_var.u.get(), 2), 1));",
         ] {
             assert!(code.contains(want), "{want}\n{code}");
@@ -2867,7 +3276,7 @@ mod tests {
         for want in [
             "seqg_var.f.set(1.1f32);",
             "if seqg_var.f.get() == 1.1f32 {",
-            "seqg_var.d.set(0.5f32 as _);",
+            "seqg_var.d.set(0.5f32 as f64);",
         ] {
             assert!(code.contains(want), "{want}\n{code}");
         }
@@ -2974,8 +3383,8 @@ mod tests {
         assert_eq!(diag, "");
         for call in [
             "seqg_rt::c::tail(&seqg_var.s, 1)",
-            "seqg_rt::c::tail(seqg_var.p.get(), seqg_var.n.get() as _)",
-            "seqg_rt::c::tail(&seqg_var.buf, seqg_var.n.get() as _)",
+            "seqg_rt::c::tail(seqg_var.p.get(), seqg_var.n.get() as isize)",
+            "seqg_rt::c::tail(&seqg_var.buf, seqg_var.n.get() as isize)",
             "seqg_rt::c::tail(\"abc\", 2)",
         ] {
             assert!(
@@ -2983,6 +3392,78 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn a_string_plus_offsets_is_read_once_at_their_sum() {
+        // reviewer4's tail.st: a tail of a tail stops at the first
+        // terminator, where C's s+1+2 reads on as s+3 does
+        let (code, diag) = translate(
+            "program p\nstring r;\nstring s;\nstring sa[3];\nchar cc[2][8];\nchar c;\nchar *p;\n\
+             int k;\nss a {\nstate z {\nwhen () {\nstrcpy(r, s+1+2);\nstrcpy(r, sa[1]+2);\n\
+             strcpy(r, cc[1]+2);\nc = *(s+1);\nc = (s+1)[k];\nc = *(p+1);\nc = p[k];\n\
+             strcpy(r, 1+(s+k));\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        for e in [
+            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.s, 1 + 2))",
+            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.sa.at(1), 2))",
+            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.cc.at(1), 2))",
+            "seqg_var.c.set(seqg_var.s.at(1).get())",
+            "seqg_var.c.set(seqg_var.s.at((1 + seqg_var.k.get()) as usize).get())",
+            "seqg_var.c.set(seqg_rt::c::char_at(seqg_var.p.get(), 1))",
+            "seqg_var.c.set(seqg_rt::c::char_at(seqg_var.p.get(), seqg_var.k.get() as isize))",
+            "strcpy(&seqg_var.r, seqg_rt::c::tail(&seqg_var.s, (seqg_var.k.get() + 1) as isize))",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
+    }
+
+    #[test]
+    fn an_integer_constant_with_a_value_of_unknown_type_is_refused() {
+        // `h() * 2` builds only where the companion's h returns an integer;
+        // a use of h in escaped C declares no type, nor a typedef name x's
+        let (_, diag) = translate(
+            "program p\n%%static int g(void) { return h(); }\n%%static char *c(void);\n\
+             %%foo_t x;\nint y;\ndouble d;\nss a {\nstate s {\nwhen () {\ny = h() * 2;\n\
+             y = h() == 0;\ny = 1 << h();\ny = y ? 1 : h();\ny = x + 1;\ny = c() == 0;\n\
+             d = h() * 2.0;\ny = g() + 1;\n} state s\n}\n}\n",
+        );
+        let refused = |line| {
+            format!(
+                "t.st:{line}: error: snc-rs does not support an integer constant with a value of \
+                 unknown type\n"
+            )
+        };
+        assert_eq!(diag, [10, 11, 12, 13, 14, 15].map(refused).concat());
+    }
+
+    #[test]
+    fn testing_a_value_of_unknown_type_is_refused() {
+        // control.st:37; `x != 0` builds only if the companion's x is an
+        // integer
+        let (_, diag) = translate(
+            "program p\n%%foo_t x;\nint y;\nassign y to \"y\";\nss a {\nstate s {\nwhen (h()) {\n\
+             if (x) y = 1;\nwhile (x) y = 2;\ny = !x;\ny = y && x;\ny = x ? 1 : 2;\n\
+             x ? h() : h();\ny = pvPutComplete(y, 1, x);\nif (y) y = 3;\n} state s\n}\n}\n",
+        );
+        let refused = |line| {
+            format!("t.st:{line}: error: snc-rs does not support testing a value of unknown type\n")
+        };
+        assert_eq!(diag, [7, 8, 9, 10, 11, 12, 13, 14].map(refused).concat());
+    }
+
+    #[test]
+    fn a_for_condition_of_unknown_type_is_refused() {
+        // reviewer4: `for (;x;)` came out as `while x != 0`
+        let (_, diag) = translate(
+            "program p\n%%foo_t x;\nint i;\nss a {\nstate s {\nwhen () {\n\
+             for (;x;) i = 1;\nfor (i = 0; h(); i++) i = 2;\n} state s\n}\n}\n",
+        );
+        let refused = |line| {
+            format!("t.st:{line}: error: snc-rs does not support testing a value of unknown type\n")
+        };
+        assert_eq!(diag, [7, 8].map(refused).concat());
     }
 
     #[test]
@@ -3098,5 +3579,62 @@ mod tests {
             "t.st:9: error: snc-rs does not support calling the variadic escaped-C function \
              'printMessage'\n"
         );
+    }
+
+    #[test]
+    fn a_call_has_the_type_its_escaped_c_prototype_gives_it() {
+        // pf4.st:135's fillShowArrays; gcc types a call by the prototype
+        let (code, diag) = translate(
+            "program p\n%%static double h(void);\n%{\n#include <x.h>\nstatic unsigned int\n\
+             u(int n);\n}%\nint y;\ndouble d;\nss a {\nstate s {\n\
+             when () {\nd = h() * 2;\ny = u(y) == -1;\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        assert!(code.contains("h() * 2.0"), "{code}");
+        assert!(
+            code.contains("u(seqg_var.y.get()) == (-1 as i64) as u32"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn an_escaped_c_call_converts_its_arguments_by_the_prototype() {
+        // pf4.st:144's thickZ; gcc converts each argument to its parameter's
+        // type, so 70000 reaches a short as 4464
+        let (code, diag) = translate(
+            "program p\n%%static int f(short a, void (*cb)(int, int), double, char *s, unsigned);\n\
+             %%static int g();\nint y;\nshort h;\nstring s;\nss a {\nstate z {\nwhen () {\n\
+             y = f(70000, 0, y, s, h);\ny = g(h);\n} state z\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        assert!(
+            code.contains(
+                "f((70000 as i64) as i16, 0, seqg_var.y.get() as f64, &seqg_var.s, \
+                 seqg_var.h.get() as u32)"
+            ),
+            "{code}"
+        );
+        // `()` declares no prototype
+        assert!(code.contains("g(seqg_var.h.get())"), "{code}");
+    }
+
+    #[test]
+    fn a_variable_declared_in_escaped_c_has_its_declared_type() {
+        // femto.st:52's powers
+        let (code, diag) = translate(
+            "program p\n%%static int x;\n%%static double a = f(1, 2), b;\n\
+             %%static int powers[] = {5,6};\n%{\nshort m[2][3];\n}%\nint y;\ndouble d;\nss z {\n\
+             state s {\nwhen () {\ny = x + 1;\nd = b * 2;\nd = pow(10, powers[y]);\n\
+             y = m[1][y] + 1;\n} state s\n}\n}\n",
+        );
+        assert_eq!(diag, "");
+        for e in [
+            "seqg_var.y.set(x + 1)",
+            "seqg_var.d.set(b * 2.0)",
+            "seqg_var.d.set(pow(10.0, powers[seqg_var.y.get() as usize] as f64))",
+            "seqg_var.y.set(m[1][seqg_var.y.get() as usize] as i32 + 1)",
+        ] {
+            assert!(code.contains(e), "{e}\n{code}");
+        }
     }
 }

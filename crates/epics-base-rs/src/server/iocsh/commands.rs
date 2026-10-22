@@ -15207,12 +15207,6 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
     /// (`dbLoadTemplate.y:371-374`) before `pdbbase` is touched, returning
     /// -1. Measured on softIoc: `dbLoadTemplate: error opening sub file
     /// nosuch.sub: No such file or directory`.
-    ///
-    /// The reason half of that line is the platform's, exactly as C's own
-    /// `strerror` is, so it is taken from a real failed open of the same path
-    /// rather than pinned: Windows spells this code "The system cannot find
-    /// the file specified." The glibc sentence the measurement above recorded
-    /// is asserted where glibc is what answers.
     #[test]
     fn db_load_template_file_not_found_errors() {
         let (db, ctx) = make_ctx();
@@ -15222,7 +15216,6 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
         let reason = super::super::c_strerror(
             &std::fs::read_to_string(&missing).expect_err("the path must not exist"),
         );
-        #[cfg(all(unix, target_env = "gnu"))]
         assert_eq!(reason, "No such file or directory");
 
         let err = load_template(&ctx, &missing, None)

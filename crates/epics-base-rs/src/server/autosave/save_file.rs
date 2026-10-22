@@ -493,8 +493,14 @@ fn fsync_failed(e: &std::io::Error) -> bool {
 /// C `myPrintErrno` (dbrestore.c:114-117), called at `file`:`line`; C calls
 /// it only when `errno` is set.
 pub(super) fn my_print_errno(s: &str, file: &str, line: u32, e: &std::io::Error) {
-    if let Some(errno) = e.raw_os_error() {
-        print_errno(s, file, line, errno, &crate::server::iocsh::c_strerror(e));
+    if let Some(errno) = crate::runtime::crt_errno::errno(e) {
+        print_errno(
+            s,
+            file,
+            line,
+            errno,
+            &crate::runtime::crt_errno::strerror(e),
+        );
     }
 }
 

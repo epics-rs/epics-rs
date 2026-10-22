@@ -1846,19 +1846,8 @@ fn paint_error_if(msg: &str, color: bool) -> String {
 }
 
 /// C `strerror(errno)`, which is what every open-failure diagnostic in
-/// `iocsh.cpp` interpolates. `io::Error`'s Display is the same sentence with
-/// ` (os error N)` appended, so the suffix comes off rather than the message
-/// being rebuilt from a table this port would then have to keep in step.
-pub fn c_strerror(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match e.raw_os_error() {
-        Some(errno) => text
-            .strip_suffix(&format!(" (os error {errno})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    }
-}
+/// `iocsh.cpp` interpolates.
+pub use crate::runtime::crt_errno::strerror as c_strerror;
 
 /// Whether a script line should be echoed before execution. Mirrors C
 /// iocsh (`iocsh.cpp:1167-1204`): script lines are echoed, except a
@@ -2977,11 +2966,9 @@ mod tests {
             });
         assert!(result.is_err(), "an unopenable script is a failure");
 
-        // The reason is whatever this platform says about the open the shell
-        // just tried, taken from the same failure rather than spelled out:
-        // glibc's "No such file or directory" is not what Windows prints for
-        // a file that is not there. C's half of the line — the wording, the
-        // colour, the single unframed line — is what this compares.
+        // The reason is C's `strerror` for the open the shell just tried. C's
+        // half of the line — the wording, the colour, the single unframed
+        // line — is what this compares.
         let reason = c_strerror(&std::fs::File::open(&missing_path).expect_err("no such file"));
         let printed = std::fs::read_to_string(&captured).unwrap();
         assert_eq!(
@@ -2994,26 +2981,14 @@ mod tests {
         );
     }
 
-    /// The same `strerror` text C prints, which `io::Error` renders with a
-    /// ` (os error N)` tail C never has.
+    /// C's `strerror` for a failed open on every OS: no ` (os error N)` tail,
+    /// and on Windows the CRT's text, not "The system cannot find the file
+    /// specified."
     #[test]
-    fn c_strerror_drops_rusts_errno_suffix() {
-        let enoent = std::io::Error::from_raw_os_error(2);
-        assert!(enoent.to_string().ends_with(" (os error 2)"));
-        assert_eq!(
-            c_strerror(&enoent),
-            enoent.to_string().trim_end_matches(" (os error 2)")
-        );
-        // The sentence is the platform's, and only glibc's is the one C
-        // prints here: Windows spells this code "The system cannot find the
-        // file specified."
-        #[cfg(all(unix, target_env = "gnu"))]
+    fn c_strerror_is_cs_text_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let enoent = std::fs::File::open(dir.path().join("nope")).expect_err("no such file");
         assert_eq!(c_strerror(&enoent), "No such file or directory");
-
-        // Not an OS error, so there is no suffix to drop and the message
-        // must survive whole.
-        let other = std::io::Error::other("stream did not contain valid UTF-8");
-        assert_eq!(c_strerror(&other), "stream did not contain valid UTF-8");
     }
 
     /// epics-base#499: a self-including script must error out at the

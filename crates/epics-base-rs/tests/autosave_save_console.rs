@@ -174,10 +174,14 @@ fn an_unwritable_save_file_is_cs_banner() {
             &stars,
         ]
     );
-    assert_eq!(
-        errlog,
-        ["../save_restore.c(1774): [0x15]=write_it:Is a directory"]
-    );
+    // Opening a directory for write is EISDIR on unix; Windows refuses it
+    // with ERROR_ACCESS_DENIED, which the CRT maps to EACCES.
+    let errno = if cfg!(windows) {
+        "[0xd]=write_it:Permission denied"
+    } else {
+        "[0x15]=write_it:Is a directory"
+    };
+    assert_eq!(errlog, [format!("../save_restore.c(1774): {errno}")]);
 }
 
 #[test]

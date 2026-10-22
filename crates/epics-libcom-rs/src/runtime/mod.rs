@@ -23,6 +23,7 @@ pub mod background;
 pub mod blocking_io;
 pub mod build_info;
 pub mod cant_proceed;
+pub mod crt_errno;
 pub mod env;
 pub mod env_table;
 pub mod epics_string;

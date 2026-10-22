@@ -12,7 +12,7 @@ use ad_core_rs::plugin::channel::NDArrayOutput;
 /// create a SimDetector. All records use standard asyn DTYPs handled by
 /// the universal asyn device support factory.
 pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
-    epics_base_rs::runtime::env::set_default("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 
     let driver_runtime: Arc<std::sync::Mutex<Option<SimDetectorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

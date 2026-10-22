@@ -77,9 +77,9 @@ impl BeamlineHolder {
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    epics_base_rs::runtime::env::set_default("XRT_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
-    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    epics_base_rs::runtime::env::set_default_path("XRT_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADCORE", ad_core_rs::AD_CORE_DIR);
+    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()

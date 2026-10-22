@@ -2773,12 +2773,12 @@ impl IocApplication {
     pub fn autosave_startup(mut self, config: Arc<Mutex<AutosaveStartupConfig>>) -> Self {
         // `$(AUTOSAVE)` as C's envPaths sets it, for
         // `$(AUTOSAVE)/db/save_restoreStatus.db`.
-        crate::runtime::env::set_default(
+        crate::runtime::env::set_default_path(
             "AUTOSAVE",
             concat!(env!("CARGO_MANIFEST_DIR"), "/autosave"),
         );
         // `$(CALC)`, for the calc records' `*_settings.req` in `$(CALC)/db`.
-        crate::runtime::env::set_default("CALC", concat!(env!("CARGO_MANIFEST_DIR"), "/calc"));
+        crate::runtime::env::set_default_path("CALC", concat!(env!("CARGO_MANIFEST_DIR"), "/calc"));
         self.autosave_startup = Some(config);
         self
     }

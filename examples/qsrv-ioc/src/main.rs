@@ -66,7 +66,7 @@ async fn main() -> CaResult<()> {
     // server is handed `None` and reads the same variables itself.
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
-    epics_base_rs::runtime::env::set_default("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("QSRV_IOC", env!("CARGO_MANIFEST_DIR"));
 
     // With no script the demo runs its own `ioc/st.cmd`, which is where the
     // `P` its database needs is set.

@@ -164,7 +164,7 @@ impl CommandHandler for ReportHandler {
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    epics_base_rs::runtime::env::set_default("SCOPE_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("SCOPE_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()

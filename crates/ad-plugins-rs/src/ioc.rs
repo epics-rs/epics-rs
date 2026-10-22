@@ -1155,7 +1155,7 @@ where
 /// ```rust,ignore
 /// #[tokio::main]
 /// async fn main() -> CaResult<()> {
-///     epics_base_rs::runtime::env::set_default("MYDET", env!("CARGO_MANIFEST_DIR"));
+///     epics_base_rs::runtime::env::set_default_path("MYDET", env!("CARGO_MANIFEST_DIR"));
 ///
 ///     let mut ioc = AdIoc::new();
 ///     my_detector::ioc_support::register(&mut ioc);
@@ -1196,7 +1196,7 @@ impl AdIoc {
         // `$(ADCORE)/db` templates. Take the path from ad-core-rs itself rather
         // than guessing a sibling of this crate: only the owning crate can name
         // its own directory under a version-suffixed registry checkout.
-        epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
+        epics_base_rs::runtime::env::set_default_path("ADCORE", ad_core_rs::AD_CORE_DIR);
 
         // Everything the IOC always needs is wired here, once. The protocol
         // runner is the only thing `run` and `run_with_pva` disagree about;

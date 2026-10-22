@@ -73,7 +73,7 @@ pub fn register_asyn_record_type() {
 
 /// `$(ASYN)` for the startup script, as the IOC's envPaths sets it in C.
 fn export_asyn_dir() {
-    epics_base_rs::runtime::env::set_default("ASYN", crate::ASYN_DIR);
+    epics_base_rs::runtime::env::set_default_path("ASYN", crate::ASYN_DIR);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -25,7 +25,7 @@ async fn main() -> CaResult<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    epics_base_rs::runtime::env::set_default("MQTT_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("MQTT_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()

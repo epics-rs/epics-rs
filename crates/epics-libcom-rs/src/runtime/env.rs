@@ -340,7 +340,8 @@ pub fn set(name: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>
     unsafe { std::env::set_var(name, value) };
 }
 
-/// Set an environment variable only if it is not already set.
+/// Set an environment variable only if it is not already set. A path a
+/// startup script reads as `$(NAME)` goes through [`set_default_path`].
 ///
 /// # Safety
 /// Uses `std::env::set_var` which is unsafe in multi-threaded programs.
@@ -349,6 +350,21 @@ pub fn set_default(name: &str, value: &str) {
     if std::env::var_os(name).is_none() {
         // SAFETY: called during IOC startup, before multi-threaded operation.
         unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// [`set_default`] for a directory a startup script reads as `$(NAME)`, the
+/// envPaths `epicsEnvSet` of C. convertRelease.pl writes it with `UnixPath`,
+/// `/` for every `\` on Windows: iocsh and macLib take a `\` as an escape.
+pub fn set_default_path(name: &str, path: &str) {
+    set_default(name, &unix_path(path));
+}
+
+fn unix_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        path.replace('\\', "/").into()
+    } else {
+        path.into()
     }
 }
 
@@ -367,7 +383,7 @@ pub fn set_default(name: &str, value: &str) {
 /// epics_base_rs::runtime::env::set_crate_path("MYIOC", env!("CARGO_MANIFEST_DIR"), "db");
 /// ```
 pub fn set_crate_path(name: &str, manifest_dir: &str, relative: &str) {
-    set_default(name, &format!("{manifest_dir}/{relative}"));
+    set_default_path(name, &format!("{manifest_dir}/{relative}"));
 }
 
 /// `gethostname`'s bytes. `None` is a failed call, whose fallback each
@@ -450,6 +466,16 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let name = std::ffi::OsString::from_vec(b"h\xff".to_vec());
         assert_eq!(host_bytes(name).as_deref(), Some(&b"h\xff"[..]));
+    }
+
+    #[test]
+    fn a_published_path_is_unix_path_on_this_os() {
+        let want = if cfg!(windows) {
+            "C:/a/b/db"
+        } else {
+            "C:\\a\\b/db"
+        };
+        assert_eq!(unix_path("C:\\a\\b/db"), want);
     }
 
     /// A scratch parameter: the accessors are the unit under test, and the

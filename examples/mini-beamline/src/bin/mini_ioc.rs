@@ -129,9 +129,9 @@ async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/..., $(ADCORE)/ioc/..., $(OPTICS)/db/...
-    epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
-    epics_base_rs::runtime::env::set_default(
+    epics_base_rs::runtime::env::set_default_path("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
+    epics_base_rs::runtime::env::set_default_path("ADCORE", ad_core_rs::AD_CORE_DIR);
+    epics_base_rs::runtime::env::set_default_path(
         "OPTICS",
         optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"),
     );
@@ -377,7 +377,7 @@ async fn main() -> CaResult<()> {
     // + configuration in st.cmd (simMotorCreate + dbLoadRecords per motor).
     // ========================================================================
 
-    epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
+    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
     app = app.register_dynamic_device_support(

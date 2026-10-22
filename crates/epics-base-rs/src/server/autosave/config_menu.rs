@@ -150,15 +150,50 @@ fn dir_names(dir: &Path) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-#[cfg(not(unix))]
+/// C's Windows `opendir`/`readdir` (tr_dirent.h): `FindFirstFileW` over
+/// the full path and `\*`, which returns `.` and `..` too.
+#[cfg(windows)]
 fn dir_names(dir: &Path) -> Option<Vec<Vec<u8>>> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    Some(
-        entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned().into_bytes())
-            .collect(),
-    )
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
+    };
+    let mut patt: Vec<u16> = std::path::absolute(dir)
+        .ok()?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    if !matches!(patt.last(), Some(&c) if b"\\/:".map(u16::from).contains(&c)) {
+        patt.push(u16::from(b'\\'));
+    }
+    patt.extend([u16::from(b'*'), 0]);
+    // SAFETY: `patt` is NUL-terminated, `data` outlives every call, each
+    // name is copied before the next `FindNextFileW`, and the handle is
+    // closed once.
+    unsafe {
+        let mut data: WIN32_FIND_DATAW = std::mem::zeroed();
+        let handle = FindFirstFileW(patt.as_ptr(), &mut data);
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut names = Vec::new();
+        loop {
+            let name = &data.cFileName;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            names.push(
+                std::ffi::OsString::from_wide(&name[..len])
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes(),
+            );
+            if FindNextFileW(handle, &mut data) == 0 {
+                break;
+            }
+        }
+        FindClose(handle);
+        Some(names)
+    }
 }
 
 /// C `makeLegal`: every non-alphanumeric character becomes `_`.

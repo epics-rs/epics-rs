@@ -95,6 +95,10 @@ tokio = { version = "1", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `autosave::config_menu`'s directory listing, C's tr_dirent.h.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 # Dev-only — `path` (no `version`) so `cargo publish` strips this
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.

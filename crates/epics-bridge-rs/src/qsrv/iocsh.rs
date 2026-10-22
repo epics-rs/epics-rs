@@ -712,6 +712,13 @@ mod tests {
 
     use epics_base_rs::server::database::PvDatabase;
 
+    /// A path as typed into an iocsh line. C's scanner takes an unquoted
+    /// backslash as an escape (`iocsh.cpp:275`), so a native Windows
+    /// redirect target loses its separators; forward slashes survive.
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
     #[tokio::test]
     async fn db_load_group_then_process_succeeds() {
         let db = Arc::new(PvDatabase::new());
@@ -757,17 +764,16 @@ mod tests {
         let shell = epics_base_rs::server::iocsh::IocShell::new(db.clone(), bridge);
         shell.register(db_load_group_command(Arc::new(BridgeProvider::new(db))));
         let tmpdir = tempfile::tempdir().expect("fixture root");
-        let missing = tmpdir.path().join("nosuch.json");
+        let missing = script_token(&tmpdir.path().join("nosuch.json"));
         let err = tmpdir.path().join("err");
         let outcome = shell.execute_line(format!(
-            "dbLoadGroup(\"{}\") 2> {}",
-            missing.display(),
-            err.display()
+            "dbLoadGroup(\"{missing}\") 2> {}",
+            script_token(&err)
         ));
         assert!(matches!(outcome, Ok(CommandOutcome::Failed)));
         assert_eq!(
             std::fs::read_to_string(&err).unwrap(),
-            format!("Error opening \"{}\"\n", missing.display())
+            format!("Error opening \"{missing}\"\n")
         );
     }
 
@@ -786,13 +792,11 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let good = tmpdir.path().join("good.json");
         std::fs::write(&good, r#"{"G":{"a":{"+channel":"A.VAL"}}}"#).unwrap();
-        for arg in [
-            good.display().to_string(),
-            format!("-{}", good.display()),
-            "-*".into(),
-        ] {
+        let good = script_token(&good);
+        for arg in [good.clone(), format!("-{good}"), "-*".into()] {
             let out = tmpdir.path().join("out");
-            let outcome = shell.execute_line(format!("dbLoadGroup(\"{arg}\") > {}", out.display()));
+            let outcome =
+                shell.execute_line(format!("dbLoadGroup(\"{arg}\") > {}", script_token(&out)));
             assert!(matches!(outcome, Ok(CommandOutcome::Continue)), "{arg}");
             assert_eq!(std::fs::read_to_string(&out).unwrap(), "", "{arg}");
         }

@@ -40,7 +40,40 @@ fn zone() -> MutexGuard<'static, ()> {
         set_stream_msg_time_stamped(0);
         set_get_thread_name_function(None);
     });
+    #[cfg(windows)]
+    ucrt::return_from_invalid_parameters();
     time
+}
+
+/// UCRT's strftime calls the invalid parameter handler, which ends the
+/// process, on a conversion it does not know or a time localtime_s could
+/// not convert, under C's printDouble as under the port's. Here the
+/// handler returns, strftime returns 0, and `run` marks the line.
+#[cfg(windows)]
+mod ucrt {
+    use std::cell::Cell;
+
+    type Handler = unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+    unsafe extern "C" {
+        fn _set_thread_local_invalid_parameter_handler(handler: Option<Handler>)
+        -> Option<Handler>;
+    }
+
+    thread_local!(static REFUSED: Cell<bool> = const { Cell::new(false) });
+
+    unsafe extern "C" fn refuse(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {
+        REFUSED.with(|r| r.set(true));
+    }
+
+    pub fn return_from_invalid_parameters() {
+        // SAFETY: the handler only sets a thread-local flag.
+        unsafe { _set_thread_local_invalid_parameter_handler(Some(refuse)) };
+    }
+
+    /// Whether UCRT refused a call since the last time this was asked.
+    pub fn refused() -> bool {
+        REFUSED.with(|r| r.replace(false))
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -76,6 +109,8 @@ fn run(case: &str) -> String {
     let mut fmt = StreamFormat::default();
     let mut info = StreamBuffer::new();
     capture_stderr();
+    #[cfg(windows)]
+    ucrt::refused();
     let format_type = match f[0] {
         "pd" => FormatType::PrintFormat,
         "sd" => FormatType::ScanFormat,
@@ -107,6 +142,10 @@ fn run(case: &str) -> String {
         }
     }
     write!(line, " err={}", hex(&take_captured())).unwrap();
+    #[cfg(windows)]
+    if ucrt::refused() {
+        line.push_str(" refused");
+    }
     line
 }
 
@@ -136,37 +175,88 @@ fn check(keep: impl Fn(&str) -> bool, cut: impl Fn(&str) -> String) {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// `timestamp.in` print lines that are the C library's strftime, as C
-/// prints them on macOS: its strftime leaves out the '%' of a conversion
-/// it does not know, has no field width, and pads %F's year to 4 digits.
-/// The case, then `ok` and the output.
-const MACOS_STRFTIME: &[(&str, i32, &str)] = &[
-    ("%T(%3d)\t0", 1, "3d"),
-    ("%T(%.x)\t0", 1, ".x"),
-    ("%T(%.3x)\t0", 1, ".3x"),
+/// A `timestamp.in` line's result where this OS's C library is not glibc,
+/// which made `timestamp.out`.
+enum Libc {
+    /// `ok` and the output.
+    Printed(i32, &'static str),
+    /// `n`, the value and the error text.
+    Scanned(isize, f64, &'static str),
+    /// UCRT refused strftime: the process ends, in C as in the port.
+    Refused,
+}
+use Libc::*;
+
+/// macOS's strftime leaves out the '%' of a conversion it does not know,
+/// has no field width, and pads %F's year to 4 digits.
+const MACOS: &[(&str, Libc)] = &[
+    ("pd\t%T(%3d)\t0", Printed(1, "3d")),
+    ("pd\t%T(%.x)\t0", Printed(1, ".x")),
+    ("pd\t%T(%.3x)\t0", Printed(1, ".3x")),
     // No "%0" is left for printDouble to refuse.
-    ("%T(%0)\t0", 1, "0"),
-    ("%T(%Ey %Od %q)\t1700000000", 1, "23 14 q"),
-    ("%T(%F)\t-62135596800", 1, "0001-01-01"),
+    ("pd\t%T(%0)\t0", Printed(1, "0")),
+    ("pd\t%T(%Ey %Od %q)\t1700000000", Printed(1, "23 14 q")),
+    ("pd\t%T(%F)\t-62135596800", Printed(1, "0001-01-01")),
 ];
 
-/// The C line, which is glibc's, as this OS's C library makes it.
-fn as_on_this_libc(case: &str, c_line: &str) -> String {
-    let this_libc: &[(&str, i32, &str)] = if cfg!(target_vendor = "apple") {
-        MACOS_STRFTIME
+/// UCRT's strftime knows no %s, field width or '.', and its localtime_s
+/// no time before 1970 or after 3000; its TZ takes no rules, so CEST is
+/// the US's summer time and "CES", and its mktime stops at 3000 too.
+const WINDOWS: &[(&str, Libc)] = &[
+    ("pd\t%T(%.4s)\t0", Refused),
+    ("pd\t%T(%3d)\t0", Refused),
+    ("pd\t%T(%.x)\t0", Refused),
+    ("pd\t%T(%.3x)\t0", Refused),
+    ("pd\t%T(%0)\t0", Refused),
+    ("pd\t%T(%0x)\t1700000000", Refused),
+    ("pd\t%T(%Ey %Od %q)\t1700000000", Refused),
+    ("pd\t%T(%s)\t1700000000", Refused),
+    ("pd\t%T(%F %T)\t253402300799", Refused),
+    ("pd\t%T(%F)\t-62135596800", Refused),
+    (
+        "pd\t%T(%Z %z %j %a %b)\t1690000000",
+        Printed(1, "CES +0200 203 Sat Jul"),
+    ),
+    // 2023-03-26 02:30:00 and 2023-10-29 02:30:00, summer time by the US.
+    (
+        "sd\t%T(%F %T)\t323032332d30332d32362030323a33303a3030",
+        Scanned(19, 1679790600.0, ""),
+    ),
+    (
+        "sd\t%T(%F %T)\t323032332d31302d32392030323a33303a3030",
+        Scanned(19, 1698539400.0, ""),
+    ),
+    // 2147483647-01-01
+    (
+        "sd\t%T(%Y-%m-%d)\t323134373438333634372d30312d3031",
+        Scanned(-1, 1234.5, "mktime failed for 01/01/2147483647 00:00:00\n"),
+    ),
+];
+
+/// `case`'s result on this OS, where it is not glibc's.
+fn this_libc(case: &str) -> Option<&'static Libc> {
+    let table = if cfg!(target_vendor = "apple") {
+        MACOS
+    } else if cfg!(windows) {
+        WINDOWS
     } else {
         &[]
     };
-    match this_libc
-        .iter()
-        .find(|(c, _, _)| case.strip_prefix("pd\t") == Some(c))
-    {
-        Some(&(_, ok, out)) => {
-            let head = &c_line[..c_line.find(" ok=").unwrap()];
-            let err = &c_line[c_line.find(" err=").unwrap()..];
-            format!("{head} ok={ok} out={}{err}", hex(out.as_bytes()))
-        }
+    table.iter().find(|(c, _)| *c == case).map(|(_, r)| r)
+}
+
+/// C's line, which is glibc's, as this OS's C library makes it.
+fn as_on_this_libc(case: &str, c_line: &str) -> String {
+    let head = parse_part(c_line);
+    match this_libc(case) {
         None => c_line.to_string(),
+        Some(Printed(ok, out)) => format!("{head} ok={ok} out={} err=", hex(out.as_bytes())),
+        Some(Scanned(n, val, err)) => format!(
+            "{head} n={n} val={:016x} err={}",
+            val.to_bits(),
+            hex(err.as_bytes())
+        ),
+        Some(Refused) => format!("{head} ok=1 out= err= refused"),
     }
 }
 
@@ -274,7 +364,13 @@ fn print_double_leaves_out_cs_bugs() {
             continue;
         };
         assert_eq!(out_text(want), c_out, "{case}");
-        assert_eq!(out_text(&run(case)), rs_out, "{case}");
+        let got = run(case);
+        if cfg!(windows) && case.contains("\t-") {
+            // The floored second is before 1970, which UCRT refuses.
+            assert!(got.ends_with(" refused"), "{case}: {got}");
+        } else {
+            assert_eq!(out_text(&got), rs_out, "{case}");
+        }
         seen += 1;
     }
     assert_eq!(seen, PRINT_BUGS_NOT_COPIED.len());
@@ -401,8 +497,13 @@ fn scan_double_leaves_out_cs_bugs() {
     let expected = std::fs::read_to_string(format!("{dir}timestamp.out")).unwrap();
     let mut seen = 0;
     for (case, want) in cases.lines().zip(expected.lines()) {
-        let Some(&(_, _, c_val, rs_val)) = scan_bug(case) else {
+        let Some(&(_, input, c_val, rs_val)) = scan_bug(case) else {
             continue;
+        };
+        // 2023-11-05 00:00 is summer time by the US rules UCRT's TZ takes.
+        let rs_val = match input {
+            "05 nov 2023" if cfg!(windows) => 1699135200.0,
+            _ => rs_val,
         };
         let got = run(case);
         assert!(same(scanned(want), c_val), "{case}: C {want}");
@@ -432,7 +533,12 @@ fn a_rounded_fraction_carries_into_the_second() {
     let line = run("pd\t%T(%Y-%m-%d %H:%M:%S.%3f)\t1704063599.9996");
     assert_eq!(out_text(&line), "2024-01-01 00:00:00.000");
     let line = run("pd\t%T(%F %T.%3f)\t-0.0004");
-    assert_eq!(out_text(&line), "1970-01-01 01:00:00.000");
+    if cfg!(windows) {
+        // Its floored second, before 1970, is formatted before the carry.
+        assert!(line.ends_with(" refused"), "{line}");
+    } else {
+        assert_eq!(out_text(&line), "1970-01-01 01:00:00.000");
+    }
     let line = run("pd\t%T(%S.%2f)\t1704063599.994");
     assert_eq!(out_text(&line), "59.99");
 }

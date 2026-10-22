@@ -16,7 +16,7 @@ use epics_base_rs::server::snl::{SeqPv, StateSet};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::Notify;
 
-use crate::db_access::DbMultiMonitor;
+use crate::db_access::{DbMultiMonitor, alloc_origin};
 
 /// How C declares a variable: `short` or `double`, `monitor`ed, `sync`ed.
 #[derive(Clone, Copy)]
@@ -262,6 +262,50 @@ impl Delays {
     }
 }
 
+/// Planck constant * speed of light in keV*Angstrom.
+pub(crate) const HC: f64 = 12.3984244;
+
+/// ss updateSet (kohzuCtl.st:1403-1446): the UseSet PV (variable
+/// useSetMode) and the three motor .SET fields follow each other, starting
+/// with the connect-time monitor of each.
+pub(crate) async fn update_set(
+    db: PvDatabase,
+    ss: StateSet,
+    use_set_pv: String,
+    motor_set_vars: [&str; 3],
+    motor_set_pvs: [String; 3],
+) {
+    const USE: usize = 0;
+    let mut table = vec![("useSetMode", use_set_pv, SHORT_SYNC)];
+    table.extend(
+        motor_set_vars
+            .into_iter()
+            .zip(motor_set_pvs)
+            .map(|(var, pv)| (var, pv, SHORT_SYNC)),
+    );
+    let mut v = Vars::new(&db, &ss, &table, alloc_origin(), 0..4).await;
+    v.flush().await;
+    loop {
+        if v.test_and_clear(USE) {
+            for i in 1..4 {
+                let use_set = v.get(USE);
+                if v.get(i) != use_set {
+                    v.set(i, use_set).await;
+                }
+            }
+            v.flush().await;
+        } else if let Some(i) = (1..4).find(|&i| v.test_and_clear(i)) {
+            let mot_set = v.get(i);
+            if v.get(USE) != mot_set {
+                v.set(USE, mot_set).await;
+            }
+            v.flush().await;
+        } else {
+            v.wait(None).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +337,7 @@ mod tests {
     }
 
     /// kohzuCtl's `opAck = 0` overwrites an ack that arrived before it
-    /// (kohzuCtl.st:651), so the next wait finds nothing left to take.
+    /// (kohzuCtl.st:650), so the next wait finds nothing left to take.
     #[epics_base_rs::epics_test]
     async fn an_arrival_queued_before_an_assignment_is_overwritten() {
         let mut v = queued_arrival().await;

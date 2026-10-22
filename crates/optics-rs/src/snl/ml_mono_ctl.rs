@@ -16,11 +16,11 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::alloc_origin;
-use crate::snl::kohzu_ctl::{HC, update_set};
 use crate::snl::vars::{
     DOUBLE, DOUBLE_MON, DOUBLE_SYNC, Decl, Delays, EventFlag, SHORT, SHORT_MON, SHORT_SYNC, Vars,
     ctl_debug,
 };
+use crate::snl::vars::{HC, update_set};
 use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 
 /// `radConv`, as C sets it in state `init` (ml_monoCtl.st:537).

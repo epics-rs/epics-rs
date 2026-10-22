@@ -12,7 +12,15 @@
 //! RTEMS and VxWorks it is unset while `exec_backend` is ON.
 //!
 //! It also compiles every `src/snl/*.st` with snc-rs to `$OUT_DIR/<stem>.rs`,
-//! which the companion calling `include_program!("<stem>")` includes.
+//! which the companion calling `include_program!("<stem>")` includes, and
+//! writes `$OUT_DIR/seq_programs.rs`: the table `seq_runner` looks a
+//! program's name up in, as `seq_cmd.c` looks in its registered programs.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
@@ -47,5 +55,48 @@ fn main() {
         println!("cargo::rustc-cfg=tokio_backend");
     }
 
-    epics_snc_rs::build::compile_dir("src/snl");
+    compile_snl();
+}
+
+fn compile_snl() {
+    let snl = Path::new("src/snl");
+    // compile_dir also reruns this on any change in src/snl, companions included.
+    let programs = epics_snc_rs::build::compile_dir(snl);
+    let mut companions = HashMap::new();
+    for entry in fs::read_dir(snl).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let module = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            if let Some(rest) = line.strip_prefix("epics_seq_rs::include_program!(\"") {
+                let stem = rest.split_once('"').unwrap().0;
+                companions.insert(stem.to_owned(), module.clone());
+            }
+        }
+    }
+    let mut table = String::new();
+    for rs in &programs {
+        let stem = rs.file_stem().unwrap().to_str().unwrap();
+        let module = companions.get(stem).unwrap_or_else(|| {
+            panic!("src/snl/{stem}.st: no src/snl/*.rs calls include_program!(\"{stem}\")")
+        });
+        // The generated file ends `pub use seqg::{<prog>, <prog>Registrar};`.
+        let generated = fs::read_to_string(rs).unwrap();
+        let program = generated
+            .rsplit_once("pub use seqg::{")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .map(|(name, _)| name.trim())
+            .unwrap_or_else(|| panic!("{}: no `pub use seqg::{{..}}`", rs.display()));
+        writeln!(table, "    &crate::snl::{module}::{program},").unwrap();
+    }
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    fs::write(
+        out.join("seq_programs.rs"),
+        format!(
+            "pub(crate) static SEQ_PROGRAMS: &[&dyn epics_seq_rs::RegisteredProgram] = &[\n{table}];\n"
+        ),
+    )
+    .unwrap();
 }

@@ -29,16 +29,12 @@ use crate::snl::filter_drive::FilterDriveConfig;
 use crate::snl::flex_combined_motion::FlexConfig;
 use crate::snl::hr_ctl::HrConfig;
 use crate::snl::io::IoConfig;
-use crate::snl::kohzu_ctl::KohzuConfig;
-use crate::snl::kohzu_ctl_soft::KohzuSoftConfig;
 use crate::snl::ml_mono_ctl::MlMonoConfig;
 use crate::snl::orient::OrientConfig;
 use crate::snl::pf4::Pf4Config;
 
-/// kohzuCtl's `geom = 1; if (*GEOM == '2') geom = 2;`.
-fn geom(s: &str) -> i32 {
-    if s.starts_with('2') { 2 } else { 1 }
-}
+// `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
+include!(concat!(env!("OUT_DIR"), "/seq_programs.rs"));
 
 /// C `sscanf(s, "%d", &n)` into a variable SNL zeroed: glibc's `strtol`
 /// stored through the `int`, or 0 when no digit converts.
@@ -60,8 +56,6 @@ fn scan_int(s: &str) -> i32 {
 
 /// An optics program, configured from its macros as its `.st` reads them.
 enum Program {
-    KohzuCtl(KohzuConfig),
-    KohzuCtlSoft(KohzuSoftConfig),
     HrCtl(HrConfig),
     MlMonoCtl(MlMonoConfig),
     Orient(OrientConfig),
@@ -77,35 +71,6 @@ impl Program {
     fn new(program: &str, macro_def: &str) -> Result<(Self, SeqMacros), String> {
         let macros = |params| SeqMacros::new(params, macro_def);
         Ok(match program {
-            "kohzuCtl" => {
-                let m = macros("P=nda, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::KohzuCtl(KohzuConfig::new(
-                        v("P"),
-                        v("M_THETA"),
-                        v("M_Y"),
-                        v("M_Z"),
-                        geom(v("GEOM")),
-                    )),
-                    m,
-                )
-            }
-            "kohzuCtl_soft" => {
-                let m = macros("P=xxx:, MONO=Kohzu1:, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::KohzuCtlSoft(KohzuSoftConfig::new(
-                        v("P"),
-                        v("MONO"),
-                        v("M_THETA"),
-                        v("M_Y"),
-                        v("M_Z"),
-                        geom(v("GEOM")),
-                    )),
-                    m,
-                )
-            }
             "hrCtl" => {
                 let m = macros("P=xxx:, N=1, M_PHI1=m9, M_PHI2=m10");
                 let v = |name| m.value(name).unwrap_or_default();
@@ -188,14 +153,6 @@ impl Program {
 
     fn spawn(self, macros: &SeqMacros, bridge: &BlockingBridge, db: &PvDatabase) {
         match self {
-            Self::KohzuCtl(config) => spawn_program(bridge, db, "kohzuCtl", macros, move |db| {
-                crate::snl::kohzu_ctl::run(config, db)
-            }),
-            Self::KohzuCtlSoft(config) => {
-                spawn_program(bridge, db, "kohzuCtl_soft", macros, move |db| {
-                    crate::snl::kohzu_ctl_soft::run(config, db)
-                })
-            }
             Self::HrCtl(config) => spawn_program(bridge, db, "hrCtl", macros, move |db| {
                 crate::snl::hr_ctl::run(config, db)
             }),
@@ -243,7 +200,8 @@ impl Program {
 /// | `flexCombinedMotion` | Coarse+fine flexure stage |
 ///
 /// Returns `Ok(())` if the program was found and spawned, or `Err` with
-/// seq_cmd.c's console line for one it does not know.
+/// seq_cmd.c's console line for one it does not know. A compiled program is
+/// started by `seq`, whose result seq_cmd.c:159-160 ignores.
 ///
 /// Must be called with the runtime access captured for the shell thread (use
 /// `CommandContext::bridge()` from st.cmd startup commands, since st.cmd runs
@@ -254,6 +212,10 @@ pub fn seq_start(
     bridge: &BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
+    if let Some(compiled) = SEQ_PROGRAMS.iter().find(|p| p.prog_name() == program) {
+        let _ = compiled.start(macro_str, 0, db);
+        return Ok(());
+    }
     let (program, macros) = Program::new(program, macro_str)?;
     program.spawn(&macros, bridge, db);
     Ok(())
@@ -264,27 +226,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::snl::kohzu_ctl::Geometry;
 
     /// With no macros at all, each program reads what its `.st`'s `program`
     /// statement defines.
     #[test]
     fn every_program_configures_on_its_program_defaults() {
-        let Ok((Program::KohzuCtl(c), _)) = Program::new("kohzuCtl", "") else {
-            panic!("kohzuCtl")
-        };
-        assert_eq!(
-            [&c.prefix, &c.m_theta, &c.m_y, &c.m_z],
-            ["nda", "m9", "m10", "m11"]
-        );
-        assert_eq!(c.geom, Geometry::Standard);
-        let Ok((Program::KohzuCtlSoft(c), _)) = Program::new("kohzuCtl_soft", "") else {
-            panic!("kohzuCtl_soft")
-        };
-        assert_eq!(
-            [&c.prefix, &c.mono, &c.m_theta, &c.m_y, &c.m_z],
-            ["xxx:", "Kohzu1:", "m9", "m10", "m11"]
-        );
         let Ok((Program::HrCtl(c), _)) = Program::new("hrCtl", "") else {
             panic!("hrCtl")
         };
@@ -354,22 +300,10 @@ mod tests {
         );
     }
 
-    /// A macro's text converted as the `.st` converts it: GEOM by its first
-    /// character (`kohzuCtl.st:560`), Y_OFF by `atof` (`ml_monoCtl.st:523`),
-    /// NUM_FILTERS by `%d` (`filterDrive.st:341`).
+    /// A macro's text converted as the `.st` converts it: Y_OFF by `atof`
+    /// (`ml_monoCtl.st:523`), NUM_FILTERS by `%d` (`filterDrive.st:341`).
     #[test]
     fn macro_text_converts_as_the_st_reads_it() {
-        let geom = |def| match Program::new("kohzuCtl", def) {
-            Ok((Program::KohzuCtl(c), _)) => c.geom,
-            _ => panic!("kohzuCtl"),
-        };
-        assert_eq!(geom("GEOM=2.0"), Geometry::Alternate);
-        assert_eq!(geom("GEOM=02"), Geometry::Standard);
-        assert_eq!(geom("GEOM="), Geometry::Standard);
-        let Ok((Program::KohzuCtlSoft(c), _)) = Program::new("kohzuCtl_soft", "GEOM=2nd") else {
-            panic!("kohzuCtl_soft")
-        };
-        assert_eq!(c.geom, Geometry::Alternate);
         let y_off = |def| match Program::new("ml_monoCtl", def) {
             Ok((Program::MlMonoCtl(c), _)) => c.y_offset,
             _ => panic!("ml_monoCtl"),
@@ -570,46 +504,73 @@ mod tests {
         assert_eq!(seq_start("kohzuCtl", "P=T:", &bridge, &db), Ok(()));
     }
 
-    /// The lattice records kohzuCtl reads on its way to `ready`, as
-    /// `kohzuSeq.db` declares them, plus the d-spacing record it writes. The
-    /// motors are left out on purpose: a missing PV reads as 0 and swallows a
-    /// put, which is enough to reach the d-spacing write without a motor
-    /// record type. `Bragg2dSpacingAO` starts at -1 so "never written" is
-    /// told apart from the 0 an ungated start computes from H=K=L=0.
-    const KOHZU_LATTICE_DB: &str = r#"
-record(ao, "T:BraggHAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggKAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggLAO") { field(PINI, "YES") field(DOL, "1") }
-record(ao, "T:BraggAAO") { field(PINI, "YES") field(DOL, "5.43102") }
-record(ao, "T:Bragg2dSpacingAO") { field(PINI, "YES") field(DOL, "1") field(VAL, "-1") }
+    /// The motors `kohzuSeq.db` leaves to the IOC. kohzuCtl is built `+c`,
+    /// so it starts only once every pv it assigns has connected.
+    const KOHZU_MOTORS: &str = r#"
+record(motor, "T:th") {}
+record(motor, "T:y") {}
+record(motor, "T:z") {}
 "#;
 
     fn two_d(db: &PvDatabase) -> f64 {
         db.get_pv("T:Bragg2dSpacingAO").unwrap().to_f64().unwrap()
     }
 
-    /// Load the fixture the way `st.cmd`'s `dbLoadRecords` does — into a
-    /// database still in its load phase, so every record's `init_record`
-    /// (where a constant `DOL` seeds `VAL`) is owed to `iocInit` and has NOT
-    /// run when `seqStart` follows.
-    async fn load_lattice(db: &PvDatabase) {
+    /// Load `kohzuSeq.db` and the motors the way `st.cmd`'s `dbLoadRecords`
+    /// does — into a database still in its load phase, so every record's
+    /// `init_record` (where a constant `DOL` seeds `VAL`) is owed to
+    /// `iocInit` and has NOT run when `seqStart` follows.
+    /// `Bragg2dSpacingAO` is set to -1, which neither the pass (its `DOL` 1,
+    /// then the program's 2a/√3) nor an ungated start (2A/0 from the
+    /// unprocessed lattice) writes.
+    async fn load_kohzu(db: &PvDatabase) {
         use epics_base_rs::server::db_loader;
+        db_loader::register_record_type(
+            "motor",
+            Box::new(|| Box::new(motor_rs::MotorRecord::new())),
+        );
+        db_loader::register_record_type(
+            "busy",
+            Box::new(|| Box::new(epics_base_rs::server::records::busy::BusyRecord::default())),
+        );
+        let macros: HashMap<String, String> = [
+            ("P", "T:"),
+            ("M_THETA", "th"),
+            ("M_Y", "y"),
+            ("M_Z", "z"),
+            ("yOffHi", "50"),
+            ("yOffLo", "-50"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let kohzu_db =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq.db"))
+                .unwrap();
         db.begin_load().unwrap();
-        for mut def in db_loader::parse_db(KOHZU_LATTICE_DB, &HashMap::new()).unwrap() {
-            let mut record = db_loader::create_record(&def.record_type).unwrap();
-            let mut common_fields = Vec::new();
-            db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
-            db.add_loaded_record(
-                &def.name,
-                record,
-                epics_base_rs::server::database::RecordLoad {
-                    common_fields,
-                    info_tags: std::mem::take(&mut def.info_tags),
-                },
-            )
-            .await
-            .unwrap();
+        for text in [kohzu_db.as_str(), KOHZU_MOTORS] {
+            for mut def in db_loader::parse_db(text, &macros).unwrap() {
+                let mut record = db_loader::create_record(&def.record_type).unwrap();
+                let mut common_fields = Vec::new();
+                db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
+                db.add_loaded_record(
+                    &def.name,
+                    record,
+                    epics_base_rs::server::database::RecordLoad {
+                        common_fields,
+                        info_tags: std::mem::take(&mut def.info_tags),
+                    },
+                )
+                .await
+                .unwrap();
+            }
         }
+        db.get_record("T:Bragg2dSpacingAO")
+            .unwrap()
+            .write()
+            .record
+            .put_field("VAL", epics_base_rs::types::EpicsValue::Double(-1.0))
+            .unwrap();
     }
 
     /// `seqStart` is issued from `st.cmd`, before `iocInit`. The program must
@@ -620,7 +581,7 @@ record(ao, "T:Bragg2dSpacingAO") { field(PINI, "YES") field(DOL, "1") field(VAL,
     #[epics_base_rs::epics_test]
     async fn kohzu_ctl_reads_the_lattice_only_after_pini() {
         let db = PvDatabase::new();
-        load_lattice(&db).await;
+        load_kohzu(&db).await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("kohzuCtl", "P=T:,M_THETA=th,M_Y=y,M_Z=z", &bridge, &db).unwrap();
 

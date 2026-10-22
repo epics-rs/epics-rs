@@ -13,7 +13,7 @@ use epics_base_rs::server::snl::{PutQueue, SeqPv, StateSet};
 use epics_libcom_rs::cfmt::CFloat;
 
 use crate::db_access::alloc_origin;
-use crate::snl::kohzu_ctl::HC;
+use crate::snl::vars::HC;
 use crate::snl::vars::{
     DOUBLE, DOUBLE_MON, DOUBLE_SYNC, Decl, Delays, SHORT, SHORT_MON, SHORT_SYNC, Vars, ctl_debug,
 };

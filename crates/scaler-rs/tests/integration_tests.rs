@@ -14,6 +14,19 @@ use epics_ca_rs::server::CaServerBuilder;
 use scaler_rs::ScalerRecord;
 use std::collections::HashMap;
 
+/// `pv` once it reads `want`, or what it reads after 10 s: a slow host fires
+/// the DLY timer late, not never.
+async fn reaches(server: &epics_ca_rs::server::CaServer, pv: &str, want: EpicsValue) -> EpicsValue {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let v = server.get(pv).await.unwrap();
+        if v == want || std::time::Instant::now() >= deadline {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 // ============================================================
 // Scaler: CNT start/stop via framework
 // ============================================================
@@ -112,7 +125,7 @@ async fn test_scaler_dly_delayed_start() {
 record(scaler, "TEST:SC3") {
     field(FREQ, "1000000")
     field(TP, "1.0")
-    field(DLY, "0.2")
+    field(DLY, "0.5")
 }
 "#;
     let macros = HashMap::new();
@@ -126,7 +139,7 @@ record(scaler, "TEST:SC3") {
         .unwrap();
     let db = server.database().clone();
 
-    // Start counting with DLY=0.2s
+    // Start counting with DLY=0.5s
     // special("CNT") sets US=WAITING, then process returns AsyncPendingReprocess
     server
         .put("TEST:SC3.CNT", EpicsValue::Short(1))
@@ -135,16 +148,13 @@ record(scaler, "TEST:SC3") {
     db.put_record_field_from_ca("TEST:SC3", "PROC", EpicsValue::Short(1))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // During DLY wait
     let us = server.get("TEST:SC3.US").await.unwrap();
     assert_eq!(us, EpicsValue::Short(1), "US should be WAITING during DLY");
 
     // Wait for DLY to expire + framework re-process
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let ss = server.get("TEST:SC3.SS").await.unwrap();
+    let ss = reaches(&server, "TEST:SC3.SS", EpicsValue::Short(2)).await;
     assert_eq!(
         ss,
         EpicsValue::Short(2),
@@ -694,7 +704,7 @@ record(scaler, "TEST:SC_E2") {
     field(SCAN, "10 second")
     field(FREQ, "1000000")
     field(TP, "1.0")
-    field(DLY, "0.1")
+    field(DLY, "0.5")
 }
 "#;
     let macros = HashMap::new();
@@ -712,7 +722,6 @@ record(scaler, "TEST:SC_E2") {
         .unwrap();
 
     // Mid-wait: WAITING, not counting.
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(
         server.get("TEST:SC_E2.US").await.unwrap(),
         EpicsValue::Short(1),
@@ -725,9 +734,8 @@ record(scaler, "TEST:SC_E2") {
     );
 
     // Past expiry: delayCallbackFunc's scanOnce has started the count.
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert_eq!(
-        server.get("TEST:SC_E2.SS").await.unwrap(),
+        reaches(&server, "TEST:SC_E2.SS", EpicsValue::Short(2)).await,
         EpicsValue::Short(2),
         "SS == SCALER_STATE_COUNTING: the watchdog started the count with no scan source"
     );

@@ -33,6 +33,19 @@ use std::time::Duration;
 
 const DLY: f64 = 0.3;
 
+/// `pv` once it reads `want`, or what it reads after 10 s: a slow host fires
+/// the DLY timer late, not never.
+async fn reaches(server: &epics_ca_rs::server::CaServer, pv: &str, want: EpicsValue) -> EpicsValue {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v = server.get(pv).await.unwrap();
+        if v == want || std::time::Instant::now() >= deadline {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 async fn counter(server: &epics_ca_rs::server::CaServer) -> f64 {
     match server.get("SC:CNTR.VAL").await.unwrap() {
         EpicsValue::Double(v) => v,
@@ -114,9 +127,8 @@ async fn an_untouched_delayed_start_still_starts_the_count() {
     let server = abort_fixture().await;
 
     put_cnt(&server, 1).await;
-    tokio::time::sleep(Duration::from_secs_f64(DLY + 0.3)).await;
 
-    let ss = server.get("SC.SS").await.unwrap();
+    let ss = reaches(&server, "SC.SS", EpicsValue::Short(2)).await;
     assert_eq!(
         ss,
         EpicsValue::Short(2),

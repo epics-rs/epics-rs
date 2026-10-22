@@ -217,6 +217,12 @@ async fn a_waiting_restart_posts_freq_once_with_the_committed_alarm() {
     let (db, lines, _readers) = boot("0.2", &[("SC", "FREQ", "SC.FREQ")]).await;
     process(&db).await;
     assert_eq!(*lines.lock().unwrap(), [] as [String; 0], "no restart yet");
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // The restart, however late a slow host fires DLY1, then 0.4 s for a
+    // second post.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while lines.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     assert_eq!(*lines.lock().unwrap(), ["SC.FREQ 12500000 0"]);
 }

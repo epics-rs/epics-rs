@@ -98,6 +98,16 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// Waits for the FLNK target to reach `want`, which the boot process's
+/// fields precede: the port's callback thread runs when the host schedules
+/// it, so a presence check waits on it and only absence checks `settle`.
+async fn scf_reaches(db: &PvDatabase, want: f64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while field(db, "SCF", "VAL").await < want && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// TIME, UDF, SEVR and the FLNK target, the things the boot process changes.
 async fn state(db: &PvDatabase) -> (bool, f64, f64, f64) {
     let stamped = db.get_record("SC").unwrap().read().common.time > epics_epoch();
@@ -122,7 +132,7 @@ async fn a_done_flagged_at_construction_processes_the_record_at_iocrun() {
         "nothing before interruptAccept"
     );
     db.scan_control().run();
-    settle().await;
+    scf_reaches(&db, 1.0).await;
     assert_eq!(state(&db).await, PROCESSED);
 }
 
@@ -134,7 +144,7 @@ async fn a_callback_before_interrupt_accept_keeps_the_flag() {
     let db = boot(done.clone()).await;
     done.call_callbacks();
     db.scan_control().run();
-    settle().await;
+    scf_reaches(&db, 1.0).await;
     assert_eq!(state(&db).await, PROCESSED);
 }
 
@@ -155,7 +165,7 @@ async fn the_replay_is_once_and_a_later_change_processes_again() {
     let done = DoneParam::new(1);
     let db = boot(done.clone()).await;
     db.scan_control().run();
-    settle().await;
+    scf_reaches(&db, 1.0).await;
     db.scan_control().pause();
     db.scan_control().run();
     settle().await;
@@ -165,7 +175,7 @@ async fn the_replay_is_once_and_a_later_change_processes_again() {
     done.call_callbacks();
     done.set(1);
     done.call_callbacks();
-    settle().await;
+    scf_reaches(&db, 2.0).await;
     assert_eq!(field(&db, "SCF", "VAL").await, 2.0);
 }
 
@@ -175,7 +185,7 @@ async fn an_unchanged_done_is_not_called_back() {
     let done = DoneParam::new(1);
     let db = boot(done.clone()).await;
     db.scan_control().run();
-    settle().await;
+    scf_reaches(&db, 1.0).await;
     done.set(1);
     done.call_callbacks();
     settle().await;

@@ -155,7 +155,10 @@ fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 100.0;
-    rec.dly = 0.01;
+    // Long enough that the put's own process lands inside it: a host that
+    // spends DLY between `special` and that process starts the count there,
+    // as C's `delayCallbackFunc` would have set REQSTART by then.
+    rec.dly = 0.5;
     rec.nch = 4;
     rec.init_record(1).unwrap();
 
@@ -163,7 +166,7 @@ fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
     assert!(has_reprocess(&actions), "DLY > 0 arms the delayed start");
     assert_eq!(rec.ss, SCALER_STATE_IDLE, "nothing counts during the wait");
 
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(600));
     fire_timer(&mut rec);
     assert_eq!(
         rec.ss, SCALER_STATE_COUNTING,

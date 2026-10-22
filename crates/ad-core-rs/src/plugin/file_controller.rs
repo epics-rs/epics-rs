@@ -90,10 +90,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// The sets C has made by the time the writer runs that the store does
-    /// not have yet: `createFileName`'s FullFileName and FileNumber.
+    /// not have yet: `createFileName`'s FullFileName, FileNumber and
+    /// FilePathExists.
     fn file_sets(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
-        self.push_file_number_update(&mut updates);
+        self.push_create_file_name_updates(&mut updates);
         self.push_full_file_name_update(&mut updates);
         updates
     }
@@ -187,22 +188,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
     }
 
     /// Re-evaluate whether the current `FilePath` directory exists and push a
-    /// `FilePathExists` param update. C++ `NDPluginFile::checkPath()` runs this
-    /// before each write, not only when FilePath changes.
+    /// `FilePathExists` param update, once per frame.
     fn refresh_file_path_exists(&mut self, updates: &mut Vec<ParamUpdate>) {
-        let idx = match self.params.file_path_exists {
-            Some(idx) => idx,
-            None => return,
-        };
-        let Some((normalized, exists)) = check_file_path(&self.file_base.file_path) else {
-            return;
-        };
-        self.file_base.file_path = normalized;
-        updates.push(ParamUpdate::Int32 {
-            reason: idx,
-            addr: 0,
-            value: if exists { 1 } else { 0 },
-        });
+        self.file_base.check_path();
+        self.push_file_path_exists_update(updates);
     }
 
     /// G9: apply the `FilePluginFileName` / `FilePluginFileNumber` attributes
@@ -363,7 +352,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
 
     fn success_updates(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
-        self.push_file_number_update(&mut updates);
+        self.push_create_file_name_updates(&mut updates);
         if let Some(idx) = self.params.write_status {
             updates.push(ParamUpdate::Int32 {
                 reason: idx,
@@ -524,12 +513,28 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
-    fn push_file_number_update(&self, updates: &mut Vec<ParamUpdate>) {
+    /// What C `createFileName` sets besides the name: FileNumber, and
+    /// FilePathExists from its `checkPath` (asynNDArrayDriver.cpp:203-218).
+    fn push_create_file_name_updates(&self, updates: &mut Vec<ParamUpdate>) {
+        self.push_file_path_exists_update(updates);
         if let Some(idx) = self.params.file_number {
             updates.push(ParamUpdate::Int32 {
                 reason: idx,
                 addr: 0,
                 value: self.file_base.file_number,
+            });
+        }
+    }
+
+    fn push_file_path_exists_update(&self, updates: &mut Vec<ParamUpdate>) {
+        if let (Some(idx), Some(exists)) = (
+            self.params.file_path_exists,
+            self.file_base.file_path_exists(),
+        ) {
+            updates.push(ParamUpdate::Int32 {
+                reason: idx,
+                addr: 0,
+                value: exists as i32,
             });
         }
     }
@@ -544,7 +549,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// same cycle pushed.
     fn push_file_base_readbacks(&self, updates: &mut Vec<ParamUpdate>) {
         self.push_num_captured_update(updates);
-        self.push_file_number_update(updates);
+        self.push_create_file_name_updates(updates);
         self.push_full_file_name_update(updates);
     }
 
@@ -758,10 +763,8 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             NDFileMode::Stream => c.capture_active,
         };
 
-        // Re-check file-path existence before every write. C++ NDPluginFile
-        // calls checkPath() before each write so a directory deleted after
-        // FilePath was set is reflected; the Rust port previously updated
-        // FilePathExists only on the FilePath param change.
+        // Every open checks the path (`open_file_name`); this also checks it
+        // on a frame that opens nothing, which C does not.
         c.refresh_file_path_exists(&mut proc_result.param_updates);
 
         // G9: FilePluginClose attribute forces an immediate file close.
@@ -1019,7 +1022,7 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
                     // The name, and FileNumber past it, are set before the
                     // open that failed (:146-155).
                     c.push_error_updates(&mut updates, &mut out.trace, true, false, &err);
-                    c.push_file_number_update(&mut updates);
+                    c.push_create_file_name_updates(&mut updates);
                     c.push_full_file_name_update(&mut updates);
                     let refused: ADResult<()> = Err(err);
                     abort_on_writer_abort(self, &mut updates, &refused);
@@ -1135,7 +1138,7 @@ fn start_capture<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
         if let Some(array) = c.latest_array.clone() {
             let opened = NDPluginFileBase::open_stream_io(&mut PortIo::new(port), &array);
             let c = port.controller();
-            c.push_file_number_update(updates);
+            c.push_create_file_name_updates(updates);
             c.push_full_file_name_update(updates);
             opened?;
         }
@@ -1231,20 +1234,6 @@ fn write_single<W: NDFileWriter, P: PortLock<FilePluginController<W>>>(
     c.record(&set);
     c.file_base.ensure_directory()?;
     NDPluginFileBase::process_array_io(&mut PortIo::new(port), array, &mut |a| post.hand_on(a))
-}
-
-/// Normalize `path` and report whether the directory exists, through the one
-/// implementation of C++ `asynNDArrayDriver::checkPath` that the file plugins
-/// inherit (`NDPluginFile` -> `NDPluginDriver` -> `asynNDArrayDriver`).
-/// `None` for an empty path, which C returns on before touching
-/// NDFilePathExists (asynNDArrayDriver.cpp:105).
-fn check_file_path(path: &str) -> Option<(String, bool)> {
-    if path.is_empty() {
-        return None;
-    }
-    let mut normalized = path.to_string();
-    let exists = crate::driver::ndarray_driver::check_path_str(&mut normalized);
-    Some((normalized, exists))
 }
 
 /// The port's side of a writer's settings: a write lands here at once, never
@@ -3356,6 +3345,35 @@ mod tests {
             error_lines(&[&format!("NDPluginFile::closeFileBase {text}\n")])
         );
         assert_eq!(message(&c, &out).as_deref(), Some(text));
+    }
+
+    /// C `createFileName` runs `checkPath` first (asynNDArrayDriver.cpp:203),
+    /// so a WriteFile or ReadFile open terminates FilePath and refreshes
+    /// FilePathExists, whatever FilePath was holding.
+    #[test]
+    fn write_file_and_read_file_check_the_path_as_create_file_name_does() {
+        let dir = std::env::temp_dir().join(format!("fc-checkpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for op in ["WriteFile", "ReadFile"] {
+            let mut c = base_port();
+            c.file_base.file_path = dir.display().to_string();
+            let reason = match op {
+                "WriteFile" => c.params.write_file,
+                _ => c.params.read_file,
+            };
+            let out = c.write_int32(reason.unwrap(), 1, WriteVerdict::Accept(1), &mut ());
+            assert_eq!(
+                c.file_base.full_file_name(),
+                format!("{}{}f_0", dir.display(), std::path::MAIN_SEPARATOR),
+                "{op}"
+            );
+            assert_eq!(
+                side_int(&out, c.params.file_path_exists.unwrap()),
+                Some(1),
+                "{op}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// NDPluginFile.cpp:160-180, the double space included.

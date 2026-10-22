@@ -432,6 +432,9 @@ pub struct NDPluginFileBase {
     is_open: bool,
     mode: NDFileMode,
     full_file_name: String,
+    /// `NDFilePathExists` as the last `checkPath` left it; `None` until a
+    /// non-empty FilePath is checked (asynNDArrayDriver.cpp:104).
+    file_path_exists: Option<bool>,
     /// C `ndArrayInfoInit`: what `isFrameValid` compares a frame against.
     init_frame: Option<InitFrame>,
 }
@@ -473,6 +476,7 @@ impl NDPluginFileBase {
             is_open: false,
             mode: NDFileMode::Single,
             full_file_name: String::new(),
+            file_path_exists: None,
             init_frame: None,
         }
     }
@@ -601,10 +605,24 @@ impl NDPluginFileBase {
         self.full_file_name.clear();
     }
 
+    /// C `checkPath()` (asynNDArrayDriver.cpp:98-109) on FilePath: normalize
+    /// it and record whether the directory exists.
+    pub(crate) fn check_path(&mut self) {
+        if !self.file_path.is_empty() {
+            let exists = crate::driver::ndarray_driver::check_path_str(&mut self.file_path);
+            self.file_path_exists = Some(exists);
+        }
+    }
+
+    pub(crate) fn file_path_exists(&self) -> Option<bool> {
+        self.file_path_exists
+    }
+
     /// C `createFileName` at an open (asynNDArrayDriver.cpp:192-219): the
-    /// name is made and AutoIncrement moves FileNumber past it there, whether
-    /// or not the open then succeeds.
+    /// path is checked, the name is made and AutoIncrement moves FileNumber
+    /// past it there, whether or not the open then succeeds.
     pub fn open_file_name(&mut self) -> String {
+        self.check_path();
         self.full_file_name = self.create_file_name();
         if self.auto_increment {
             self.file_number += 1;

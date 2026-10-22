@@ -14,7 +14,8 @@ async fn save_data_init_s_lines_go_to_the_line_s_file() {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let db = Arc::new(PvDatabase::new());
     let dir = tempfile::tempdir().unwrap();
-    let d = dir.path().display().to_string();
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    let d = dir.path().display().to_string().replace('\\', "/");
     let files = std::thread::spawn(move || {
         epics_base_rs::runtime::task::set_thread_ok_to_block(true);
         let shell = IocShell::new(db, bridge);

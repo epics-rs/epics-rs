@@ -1185,8 +1185,8 @@ impl ServerInterfaces {
     }
 }
 
-/// pvxs's listeners on its `[::]` collector, which is dual-stack: it never
-/// sets `IPV6_V6ONLY` (`udp_collector.cpp:124-151`).
+/// pvxs's listeners on its `[::]` collector, dual-stack where the OS
+/// defaults `IPV6_V6ONLY` off: pvxs never sets it (`udp_collector.cpp:124-151`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct V6Listen {
     any: bool,

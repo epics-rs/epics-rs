@@ -87,7 +87,7 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 ///
 /// The families follow `interfaces` as pvxs opens one collector per family
 /// with an entry (`server.cpp:411-426`): the v4 wildcard collector for a v4
-/// entry or the default, the dual-stack `[::]` socket for a v6 one. pvxs
+/// entry or the default, the `[::]` socket for a v6 one. pvxs
 /// binds no per-interface socket: a listed interface is a listener on the
 /// collector (`server.cpp:427-438`), which [`SearchListeners`] is.
 ///
@@ -96,8 +96,8 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 /// one read back and throws out of the `Server` constructor when it cannot
 /// (`server.cpp:421-426`, `udp_collector.cpp:151`). v4 goes first: its
 /// ephemeral pick must come from the kernel, since a guessed number under
-/// the reuse flags would co-bind silently. The dual-stack v6 socket then
-/// sets its fanout flags before the bind, as pvxs does, since without them
+/// the reuse flags would co-bind silently. The v6 socket then sets its
+/// fanout flags before the bind, as pvxs does, since dual-stack without them
 /// it would collide with this server's own v4 socket: a v6 holder of the
 /// number without fanout is `EADDRINUSE` (`WSAEACCES` on Windows), one with
 /// fanout co-binds as on any configured number. A held number, read as
@@ -252,9 +252,10 @@ async fn recv_collector(
     Ok((n, src, None, drops))
 }
 
-/// pvxs's v6 collector on `port`: `[::]`, dual-stack because pvxs never
-/// sets `IPV6_V6ONLY` (`udp_collector.cpp:124-151`), with fanout on every
-/// port and `IPV6_RECVPKTINFO`, joined to the v6 groups of `interfaces`.
+/// pvxs's v6 collector on `port`: `[::]` with `IPV6_V6ONLY` at the OS
+/// default, which pvxs never sets (`udp_collector.cpp:124-151`): dual-stack
+/// on Linux and Darwin, v6-only on Windows. Fanout on every port and
+/// `IPV6_RECVPKTINFO`, joined to the v6 groups of `interfaces`.
 /// `origin` is [`PortOrigin::Chosen`] only for a v6 collector without a v4
 /// one, which picks the number itself.
 fn bind_search_v6(
@@ -264,7 +265,6 @@ fn bind_search_v6(
 ) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_only_v6(false)?;
     sock.set_nonblocking(true)?;
     let bind_addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
     PortUse::Shared.bind(&sock, bind_addr, origin)?;
@@ -561,7 +561,7 @@ async fn dispatch_search_outputs(sock: &tokio::net::UdpSocket, outputs: Vec<Sear
     }
 }
 
-/// The v6 responder on pvxs's dual-stack `[::]` collector: what its
+/// The v6 responder on pvxs's `[::]` collector: what its
 /// listeners take ([`V6Listen::takes`]) is answered from the socket, and
 /// nothing is forwarded — pvxs forwards only a v4 destination
 /// (`udp_collector.cpp:385`).

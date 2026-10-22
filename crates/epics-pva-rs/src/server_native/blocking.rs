@@ -1192,11 +1192,11 @@ pub fn bind_udp_search(addr: SocketAddrV4, config: &PvaServerConfig) -> io::Resu
     })
 }
 
-/// pvxs's v6 collector on `port`: `[::]`, dual-stack because pvxs never sets
-/// `IPV6_V6ONLY` (`udp_collector.cpp:124-151`), with the fanout flags and
-/// `IPV6_RECVPKTINFO` pvxs sets on every collector socket, joined to the v6
-/// groups of `interfaces`. Not the ORIGIN_TAG channel, which is v4, so it
-/// answers what its listeners take and forwards nothing.
+/// pvxs's v6 collector on `port`: `[::]` with `IPV6_V6ONLY` at the OS
+/// default, which pvxs never sets (`udp_collector.cpp:124-151`), with the
+/// fanout flags and `IPV6_RECVPKTINFO` pvxs sets on every collector socket,
+/// joined to the v6 groups of `interfaces`. Not the ORIGIN_TAG channel,
+/// which is v4, so it answers what its listeners take and forwards nothing.
 pub(crate) fn bind_udp_search_v6(
     port: u16,
     interfaces: &super::search_engine::ServerInterfaces,
@@ -1206,7 +1206,6 @@ pub(crate) fn bind_udp_search_v6(
     {
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_only_v6(false)?;
         let any = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port);
         epics_base_rs::net::PortUse::Shared.bind(
             &socket,

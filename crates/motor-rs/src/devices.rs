@@ -972,8 +972,13 @@ mod tests {
         assert_eq!(parse_link("@asyn(M1 3 0x1p1)"), ok("M1", 3));
         assert_eq!(parse_link("@asyn(M1 3 inf)"), ok("M1", 3));
         assert_eq!(parse_link("@asyn(M1 3 1e999)"), invalid);
-        // C strtol takes LONG_MIN; the int it lands in keeps the low bits.
-        assert_eq!(parse_link("@asyn(M1 -9223372036854775808)"), ok("M1", 0));
+        // C strtol takes LONG_MIN where long is 64 bits, and the int it lands
+        // in keeps the low bits; a 32-bit long overflows it (ERANGE).
+        let lp64 = std::ffi::c_long::BITS == 64;
+        assert_eq!(
+            parse_link("@asyn(M1 -9223372036854775808)"),
+            if lp64 { ok("M1", 0) } else { invalid }
+        );
         // C isspace separates on a vertical tab.
         assert_eq!(parse_link("@asyn(M1\x0b3)"), ok("M1", 3));
     }

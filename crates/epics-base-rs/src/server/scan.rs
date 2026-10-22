@@ -377,8 +377,39 @@ const OVERRUN_REPORT_MAX: f64 = 3600.0;
 struct TickOutcome {
     /// The sweep ran past its deadline, so the rate's cumulative counter moves.
     overran: bool,
-    /// The warning this over-run tripped, already formatted.
-    warning: Option<String>,
+    /// The warning this over-run tripped.
+    warning: Option<OverrunReport>,
+}
+
+/// C's over-run warning (`dbScan.c:832-841`) as the numbers it prints. Data,
+/// not a `String`: the scan thread formats it straight into the errlog arena,
+/// as C's `errlogPrintf` does, and allocates nothing to report.
+#[derive(Clone, Copy)]
+struct OverrunReport {
+    scan: ScanType,
+    average: f64,
+    min: f64,
+    max: f64,
+    overruns: u32,
+    remedy: Remedy,
+}
+
+impl std::fmt::Display for OverrunReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\ndbScan {} from '{}' scan thread:\n\tScan processing averages {:.3} \
+             seconds ({:.3} .. {:.3}).\n\tOver-runs have now happened {} times in \
+             a row.\n\tTo fix this, move some records to a slower scan rate{}\n",
+            crate::runtime::log::erl_warning(),
+            self.scan,
+            CFloat(self.average),
+            CFloat(self.min),
+            CFloat(self.max),
+            self.overruns,
+            self.remedy.tail(),
+        )
+    }
 }
 
 /// C `periodicTask`'s over-run bookkeeping (`dbScan.c:788-852`) as one owner.
@@ -520,26 +551,21 @@ impl OverrunTracker {
         let warning =
             if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
                 let period = self.period.as_secs_f64();
-                let scan = self.scan;
-                let remedy = self.remedy.tail();
-                let msg = format!(
-                    "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
-                 averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
-                 happened {} times in a row.\n\tTo fix this, move some records \
-                 to a slower scan rate{remedy}\n",
-                    crate::runtime::log::erl_warning(),
-                    CFloat(period + self.overtime / f64::from(self.consecutive)),
-                    CFloat(period + self.over_min),
-                    CFloat(period + self.over_max),
-                    self.consecutive,
-                );
+                let report = OverrunReport {
+                    scan: self.scan,
+                    average: period + self.overtime / f64::from(self.consecutive),
+                    min: period + self.over_min,
+                    max: period + self.over_max,
+                    overruns: self.consecutive,
+                    remedy: self.remedy,
+                };
                 self.reported = now;
                 if self.report_delay < OVERRUN_REPORT_MAX / 2.0 {
                     self.report_delay *= 2.0;
                 } else {
                     self.report_delay = OVERRUN_REPORT_MAX;
                 }
-                Some(msg)
+                Some(report)
             } else {
                 None
             };
@@ -1516,7 +1542,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
             db.record_scan_overrun(scan_type);
         }
         if let Some(warning) = outcome.warning {
-            crate::runtime::log::errlog_printf(&warning);
+            crate::runtime::log::errlog_vprintf(format_args!("{warning}"));
         }
     }
 }
@@ -1856,7 +1882,7 @@ mod overrun_tests {
         for i in 1..=ticks {
             let now = base + sweep * i;
             if let Some(w) = tracker.after_scan(&mut next, now).warning {
-                warnings.push(w);
+                warnings.push(w.to_string());
             }
         }
         warnings

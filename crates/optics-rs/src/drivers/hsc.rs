@@ -3,8 +3,6 @@
 //! Provides `HscDriver` (the port driver with parameter cache and poll loop),
 //! `SimHsc` (in-memory simulation without serial I/O), and `HscHolder`
 //! (IOC startup command registration).
-//!
-//! Reuses all protocol/math from [`crate::snl::xiahsc`] and [`crate::snl::xia_slit`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,10 +14,43 @@ use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
-use crate::snl::xiahsc::{
-    blades_from_height_center, blades_from_width_center, h_center_from_blades, height_from_blades,
-    v_center_from_blades, width_from_blades,
-};
+// ---------------------------------------------------------------------------
+// Slit geometry calculations (pure functions)
+// ---------------------------------------------------------------------------
+
+/// Compute slit width from left and right blade positions.
+pub fn width_from_blades(left: f64, right: f64) -> f64 {
+    left + right
+}
+
+/// Compute horizontal center from left and right blade positions.
+pub fn h_center_from_blades(left: f64, right: f64) -> f64 {
+    (right - left) / 2.0
+}
+
+/// Compute slit height from top and bottom blade positions.
+pub fn height_from_blades(top: f64, bottom: f64) -> f64 {
+    top + bottom
+}
+
+/// Compute vertical center from top and bottom blade positions.
+pub fn v_center_from_blades(top: f64, bottom: f64) -> f64 {
+    (top - bottom) / 2.0
+}
+
+/// Compute left and right blade positions from width and horizontal center.
+pub fn blades_from_width_center(width: f64, h_center: f64) -> (f64, f64) {
+    let left = width / 2.0 - h_center;
+    let right = width / 2.0 + h_center;
+    (left, right)
+}
+
+/// Compute top and bottom blade positions from height and vertical center.
+pub fn blades_from_height_center(height: f64, v_center: f64) -> (f64, f64) {
+    let top = height / 2.0 + v_center;
+    let bottom = height / 2.0 - v_center;
+    (top, bottom)
+}
 
 // ---------------------------------------------------------------------------
 // Parameter indices
@@ -839,5 +870,45 @@ mod tests {
         blade.update();
         assert!(blade.position < 10.0);
         assert!(blade.moving);
+    }
+
+    // -- Slit geometry tests --
+
+    #[test]
+    fn width_from_blades_symmetric() {
+        assert!((width_from_blades(2.5, 2.5) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h_center_from_blades_centered() {
+        assert!((h_center_from_blades(2.5, 2.5) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h_center_from_blades_offset() {
+        // left=1, right=3 => center = (3-1)/2 = 1.0
+        assert!((h_center_from_blades(1.0, 3.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blades_from_width_center_roundtrip() {
+        let left = 1.5;
+        let right = 3.5;
+        let w = width_from_blades(left, right);
+        let c = h_center_from_blades(left, right);
+        let (l2, r2) = blades_from_width_center(w, c);
+        assert!((l2 - left).abs() < 1e-9);
+        assert!((r2 - right).abs() < 1e-9);
+    }
+
+    #[test]
+    fn height_and_v_center_roundtrip() {
+        let top = 4.0;
+        let bottom = 2.0;
+        let h = height_from_blades(top, bottom);
+        let c = v_center_from_blades(top, bottom);
+        let (t2, b2) = blades_from_height_center(h, c);
+        assert!((t2 - top).abs() < 1e-9);
+        assert!((b2 - bottom).abs() < 1e-9);
     }
 }

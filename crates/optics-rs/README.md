@@ -24,7 +24,7 @@ monitors, and other optical components.
 | XIA PF4 dual filter | `snl::pf4` | pf4.st |
 | Ion chamber I0 | `snl::io` | Io.st |
 | Coarse+fine flexure | `snl::flex_combined_motion` | flexCombinedMotion.st |
-| HSC-1 slit controller | `drivers::hsc` (port driver) and `snl::xiahsc` (serial actor) | xiahsc.st |
+| HSC-1 slit controller | `drivers::hsc` (port driver) and `snl::xiahsc` | xiahsc.st |
 | XIA slit with sscan | `snl::xia_slit` | xia_slit.st |
 | Quad X-ray BPM | `drivers::qxbpm` (port driver) and `snl::qxbpm` | sncqxbpm.st |
 

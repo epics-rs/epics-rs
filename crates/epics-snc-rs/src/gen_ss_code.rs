@@ -4,7 +4,7 @@
 //!
 //! C prints each expression as the C text it is and leaves the conversions
 //! to the C compiler. Rust converts nothing implicitly, so every translated
-//! expression carries its [`Ty`], and C's integer promotions, usual
+//! expression carries its `Ty`, and C's integer promotions, usual
 //! arithmetic conversions, truth values and conversions on assignment are
 //! written out.
 

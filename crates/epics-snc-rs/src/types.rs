@@ -294,77 +294,77 @@ pub struct StateSet {
 /// Syntax node kinds (C `enum node_tag`); the comment lists the children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeTag {
-    /// assign statement [subscr,pvs]
+    /// assign statement \[subscr,pvs\]
     DAssign,
-    /// variable declaration [init]
+    /// variable declaration \[init\]
     DDecl,
-    /// entry or exit statement [block]
+    /// entry or exit statement \[block\]
     DEntex,
-    /// function definition [decl,block]
+    /// function definition \[decl,block\]
     DFuncdef,
-    /// monitor statement [subscr]
+    /// monitor statement \[subscr\]
     DMonitor,
     /// option definition []
     DOption,
-    /// whole program [param,defns,entry,statesets,exit,xdefns]
+    /// whole program \[param,defns,entry,statesets,exit,xdefns\]
     DProg,
-    /// state set statement [defns,states]
+    /// state set statement \[defns,states\]
     DSs,
-    /// state statement [defns,entry,whens,exit]
+    /// state statement \[defns,entry,whens,exit\]
     DState,
-    /// struct definition [members]
+    /// struct definition \[members\]
     DStructdef,
-    /// sync statement [subscr,evflag]
+    /// sync statement \[subscr,evflag\]
     DSync,
-    /// syncq statement [subscr,evflag,maxqsize]
+    /// syncq statement \[subscr,evflag,maxqsize\]
     DSyncq,
-    /// when statement [cond,block]
+    /// when statement \[cond,block\]
     DWhen,
-    /// binary operator [left,right]
+    /// binary operator \[left,right\]
     EBinop,
     /// builtin function []
     EBuiltin,
-    /// type cast [type,operand]
+    /// type cast \[type,operand\]
     ECast,
     /// numeric (inkl. character) constant []
     EConst,
-    /// function call [expr,args]
+    /// function call \[expr,args\]
     EFunc,
-    /// array or struct initializer [elems]
+    /// array or struct initializer \[elems\]
     EInit,
     /// struct or union member []
     EMember,
-    /// parenthesized expression [expr]
+    /// parenthesized expression \[expr\]
     EParen,
-    /// unary postfix operator [operand]
+    /// unary postfix operator \[operand\]
     EPost,
-    /// unary prefix operator [operand]
+    /// unary prefix operator \[operand\]
     EPre,
-    /// member selection [left,right]
+    /// member selection \[left,right\]
     ESelect,
     /// string constant []
     EString,
-    /// subscripted expr [operand,index]
+    /// subscripted expr \[operand,index\]
     ESubscr,
-    /// ternary operator [cond,then,else]
+    /// ternary operator \[cond,then,else\]
     ETernop,
     /// variable []
     EVar,
     /// state change statement []
     SChange,
-    /// compound statement [defns,stmts]
+    /// compound statement \[defns,stmts\]
     SCmpnd,
-    /// for statement [init,cond,iter,stmt]
+    /// for statement \[init,cond,iter,stmt\]
     SFor,
-    /// if statement [cond,then,else]
+    /// if statement \[cond,then,else\]
     SIf,
     /// break or continue stmt []
     SJump,
-    /// return stmt [expr]
+    /// return stmt \[expr\]
     SReturn,
-    /// simple statement, i.e. 'expr;'  [expr]
+    /// simple statement, i.e. 'expr;'  \[expr\]
     SStmt,
-    /// while statement [cond,stmt]
+    /// while statement \[cond,stmt\]
     SWhile,
     /// C code or other text to be inserted []
     TText,

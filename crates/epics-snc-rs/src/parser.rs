@@ -1,5 +1,5 @@
 //! The parser: lemon's driver (C `lemon/snl.lt`, as generated into
-//! `snl.c`) over the [`snl`](crate::snl) tables, and `parse_program`
+//! `snl.c`) over the `snl` tables, and `parse_program`
 //! (C `snl.re`).
 
 use crate::driver::{Exit, Snc};

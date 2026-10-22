@@ -1,7 +1,7 @@
 //! The Rust snc-rs writes, as a tree, and its printer.
 //!
 //! C snc prints its output with `gen_code()` calls. snc-rs builds
-//! [`Item`]s and [`print`]s them in a fixed layout that does not depend on
+//! [`Item`]s and [`print`](fn@print)s them in a fixed layout that does not depend on
 //! line width: four-space indentation, one item or statement per line,
 //! a struct literal one field per line, and any other list (arguments,
 //! array elements) one element per line only when an element spans lines

@@ -114,7 +114,7 @@ record(ai, "AN") { field(DTYP, "Intr NoDsxt") field(INP, "@x") field(SCAN, "I/O 
 fn run(shell: &IocShell, line: &str) -> String {
     let out = std::env::temp_dir().join(format!("mca-intr-{}", std::process::id()));
     shell
-        .execute_line(format!("{line} > {}", out.display()))
+        .execute_line(format!("{line} > \"{}\"", out.display()))
         .unwrap();
     let text = std::fs::read_to_string(&out).unwrap();
     std::fs::remove_file(&out).unwrap();

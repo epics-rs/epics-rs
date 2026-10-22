@@ -3591,6 +3591,9 @@ mod tests {
         resp.send(b"x").unwrap();
         let resp = Arc::new(resp);
         let rearm = resp.clone();
+        // Replies go out unconnected, as on `conf->udp`: Darwin and the BSDs
+        // refuse a `send_to` on a connected socket (EISCONN).
+        let reply = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
 
         let errors = Arc::new(AtomicUsize::new(0));
         let recorder = RefusalRecorder {
@@ -3601,7 +3604,7 @@ mod tests {
         let stop = shutdown.clone();
         let udp_thread = thread::spawn(move || {
             tracing::subscriber::with_default(recorder, || {
-                handle_udp_search_blocking(&resp, &resp, "CAS-UDP", &[], db, 5064, &stop)
+                handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &stop)
             })
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

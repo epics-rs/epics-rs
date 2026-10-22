@@ -86,7 +86,8 @@ impl Shell<'_> {
     pub fn capture(&mut self, cmd: &str) -> String {
         self.n += 1;
         let f = self.dir.join(format!("{}{}.txt", self.tag, self.n));
-        self.line(&format!("{cmd} > {}", f.display()));
+        // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
+        self.line(&format!("{cmd} > \"{}\"", f.display()));
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Ok(text) = std::fs::read_to_string(&f)

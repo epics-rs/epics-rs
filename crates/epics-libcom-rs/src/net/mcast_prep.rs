@@ -165,15 +165,23 @@ mod tests {
         assert_eq!(s.multicast_if_v4().unwrap(), Ipv4Addr::UNSPECIFIED);
     }
 
+    /// Darwin refuses index 0 with EINVAL (`in6p_set_multicast_if`:
+    /// `IF_INDEX_IN_RANGE`), which pvxs logs before sending anyway; the hops
+    /// are set first either way.
     #[cfg(not(epics_embedded_target))]
     #[test]
     fn prep_v6_sets_hops_and_index() {
         let Ok(sock) = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)) else {
             return; // no v6 stack on this host
         };
-        mcast_prep_v6(&sock, 3, 0).unwrap();
+        let prep = mcast_prep_v6(&sock, 3, 0);
         let s = socket2::SockRef::from(&sock);
         assert_eq!(s.multicast_hops_v6().unwrap(), 3);
-        assert_eq!(s.multicast_if_v6().unwrap(), 0);
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(prep.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        } else {
+            prep.unwrap();
+            assert_eq!(s.multicast_if_v6().unwrap(), 0);
+        }
     }
 }

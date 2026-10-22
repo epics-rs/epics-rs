@@ -261,12 +261,7 @@ impl DbStatus {
         let modnum = (status as u32 >> 16) & 0xffff;
         let errnum = status as u32 & 0xffff;
         if modnum < MIN_MODULE_NUM {
-            let os = std::io::Error::from_raw_os_error(status).to_string();
-            // Rust appends " (os error N)" to `strerror`'s text.
-            return match os.rfind(" (os error ") {
-                Some(at) => os[..at].to_string().into(),
-                None => os.into(),
-            };
+            return crate::runtime::crt_errno::errno_text(status).into();
         }
         if let Some(message) = symbol_message(modnum, errnum) {
             return message.into();
@@ -786,7 +781,14 @@ mod db_status_tests {
         assert_eq!(text((504 << 16) | 4), "Too large to represent");
         // An unlisted dbAccess number falls back to the numbers.
         assert_eq!(text((511 << 16) | 2), "Error (511,2)");
-        #[cfg(unix)]
-        assert_eq!(text(libc::ENOENT), "No such file or directory");
+        // ENOENT: an errno, the same number and text on every OS.
+        assert_eq!(text(2), "No such file or directory");
+        // A CRT errno, not a Win32 code: as Win32 codes 12 and 18 would read
+        // EINVAL and ENOENT.
+        #[cfg(windows)]
+        {
+            assert_eq!(text(12), "Not enough space");
+            assert_eq!(text(18), "Improper link");
+        }
     }
 }

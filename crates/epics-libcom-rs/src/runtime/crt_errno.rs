@@ -19,24 +19,29 @@ pub fn errno(e: &io::Error) -> Option<i32> {
 /// message.
 pub fn strerror(e: &io::Error) -> String {
     match e.raw_os_error() {
-        #[cfg(windows)]
-        Some(code) => {
-            // SAFETY: the CRT returns a NUL-terminated string "in a
-            // thread-local storage buffer owned by the runtime" (MS docs,
-            // strerror), copied here before this thread can call it again.
-            unsafe { std::ffi::CStr::from_ptr(libc::strerror(os_to_errno(code))) }
-                .to_string_lossy()
-                .into_owned()
-        }
-        // std's message is `strerror`'s with ` (os error N)` appended.
-        #[cfg(not(windows))]
-        Some(code) => {
-            let text = e.to_string();
-            text.strip_suffix(&format!(" (os error {code})"))
-                .unwrap_or(&text)
-                .to_string()
-        }
+        Some(code) => errno_text(os_to_errno(code)),
         None => e.to_string(),
+    }
+}
+
+/// `strerror(errno)` for an `errno` C already holds, so no Win32 map.
+pub fn errno_text(errno: i32) -> String {
+    #[cfg(windows)]
+    {
+        // SAFETY: the CRT returns a NUL-terminated string "in a thread-local
+        // storage buffer owned by the runtime" (MS docs, strerror), copied
+        // here before this thread can call it again.
+        unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }
+            .to_string_lossy()
+            .into_owned()
+    }
+    // std's message is `strerror`'s with ` (os error N)` appended.
+    #[cfg(not(windows))]
+    {
+        let text = io::Error::from_raw_os_error(errno).to_string();
+        text.strip_suffix(&format!(" (os error {errno})"))
+            .unwrap_or(&text)
+            .to_string()
     }
 }
 
@@ -92,6 +97,16 @@ mod tests {
         );
         #[cfg(target_env = "gnu")]
         assert_eq!(strerror(&e), "Is a directory");
+    }
+
+    /// An errno is not mapped again: as a Win32 code 18 would read ENOENT.
+    #[test]
+    fn errno_text_is_the_errnos_own_text() {
+        #[cfg(windows)]
+        assert_eq!(errno_text(18), "Improper link");
+        #[cfg(all(unix, target_env = "gnu"))]
+        assert_eq!(errno_text(libc::EXDEV), "Invalid cross-device link");
+        assert_eq!(errno_text(2), "No such file or directory");
     }
 
     /// The edges of the measured map, with the texts the CRT printed for

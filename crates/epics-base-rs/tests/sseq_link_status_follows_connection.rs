@@ -101,24 +101,19 @@ async fn sleep(ms: u64) {
     epics_base_rs::runtime::task::sleep(Duration::from_millis(ms)).await;
 }
 
-/// What `pv` reads 450 ms and 600 ms on the delayed-callback timer after a
-/// put armed its pass, read on cbLow. Queued from cbMedium, behind the
-/// `special` task that arms the pass there, so the timer, firing in deadline
-/// order, runs a 0.5 s pass between the two reads.
-fn read_at_450_and_600_ms(
-    db: &Arc<PvDatabase>,
-    pv: &'static str,
-) -> BackgroundTaskHandle<[i16; 2]> {
+/// What `pv` reads 600 ms on the delayed-callback timer after a put armed
+/// its pass, read on cbLow. Queued from cbMedium, behind the `special` task
+/// that arms the pass there, so the timer, firing in deadline order, runs a
+/// 0.5 s pass first however late the host runs both.
+fn read_after_600_ms(db: &Arc<PvDatabase>, pv: &'static str) -> BackgroundTaskHandle<i16> {
     let db = db.clone();
     spawn_background(CallbackPriority::Medium, async move {
-        let [early, late] = [450, 600].map(|ms| {
-            let db = db.clone();
-            spawn_background(CallbackPriority::Low, async move {
-                sleep_background(Duration::from_millis(ms)).await;
-                read(&db, pv)
-            })
-        });
-        [early.await.unwrap(), late.await.unwrap()]
+        spawn_background(CallbackPriority::Low, async move {
+            sleep_background(Duration::from_millis(600)).await;
+            read(&db, pv)
+        })
+        .await
+        .unwrap()
     })
 }
 
@@ -130,27 +125,36 @@ fn drain(rx: &mut EventReader) -> usize {
     n
 }
 
-/// Whether the pass after the next one `rx` sees has posted 450 ms and
-/// 600 ms on the delayed-callback timer after it, read on cbLow. That post
-/// wakes this on cbLow's one worker once its pass has re-armed, and the timer
-/// fires in deadline order, so a 0.5 s re-arm lands between the two reads
-/// unless this registers its 450 ms more than 50 ms after the re-arm.
-fn next_pass_at_450_and_600_ms(
+/// When a cbLow task takes each of the next `n` posts to `rx`, then each one
+/// queued 600 ms on the delayed-callback timer after the last; a 0.5 s
+/// re-arm's pass is among those. The last post wakes this on cbLow's one
+/// worker once its pass has re-armed, and the timer fires in deadline order,
+/// so the next pass posts first however late the host runs both.
+fn posts_then_600_ms(
     mut rx: EventReader,
-) -> BackgroundTaskHandle<(EventReader, [bool; 2])> {
+    n: usize,
+) -> BackgroundTaskHandle<(EventReader, Vec<Instant>)> {
     spawn_background(CallbackPriority::Low, async move {
-        drain(&mut rx);
-        rx.recv().await.expect("subscriber open");
-        let at_600 = spawn_background(
-            CallbackPriority::Low,
-            sleep_background(Duration::from_millis(600)),
-        );
-        sleep_background(Duration::from_millis(450)).await;
-        let by_450 = drain(&mut rx) > 0;
-        at_600.await.unwrap();
-        let by_600 = by_450 || drain(&mut rx) > 0;
-        (rx, [by_450, by_600])
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            rx.recv().await.expect("subscriber open");
+            seen.push(Instant::now());
+        }
+        sleep_background(Duration::from_millis(600)).await;
+        let at = Instant::now();
+        seen.extend((0..drain(&mut rx)).map(|_| at));
+        (rx, seen)
     })
+}
+
+/// A timer never fires early and a re-arm counts from its own pass, so with
+/// the chain armed by init after `armed`, pass k posts no sooner than
+/// `armed` + 1 s + (k - 1) × 0.5 s. `seen[i]` is pass i + 1 or a later one.
+fn assert_no_pass_early(armed: Instant, seen: &[Instant]) {
+    for (i, &at) in seen.iter().enumerate() {
+        let due = armed + Duration::from_secs(1) + Duration::from_millis(500) * i as u32;
+        assert!(at >= due, "pass {} posted {:?} early", i + 1, due - at);
+    }
 }
 
 /// Init leaves both CA links `Ext PV NC` with no type; the pass init arms
@@ -177,10 +181,11 @@ async fn an_sseq_ca_link_reads_ok_once_connected_without_a_process() {
 #[epics_macros_rs::epics_test]
 async fn a_down_sseq_link_is_rechecked_until_it_connects() {
     let up = Arc::new(AtomicBool::new(false));
+    let armed = Instant::now();
     let db = build(&up).await;
     settled(&db, "Q:SQ.DOL2V", LOC).await;
     let rec = db.get_record("Q:SQ").unwrap();
-    let mut rx = rec
+    let rx = rec
         .write()
         .add_subscriber("LNK2V", 1, DbFieldType::Enum, EventMask::VALUE.bits())
         .expect("subscriber");
@@ -188,30 +193,10 @@ async fn a_down_sseq_link_is_rechecked_until_it_connects() {
     db.put_pv_and_post("Q:SQ.WAIT2", EpicsValue::String("Wait".into()))
         .await
         .unwrap();
-    let mut reposts = Vec::new();
-    while reposts.len() < 5 {
-        let ev = epics_base_rs::runtime::task::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("a pass re-posts LNK2V")
-            .expect("subscriber open");
-        if ev.value().as_value() == Some(&EpicsValue::Enum(LOC as u16)) {
-            reposts.push(Instant::now());
-        }
-    }
+    let (mut rx, seen) = posts_then_600_ms(rx, 5).await.unwrap();
+    assert!(seen.len() > 5, "no pass 600 ms after the fifth");
+    assert_no_pass_early(armed, &seen);
     assert_eq!(read(&db, "Q:SQ.LNK1V"), EXT_NC);
-    // One pass per 0.5 s spans 2 s; a second chain armed beside a pending
-    // one halves every other gap and spans 1 s.
-    let span = reposts[4] - reposts[0];
-    assert!(
-        span >= Duration::from_millis(1500),
-        "five Local PV re-posts in {span:?}"
-    );
-    let (mut rx, passes) = next_pass_at_450_and_600_ms(rx).await.unwrap();
-    assert_eq!(
-        passes,
-        [false, true],
-        "a pass 450 ms and 600 ms after a pass"
-    );
 
     up.store(true, Ordering::SeqCst);
     settled(&db, "Q:SQ.LNK1V", EXT_OK).await;
@@ -288,14 +273,14 @@ async fn a_wait_put_moves_werr_after_half_a_second() {
     db.put_pv_and_post("Q:SQ.WAIT2", EpicsValue::String("NoWait".into()))
         .await
         .unwrap();
-    let werr = read_at_450_and_600_ms(&db, "Q:SQ.WERR2");
+    let werr = read_after_600_ms(&db, "Q:SQ.WERR2");
     settled(&db, "Q:SQ.WERR2", 0).await;
-    assert_eq!(werr.await.unwrap(), [1, 0], "WERR2 450 ms and 600 ms on");
     assert!(
         put.elapsed() >= Duration::from_millis(500),
         "{:?}",
         put.elapsed()
     );
+    assert_eq!(werr.await.unwrap(), 0, "WERR2 600 ms on");
 }
 
 /// An `LNKn` put posts its status at once and arms the pass that sets
@@ -310,15 +295,15 @@ async fn a_link_put_sets_werr_after_half_a_second() {
     db.put_record_field_from_ca("Q:SP", "LNK1", EpicsValue::String("Q:SRC.VAL".into()))
         .await
         .unwrap();
-    let werr = read_at_450_and_600_ms(&db, "Q:SP.WERR1");
+    let werr = read_after_600_ms(&db, "Q:SP.WERR1");
     settled(&db, "Q:SP.LNK1V", LOC).await;
     settled(&db, "Q:SP.WERR1", 1).await;
-    assert_eq!(werr.await.unwrap(), [0, 1], "WERR1 450 ms and 600 ms on");
     assert!(
         put.elapsed() >= Duration::from_millis(500),
         "{:?}",
         put.elapsed()
     );
+    assert_eq!(werr.await.unwrap(), 1, "WERR1 600 ms on");
 }
 
 /// A DB-syntax link naming no record here is the `CA_LINK` C's `dbInitLink`

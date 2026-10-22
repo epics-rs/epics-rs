@@ -55,27 +55,36 @@ fn drain(rx: &mut EventReader) -> usize {
     n
 }
 
-/// Whether the pass after the next one `rx` sees has posted 450 ms and
-/// 600 ms on the delayed-callback timer after it, read on cbLow. That post
-/// wakes this on cbLow's one worker once its pass has re-armed, and the timer
-/// fires in deadline order, so a 0.5 s re-arm lands between the two reads
-/// unless this registers its 450 ms more than 50 ms after the re-arm.
-fn next_pass_at_450_and_600_ms(
+/// When a cbLow task takes each of the next `n` posts to `rx`, then each one
+/// queued 600 ms on the delayed-callback timer after the last; a 0.5 s
+/// re-arm's pass is among those. The last post wakes this on cbLow's one
+/// worker once its pass has re-armed, and the timer fires in deadline order,
+/// so the next pass posts first however late the host runs both.
+fn posts_then_600_ms(
     mut rx: EventReader,
-) -> BackgroundTaskHandle<(EventReader, [bool; 2])> {
+    n: usize,
+) -> BackgroundTaskHandle<(EventReader, Vec<Instant>)> {
     spawn_background(CallbackPriority::Low, async move {
-        drain(&mut rx);
-        rx.recv().await.expect("subscriber open");
-        let at_600 = spawn_background(
-            CallbackPriority::Low,
-            sleep_background(Duration::from_millis(600)),
-        );
-        sleep_background(Duration::from_millis(450)).await;
-        let by_450 = drain(&mut rx) > 0;
-        at_600.await.unwrap();
-        let by_600 = by_450 || drain(&mut rx) > 0;
-        (rx, [by_450, by_600])
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            rx.recv().await.expect("subscriber open");
+            seen.push(Instant::now());
+        }
+        sleep_background(Duration::from_millis(600)).await;
+        let at = Instant::now();
+        seen.extend((0..drain(&mut rx)).map(|_| at));
+        (rx, seen)
     })
+}
+
+/// A timer never fires early and a re-arm counts from its own pass, so with
+/// the chain armed by init after `armed`, pass k posts no sooner than
+/// `armed` + 1 s + (k - 1) × 0.5 s. `seen[i]` is pass i + 1 or a later one.
+fn assert_no_pass_early(armed: Instant, seen: &[Instant]) {
+    for (i, &at) in seen.iter().enumerate() {
+        let due = armed + Duration::from_secs(1) + Duration::from_millis(500) * i as u32;
+        assert!(at >= due, "pass {} posted {:?} early", i + 1, due - at);
+    }
 }
 
 /// The events each of `rxs` gets once every one has `least`, plus any in a
@@ -275,6 +284,7 @@ record(sseq, "Q") {
     field(DOL2, "T") field(LNK2, "T2")
 }
 "#;
+    let armed = Instant::now();
     let db = IocBuilder::new()
         .register_record_type("sseq", || Box::new(SseqRecord::default()))
         .db_string(DB, &HashMap::new())
@@ -300,18 +310,20 @@ record(sseq, "Q") {
         })
         .collect();
     let mut dol2v = rxs.pop().expect("DOL2V");
+    let mut passes = Vec::new();
     for field in ["WAIT2", "WAIT1", "PROC"] {
         db.put_record_field_from_ca("Q", field, EpicsValue::Short(1))
             .await
             .unwrap();
-        let (rx, passes) = next_pass_at_450_and_600_ms(dol2v).await.unwrap();
+        let (rx, seen) = posts_then_600_ms(dol2v, 1).await.unwrap();
         dol2v = rx;
         let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
         assert_eq!(got, [0, 0], "CA status events after the {field} put");
-        assert_eq!(
-            passes,
-            [false, true],
-            "a pass 450 ms and 600 ms after one, after the {field} put"
+        assert!(
+            seen.len() > 1,
+            "no pass 600 ms after one, after the {field} put"
         );
+        passes.extend(seen);
     }
+    assert_no_pass_early(armed, &passes);
 }

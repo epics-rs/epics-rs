@@ -1988,15 +1988,20 @@ mod tests {
         assert!(!ev.try_wait(), "the waiter consumed the signal");
     }
 
-    /// The waiter is seen parked on the condition variable's futex before
-    /// the lock is taken and held past its deadline, so its wait times out
-    /// with the event full, whatever the scheduling.
+    /// A thread in `wait_timeout(timeout)` on a new event, returned once it
+    /// is seen parked on the condition variable's futex, with the span its
+    /// wait began in: its deadline is that span plus `timeout`.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn epics_event_signal_landing_with_the_timeout_is_left_for_the_next_wait() {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    fn parked_waiter(
+        timeout: std::time::Duration,
+    ) -> (
+        std::sync::Arc<EpicsEvent>,
+        std::thread::JoinHandle<bool>,
+        std::ops::Range<std::time::Instant>,
+    ) {
         let ev = std::sync::Arc::new(EpicsEvent::new());
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let spawned = std::time::Instant::now();
         let waiter = {
             let ev = ev.clone();
             std::thread::spawn(move || {
@@ -2004,7 +2009,7 @@ mod tests {
                 tid_tx
                     .send(unsafe { libc::syscall(libc::SYS_gettid) })
                     .unwrap();
-                ev.wait_timeout(TIMEOUT.as_secs_f64())
+                ev.wait_timeout(timeout.as_secs_f64())
             })
         };
         let tid = tid_rx.recv().unwrap();
@@ -2026,18 +2031,49 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let seen = std::time::Instant::now();
+        (ev, waiter, spawned..std::time::Instant::now())
+    }
+
+    /// The lock is taken and held past the parked waiter's deadline, so its
+    /// wait times out with the event full, whatever the scheduling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epics_event_signal_landing_with_the_timeout_is_left_for_the_next_wait() {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let (ev, waiter, began) = parked_waiter(TIMEOUT);
         let mut full = ev.lock();
         assert!(
             !waiter.is_finished(),
             "inconclusive: the waiter timed out before the lock"
         );
-        let past_deadline = seen + TIMEOUT + std::time::Duration::from_millis(100);
+        let past_deadline = began.end + TIMEOUT + std::time::Duration::from_millis(100);
         std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
         *full = true;
         drop(full);
         ev.cv.notify_one();
         assert!(!waiter.join().unwrap(), "C: epicsEventWaitTimeout");
         assert!(ev.try_wait(), "C: the signal is left for the next wait");
+    }
+
+    /// Notified before its deadline but given the lock back only after it:
+    /// `pthread_cond_timedwait` returns 0 there, not ETIMEDOUT, so C takes
+    /// the signal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epics_event_signal_before_the_deadline_is_taken_however_late_the_lock() {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+        let (ev, waiter, began) = parked_waiter(TIMEOUT);
+        let mut full = ev.lock();
+        *full = true;
+        ev.cv.notify_one();
+        assert!(
+            began.start.elapsed() < TIMEOUT,
+            "inconclusive: notified after the deadline"
+        );
+        let past_deadline = began.end + TIMEOUT + std::time::Duration::from_millis(20);
+        std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
+        drop(full);
+        assert!(waiter.join().unwrap(), "C: epicsEventOK");
+        assert!(!ev.try_wait(), "C: the signal was consumed");
     }
 }

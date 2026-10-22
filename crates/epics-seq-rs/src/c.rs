@@ -1454,9 +1454,16 @@ mod tests {
 
     #[test]
     fn atoi_is_strtol_cut_to_int() {
+        use std::ffi::c_long;
         assert_eq!(atoi(" -42abc"), -42);
         assert_eq!(atoi("x1"), 0);
-        assert_eq!(atoi("2147483648"), i32::MIN);
+        // A 64-bit `long` wraps when cut to int; a 32-bit one saturates.
+        let past_int = if c_long::BITS == 64 {
+            i32::MIN
+        } else {
+            i32::MAX
+        };
+        assert_eq!(atoi("2147483648"), past_int);
         let v = <SeqVar<SeqString>>::zeroed();
         strcpy(&v, "4");
         assert_eq!(atoi(&v), 4);

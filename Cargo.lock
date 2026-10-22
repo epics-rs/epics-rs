@@ -1259,6 +1259,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-seq-rs"
+version = "0.32.0"
+dependencies = [
+ "async-trait",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "epics-libcom-rs",
+ "epics-macros-rs",
+ "fact-budget",
+ "libc",
+ "parking_lot",
+ "serial_test",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "epics-stream-rs"
 version = "0.32.0"
 dependencies = [

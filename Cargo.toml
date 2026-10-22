@@ -15,6 +15,7 @@ default-members = [
     "crates/std-rs",
     "crates/scaler-rs",
     "crates/sscan-rs",
+    "crates/epics-seq-rs",
     "crates/stream-rs",
     "crates/optics-rs",
     "crates/mca-rs",
@@ -75,6 +76,7 @@ epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.32.0" }
 epics-rtems-boot = { path = "crates/epics-rtems-boot", version = "0.32.0" }
 epics-libcom-rs = { path = "crates/epics-libcom-rs", version = "0.32.0" }
 epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.32.0" }
+epics-seq-rs = { path = "crates/epics-seq-rs", version = "0.32.0" }
 epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.32.0" }
 motor-rs = { path = "crates/motor-rs", version = "0.32.0" }
 std-rs = { path = "crates/std-rs", version = "0.32.0" }

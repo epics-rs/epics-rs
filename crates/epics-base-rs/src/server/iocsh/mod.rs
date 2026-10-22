@@ -1370,13 +1370,16 @@ impl IocShell {
         use std::io::{BufRead, Write};
         let (_, prompt) = iocsh_prompt();
         let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
         let mut line = Vec::new();
         loop {
             print!("{prompt}");
             let _ = std::io::stdout().flush();
             line.clear();
-            match handle.read_until(b'\n', &mut line) {
+            // Locked for the read only — a match scrutinee would keep the
+            // lock through the arms — so a command that reads stdin takes the
+            // next script line from the same buffer, as from C's one `FILE`.
+            let read = stdin.lock().read_until(b'\n', &mut line);
+            match read {
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     let trimmed = line.trim_ascii();

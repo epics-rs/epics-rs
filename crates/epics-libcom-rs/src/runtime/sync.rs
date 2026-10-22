@@ -908,43 +908,139 @@ pub fn osd_show_all_line() -> &'static str {
 /// [`wait`](StartWait::wait)s until the started thread drops its
 /// [`StartSignal`], which a panic in its startup does too.
 ///
-/// A `Mutex` + `Condvar` rather than [`Event`] or a channel, because those
+/// An [`EpicsEvent`] rather than [`Event`] or a channel, because those
 /// sleep in `thread::park`, which swallows any unpark meant for the
 /// spawner's own future — a spawner inside a `park_on` poll would lose
 /// that wake and park for good.
 pub fn start_latch() -> (StartSignal, StartWait) {
-    let shared = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    (StartSignal(shared.clone()), StartWait(shared))
+    let event = std::sync::Arc::new(EpicsEvent::new());
+    (StartSignal(event.clone()), StartWait(event))
 }
 
 /// The started thread's half of [`start_latch`]; dropping it releases the
 /// spawner.
-pub struct StartSignal(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+pub struct StartSignal(std::sync::Arc<EpicsEvent>);
 
 impl Drop for StartSignal {
     fn drop(&mut self) {
-        let (started, cv) = &*self.0;
-        *started
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        cv.notify_one();
+        self.0.signal();
     }
 }
 
 /// The spawner's half of [`start_latch`].
-pub struct StartWait(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+pub struct StartWait(std::sync::Arc<EpicsEvent>);
 
 impl StartWait {
     /// Block until the [`StartSignal`] is dropped.
     pub fn wait(self) {
-        let (started, cv) = &*self.0;
-        let guard = started
+        self.0.wait();
+    }
+}
+
+/// C `epicsEventId` as `osdEvent.c` builds it: a binary latch over a mutex
+/// and a condition variable. [`signal`](Self::signal) with no waiter is kept
+/// for the next wait, and two signals before a wait are one — unlike
+/// [`Event`], which is a condition wait and keeps nothing. Any number of
+/// threads may wait; each signal releases one.
+///
+/// The lock is held only to flip the latch. It is std's, not the
+/// priority-inheriting mutex C's is (`osdEvent.c:54`).
+pub struct EpicsEvent {
+    full: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+/// `convertDoubleToWakeTime`'s cap on a timeout: ten years
+/// (`osdTime.cpp:97-100`).
+const EPICS_EVENT_MAX_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 3652.5;
+
+impl EpicsEvent {
+    /// `epicsEventCreate(epicsEventEmpty)`.
+    pub const fn new() -> Self {
+        EpicsEvent {
+            full: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.full
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        drop(
-            cv.wait_while(guard, |started| !*started)
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `epicsEventSignal`.
+    pub fn signal(&self) {
+        *self.lock() = true;
+        self.cv.notify_one();
+    }
+
+    /// `epicsEventMustWait`: until signalled, consuming the signal.
+    pub fn wait(&self) {
+        let mut full = self.lock();
+        while !*full {
+            full = self
+                .cv
+                .wait(full)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *full = false;
+    }
+
+    /// `epicsEventWaitWithTimeout`: true when signalled, consuming the
+    /// signal; false at the timeout, with a signal that lands with it left
+    /// for the next wait, as C (`osdEvent.c:134-138`). `secs` at or below 0, or NaN, polls; above
+    /// ten years it is ten years, as C caps it.
+    pub fn wait_timeout(&self, secs: f64) -> bool {
+        let secs = if secs.is_nan() {
+            0.0
+        } else {
+            secs.clamp(0.0, EPICS_EVENT_MAX_TIMEOUT)
+        };
+        let Some(deadline) =
+            std::time::Instant::now().checked_add(std::time::Duration::from_secs_f64(secs))
+        else {
+            self.wait();
+            return true;
+        };
+        let mut full = self.lock();
+        while !*full {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, wait) = self
+                .cv
+                .wait_timeout(full, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            full = guard;
+            // C's ETIMEDOUT branch: a timed-out wait is a timeout even when
+            // the event filled with it.
+            if wait.timed_out() {
+                return false;
+            }
+        }
+        *full = false;
+        true
+    }
+
+    /// `epicsEventTryWait`: [`wait_timeout`](Self::wait_timeout) with 0.
+    pub fn try_wait(&self) -> bool {
+        self.wait_timeout(0.0)
+    }
+}
+
+impl Default for EpicsEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for EpicsEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpicsEvent")
+            .field("full", &*self.lock())
+            .finish()
     }
 }
 
@@ -1812,5 +1908,134 @@ mod tests {
             t0.elapsed() < std::time::Duration::from_secs(1),
             "the start wait consumed the thread's unpark"
         );
+    }
+
+    #[test]
+    fn epics_event_keeps_a_signal_made_before_the_wait() {
+        let ev = EpicsEvent::new();
+        ev.signal();
+        assert!(
+            ev.wait_timeout(0.0),
+            "epicsEventSignal with no waiter is kept"
+        );
+    }
+
+    #[test]
+    fn epics_event_two_signals_before_a_wait_are_one() {
+        let ev = EpicsEvent::new();
+        ev.signal();
+        ev.signal();
+        ev.wait();
+        assert!(
+            !ev.try_wait(),
+            "the event is binary: the second signal is not banked"
+        );
+    }
+
+    #[test]
+    fn epics_event_zero_negative_or_nan_timeout_polls() {
+        let ev = EpicsEvent::new();
+        for secs in [0.0, -1.0, f64::NAN] {
+            let t0 = std::time::Instant::now();
+            assert!(!ev.wait_timeout(secs));
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(1),
+                "{secs} did not poll"
+            );
+            ev.signal();
+            assert!(ev.wait_timeout(secs), "{secs} missed a kept signal");
+        }
+        assert!(!ev.try_wait());
+        ev.signal();
+        assert!(ev.try_wait());
+        assert!(!ev.try_wait(), "try_wait consumes the signal");
+    }
+
+    #[test]
+    fn epics_event_unsignalled_wait_times_out_after_its_timeout() {
+        let ev = EpicsEvent::new();
+        let t0 = std::time::Instant::now();
+        assert!(!ev.wait_timeout(0.05));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn epics_event_timeout_past_ten_years_waits_for_the_signal() {
+        let ev = std::sync::Arc::new(EpicsEvent::new());
+        let signaller = {
+            let ev = ev.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                ev.signal();
+            })
+        };
+        assert!(ev.wait_timeout(f64::INFINITY));
+        signaller.join().unwrap();
+    }
+
+    #[test]
+    fn epics_event_signal_from_another_thread_ends_a_wait() {
+        let ev = std::sync::Arc::new(EpicsEvent::new());
+        let waiter = {
+            let ev = ev.clone();
+            std::thread::spawn(move || ev.wait())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ev.signal();
+        waiter.join().unwrap();
+        assert!(!ev.try_wait(), "the waiter consumed the signal");
+    }
+
+    /// The waiter is seen parked on the condition variable's futex before
+    /// the lock is taken and held past its deadline, so its wait times out
+    /// with the event full, whatever the scheduling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epics_event_signal_landing_with_the_timeout_is_left_for_the_next_wait() {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let ev = std::sync::Arc::new(EpicsEvent::new());
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let ev = ev.clone();
+            std::thread::spawn(move || {
+                // SAFETY: `gettid` takes no arguments and cannot fail.
+                tid_tx
+                    .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                    .unwrap();
+                ev.wait_timeout(TIMEOUT.as_secs_f64())
+            })
+        };
+        let tid = tid_rx.recv().unwrap();
+        let cv = std::ptr::addr_of!(ev.cv) as usize;
+        let cv = cv..cv + std::mem::size_of::<std::sync::Condvar>();
+        let parked = || {
+            let line = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall"))
+                .expect("read the waiter's syscall");
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|a| usize::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+                .is_some_and(|a| cv.contains(&a))
+        };
+        let t0 = std::time::Instant::now();
+        while !parked() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "the waiter never parked"
+            );
+            std::thread::yield_now();
+        }
+        let seen = std::time::Instant::now();
+        let mut full = ev.lock();
+        assert!(
+            !waiter.is_finished(),
+            "inconclusive: the waiter timed out before the lock"
+        );
+        let past_deadline = seen + TIMEOUT + std::time::Duration::from_millis(100);
+        std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
+        *full = true;
+        drop(full);
+        ev.cv.notify_one();
+        assert!(!waiter.join().unwrap(), "C: epicsEventWaitTimeout");
+        assert!(ev.try_wait(), "C: the signal is left for the next wait");
     }
 }

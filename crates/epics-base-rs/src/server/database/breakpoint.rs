@@ -63,11 +63,12 @@
 //! nobody is debugging pays one relaxed atomic load where C pays one
 //! comparison.
 
+use crate::runtime::sync::EpicsEvent;
 use crate::types::RecordName;
 use epics_libcom_rs::cfmt::CFloat;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::PvDatabase;
@@ -150,36 +151,10 @@ struct LockSet {
     cont: Option<Arc<AtomicU64>>,
     /// C `pnode->ex_sem`, the execution semaphore: signalled when an entry
     /// point is scheduled, and by `dbd` when the last breakpoint goes so the
-    /// thread wakes to find its loop condition false.
-    ex: Arc<BinarySemaphore>,
-}
-
-/// C `epicsEventCreate(epicsEventEmpty)` — a binary semaphore. Signalling one
-/// that is already full is a no-op, and that idempotence is load-bearing: C
-/// signals `ex_sem` once per scheduling and the continuation task answers by
-/// walking the whole queue, so two signals before one pass must not produce
-/// two passes.
-#[derive(Default)]
-struct BinarySemaphore {
-    full: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl BinarySemaphore {
-    fn signal(&self) {
-        let mut full = self.full.lock().expect("breakpoint semaphore poisoned");
-        *full = true;
-        self.cv.notify_one();
-    }
-
-    /// C `epicsEventMustWait`.
-    fn wait(&self) {
-        let mut full = self.full.lock().expect("breakpoint semaphore poisoned");
-        while !*full {
-            full = self.cv.wait(full).expect("breakpoint semaphore poisoned");
-        }
-        *full = false;
-    }
+    /// thread wakes to find its loop condition false. That it is binary is
+    /// load-bearing: one pass walks the whole queue, so two signals before
+    /// it must not make two passes.
+    ex: Arc<EpicsEvent>,
 }
 
 /// C `epicsThreadResume(pnode->taskid)` — what `dbc` (`dbBkpt.c:518`), `dbs`
@@ -568,7 +543,7 @@ impl BreakpointTable {
                     ep_queue: Vec::new(),
                     step: false,
                     cont: None,
-                    ex: Arc::new(BinarySemaphore::default()),
+                    ex: Arc::new(EpicsEvent::new()),
                 });
                 stack.sets.len() - 1
             }
@@ -871,7 +846,7 @@ pub fn toggle_autoprint(db: &PvDatabase, record: impl AsRef<[u8]>) -> Result<Str
 /// the publication has to happen on the thread — the `EPICS ID` is assigned by
 /// the thread's own registry prologue, so `dbb` cannot know it at spawn.
 pub struct BinarySemaphoreHandle {
-    ex: Arc<BinarySemaphore>,
+    ex: Arc<EpicsEvent>,
     taskid: Arc<AtomicU64>,
 }
 
@@ -1261,12 +1236,12 @@ mod tests {
     /// where the park now lives.
     #[test]
     fn the_execution_semaphore_banks_a_signal() {
-        let ex = Arc::new(BinarySemaphore::default());
+        let ex = EpicsEvent::new();
         ex.signal();
         ex.signal();
         ex.wait(); // returns: the signal was banked
         assert!(
-            !*ex.full.lock().expect("sem"),
+            !ex.try_wait(),
             "epicsEventSignal is binary: two signals before one wait are one pass"
         );
     }

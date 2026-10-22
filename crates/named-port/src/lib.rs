@@ -245,12 +245,19 @@ fn port_is_held(ty: Type, port: u16) -> bool {
 /// dials the number itself. Probed, released and rebound, the number is free
 /// for any socket on the box in between — under load an outgoing connect's
 /// source port — and the subject then falls back, fails, or reaches a
-/// stranger. The hold never listens and is never handed out by `bind(0)` or
-/// `connect()`; what else may bind beside it is the constructor's choice.
+/// stranger. The hold never listens and is never handed out by a plain
+/// `bind(0)` or by `connect()`; what else may bind beside it is the
+/// constructor's choice.
 pub struct HeldPort {
-    _hold: Socket,
+    /// The hold, then any socket that keeps it in place (its peer).
+    holds: Vec<Socket>,
     pub port: u16,
 }
+
+/// Darwin and the BSDs hand a SYN for the number to a bound socket that is
+/// not listening and drop it there (`tcp_input`: `TCPS_CLOSED`), so a connect
+/// times out instead of being refused. Their lookup skips a connected socket.
+const SYN_REACHES_A_BOUND_HOLD: bool = cfg!(all(unix, not(target_os = "linux")));
 
 impl HeldPort {
     /// A TCP number for a listener under test, which binds beside the hold:
@@ -296,11 +303,19 @@ impl HeldPort {
         Self::bind(hold)
     }
 
-    /// A TCP number nothing answers on: a connect is refused, and no other
-    /// socket binds it (unix: the hold sets no reuse option; Windows:
-    /// `SO_EXCLUSIVEADDRUSE`).
+    /// A TCP number nothing answers on: a connect is refused, and no plain
+    /// bind takes it (unix: the hold sets no reuse option; Windows:
+    /// `SO_EXCLUSIVEADDRUSE`, which refuses every other bind). Darwin and
+    /// the BSDs: connected to a loopback peer it keeps
+    /// ([`SYN_REACHES_A_BOUND_HOLD`]), so there an `SO_REUSEADDR` bind, whose
+    /// lookup sees only unconnected sockets, is not refused.
     pub fn closed_tcp() -> Self {
-        Self::closed(Type::STREAM)
+        let held = Self::closed(Type::STREAM);
+        if SYN_REACHES_A_BOUND_HOLD {
+            held.connected()
+        } else {
+            held
+        }
     }
 
     /// [`HeldPort::closed_tcp`] for UDP: a datagram sent to it is absorbed
@@ -325,7 +340,20 @@ impl HeldPort {
             .as_socket()
             .expect("an inet address")
             .port();
-        Self { _hold: hold, port }
+        Self {
+            holds: vec![hold],
+            port,
+        }
+    }
+
+    /// The TCP hold connected to a loopback peer, which is kept beside it.
+    fn connected(mut self) -> Self {
+        let peer = TcpListener::bind("127.0.0.1:0").expect("bind the hold's peer");
+        let at = peer.local_addr().expect("read the peer's port");
+        self.holds[0].connect(&at.into()).expect("connect the hold");
+        let (accepted, _) = peer.accept().expect("accept the hold");
+        self.holds.push(accepted.into());
+        self
     }
 }
 
@@ -446,15 +474,19 @@ mod tests {
         assert!(plain_bind(Type::DGRAM, [0, 0, 0, 0], held.port).is_err());
     }
 
-    /// A closed hold refuses a connect and every bind, a listener's
-    /// `SO_REUSEADDR` one included.
+    /// A closed hold refuses a connect and every plain bind; a listener's
+    /// `SO_REUSEADDR` one too, except beside Darwin's connected hold.
     #[test]
     fn a_closed_hold_answers_nothing_and_shares_with_nobody() {
         let tcp = HeldPort::closed_tcp();
         let refused = std::net::TcpStream::connect(("127.0.0.1", tcp.port)).unwrap_err();
         assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
-        assert!(TcpListener::bind(("127.0.0.1", tcp.port)).is_err());
+        assert_eq!(
+            TcpListener::bind(("127.0.0.1", tcp.port)).is_err(),
+            !SYN_REACHES_A_BOUND_HOLD
+        );
         assert!(plain_bind(Type::STREAM, [0, 0, 0, 0], tcp.port).is_err());
+        assert!(plain_bind(Type::STREAM, [127, 0, 0, 1], tcp.port).is_err());
 
         let udp = HeldPort::closed_udp();
         assert!(UdpSocket::bind(("127.0.0.1", udp.port)).is_err());

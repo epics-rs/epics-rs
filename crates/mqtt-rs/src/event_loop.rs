@@ -1638,7 +1638,7 @@ mod tests {
     /// between phases is free for any socket on the box to take — under load,
     /// an outgoing connect's source port — and the next bind then fails.
     struct BrokerPort {
-        _hold: socket2::Socket,
+        _hold: (socket2::Socket, std::net::TcpStream),
         addr: SocketAddr,
     }
 
@@ -1653,7 +1653,16 @@ mod tests {
             hold.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
                 .unwrap();
             let addr = hold.local_addr().unwrap().as_socket().unwrap();
-            Self { _hold: hold, addr }
+            // Connected to a peer it keeps: Darwin and the BSDs hand a SYN to
+            // a bound socket that is not listening and drop it there, so the
+            // connect would time out instead of being refused.
+            let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            hold.connect(&peer.local_addr().unwrap().into()).unwrap();
+            let (peer, _) = peer.accept().unwrap();
+            Self {
+                _hold: (hold, peer),
+                addr,
+            }
         }
 
         fn socket() -> socket2::Socket {
@@ -1676,26 +1685,28 @@ mod tests {
 
     /// The release-and-rebind this replaces lost the number to a socket that
     /// took it in between; held, no plain bind can take it, and the broker
-    /// still comes up on it (refused, up, refused, up).
+    /// still comes up on it (refused, up, refused, up). Plain: no reuse
+    /// option, as a `connect()`'s implicit bind; Darwin's lookup for an
+    /// `SO_REUSEADDR` one skips the connected hold.
     #[tokio::test]
     async fn a_held_broker_port_keeps_its_number_between_sessions() {
         let port = BrokerPort::new();
         let refused = || std::net::TcpStream::connect(port.addr).unwrap_err().kind();
+        let plain_bind = || {
+            BrokerPort::socket()
+                .bind(&port.addr.into())
+                .unwrap_err()
+                .kind()
+        };
         assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
-        assert_eq!(
-            std::net::TcpListener::bind(port.addr).unwrap_err().kind(),
-            io::ErrorKind::AddrInUse
-        );
+        assert_eq!(plain_bind(), io::ErrorKind::AddrInUse);
         for _ in 0..2 {
             let listener = port.listen();
             let client = tokio::net::TcpStream::connect(port.addr).await.unwrap();
             let (served, _) = listener.accept().await.unwrap();
             drop((listener, served, client));
             assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
-            assert_eq!(
-                std::net::TcpListener::bind(port.addr).unwrap_err().kind(),
-                io::ErrorKind::AddrInUse
-            );
+            assert_eq!(plain_bind(), io::ErrorKind::AddrInUse);
         }
     }
 

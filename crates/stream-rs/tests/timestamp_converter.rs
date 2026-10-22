@@ -123,7 +123,7 @@ fn check(keep: impl Fn(&str) -> bool, cut: impl Fn(&str) -> String) {
         if !keep(case) {
             continue;
         }
-        let (want, got) = (cut(want), cut(&run(case)));
+        let (want, got) = (cut(&as_on_this_libc(case, want)), cut(&run(case)));
         if got != want {
             failed.push(format!(
                 "{}\n   C: {want}\n  rs: {got}",
@@ -134,6 +134,40 @@ fn check(keep: impl Fn(&str) -> bool, cut: impl Fn(&str) -> String) {
     }
     assert!(n > 0);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// `timestamp.in` print lines that are the C library's strftime, as C
+/// prints them on macOS: its strftime leaves out the '%' of a conversion
+/// it does not know, has no field width, and pads %F's year to 4 digits.
+/// The case, then `ok` and the output.
+const MACOS_STRFTIME: &[(&str, i32, &str)] = &[
+    ("%T(%3d)\t0", 1, "3d"),
+    ("%T(%.x)\t0", 1, ".x"),
+    ("%T(%.3x)\t0", 1, ".3x"),
+    // No "%0" is left for printDouble to refuse.
+    ("%T(%0)\t0", 1, "0"),
+    ("%T(%Ey %Od %q)\t1700000000", 1, "23 14 q"),
+    ("%T(%F)\t-62135596800", 1, "0001-01-01"),
+];
+
+/// The C line, which is glibc's, as this OS's C library makes it.
+fn as_on_this_libc(case: &str, c_line: &str) -> String {
+    let this_libc: &[(&str, i32, &str)] = if cfg!(target_vendor = "apple") {
+        MACOS_STRFTIME
+    } else {
+        &[]
+    };
+    match this_libc
+        .iter()
+        .find(|(c, _, _)| case.strip_prefix("pd\t") == Some(c))
+    {
+        Some(&(_, ok, out)) => {
+            let head = &c_line[..c_line.find(" ok=").unwrap()];
+            let err = &c_line[c_line.find(" err=").unwrap()..];
+            format!("{head} ok={ok} out={}{err}", hex(out.as_bytes()))
+        }
+        None => c_line.to_string(),
+    }
 }
 
 /// What `parse` left: the line up to the print or scan result, or all of a

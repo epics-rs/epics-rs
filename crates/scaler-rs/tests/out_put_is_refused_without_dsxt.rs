@@ -38,7 +38,8 @@ record(scaler, "SC") {
 fn run(shell: &IocShell, line: &str) -> String {
     let out = std::env::temp_dir().join(format!("scaler-dsxt-{}", std::process::id()));
     shell
-        .execute_line(format!("{line} > {}", out.display()))
+        // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
+        .execute_line(format!("{line} > \"{}\"", out.display()))
         .unwrap();
     let text = std::fs::read_to_string(&out).unwrap();
     std::fs::remove_file(&out).unwrap();

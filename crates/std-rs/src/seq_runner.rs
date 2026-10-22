@@ -1,9 +1,9 @@
 //! SNL program launcher for the std module — the Rust stand-in for C's
 //! `seq &program, "macros"`.
 //!
-//! Each `snl` module here is a pure state machine plus a `run(config, db)`
-//! that gives it PVs; this is the one place that turns a program name and a
-//! macro string into the right pair. An IOC binary reaches it with a single
+//! Each `snl` module here is a program snc-rs compiled from the upstream
+//! `.st`; this is the one place that turns a program name and a macro string
+//! into `epics_seq_rs::seq`. An IOC binary reaches it with a single
 //! `seqStart` startup command, the same shape
 //! `optics_rs::seq_runner::seq_start` is registered with.
 
@@ -14,7 +14,6 @@
 // test's own `Runtime::new`, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::{SeqMacros, spawn_program};
 
 /// Start a std-module SNL program by name, its macros parsed over the
 /// program's `program` parameters as `seq` does, so one left out takes the
@@ -31,33 +30,17 @@ use epics_base_rs::server::snl::{SeqMacros, spawn_program};
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    bridge: &epics_base_rs::runtime::task::BlockingBridge,
+    _bridge: &epics_base_rs::runtime::task::BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
     match program {
         "delayDo" => {
-            let m = SeqMacros::new("name=delayDo,P=xxx:,R=delayDo1", macro_str);
-            let v = |name| m.value(name).unwrap_or_default();
-            let config = crate::snl::delay_do::DelayDoConfig::new(v("P"), v("R"));
-            spawn_program(bridge, db, "delayDo", &m, move |db| {
-                crate::snl::delay_do::run(config, db)
-            });
+            epics_seq_rs::seq(&crate::snl::delay_do::delayDo, macro_str, 0, db)
+                .ok_or_else(|| "seq: delayDo refused to start".to_string())?;
         }
         "femto" => {
-            let m = SeqMacros::new("name=femto,P=,H=,F=,G1=,G2=,G3=,NO=", macro_str);
-            let v = |name| m.value(name).unwrap_or_default();
-            let config = crate::snl::femto::FemtoConfig::new(
-                v("P"),
-                v("H"),
-                v("F"),
-                v("G1"),
-                v("G2"),
-                v("G3"),
-                v("NO"),
-            );
-            spawn_program(bridge, db, "femto", &m, move |db| {
-                crate::snl::femto::run(config, db)
-            });
+            epics_seq_rs::seq(&crate::snl::femto::femto, macro_str, 0, db)
+                .ok_or_else(|| "seq: femto refused to start".to_string())?;
         }
         other => return Err(format!("Can't find sequencer `{other}'.")),
     }

@@ -281,7 +281,7 @@ impl HeldPort {
     /// subject's `SO_REUSEPORT` group, so unicast goes to the later-bound
     /// subject and none is hashed to the hold. Darwin and the BSDs share a
     /// UDP address only when both sides set `SO_REUSEPORT`, and the hold is
-    /// connected ([`BSD_PCB_LOOKUP`]); a plain bind on another address then
+    /// connected (`BSD_PCB_LOOKUP`); a plain bind on another address then
     /// binds there, and cannot fail the subject's: their `SO_REUSEADDR`
     /// bind looks only at unconnected sockets on its own address. Windows
     /// hands unicast to the older of two `SO_REUSEADDR` wildcard binds, and
@@ -323,7 +323,7 @@ impl HeldPort {
     /// bind takes it (unix: the hold sets no reuse option; Windows:
     /// `SO_EXCLUSIVEADDRUSE`, which refuses every other bind). Darwin and
     /// the BSDs: connected to a loopback peer it keeps
-    /// ([`BSD_PCB_LOOKUP`]), so there an `SO_REUSEADDR` bind, whose
+    /// (`BSD_PCB_LOOKUP`), so there an `SO_REUSEADDR` bind, whose
     /// lookup sees only unconnected sockets, is not refused.
     pub fn closed_tcp() -> Self {
         let held = Self::closed(Type::STREAM);

@@ -185,6 +185,10 @@ impl StreamIo<'_> {
     }
 
     /// `streamPrintf(record, format, long)`: [`OK`] or [`ERROR`].
+    ///
+    /// `long` is 64 bits on every OS. C bug not copied: on LLP64 Windows
+    /// C's `long` is 32 bits, so its `(long)` casts cut an int64 value
+    /// that C on Linux prints whole.
     pub fn printf_long(&self, format: &Format<'_>, value: i64) -> i64 {
         self.print(format, |c| match format.type_ {
             Dbf::Ulong | Dbf::Long | Dbf::Enum => c.print_value_long(format.priv_, value),

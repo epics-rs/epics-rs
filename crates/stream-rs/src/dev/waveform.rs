@@ -40,15 +40,6 @@ fn dbf_name(ftvl: Ftype) -> String {
     format!("DBF_{}", MENU_FTYPE[ftvl.index() as usize])
 }
 
-/// C's `(long)`: 32 bits where `long` is
-fn c_long(v: i64) -> i64 {
-    if size_of::<std::ffi::c_long>() == 4 {
-        v as i32 as i64
-    } else {
-        v
-    }
-}
-
 fn read_data(
     io: &StreamIo<'_>,
     record: &mut dyn Record,
@@ -214,8 +205,8 @@ fn write_data(
             }
             Dbf::Long | Dbf::Ulong | Dbf::Enum => {
                 let lval = match &wf.val {
-                    EpicsValue::Int64Array(a) => c_long(a.as_slice()[nowd]),
-                    EpicsValue::UInt64Array(a) => c_long(a.as_slice()[nowd] as i64),
+                    EpicsValue::Int64Array(a) => a.as_slice()[nowd],
+                    EpicsValue::UInt64Array(a) => a.as_slice()[nowd] as i64,
                     EpicsValue::LongArray(a) => a.as_slice()[nowd] as i64,
                     EpicsValue::ULongArray(a) => a.as_slice()[nowd] as i64,
                     EpicsValue::ShortArray(a) => a.as_slice()[nowd] as i64,

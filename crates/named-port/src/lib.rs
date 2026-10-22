@@ -332,9 +332,25 @@ impl HeldPort {
     }
 
     /// [`HeldPort::closed_tcp`] for UDP: a datagram sent to it is absorbed
-    /// and never answered.
+    /// and never answered, and no other socket binds it on loopback or the
+    /// wildcard. Darwin and the BSDs: an `SO_REUSEADDR` bind there conflicts
+    /// only with a socket on its own address, so the hold is a plain socket
+    /// on loopback and, beside it, one on the wildcard with `SO_REUSEADDR`
+    /// alone, which refuses every bind short of both sides setting
+    /// `SO_REUSEPORT`.
     pub fn closed_udp() -> Self {
-        Self::closed(Type::DGRAM)
+        if !BSD_PCB_LOOKUP {
+            return Self::closed(Type::DGRAM);
+        }
+        let lo = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a closed hold");
+        let mut held = Self::bind_on(lo, Ipv4Addr::LOCALHOST);
+        let any = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a closed hold");
+        any.set_reuse_address(true)
+            .expect("SO_REUSEADDR on the hold");
+        any.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, held.port)).into())
+            .expect("bind the wildcard hold");
+        held.holds.push(any);
+        held
     }
 
     fn closed(ty: Type) -> Self {
@@ -345,8 +361,12 @@ impl HeldPort {
     }
 
     fn bind(hold: Socket) -> Self {
-        let any = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-        hold.bind(&any.into()).expect("bind the hold");
+        Self::bind_on(hold, Ipv4Addr::UNSPECIFIED)
+    }
+
+    fn bind_on(hold: Socket, ip: Ipv4Addr) -> Self {
+        let at = SocketAddr::from((ip, 0));
+        hold.bind(&at.into()).expect("bind the hold");
         let port = hold
             .local_addr()
             .expect("read the held port")
@@ -513,15 +533,18 @@ mod tests {
 
         let udp = HeldPort::closed_udp();
         assert!(UdpSocket::bind(("127.0.0.1", udp.port)).is_err());
-        let fanout = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
-        fanout.set_reuse_address(true).unwrap();
-        #[cfg(unix)]
-        fanout.set_reuse_port(true).unwrap();
-        assert!(
-            fanout
-                .bind(&SocketAddr::from(([127, 0, 0, 1], udp.port)).into())
-                .is_err()
-        );
+        for ip in [[127, 0, 0, 1], [0, 0, 0, 0]] {
+            let fanout = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            fanout.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            fanout.set_reuse_port(true).unwrap();
+            assert!(
+                fanout
+                    .bind(&SocketAddr::from((ip, udp.port)).into())
+                    .is_err(),
+                "{ip:?}"
+            );
+        }
     }
 
     /// The winning attempt's value comes back, and no further candidate is

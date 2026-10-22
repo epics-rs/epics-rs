@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::crt_errno;
 use parking_lot::Mutex;
 
-use super::write_xdr::{Xdr, strerror};
+use super::write_xdr::Xdr;
 
 /// `FILE_FORMAT_VERSION`.
 pub const FILE_FORMAT_VERSION: f32 = 1.4;
@@ -296,7 +297,7 @@ pub fn file_status(fname: &str) -> std::io::Result<()> {
         if DEBUG_SAVE_DATA.load(Ordering::Relaxed) != 0 {
             println!(
                 "saveData: stat returned -1 for filename '{local}'; errno={}",
-                e.raw_os_error().unwrap_or(0)
+                crt_errno::errno(e).unwrap_or(0)
             );
         }
     })
@@ -305,7 +306,7 @@ pub fn file_status(fname: &str) -> std::io::Result<()> {
 type MdaFile = Xdr<BufWriter<File>>;
 
 fn errno_text(e: &std::io::Error) -> (i32, String) {
-    (e.raw_os_error().unwrap_or(0), strerror(e))
+    (crt_errno::errno(e).unwrap_or(0), crt_errno::strerror(e))
 }
 
 /// C `fclose` with the retry after 0.1 s: true when the buffered bytes
@@ -1245,5 +1246,15 @@ mod tests {
         ));
         assert_eq!(env.status, STATUS_ERROR);
         assert_eq!(env.messages, ["!! Can't open file gone.mda"]);
+    }
+
+    /// A missing directory is the CRT's ENOENT on Windows too, not
+    /// ERROR_PATH_NOT_FOUND's code and sentence.
+    #[test]
+    fn a_failed_stat_reads_as_c_errno() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone").join("x.mda");
+        let e = file_status(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(errno_text(&e), (2, "No such file or directory".into()));
     }
 }

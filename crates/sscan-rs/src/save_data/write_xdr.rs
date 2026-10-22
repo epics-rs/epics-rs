@@ -6,18 +6,11 @@
 
 use std::io::{self, Seek, SeekFrom, Write};
 
+use epics_libcom_rs::runtime::crt_errno;
+
 /// A file being written in XDR (C's `FILE *fd`).
 pub struct Xdr<W> {
     w: W,
-}
-
-/// C `strerror(errno)`: the OS text without std's `(os error N)` suffix.
-pub(super) fn strerror(e: &io::Error) -> String {
-    let text = e.to_string();
-    match text.rfind(" (os error ") {
-        Some(at) => text[..at].to_string(),
-        None => text,
-    }
 }
 
 /// C `strlen`: the bytes before the first NUL.
@@ -66,8 +59,8 @@ impl<W: Write + Seek> Xdr<W> {
             Err(e) => {
                 println!(
                     "writeXDR_epicsInt32: fwrite failed, status=0, errno={}, ('{}')",
-                    e.raw_os_error().unwrap_or(0),
-                    strerror(&e)
+                    crt_errno::errno(&e).unwrap_or(0),
+                    crt_errno::strerror(&e)
                 );
                 false
             }
@@ -127,8 +120,8 @@ impl<W: Write + Seek> Xdr<W> {
             Err(e) => {
                 println!(
                     "writeXDR_bytes: fwrite failed, status=0, errno={}, ('{}')",
-                    e.raw_os_error().unwrap_or(0),
-                    strerror(&e)
+                    crt_errno::errno(&e).unwrap_or(0),
+                    crt_errno::strerror(&e)
                 );
                 false
             }
@@ -148,8 +141,8 @@ impl<W: Write + Seek> Xdr<W> {
             Err(e) => {
                 println!(
                     "writeXDR_getpos: ftell failed, retval = -1, errno={}, ('{}')",
-                    e.raw_os_error().unwrap_or(0),
-                    strerror(&e)
+                    crt_errno::errno(&e).unwrap_or(0),
+                    crt_errno::strerror(&e)
                 );
                 -1
             }
@@ -162,8 +155,8 @@ impl<W: Write + Seek> Xdr<W> {
         if let Err(e) = self.w.flush() {
             println!(
                 "writeXDR_setpos: fflush failed, status = -1, errno={}, ('{}')",
-                e.raw_os_error().unwrap_or(0),
-                strerror(&e)
+                crt_errno::errno(&e).unwrap_or(0),
+                crt_errno::strerror(&e)
             );
         }
         // A negative offset is fseek's EINVAL.
@@ -176,8 +169,8 @@ impl<W: Write + Seek> Xdr<W> {
             Err(e) => {
                 println!(
                     "writeXDR_setpos: fseek failed, status = -1, errno={}, ('{}')",
-                    e.raw_os_error().unwrap_or(0),
-                    strerror(&e)
+                    crt_errno::errno(&e).unwrap_or(0),
+                    crt_errno::strerror(&e)
                 );
                 false
             }

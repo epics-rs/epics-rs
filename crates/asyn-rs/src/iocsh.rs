@@ -3836,7 +3836,9 @@ mod tests {
             shell.register(def);
         }
         let out = tempfile::NamedTempFile::new().unwrap();
-        let path = out.path().display();
+        // iocsh, as C's, reads an unquoted `\` as an escape (iocsh.cpp:275),
+        // so a Windows path goes in with the `/` Windows also takes.
+        let path = out.path().display().to_string().replace('\\', "/");
         for line in lines {
             shell.execute_line(format!("{line} >> {path}")).unwrap();
         }

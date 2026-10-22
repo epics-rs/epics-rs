@@ -29,7 +29,9 @@ fn redirected(files: &[(&str, &str)], script: &str, names: &[&str]) -> Vec<Strin
     for (name, text) in files {
         std::fs::write(d.join(name), text).unwrap();
     }
-    let d = d.display().to_string();
+    // iocsh, as C's, reads an unquoted `\` as an escape (iocsh.cpp:275), so
+    // a Windows directory goes in with the `/` Windows also takes.
+    let d = d.display().to_string().replace('\\', "/");
     std::fs::write(format!("{d}/st.cmd"), script.replace("{d}", &d)).unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child_script", "--nocapture", "--test-threads=1"])

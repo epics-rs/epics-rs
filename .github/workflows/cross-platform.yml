@@ -74,10 +74,16 @@ jobs:
             # Build 18-26 min + nextest 11-15 min on 4 vCPU: 41 min measured
             # against the 45 min default.
             timeout: 75
+          # Build ~20 min, then nextest ran 13927 of 17023 tests in 25 min
+          # before the 45 min default cancelled the job (run 39710144196).
           - name: windows-x86_64
             os: windows-latest
+            timeout: 90
+            test_timeout: 50
           - name: windows-arm64
             os: windows-11-arm
+            timeout: 90
+            test_timeout: 50
 
     steps:
       - uses: actions/checkout@v4
@@ -146,7 +152,7 @@ jobs:
       # reads epics-base sources directly and this job provisions none.
       # Below the job timeout, so a hang fails this step and the job log is
       # kept; `--status-level slow` is what prints the SLOW line naming a
-      # stuck test (profile.ci stops at `retry`). The slowest cell takes ~15 min.
+      # stuck test (profile.ci stops at `retry`). Unix cells take ~15 min; Windows sets its own.
       - name: Test (nextest)
-        timeout-minutes: 30
+        timeout-minutes: ${{ matrix.test_timeout || 30 }}
         run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci --status-level slow

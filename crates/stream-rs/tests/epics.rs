@@ -816,7 +816,8 @@ async fn shell(db: &Arc<PvDatabase>, line: &str) -> Vec<u8> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let line = format!("{line} > {}", path.display());
+    // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
+    let line = format!("{line} > \"{}\"", path.display());
     let db = db.clone();
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let thread = std::thread::spawn(move || {
@@ -1044,8 +1045,8 @@ fn set_logfile() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let bad = dir.path().join("none/log");
-        shell(&db, &format!("streamSetLogfile {}", log.display())).await;
-        shell(&db, &format!("streamSetLogfile {}", bad.display())).await;
+        shell(&db, &format!("streamSetLogfile \"{}\"", log.display())).await;
+        shell(&db, &format!("streamSetLogfile \"{}\"", bad.display())).await;
         stream_rs::error::stream_error(b"logged\n");
         shell(&db, "streamSetLogfile").await;
         stream_rs::error::stream_error(b"after\n");

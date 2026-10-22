@@ -42,7 +42,8 @@ pub async fn shell(db: &Arc<PvDatabase>, line: &str) -> Vec<u8> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let line = format!("{line} > {}", path.display());
+    // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
+    let line = format!("{line} > \"{}\"", path.display());
     let db = db.clone();
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let thread = std::thread::spawn(move || IocShell::new(db, bridge).execute_line(line).unwrap());

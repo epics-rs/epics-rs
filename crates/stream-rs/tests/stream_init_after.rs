@@ -32,7 +32,7 @@ async fn run() {
         .port(0)
         .startup_line(&format!("dbLoadRecords(\"{}\")", db.display()))
         .startup_line(&format!(
-            "streamReportRecord rec > {}",
+            "streamReportRecord rec > \"{}\"",
             before_init.display()
         ))
         .before_ioc_init(|| IocInitDecision::run(false))

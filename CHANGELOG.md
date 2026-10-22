@@ -1,116 +1,40 @@
 # Changelog
 
-## v0.32.0 — 2026-10-15
+## v0.32.0 — 2026-10-22
 
-Minor release, on the same 1.99.0 toolchain. The record cycle, its monitor
-post and the CA event path are rebuilt to C's shape, and every database
-serves its own local CA links. The breaking changes:
-`IocApplication::register_link_set_installer` becomes
-`register_link_type(key, installer)`, one link set per JSON link type per
-database; `DeviceSupport`'s `WriteCompletion` gives way to `DeviceDone`,
-which also completes the new `read_begin`;
-`CommonFields::time` and `general_time` are a `WallTime`; the process-wide
-`scan_pause`/`scan_run`/`scan_stop` are gone, each database owning its own
-interruptAccept gate; `CaChannel::on_connection_change`,
-`on_access_rights_change` and `EventWatcher` give way to
-`create_channel_with_events`, and CA names are bytes; asyn's `*_blocking`
-helpers are gone and `subscribe_async` returns a per-subscriber ring
-instead of a tokio broadcast; `PriorityInheritanceMutex` is the movable
-form, with `PinnedPriorityInheritanceMutex` beside it; an asyn port is
-built under a `PortClaim` (`claim_port_driver`, then
-`create_port_runtime(&claim, ..)` and `claim.publish`), with
-`PortManager::register_port` taking the claim and `registry::register_port`
-behind `test-support`; `ParamList`'s value getters and setters are
-crate-private, the `*_strict` getters are gone and `get_*_param` returns
-`ParamUndefined` for an unset value; the per-parameter stamps
-(`set_param_timestamp`, `current_timestamp`, `ParamList::set_timestamp` and
-`get_timestamp`) give way to the port's `update_time_stamp`,
-`get_time_stamp` and `set_time_stamp`; `DeviceInitOutcome::Live` splits
-into `Ok(DeviceUdf)` (C status 0) and `DoNotConvert(DeviceUdf)` (C 2),
-with `DeviceInitOutcome::ok()` as the default init's value; and
-`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`.
+Minor release; the pinned toolchain moves 1.99.0 → 1.99.1. The record
+cycle, CA, PVA and asyn follow C and pvxs; sscan and StreamDevice are ported.
 
-### A monitored IOC's realtime tail at C's
+### Breaking
 
-A 2001-record IOC with monitors, under SCHED_FIFO on a PREEMPT_RT host,
-now wakes late as often as C softIoc: over 35 interleaved 60 s rounds the
-count of wakes past 300 us and the p99 do not differ from C's, and the
-mean is 5% above. The cycle takes a `CyclePlan` arm per record shape,
-reads a soft INP at its dset's DBR type off a cached link address, posts
-a fixed `PostLog` into the event queue's ring through a name-keyed
-subscriber list, and prefetches the next record's cycle lines. A CA
-client's updates go out as one send per queue drain, not one per event.
-The release profile is fat LTO with one codegen unit.
+- `IocApplication::register_link_set_installer` → `register_link_type(key, installer)`, one link set per JSON link type per database.
+- `DeviceSupport`: `WriteCompletion` → `DeviceDone`, which also completes `read_begin`; `add_record(&str)` → `add_record(&mut dyn Record)`; `DeviceInitOutcome::Live` → `Ok(DeviceUdf)` / `DoNotConvert(DeviceUdf)`.
+- `Record`: `restamps_time_after_completion`, `stamps_after_write` and `alarms_before_stamp` → `stamp_point()`; `processes_after_put(field)` → `processes_after_put(field, pp)`.
+- `CommonFields::time` and `general_time::get_current`: `SystemTime` → `WallTime`; the process-wide `scan_pause`/`scan_run`/`scan_stop` → each database's own interruptAccept gate.
+- `RecordInstance::invalidate_metadata_cache` removed, CTRL metadata being read from the fields each time; `PvDatabase::find_pv` and `all_record_names` are no longer async.
+- CA client: `CaChannel::on_connection_change`, `on_access_rights_change` and `EventWatcher` → `create_channel_with_events`; CA names are bytes.
+- asyn ports: built under a `PortClaim` (`claim_port_driver`, `create_port_runtime(&claim, ..)`, `claim.publish`) that `PortManager::register_port` takes; `PortDriverBase::new`/`new_exact_flags` and `ADDriverBase::new` take C's interface and interrupt masks, and `ADDriverBase::new` no sensor size.
+- asyn octet reads: `PortDriver::read_octet`/`io_read_octet` `AsynResult<usize>` → `OctetReadResult` and `SyncIO::read_octet`/`write_read` → `OctetRead`, the bytes beside the status; `io_read_octet_eom` and `PartialOctetRead` removed.
+- asyn params: `ParamList`'s value accessors are crate-private, the `*_strict` getters are gone, an unset `get_*_param` → `ParamUndefined`; per-parameter stamps → the port's `update_time_stamp`/`get_time_stamp`/`set_time_stamp`.
+- asyn: the `*_blocking` helpers are gone; `subscribe_async` tokio broadcast → per-subscriber ring; `PortDriver::get_option(key)` → `get_option(user, key)`; `AxisRuntime` and `AsynOctet` removed.
+- motor: `AsynMotor::poll(user) -> MotorStatus` → `poll(user, &mut MotorStatus)` plus a required `poll_failure()`; `MotorPollLoop::run().await` → `start()`.
+- areaDetector: `NDPluginProcess` must declare `INTERFACE_MASK` and `INTERRUPT_MASK`, and `max_addr()` replaces `create_plugin_runtime_multi_addr`; `prepare_array(Arc<NDArray>)` → `prepare_array(DriverArray) -> PublishedArray`; `ADDriver::set_shutter` returns `()`.
+- autosave: `AutosaveBuilder::add_set(cfg)` → `add_set(cfg, SaveStrategy)`; `restore_from_file(db, path)` → `restore_from_file(db, path, RestorePass)`; `CompatMode` and `autosave::iocsh` removed.
+- libcom: `PriorityInheritanceMutex` is the movable form, `PinnedPriorityInheritanceMutex` beside it; `InterruptGate::on_open` callbacks return `EdgeDone`; `scan_once(cb)` → `scan_once(name, cb)`; calc's `cvt::fmt_*` and `strtod` → `cfmt::CFloat` and `runtime::stdlib::strtod`.
+- PVA: `PvaClient`'s `pvput_get*`, `pvget_get`/`pvget_put`, `pvprocess*` and `pvarray_*` removed, as a pvxs 1.5.3 server answers none of them; `config::env`'s list readers and `PvaServerConfig::with_env` return `Result`; `epics-bridge-rs` drops `run_ca_pva_qsrv_ioc`, `BridgeMonitor`, `qsrv::PvaPvHandle` and `install_pvalink`.
 
-### Local CA, CP and CPP links in base
+### New
 
-As C keeps dbCa and dbContext in base, `PvDatabase::new` registers a
-`CaLinks` set that resolves a link to a local record with no network;
-registering the `ca` link set adds only libca's network half, which is
-all `calink` now holds. `dbChannel_create`, put and `add_event` live in
-the database layer, shared by the in-process link and rsrv, and a link
-put of a `pva` link opens and drops the channel through its link set.
+- `sscan-rs`: synApps sscan R2-12, with the sscan and scanparm records, saveData's MDA writer and `scanProg.st`.
+- `epics-stream-rs` (imported as `stream_rs`; `stream-rs` is taken on crates.io): StreamDevice, with PCRE 8.45 ported to Rust for `%/regexp/`.
+- `epics_base_rs::server::rec_dyn_link`: recDynLink, which sscan's and swait's links run on.
 
-### PVA interface list and beacons as pvxs
+### Highlights
 
-The server expands its interface list once, as pvxs `Config::expand`,
-and binds each entry on its own port. Beacons go from an unbound socket
-to the expanded destinations; the collector joins the beacon groups and
-routes by listener. The v6 search socket binds the v4 number, a
-broadcast port of 0 gets its per-NIC receive sockets, and a datagram's
-arrival address is read through one owner on every platform, so a group
-SEARCH is no longer dropped off Linux. A panicking source no longer
-takes its client's connection down.
-
-### Records, links and asyn against C
-
-Link field text is held as given, so a Latin-1 target resolves. Calc
-programs compile to C's postfix bytes. Soft-input, deadband-tracker,
-simulation-stamp and post order follow C record by record (ai, bi,
-mbbi/mbbiDirect, mbboDirect, printf, lsi/lso, sseq, acalcout, scaler,
-epid, throttle, table, asyn, motor, mca), with tests that compare the
-records' posts with softIoc's and the std/calc oracle IOCs'. asyn's
-request queue keeps C's states: a disabled or disconnected port refuses
-at queueRequest and parks what is already queued, and `cancelRequest`
-unlinks and reports as C's does. Every port gets its owner gate at
-`register_port`. An asyn output whose dset reads the driver back at init
-converts RVAL and comes up defined, as C's status 0 does. modbus keeps
-its I/O statistics in the param library, set by each I/O and posted only
-through the generic write, and a data write sets no param, as
-drvModbusAsyn does. A port with maxAddr above 1 is multi-device, as
-asynPortDriver forces it; `PortDriverBase::new_exact_flags` keeps the
-attributes a driver's own `registerPort` gives. mqtt moves to
-rumqttc-v5-next 0.34 and keeps paho's connect timeout, reconnect backoff
-and per-request success and failure lines. motorSim reports C's status
-bits, and the motor poller runs on its own thread with no ambient tokio
-runtime.
-
-### asyn ports registered as asynPortDriver registers them
-
-A port's name is claimed before its driver is built, as the
-`registerPort` an `asynPortDriver` constructor makes first, so a duplicate
-Configure prints C's two lines and builds nothing. As C has no
-unregister, a constructor that fails after that point keeps the port:
-`PortClaim::publish_failed` publishes the half-built driver and returns
-the error, and drvModbusAsyn's function, length and octet-port refusals
-now leave a registered, disabled port. A port's own trace lines go
-through device 0 as `pasynUserSelf` does, so on a multi-device port
-`asynSetTraceMask P 0` gates them and their file is device 0's: C's
-`asynSetTraceFile` is not pushed down, so `asynSetTraceFile P -1` no
-longer reaches them and an `st.cmd` names `asynSetTraceFile P 0`. One
-timestamp is kept per port, refreshed only by `updateTimeStamp` and
-read by every callback, and every address resolves through `getAddress`.
-
-### SCHED_FIFO thread banding is on by default, under C's switch
-
-IOC threads now ask for SCHED_FIFO by default on every target, as C's do.
-`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` is the switch: unset means
-`YES` (`configure/CONFIG_ENV`), and only a case-insensitive `yes` turns it on,
-so `NO` or an empty value turns it off. `EPICS_RS_ALLOW_RT_PRIORITY`, the
-earlier opt-in, is still read, but only when C's variable is unset. Where the
-process may not use SCHED_FIFO (no `RLIMIT_RTPRIO`, no `CAP_SYS_NICE`), threads
-fall back to the default policy silently, as C's do; the once-per-process
-warning is gone.
+- A monitored 2001-record IOC under SCHED_FIFO on PREEMPT_RT wakes late as often as C softIoc: over 35 interleaved 60 s rounds the late-wake count and p99 match C's.
+- `PvDatabase::new` resolves a CA, CP or CPP link to a local record with no network, as C keeps dbCa in base; the `ca` link set adds only libca's network half.
+- An asyn port registers as `asynPortDriver` registers it: the name is claimed before the driver is built, and a constructor that fails after that leaves a registered, disabled port.
+- IOC threads ask for SCHED_FIFO by default under `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` (unset means YES), and fall back silently where the process may not.
 
 ## v0.31.0 — 2026-10-06
 

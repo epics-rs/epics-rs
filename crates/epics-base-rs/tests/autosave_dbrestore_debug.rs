@@ -36,7 +36,8 @@ async fn child_debug() {
     let status = RestoreDef::new("s.sav".into(), String::new()).status;
     let item = |write_backup| BootRestore {
         filename: "s.sav".into(),
-        path: dir.join("s.sav"),
+        // C's `concatenate_paths`, `/` on every OS.
+        path: format!("{}/s.sav", dir.display()).into(),
         status: status.clone(),
         settings: Default::default(),
         macrostring: "X=B".into(),

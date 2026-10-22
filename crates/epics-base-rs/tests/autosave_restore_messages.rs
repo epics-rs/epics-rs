@@ -47,7 +47,8 @@ async fn child_restore() {
         .await
         .unwrap();
     let item = BootRestore {
-        path: dir.join("s.sav"),
+        // C's `concatenate_paths`, `/` on every OS.
+        path: format!("{}/s.sav", dir.display()).into(),
         status: RestoreDef::new("s.sav".into(), String::new()).status,
         filename: "s.sav".into(),
         macrostring: String::new(),

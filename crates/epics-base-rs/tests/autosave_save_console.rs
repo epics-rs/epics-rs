@@ -85,7 +85,8 @@ async fn save_once() -> Option<()> {
         .add_set(
             SaveSetConfig {
                 name: "set".into(),
-                save_path: dir.join("set.sav"),
+                // C's `concatenate_paths`, `/` on every OS.
+                save_path: format!("{}/set.sav", dir.display()).into(),
                 request_file: None,
                 request_pvs: vec!["TEMP".into()],
                 backup: BackupConfig {

@@ -52,7 +52,8 @@ fn run(d: &Path, seq_files: usize, tail: &str) -> (Vec<String>, f64, Vec<String>
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    let sav = d.join("sav").display().to_string();
+    // The script's own spelling, which C extends with `/`.
+    let sav = format!("{}/sav", d.display());
     let errlog = String::from_utf8_lossy(&out.stderr)
         .lines()
         .filter(|l| l.contains("dbrestore.c"))

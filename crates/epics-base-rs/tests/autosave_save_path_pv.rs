@@ -58,10 +58,13 @@ async fn manager(sav: &Path, macros: &[(&str, &str)]) -> Arc<AutosaveManager> {
     )
 }
 
+/// Every file under `dir`, `/`-separated on every OS.
 fn files(dir: &Path) -> Vec<String> {
     let mut found = Vec::new();
     for e in walk(dir) {
-        found.push(e.strip_prefix(dir).unwrap().display().to_string());
+        let rel = e.strip_prefix(dir).unwrap();
+        let parts: Vec<_> = rel.iter().map(|p| p.to_string_lossy()).collect();
+        found.push(parts.join("/"));
     }
     found.sort();
     found

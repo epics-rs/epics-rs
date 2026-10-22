@@ -148,10 +148,28 @@ fn printed_as_meant(case: &str, c_line: &str) -> String {
     format!("{head} out={} err={err}", hex(fixed))
 }
 
+/// The C line as this libm makes it. 10^23 is a tie between two doubles:
+/// glibc's pow rounds it up, so C prints 1/pow(10,23) below 1e-23;
+/// macOS's `__exp10`, which clang calls for C's `pow(10.0, x)` as rustc
+/// does for `powf`, rounds it to even.
+fn as_on_this_libm(case: &str, c_line: &str) -> String {
+    if case == "pd\t%.24m\t1" && 10f64.powf(std::hint::black_box(23.0)) == 1e23 {
+        let (head, tail) = c_line.split_once(" out=").unwrap();
+        let err = tail.split_once(" err=").unwrap().1;
+        return format!(
+            "{head} out={} err={err}",
+            hex(b"100000000000000010737149-23")
+        );
+    }
+    c_line.to_string()
+}
+
 /// `parse`, and `printDouble` on what it built.
 #[test]
 fn mantexp_parse_and_print() {
-    check_with("print", 0, printed_as_meant);
+    check_with("print", 0, |case, c_line| {
+        printed_as_meant(case, &as_on_this_libm(case, c_line))
+    });
 }
 
 #[test]

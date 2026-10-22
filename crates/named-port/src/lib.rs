@@ -254,10 +254,13 @@ pub struct HeldPort {
     pub port: u16,
 }
 
-/// Darwin and the BSDs hand a SYN for the number to a bound socket that is
-/// not listening and drop it there (`tcp_input`: `TCPS_CLOSED`), so a connect
-/// times out instead of being refused. Their lookup skips a connected socket.
-const SYN_REACHES_A_BOUND_HOLD: bool = cfg!(all(unix, not(target_os = "linux")));
+/// Darwin and the BSDs deliver to an unconnected hold what Linux keeps from
+/// it: a SYN for the number to a bound socket that is not listening, which
+/// drops it (`tcp_input`: `TCPS_CLOSED`) so a connect times out instead of
+/// being refused, and UDP unicast to the oldest wildcard bind
+/// (`in_pcblookup_hash` keeps the last match of a head-inserted chain).
+/// Both lookups skip a connected socket.
+const BSD_PCB_LOOKUP: bool = cfg!(all(unix, not(target_os = "linux")));
 
 impl HeldPort {
     /// A TCP number for a listener under test, which binds beside the hold:
@@ -277,15 +280,25 @@ impl HeldPort {
     /// the subject's wildcard bind. Linux: `SO_REUSEADDR` alone, outside the
     /// subject's `SO_REUSEPORT` group, so unicast goes to the later-bound
     /// subject and none is hashed to the hold. Darwin and the BSDs share a
-    /// UDP address only when both sides set `SO_REUSEPORT`, and there the
-    /// last bind takes the unicast.
+    /// UDP address only when both sides set `SO_REUSEPORT`, and the hold is
+    /// connected ([`BSD_PCB_LOOKUP`]); a plain bind on another address then
+    /// binds there, and cannot fail the subject's: their `SO_REUSEADDR`
+    /// bind looks only at unconnected sockets on its own address.
     pub fn udp() -> Self {
         let hold = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a UDP hold");
         hold.set_reuse_address(true)
             .expect("SO_REUSEADDR on the hold");
         #[cfg(all(unix, not(target_os = "linux")))]
         hold.set_reuse_port(true).expect("SO_REUSEPORT on the hold");
-        Self::bind(hold)
+        let held = Self::bind(hold);
+        if BSD_PCB_LOOKUP {
+            // The discard port: a peer nothing sends from.
+            let discard = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+            held.holds[0]
+                .connect(&discard.into())
+                .expect("connect the hold");
+        }
+        held
     }
 
     /// A UDP number for asyn's `udp&`, which sets `SO_REUSEPORT` alone
@@ -307,11 +320,11 @@ impl HeldPort {
     /// bind takes it (unix: the hold sets no reuse option; Windows:
     /// `SO_EXCLUSIVEADDRUSE`, which refuses every other bind). Darwin and
     /// the BSDs: connected to a loopback peer it keeps
-    /// ([`SYN_REACHES_A_BOUND_HOLD`]), so there an `SO_REUSEADDR` bind, whose
+    /// ([`BSD_PCB_LOOKUP`]), so there an `SO_REUSEADDR` bind, whose
     /// lookup sees only unconnected sockets, is not refused.
     pub fn closed_tcp() -> Self {
         let held = Self::closed(Type::STREAM);
-        if SYN_REACHES_A_BOUND_HOLD {
+        if BSD_PCB_LOOKUP {
             held.connected()
         } else {
             held
@@ -399,9 +412,9 @@ mod tests {
         assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
     }
 
-    fn plain_bind(ty: Type, ip: [u8; 4], port: u16) -> std::io::Result<()> {
+    fn plain_bind(ty: Type, ip: [u8; 4], port: u16) -> std::io::Result<Socket> {
         let s = Socket::new(Domain::IPV4, ty, None).unwrap();
-        s.bind(&SocketAddr::from((ip, port)).into())
+        s.bind(&SocketAddr::from((ip, port)).into()).map(|()| s)
     }
 
     /// The hold keeps a plain bind off the number and lets the subject's on.
@@ -423,12 +436,22 @@ mod tests {
             .unwrap();
     }
 
-    /// A plain bind on another loopback address is kept off the number too:
-    /// it would refuse the subject's wildcard fanout bind.
+    /// A plain bind on another loopback address cannot fail the subject's
+    /// wildcard fanout bind: Linux would, so the hold refuses it there.
     #[test]
-    fn a_udp_hold_refuses_a_plain_bind_on_another_address() {
+    fn a_plain_bind_on_another_address_leaves_the_subject_its_bind() {
         let held = HeldPort::udp();
-        assert!(plain_bind(Type::DGRAM, [127, 0, 0, 2], held.port).is_err());
+        let stranger = plain_bind(Type::DGRAM, [127, 0, 0, 2], held.port);
+        if cfg!(target_os = "linux") {
+            assert!(stranger.is_err());
+        }
+        let subject = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+        subject.set_reuse_address(true).unwrap();
+        #[cfg(unix)]
+        subject.set_reuse_port(true).unwrap();
+        subject
+            .bind(&SocketAddr::from(([0, 0, 0, 0], held.port)).into())
+            .unwrap();
     }
 
     /// Every datagram to the number reaches the subject's fanout socket, none
@@ -483,7 +506,7 @@ mod tests {
         assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
         assert_eq!(
             TcpListener::bind(("127.0.0.1", tcp.port)).is_err(),
-            !SYN_REACHES_A_BOUND_HOLD
+            !BSD_PCB_LOOKUP
         );
         assert!(plain_bind(Type::STREAM, [0, 0, 0, 0], tcp.port).is_err());
         assert!(plain_bind(Type::STREAM, [127, 0, 0, 1], tcp.port).is_err());

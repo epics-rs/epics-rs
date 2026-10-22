@@ -125,7 +125,7 @@ impl Vars {
     }
 
     fn poll(&mut self) {
-        while let Some((pv, v)) = self.monitor.try_change() {
+        for (pv, v) in self.monitor.try_changes() {
             self.take(&pv, v);
         }
     }
@@ -138,14 +138,16 @@ impl Vars {
 
     /// Wait for a monitor or `deadline`, whichever is first.
     pub(crate) async fn wait(&mut self, deadline: Option<Instant>) {
-        let (pv, v) = match deadline {
+        let changes = match deadline {
             Some(at) => tokio::select! {
-                r = self.monitor.wait_change() => r,
+                r = self.monitor.wait_changes() => r,
                 _ = epics_base_rs::runtime::task::sleep_until(at) => return,
             },
-            None => self.monitor.wait_change().await,
+            None => self.monitor.wait_changes().await,
         };
-        self.take(&pv, v);
+        for (pv, v) in changes {
+            self.take(&pv, v);
+        }
     }
 
     pub(crate) fn get(&mut self, i: usize) -> f64 {

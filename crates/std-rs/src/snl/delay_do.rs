@@ -435,9 +435,29 @@ pub async fn run(
         active: ch_active.get_i32().await != 0,
         active_changed: false,
     };
+    // SNL `sync`: every monitor taken writes its variable and raises its
+    // flag before the evaluation that follows, whichever PVs it names.
+    let take = |inputs: &mut DelayDoInputs, changes: Vec<(String, f64)>| {
+        for (pv, value) in changes {
+            if pv == pv_enable {
+                inputs.enable = (value as i16) != 0;
+                inputs.enable_changed = true;
+            } else if pv == pv_standby {
+                inputs.standby = (value as i32) != 0;
+                inputs.standby_changed = true;
+            } else if pv == pv_active {
+                inputs.active = (value as i32) != 0;
+                inputs.active_changed = true;
+            }
+        }
+    };
 
     loop {
         loop {
+            // Each evaluation, a transient re-evaluation included, sees every
+            // monitor queued before it, as C's monitor callback has raised
+            // the flag by then.
+            take(&mut inputs, monitor.try_changes());
             let previous = ctrl.state;
             ctrl.delay_period =
                 epics_base_rs::runtime::time::duration_from_secs(monitor.var(&pv_delay));
@@ -469,23 +489,14 @@ pub async fn run(
         }
 
         let woken = match ctrl.delay_remaining() {
-            Some(remaining) => tokio::time::timeout(remaining, monitor.wait_change())
+            Some(remaining) => tokio::time::timeout(remaining, monitor.wait_changes())
                 .await
                 .ok(),
-            None => Some(monitor.wait_change().await),
+            None => Some(monitor.wait_changes().await),
         };
         // `None`: the armed `delay(delayPeriod)` clause came first.
-        if let Some((pv, value)) = woken {
-            if pv == pv_enable {
-                inputs.enable = (value as i16) != 0;
-                inputs.enable_changed = true;
-            } else if pv == pv_standby {
-                inputs.standby = (value as i32) != 0;
-                inputs.standby_changed = true;
-            } else if pv == pv_active {
-                inputs.active = (value as i32) != 0;
-                inputs.active_changed = true;
-            }
+        if let Some(changes) = woken {
+            take(&mut inputs, changes);
         }
     }
 }

@@ -190,6 +190,38 @@ async fn an_active_event_during_standby_survives_to_arm_the_wait_and_process_dos
     task.abort();
 }
 
+/// Every monitor queued before an evaluation reaches it. `activeCalc` raised
+/// and dropped and `standbyCalc` dropped with nothing yielding between them
+/// (the puts complete synchronously on this one-thread runtime) are all
+/// queued when the runner next evaluates, so `maybeWait`, entered on the
+/// standby drop, finds the active event (`delayDo.st:130`): C's monitor
+/// callbacks have raised every flag by then.
+#[tokio::test]
+async fn monitors_queued_together_all_reach_the_evaluation() {
+    let server = delay_do_ioc().await;
+    let db = (**server.database()).clone();
+    let task = tokio::spawn(std_rs::snl::delay_do::run(DelayDoConfig::new(P, R), db));
+    assert!(eventually(async || state_of(&server).await == "idle").await);
+    put_calc(&server, "standbyCalc", 1.0).await;
+    assert!(eventually(async || state_of(&server).await == "standby").await);
+
+    put_calc(&server, "activeCalc", 1.0).await;
+    put_calc(&server, "activeCalc", 0.0).await;
+    put_calc(&server, "standbyCalc", 0.0).await;
+    assert!(
+        eventually(async || state_of(&server).await == "waiting").await,
+        "maybeWait must find the active event queued before the standby drop"
+    );
+    assert!(
+        eventually(async || {
+            server.get("TEST:dd:sink").await.unwrap() == EpicsValue::Double(7.0)
+        })
+        .await,
+        "the wait must expire and process doSeq"
+    );
+    task.abort();
+}
+
 /// `enable` is the one input whose clause is first in every state that has
 /// one. Dropping it parks the machine in `disable` (`:80-84`); raising it
 /// crosses `maybeStandby`, which — like `maybeWait` — is never published
@@ -301,6 +333,8 @@ async fn a_program_whose_pvs_are_absent_reports_instead_of_hanging() {
 
 /// `femto.st` assigns its four gain-bit PVs by whole name, so the test owns
 /// them; `{P}{H}{F}` composes the rest, as `femto.db` names them.
+/// `TEST:fem:saw9` latches a `gainidx` of 9 as its process cascade posts it,
+/// which a subscription read afterwards would miss.
 async fn femto_ioc() -> CaServer {
     let template =
         std::fs::read_to_string(format!("{}/femto.db", std_rs::STD_DB_DIR)).expect("femto.db");
@@ -309,7 +343,11 @@ async fn femto_ioc() -> CaServer {
          record(longout, \"TEST:fem:bit0\") {{ field(VAL, \"0\") }}\n\
          record(longout, \"TEST:fem:bit1\") {{ field(VAL, \"0\") }}\n\
          record(longout, \"TEST:fem:bit2\") {{ field(VAL, \"0\") }}\n\
-         record(longout, \"TEST:fem:noise\") {{ field(VAL, \"0\") }}\n"
+         record(longout, \"TEST:fem:noise\") {{ field(VAL, \"0\") }}\n\
+         record(mbbo, \"TEST:fem01gainidx\") {{ field(FLNK, \"TEST:fem:saw9\") }}\n\
+         record(calc, \"TEST:fem:saw9\") {{\n\
+             field(INPA, \"TEST:fem01gainidx NPP\") field(CALC, \"VAL||(A=9)\")\n\
+         }}\n"
     );
     let macros: HashMap<String, String> = [("P", "TEST:"), ("H", "fem"), ("F", "01")]
         .into_iter()
@@ -433,6 +471,38 @@ async fn femto_external_bit_change_recomputes_the_index() {
         .await,
         "gain is {:?}",
         server.get("TEST:fem01gain").await.unwrap()
+    );
+    task.abort();
+}
+
+/// Bits moved together reach one evaluation: `bit0` and `bit1` raised with
+/// nothing yielding between them are both written before `idle` tests its
+/// flags, so `updateGain` computes the index from both (`femto.st:98-110`)
+/// and never publishes the one `bit0` alone would give.
+#[tokio::test]
+async fn femto_bits_moved_together_publish_no_partial_index() {
+    let server = femto_ioc().await;
+    let db = (**server.database()).clone();
+    let task = tokio::spawn(std_rs::snl::femto::run(femto_config(), db));
+    assert!(
+        eventually(async || server.get("TEST:fem:noise").await.unwrap() == EpicsValue::Long(1))
+            .await
+    );
+
+    // `init` applied index 8, the noise bit alone; bit0 and bit1 on top of
+    // it are index 11, and bit0 alone would be 9.
+    ca_put(&server, "TEST:fem:bit0", EpicsValue::Long(1)).await;
+    ca_put(&server, "TEST:fem:bit1", EpicsValue::Long(1)).await;
+    assert!(
+        eventually(async || {
+            server.get("TEST:fem01gainidx").await.unwrap() == EpicsValue::Enum(11)
+        })
+        .await
+    );
+    assert_eq!(
+        server.get("TEST:fem:saw9").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "gainidx was published from bit0 alone"
     );
     task.abort();
 }

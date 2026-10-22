@@ -192,7 +192,7 @@ async fn readback(
         }
         if !raised {
             tokio::select! {
-                _ = monitor.wait_change() => {}
+                _ = monitor.wait_changes() => {}
                 _ = matrices.changed() => continue,
             }
         }
@@ -276,7 +276,7 @@ async fn stop_all(db: PvDatabase, p: String, motors: [String; 4]) {
             }
             let _ = ch_stop_motors.put_i16_process(0).await;
         }
-        monitor.wait_change().await;
+        monitor.wait_changes().await;
     }
 }
 
@@ -628,7 +628,7 @@ impl Orient {
     /// Take the monitors that arrived, as they reach C's variables and
     /// flags before a clause is tested.
     fn poll(&mut self) {
-        while let Some((name, v)) = self.monitor.try_change() {
+        for (name, v) in self.monitor.try_changes() {
             self.deliver(name, v);
         }
         while let Some(name) = self.queue.try_completion() {
@@ -652,12 +652,12 @@ impl Orient {
                 None => std::future::pending().await,
             }
         };
-        let (change, done) = tokio::select! {
-            c = self.monitor.wait_change() => (Some(c), None),
-            n = self.queue.completion() => (None, Some(n)),
-            () = until => (None, None),
+        let (changes, done) = tokio::select! {
+            c = self.monitor.wait_changes() => (c, None),
+            n = self.queue.completion() => (Vec::new(), Some(n)),
+            () = until => (Vec::new(), None),
         };
-        if let Some((name, v)) = change {
+        for (name, v) in changes {
             self.deliver(name, v);
         }
         if let Some(name) = done {

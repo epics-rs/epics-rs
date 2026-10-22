@@ -302,10 +302,6 @@ fn debug_print(debug_flag: i32, level: i32, msg: &str) {
 /// exactly those: the applying `changeGain` arm drives the amplifier's bit
 /// PVs, and the arm that finds no change needed drives nothing.
 ///
-/// A `{P}{H}{F}debug` monitor updates the level without re-evaluating, which
-/// is what C's first `idle` clause amounts to — it prints and re-enters
-/// `idle` (`femto.st:295-299`).
-///
 /// Same one deviation as `delayDo`: a PV the database never loaded is an
 /// error return here, where C sits in `init` waiting for a connection that
 /// never comes.
@@ -359,9 +355,46 @@ pub async fn run(
         g3: ch_t2.get_i32().await != 0,
         no: ch_tx.get_i32().await != 0,
     });
+    // The six `EvFlag`s (`femto.st:30-36`), by place in `monitored`.
+    const T0: usize = 0;
+    const T1: usize = 1;
+    const T2: usize = 2;
+    const TX: usize = 3;
+    const GAINIDX: usize = 4;
+    const DEBUG: usize = 5;
+    let mut raised = [false; 6];
+    // SNL `sync`: every monitor taken writes its variable (the controller's
+    // bits and index, or the debug level) and raises its flag before the
+    // evaluation that follows.
+    let take = |changes: Vec<(String, f64)>,
+                ctrl: &mut FemtoController,
+                debug_flag: &mut i32,
+                raised: &mut [bool; 6]| {
+        for (pv, value) in changes {
+            let Some(i) = monitored.iter().position(|m| *m == pv) else {
+                continue;
+            };
+            raised[i] = true;
+            let v = value as i32;
+            match i {
+                T0 => ctrl.g1 = v != 0,
+                T1 => ctrl.g2 = v != 0,
+                T2 => ctrl.g3 = v != 0,
+                TX => ctrl.no = v != 0,
+                GAINIDX => ctrl.gain_index = v,
+                _ => *debug_flag = v,
+            }
+        }
+    };
 
     loop {
         loop {
+            take(
+                monitor.try_changes(),
+                &mut ctrl,
+                &mut debug_flag,
+                &mut raised,
+            );
             let previous = ctrl.state;
             let (state, puts) = ctrl.step(event.take());
             if let Some((g1, g2, g3, no)) = puts.bits {
@@ -380,11 +413,17 @@ pub async fn run(
             // (`:283-287`) efClear the flags their own puts just raised; the
             // reverting arms and `updateGain` do not, and take their own post.
             if previous == FemtoState::Init || puts.bits.is_some() {
-                for pv in [&pv_t0, &pv_t1, &pv_t2, &pv_tx, &pv_gainidx] {
-                    monitor.clear(pv);
+                take(
+                    monitor.try_changes(),
+                    &mut ctrl,
+                    &mut debug_flag,
+                    &mut raised,
+                );
+                for i in [T0, T1, T2, TX, GAINIDX] {
+                    raised[i] = false;
                 }
                 if previous == FemtoState::Init {
-                    monitor.clear(&pv_debug);
+                    raised[DEBUG] = false;
                 }
             }
             if state != previous {
@@ -395,43 +434,47 @@ pub async fn run(
             }
         }
 
-        loop {
-            let (pv, value) = monitor.wait_change().await;
-            if pv == pv_debug {
-                // `when( efTestAndClear(debug_flag_mon) )` prints and re-enters
-                // `idle` (`femto.st:295-299`) — no clause tests it, so
-                // re-evaluating would only consume flags nothing acted on.
-                debug_flag = value as i32;
+        // `idle`'s clauses in C's order (`femto.st:295-311`). `delay(.1)`
+        // re-enters `idle` with nothing new to test, so only a monitor wakes
+        // it.
+        event = Some(loop {
+            take(
+                monitor.try_changes(),
+                &mut ctrl,
+                &mut debug_flag,
+                &mut raised,
+            );
+            if std::mem::take(&mut raised[DEBUG]) {
                 debug_print(
                     debug_flag,
                     1,
                     &format!("Debug level changed to {debug_flag}"),
                 );
+                // `state idle`: re-entered, so its clauses run again.
                 continue;
             }
-            if pv == pv_gainidx {
-                event = Some(FemtoEvent::GainIndexChanged(value as i32));
-            } else {
-                // Any of the four bit monitors: C's second `idle` clause tests
-                // all four together (`femto.st:301-303`) and `updateGain`
-                // recomputes from the whole set, so the event carries it.
-                let mut g1 = ctrl.g1;
-                let mut g2 = ctrl.g2;
-                let mut g3 = ctrl.g3;
-                let mut no = ctrl.no;
-                let level = (value as i32) != 0;
-                if pv == pv_t0 {
-                    g1 = level;
-                } else if pv == pv_t1 {
-                    g2 = level;
-                } else if pv == pv_t2 {
-                    g3 = level;
-                } else if pv == pv_tx {
-                    no = level;
-                }
-                event = Some(FemtoEvent::BitsChanged { g1, g2, g3, no });
+            // `efTestAndClear(tx_mon) || ... || efTestAndClear(t0_mon)` clears
+            // only the first raised flag; `updateGain` reads all four bits.
+            if [TX, T2, T1, T0]
+                .into_iter()
+                .any(|i| std::mem::take(&mut raised[i]))
+            {
+                break FemtoEvent::BitsChanged {
+                    g1: ctrl.g1,
+                    g2: ctrl.g2,
+                    g3: ctrl.g3,
+                    no: ctrl.no,
+                };
             }
-            break;
-        }
+            if std::mem::take(&mut raised[GAINIDX]) {
+                break FemtoEvent::GainIndexChanged(ctrl.gain_index);
+            }
+            take(
+                monitor.wait_changes().await,
+                &mut ctrl,
+                &mut debug_flag,
+                &mut raised,
+            );
+        });
     }
 }

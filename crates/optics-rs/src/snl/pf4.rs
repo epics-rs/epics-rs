@@ -4,8 +4,6 @@
 //! run through C's states (`init`, `idle`, `filterBits`, `filterPos`,
 //! `recalcBank`, `bankControl`, `bankOff`) with one flag per C event flag.
 
-use std::time::Duration;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 use epics_libcom_rs::cfmt::CFloat;
@@ -453,10 +451,8 @@ fn take_first(flags: &mut [bool], order: impl IntoIterator<Item = usize>) -> boo
 }
 
 /// Take every monitor already queued, raising the flags it is synced to.
-async fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
-    while let Ok((pv, _)) =
-        epics_base_rs::runtime::task::timeout(Duration::ZERO, monitor.wait_change()).await
-    {
+fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
+    for (pv, _) in monitor.try_changes() {
         names.raise(flags, &pv);
     }
 }
@@ -473,7 +469,11 @@ async fn wait(
     deadline: epics_base_rs::runtime::task::Instant,
 ) {
     tokio::select! {
-        (pv, _) = monitor.wait_change() => names.raise(flags, &pv),
+        changes = monitor.wait_changes() => {
+            for (pv, _) in changes {
+                names.raise(flags, &pv);
+            }
+        }
         _ = epics_base_rs::runtime::task::sleep_until(deadline) => {}
     }
 }
@@ -609,7 +609,7 @@ pub async fn run(
     let _ = ch_display_energy.put_f64_sync(mono).await;
     let _ = ch_local.put_f64_sync(mono).await;
     let mut flags = Flags::default();
-    poll(&mut monitor, &names, &mut flags).await;
+    poll(&mut monitor, &names, &mut flags);
     // init clears every flag but these, which their connect-time monitors raised.
     flags = Flags {
         other: [true; 4],
@@ -625,7 +625,7 @@ pub async fn run(
                 let entered = epics_base_rs::runtime::task::Instant::now();
                 let delay = epics_base_rs::runtime::time::duration_from_secs(IDLE_WAIT);
                 loop {
-                    poll(&mut monitor, &names, &mut flags).await;
+                    poll(&mut monitor, &names, &mut flags);
                     if std::mem::take(&mut flags.debug) {
                         let msg = format!("Debug level changed to {}", debug.flag.get_i32().await);
                         debug.print(1, 349, &msg).await;
@@ -634,7 +634,7 @@ pub async fn run(
                     if std::mem::take(&mut flags.local) {
                         let _ = ch_select.put_i32_sync(0).await;
                         sleep_secs(PVPUT_WAIT).await;
-                        poll(&mut monitor, &names, &mut flags).await;
+                        poll(&mut monitor, &names, &mut flags);
                         flags.select = false;
                         let msg = format!(
                             "local energy changed to {}",
@@ -648,7 +648,7 @@ pub async fn run(
                         if select != 0 {
                             let _ = ch_local.put_f64_sync(ch_mono.get_f64().await).await;
                             sleep_secs(PVPUT_WAIT).await;
-                            poll(&mut monitor, &names, &mut flags).await;
+                            poll(&mut monitor, &names, &mut flags);
                             flags.local = false;
                             put_bankctl(3, 0).await;
                         }
@@ -662,7 +662,7 @@ pub async fn run(
                         if ch_select.get_i32().await != 0 {
                             let _ = ch_local.put_f64_sync(mono).await;
                             sleep_secs(PVPUT_WAIT).await;
-                            poll(&mut monitor, &names, &mut flags).await;
+                            poll(&mut monitor, &names, &mut flags);
                             flags.local = false;
                             energytimeout = ENERGY_WAIT;
                             let msg = format!("monochromator energy changed to {}", CFloat(mono));
@@ -779,7 +779,7 @@ pub async fn run(
                 let _ = ch_bitflg.put_i32_sync(1 << filpos).await;
                 let _ = ch_bitsts.put_i16_sync(i16::from(bits[filpos])).await;
                 put_bankctl(2, 0).await;
-                poll(&mut monitor, &names, &mut flags).await;
+                poll(&mut monitor, &names, &mut flags);
                 flags.filpos = false;
                 State::Idle
             }
@@ -803,7 +803,7 @@ pub async fn run(
                 }
                 let _ = ch_bitflg.put_i32_sync(1 << filpos).await;
                 let _ = ch_bitsts.put_i16_sync(i16::from(pattern)).await;
-                poll(&mut monitor, &names, &mut flags).await;
+                poll(&mut monitor, &names, &mut flags);
                 flags.b = [false; 4];
                 State::RecalcBank
             }
@@ -848,7 +848,7 @@ pub async fn run(
                         }
                         3 => {
                             let local = ch_local.get_f64().await;
-                            poll(&mut monitor, &names, &mut flags).await;
+                            poll(&mut monitor, &names, &mut flags);
                             flags.local = false;
                             let (z, f) = blades(&ch_z, &ch_f).await;
                             let mut other: [String; 4] = Default::default();
@@ -880,12 +880,12 @@ pub async fn run(
                 let mut entered = epics_base_rs::runtime::task::Instant::now();
                 let delay = epics_base_rs::runtime::time::duration_from_secs(IDLE_WAIT);
                 loop {
-                    poll(&mut monitor, &names, &mut flags).await;
+                    poll(&mut monitor, &names, &mut flags);
                     let bankctl = ch_bankctl.get_i16().await;
                     if bankctl != 0 {
                         let mono = ch_mono.get_f64().await;
                         let _ = ch_display_energy.put_f64_sync(mono).await;
-                        poll(&mut monitor, &names, &mut flags).await;
+                        poll(&mut monitor, &names, &mut flags);
                         flags.local = false;
                         let msg = format!("filter bank switched on ({bankctl})");
                         debug.print(2, 337, &msg).await;

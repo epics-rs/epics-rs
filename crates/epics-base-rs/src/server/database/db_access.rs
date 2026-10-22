@@ -1090,11 +1090,11 @@ impl<D: EventDelivery> DrainTask<D> {
 // DbMultiMonitor — select! over multiple subscriptions
 // ---------------------------------------------------------------------------
 
-/// Monitor multiple PVs simultaneously. Returns the name and value of
-/// whichever PV changes first.
+/// Monitor multiple PVs simultaneously, answering with every one that
+/// changed.
 pub struct DbMultiMonitor {
     /// Each subscription beside the name its caller asked for, which is what
-    /// [`Self::wait_change`] answers with.
+    /// [`Self::try_changes`] answers with.
     subs: Vec<(String, DbSubscription)>,
     /// SNL `monitor` variables with no event flag, each with the last value
     /// posted to it.
@@ -1121,7 +1121,7 @@ impl DbMultiMonitor {
 
     /// Monitor `names` as SNL `monitor` variables that no event flag is
     /// `sync`ed to: C writes such a variable as each monitor arrives, so it
-    /// raises no [`Self::wait_change`] and [`Self::var`] reads its last post.
+    /// raises no [`Self::try_changes`] and [`Self::var`] reads its last post.
     /// Returns how many of `names` were subscribed.
     pub async fn add_vars(&mut self, db: &PvDatabase, names: &[String]) -> usize {
         let before = self.vars.len();
@@ -1176,32 +1176,38 @@ impl DbMultiMonitor {
         }
     }
 
-    /// [`Self::wait_change`]'s answer if a change is already queued.
-    pub fn try_change(&mut self) -> Option<(String, f64)> {
+    /// Every subscribed PV with events queued, once each with the newest
+    /// value queued for it, in subscription order; empty if none is. An SNL
+    /// evaluation sees every monitor that arrived before it, each having
+    /// written its variable and raised its sync'd flag, so a caller takes the
+    /// whole batch before it evaluates rather than one PV of it.
+    pub fn try_changes(&mut self) -> Vec<(String, f64)> {
+        let mut changes = Vec::new();
         for (name, sub) in &mut self.subs {
-            if let Ok(mut event) = sub.try_next_event() {
-                while let Ok(newer) = sub.try_next_event() {
-                    event = newer;
-                }
+            let mut newest = None;
+            while let Ok(event) = sub.try_next_event() {
+                newest = Some(event);
+            }
+            if let Some(event) = newest {
                 let val = event
                     .value()
                     .as_value()
                     .and_then(EpicsValue::to_f64)
                     .unwrap_or(0.0);
-                return Some((name.clone(), val));
+                changes.push((name.clone(), val));
             }
         }
-        None
+        changes
     }
 
-    /// Wait for any subscribed PV to change. Returns (pv_name, new_value)
-    /// with the newest value queued for that PV: one SNL sync'd event flag
-    /// stands for every monitor since it was last cleared, and its variable
-    /// holds the last of them.
-    pub async fn wait_change(&mut self) -> (String, f64) {
+    /// Wait until a subscribed PV has an event queued, then return
+    /// [`Self::try_changes`], never empty. Cancel-safe: nothing is taken
+    /// unless it is returned.
+    pub async fn wait_changes(&mut self) -> Vec<(String, f64)> {
         loop {
-            if let Some(change) = self.try_change() {
-                return change;
+            let changes = self.try_changes();
+            if !changes.is_empty() {
+                return changes;
             }
             // No events ready — yield briefly then retry. The background
             // timer, not the ambient one: a caller can await this from a
@@ -1239,11 +1245,31 @@ mod multi_monitor_tests {
             .await
             .unwrap();
         monitor.clear("X");
-        assert_eq!(monitor.wait_change().await, ("Y".to_string(), 3.0));
+        assert_eq!(monitor.try_changes(), [("Y".to_string(), 3.0)]);
         db.put_pv_and_post("X", EpicsValue::Double(4.0))
             .await
             .unwrap();
-        assert_eq!(monitor.wait_change().await, ("X".to_string(), 4.0));
+        assert_eq!(monitor.try_changes(), [("X".to_string(), 4.0)]);
+    }
+
+    /// One take answers every channel with events queued, each once with its
+    /// newest value, in subscription order whatever order they were posted
+    /// in, and leaves nothing behind.
+    #[epics_macros_rs::epics_test]
+    async fn one_take_answers_every_queued_channel() {
+        let db = db_with(&[("X", 0.0), ("Y", 0.0), ("Z", 0.0)]).await;
+        let names = ["X", "Y", "Z"].map(String::from);
+        let mut monitor = DbMultiMonitor::new(&db, &names).await;
+        for (name, v) in [("Z", 1.0), ("X", 2.0), ("X", 3.0)] {
+            db.put_pv_and_post(name, EpicsValue::Double(v))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            monitor.try_changes(),
+            [("X".to_string(), 3.0), ("Z".to_string(), 1.0)]
+        );
+        assert!(monitor.try_changes().is_empty());
     }
 
     /// Two queued events on one channel arrive as one, with the later value.
@@ -1262,12 +1288,12 @@ mod multi_monitor_tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(monitor.wait_change().await, ("X".to_string(), 2.0));
+        assert_eq!(monitor.try_changes(), [("X".to_string(), 2.0)]);
         monitor.clear("X");
         db.put_pv_and_post("X", EpicsValue::Double(3.0))
             .await
             .unwrap();
-        assert_eq!(monitor.wait_change().await, ("X".to_string(), 3.0));
+        assert_eq!(monitor.try_changes(), [("X".to_string(), 3.0)]);
     }
 
     async fn db_with(records: &[(&str, f64)]) -> PvDatabase {
@@ -1303,7 +1329,7 @@ mod multi_monitor_tests {
         db.put_pv_and_post("X", EpicsValue::Double(3.0))
             .await
             .unwrap();
-        assert_eq!(monitor.wait_change().await, ("X".to_string(), 3.0));
+        assert_eq!(monitor.try_changes(), [("X".to_string(), 3.0)]);
         assert_eq!(monitor.var("M"), 2.0);
     }
 
@@ -1323,7 +1349,7 @@ mod multi_monitor_tests {
             .put_f64_process(5.0)
             .await
             .unwrap();
-        assert_eq!(monitor.wait_change().await, ("X".to_string(), 5.0));
+        assert_eq!(monitor.try_changes(), [("X".to_string(), 5.0)]);
     }
 
     /// `get_string` is `dbGetField(DBR_STRING)`: a real at the record's
@@ -1355,8 +1381,8 @@ mod multi_monitor_tests {
         .unwrap();
         let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
         DbChannel::new(&db, "X").put_i16_process(0).await.unwrap();
-        let change = crate::runtime::task::timeout(Duration::from_secs(1), monitor.wait_change());
-        assert_eq!(change.await.ok(), Some(("X".to_string(), 0.0)));
+        let changes = crate::runtime::task::timeout(Duration::from_secs(1), monitor.wait_changes());
+        assert_eq!(changes.await.ok(), Some(vec![("X".to_string(), 0.0)]));
     }
 }
 

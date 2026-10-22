@@ -6,8 +6,6 @@
 //! `waiting`, `update_filters`, `action`, `change_filters`) in order;
 //! [`FilterDrive`] holds C's program variables and does the arithmetic.
 
-use std::time::Duration;
-
 use epics_base_rs::server::database::PvDatabase;
 
 use crate::data::chantler::{FILTER_MATERIALS, attenuation};
@@ -604,10 +602,8 @@ impl Names {
 }
 
 /// Take every monitor already queued, raising the flags it is synced to.
-async fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
-    while let Ok((pv, _)) =
-        epics_base_rs::runtime::task::timeout(Duration::ZERO, monitor.wait_change()).await
-    {
+fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
+    for (pv, _) in monitor.try_changes() {
         names.raise(flags, &pv);
     }
 }
@@ -713,7 +709,7 @@ pub async fn run(
     sleep_secs(2.0).await;
     let _ = ch_msg.put_string_process("Initialising ...").await;
     prog.msge.clear();
-    poll(&mut monitor, &names, &mut flags).await;
+    poll(&mut monitor, &names, &mut flags);
     flags.transm_setpt = false;
     let _ = ch_step_up.put_i32_process(0).await;
     let _ = ch_step_down.put_i32_process(0).await;
@@ -723,7 +719,7 @@ pub async fn run(
         // `waiting` (`filterDrive.st:396-450`): the first true clause wins,
         // and says why under DEBUG bit 0.
         let (my_action, why) = loop {
-            poll(&mut monitor, &names, &mut flags).await;
+            poll(&mut monitor, &names, &mut flags);
             if std::mem::take(&mut flags.new_energy) {
                 break (None, "Energy change detected");
             }
@@ -751,8 +747,9 @@ pub async fn run(
             if std::mem::take(&mut flags.external_io) {
                 break (None, "External IO event flag was set");
             }
-            let (pv, _) = monitor.wait_change().await;
-            names.raise(&mut flags, &pv);
+            for (pv, _) in monitor.wait_changes().await {
+                names.raise(&mut flags, &pv);
+            }
         };
         // One read serves the clause and the state it enters.
         prog.debug = ch_debug.get_i32().await;
@@ -770,7 +767,7 @@ pub async fn run(
             let mut blades = Vec::with_capacity(blade_count);
             for b in &blades_ch {
                 let outget = b.outget.get_f64().await as i32;
-                poll(&mut monitor, &names, &mut flags).await;
+                poll(&mut monitor, &names, &mut flags);
                 flags.external_io = false;
                 let mut blade = b.read(&queue).await;
                 if blade.set != outget {

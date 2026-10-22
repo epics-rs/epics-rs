@@ -249,9 +249,21 @@ jobs:
   # exactly the retirement trip-wire the deviation doc requires. Pinning a
   # nightly here would mute that trip-wire and drift from what
   # `cargo +nightly` means on a developer machine.
+  #
+  # It is nevertheless PINNED to nightly-2026-10-19, because std stopped
+  # compiling for the target. rust-lang/rust#163732 (first in
+  # nightly-2026-10-20) moved std's libc to 0.2.191, whose newlib `stat`
+  # spells the timestamps `st_atim`/`st_mtim`/`st_ctim` while std's
+  # `os/rtems/fs.rs` and `sys/fs/unix.rs` still read `st_atime`; and
+  # rust-lang/rust#163701 (first in nightly-2026-10-22) added `ReadDir::dir`,
+  # which calls `libc::dirfd` on RTEMS, for which no libc declares it. Lift the
+  # pin once a current nightly's std builds for armv7-rtems-eabihf; until then
+  # the floating trip-wire lives in a local `./scripts/rtems-check.sh` run.
   rtems-closure:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RTEMS_TOOLCHAIN: nightly-2026-10-19
 
     steps:
     - uses: actions/checkout@v4
@@ -267,7 +279,7 @@ jobs:
       run: ./scripts/csrc-check.sh
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: nightly
+        toolchain: ${{ env.RTEMS_TOOLCHAIN }}
         components: rust-src
     - uses: Swatinem/rust-cache@v2
       with:
@@ -602,18 +614,20 @@ jobs:
   rustdoc-embedded:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The RTEMS rows take `rtems-closure`'s pin, for the reasons its header gives.
+    env:
+      RTEMS_TOOLCHAIN: nightly-2026-10-19
 
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: nightly
+        toolchain: ${{ env.RTEMS_TOOLCHAIN }}
         components: rust-src
     # The VxWorks rows below are pinned to nightly-2026-08-30, the last nightly
     # before rust#160170 (first in nightly-2026-08-31) removed the vxworks guard
     # around `libc::O_NOFOLLOW` in std's `set_perm_nofollow`; see the
-    # `vxworks-census` header. The RTEMS rows keep the floating `nightly` above —
-    # the break is VxWorks-only. Drop this second toolchain and restore the
+    # `vxworks-census` header. Drop this second toolchain and restore the
     # VxWorks rows to `+nightly` once rust#162065 (the std-side fix) lands.
     - uses: dtolnay/rust-toolchain@master
       with:
@@ -650,7 +664,7 @@ jobs:
             asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (armv7-rtems-eabihf)"
-          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+          cargo +"$RTEMS_TOOLCHAIN" doc --no-deps --no-default-features --document-private-items \
             -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
             -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
           echo "::endgroup::"

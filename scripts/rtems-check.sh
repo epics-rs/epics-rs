@@ -69,11 +69,18 @@
 # Usage:
 #   ./scripts/rtems-check.sh          # check every crate and target binary
 #   ./scripts/rtems-check.sh --quiet  # only report failures
+#   RTEMS_TOOLCHAIN=nightly-2026-10-19 ./scripts/rtems-check.sh
+#                                     # a dated nightly instead of `nightly`
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Exported because `rtems-tls-spec.sh` reads it: the spec must be printed by
+# the toolchain that compiles against it.
+export RTEMS_TOOLCHAIN="${RTEMS_TOOLCHAIN:-nightly}"
+TOOLCHAIN="$RTEMS_TOOLCHAIN"
 
 # The RTEMS target this gate compiles for.
 #
@@ -132,7 +139,7 @@ fi
 # still fire, byte for byte, as they do at 0.2.186. No published `libc`
 # satisfies the predicates; the one that does is the unmerged fork, and which
 # fork lands is not this script's decision.
-COMMON=(+nightly check --locked --no-default-features "-Zbuild-std=std,panic_abort" ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
+COMMON=(+"$TOOLCHAIN" check --locked --no-default-features "-Zbuild-std=std,panic_abort" ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
 
 # The crates that must compile for the target.
 #
@@ -282,8 +289,8 @@ QUIET=0
 
 log() { [[ $QUIET -eq 1 ]] || echo "$@"; }
 
-if ! cargo +nightly --version >/dev/null 2>&1; then
-    echo "error: the nightly toolchain is required for -Zbuild-std." >&2
+if ! cargo "+$TOOLCHAIN" --version >/dev/null 2>&1; then
+    echo "error: the $TOOLCHAIN toolchain is required for -Zbuild-std." >&2
     exit 1
 fi
 

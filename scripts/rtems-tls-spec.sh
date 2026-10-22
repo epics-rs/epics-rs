@@ -29,14 +29,16 @@
 # and `jq`. `RTEMS_TLS_SPEC_RUSTC=/path/to/rustc` derives the spec from that
 # exact rustc instead of the rustup `+nightly` shim — the rustc-wrapper path
 # (`scripts/rtems-rustc-wrapper.sh`) uses it so the spec always matches the
-# toolchain actually compiling.
+# toolchain actually compiling. Otherwise `RTEMS_TOOLCHAIN` (default `nightly`)
+# names the rustup toolchain, the same one `rtems-check.sh` compiles with.
 
 set -euo pipefail
 
 STOCK_TARGET="armv7-rtems-eabihf"
+TOOLCHAIN="${RTEMS_TOOLCHAIN:-nightly}"
 
-if [[ -z "${RTEMS_TLS_SPEC_RUSTC:-}" ]] && ! cargo +nightly --version >/dev/null 2>&1; then
-    echo "error: the nightly toolchain is required to print the target spec." >&2
+if [[ -z "${RTEMS_TLS_SPEC_RUSTC:-}" ]] && ! cargo "+$TOOLCHAIN" --version >/dev/null 2>&1; then
+    echo "error: the $TOOLCHAIN toolchain is required to print the target spec." >&2
     exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -52,7 +54,7 @@ if [[ -n "${RTEMS_TLS_SPEC_RUSTC:-}" ]]; then
         exit 1
     }
 else
-    stock="$(rustc +nightly -Zunstable-options --print target-spec-json \
+    stock="$(rustc "+$TOOLCHAIN" -Zunstable-options --print target-spec-json \
         --target "$STOCK_TARGET" 2>/dev/null)"
 fi
 

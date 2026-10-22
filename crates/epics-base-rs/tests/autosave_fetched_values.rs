@@ -158,7 +158,10 @@ fn a_restore_of_the_lists_last_save_uses_the_fetched_values() {
          dbpf A 7\n\
          dbpf W.VAL \"[4,5]\"\n\
          dbpf S \"x\"\n\
-         system \"printf '# h\\nA 9\\n<END>\\n' > s.sav\"\n\
+         eraseFile(\"s.sav\")\n\
+         appendToFile(\"s.sav\", \"# h\")\n\
+         appendToFile(\"s.sav\", \"A 9\")\n\
+         appendToFile(\"s.sav\", \"<END>\")\n\
          echo ==mem\n\
          save_restoreSet_Debug(5)\n\
          fdbrestore(\"s.sav\")\n\
@@ -376,7 +379,11 @@ fn a_refused_put_from_a_file_prints_nothing() {
          iocInit\n\
          epicsThreadSleep 2\n\
          dbpf S.DISP 1\n\
-         system \"printf '# h\\nA 9\\nS y\\n<END>\\n' > f.sav\"\n\
+         eraseFile(\"f.sav\")\n\
+         appendToFile(\"f.sav\", \"# h\")\n\
+         appendToFile(\"f.sav\", \"A 9\")\n\
+         appendToFile(\"f.sav\", \"S y\")\n\
+         appendToFile(\"f.sav\", \"<END>\")\n\
          echo ==mem\n\
          fdbrestore(\"f.sav\")\n\
          epicsThreadSleep 1\n\

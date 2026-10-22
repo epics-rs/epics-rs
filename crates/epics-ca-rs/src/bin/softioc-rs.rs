@@ -1375,6 +1375,14 @@ mod tests {
     #[cfg(tokio_backend)]
     use super::{ServerOptions, run_ioc_app};
 
+    /// A path as an unquoted iocsh token: C's out-of-quote backslash escape
+    /// (`iocsh.cpp:273-277`) eats a native Windows path's separators, so a
+    /// Windows st.cmd writes forward slashes.
+    #[cfg(tokio_backend)]
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
     /// `-S` alone picks the serving arm; without it (and with the ignored
     /// `-s`) the shell's. `dash_s_keeps_serving_after_stdin_is_closed` then
     /// only has to show that the serving arm outlives EOF.
@@ -1446,7 +1454,7 @@ mod tests {
             &script,
             format!(
                 "on error break\ndbDumpRegistrar pdbbase > {}\nnosuchcommand\n",
-                dump.display()
+                script_token(&dump)
             ),
         )
         .unwrap();
@@ -1641,7 +1649,10 @@ mod tests {
         let script = dir.path().join("st.cmd");
         std::fs::write(
             &script,
-            format!("on error break\ndbl > {}\nnosuchcommand\n", dump.display()),
+            format!(
+                "on error break\ndbl > {}\nnosuchcommand\n",
+                script_token(&dump)
+            ),
         )
         .expect("write script");
 
@@ -1713,7 +1724,7 @@ mod tests {
         let script = dir.path().join("st.cmd");
         std::fs::write(
             &script,
-            format!("epicsEnvShow PATH > {}\n", marker.display()),
+            format!("epicsEnvShow PATH > {}\n", script_token(&marker)),
         )
         .expect("write script");
         let script = script.display().to_string();

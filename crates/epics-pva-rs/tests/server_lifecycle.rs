@@ -17,12 +17,10 @@ fn tcp_is_held(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
 }
 
-// Probe the loopback address the bundle binds. A wildcard bind does not
-// see a bundle of more than ten per-NIC sockets (the kernel's secondary
-// UDP hash only compares the wildcard and the probe's own address), and the
-// one wildcard socket the server owns is bound by its task, after the report.
+// The search socket is pvxs's wildcard collector; a plain loopback bind
+// beside it succeeds on Windows.
 fn udp_is_held(port: u16) -> bool {
-    std::net::UdpSocket::bind(("127.0.0.1", port)).is_err()
+    named_port::udp_port_is_held(port)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

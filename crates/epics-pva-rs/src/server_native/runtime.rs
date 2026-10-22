@@ -1572,12 +1572,11 @@ mod tcp_fallback_tests {
             "udp_port = 0 must be resolved to the kernel-assigned port and reported",
         );
         // The reported port must be the one actually held: nothing else may
-        // take it while the responder is alive. A plain (non-SO_REUSEPORT)
-        // bind is refused by a live pvxs/epics-rs search socket, so a
-        // successful bind here would mean the report named a port the server
-        // is not on.
+        // take it while the responder is alive, so a bind that only another
+        // socket on the number refuses succeeding here would mean the report
+        // named a port the server is not on.
         assert!(
-            std::net::UdpSocket::bind(("127.0.0.1", report.udp_port)).is_err(),
+            named_port::udp_port_is_held(report.udp_port),
             "reported UDP port {} is not actually held by the server",
             report.udp_port,
         );

@@ -46,7 +46,7 @@ fn dump(record_type: &str) -> String {
     let out = tempfile::NamedTempFile::new().unwrap();
     shell
         .execute_line(format!(
-            "dbDumpDevice pdbbase {record_type} > {}",
+            "dbDumpDevice pdbbase {record_type} > \"{}\"",
             out.path().display()
         ))
         .unwrap();

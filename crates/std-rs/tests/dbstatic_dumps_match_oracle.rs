@@ -35,7 +35,7 @@ fn shell() -> IocShell {
 fn run(shell: &IocShell, line: &str) -> String {
     let out = tempfile::NamedTempFile::new().unwrap();
     shell
-        .execute_line(format!("{line} > {}", out.path().display()))
+        .execute_line(format!("{line} > \"{}\"", out.path().display()))
         .unwrap();
     std::fs::read_to_string(out.path()).unwrap()
 }

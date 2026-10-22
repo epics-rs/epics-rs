@@ -138,8 +138,9 @@ fn assert_near(ioc: &Ioc, pv: &str, want: f64) {
     );
 }
 
+/// Up to 20 s, the longest being set_offsets' sweep of about 7 s.
 async fn wait_for(ioc: &Ioc, pv: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while f64_of(ioc, pv) != want && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
     }
@@ -397,7 +398,10 @@ async fn a_short_reply_leaves_the_reading() {
 #[epics_base_rs::epics_test]
 async fn set_offsets_reads_each_gain_and_restores_it() {
     let ioc = boot_enabled().await;
-    put(&ioc, "T:settling", EpicsValue::Double(0.1)).await;
+    // RANG follows the gain_mon event flag, so two gains put within one read
+    // cycle send one RANG, as in C. macOS runners stretched a read cycle past
+    // 0.1 s; a 1 s settling outlasts it.
+    put(&ioc, "T:settling", EpicsValue::Double(1.0)).await;
     put(&ioc, "T:gain", EpicsValue::Enum(2)).await;
     expect_commands(
         &ioc,

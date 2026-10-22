@@ -55,17 +55,26 @@ fn drain(rx: &mut EventReader) -> usize {
     n
 }
 
-/// Whether `rx` has a post 750 ms on the delayed-callback timer after its
-/// next one, read on cbLow. A pass's post wakes this there only once the pass
-/// has re-armed, and the timer fires in deadline order, so a 0.5 s re-arm has
-/// posted by then and a 1 s one has not, however late the host runs both.
-fn reposted_within_750_ms(mut rx: EventReader) -> BackgroundTaskHandle<(EventReader, bool)> {
+/// Whether the pass after the next one `rx` sees has posted 450 ms and
+/// 600 ms on the delayed-callback timer after it, read on cbLow. That post
+/// wakes this on cbLow's one worker once its pass has re-armed, and the timer
+/// fires in deadline order, so a 0.5 s re-arm lands between the two reads
+/// unless this registers its 450 ms more than 50 ms after the re-arm.
+fn next_pass_at_450_and_600_ms(
+    mut rx: EventReader,
+) -> BackgroundTaskHandle<(EventReader, [bool; 2])> {
     spawn_background(CallbackPriority::Low, async move {
         drain(&mut rx);
         rx.recv().await.expect("subscriber open");
-        sleep_background(Duration::from_millis(750)).await;
-        let again = drain(&mut rx) > 0;
-        (rx, again)
+        let at_600 = spawn_background(
+            CallbackPriority::Low,
+            sleep_background(Duration::from_millis(600)),
+        );
+        sleep_background(Duration::from_millis(450)).await;
+        let by_450 = drain(&mut rx) > 0;
+        at_600.await.unwrap();
+        let by_600 = by_450 || drain(&mut rx) > 0;
+        (rx, [by_450, by_600])
     })
 }
 
@@ -295,13 +304,14 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::Short(1))
             .await
             .unwrap();
-        let (rx, rearmed) = reposted_within_750_ms(dol2v).await.unwrap();
+        let (rx, passes) = next_pass_at_450_and_600_ms(dol2v).await.unwrap();
         dol2v = rx;
         let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
         assert_eq!(got, [0, 0], "CA status events after the {field} put");
-        assert!(
-            rearmed,
-            "no checkLinks pass 750 ms after one, after the {field} put"
+        assert_eq!(
+            passes,
+            [false, true],
+            "a pass 450 ms and 600 ms after one, after the {field} put"
         );
     }
 }

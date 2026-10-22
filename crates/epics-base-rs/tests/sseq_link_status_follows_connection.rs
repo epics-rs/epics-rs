@@ -101,29 +101,55 @@ async fn sleep(ms: u64) {
     epics_base_rs::runtime::task::sleep(Duration::from_millis(ms)).await;
 }
 
-/// What `pv` reads 750 ms from now on the delayed-callback timer, read on
-/// cbLow. The timer fires in deadline order and cbLow has one worker, so a
-/// 0.5 s pass armed just before has run by then and a 1 s one has not,
-/// however late the host runs both.
-fn read_after_750_ms(db: &Arc<PvDatabase>, pv: &'static str) -> BackgroundTaskHandle<i16> {
+/// What `pv` reads 450 ms and 600 ms on the delayed-callback timer after a
+/// put armed its pass, read on cbLow. Queued from cbMedium, behind the
+/// `special` task that arms the pass there, so the timer, firing in deadline
+/// order, runs a 0.5 s pass between the two reads.
+fn read_at_450_and_600_ms(
+    db: &Arc<PvDatabase>,
+    pv: &'static str,
+) -> BackgroundTaskHandle<[i16; 2]> {
     let db = db.clone();
-    spawn_background(CallbackPriority::Low, async move {
-        sleep_background(Duration::from_millis(750)).await;
-        read(&db, pv)
+    spawn_background(CallbackPriority::Medium, async move {
+        let [early, late] = [450, 600].map(|ms| {
+            let db = db.clone();
+            spawn_background(CallbackPriority::Low, async move {
+                sleep_background(Duration::from_millis(ms)).await;
+                read(&db, pv)
+            })
+        });
+        [early.await.unwrap(), late.await.unwrap()]
     })
 }
 
-/// Whether `rx` has a post 750 ms on the delayed-callback timer after its
-/// next one, read on cbLow. A pass's post wakes this there only once the pass
-/// has re-armed, and the timer fires in deadline order, so a 0.5 s re-arm has
-/// posted by then and a 1 s one has not, however late the host runs both.
-fn reposted_within_750_ms(mut rx: EventReader) -> BackgroundTaskHandle<(EventReader, bool)> {
+fn drain(rx: &mut EventReader) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// Whether the pass after the next one `rx` sees has posted 450 ms and
+/// 600 ms on the delayed-callback timer after it, read on cbLow. That post
+/// wakes this on cbLow's one worker once its pass has re-armed, and the timer
+/// fires in deadline order, so a 0.5 s re-arm lands between the two reads
+/// unless this registers its 450 ms more than 50 ms after the re-arm.
+fn next_pass_at_450_and_600_ms(
+    mut rx: EventReader,
+) -> BackgroundTaskHandle<(EventReader, [bool; 2])> {
     spawn_background(CallbackPriority::Low, async move {
-        while rx.try_recv().is_ok() {}
+        drain(&mut rx);
         rx.recv().await.expect("subscriber open");
-        sleep_background(Duration::from_millis(750)).await;
-        let again = rx.try_recv().is_ok();
-        (rx, again)
+        let at_600 = spawn_background(
+            CallbackPriority::Low,
+            sleep_background(Duration::from_millis(600)),
+        );
+        sleep_background(Duration::from_millis(450)).await;
+        let by_450 = drain(&mut rx) > 0;
+        at_600.await.unwrap();
+        let by_600 = by_450 || drain(&mut rx) > 0;
+        (rx, [by_450, by_600])
     })
 }
 
@@ -180,8 +206,12 @@ async fn a_down_sseq_link_is_rechecked_until_it_connects() {
         span >= Duration::from_millis(1500),
         "five Local PV re-posts in {span:?}"
     );
-    let (mut rx, rearmed) = reposted_within_750_ms(rx).await.unwrap();
-    assert!(rearmed, "no pass 750 ms after a pass");
+    let (mut rx, passes) = next_pass_at_450_and_600_ms(rx).await.unwrap();
+    assert_eq!(
+        passes,
+        [false, true],
+        "a pass 450 ms and 600 ms after a pass"
+    );
 
     up.store(true, Ordering::SeqCst);
     settled(&db, "Q:SQ.LNK1V", EXT_OK).await;
@@ -258,14 +288,14 @@ async fn a_wait_put_moves_werr_after_half_a_second() {
     db.put_pv_and_post("Q:SQ.WAIT2", EpicsValue::String("NoWait".into()))
         .await
         .unwrap();
-    let at_750_ms = read_after_750_ms(&db, "Q:SQ.WERR2");
+    let werr = read_at_450_and_600_ms(&db, "Q:SQ.WERR2");
     settled(&db, "Q:SQ.WERR2", 0).await;
+    assert_eq!(werr.await.unwrap(), [1, 0], "WERR2 450 ms and 600 ms on");
     assert!(
         put.elapsed() >= Duration::from_millis(500),
         "{:?}",
         put.elapsed()
     );
-    assert_eq!(at_750_ms.await.unwrap(), 0, "the pass ran after 750 ms");
 }
 
 /// An `LNKn` put posts its status at once and arms the pass that sets
@@ -280,15 +310,15 @@ async fn a_link_put_sets_werr_after_half_a_second() {
     db.put_record_field_from_ca("Q:SP", "LNK1", EpicsValue::String("Q:SRC.VAL".into()))
         .await
         .unwrap();
-    let at_750_ms = read_after_750_ms(&db, "Q:SP.WERR1");
+    let werr = read_at_450_and_600_ms(&db, "Q:SP.WERR1");
     settled(&db, "Q:SP.LNK1V", LOC).await;
     settled(&db, "Q:SP.WERR1", 1).await;
+    assert_eq!(werr.await.unwrap(), [0, 1], "WERR1 450 ms and 600 ms on");
     assert!(
         put.elapsed() >= Duration::from_millis(500),
         "{:?}",
         put.elapsed()
     );
-    assert_eq!(at_750_ms.await.unwrap(), 1, "the pass ran after 750 ms");
 }
 
 /// A DB-syntax link naming no record here is the `CA_LINK` C's `dbInitLink`

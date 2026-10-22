@@ -51,7 +51,7 @@
 pub mod port_holders;
 pub mod verdict;
 
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
 use epics_libcom_rs::net::port_held;
 use socket2::{Domain, Socket, Type};
@@ -181,14 +181,10 @@ impl<P: FnMut() -> u16> Iterator for Candidates<P> {
 /// Probed on the wildcard: a subject binds every NIC, and a number free on
 /// 127.0.0.1 can already be held on one of them.
 pub fn free_for_tcp_and_udp() -> u16 {
-    for _ in 0..64 {
-        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
-        let port = tcp.local_addr().expect("read the ephemeral port").port();
-        if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no port was free for both TCP and UDP after 64 attempts");
+    free_where(|port| {
+        probe_bind(Type::STREAM, port).is_ok() && probe_bind(Type::DGRAM, port).is_ok()
+    })
+    .expect("no port was free for both TCP and UDP after 64 attempts")
 }
 
 /// A port number free on TCP whose successor is free on UDP: a PVA server
@@ -196,14 +192,28 @@ pub fn free_for_tcp_and_udp() -> u16 {
 /// whatever `EPICS_PVAS_BROADCAST_PORT` says. A hint, as
 /// [`free_for_tcp_and_udp`] is.
 pub fn free_tcp_with_udp_successor() -> u16 {
-    for _ in 0..64 {
-        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
-        let port = tcp.local_addr().expect("read the ephemeral port").port();
-        if port < u16::MAX && UdpSocket::bind(("0.0.0.0", port + 1)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no TCP port with a free UDP successor after 64 attempts");
+    free_where(|port| {
+        port < u16::MAX
+            && probe_bind(Type::STREAM, port).is_ok()
+            && probe_bind(Type::DGRAM, port + 1).is_ok()
+    })
+    .expect("no TCP port with a free UDP successor after 64 attempts")
+}
+
+/// The first of 64 random numbers in the IANA dynamic range that `fits`.
+///
+/// Drawn, not taken from `bind(0)`: Windows hands ephemeral ports out in
+/// sequence, so a `bind(0)` walk steps through a block that other tests'
+/// sockets hold on the other protocol, and missed 64 times in a row under
+/// the CI suite (run 39804498678).
+fn free_where(fits: impl Fn(u16) -> bool) -> Option<u16> {
+    use std::hash::BuildHasher;
+    (0..64)
+        .map(|_| {
+            let draw = std::collections::hash_map::RandomState::new().hash_one(());
+            49152 + (draw % 16384) as u16
+        })
+        .find(|&port| fits(port))
 }
 
 /// Whether another socket holds `port` on TCP now: the kernel's own answer,
@@ -220,6 +230,11 @@ pub fn udp_port_is_held(port: u16) -> bool {
 }
 
 /// A wildcard bind of `port` that only another socket on the number refuses.
+fn port_is_held(ty: Type, port: u16) -> bool {
+    matches!(probe_bind(ty, port), Err(e) if port_held(&e))
+}
+
+/// The probe's wildcard bind; `Ok` is a number free on `ty`.
 ///
 /// Linux: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
 /// left in TIME_WAIT reads free; Linux still refuses it beside a listener on
@@ -228,7 +243,7 @@ pub fn udp_port_is_held(port: u16) -> bool {
 /// (`in_pcbbind`). Windows: `SO_EXCLUSIVEADDRUSE`, because a plain Winsock
 /// wildcard bind succeeds beside such a socket. Off Linux a port with
 /// connections left in TIME_WAIT may therefore read held.
-fn port_is_held(ty: Type, port: u16) -> bool {
+fn probe_bind(ty: Type, port: u16) -> std::io::Result<()> {
     let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
     #[cfg(target_os = "linux")]
     if ty == Type::STREAM {
@@ -238,7 +253,7 @@ fn port_is_held(ty: Type, port: u16) -> bool {
     #[cfg(windows)]
     exclusive_address_use(&sock);
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-    matches!(sock.bind(&addr.into()), Err(e) if port_held(&e))
+    sock.bind(&addr.into())
 }
 
 /// A port a test holds from first bind to last, for a subject that binds or
@@ -419,6 +434,25 @@ fn exclusive_address_use(sock: &Socket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
+
+    /// UDP held on the numbers Windows' sequential `bind(0)` hands TCP next
+    /// does not starve the pick, as it did run 39804498678.
+    #[cfg(windows)]
+    #[test]
+    fn a_udp_block_on_the_next_tcp_numbers_does_not_starve_the_pick() {
+        let next = TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+            + 1;
+        let block: Vec<UdpSocket> = (next..next.saturating_add(256))
+            .filter_map(|p| UdpSocket::bind(("0.0.0.0", p)).ok())
+            .collect();
+        assert!(block.len() > 200, "held only {} of 256", block.len());
+        free_for_tcp_and_udp();
+    }
 
     /// The held/free boundary: a bound socket reads held, the number it
     /// leaves behind reads free.

@@ -891,17 +891,33 @@ mod tests {
 
     /// C's `calcTrans` to the bit over every material, out-of-range energies
     /// included: `1.0/(d*mu)` then `*= 1.e4` rounds differently from
-    /// `1.e4/(d*mu)` on 138 of these cases.
+    /// `1.e4/(d*mu)` on 138 of these cases. The oracle's transmissions are
+    /// glibc's `exp`; C elsewhere calls its own libm's, which rounds a few
+    /// the other way (macOS arm64: Fe 2.3491 3.78), so off glibc the
+    /// transmission expected is this libm's `exp` of C's absLen.
     #[test]
     fn calc_trans_is_c_to_the_bit() {
         let oracle = include_str!("../../tests/oracle/filterDrive_calcTrans.txt");
         let mut cases = 0;
         for line in oracle.lines().filter(|l| !l.starts_with('#')) {
-            let [mat, kev, um, bits] = line.split(' ').collect::<Vec<_>>()[..] else {
+            let [mat, kev, um, abs_len, bits] = line.split(' ').collect::<Vec<_>>()[..] else {
                 panic!("{line}");
             };
-            let t = calc_single_transmission(mat, kev.parse().unwrap(), um.parse().unwrap(), 0);
-            assert_eq!(format!("{:016x}", t.to_bits()), bits, "{line}: {t:e}");
+            let (kev, um): (f64, f64) = (kev.parse().unwrap(), um.parse().unwrap());
+            let t = calc_single_transmission(mat, kev, um, 0);
+            let rs_abs_len = FILTER_MATERIALS
+                .iter()
+                .find(|m| m.name == mat)
+                .and_then(|m| attenuation(m, kev, um))
+                .map(|a| format!("{:016x}", a.abs_len_um.to_bits()));
+            assert_eq!(rs_abs_len.as_deref().unwrap_or("-"), abs_len, "{line}");
+            let want = match u64::from_str_radix(abs_len, 16) {
+                Ok(c) if !cfg!(all(target_os = "linux", target_env = "gnu")) => {
+                    format!("{:016x}", (-(um / f64::from_bits(c))).exp().to_bits())
+                }
+                _ => bits.to_string(),
+            };
+            assert_eq!(format!("{:016x}", t.to_bits()), want, "{line}: {t:e}");
             cases += 1;
         }
         assert_eq!(cases, 1056);

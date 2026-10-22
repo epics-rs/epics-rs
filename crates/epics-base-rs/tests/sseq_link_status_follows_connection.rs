@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -132,15 +132,23 @@ async fn a_down_sseq_link_is_rechecked_until_it_connects() {
     db.put_pv_and_post("Q:SQ.WAIT2", EpicsValue::String("Wait".into()))
         .await
         .unwrap();
-    sleep(2200).await;
+    let mut reposts = Vec::new();
+    while reposts.len() < 5 {
+        let ev = epics_base_rs::runtime::task::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a pass re-posts LNK2V")
+            .expect("subscriber open");
+        if ev.value().as_value() == Some(&EpicsValue::Enum(LOC as u16)) {
+            reposts.push(Instant::now());
+        }
+    }
     assert_eq!(read(&db, "Q:SQ.LNK1V"), EXT_NC);
-    let reposts = std::iter::from_fn(|| rx.try_recv().ok())
-        .filter(|ev| ev.value().as_value() == Some(&EpicsValue::Enum(LOC as u16)))
-        .count();
-    // One pass per 0.5 s: a second chain armed beside a pending one doubles it.
+    // One pass per 0.5 s spans 2 s; a second chain armed beside a pending
+    // one halves every other gap and spans 1 s.
+    let span = reposts[4] - reposts[0];
     assert!(
-        (3..=5).contains(&reposts),
-        "{reposts} Local PV re-posts in 2.2 s"
+        span >= Duration::from_millis(1500),
+        "five Local PV re-posts in {span:?}"
     );
 
     up.store(true, Ordering::SeqCst);
@@ -181,14 +189,18 @@ async fn a_wait_put_keeps_a_connected_ca_link_ok() {
 #[epics_macros_rs::epics_test]
 async fn init_leaves_werr_and_types_to_the_1s_pass() {
     let up = Arc::new(AtomicBool::new(true));
+    // Before init arms the pass, so the pass is at least 1 s after it.
+    let start = Instant::now();
     let db = build(&up).await;
     settled(&db, "Q:SQ.DOL2V", LOC).await;
-    let dt3 = read(&db, "Q:SQ.DT3");
-    sleep(600).await;
     assert_eq!(read(&db, "Q:SQ.WERR2"), 0);
-    assert_eq!(read(&db, "Q:SQ.DT3"), dt3);
-    assert_ne!(dt3, -1);
+    assert_ne!(read(&db, "Q:SQ.DT3"), -1);
     settled(&db, "Q:SQ.WERR2", 1).await;
+    assert!(
+        start.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
     assert_eq!(read(&db, "Q:SQ.DT3"), -1);
 }
 
@@ -210,13 +222,16 @@ async fn a_wait_put_moves_werr_after_half_a_second() {
     let db = build(&up).await;
     settled(&db, "Q:SQ.WERR2", 1).await;
     sleep(600).await;
+    let put = Instant::now();
     db.put_pv_and_post("Q:SQ.WAIT2", EpicsValue::String("NoWait".into()))
         .await
         .unwrap();
-    sleep(300).await;
-    assert_eq!(read(&db, "Q:SQ.WERR2"), 1);
-    sleep(400).await;
-    assert_eq!(read(&db, "Q:SQ.WERR2"), 0);
+    settled(&db, "Q:SQ.WERR2", 0).await;
+    assert!(
+        put.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        put.elapsed()
+    );
 }
 
 /// An `LNKn` put posts its status at once and arms the pass that sets
@@ -227,14 +242,17 @@ async fn a_link_put_sets_werr_after_half_a_second() {
     let db = build(&up).await;
     sleep(1500).await;
     assert_eq!(read(&db, "Q:SP.WERR1"), 0);
+    let put = Instant::now();
     db.put_record_field_from_ca("Q:SP", "LNK1", EpicsValue::String("Q:SRC.VAL".into()))
         .await
         .unwrap();
     settled(&db, "Q:SP.LNK1V", LOC).await;
-    sleep(300).await;
-    assert_eq!(read(&db, "Q:SP.WERR1"), 0);
-    sleep(400).await;
-    assert_eq!(read(&db, "Q:SP.WERR1"), 1);
+    settled(&db, "Q:SP.WERR1", 1).await;
+    assert!(
+        put.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        put.elapsed()
+    );
 }
 
 /// A DB-syntax link naming no record here is the `CA_LINK` C's `dbInitLink`

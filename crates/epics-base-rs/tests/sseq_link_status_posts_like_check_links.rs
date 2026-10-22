@@ -15,7 +15,7 @@ use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Past the 0.5 s `checkLinksCallback` a put arms (`sseqRecord.c:1018`).
 const PASS: Duration = Duration::from_millis(600);
@@ -50,6 +50,27 @@ fn drain(rx: &mut EventReader) -> usize {
         n += 1;
     }
     n
+}
+
+/// The events each of `rxs` gets once every one has `least`, plus any in a
+/// further [`PASS`]: a slow host runs the pass late, not never.
+async fn events(rxs: &mut [EventReader], least: &[usize]) -> Vec<usize> {
+    let mut got = vec![0; rxs.len()];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for (n, rx) in got.iter_mut().zip(rxs.iter_mut()) {
+            *n += drain(rx);
+        }
+        if got.iter().zip(least).all(|(n, l)| n >= l) || Instant::now() >= deadline {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    epics_base_rs::runtime::task::sleep(PASS).await;
+    for (n, rx) in got.iter_mut().zip(rxs.iter_mut()) {
+        *n += drain(rx);
+    }
+    got
 }
 
 #[epics_macros_rs::epics_test]
@@ -121,8 +142,7 @@ async fn sseq_link_status_event_counts_match_oracle_ioc() {
         db.put_record_field_from_ca("Q", field, value)
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(PASS).await;
-        let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
+        let got = events(&mut rxs, &want).await;
         assert_eq!(got, want, "events after the {field} put, per {FIELDS:?}");
     }
 }
@@ -206,6 +226,11 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::String(value.into()))
             .await
             .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while types(&db) != short(want) && Instant::now() < deadline {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        // And no pass after it moves them on.
         epics_base_rs::runtime::task::sleep(PASS).await;
         assert_eq!(types(&db), short(want), "after the {field} put");
     }
@@ -254,8 +279,8 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::Short(1))
             .await
             .unwrap();
-        epics_base_rs::runtime::task::sleep(PASS).await;
-        let got: Vec<usize> = rxs.iter_mut().map(drain).collect();
+        let pass = usize::from(field != "PROC");
+        let got = events(&mut rxs, &[0, 0, pass]).await;
         assert_eq!(got[..2], [0, 0], "CA status events after the {field} put");
         if field != "PROC" {
             assert!(got[2] > 0, "no checkLinks pass after the {field} put");

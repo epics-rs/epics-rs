@@ -283,7 +283,10 @@ impl HeldPort {
     /// UDP address only when both sides set `SO_REUSEPORT`, and the hold is
     /// connected ([`BSD_PCB_LOOKUP`]); a plain bind on another address then
     /// binds there, and cannot fail the subject's: their `SO_REUSEADDR`
-    /// bind looks only at unconnected sockets on its own address.
+    /// bind looks only at unconnected sockets on its own address. Windows
+    /// hands unicast to the older of two `SO_REUSEADDR` wildcard binds, and
+    /// to a connected hold as the better match for its local address, so
+    /// there the hold is only for a subject that is sent nothing.
     pub fn udp() -> Self {
         let hold = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a UDP hold");
         hold.set_reuse_address(true)
@@ -476,6 +479,7 @@ mod tests {
 
     /// Every datagram to the number reaches the subject's fanout socket, none
     /// the hold: one client socket per datagram, so each is hashed afresh.
+    /// Windows gives the first to the hold ([`HeldPort::udp`]).
     #[test]
     fn a_udp_hold_takes_none_of_the_subjects_unicast() {
         let held = HeldPort::udp();
@@ -490,14 +494,13 @@ mod tests {
         subject
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
-        for _ in 0..64 {
+        for _ in 0..if cfg!(windows) { 1 } else { 64 } {
             UdpSocket::bind("127.0.0.1:0")
                 .unwrap()
                 .send_to(b"x", ("127.0.0.1", held.port))
                 .unwrap();
-            subject
-                .recv(&mut [0; 1])
-                .expect("the subject got the datagram");
+            let got = subject.recv(&mut [0; 1]);
+            assert_eq!(got.is_ok(), !cfg!(windows), "{got:?}");
         }
     }
 

@@ -1014,9 +1014,11 @@ impl EpicsEvent {
                 .wait_timeout(full, deadline - now)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             full = guard;
-            // C's ETIMEDOUT branch: a timed-out wait is a timeout even when
-            // the event filled with it.
-            if wait.timed_out() {
+            // C's ETIMEDOUT branch: a wait that reached the deadline is a
+            // timeout even when the event filled with it. Windows' ms
+            // granularity can report timed out before the deadline, and
+            // `pthread_cond_timedwait` never does, so that wait goes on.
+            if wait.timed_out() && std::time::Instant::now() >= deadline {
                 return false;
             }
         }

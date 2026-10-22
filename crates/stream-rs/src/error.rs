@@ -328,12 +328,28 @@ macro_rules! cmsg {
     }};
 }
 
+/// `file!()` as C's `__FILE__` names a file: on Windows `file!()` joins
+/// its directories with `\`, which `StreamDebugClass::print`'s
+/// `strrchr(file, '/')` would keep.
+#[doc(hidden)]
+pub fn source_file(file: &'static str) -> &'static str {
+    if cfg!(windows) {
+        file.rsplit('\\').next().unwrap_or(file)
+    } else {
+        file
+    }
+}
+
 /// `debug(...)`: print when `streamDebug` is on.
 #[macro_export]
 macro_rules! debug {
     ($($part:expr),* $(,)?) => {
         if $crate::error::stream_debug() != 0 {
-            $crate::error::stream_debug_print(Some(file!()), line!(), &$crate::cmsg!($($part),*));
+            $crate::error::stream_debug_print(
+                Some($crate::error::source_file(file!())),
+                line!(),
+                &$crate::cmsg!($($part),*),
+            );
         }
     };
 }
@@ -343,7 +359,11 @@ macro_rules! debug {
 macro_rules! debug2 {
     ($($part:expr),* $(,)?) => {
         if $crate::error::stream_debug() >= 2 {
-            $crate::error::stream_debug_print(Some(file!()), line!(), &$crate::cmsg!($($part),*));
+            $crate::error::stream_debug_print(
+                Some($crate::error::source_file(file!())),
+                line!(),
+                &$crate::cmsg!($($part),*),
+            );
         }
     };
 }
@@ -439,5 +459,18 @@ mod tests {
         stream_debug_print(Some("src/protocol.rs"), 12, b"x\n");
         stream_debug_print(Some("a.rs"), 0, b"y\n");
         assert_eq!(take_captured(), b"protocol.rs:12: x\na.rs: y\n".to_vec());
+    }
+
+    #[test]
+    fn the_debug_macro_shows_its_source_file_basename() {
+        let _switches = TEST_SWITCHES.lock();
+        set_stream_msg_time_stamped(0);
+        set_get_thread_name_function(None);
+        set_stream_debug(1);
+        capture_stderr();
+        crate::debug!(b"x\n");
+        set_stream_debug(0);
+        let out = String::from_utf8(take_captured()).unwrap();
+        assert!(out.starts_with("error.rs:"), "{out:?}");
     }
 }

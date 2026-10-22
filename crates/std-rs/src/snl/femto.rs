@@ -348,13 +348,12 @@ pub async fn run(
 
     let mut debug_flag = ch_debug.get_i32().await;
     let mut ctrl = FemtoController::default();
-    // `pvGet(t0..tx, SYNC)` at the top of `init` (`femto.st:53-56`).
-    let mut event = Some(FemtoEvent::BitsChanged {
-        g1: ch_t0.get_i32().await != 0,
-        g2: ch_t1.get_i32().await != 0,
-        g3: ch_t2.get_i32().await != 0,
-        no: ch_tx.get_i32().await != 0,
-    });
+    // `pvGet(t0..tx, SYNC)` at the top of `init` (`femto.st:53-56`), into the
+    // variables a monitor taken after it overwrites.
+    ctrl.g1 = ch_t0.get_i32().await != 0;
+    ctrl.g2 = ch_t1.get_i32().await != 0;
+    ctrl.g3 = ch_t2.get_i32().await != 0;
+    ctrl.no = ch_tx.get_i32().await != 0;
     // The six `EvFlag`s (`femto.st:30-36`), by place in `monitored`.
     const T0: usize = 0;
     const T1: usize = 1;
@@ -363,6 +362,13 @@ pub async fn run(
     const GAINIDX: usize = 4;
     const DEBUG: usize = 5;
     let mut raised = [false; 6];
+    /// The `idle` clause that fired. Its event is built after the next
+    /// step's take, so `take` stays the only writer of the variables.
+    enum Fired {
+        Bits,
+        GainIndex,
+    }
+    let mut fired = None;
     // SNL `sync`: every monitor taken writes its variable (the controller's
     // bits and index, or the debug level) and raises its flag before the
     // evaluation that follows.
@@ -395,8 +401,17 @@ pub async fn run(
                 &mut debug_flag,
                 &mut raised,
             );
+            let event = fired.take().map(|f| match f {
+                Fired::Bits => FemtoEvent::BitsChanged {
+                    g1: ctrl.g1,
+                    g2: ctrl.g2,
+                    g3: ctrl.g3,
+                    no: ctrl.no,
+                },
+                Fired::GainIndex => FemtoEvent::GainIndexChanged(ctrl.gain_index),
+            });
             let previous = ctrl.state;
-            let (state, puts) = ctrl.step(event.take());
+            let (state, puts) = ctrl.step(event);
             if let Some((g1, g2, g3, no)) = puts.bits {
                 let _ = ch_t0.put_i32_process(g1 as i32).await;
                 let _ = ch_t1.put_i32_process(g2 as i32).await;
@@ -437,7 +452,7 @@ pub async fn run(
         // `idle`'s clauses in C's order (`femto.st:295-311`). `delay(.1)`
         // re-enters `idle` with nothing new to test, so only a monitor wakes
         // it.
-        event = Some(loop {
+        fired = Some(loop {
             take(
                 monitor.try_changes(),
                 &mut ctrl,
@@ -459,15 +474,10 @@ pub async fn run(
                 .into_iter()
                 .any(|i| std::mem::take(&mut raised[i]))
             {
-                break FemtoEvent::BitsChanged {
-                    g1: ctrl.g1,
-                    g2: ctrl.g2,
-                    g3: ctrl.g3,
-                    no: ctrl.no,
-                };
+                break Fired::Bits;
             }
             if std::mem::take(&mut raised[GAINIDX]) {
-                break FemtoEvent::GainIndexChanged(ctrl.gain_index);
+                break Fired::GainIndex;
             }
             take(
                 monitor.wait_changes().await,

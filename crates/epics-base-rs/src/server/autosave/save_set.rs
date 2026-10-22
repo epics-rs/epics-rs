@@ -637,7 +637,7 @@ impl SaveSet {
         if dir.is_empty() {
             return None;
         }
-        if dir.starts_with('/') || Path::new(&dir).is_absolute() {
+        if request::is_absolute(&dir) {
             return Some(dir.into());
         }
         let standard = standard.to_string_lossy();
@@ -1486,7 +1486,7 @@ pub async fn do_manual_restore(
             return set.restore_fetched(db, ca).await;
         }
     }
-    if !std::path::Path::new(filename).is_absolute() {
+    if !request::is_absolute(filename) {
         request::concatenated(&path.to_string_lossy(), settings);
     }
     let file = match from {

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -311,7 +311,7 @@ impl TaskOp {
                 }
                 if from == ManualSource::AsciiFile {
                     if status == 0 {
-                        if !Path::new(&filename).is_absolute() {
+                        if !super::request::is_absolute(&filename) {
                             super::request::concatenated(&path.to_string_lossy(), settings);
                         }
                         status = super::verify::do_as_verify(db, &path, -1, None).await;
@@ -366,7 +366,7 @@ impl TaskOp {
                 if debug != 0 {
                     crate::epics_println!("save_restore task: calling do_asVerify('{filename}')");
                 }
-                if !Path::new(&filename).is_absolute() {
+                if !super::request::is_absolute(&filename) {
                     super::request::concatenated(&path.to_string_lossy(), settings);
                 }
                 super::verify::do_as_verify(db, &path, verbose, restore.as_deref()).await;

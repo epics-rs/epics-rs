@@ -1,6 +1,6 @@
 // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — sync tests that hand-build their own tokio runtime; all three passed under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-base-rs --lib server::autosave::startup::`.
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -354,7 +354,7 @@ impl AutosaveStartupConfig {
                     status: status.clone(),
                     settings: self.settings.clone(),
                     macrostring: item.macros.clone(),
-                    write_backup: !Path::new(&item.filename).is_absolute()
+                    write_backup: !super::request::is_absolute(&item.filename)
                         && !(pass1
                             && self
                                 .pass0_restores

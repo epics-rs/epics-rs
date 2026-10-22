@@ -65,7 +65,7 @@ pub async fn reboot_restore(
             "Found filename '{filename}' in restoreFileList.\n"
         ));
         // `concatenate_paths` unless the name is absolute (:819-823).
-        if !Path::new(filename).is_absolute() {
+        if !request::is_absolute(filename) {
             request::concatenated(&item.path.to_string_lossy(), &item.settings);
         }
         // initHookAfterInitDevSup, initHookAfterInitDatabase (initHooks.h:84-85).

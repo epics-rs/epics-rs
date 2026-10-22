@@ -108,6 +108,17 @@ pub(crate) fn concatenate_paths(s1: &str, s2: &str, settings: &SrSettings) -> St
     dest
 }
 
+/// C `isAbsolute` (save_restore.c:501-510): a leading `/`, and on Windows
+/// also `x:/`, `x:\` or a leading `\`, which `Path::is_absolute` does not
+/// all count.
+pub(crate) fn is_absolute(filename: &str) -> bool {
+    let b = filename.as_bytes();
+    b.first() == Some(&b'/')
+        || (cfg!(windows)
+            && (b.first() == Some(&b'\\')
+                || (b.len() > 2 && b[1] == b':' && matches!(b[2], b'/' | b'\\'))))
+}
+
 /// `concatenate_paths`'s trace, for a site whose path rs joined once,
 /// before the C call that joins it again.
 pub(crate) fn concatenated(dest: &str, settings: &SrSettings) {
@@ -551,6 +562,23 @@ mod tests {
         ] {
             assert_eq!(split_include(line).0, name, "{line}");
             assert_eq!(include_macro_text(line), defs, "{line}");
+        }
+    }
+
+    #[test]
+    fn is_absolute_is_cs_test_on_this_os() {
+        let windows = cfg!(windows);
+        for (name, absolute) in [
+            ("/x", true),
+            ("x", false),
+            ("", false),
+            ("\\x", windows),
+            ("C:/x", windows),
+            ("C:\\x", windows),
+            ("C:", false),
+            ("C:x", false),
+        ] {
+            assert_eq!(is_absolute(name), absolute, "{name}");
         }
     }
 }

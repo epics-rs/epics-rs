@@ -71,8 +71,9 @@ libc = "0.2"
 
 # `runtime::socket::poll_ready`'s `WSAPoll`; `net::win_adapters`'s
 # `GetAdaptersAddresses`; `runtime::task::current_thread_stack_low`'s
-# `GetCurrentThreadStackLimits`.
+# `GetCurrentThreadStackLimits`. libc is `runtime::crt_errno`'s CRT `strerror`.
 [target.'cfg(windows)'.dependencies]
+libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

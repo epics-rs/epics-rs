@@ -2966,16 +2966,12 @@ mod tests {
             });
         assert!(result.is_err(), "an unopenable script is a failure");
 
-        // The reason is C's `strerror` for the open the shell just tried. C's
-        // half of the line — the wording, the colour, the single unframed
-        // line — is what this compares.
-        let reason = c_strerror(&std::fs::File::open(&missing_path).expect_err("no such file"));
         let printed = std::fs::read_to_string(&captured).unwrap();
         assert_eq!(
             printed,
             format!(
                 "{}\n",
-                paint_error(&format!("Can't open {missing}: {reason}"))
+                paint_error(&format!("Can't open {missing}: No such file or directory"))
             ),
             "one line, C's wording, C's `strerror` with no Rust suffix"
         );

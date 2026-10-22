@@ -156,7 +156,7 @@ async fn a_served_name_is_an_in_process_channel() {
             let mut events = Events::new();
 
             let ao = create(&sys, "SEQ:AO", &events, "ao");
-            assert_eq!(events.next("ao connect").await, Ev::Conn("ao", true));
+            assert!(ao.in_process(), "connected in the create");
             assert_eq!(ao.name(), "SEQ:AO");
             assert_eq!(ao.count(), 1);
 
@@ -207,7 +207,7 @@ async fn a_served_name_is_an_in_process_channel() {
 
             // The first event is the value; a put is seen.
             assert_eq!(
-                ao.monitor_on(PvType::TimeDouble, 1, events.monitor("ao")),
+                ao.monitor_on(&sys.gate(), PvType::TimeDouble, 1, events.monitor("ao")),
                 PvStat::Ok
             );
             assert_eq!(
@@ -230,7 +230,7 @@ async fn a_served_name_is_an_in_process_channel() {
 
             // A put callback completes when the processing it started does.
             let co = create(&sys, "SEQ:CO.A", &events, "co");
-            assert_eq!(events.next("co connect").await, Ev::Conn("co", true));
+            assert!(co.in_process(), "connected in the create");
             let started = Instant::now();
             co.put_callback(
                 PvType::Double,
@@ -256,7 +256,7 @@ async fn a_served_name_is_an_in_process_channel() {
 
             // An array: the count is the server's; a request moves `count`.
             let wf = create(&sys, "SEQ:WF", &events, "wf");
-            assert_eq!(events.next("wf connect").await, Ev::Conn("wf", true));
+            assert!(wf.in_process(), "connected in the create");
             assert_eq!(wf.count(), 10);
             wf.put_no_block(
                 PvType::Double,
@@ -276,6 +276,97 @@ async fn a_served_name_is_an_in_process_channel() {
     .await;
 }
 
+/// `dbChannelIO::initiateConnect` connects an in-process channel inside
+/// `ca_create_channel`.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn an_in_process_channel_is_connected_when_created() {
+    with_ioc(
+        "record(ao, \"SEQ:AO\") {}\n",
+        "192.0.2.1".into(),
+        |db| async move {
+            let sys = PvSystem::create(&db);
+            let mut events = Events::new();
+            let ao = create(&sys, "SEQ:AO", &events, "ao");
+            assert_eq!(ao.count(), 1);
+            assert_eq!(
+                ao.put_no_block(PvType::Double, 1, EpicsValue::Double(3.0)),
+                PvStat::Ok
+            );
+            assert_eq!(ao.message(), None, "not refused as disconnected");
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
+            assert!(events.rx.try_recv().is_err(), "no connection handler call");
+        },
+    )
+    .await;
+}
+
+/// An in-process request runs on the caller's thread, as `dbContext`'s
+/// does: a put has processed the record (`dbPutField`) when it returns, and
+/// the callback of a get, or of a put whose processing ends at once, has
+/// run.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn an_in_process_request_completes_in_the_caller() {
+    with_ioc(
+        "record(ao, \"SEQ:AO\") { field(VAL, \"9.95\") field(DRVH, \"226\") field(DRVL, \"-229\") }\n",
+        "192.0.2.1".into(),
+        |db| async move {
+            let sys = PvSystem::create(&db);
+            let mut events = Events::new();
+            let ao = create(&sys, "SEQ:AO", &events, "ao");
+            assert!(ao.in_process(), "connected in the create");
+            let drvh = create(&sys, "SEQ:AO.DRVH", &events, "drvh");
+            assert!(drvh.in_process(), "connected in the create");
+
+            // DRVH is pp(TRUE): the put processes the record, which clamps
+            // VAL to it.
+            assert_eq!(
+                drvh.put_no_block(PvType::Double, 1, EpicsValue::Double(0.0)),
+                PvStat::Ok
+            );
+            assert_eq!(db.get_pv("SEQ:AO").unwrap(), EpicsValue::Double(0.0));
+
+            assert_eq!(
+                ao.get_callback(PvType::TimeDouble, 1, events.done("ao")),
+                PvStat::Ok
+            );
+            assert_eq!(
+                events.rx.try_recv().ok(),
+                Some(Ev::Done {
+                    pv: "ao",
+                    evt: PvEventType::Get,
+                    count: 1,
+                    value: Some(vec![0.0]),
+                    message: NORMAL.into(),
+                })
+            );
+
+            assert_eq!(
+                drvh.put_callback(
+                    PvType::Double,
+                    1,
+                    EpicsValue::Double(-1.0),
+                    events.done("drvh")
+                ),
+                PvStat::Ok
+            );
+            assert_eq!(
+                events.rx.try_recv().ok(),
+                Some(Ev::Done {
+                    pv: "drvh",
+                    evt: PvEventType::Put,
+                    count: 1,
+                    value: None,
+                    message: NORMAL.into(),
+                })
+            );
+            assert_eq!(db.get_pv("SEQ:AO").unwrap(), EpicsValue::Double(-1.0));
+        },
+    )
+    .await;
+}
+
 /// A put sends the variable's bits as its put type: an unsigned short
 /// 0xffff is DBR_SHORT -1, and a char of either sign is the byte
 /// `dbChannel_put` stores as DBR_UCHAR.
@@ -290,7 +381,7 @@ async fn a_put_sends_the_variables_bits_as_its_put_type() {
             let sys = PvSystem::create(&db);
             let mut events = Events::new();
             let ao = create(&sys, "SEQ:AO", &events, "ao");
-            assert_eq!(events.next("ao connect").await, Ev::Conn("ao", true));
+            assert!(ao.in_process(), "connected in the create");
             for (ty, value, want) in [
                 (PvType::Short, EpicsValue::UShort(0xffff), -1.0),
                 (PvType::Long, EpicsValue::ULong(0xffff_ffff), -1.0),
@@ -317,7 +408,7 @@ async fn a_put_sends_the_variables_bits_as_its_put_type() {
             }
 
             let wf = create(&sys, "SEQ:WF", &events, "wf");
-            assert_eq!(events.next("wf connect").await, Ev::Conn("wf", true));
+            assert!(wf.in_process(), "connected in the create");
             wf.put_no_block(
                 PvType::Short,
                 2,
@@ -385,6 +476,7 @@ async fn a_disconnect_fails_what_is_in_flight_then_tells_the_handler() {
             let mut events = Events::new();
             let ai = create(&sys, "SEQNET:AI", &events, "ai");
             assert_eq!(events.next("ai connect").await, Ev::Conn("ai", true));
+            assert!(!ai.in_process());
             assert_eq!(ai.count(), 1);
             ai.get_callback(PvType::TimeDouble, 1, events.done("ai"));
             assert_eq!(

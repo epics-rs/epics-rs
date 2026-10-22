@@ -201,7 +201,7 @@ impl<V: ProgramVars> StateSet<V> {
                 let start = Instant::now();
                 while slot.lock().is_some() {
                     let left = tmo - start.elapsed().as_secs_f64();
-                    if self.sscb().sync_sem.wait_timeout(left) {
+                    if self.prog.sync_wait(self.index, left) {
                         let status = self.check_connected(ch);
                         if status != PvStat::Ok {
                             return status;
@@ -260,7 +260,7 @@ impl<V: ProgramVars> StateSet<V> {
             // whole tmo again after each one, so a state set with a busy
             // monitor never timed out. The deadline here is the request's.
             let left = tmo - start.elapsed().as_secs_f64();
-            if !self.sscb().sync_sem.wait_timeout(left) {
+            if !self.prog.sync_wait(self.index, left) {
                 *slot.lock() = None;
                 return self.completion_timeout(ev, ch);
             }
@@ -489,8 +489,16 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_get_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvGetTmo`; `tmo` in seconds.
+    /// `seq_pvGetTmo`; `tmo` in seconds. Its return is a delivery point of
+    /// [`Program::gate`].
     pub fn pv_get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
+        self.prog
+            .gate
+            .call(self.index, || self.get_tmo(ch, comp, tmo))
+    }
+
+    /// [`Self::pv_get_tmo`]'s request.
+    fn get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {
@@ -604,8 +612,16 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_put_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvPutTmo`; `tmo` in seconds.
+    /// `seq_pvPutTmo`; `tmo` in seconds. Its return is a delivery point of
+    /// [`Program::gate`], which the put's own monitor does not pass.
     pub fn pv_put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
+        self.prog
+            .gate
+            .call(self.index, || self.put_tmo(ch, comp, tmo))
+    }
+
+    /// [`Self::pv_put_tmo`]'s request.
+    fn put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {
@@ -749,17 +765,17 @@ impl<V: ProgramVars> StateSet<V> {
             chan.db_count.store(chan.def.count, Ordering::Relaxed);
             return status;
         }
-        match self.prog.pv_var_create(ch, &name) {
-            Ok(pvid) => {
-                // C reuses a replaced channel's dbCount and meta data and
-                // callocs a new one's.
-                if !replaced {
-                    chan.db_count.store(0, Ordering::Relaxed);
-                    *chan.var_lock.lock() = PvMeta::zeroed();
-                }
-                d.assign_dbch(ch, name, pvid);
-                PvStat::Ok
+        let created = self.prog.pv_var_create(&mut d, ch, &name, |d, pvid| {
+            // C reuses a replaced channel's dbCount and meta data and
+            // callocs a new one's.
+            if !replaced {
+                chan.db_count.store(0, Ordering::Relaxed);
+                *chan.var_lock.lock() = PvMeta::zeroed();
             }
+            d.assign_dbch(ch, name.clone(), pvid);
+        });
+        match created {
+            Ok(()) => PvStat::Ok,
             Err((status, mess)) => {
                 // C frees the channel and leaves ch->dbch pointing at it.
                 chan.db_count.store(chan.def.count, Ordering::Relaxed);

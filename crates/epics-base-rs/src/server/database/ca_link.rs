@@ -21,13 +21,16 @@ use parking_lot::RwLock;
 
 use super::channel_io::{self, ChannelTarget, DbAccessChannel};
 use super::dbr_delivery::{DeliveryStage, prepare_read, with_live_options};
+use super::filters::FilterChain;
 use super::link_set::{
     DynLinkSet, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp, LinkRef,
     LinkSerial, LinkSet, PutAdmission,
 };
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
 use crate::runtime::task::TaskHandle;
-use crate::server::event_queue::{AttachId, EvQue, EventReader, EventUser, no_context};
+use crate::server::event_queue::{
+    AttachId, DeliveryContext, EvQue, EventReader, EventUser, no_context,
+};
 use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
 use crate::server::record::ProcessCompletion;
 use crate::server::snapshot::Snapshot;
@@ -876,21 +879,21 @@ impl LocalChannel {
         dbr_type: u16,
         mask: u16,
     ) -> Result<LocalMonitor, SubscribeRefused> {
-        let (pre_chain, post_chain) = self.chan.filter_chain().split();
+        let (pre_chain, notify) = self.state_notify(dbr_type);
         let user = EventUser::new();
-        let reader = channel_io::add_event(
-            db,
-            &self.chan.target,
-            &user,
-            0,
-            self.chan.native_type,
-            mask,
-            no_context(),
-            pre_chain,
-        )?;
+        let reader = self.add_event(db, &user, mask, no_context(), pre_chain)?;
         Ok(LocalMonitor {
             _user: user,
             reader,
+            notify,
+        })
+    }
+
+    /// A `dbr_type` subscription's `callStateNotify`, and the pre chain its
+    /// `db_add_event` runs.
+    pub(super) fn state_notify(&self, dbr_type: u16) -> (FilterChain, StateNotify) {
+        let (pre_chain, post_chain) = self.chan.filter_chain().split();
+        let notify = StateNotify {
             stage: DeliveryStage::new(
                 &self.chan.target,
                 post_chain,
@@ -901,7 +904,30 @@ impl LocalChannel {
             dbr_type,
             db: self.db.clone(),
             target: self.chan.target.clone(),
-        })
+        };
+        (pre_chain, notify)
+    }
+
+    /// `db_add_event` on `user`'s queue with `mask`, its entries carrying
+    /// `context`, then `db_post_single_event`.
+    pub(super) fn add_event(
+        &self,
+        db: &PvDatabase,
+        user: &EventUser,
+        mask: u16,
+        context: &DeliveryContext,
+        pre_chain: FilterChain,
+    ) -> Result<EventReader, SubscribeRefused> {
+        channel_io::add_event(
+            db,
+            &self.chan.target,
+            user,
+            0,
+            self.chan.native_type,
+            mask,
+            context,
+            pre_chain,
+        )
     }
 
     /// `dbChannelIO::write` for a link: a plain put is `dbChannel_put`
@@ -947,12 +973,26 @@ impl LocalChannel {
                 .map(|_| None)
                 .map_err(|r| format!("db_put_field() completed unsuccessfully: {}", r.error));
         }
+        self.put_callback(value)
+            .await
+            .map(Some)
+            .map_err(|_| "put callback request timed out".to_string())
+    }
+
+    /// `dbChannelIO::write` with a notify: the completion, which holds the
+    /// channel's `dbPutNotifyBlocker` until the record's processing is done.
+    /// `Err` is the blocker's wait for the put in flight running out
+    /// (`requestTimedOut`).
+    pub(super) async fn put_callback(
+        &self,
+        value: EpicsValue,
+    ) -> Result<super::ca_client::PutCompletion, crate::error::CaError> {
         let (completion, status, blocker) = self.put_notify(value).await?;
-        Ok(Some(Box::pin(async move {
+        Ok(Box::pin(async move {
             let _blocker = blocker;
             let settled = completion.settle().await;
             status.and(settled)
-        })))
+        }))
     }
 
     /// A put callback issued under the channel's `dbPutNotifyBlocker`, which
@@ -962,13 +1002,14 @@ impl LocalChannel {
     async fn put_notify(
         &self,
         value: EpicsValue,
-    ) -> Result<(Issued, Result<(), String>, tokio::sync::OwnedMutexGuard<()>), String> {
+    ) -> Result<(Issued, Result<(), String>, tokio::sync::OwnedMutexGuard<()>), crate::error::CaError>
+    {
         let blocker = crate::runtime::task::timeout(
             PUT_NOTIFY_BLOCK_TIMEOUT,
             self.blocker.clone().lock_owned(),
         )
         .await
-        .map_err(|_| "put callback request timed out".to_string())?;
+        .map_err(|_| crate::error::CaError::Timeout)?;
         let (issued, status) = Issued::outcome(self.put(value, true).await);
         let status = status.map_err(|e| format!("put notify unsuccessful: {e}"));
         Ok((issued, status, blocker))
@@ -1051,13 +1092,26 @@ pub(super) struct LocalMonitor {
     /// The event context the reader's queue belongs to.
     _user: EventUser,
     pub(super) reader: EventReader,
+    notify: StateNotify,
+}
+
+impl LocalMonitor {
+    /// [`StateNotify::state_notify`].
+    pub(super) fn state_notify(&self, event: MonitorEvent, count: u32) -> Option<Snapshot> {
+        self.notify.state_notify(event, count)
+    }
+}
+
+/// What `callStateNotify` needs to hand a subscription's event over as a
+/// DBR value.
+pub(super) struct StateNotify {
     stage: DeliveryStage,
     dbr_type: u16,
     db: Weak<PvDatabaseInner>,
     target: ChannelTarget,
 }
 
-impl LocalMonitor {
+impl StateNotify {
     /// `dbContext::callStateNotify` (`dbContext.cpp:141-189`): the event as
     /// a `dbr_type` value of `count` elements, 0 for its current count.
     pub(super) fn state_notify(&self, event: MonitorEvent, count: u32) -> Option<Snapshot> {

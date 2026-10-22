@@ -760,6 +760,7 @@ mod tests {
             instance: AtomicU32::new(0),
             thread_priority: 50,
             stack_size: 0,
+            gate: Arc::default(),
             pv_sys: PvSystem::create(&PvDatabase::new()),
             chans: table
                 .chan

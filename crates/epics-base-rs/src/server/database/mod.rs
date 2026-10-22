@@ -26,7 +26,7 @@ mod subroutine_context;
 
 pub use ca_client::{
     CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
-    PutCompletion,
+    InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;
 pub use field_io::{

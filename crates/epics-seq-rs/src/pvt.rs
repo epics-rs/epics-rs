@@ -15,7 +15,7 @@ use epics_base_rs::types::WallTime;
 use parking_lot::Mutex;
 
 use crate::program::{SeqChan, SeqProgram, SeqSs};
-use crate::pv::{PvSystem, PvVar};
+use crate::pv::{EventGate, PvSystem, PvVar};
 use crate::seq::SeqThreadId;
 use crate::types::{ChId, CharPtr, EfId, PvSevr, PvStat, SeqMask};
 use crate::var::ProgramVars;
@@ -319,6 +319,9 @@ pub struct Program<V: 'static> {
     pub thread_priority: u32,
     pub stack_size: u32,
     pub pv_sys: PvSystem,
+    /// What the program's monitor events pass: each state set is in it
+    /// while it runs, so an event lands only while every one is blocked.
+    pub gate: Arc<EventGate>,
     pub chans: Box<[Chan<V>]>,
     pub queues: Box<[SeqQueue]>,
     pub ss: Box<[Sscb<V>]>,
@@ -357,6 +360,9 @@ pub trait ProgInstance: Send + Sync {
     /// `seqStop`'s `seq_exit(sp->ss)`.
     fn stop(&self);
 
+    /// [`Program::gate`].
+    fn gate(&self) -> &EventGate;
+
     /// An `Arc`, because `seqShow` asks each state set's
     /// `pvGetComplete` / `pvPutComplete`.
     fn show(self: Arc<Self>);
@@ -381,6 +387,10 @@ impl<V: ProgramVars> ProgInstance for Program<V> {
 
     fn num_ss(&self) -> usize {
         self.ss.len()
+    }
+
+    fn gate(&self) -> &EventGate {
+        &self.gate
     }
 
     fn thread_id(&self, ss: usize) -> Option<SeqThreadId> {

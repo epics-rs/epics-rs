@@ -29,27 +29,28 @@ impl<V: ProgramVars> Program<V> {
     pub fn seq_connect(self: &Arc<Self>, wait: bool) -> PvStat {
         for (n, chan) in self.chans.iter().enumerate() {
             let ch = ChId(n as u32);
-            // Held across the create, so the connection handler, which runs
-            // only after it returns, finds the pv stored.
+            // Held across the create, so a network pv's connection handler,
+            // which runs only after it returns, finds the pv stored.
             let mut d = self.dynamic.lock();
-            let Some(dbch) = d.dbch(ch) else {
+            let Some(name) = d.dbch(ch).map(|dbch| dbch.db_name.clone()) else {
                 continue;
             };
-            match self.pv_var_create(ch, &dbch.db_name) {
-                Ok(pvid) => d.set_pvid(ch, pvid),
-                Err((_, message)) => {
-                    errlog_sev_vprintf(
-                        ErrlogSevEnum::Fatal,
-                        format_args!(
-                            "seq_connect(var '{}', pv '{}'): pvVarCreate() failure: {message}\n",
-                            chan.def.var_name, dbch.db_name
-                        ),
-                    );
-                    d.drop_uncreated_dbch(ch);
-                }
+            let created = self.pv_var_create(&mut d, ch, &name, |d, pvid| d.set_pvid(ch, pvid));
+            if let Err((_, message)) = created {
+                errlog_sev_vprintf(
+                    ErrlogSevEnum::Fatal,
+                    format_args!(
+                        "seq_connect(var '{}', pv '{name}'): pvVarCreate() failure: {message}\n",
+                        chan.def.var_name
+                    ),
+                );
+                d.drop_uncreated_dbch(ch);
             }
         }
         self.pv_sys.flush();
+        // No state set runs yet: the first monitors queued at the creates
+        // land before the first state does.
+        self.pv_sys.deliver();
         if wait {
             self.wait_connected()
         } else {
@@ -163,7 +164,7 @@ impl<V: ProgramVars> Program<V> {
         let def = self.chans[ch.index()].def;
         let status = if on {
             let prog = Arc::downgrade(self);
-            pvid.monitor_on(def.var_type.get_type(), def.count, move |ev| {
+            pvid.monitor_on(&self.gate, def.var_type.get_type(), def.count, move |ev| {
                 if let Some(prog) = prog.upgrade() {
                     prog.seq_mon_handler(ch, ev)
                 }
@@ -187,23 +188,32 @@ impl<V: ProgramVars> Program<V> {
     }
 
     /// `pvVarCreate` for channel `ch` with `seq_conn_handler` as its
-    /// connection callback: what `seq_connect` and `pvAssign` call. It does
-    /// not take `dynamic`; the caller holds it until the pv is stored, as
-    /// the handler takes it. A failure carries what C's `pvVarGetMess`
-    /// would then return.
+    /// connection callback: what `seq_connect` and `pvAssign` call, holding
+    /// `dynamic` as `d`. `store` puts the pv in `ch`'s slot; an in-process
+    /// pv is then connected here, under that hold, as
+    /// `dbChannelIO::initiateConnect` runs `seq_conn_handler` inside
+    /// `ca_create_channel` under the recursive `sp->lock`. A failure
+    /// carries what C's `pvVarGetMess` would then return.
     pub fn pv_var_create(
         self: &Arc<Self>,
+        d: &mut ProgDyn,
         ch: ChId,
         name: &str,
-    ) -> Result<Arc<PvVar>, (PvStat, &'static str)> {
+        store: impl FnOnce(&mut ProgDyn, Arc<PvVar>),
+    ) -> Result<(), (PvStat, &'static str)> {
         let prog = Arc::downgrade(self);
-        PvVar::create(&self.pv_sys, name, move |connected| {
+        let pvid = PvVar::create(&self.pv_sys, name, move |connected| {
             if let Some(prog) = prog.upgrade() {
                 prog.seq_conn_handler(ch, connected)
             }
         })
-        .map(Arc::new)
-        .map_err(|status| (status, NO_CONTEXT))
+        .map_err(|status| (status, NO_CONTEXT))?;
+        let in_process = pvid.in_process();
+        store(d, Arc::new(pvid));
+        if in_process && self.conn_change(d, ch, true) {
+            self.ss_wakeup(0);
+        }
+        Ok(())
     }
 
     /// `seq_conn_handler`.
@@ -590,6 +600,7 @@ mod tests {
             instance: AtomicU32::new(0),
             thread_priority: 0,
             stack_size: 0,
+            gate: Arc::default(),
             pv_sys: PvSystem::create(&PvDatabase::new()),
             chans: Box::new([Chan {
                 def,
@@ -921,7 +932,10 @@ mod tests {
     #[test]
     fn a_create_without_a_context_fails_with_the_reason() {
         let p = prog(false);
-        let Err((status, message)) = p.pv_var_create(X, "X") else {
+        let created = p.pv_var_create(&mut p.dynamic.lock(), X, "X", |_, _| {
+            panic!("stored without a reactor")
+        });
+        let Err((status, message)) = created else {
             panic!("created without a reactor");
         };
         assert_eq!((status, message), (PvStat::Error, NO_CONTEXT));

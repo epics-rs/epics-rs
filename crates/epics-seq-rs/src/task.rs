@@ -58,6 +58,9 @@ impl<V: ProgramVars> Program<V> {
                 prog: Arc::clone(&self),
                 index: 0,
             };
+            // Each state set runs from here, or from its spawn, until its
+            // `ss_entry` ends.
+            self.gate.run(0);
             if let Some(entry) = self.table.entry_func {
                 entry(&ss0);
             }
@@ -70,6 +73,7 @@ impl<V: ProgramVars> Program<V> {
                 let ss_name = format!("{}_{nss}", &name[..len]);
                 let prog = Arc::clone(&self);
                 let thread_name = ss_name.clone();
+                self.gate.run(nss);
                 let spawned = MandatoryThread::new(
                     ss_name,
                     ThreadPriority::Custom(self.thread_priority),
@@ -85,6 +89,7 @@ impl<V: ProgramVars> Program<V> {
                         ErrlogSevEnum::Fatal,
                         format_args!("seq: epicsThreadCreate failed"),
                     );
+                    self.gate.stop(nss);
                     self.ss[nss].dead.signal();
                 }
             }
@@ -93,7 +98,9 @@ impl<V: ProgramVars> Program<V> {
                 ss.dead.wait();
             }
             if let Some(exit) = self.table.exit_func {
+                self.gate.run(0);
                 exit(&ss0);
+                self.gate.stop(0);
             }
         }
         self.seq_disconnect();
@@ -177,7 +184,7 @@ impl<V: ProgramVars> Program<V> {
             let mut next = 0;
             loop {
                 let timeout = *ss.wakeup_time.lock() - now;
-                ss.sync_sem.wait_timeout(timeout);
+                self.sync_wait(nss, timeout);
                 if self.die.load(Ordering::Acquire) {
                     break 'run;
                 }
@@ -213,8 +220,25 @@ impl<V: ProgramVars> Program<V> {
             ss.current_state.store(cur as i32, Ordering::Relaxed);
         }
         drop(watched);
+        self.gate.stop(nss);
         if nss != 0 {
             ss.dead.signal();
+        }
+    }
+
+    /// `epicsEventWaitWithTimeout` on state set `nss`'s `syncSem`, a block
+    /// point of [`Program::gate`] when it sleeps and a pass when it finds
+    /// `syncSem` raised or has no time to wait.
+    pub(crate) fn sync_wait(&self, nss: usize, timeout: f64) -> bool {
+        let sem = &self.ss[nss].sync_sem;
+        if sem.try_wait() {
+            self.gate.pass(nss);
+            true
+        } else if timeout > 0.0 {
+            self.gate.block(nss, || sem.wait_timeout(timeout))
+        } else {
+            self.gate.pass(nss);
+            false
         }
     }
 
@@ -320,6 +344,8 @@ mod tests {
     use epics_base_rs::types::WallTime;
 
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
     use crate::program::VarModel;
     use crate::seq::fixture::{Vars, build, build_on, chan, program, table, w_chan};
     use crate::types::{PvSevr, PvStat, SeqMask, bit_set};
@@ -580,5 +606,185 @@ mod tests {
     fn safe_mode_raises_the_flags_of_the_anonymous_synced_channels() {
         assert_eq!(flags_at_entry(VarModel::Safe), (false, true));
         assert_eq!(flags_at_entry(VarModel::Reentrant), (false, false));
+    }
+
+    /// A database serving the ao records the sleep tests' programs use, on
+    /// a reactor that outlives the test.
+    fn served_db() -> &'static PvDatabase {
+        static DB: std::sync::OnceLock<PvDatabase> = std::sync::OnceLock::new();
+        DB.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                epics_base_rs::runtime::task::test_block_on(async move {
+                    let db = PvDatabase::new();
+                    for name in ["d1:n", "d2:n", "d3:n", "d4:n"] {
+                        db.add_record(
+                            name,
+                            Box::new(epics_base_rs::server::records::ao::AoRecord::new(1.5)),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    db.mark_pini_done();
+                    tx.send(db).unwrap();
+                    std::future::pending::<()>().await
+                })
+            });
+            rx.recv().unwrap()
+        })
+    }
+
+    /// `sequencer` to its end over a one-state program named `pv`, found
+    /// by its thread as a registered one is, whose `n` is on `pv`,
+    /// monitored and synced to flag 1.
+    fn run_one_state(
+        pv: &'static str,
+        event_func: crate::program::EventFn<Vars>,
+        action_func: crate::program::ActionFn<Vars>,
+    ) {
+        let n = crate::program::SeqChan {
+            ef_id: EfId(1),
+            ..chan(Some(pv), true)
+        };
+        let base = program(vec![n], VarModel::Reentrant, "", 1);
+        let states = Box::leak(Box::new([crate::program::SeqState {
+            state_name: "s",
+            action_func,
+            event_func,
+            entry_func: None,
+            exit_func: None,
+            event_mask: base.ss[0].states[0].event_mask,
+            options: StateOptions::new(0),
+        }]));
+        let ss = Box::leak(Box::new([crate::program::SeqSs {
+            ss_name: "ss",
+            states,
+        }]));
+        let table = Box::leak(Box::new(crate::program::SeqProgram {
+            prog_name: pv,
+            ss,
+            ..base
+        }));
+        crate::cmd::seq_register_sequencer_program(table);
+        let p = build_on(table, served_db());
+        p.sequencer(served_db(), "t");
+    }
+
+    /// A put of `v` to `pv` from a client context of its own.
+    fn post_from_another_client(pv: &'static str, v: f64) {
+        std::thread::spawn(move || {
+            let sys = crate::pv::PvSystem::create(served_db());
+            let pv = crate::pv::PvVar::create(&sys, pv, |_| {}).unwrap();
+            let put = pv.put_no_block(crate::types::PvType::Double, 1, EpicsValue::Double(v));
+            assert_eq!(put, PvStat::Ok);
+        })
+        .join()
+        .unwrap();
+    }
+
+    static RESPONSE_SEEN: AtomicBool = AtomicBool::new(false);
+
+    /// xiahsc's `WAIT_HSC_RESPONSE`: an action polls a synced flag between
+    /// `epicsThreadSleep`s and sees the response another client posts, as
+    /// C's `CAC-event` delivers while the state set sleeps.
+    #[test]
+    fn a_flag_polled_between_sleeps_sees_a_post_land() {
+        fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            true
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            ss.ef_clear(EfId(1));
+            post_from_another_client("d1:n", 5.0);
+            let seen = (0..50).any(|_| {
+                ss.ef_test(EfId(1)) || {
+                    crate::c::epicsThreadSleep(0.02);
+                    false
+                }
+            });
+            RESPONSE_SEEN.store(seen, Ordering::SeqCst);
+            ss.prog.die.store(true, Ordering::Release);
+        }
+        run_one_state("d1:n", event, action);
+        assert!(RESPONSE_SEEN.load(Ordering::SeqCst));
+    }
+
+    static AT_ONCE_SEEN: AtomicU32 = AtomicU32::new(0);
+
+    /// A sleep that returns at once, as C's `nanosleep` of zero or of a
+    /// delay it refuses does, is a delivery point too, as a `when` wait
+    /// that finds `syncSem` raised is.
+    #[test]
+    fn a_sleep_that_returns_at_once_is_a_delivery_point_too() {
+        fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            true
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            for (v, at_once) in [(2.0, 0.0), (3.0, -1.0), (4.0, f64::NAN), (5.0, 1e300)] {
+                ss.ef_clear(EfId(1));
+                post_from_another_client("d3:n", v);
+                crate::c::epicsThreadSleep(at_once);
+                if ss.ef_test(EfId(1)) {
+                    AT_ONCE_SEEN.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            ss.prog.die.store(true, Ordering::Release);
+        }
+        run_one_state("d3:n", event, action);
+        assert_eq!(AT_ONCE_SEEN.load(Ordering::SeqCst), 4);
+    }
+
+    static OWN_AT_ZERO: AtomicBool = AtomicBool::new(true);
+    static OWN_AFTER_SLEEP: AtomicBool = AtomicBool::new(false);
+
+    /// A zero sleep after a put does not block: the put's own monitor has
+    /// not landed after it, and a sleep that blocks lands it.
+    #[test]
+    fn a_zero_sleep_after_a_put_leaves_its_own_monitor_held() {
+        fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            true
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            ss.ef_clear(EfId(1));
+            ss.var().n.set(3);
+            assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
+            crate::c::epicsThreadSleep(0.0);
+            OWN_AT_ZERO.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
+            crate::c::epicsThreadSleep(0.05);
+            OWN_AFTER_SLEEP.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
+            ss.prog.die.store(true, Ordering::Release);
+        }
+        run_one_state("d4:n", event, action);
+        assert!(!OWN_AT_ZERO.load(Ordering::SeqCst), "at the zero sleep");
+        assert!(
+            OWN_AFTER_SLEEP.load(Ordering::SeqCst),
+            "at a sleep that blocks"
+        );
+    }
+
+    static PASS: AtomicU32 = AtomicU32::new(0);
+    static STALE_ECHO: AtomicBool = AtomicBool::new(true);
+
+    /// pf4's `PVPUT(x); epicsThreadSleep(PVPUT_WAIT); efClear(x_mon)`: the
+    /// put's echo lands during the sleep and the clear takes it, so the
+    /// next wait sees no flag.
+    #[test]
+    fn an_own_put_echo_lands_during_a_sleep_before_the_clear() {
+        fn event(ss: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            PASS.load(Ordering::SeqCst) == 0 || ss.delay(0.2)
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            if PASS.fetch_add(1, Ordering::SeqCst) == 0 {
+                ss.var().n.set(0);
+                assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
+                crate::c::epicsThreadSleep(0.05);
+                ss.ef_clear(EfId(1));
+            } else {
+                STALE_ECHO.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
+                ss.prog.die.store(true, Ordering::Release);
+            }
+        }
+        run_one_state("d2:n", event, action);
+        assert_eq!(PASS.load(Ordering::SeqCst), 2);
+        assert!(!STALE_ECHO.load(Ordering::SeqCst));
     }
 }

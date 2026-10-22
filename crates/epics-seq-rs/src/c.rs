@@ -18,10 +18,13 @@ use std::ffi::{c_char, c_int};
 use std::io;
 use std::slice;
 use std::sync::Arc;
+use std::time::Duration;
 
 use epics_base_rs::runtime::{crt_errno, stdio, stdlib};
 use epics_libcom_rs::cfmt::{self, Directive, Length, Spec};
 
+use crate::prog::seq_find_state_set;
+use crate::seq::SeqThreadId;
 use crate::types::{CharPtr, SeqString};
 use crate::var::{At, Place, SeqVar};
 
@@ -1026,10 +1029,20 @@ pub fn atoi(s: impl CSrc) -> c_int {
     s.with_c_bytes(|b| stdlib::atoi(b))
 }
 
-/// `epicsThreadSleep`; `secs` in seconds.
+/// `epicsThreadSleep`; `secs` in seconds. A state set's sleep is a block
+/// point of its program's [`EventGate`](crate::pv::EventGate), and one that
+/// returns at once a pass, as its `when` waits are.
 #[allow(non_snake_case)]
 pub fn epicsThreadSleep(secs: f64) {
-    epics_base_rs::runtime::time::sleep_secs(secs)
+    let sleep = || epics_base_rs::runtime::time::sleep_secs(secs);
+    let Some((prog, ss)) = seq_find_state_set(SeqThreadId::current()) else {
+        return sleep();
+    };
+    if Duration::try_from_secs_f64(secs).is_ok_and(|d| !d.is_zero()) {
+        prog.gate().block(ss, sleep)
+    } else {
+        prog.gate().pass(ss)
+    }
 }
 
 macro_rules! math1 {

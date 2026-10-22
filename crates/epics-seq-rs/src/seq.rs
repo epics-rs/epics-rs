@@ -291,6 +291,7 @@ impl<V: ProgramVars> InitProg<V> {
             instance: AtomicU32::new(0),
             thread_priority,
             stack_size,
+            gate: pv_sys.gate(),
             pv_sys,
             chans: self.chans.into(),
             queues: self.queues,

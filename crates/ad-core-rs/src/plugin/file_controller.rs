@@ -257,10 +257,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// [`FileControl::store_int32`] for the octet settings.
     pub fn store_octet(&mut self, reason: usize, value: &str) {
         let p = self.params;
-        let field = if Some(reason) == p.file_path {
-            // The port's write already ran `checkPath` and set FilePathExists.
-            &mut self.file_base.file_path
-        } else if Some(reason) == p.file_name {
+        if Some(reason) == p.file_path {
+            self.file_base.set_file_path(value);
+            return;
+        }
+        let field = if Some(reason) == p.file_name {
             &mut self.file_base.file_name
         } else if Some(reason) == p.file_template {
             &mut self.file_base.file_template
@@ -1995,6 +1996,29 @@ mod tests {
         c.store_octet(66, "");
         let r = c.process_array(&Arc::new(array(1)), &mut ());
         assert_eq!(int_update(&r.param_updates, PATH_EXISTS), None);
+    }
+
+    /// C sets FilePathExists only in `checkPath`, at `createFileName` and at
+    /// a FilePath write (asynNDArrayDriver.cpp:203, :530), so a frame
+    /// streamed into an open file leaves the FilePath write's value standing.
+    #[test]
+    fn a_stream_frame_into_an_open_file_keeps_the_file_path_writes_check() {
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        c.params.file_path = Some(66);
+        c.params.file_path_exists = Some(PATH_EXISTS);
+        c.file_base.set_mode(NDFileMode::Stream);
+        c.file_base.set_num_capture(0);
+        c.capture_active = true;
+        c.store_octet(66, &std::env::temp_dir().display().to_string());
+        let r = c.process_array(&Arc::new(array(1)), &mut ());
+        assert_eq!(int_update(&r.param_updates, PATH_EXISTS), Some(1));
+
+        // The port's FilePath write has set FilePathExists 0 (base_octet).
+        c.store_octet(66, "/adcore-no-such-dir-for-path-exists/");
+        let r = c.process_array(&Arc::new(array(2)), &mut ());
+        assert_eq!(c.writer.lock().opens, 1, "the second frame opens nothing");
+        assert_ne!(int_update(&r.param_updates, PATH_EXISTS), Some(1));
     }
 
     /// A formerly-bypassing exit: the Stream close ran its own

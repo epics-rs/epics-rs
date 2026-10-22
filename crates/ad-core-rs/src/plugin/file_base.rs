@@ -606,6 +606,14 @@ impl NDPluginFileBase {
         self.full_file_name.clear();
     }
 
+    /// Store a FilePath write. The port's `writeOctet` has just checked it
+    /// (asynNDArrayDriver.cpp:529-536); checking again here keeps
+    /// `file_path_exists` the port's FilePathExists.
+    pub(crate) fn set_file_path(&mut self, path: &str) {
+        self.file_path = path.to_owned();
+        self.check_path();
+    }
+
     /// C `checkPath()` (asynNDArrayDriver.cpp:98-109) on FilePath: normalize
     /// it and record whether the directory exists.
     fn check_path(&mut self) {

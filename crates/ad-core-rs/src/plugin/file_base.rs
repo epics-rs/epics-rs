@@ -395,10 +395,11 @@ pub enum FlushStep<'a> {
         /// The frame, when its write ran: C hands it to endProcessCallbacks
         /// (NDPluginFile.cpp:296-301).
         handed_on: Option<&'a Arc<NDArray>>,
-        /// FileNumber and FullFileName once the frame's file was named
-        /// (asynNDArrayDriver.cpp:216-219, NDPluginFile.cpp:51).
+        /// FileNumber, FullFileName and FilePathExists once the frame's file
+        /// was named (asynNDArrayDriver.cpp:203-219, NDPluginFile.cpp:51).
         file_number: i32,
         full_file_name: &'a str,
+        file_path_exists: Option<bool>,
     },
 }
 
@@ -607,7 +608,7 @@ impl NDPluginFileBase {
 
     /// C `checkPath()` (asynNDArrayDriver.cpp:98-109) on FilePath: normalize
     /// it and record whether the directory exists.
-    pub(crate) fn check_path(&mut self) {
+    fn check_path(&mut self) {
         if !self.file_path.is_empty() {
             let exists = crate::driver::ndarray_driver::check_path_str(&mut self.file_path);
             self.file_path_exists = Some(exists);
@@ -860,25 +861,33 @@ impl NDPluginFileBase {
         let frames = std::mem::take(&mut base.capture_buffer);
         let mut left = base.num_captured;
         base.num_captured = 0;
-        let mut count_down = |elapsed,
-                              status: FrameStatus<'_>,
-                              handed_on: Option<&Arc<NDArray>>,
-                              (file_number, name): (i32, &str)| {
-            left = left.saturating_sub(1);
-            posted(FlushStep::Frame {
-                num_captured: left,
-                elapsed,
-                status,
-                handed_on,
-                file_number,
-                full_file_name: name,
-            });
+        let mut count_down =
+            |elapsed,
+             status: FrameStatus<'_>,
+             handed_on: Option<&Arc<NDArray>>,
+             (file_number, name, exists): (i32, &str, Option<bool>)| {
+                left = left.saturating_sub(1);
+                posted(FlushStep::Frame {
+                    num_captured: left,
+                    elapsed,
+                    status,
+                    handed_on,
+                    file_number,
+                    full_file_name: name,
+                    file_path_exists: exists,
+                });
+            };
+        let named = |base: &mut Self| {
+            (
+                base.file_number,
+                base.full_file_name.clone(),
+                base.file_path_exists,
+            )
         };
-        let named = |base: &mut Self| (base.file_number, base.full_file_name.clone());
         if lock.io(|w| w.supports_multiple_arrays()) {
             // Multi-array format: open once, write all, close once.
             let (write_path, final_path) = lock.base().write_path(out);
-            let (number, name) = named(lock.base());
+            let (number, name, exists) = named(lock.base());
             let mut frame_failed = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -895,7 +904,7 @@ impl NDPluginFileBase {
                             elapsed,
                             failed.map_or(FrameStatus::Untouched, FrameStatus::Failed),
                             frame,
-                            (number, &name),
+                            (number, &name, exists),
                         )
                     },
                 )
@@ -911,7 +920,7 @@ impl NDPluginFileBase {
         for arr in &frames {
             let start = Instant::now();
             let (write_path, final_path) = lock.base().write_path(arr);
-            let (number, name) = named(lock.base());
+            let (number, name, exists) = named(lock.base());
             let mut ran = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -928,7 +937,12 @@ impl NDPluginFileBase {
             let status = written
                 .as_ref()
                 .map_or_else(FrameStatus::Failed, |()| FrameStatus::Ok);
-            count_down(start.elapsed(), status, ran.then_some(arr), (number, &name));
+            count_down(
+                start.elapsed(),
+                status,
+                ran.then_some(arr),
+                (number, &name, exists),
+            );
             last = written;
         }
         let ok = last.is_ok();

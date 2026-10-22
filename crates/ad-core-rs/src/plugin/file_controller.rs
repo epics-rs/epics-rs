@@ -187,13 +187,6 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
-    /// Re-evaluate whether the current `FilePath` directory exists and push a
-    /// `FilePathExists` param update, once per frame.
-    fn refresh_file_path_exists(&mut self, updates: &mut Vec<ParamUpdate>) {
-        self.file_base.check_path();
-        self.push_file_path_exists_update(updates);
-    }
-
     /// G9: apply the `FilePluginFileName` / `FilePluginFileNumber` attributes
     /// to the file base, returning param updates for the changed PVs and
     /// whether a mid-stream file reopen is required (C++ `attrFileNameSet` /
@@ -459,6 +452,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 handed_on: frame,
                 file_number,
                 full_file_name,
+                file_path_exists,
             } => {
                 if let Some(frame) = frame {
                     if let Some(view) = &view {
@@ -488,6 +482,9 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         p.file_number.map(|r| ParamUpdate::int32(r, file_number)),
                         p.full_file_name
                             .map(|r| ParamUpdate::octet(r, full_file_name.to_string())),
+                        p.file_path_exists
+                            .zip(file_path_exists)
+                            .map(|(r, v)| ParamUpdate::int32(r, v as i32)),
                         p.write_status
                             .zip(status)
                             .map(|(r, v)| ParamUpdate::int32(r, v)),
@@ -762,10 +759,6 @@ impl<W: NDFileWriter, P: PortLock<FilePluginController<W>>> FileControl<W> for P
             NDFileMode::Capture => false,
             NDFileMode::Stream => c.capture_active,
         };
-
-        // Every open checks the path (`open_file_name`); this also checks it
-        // on a frame that opens nothing, which C does not.
-        c.refresh_file_path_exists(&mut proc_result.param_updates);
 
         // G9: FilePluginClose attribute forces an immediate file close.
         let force_close = array
@@ -1965,28 +1958,31 @@ mod tests {
         assert_eq!(int_update(&last.param_updates, WRITE_STATUS), Some(1));
     }
 
-    /// The same failing cycle also ran `refresh_file_path_exists` before it
-    /// touched the writer. That update belongs to the cycle and the error exit
-    /// must not drop it — C++ accumulates into the parameter library and
-    /// posts it with the flush's first `callParamCallbacks`
-    /// (`NDPluginFile.cpp:278-279`).
+    /// C checks the path only where `createFileName` names a file
+    /// (asynNDArrayDriver.cpp:203), so a buffered frame and the flush's
+    /// WriteFile post (NDPluginFile.cpp:278-279) carry no FilePathExists, and
+    /// each flushed frame's post (:320) carries its open's check, the failed
+    /// ones' included, as does the error exit.
     #[test]
-    fn a_partial_capture_flush_keeps_the_path_check_of_the_same_cycle() {
+    fn a_capture_flush_posts_the_path_check_of_each_open() {
         let mut c = capture_controller(false);
         c.file_base.file_path = std::env::temp_dir().display().to_string();
         c.file_base.set_num_capture(4);
         c.writer.lock().fail_write_after = Some(2);
 
         for id in 1..=3 {
-            c.process_array(&Arc::new(array(id)), &mut ());
+            let r = c.process_array(&Arc::new(array(id)), &mut ());
+            assert_eq!(int_update(&r.param_updates, PATH_EXISTS), None, "{id}");
         }
         let mut posts = Vec::new();
-        c.process_array(&Arc::new(array(4)), &mut posts);
+        let r = c.process_array(&Arc::new(array(4)), &mut posts);
 
-        assert!(
-            int_update(&posts[0], PATH_EXISTS).is_some(),
-            "FilePathExists was checked this cycle; the error exit dropped it"
-        );
+        assert_eq!(int_update(&posts[0], PATH_EXISTS), None);
+        assert_eq!(posts.len(), 5);
+        for frame in &posts[1..] {
+            assert_eq!(int_update(frame, PATH_EXISTS), Some(1));
+        }
+        assert_eq!(int_update(&r.param_updates, PATH_EXISTS), Some(1));
     }
 
     /// C `checkPath` returns before NDFilePathExists on an empty FilePath

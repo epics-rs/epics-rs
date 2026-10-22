@@ -44,18 +44,20 @@ async fn includes_search_the_path_in_order() {
 /// `concatenate_paths` puts an absolute name UNDER each path directory.
 #[epics_macros_rs::epics_test]
 async fn an_absolute_name_is_joined_under_each_path_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    // In the target dir, on the drive the test runs from: Windows opens the
+    // drive-less name there.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let abs = dir.path().join("abs.req");
     std::fs::write(&abs, "ABS\n").unwrap();
     let path = tempfile::tempdir().unwrap();
     let ctx = MacroContext::new();
-    let name = abs.to_string_lossy();
+    let name = rooted(&abs);
     assert!(
         load_request_file_with_search_paths(&name, &[path.path().to_path_buf()], &ctx)
             .await
             .is_err()
     );
-    let under = path.path().join(abs.strip_prefix("/").unwrap());
+    let under = path.path().join(&name[1..]);
     std::fs::create_dir_all(under.parent().unwrap()).unwrap();
     std::fs::write(&under, "UNDER\n").unwrap();
     let list = load_request_file_with_search_paths(&name, &[path.path().to_path_buf()], &ctx)
@@ -67,4 +69,14 @@ async fn an_absolute_name_is_joined_under_each_path_directory() {
         .await
         .unwrap();
     assert_eq!(list.entries[0].pv_name, "ABS");
+}
+
+/// `p` as a `/`-led name with no drive, absolute to C `isAbsolute` on
+/// every OS, where a Windows `C:\` name would not join under a directory.
+fn rooted(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    match s.as_bytes() {
+        [_, b':', ..] => s[2..].to_string(),
+        _ => s,
+    }
 }

@@ -1272,11 +1272,13 @@ mod tests {
     }
 
     /// A destination of the comparison with glibc.
+    #[cfg(all(unix, target_env = "gnu"))]
     trait Checked {
         fn target(&self) -> &dyn ScanTarget;
         fn bytes(&self) -> Vec<u8>;
     }
 
+    #[cfg(all(unix, target_env = "gnu"))]
     impl<T: ScanStore + Copy> Checked for SeqVar<T> {
         fn target(&self) -> &dyn ScanTarget {
             self

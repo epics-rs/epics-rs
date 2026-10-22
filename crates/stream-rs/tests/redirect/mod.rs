@@ -150,6 +150,12 @@ fn dev(
     }))
 }
 
+/// `file` as a db field's quoted text: `dbTranslateEscape` takes a Windows
+/// path's `\` as an escape.
+pub fn db_path(file: &std::path::Path) -> String {
+    file.display().to_string().replace('\\', "\\\\")
+}
+
 /// An IOC running `db_text`, its protocols from `tests/redirect`.
 pub async fn ioc(db_text: &str) -> Arc<PvDatabase> {
     bus::register_stream_bus_interface("Redirect", dev);

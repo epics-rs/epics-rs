@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::runtime::task::{sleep, test_block_on};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
-use redirect::{ASYNC_FED, ASYNC_FEED, REPLIES, WRITES, get, ioc, process};
+use redirect::{ASYNC_FED, ASYNC_FEED, REPLIES, WRITES, db_path, get, ioc, process};
 
 /// A deadlocked entry keeps its record's set, and the test's next read of
 /// that record waits for it: abort the run instead of hanging it.
@@ -144,7 +144,7 @@ record(ao, "lt1") {{ }}
 record(ao, "lt2") {{ }}
 record(ai, "la") {{ field(DTYP, "stream") field(INP, "@{} p R") }}
 "#,
-            file.display()
+            db_path(&file)
         ))
         .await;
         assert!(same_set(&db, "la", "lt1"));

@@ -20,7 +20,7 @@ use epics_base_rs::runtime::task::test_block_on;
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};
 use epics_base_rs::server::db_loader::{apply_fields, create_record, parse_db};
 use epics_base_rs::types::EpicsValue;
-use redirect::ioc;
+use redirect::{db_path, ioc};
 
 /// A deadlocked relink keeps the record's set, and the test's next read of
 /// it waits for it: abort the run instead of hanging it.
@@ -105,7 +105,7 @@ fn a_reload_against_lock_records_of_a_lower_target() {
 record(ai, "t0") {{ field(DTYP, "stream") field(INP, "@{0} q R") }}
 record(ai, "sx") {{ field(DTYP, "stream") field(INP, "@{0} p R") }}
 "#,
-            file.display()
+            db_path(&file)
         ))
         .await;
         assert!(id(&db, "t0") < id(&db, "sx"));
@@ -161,7 +161,7 @@ fn a_reload_against_a_link_put_naming_it() {
 record(ai, "t0") {{ field(DTYP, "stream") field(INP, "@{0} q R") }}
 record(ai, "sx") {{ field(DTYP, "stream") field(INP, "@{0} p R") }}
 "#,
-            file.display()
+            db_path(&file)
         ))
         .await;
         assert!(id(&db, "t0") < id(&db, "sx"));
@@ -186,7 +186,7 @@ fn a_record_created_after_ioc_init_against_lock_records() {
     test_block_on(async {
         let db = ioc(&format!(
             "record(ai, \"t0\") {{ field(DTYP, \"stream\") field(INP, \"@{} q R\") }}\n",
-            file.display()
+            db_path(&file)
         ))
         .await;
         let creating = Arc::new(AtomicUsize::new(0));
@@ -200,7 +200,7 @@ fn a_record_created_after_ioc_init_against_lock_records() {
             creating.store(n, Ordering::Release);
             let text = format!(
                 "record(ai, \"sx{n}\") {{ field(DTYP, \"stream\") field(INP, \"@{} p R\") }}",
-                file.display()
+                db_path(&file)
             );
             for def in parse_db(&text, &HashMap::new()).unwrap() {
                 let mut record = create_record(&def.record_type).unwrap();

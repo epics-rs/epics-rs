@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::{sleep, test_block_on};
 use epics_base_rs::types::EpicsValue;
-use redirect::{REPLIES, WRITES, get, ioc};
+use redirect::{REPLIES, WRITES, db_path, get, ioc};
 
 /// `ax` fills 39 fields of `t3` and then `t3.FLNK = by`; `by` does the same
 /// to `t4`, naming `ax`. The fills hold the record long enough for the
@@ -49,7 +49,7 @@ record(ao, "t4") {{ }}
 record(ai, "ax") {{ field(DTYP, "stream") field(INP, "@{0} x R") }}
 record(ai, "by") {{ field(DTYP, "stream") field(INP, "@{0} y R") }}
 "#,
-            file.display()
+            db_path(&file)
         ))
         .await;
         for round in 0..200 {

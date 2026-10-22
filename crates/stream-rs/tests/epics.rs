@@ -1042,16 +1042,36 @@ fn help_matches_c() {
 }
 
 /// `streamSetLogfile file` sends the error lines to the file too, one that
-/// cannot be opened leaves the file before it in place, and no argument
-/// closes it.
+/// cannot be opened leaves the file before it in place and says C's
+/// `strerror` on stderr, and no argument closes it. The stderr is a child's,
+/// running this test.
 #[test]
 fn set_logfile() {
+    const DIR: &str = "STREAM_RS_SET_LOGFILE_DIR";
+    let Ok(dir) = std::env::var(DIR) else {
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["set_logfile", "--exact", "--nocapture"])
+            .env(DIR, dir.path())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        // the CRT's ENOENT text on Windows, not the Win32 sentence
+        let bad = dir.path().join("none/log");
+        let want = format!(
+            "Opening file {} failed: No such file or directory",
+            bad.display()
+        );
+        assert!(err.lines().any(|line| line == want), "{err}");
+        return;
+    };
     let _run = RUN.lock();
     epics_base_rs::runtime::task::test_block_on(async {
         let db = Arc::new(PvDatabase::new());
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("log");
-        let bad = dir.path().join("none/log");
+        let dir = PathBuf::from(dir);
+        let log = dir.join("log");
+        let bad = dir.join("none/log");
         shell(&db, &format!("streamSetLogfile \"{}\"", log.display())).await;
         shell(&db, &format!("streamSetLogfile \"{}\"", bad.display())).await;
         stream_rs::error::stream_error(b"logged\n");

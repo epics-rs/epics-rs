@@ -2447,12 +2447,10 @@ pub fn stream_set_logfile(filename: Option<&str>, _: &mut dyn std::io::Write) ->
     let file = match filename.map(std::fs::File::create).transpose() {
         Ok(file) => file,
         Err(e) => {
-            // strerror's text, without Rust's " (os error N)"
-            let text = e.to_string();
-            let text = text.rfind(" (os error ").map_or(&*text, |at| &text[..at]);
             epics_base_rs::stderr_println!(
-                "Opening file {} failed: {text}",
-                filename.unwrap_or_default()
+                "Opening file {} failed: {}",
+                filename.unwrap_or_default(),
+                epics_libcom_rs::runtime::crt_errno::strerror(&e)
             );
             return ERROR;
         }

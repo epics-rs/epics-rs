@@ -1859,6 +1859,9 @@ mod tests {
         .install_channel_sources(&db, &composite)
         .expect("qsrv sources mount");
 
+        // The group's no-+trigger WARN may still be queued here; a listener added
+        // before the worker drains it hears it, as in C errlog.
+        epics_base_rs::runtime::log::errlog_flush();
         let heard = Arc::new(std::sync::Mutex::new(String::new()));
         let sink = heard.clone();
         let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {

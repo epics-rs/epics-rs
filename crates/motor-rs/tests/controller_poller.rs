@@ -37,6 +37,14 @@ fn until_blocking(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Waits for `log` to hold `n` entries. An added axis stops counting as
+/// pending at its own first poll, before the pass polls the axes after it.
+fn polled(log: &Log, n: usize) {
+    until_blocking(&format!("{n} polls never ran"), || {
+        log.lock().unwrap().len() >= n
+    });
+}
+
 struct Axis {
     name: &'static str,
     log: Log,
@@ -570,7 +578,7 @@ async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
         .unwrap();
     assert_eq!(first.first_polls_pending(), 1);
     poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
-    settle();
+    polled(&log, 3);
     let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["A2", "A0", "A2"]);
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
@@ -623,7 +631,7 @@ async fn an_axis_built_under_the_lock_is_polled_by_the_pass_that_waited() {
     .await
     .unwrap()
     .unwrap();
-    settle();
+    polled(&log, 3);
     let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["B2", "B0", "B2"]);
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
@@ -689,7 +697,7 @@ async fn no_pass_polls_between_two_builds_of_one_batch() {
         .unwrap();
     done.unwrap();
     assert_eq!(added.len(), 2);
-    settle();
+    polled(&log, 4);
     let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
     assert_eq!(names[..4], ["C3", "built C1", "built C2", "C1"]);
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();

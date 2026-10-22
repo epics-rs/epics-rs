@@ -1055,6 +1055,9 @@ mod tests {
     /// (NDPluginFile.cpp:252), so a WriteFile arriving while the frame is
     /// written waits for it and returns. `path` is a FIFO, which holds each
     /// write until it is read.
+    // The hold is a POSIX FIFO; Windows has no blocking open to stand in for
+    // it, and the locking under test does not depend on the OS.
+    #[cfg(unix)]
     #[test]
     fn a_write_file_during_a_single_mode_write_returns() {
         use crate::test_util::{frame, gated, publish, wait_saved, write_file_returns};

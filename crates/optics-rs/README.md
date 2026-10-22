@@ -26,9 +26,9 @@ monitors, and other optical components.
 | Coarse+fine flexure | `snl::flex_combined_motion` | flexCombinedMotion.st |
 | HSC-1 slit controller | `drivers::hsc` (port driver) and `snl::xiahsc` (serial actor) | xiahsc.st |
 | XIA slit with sscan | `snl::xia_slit` | xia_slit.st |
-| Quad X-ray BPM | `drivers::qxbpm` (port driver) and `snl::qxbpm` (serial actor) | sncqxbpm.st |
+| Quad X-ray BPM | `drivers::qxbpm` (port driver) and `snl::qxbpm` | sncqxbpm.st |
 
-The three serial actors in `snl/` are async entry points taking the read and
+The serial actors in `snl/` are async entry points taking the read and
 write halves of the connection (`run(config, reader, writer, cmd_rx,
 status_tx)`); they are not `seqStart` programs.
 

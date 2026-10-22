@@ -65,7 +65,6 @@ tokio = { version = "1", default-features = false, features = [
 # and `recvmsg`/cmsg parsing in `net::async_udp_v4`, `getifaddrs` in
 # `net::iface_map`, `SCHED_FIFO` in `runtime::task`, `PTHREAD_PRIO_INHERIT` in
 # `runtime::sync`); this gate governs only whether libc is linked at all.
-# Windows still skips it entirely.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

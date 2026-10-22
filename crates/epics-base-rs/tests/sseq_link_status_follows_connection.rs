@@ -144,10 +144,10 @@ async fn a_down_sseq_link_is_rechecked_until_it_connects() {
     }
     assert_eq!(read(&db, "Q:SQ.LNK1V"), EXT_NC);
     // One pass per 0.5 s spans 2 s; a second chain armed beside a pending
-    // one halves every other gap and spans 1 s.
+    // one halves every other gap and spans 1 s, and a 1 s recheck spans 4 s.
     let span = reposts[4] - reposts[0];
     assert!(
-        span >= Duration::from_millis(1500),
+        (Duration::from_millis(1500)..Duration::from_secs(4)).contains(&span),
         "five Local PV re-posts in {span:?}"
     );
 
@@ -227,10 +227,11 @@ async fn a_wait_put_moves_werr_after_half_a_second() {
         .await
         .unwrap();
     settled(&db, "Q:SQ.WERR2", 0).await;
+    // Late on a slow host, but a 1 s pass is a whole period late.
+    let took = put.elapsed();
     assert!(
-        put.elapsed() >= Duration::from_millis(500),
-        "{:?}",
-        put.elapsed()
+        (Duration::from_millis(500)..Duration::from_secs(1)).contains(&took),
+        "{took:?}"
     );
 }
 
@@ -248,10 +249,11 @@ async fn a_link_put_sets_werr_after_half_a_second() {
         .unwrap();
     settled(&db, "Q:SP.LNK1V", LOC).await;
     settled(&db, "Q:SP.WERR1", 1).await;
+    // Late on a slow host, but a 1 s pass is a whole period late.
+    let took = put.elapsed();
     assert!(
-        put.elapsed() >= Duration::from_millis(500),
-        "{:?}",
-        put.elapsed()
+        (Duration::from_millis(500)..Duration::from_secs(1)).contains(&took),
+        "{took:?}"
     );
 }
 

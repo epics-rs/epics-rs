@@ -30,22 +30,50 @@ fn prefixed_literals_are_one_token() {
 #[test]
 fn pragma_once_leaves_a_line_indented_to_its_name() {
     let dir = tempfile::tempdir().unwrap();
-    let d = dir.path().display();
     let main = dir.path().join("m.c");
-    std::fs::write(dir.path().join("o.h"), "#  pragma   once\nint o2;\n").unwrap();
+    let o = dir.path().join("o.h");
+    std::fs::write(&o, "#  pragma   once\nint o2;\n").unwrap();
     let src = "x\n#include \"o.h\"\n  #pragma once\ny\n";
     let out = cpp::preprocess(&main, &main, src.as_bytes(), &[], &[]);
+    // A marker escapes the `\` of a Windows path.
+    let marker = |p: &Path| p.display().to_string().replace('\\', "\\\\");
+    let (m, o) = (marker(&main), marker(&o));
     assert_eq!(
         String::from_utf8(out.text).unwrap(),
         format!(
-            "# 1 \"{d}/m.c\"\nx\n# 1 \"{d}/o.h\" 1\n           \nint o2;\n\
-             # 3 \"{d}/m.c\" 2\n         \ny\n"
+            "# 1 \"{m}\"\nx\n# 1 \"{o}\" 1\n           \nint o2;\n\
+             # 3 \"{m}\" 2\n         \ny\n"
         )
     );
     let diags: Vec<_> = out.diagnostics.iter().map(|d| d.to_string()).collect();
     assert_eq!(
         diags,
-        [format!("{d}/m.c:3:11: warning: #pragma once in main file")]
+        [format!(
+            "{}:3:11: warning: #pragma once in main file",
+            main.display()
+        )]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_include_is_fatal_with_strerror_text() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let h = dir.path().join("h.h");
+    std::fs::write(&h, "x\n").unwrap();
+    std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(std::fs::read(&h).is_err(), "mode 0 is readable to root");
+    let main = dir.path().join("t.c");
+    let out = cpp::preprocess(&main, &main, b"#include \"h.h\"\n", &[], &[]);
+    let diags: Vec<_> = out.diagnostics.iter().map(|d| d.to_string()).collect();
+    assert_eq!(
+        diags,
+        [format!(
+            "{}:1:10: fatal error: {}: Permission denied",
+            main.display(),
+            h.display()
+        )]
     );
 }
 

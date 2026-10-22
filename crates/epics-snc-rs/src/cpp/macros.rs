@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use super::engine::Engine;
+use super::engine::{Engine, base_name};
 use super::lex::{self, END_ARG, Kind, Loc, P, PASTE_LEFT, PREV_WHITE, STRINGIFY_ARG, Tok};
 use super::print::quote_into;
 
@@ -682,11 +682,7 @@ impl Engine {
         };
         let text = match b {
             Builtin::File => quoted(&self.names[name.loc.name as usize]),
-            Builtin::FileName => {
-                let n = &self.names[name.loc.name as usize];
-                let base = n.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1);
-                quoted(&n[base..])
-            }
+            Builtin::FileName => quoted(base_name(&self.names[name.loc.name as usize])),
             Builtin::BaseFile => quoted(&self.main_path),
             Builtin::Line => name.loc.line.to_string().into_bytes(),
             Builtin::IncludeLevel => (self.buffers.len() - 1).to_string().into_bytes(),

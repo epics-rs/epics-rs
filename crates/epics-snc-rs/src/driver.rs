@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
+use epics_libcom_rs::runtime::crt_errno::strerror;
 use epics_libcom_rs::runtime::log::StagedStderr;
 
 use crate::types::{Ast, Node, Options};
@@ -48,18 +49,6 @@ pub struct Snc {
 impl Default for Snc {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// `strerror(errno)` for an I/O error: Rust's text without the
-/// " (os error N)" suffix.
-fn strerror(e: &io::Error) -> String {
-    let s = e.to_string();
-    match e.raw_os_error() {
-        Some(code) => s
-            .strip_suffix(&format!(" (os error {code})"))
-            .map_or(s.clone(), str::to_string),
-        None => s,
     }
 }
 

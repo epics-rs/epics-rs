@@ -4,7 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use super::engine::{Engine, File, IfFrame, StartDir, dir_prefix, join, path_bytes, to_path};
+use epics_libcom_rs::runtime::crt_errno::strerror;
+
+use super::engine::{
+    Engine, File, IfFrame, StartDir, dir_prefix, is_absolute_path, join, path_bytes,
+};
 use super::expr::unescape;
 use super::lex::{Kind, Loc, P, Prefix};
 
@@ -393,7 +397,7 @@ impl Engine {
         let data = match std::fs::read(&file.disk) {
             Ok(d) => d,
             Err(e) => {
-                let msg = format!("{}: {e}", String::from_utf8_lossy(&file.path));
+                let msg = format!("{}: {}", String::from_utf8_lossy(&file.path), strerror(&e));
                 self.fatal(loc, msg);
                 return;
             }
@@ -436,7 +440,7 @@ impl Engine {
     /// (name as written, start directory), shared with the `-I` chain
     /// head once the search reaches it.
     fn find_file(&mut self, fname: &[u8], angled: bool, loc: Loc) -> Option<usize> {
-        let start = if to_path(fname).is_absolute() {
+        let start = if is_absolute_path(fname) {
             StartDir::None
         } else if angled {
             if self.include_dirs.is_empty() {

@@ -155,7 +155,7 @@ impl Engine {
     pub(super) fn disk(&self, spelled: &[u8]) -> PathBuf {
         let (dir, real) = &self.main_dir;
         match spelled.strip_prefix(dir.as_slice()) {
-            Some(rest) if !(dir.is_empty() && to_path(spelled).is_absolute()) => {
+            Some(rest) if !(dir.is_empty() && is_absolute_path(spelled)) => {
                 to_path(&[real, rest].concat())
             }
             _ => to_path(spelled),
@@ -494,22 +494,54 @@ impl Engine {
     }
 }
 
-/// `lbasename`'s directory prefix, trailing `/` kept.
-pub(super) fn dir_prefix(path: &[u8]) -> Vec<u8> {
-    match path.iter().rposition(|&c| c == b'/') {
-        Some(i) => path[..=i].to_vec(),
-        None => Vec::new(),
-    }
+/// libiberty's filenames.h: on a DOS-based file system (`_WIN32`, so
+/// mingw's gcc) `\` separates too and a drive spec makes a name absolute.
+const DOS_BASED: bool = cfg!(windows);
+
+/// `IS_DIR_SEPARATOR_1`.
+fn is_dir_separator_1(dos_based: bool, c: u8) -> bool {
+    c == b'/' || (dos_based && c == b'\\')
+}
+
+/// `IS_ABSOLUTE_PATH_1`, which takes `d:foo` too.
+fn is_absolute_path_1(dos_based: bool, f: &[u8]) -> bool {
+    f.first().is_some_and(|&c| is_dir_separator_1(dos_based, c))
+        || (dos_based && matches!(f, [c, b':', ..] if *c != 0))
+}
+
+/// Where `lbasename`'s base name starts.
+fn base_at_1(dos_based: bool, path: &[u8]) -> usize {
+    path.iter()
+        .rposition(|&c| is_dir_separator_1(dos_based, c))
+        .map_or(0, |i| i + 1)
 }
 
 /// `append_file_to_dir`.
-pub(super) fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+fn join_1(dos_based: bool, dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut p = dir.to_vec();
-    if !p.is_empty() && p.last() != Some(&b'/') {
+    if p.last().is_some_and(|&c| !is_dir_separator_1(dos_based, c)) {
         p.push(b'/');
     }
     p.extend_from_slice(name);
     p
+}
+
+pub(super) fn is_absolute_path(f: &[u8]) -> bool {
+    is_absolute_path_1(DOS_BASED, f)
+}
+
+/// `lbasename`.
+pub(super) fn base_name(path: &[u8]) -> &[u8] {
+    &path[base_at_1(DOS_BASED, path)..]
+}
+
+/// `lbasename`'s directory prefix, trailing separator kept.
+pub(super) fn dir_prefix(path: &[u8]) -> Vec<u8> {
+    path[..base_at_1(DOS_BASED, path)].to_vec()
+}
+
+pub(super) fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    join_1(DOS_BASED, dir, name)
 }
 
 pub(super) fn to_path(b: &[u8]) -> PathBuf {
@@ -533,5 +565,27 @@ pub(super) fn path_bytes(p: &std::path::Path) -> Vec<u8> {
     #[cfg(not(unix))]
     {
         p.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dos_names_split_and_join_on_either_separator() {
+        let prefix = |dos_based, p: &[u8]| p[..base_at_1(dos_based, p)].to_vec();
+        assert_eq!(prefix(true, br"C:\top\src\p.st"), br"C:\top\src\");
+        assert_eq!(prefix(true, br"C:\top\src/p.st"), br"C:\top\src/");
+        assert_eq!(prefix(false, br"C:\top\src\p.st"), b"");
+        assert_eq!(join_1(true, br"C:\top\src\", b"h.h"), br"C:\top\src\h.h");
+        assert_eq!(join_1(true, br"C:\top\src", b"h.h"), br"C:\top\src/h.h");
+        assert_eq!(join_1(false, br"C:\top\src\", b"h.h"), br"C:\top\src\/h.h");
+        for f in [&br"\top\h.h"[..], b"/top/h.h", b"C:h.h"] {
+            assert!(is_absolute_path_1(true, f));
+        }
+        assert!(is_absolute_path_1(false, b"/top/h.h"));
+        assert!(!is_absolute_path_1(false, br"\top\h.h"));
+        assert!(!is_absolute_path_1(false, b"C:h.h"));
     }
 }

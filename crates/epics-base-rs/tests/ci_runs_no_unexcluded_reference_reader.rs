@@ -23,6 +23,28 @@ fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The roots of the workspace's `members = ["<root>/*", ..]`. Read rather
+/// than listed: a hand-kept `crates` + `tools` list never scanned `examples/`,
+/// and scope-ioc's `db_is_c_s` failed every CI run from there.
+fn member_roots() -> Vec<PathBuf> {
+    let toml =
+        std::fs::read_to_string(workspace().join("Cargo.toml")).expect("read workspace Cargo.toml");
+    let line = toml
+        .lines()
+        .find(|l| l.starts_with("members = ["))
+        .expect("workspace members");
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|m| {
+            let root = m
+                .strip_suffix("/*")
+                .unwrap_or_else(|| panic!("member {m:?} is not a `<root>/*` glob"));
+            workspace().join(root)
+        })
+        .collect()
+}
+
 /// `.rs` files under `dir`, recursively.
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -265,11 +287,7 @@ fn violations(ex: &CiExclusions, roots: &[PathBuf]) -> Vec<String> {
 
 #[test]
 fn reference_consumers_are_excluded_from_profile_ci() {
-    let ws = workspace();
-    let bad = violations(
-        &CiExclusions::load(),
-        &[ws.join("crates"), ws.join("tools")],
-    );
+    let bad = violations(&CiExclusions::load(), &member_roots());
     assert!(
         bad.is_empty(),
         "these tests reach a reference tree, run in profile.ci, and are not #[ignore]d: {bad:?}"

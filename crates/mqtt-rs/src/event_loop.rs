@@ -1689,27 +1689,32 @@ mod tests {
     /// The release-and-rebind this replaces lost the number to a socket that
     /// took it in between; held, no plain bind can take it, and the broker
     /// still comes up on it (refused, up, refused, up). Plain: no reuse
-    /// option, as a `connect()`'s implicit bind; Darwin's lookup for an
-    /// `SO_REUSEADDR` one skips the connected hold.
+    /// option, as a `connect()`'s implicit bind. std's listener sets
+    /// `SO_REUSEADDR` on unix, and Darwin's lookup for that bind skips the
+    /// connected hold.
     #[tokio::test]
     async fn a_held_broker_port_keeps_its_number_between_sessions() {
         let port = BrokerPort::new();
         let refused = || std::net::TcpStream::connect(port.addr).unwrap_err().kind();
-        let plain_bind = || {
-            BrokerPort::socket()
-                .bind(&port.addr.into())
-                .unwrap_err()
-                .kind()
+        let taken = || {
+            let plain = BrokerPort::socket().bind(&port.addr.into());
+            assert_eq!(plain.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+            if !cfg!(all(unix, not(target_os = "linux"))) {
+                assert_eq!(
+                    std::net::TcpListener::bind(port.addr).unwrap_err().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+            }
         };
         assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
-        assert_eq!(plain_bind(), io::ErrorKind::AddrInUse);
+        taken();
         for _ in 0..2 {
             let listener = port.listen();
             let client = tokio::net::TcpStream::connect(port.addr).await.unwrap();
             let (served, _) = listener.accept().await.unwrap();
             drop((listener, served, client));
             assert_eq!(refused(), io::ErrorKind::ConnectionRefused);
-            assert_eq!(plain_bind(), io::ErrorKind::AddrInUse);
+            taken();
         }
     }
 

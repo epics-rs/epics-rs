@@ -30,7 +30,6 @@ use crate::snl::flex_combined_motion::FlexConfig;
 use crate::snl::hr_ctl::HrConfig;
 use crate::snl::io::IoConfig;
 use crate::snl::ml_mono_ctl::MlMonoConfig;
-use crate::snl::orient::OrientConfig;
 use crate::snl::pf4::Pf4Config;
 
 // `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
@@ -58,7 +57,6 @@ fn scan_int(s: &str) -> i32 {
 enum Program {
     HrCtl(HrConfig),
     MlMonoCtl(MlMonoConfig),
-    Orient(OrientConfig),
     FilterDrive(FilterDriveConfig),
     Pf4(Pf4Config),
     Io(IoConfig),
@@ -91,21 +89,6 @@ impl Program {
                         v("M_Y"),
                         v("M_Z"),
                         strtod(v("Y_OFF").as_bytes()).value,
-                    )),
-                    m,
-                )
-            }
-            "orient" => {
-                let m = macros("P=xxx:orient1:,PM=xxx:,mTTH=m9,mTH=m10,mCHI=m11,mPHI=m12");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::Orient(OrientConfig::new(
-                        v("P"),
-                        v("PM"),
-                        v("mTTH"),
-                        v("mTH"),
-                        v("mCHI"),
-                        v("mPHI"),
                     )),
                     m,
                 )
@@ -158,9 +141,6 @@ impl Program {
             }),
             Self::MlMonoCtl(config) => spawn_program(bridge, db, "ml_monoCtl", macros, move |db| {
                 crate::snl::ml_mono_ctl::run(config, db)
-            }),
-            Self::Orient(config) => spawn_program(bridge, db, "orient", macros, move |db| {
-                crate::snl::orient::run(config, db)
             }),
             Self::FilterDrive(config) => {
                 spawn_program(bridge, db, "filterDrive", macros, move |db| {
@@ -246,27 +226,6 @@ mod tests {
             ["xxx:", "m9", "m12", "m10", "m11"]
         );
         assert_eq!(c.y_offset, 35.0);
-        let Ok((Program::Orient(c), _)) = Program::new("orient", "") else {
-            panic!("orient")
-        };
-        assert_eq!(
-            [
-                &c.prefix,
-                &c.motor_prefix,
-                &c.motor_tth,
-                &c.motor_th,
-                &c.motor_chi,
-                &c.motor_phi
-            ],
-            [
-                "xxx:orient1:",
-                "xxx:",
-                "xxx:m9",
-                "xxx:m10",
-                "xxx:m11",
-                "xxx:m12"
-            ]
-        );
         let Ok((Program::FilterDrive(c), _)) = Program::new("filterDrive", "") else {
             panic!("filterDrive")
         };

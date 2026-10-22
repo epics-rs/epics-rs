@@ -42,13 +42,15 @@ pub fn mult_mat_mat(a: &Mat3, b: &Mat3) -> Mat3 {
     r
 }
 
-/// Matrix × vector multiplication.
+/// Matrix × vector multiplication. Each sum starts from 0, as C's does.
 pub fn mult_mat_vec(a: &Mat3, v: &Vec3) -> Vec3 {
-    [
-        a[0][0] * v[0] + a[0][1] * v[1] + a[0][2] * v[2],
-        a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2],
-        a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2],
-    ]
+    let mut r = [0.0; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i] += a[i][j] * v[j];
+        }
+    }
+    r
 }
 
 /// Determinant of a 3×3 matrix.
@@ -60,28 +62,28 @@ pub fn determinant(a: &Mat3) -> f64 {
 
 /// Invert a 3×3 matrix using Cramer's rule.
 /// Returns `None` unless |det| > SMALL, which a NaN determinant fails as
-/// it does C's test (matrix3.c:91).
+/// it does C's test (matrix3.c:91). Each cofactor is divided by the
+/// determinant, as C does; multiplying by `1 / det` rounds differently.
 pub fn invert(a: &Mat3) -> Option<Mat3> {
     let det = determinant(a);
     if det.abs().partial_cmp(&SMALL) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
-    let inv_det = 1.0 / det;
     Some([
         [
-            (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * inv_det,
-            -(a[0][1] * a[2][2] - a[2][1] * a[0][2]) * inv_det,
-            (a[0][1] * a[1][2] - a[1][1] * a[0][2]) * inv_det,
+            (a[1][1] * a[2][2] - a[1][2] * a[2][1]) / det,
+            -(a[0][1] * a[2][2] - a[2][1] * a[0][2]) / det,
+            (a[0][1] * a[1][2] - a[1][1] * a[0][2]) / det,
         ],
         [
-            -(a[1][0] * a[2][2] - a[1][2] * a[2][0]) * inv_det,
-            (a[0][0] * a[2][2] - a[2][0] * a[0][2]) * inv_det,
-            -(a[0][0] * a[1][2] - a[1][0] * a[0][2]) * inv_det,
+            -(a[1][0] * a[2][2] - a[1][2] * a[2][0]) / det,
+            (a[0][0] * a[2][2] - a[2][0] * a[0][2]) / det,
+            -(a[0][0] * a[1][2] - a[1][0] * a[0][2]) / det,
         ],
         [
-            (a[1][0] * a[2][1] - a[2][0] * a[1][1]) * inv_det,
-            -(a[0][0] * a[2][1] - a[2][0] * a[0][1]) * inv_det,
-            (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det,
+            (a[1][0] * a[2][1] - a[2][0] * a[1][1]) / det,
+            -(a[0][0] * a[2][1] - a[2][0] * a[0][1]) / det,
+            (a[0][0] * a[1][1] - a[0][1] * a[1][0]) / det,
         ],
     ])
 }
@@ -215,6 +217,14 @@ mod tests {
         assert_mat_eq(&invert(&MATRIX2).unwrap(), &expected);
     }
 
+    /// matrix3.c:108 divides each cofactor by det: 49 / 49 is 1, where
+    /// 49 * (1 / 49) is 0.9999999999999999.
+    #[test]
+    fn invert_divides_by_the_determinant() {
+        let a = [[7.0, 0.0, 0.0], [0.0, 7.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(invert(&a).unwrap()[2][2], 1.0);
+    }
+
     // --- multArrayArray tests (4) ---
     #[test]
     fn test_mult_mat_mat() {
@@ -239,5 +249,13 @@ mod tests {
         assert_vec_eq(&mult_mat_vec(&MATRIX1, &V2), &[287.0, 665.0, 1043.0]);
         assert_vec_eq(&mult_mat_vec(&MATRIX2, &V1), &[25.0, 17.0, 10.0]);
         assert_vec_eq(&mult_mat_vec(&MATRIX2, &V2), &[790.0, 194.0, 391.0]);
+    }
+
+    /// multArrayVector's sums start from 0 (matrix3.c:69), so three -0
+    /// products sum to +0, which atan2 tells from -0.
+    #[test]
+    fn mult_mat_vec_sums_from_zero() {
+        let r = mult_mat_vec(&[[-1.0; 3]; 3], &ZEROES);
+        assert!(r.iter().all(|x| x.is_sign_positive()), "{r:?}");
     }
 }

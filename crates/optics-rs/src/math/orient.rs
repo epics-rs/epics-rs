@@ -11,7 +11,7 @@ const D2R: f64 = PI / 180.0;
 /// 0, `MIN_CHI_PHIm90` 1, `PHI_CONST` 2. The variants were previously
 /// numbered with `PHI_CONST` and `MIN_CHI_PHIm90` swapped; the values are
 /// never cast, but they are corrected here so the repr is a faithful mirror
-/// of the wire menu (see `constraint_from_mode`).
+/// of the wire menu (see `HKL_to_angles` in `snl::orient`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
     /// TH = TTH/2 (omega = 0). C `OMEGA_ZERO`.
@@ -70,7 +70,7 @@ pub fn angles_to_hkl(angles_deg: &[f64; 4], omtx_inv: &Mat3, a0_inv: &Mat3) -> O
 /// Calculate diffraction angles (in degrees) from HKL.
 ///
 /// For `PhiConst`, `angles_deg[PHI]` is used as the supplied phi value.
-/// Returns `None` on math errors (NaN results).
+/// Writes all four angles, and returns `None` when any of them is NaN.
 pub fn hkl_to_angles(
     hkl: &Vec3,
     a0: &Mat3,
@@ -121,11 +121,14 @@ pub fn hkl_to_angles(
 
     for i in 0..4 {
         angles_deg[i] = angles[i] / D2R;
-        if angles_deg[i].is_nan() {
-            return None;
-        }
     }
-    Some(())
+    // C's `errno ||` adds no case: each domain error its libm calls can
+    // raise here also leaves a NaN.
+    if angles_deg.iter().any(|a| a.is_nan()) {
+        None
+    } else {
+        Some(())
+    }
 }
 
 /// Calculate A0 matrix from lattice parameters and wavelength.
@@ -539,5 +542,22 @@ mod tests {
     #[test]
     fn a_zero_a_fails_calc_a0() {
         assert!(calc_a0(0.0, 5.431, 5.431, 90.0, 90.0, 90.0, 0.5725).is_none());
+    }
+
+    /// |HKL| = 2 puts asin out of its domain, so TTH and TH are NaN; C
+    /// writes CHI and PHI all the same (orient.c:127-130).
+    #[test]
+    fn a_nan_angle_still_writes_all_four() {
+        let mut angles = [0.0, 0.0, 0.0, 77.0];
+        let r = hkl_to_angles(
+            &[2.0, 0.0, 0.0],
+            &IDENTITY,
+            &IDENTITY,
+            &mut angles,
+            Constraint::OmegaZero,
+        );
+        assert!(r.is_none());
+        assert!(angles[TTH].is_nan() && angles[TH].is_nan());
+        assert_eq!([angles[CHI], angles[PHI]], [0.0, 0.0]);
     }
 }

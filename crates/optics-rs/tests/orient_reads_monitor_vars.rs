@@ -1,15 +1,17 @@
 //! orient reads motPut_Auto and motGet_Auto as C's monitored variables,
 //! written as each monitor arrives (orient_st.st:126, :136, no efflag).
 
-use epics_base_rs::runtime::task::{self, BlockingBridge};
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::server::records::transform::TransformRecord;
+use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
-use optics_rs::snl::orient::{self, OrientConfig};
+use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+use optics_rs::snl::orient::orient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,30 @@ record(motor, "X:m:phi") { field(HLM, "180") field(LLM, "-180") }
 record(ao, "X:m:plain") {}
 "#;
 const P: &str = "X:orient1:";
+
+/// The running orient instance, stopped when the test drops it, and the
+/// scan owner of its database, which drops after it.
+struct Orient {
+    prog: SeqThreadId,
+    _scan: ScanOwner,
+}
+
+impl Drop for Orient {
+    fn drop(&mut self) {
+        seq_stop(self.prog);
+    }
+}
+
+/// `seq(&orient, ...)` with `X:m:<phi>` as the PHI motor.
+fn start(ioc: &Arc<PvDatabase>, phi: &str) -> Orient {
+    // The program waits for PINI, which the scan owner's pass publishes.
+    let scan = ScanOwner::start(ioc.clone());
+    let macros = format!("P={P},PM=X:m:,mTTH=tth,mTH=th,mCHI=chi,mPHI={phi}");
+    Orient {
+        prog: seq(&orient, &macros, 0, ioc).expect("orient starts"),
+        _scan: scan,
+    }
+}
 
 /// The four motors on simulated axes: a drive takes about half a second
 /// and completes its put callback when it finishes.
@@ -45,10 +71,10 @@ async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
 }
 
 /// Boot with both of init's matrices good and wait until orient is live.
-async fn boot() -> (Arc<PvDatabase>, PvDatabase) {
-    let (ioc, db) = boot_with(&good_inputs()).await;
+async fn boot() -> (Arc<PvDatabase>, PvDatabase, Orient) {
+    let (ioc, db, prog) = boot_with(&good_inputs()).await;
     wait_live(&ioc).await;
-    (ioc, db)
+    (ioc, db, prog)
 }
 
 /// Silicon's cubic cell; orient.db leaves the lattice at zero.
@@ -67,7 +93,7 @@ fn lattice() -> Vec<(String, EpicsValue)> {
 }
 
 /// Boot with `preset` posted before orient starts.
-async fn boot_with(preset: &[(String, EpicsValue)]) -> (Arc<PvDatabase>, PvDatabase) {
+async fn boot_with(preset: &[(String, EpicsValue)]) -> (Arc<PvDatabase>, PvDatabase, Orient) {
     boot_with_phi(preset, "phi").await
 }
 
@@ -75,7 +101,7 @@ async fn boot_with(preset: &[(String, EpicsValue)]) -> (Arc<PvDatabase>, PvDatab
 async fn boot_with_phi(
     preset: &[(String, EpicsValue)],
     phi: &str,
-) -> (Arc<PvDatabase>, PvDatabase) {
+) -> (Arc<PvDatabase>, PvDatabase, Orient) {
     let builder = IocBuilder::new()
         .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))
         .db_string(MOTORS, &HashMap::new())
@@ -84,7 +110,7 @@ async fn boot_with_phi(
 }
 
 /// [`boot`] with the motors on simulated axes.
-async fn boot_sim() -> (Arc<PvDatabase>, PvDatabase) {
+async fn boot_sim() -> (Arc<PvDatabase>, PvDatabase, Orient) {
     use motor_rs::builder::{AxisSetup, MotorBuilder};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,9 +144,9 @@ async fn boot_sim() -> (Arc<PvDatabase>, PvDatabase) {
         )
         .db_string(SIM_MOTORS, &HashMap::from([("PORT".to_string(), port)]))
         .unwrap();
-    let (ioc, db) = boot_on(builder, &good_inputs(), "phi").await;
+    let (ioc, db, prog) = boot_on(builder, &good_inputs(), "phi").await;
     wait_live(&ioc).await;
-    (ioc, db)
+    (ioc, db, prog)
 }
 
 /// Load orient.db beside the motors `builder` holds, post `preset`, and
@@ -129,7 +155,7 @@ async fn boot_on(
     builder: IocBuilder,
     preset: &[(String, EpicsValue)],
     phi: &str,
-) -> (Arc<PvDatabase>, PvDatabase) {
+) -> (Arc<PvDatabase>, PvDatabase, Orient) {
     let macros: HashMap<String, String> = [("P", "X:"), ("O", "1"), ("PREC", "4")]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -145,11 +171,8 @@ async fn boot_on(
         .0;
     let db = PvDatabase::clone(&ioc);
     post(&db, preset);
-    BlockingBridge::capture().spawn(orient::run(
-        OrientConfig::new(P, "X:m:", "tth", "th", "chi", phi),
-        db.clone(),
-    ));
-    (ioc, db)
+    let prog = start(&ioc, phi);
+    (ioc, db, prog)
 }
 
 /// Post each value as a monitor, in order. A monitored variable is read
@@ -204,7 +227,7 @@ fn reflections() -> Vec<(String, EpicsValue)> {
 async fn going_live_clears_the_hkl_written_during_the_init_delay() {
     let mut preset = good_inputs();
     preset.push((format!("{P}motPut_Auto"), EpicsValue::Enum(1)));
-    let (ioc, db) = boot_with(&preset).await;
+    let (ioc, db, _orient) = boot_with(&preset).await;
     wait_for_msg(&ioc, "Successful OMTX calc").await;
     put(&db, "H", 4.0).await;
     put(&db, "K", 4.0).await;
@@ -233,7 +256,7 @@ fn set_rbvs(db: &PvDatabase, rbvs: &[(&str, f64)]) {
 /// good (orient_st.st:181-183, :1196-1199).
 #[epics_base_rs::epics_test]
 async fn a_bad_matrix_leaves_an_outside_readback_value() {
-    let (ioc, _db) = boot_with(&[(format!("{P}H_RBV"), EpicsValue::Double(1.5))]).await;
+    let (ioc, _db, _orient) = boot_with(&[(format!("{P}H_RBV"), EpicsValue::Double(1.5))]).await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
     task::sleep(Duration::from_millis(500)).await;
     assert_eq!(f64_of(&ioc, &format!("{P}H_RBV")).await, 1.5);
@@ -243,7 +266,7 @@ async fn a_bad_matrix_leaves_an_outside_readback_value() {
 /// zeroes the readbacks (orient_st.st:149-152, :1193-1210).
 #[epics_base_rs::epics_test]
 async fn each_readback_converts_and_a_bad_omtx_zeroes_them() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     set_rbvs(&db, &[("tth", 24.3414), ("th", 12.1707)]);
     wait_near(&ioc, &format!("{P}H_RBV"), 4.0).await;
     task::sleep(Duration::from_millis(200)).await;
@@ -258,7 +281,7 @@ async fn each_readback_converts_and_a_bad_omtx_zeroes_them() {
 /// H/K/L_RBV through enter_monitor_all's 10 s delay (orient_st.st:1181-1212).
 #[epics_base_rs::epics_test]
 async fn readbacks_convert_during_the_init_delay() {
-    let (ioc, db) = boot_with(&good_inputs()).await;
+    let (ioc, db, _orient) = boot_with(&good_inputs()).await;
     wait_for_msg(&ioc, "Successful OMTX calc").await;
     set_rbvs(
         &db,
@@ -286,7 +309,7 @@ async fn readbacks_convert_during_the_init_delay() {
 /// orient is still retrying a failed init (orient_st.st:1215-1226).
 #[epics_base_rs::epics_test]
 async fn stop_motors_stops_them_during_init() {
-    let (ioc, db) = boot_with(&[]).await;
+    let (ioc, db, _orient) = boot_with(&[]).await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
     let mut stops = Vec::new();
     for m in ["tth", "th", "chi", "phi"] {
@@ -306,6 +329,35 @@ async fn stop_motors_stops_them_during_init() {
         }
         assert!(put_one, "{m}.STOP was not put to 1");
     }
+}
+
+/// A PM+mPHI of 40 chars or more is built in tmpstr, so its .STOP is
+/// assigned and motPHI_name shows the first 39 chars; upstream C built it
+/// in the 40-byte motPHI_name and ran past it.
+#[epics_base_rs::epics_test]
+async fn a_long_motor_name_is_assigned_and_shown_cut() {
+    const PHI: &str = "phi-motor-on-a-long-record-name-for-orient";
+    let long = format!(r#"record(motor, "X:m:{PHI}") {{ field(HLM, "180") field(LLM, "-180") }}"#);
+    let builder = IocBuilder::new()
+        .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))
+        .db_string(&format!("{MOTORS}{long}\n"), &HashMap::new())
+        .unwrap();
+    let (ioc, db, _orient) = boot_on(builder, &[], PHI).await;
+    // ss connections and ss orient put these from their own delay(1)
+    // (orient_st.st:1187, :465), in either order, as C's do.
+    wait_for(&ioc, &format!("{P}motPHI_Connected"), 1.0).await;
+    let name = format!("X:m:{PHI}");
+    wait_for_string(&ioc, &format!("{P}motPHI_name"), &name[..39]).await;
+    let mut stop = DbSubscription::subscribe(&db, format!("{name}.STOP"))
+        .await
+        .unwrap();
+    put(&db, "stopMotors", 1.0).await;
+    wait_for(&ioc, &format!("{P}stopMotors"), 0.0).await;
+    let mut put_one = false;
+    while let Ok(ev) = stop.try_recv_event() {
+        put_one |= ev.value().as_value().and_then(EpicsValue::to_f64) == Some(1.0);
+    }
+    assert!(put_one, "{name}.STOP was not put to 1");
 }
 
 /// Wait out enter_monitor_all's 10 s delay (orient_st.st:593-601).
@@ -338,7 +390,7 @@ fn good_inputs() -> Vec<(String, EpicsValue)> {
 /// secondary reflection.
 #[epics_base_rs::epics_test]
 async fn a0_and_omtx_states_are_published() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     assert_eq!(f64_of(&ioc, &format!("{P}A0_state")).await, 1.0);
     assert_eq!(f64_of(&ioc, &format!("{P}OMTX_state")).await, 1.0);
     post(&db, &[(format!("{P}K2"), EpicsValue::Double(0.0))]);
@@ -357,7 +409,7 @@ async fn a_zero_lattice_fails_a0() {
         format!("{P}lambda"),
         EpicsValue::Double(12.3984244 / 21.657),
     ));
-    let (ioc, _db) = boot_with(&preset).await;
+    let (ioc, _db, _orient) = boot_with(&preset).await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
     assert_ne!(
         string_of(&ioc, &format!("{P}Msg")).await,
@@ -369,7 +421,7 @@ async fn a_zero_lattice_fails_a0() {
 /// "Orient initialized" (orient_st.st:364-570).
 #[epics_base_rs::epics_test]
 async fn a_failing_init_leaves_msg_empty() {
-    let (ioc, _db) = boot_with(&[]).await;
+    let (ioc, _db, _orient) = boot_with(&[]).await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
     task::sleep(Duration::from_millis(300)).await;
     assert_eq!(string_of(&ioc, &format!("{P}Msg")).await, "");
@@ -387,7 +439,7 @@ async fn init_retries_omtx_until_the_reflections_are_good() {
         EpicsValue::Double(12.3984244 / 21.657),
     ));
     preset.push((format!("{P}motPut_Auto"), EpicsValue::Enum(1)));
-    let (ioc, db) = boot_with(&preset).await;
+    let (ioc, db, _orient) = boot_with(&preset).await;
     wait_for(&ioc, &format!("{P}A0_state"), 1.0).await;
     wait_for(&ioc, &format!("{P}OMTX_state"), 2.0).await;
     // A failed init OMTX sets motPut_Auto to manual (orient_st.st:555-560).
@@ -410,7 +462,7 @@ async fn init_retries_omtx_until_the_reflections_are_good() {
 /// copies the motor into the trial angle, though the motor is taken first.
 #[epics_base_rs::epics_test]
 async fn a_motor_post_queued_after_mot_get_auto_copies_the_angle() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(
         &db,
         &[
@@ -428,16 +480,17 @@ async fn a_motor_post_queued_after_mot_get_auto_copies_the_angle() {
 }
 
 async fn wait_for_msg(ioc: &PvDatabase, want: &str) {
+    wait_for_string(ioc, &format!("{P}Msg"), want).await;
+}
+
+async fn wait_for_string(ioc: &PvDatabase, pv: &str, want: &str) {
     for _ in 0..100 {
-        if string_of(ioc, &format!("{P}Msg")).await == want {
+        if string_of(ioc, pv).await == want {
             return;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    panic!(
-        "Msg = {:?}, want {want:?}",
-        string_of(ioc, &format!("{P}Msg")).await
-    );
+    panic!("{pv} = {:?}, want {want:?}", string_of(ioc, pv).await);
 }
 
 /// Put the energy with the reflections posted, and wait out the passes it
@@ -469,7 +522,7 @@ async fn set_energy(ioc: &PvDatabase, db: &PvDatabase, energy: f64) {
 /// (orient_st.st:169, :222-240, :626-654).
 #[epics_base_rs::epics_test]
 async fn omtx_calc_takes_the_posted_reflections() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     set_energy(&ioc, &db, 21.657).await;
     post(&db, &[(format!("{P}OMTX_Calc"), EpicsValue::Enum(1))]);
     wait_for(&ioc, &format!("{P}OMTX_Calc"), 0.0).await;
@@ -486,7 +539,7 @@ async fn omtx_calc_takes_the_posted_reflections() {
 /// (orient_st.st:649-653, :957-959).
 #[epics_base_rs::epics_test]
 async fn a_bad_omtx_calc_sets_mot_put_auto_to_manual() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(
         &db,
         &[
@@ -506,7 +559,7 @@ async fn a_bad_omtx_calc_sets_mot_put_auto_to_manual() {
 /// (orient_st.st:626-648, orient.c:279-285, :296-298).
 #[epics_base_rs::epics_test]
 async fn a_live_omtx_calc_puts_err_angle() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     assert!(f64_of(&ioc, &format!("{P}errAngle")).await.is_finite());
     post(&db, &[(format!("{P}K2"), EpicsValue::Double(0.0))]);
     post(&db, &[(format!("{P}OMTX_Calc"), EpicsValue::Enum(1))]);
@@ -520,26 +573,26 @@ async fn a_live_omtx_calc_puts_err_angle() {
 /// (orient_st.st:1150-1177).
 #[epics_base_rs::epics_test]
 async fn motor_connections_are_published() {
-    let (ioc, _db) = boot_with(&[]).await;
+    let (ioc, _db, _orient) = boot_with(&[]).await;
     for a in ["TTH", "TH", "CHI", "PHI"] {
         wait_for(&ioc, &format!("{P}mot{a}_Connected"), 1.0).await;
     }
 }
 
-/// With a motor missing, monitor_all only says so, each second, and an
-/// HKL write waits (orient_st.st:604-619).
+/// The motor PVs are assigned statically, so under snc's default `+c` a
+/// missing one holds the whole program in seq_connect (seq_task.c:61,
+/// seq_ca.c:87-134): no state set runs, and an HKL write moves nothing.
 #[epics_base_rs::epics_test]
-async fn a_missing_motor_holds_monitor_all() {
+async fn a_missing_motor_holds_the_program_at_connect() {
     let mut preset = good_inputs();
     preset.push((format!("{P}motPut_Auto"), EpicsValue::Enum(1)));
-    let (ioc, db) = boot_with_phi(&preset, "nope").await;
-    // enter_monitor_all's delay.
-    task::sleep(Duration::from_secs(10)).await;
-    wait_for_msg(&ioc, "Waiting for motor connection(s)").await;
-    assert_eq!(f64_of(&ioc, &format!("{P}motTTH_Connected")).await, 1.0);
-    assert_eq!(f64_of(&ioc, &format!("{P}motPHI_Connected")).await, 0.0);
+    let (ioc, db, _orient) = boot_with_phi(&preset, "nope").await;
+    task::sleep(Duration::from_secs(2)).await;
     put(&db, "H", 4.0).await;
     task::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(string_of(&ioc, &format!("{P}Msg")).await, "");
+    assert_eq!(string_of(&ioc, &format!("{P}motTTH_name")).await, "");
+    assert_eq!(f64_of(&ioc, &format!("{P}motTTH_Connected")).await, 0.0);
     assert_eq!(f64_of(&ioc, "X:m:tth").await, 0.0);
 }
 
@@ -547,7 +600,7 @@ async fn a_missing_motor_holds_monitor_all() {
 /// (orient_st.st:621-623).
 #[epics_base_rs::epics_test]
 async fn a_motor_without_stop_holds_monitor_all() {
-    let (ioc, _db) = boot_with_phi(&good_inputs(), "plain").await;
+    let (ioc, _db, _orient) = boot_with_phi(&good_inputs(), "plain").await;
     // enter_monitor_all's delay.
     task::sleep(Duration::from_secs(10)).await;
     wait_for_msg(&ioc, "Waiting for motor-stop connection(s)").await;
@@ -595,7 +648,7 @@ async fn a_live_bad_omtx_calc_alerts() {
         );
         return;
     }
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(
         &db,
         &[
@@ -626,7 +679,7 @@ async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
 /// 34.6923).
 #[epics_base_rs::epics_test]
 async fn rewriting_the_standing_k_drives_the_motors_again() {
-    let (ioc, db) = boot_sim().await;
+    let (ioc, db, _orient) = boot_sim().await;
     set_energy(&ioc, &db, 21.657).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     put(&db, "H", 4.0).await;
@@ -647,7 +700,7 @@ async fn rewriting_the_standing_k_drives_the_motors_again() {
 /// later outside move (orient_st.st:801-875, :1053).
 #[epics_base_rs::epics_test]
 async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
-    let (ioc, db) = boot_sim().await;
+    let (ioc, db, _orient) = boot_sim().await;
     set_energy(&ioc, &db, 21.657).await;
     post(
         &db,
@@ -695,7 +748,7 @@ async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
 /// (orient_st.st:863-875, :1132-1141).
 #[epics_base_rs::epics_test]
 async fn put_all_and_the_drive_completion_clear_the_busy_records() {
-    let (ioc, db) = boot_sim().await;
+    let (ioc, db, _orient) = boot_sim().await;
     set_energy(&ioc, &db, 21.657).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     // K_busy is 1 only while the drive runs, which a read can miss, so
@@ -734,7 +787,7 @@ async fn put_all_and_the_drive_completion_clear_the_busy_records() {
 /// reflections as they now stand (orient_st.st:657-685).
 #[epics_base_rs::epics_test]
 async fn an_energy_change_leaves_the_omtx() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(&db, &[(format!("{P}K2"), EpicsValue::Double(0.0))]);
     put(&db, "energy", 15.0).await;
     wait_for_msg(&ioc, "Successful A0 calc").await;
@@ -749,7 +802,7 @@ async fn an_energy_change_leaves_the_omtx() {
 /// A0's determinant under invertArray's SMALL.
 #[epics_base_rs::epics_test]
 async fn omtx_calc_waits_for_a_good_a0() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     let si_a0_11 = f64_of(&ioc, &format!("{P}A0_11")).await;
     post(&db, &[(format!("{P}a"), EpicsValue::Double(1.0e9))]);
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
@@ -771,7 +824,7 @@ async fn omtx_calc_waits_for_a_good_a0() {
 /// state PVs C's db holds (orient_st.st:414, :990-991, :1082-1094).
 #[epics_base_rs::epics_test]
 async fn init_and_new_hkl_put_their_state_pvs() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     for (a, m) in [("TTH", "tth"), ("TH", "th"), ("CHI", "chi"), ("PHI", "phi")] {
         assert_eq!(
             string_of(&ioc, &format!("{P}mot{a}_name")).await,
@@ -793,7 +846,7 @@ async fn init_and_new_hkl_put_their_state_pvs() {
 /// newA0 goes back to monitor_all (orient_st.st:686-699, :943-947).
 #[epics_base_rs::epics_test]
 async fn a_singular_user_a0_fails() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(&db, &[(format!("{P}A0_11"), EpicsValue::Double(0.0))]);
     wait_for_msg(&ioc, "Could not invert A0 array").await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
@@ -804,7 +857,7 @@ async fn a_singular_user_a0_fails() {
 /// (orient_st.st:701-727, :957-959).
 #[epics_base_rs::epics_test]
 async fn a_user_omtx_failing_the_check_sets_mot_put_auto_to_manual() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     let omtx_22 = f64_of(&ioc, &format!("{P}OMTX_22")).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     post(
@@ -821,7 +874,7 @@ async fn a_user_omtx_failing_the_check_sets_mot_put_auto_to_manual() {
 /// the button half a second later (orient_st.st:578-590, :907-910).
 #[epics_base_rs::epics_test]
 async fn ref_get1_copies_the_current_values() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(
         &db,
         &[
@@ -840,7 +893,7 @@ async fn ref_get1_copies_the_current_values() {
 /// records themselves (orient_st.st:923-926).
 #[epics_base_rs::epics_test]
 async fn ref_put2_writes_the_secondary_reflection() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(&db, &[(format!("{P}refPut2"), EpicsValue::Enum(1))]);
     wait_for(&ioc, &format!("{P}K"), 4.0).await;
     wait_for(&ioc, &format!("{P}refPut2"), 0.0).await;
@@ -849,7 +902,7 @@ async fn ref_put2_writes_the_secondary_reflection() {
 /// OperAck erases Msg and clears Alert (orient_st.st:929-933).
 #[epics_base_rs::epics_test]
 async fn oper_ack_clears_msg_and_alert() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     post(&db, &[(format!("{P}A0_11"), EpicsValue::Double(0.0))]);
     put(&db, "H", 1.0).await;
     wait_for(&ioc, &format!("{P}Alert"), 1.0).await;
@@ -908,7 +961,7 @@ async fn debug_prints_msg_and_the_debug_lines() {
     }
     let mut preset = good_inputs();
     preset.push((format!("{P}Debug"), EpicsValue::Enum(1)));
-    let (ioc, db) = boot_with(&preset).await;
+    let (ioc, db, _orient) = boot_with(&preset).await;
     wait_live(&ioc).await;
     task::sleep(Duration::from_millis(300)).await;
     put(&db, "H", 4.0).await;
@@ -922,7 +975,7 @@ async fn debug_prints_msg_and_the_debug_lines() {
 /// motor's target where the first put set it. These motors never finish.
 #[epics_base_rs::epics_test]
 async fn a_second_drive_during_a_move_is_refused() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     set_energy(&ioc, &db, 21.657).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     put(&db, "H", 4.0).await;
@@ -936,8 +989,8 @@ async fn a_second_drive_during_a_move_is_refused() {
 }
 
 /// Drive H=4, K=4 with X:m:tth's `field` put to `v` first.
-async fn drive_with_tth(field: &str, v: EpicsValue) -> (Arc<PvDatabase>, PvDatabase) {
-    let (ioc, db) = boot_sim().await;
+async fn drive_with_tth(field: &str, v: EpicsValue) -> (Arc<PvDatabase>, PvDatabase, Orient) {
+    let (ioc, db, prog) = boot_sim().await;
     set_energy(&ioc, &db, 21.657).await;
     db.put_record_field_from_ca("X:m:tth", field, v)
         .await
@@ -946,14 +999,14 @@ async fn drive_with_tth(field: &str, v: EpicsValue) -> (Arc<PvDatabase>, PvDatab
     put(&db, "H", 4.0).await;
     put(&db, "K", 4.0).await;
     wait_near(&ioc, &format!("{P}TTH"), 34.6923).await;
-    (ioc, db)
+    (ioc, db, prog)
 }
 
 /// dbProcess completes the put callback of a disabled record without
 /// processing it, so the drive finishes with TTH never moved.
 #[epics_base_rs::epics_test]
 async fn a_drive_completes_on_a_disabled_motor() {
-    let (ioc, _db) = drive_with_tth("DISA", EpicsValue::Short(1)).await;
+    let (ioc, _db, _orient) = drive_with_tth("DISA", EpicsValue::Short(1)).await;
     wait_for(&ioc, &format!("{P}waiting4motTTH"), 0.0).await;
     wait_for(&ioc, &format!("{P}waiting4Mot"), 0.0).await;
     wait_for(&ioc, &format!("{P}Busy"), 0.0).await;
@@ -965,7 +1018,7 @@ async fn a_drive_completes_on_a_disabled_motor() {
 /// do_work :2237, process :1509) until SPMG=Go runs the move.
 #[epics_base_rs::epics_test]
 async fn a_drive_on_a_stopped_motor_waits_for_go() {
-    let (ioc, db) = drive_with_tth("SPMG", EpicsValue::Enum(0)).await;
+    let (ioc, db, _orient) = drive_with_tth("SPMG", EpicsValue::Enum(0)).await;
     task::sleep(Duration::from_secs(1)).await;
     assert_eq!(f64_of(&ioc, &format!("{P}waiting4motTTH")).await, 1.0);
     assert_eq!(f64_of(&ioc, &format!("{P}Busy")).await, 1.0);
@@ -982,7 +1035,7 @@ async fn a_drive_on_a_stopped_motor_waits_for_go() {
 /// `fabs(det) > SMALL` refuses, so A0 fails and is left identity.
 #[epics_base_rs::epics_test]
 async fn a_zero_a_live_fails_a0() {
-    let (ioc, db) = boot().await;
+    let (ioc, db, _orient) = boot().await;
     put(&db, "a", 0.0).await;
     wait_for(&ioc, &format!("{P}A0_state"), 2.0).await;
     assert_eq!(f64_of(&ioc, &format!("{P}A0_11")).await, 1.0);
@@ -1012,10 +1065,7 @@ async fn standing_readbacks_convert_when_the_matrices_go_good() {
     let db = PvDatabase::clone(&ioc);
     post(&db, &good_inputs());
     set_rbvs(&db, &[("tth", 24.3414), ("th", 12.1707)]);
-    BlockingBridge::capture().spawn(orient::run(
-        OrientConfig::new(P, "X:m:", "tth", "th", "chi", "phi"),
-        db.clone(),
-    ));
+    let _orient = start(&ioc, "phi");
     wait_for_msg(&ioc, "Successful OMTX calc").await;
     wait_near(&ioc, &format!("{P}H_RBV"), 4.0).await;
 }

@@ -546,8 +546,14 @@ mod tests {
         assert_eq!(a.load(3), EpicsValue::ShortArray(vec![1, 2, 3].into()));
         assert_eq!(a.load(1), EpicsValue::Short(1));
         assert_eq!(a.load(0), EpicsValue::ShortArray(Vec::new().into()));
+        // `c_char` is `u8` on aarch64 Linux.
         let c = <SeqVar<[c_char; 3]>>::zeroed();
-        assert_eq!(c.load(3), EpicsValue::CharArray(vec![0, 0, 0].into()));
+        let zeros = vec![0, 0, 0].into();
+        let want = match C_CHAR_KIND {
+            ElemKind::I8 => EpicsValue::CharArray(zeros),
+            _ => EpicsValue::UCharArray(zeros),
+        };
+        assert_eq!(c.load(3), want);
     }
 
     #[test]

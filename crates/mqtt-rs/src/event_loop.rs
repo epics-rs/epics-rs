@@ -1645,11 +1645,14 @@ mod tests {
     impl BrokerPort {
         fn new() -> Self {
             let hold = Self::socket();
-            // Unix shares a bound port only among `SO_REUSEPORT` sockets, so
-            // the hold sets it; Windows lets an `SO_REUSEADDR` bind join any
-            // non-exclusive one, so the hold sets nothing.
+            // The sharing option the listener also sets: unix shares a bound
+            // port only among `SO_REUSEPORT` sockets, and Winsock refuses an
+            // `SO_REUSEADDR` bind on the address of a socket without it
+            // (WSAEACCES).
             #[cfg(unix)]
             hold.set_reuse_port(true).unwrap();
+            #[cfg(windows)]
+            hold.set_reuse_address(true).unwrap();
             hold.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
                 .unwrap();
             let addr = hold.local_addr().unwrap().as_socket().unwrap();

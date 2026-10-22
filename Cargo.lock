@@ -1276,6 +1276,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-snc-rs"
+version = "0.32.0"
+dependencies = [
+ "chrono",
+ "epics-base-rs",
+ "epics-libcom-rs",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "epics-stream-rs"
 version = "0.32.0"
 dependencies = [

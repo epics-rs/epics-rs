@@ -1,0 +1,3 @@
+$ snc structuse.st
+$ snc +W structuse.st
+$ snc -w structuse.st

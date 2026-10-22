@@ -1,0 +1,35 @@
+$ snc states.st
+states.st:13: error: a state with name 'a' in state set 's1' was already declared at line 5
+states.st:9: error: a state with name 'missing' does not exist in state set 's1'
+states.st:19: error: a state set with name 's1' was already declared at line 4
+states.st:23: error: a state with name 'z' does not exist in state set 's2'
+states.st:3: error: state change statement not allowed here
+states.st:6: error: state change statement not allowed here
+states.st:8: error: a state with name 'nope' does not exist in state set 's1'
+states.st:10: error: state change statement not allowed here
+states.st:13: warning: state 'a' in state set 's1' cannot be reached from start state
+states.st:15: warning: state 'd' in state set 's1' cannot be reached from start state
+states.st:16: warning: state 'e' in state set 's1' cannot be reached from start state
+states.st:17: warning: state 'f' in state set 's1' cannot be reached from start state
+$ snc +W states.st
+states.st:13: error: a state with name 'a' in state set 's1' was already declared at line 5
+states.st:9: error: a state with name 'missing' does not exist in state set 's1'
+states.st:19: error: a state set with name 's1' was already declared at line 4
+states.st:23: error: a state with name 'z' does not exist in state set 's2'
+states.st:3: error: state change statement not allowed here
+states.st:6: error: state change statement not allowed here
+states.st:8: error: a state with name 'nope' does not exist in state set 's1'
+states.st:10: error: state change statement not allowed here
+states.st:13: warning: state 'a' in state set 's1' cannot be reached from start state
+states.st:15: warning: state 'd' in state set 's1' cannot be reached from start state
+states.st:16: warning: state 'e' in state set 's1' cannot be reached from start state
+states.st:17: warning: state 'f' in state set 's1' cannot be reached from start state
+$ snc -w states.st
+states.st:13: error: a state with name 'a' in state set 's1' was already declared at line 5
+states.st:9: error: a state with name 'missing' does not exist in state set 's1'
+states.st:19: error: a state set with name 's1' was already declared at line 4
+states.st:23: error: a state with name 'z' does not exist in state set 's2'
+states.st:3: error: state change statement not allowed here
+states.st:6: error: state change statement not allowed here
+states.st:8: error: a state with name 'nope' does not exist in state set 's1'
+states.st:10: error: state change statement not allowed here

@@ -1,0 +1,5 @@
+$ snc tables.st
+tables.st:24: warning: state 'third' in state set 'one' cannot be reached from start state
+$ snc +W tables.st
+tables.st:24: warning: state 'third' in state set 'one' cannot be reached from start state
+$ snc -w tables.st

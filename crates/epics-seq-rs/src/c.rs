@@ -92,9 +92,15 @@ impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> From<&At<'_, P, [B; N]>
 
 /// A C string read as a source: the bytes before the first NUL.
 pub trait CSrc {
-    /// Run `f` on the bytes, under the lock when `self` is a variable; `f`
-    /// must not touch another program variable.
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R;
+    /// Run `f` on the whole buffer, the NUL and the bytes after it
+    /// included, under the lock when `self` is a variable; `f` must not
+    /// touch another program variable.
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R;
+
+    /// Run `f` on the bytes before the first NUL, as `with_c_buffer`.
+    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.with_c_buffer(|b| f(before_nul(b)))
+    }
 
     /// Whether `self` is C's null pointer, which only a [`CharPtr`] can be:
     /// a callee that tests `!s` as C asks this before reading the bytes
@@ -114,34 +120,34 @@ fn before_nul(b: &[u8]) -> &[u8] {
 }
 
 impl CSrc for str {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(before_nul(self.as_bytes()))
-    }
-}
-
-impl CSrc for [u8] {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(before_nul(self))
-    }
-}
-
-impl CSrc for SeqString {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         f(self.as_bytes())
     }
 }
 
+impl CSrc for [u8] {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(self)
+    }
+}
+
+impl CSrc for SeqString {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(self.as_buffer())
+    }
+}
+
 impl CSrc for Arc<[u8]> {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(before_nul(self))
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(self)
     }
 }
 
 /// The null pointer panics where C would dereference it.
 impl CSrc for CharPtr {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         match self {
-            Some(s) => f(before_nul(s)),
+            Some(s) => f(s),
             None => panic!("null pointer passed as a C string"),
         }
     }
@@ -152,17 +158,17 @@ impl CSrc for CharPtr {
 }
 
 impl<const N: usize> CSrc for [c_char; N] {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         // SAFETY: `c_char` is `i8` or `u8`, the same size and alignment as
         // `u8`, and every bit pattern is a valid `u8`.
         let bytes = unsafe { std::slice::from_raw_parts(self.as_ptr().cast::<u8>(), N) };
-        f(before_nul(bytes))
+        f(bytes)
     }
 }
 
 impl<T: CSrc + ?Sized> CSrc for &T {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        (**self).with_c_bytes(f)
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        (**self).with_c_buffer(f)
     }
 
     fn is_null(&self) -> bool {
@@ -171,8 +177,8 @@ impl<T: CSrc + ?Sized> CSrc for &T {
 }
 
 impl<B: CSrc> CSrc for SeqVar<B> {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        self.modify(|b| b.with_c_bytes(f))
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.modify(|b| b.with_c_buffer(f))
     }
 
     fn is_null(&self) -> bool {
@@ -181,8 +187,8 @@ impl<B: CSrc> CSrc for SeqVar<B> {
 }
 
 impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> CSrc for At<'_, P, [B; N]> {
-    fn with_c_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        self.modify(|b| b.with_c_bytes(f))
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.modify(|b| b.with_c_buffer(f))
     }
 
     fn is_null(&self) -> bool {
@@ -405,6 +411,16 @@ fn format(fmt: &[u8], args: &[CArg<'_>], errno: &io::Error) -> (Vec<u8>, c_int) 
     out.extend_from_slice(&fmt[i..]);
     let len = c_int::try_from(out.len()).unwrap_or(-1);
     (out, len)
+}
+
+/// C's `s + n` read as a string, copied: from offset `n` of the buffer to
+/// the next NUL, so past the terminator it reads what `strcpy` left
+/// there. An offset outside the buffer panics where C would read outside
+/// the variable.
+pub fn tail(s: impl CSrc, n: isize) -> CharPtr {
+    let n = usize::try_from(n).ok();
+    let rest = s.with_c_buffer(|b| n.and_then(|n| b.get(n..)).map(|r| Arc::from(before_nul(r))));
+    Some(rest.expect("string offset outside the buffer"))
 }
 
 /// `printf`, through the IOC's stdout.
@@ -1454,6 +1470,33 @@ mod tests {
         let v = <SeqVar<[SeqString; 3]>>::zeroed();
         strcpy(&v.at(2), "Al");
         assert_eq!(v.get()[2].as_bytes(), b"Al");
+    }
+
+    #[test]
+    fn a_tail_reads_from_the_offset_to_the_next_nul() {
+        let v = <SeqVar<SeqString>>::zeroed();
+        strcpy(&v, "abcdef");
+        strcpy(&v, "xy");
+        let t = |n| tail(&v, n).unwrap().to_vec();
+        assert_eq!(t(1), b"y");
+        assert_eq!(t(2), b"");
+        // past the terminator, what the longer copy left
+        assert_eq!(t(3), b"def");
+        assert_eq!(t(40), b"");
+        assert_eq!(&*tail("abc", 3).unwrap(), b"");
+        assert_eq!(&*tail(Some(Arc::from(&b"a\0bc"[..])), 2).unwrap(), b"bc");
+    }
+
+    #[test]
+    #[should_panic(expected = "string offset outside the buffer")]
+    fn a_tail_past_the_buffer_panics() {
+        tail("abc", 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "string offset outside the buffer")]
+    fn a_tail_before_the_buffer_panics() {
+        tail("abc", -1);
     }
 
     #[test]

@@ -1,0 +1,19 @@
+$ snc decls.st
+decls.st:3: warning: ignoring duplicate struct declaration
+decls.st:4: warning: foreign declarations are deprecated
+decls.st:7: error: variable 'x' already declared at decls.st:6
+decls.st:13: error: variable 'y' already declared at decls.st:12
+decls.st:14: error: event flags can only be declared at the top-level
+decls.st:19: error: event flags can only be declared at the top-level
+$ snc +W decls.st
+decls.st:3: warning: ignoring duplicate struct declaration
+decls.st:4: warning: foreign declarations are deprecated
+decls.st:7: error: variable 'x' already declared at decls.st:6
+decls.st:13: error: variable 'y' already declared at decls.st:12
+decls.st:14: error: event flags can only be declared at the top-level
+decls.st:19: error: event flags can only be declared at the top-level
+$ snc -w decls.st
+decls.st:7: error: variable 'x' already declared at decls.st:6
+decls.st:13: error: variable 'y' already declared at decls.st:12
+decls.st:14: error: event flags can only be declared at the top-level
+decls.st:19: error: event flags can only be declared at the top-level

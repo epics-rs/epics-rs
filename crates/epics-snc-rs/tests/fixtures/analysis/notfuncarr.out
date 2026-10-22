@@ -1,0 +1,6 @@
+$ snc notfuncarr.st
+notfuncarr.st:2: error: not a function type
+$ snc +W notfuncarr.st
+notfuncarr.st:2: error: not a function type
+$ snc -w notfuncarr.st
+notfuncarr.st:2: error: not a function type

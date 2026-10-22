@@ -55,885 +55,641 @@ mod seqg {
     // Program init func
     fn seqg_init(_seqg_var: &seqg_vars) {}
 
-    // ****** Code for state "init" in state set "delayDoMain" ******
+    mod seqg_ss_delayDoMain {
+        use super::*;
 
-    // Event function for state "init" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_init(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        // delayDo.st:35
-        if seqg_env.pv_connect_count() == seqg_env.pv_assign_count() {
-            *seqg_pnst = 3;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        false
-    }
+        // ****** Code for state "init" in state set "delayDoMain" ******
 
-    // Action function for state "init" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_init(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:37
-                seqg_var.resumeWaiting.set(0);
-                // delayDo.st:38
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(38),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("init -> idle\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:39
-                {
-                    strcpy(&seqg_var.seqState, "idle");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+        // Event function for state "init" in state set "delayDoMain"
+        pub fn seqg_event_init(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            // delayDo.st:35
+            if seqg_env.pv_connect_count() == seqg_env.pv_assign_count() {
+                *seqg_pnst = 3;
+                *seqg_ptrn = 0;
+                return true;
             }
-            _ => {}
+            false
         }
-    }
 
-    // ****** Code for state "disable" in state set "delayDoMain" ******
-
-    // Event function for state "disable" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_disable(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:46
-        if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() != 0 {
-            *seqg_pnst = 2;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "disable" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_disable(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:49
-                seqg_env.ef_clear(active_mon);
-                // delayDo.st:50
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(50),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("disable -> maybeStandby\n")]);
-                    epicsThreadSleep(0.01);
+        // Action function for state "init" in state set "delayDoMain"
+        pub fn seqg_action_init(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:37
+                    seqg_var.resumeWaiting.set(0);
+                    // delayDo.st:38
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(38), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("init -> idle\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:39
+                    {
+                        strcpy(&seqg_var.seqState, "idle");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    // ****** Code for state "maybeStandby" in state set "delayDoMain" ******
+        // ****** Code for state "disable" in state set "delayDoMain" ******
 
-    // Event function for state "maybeStandby" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_maybeStandby(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:58
-        if seqg_var.standby.get() != 0 {
-            *seqg_pnst = 4;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        // delayDo.st:64
-        if seqg_var.active.get() != 0 {
-            *seqg_pnst = 6;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        // delayDo.st:70
-        if seqg_var.standby.get() == 0 {
-            *seqg_pnst = 3;
-            *seqg_ptrn = 2;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "maybeStandby" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_maybeStandby(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:60
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(60),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> standby\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:61
-                {
-                    strcpy(&seqg_var.seqState, "standby");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+        // Event function for state "disable" in state set "delayDoMain"
+        pub fn seqg_event_disable(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:46
+            if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() != 0 {
+                *seqg_pnst = 2;
+                *seqg_ptrn = 0;
+                return true;
             }
-            1 => {
-                // delayDo.st:66
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(66),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> active\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:67
-                {
-                    strcpy(&seqg_var.seqState, "active");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            2 => {
-                // delayDo.st:72
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(72),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> idle\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:73
-                {
-                    strcpy(&seqg_var.seqState, "idle");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            _ => {}
+            false
         }
-    }
 
-    // ****** Code for state "idle" in state set "delayDoMain" ******
-
-    // Event function for state "idle" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_idle(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:80
-        if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
-            *seqg_pnst = 1;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        // delayDo.st:86
-        if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
-            *seqg_pnst = 4;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        // delayDo.st:92
-        if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() != 0 {
-            *seqg_pnst = 6;
-            *seqg_ptrn = 2;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "idle" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_idle(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:82
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(82),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("idle -> disable\n")]);
-                    epicsThreadSleep(0.01);
+        // Action function for state "disable" in state set "delayDoMain"
+        pub fn seqg_action_disable(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:49
+                    seqg_env.ef_clear(active_mon);
+                    // delayDo.st:50
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(50), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("disable -> maybeStandby\n")]);
+                        epicsThreadSleep(0.01);
+                    }
                 }
-                // delayDo.st:83
-                {
-                    strcpy(&seqg_var.seqState, "disable");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+                _ => {}
             }
-            1 => {
-                // delayDo.st:88
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(88),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("idle -> standby\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:89
-                {
-                    strcpy(&seqg_var.seqState, "standby");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            2 => {
-                // delayDo.st:94
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(94),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("idle -> active\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:95
-                {
-                    strcpy(&seqg_var.seqState, "active");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            _ => {}
         }
-    }
 
-    // ****** Code for state "standby" in state set "delayDoMain" ******
+        // ****** Code for state "maybeStandby" in state set "delayDoMain" ******
 
-    // Event function for state "standby" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_standby(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:102
-        if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
-            *seqg_pnst = 1;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        // delayDo.st:109
-        if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() == 0 {
-            *seqg_pnst = 5;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "standby" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_standby(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:104
-                seqg_var.resumeWaiting.set(0);
-                // delayDo.st:105
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(105),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("standby -> disable\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:106
-                {
-                    strcpy(&seqg_var.seqState, "disable");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+        // Event function for state "maybeStandby" in state set "delayDoMain"
+        pub fn seqg_event_maybeStandby(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:58
+            if seqg_var.standby.get() != 0 {
+                *seqg_pnst = 4;
+                *seqg_ptrn = 0;
+                return true;
             }
-            1 => {
-                // delayDo.st:111
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(111),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("standby -> maybeWait\n")]);
-                    epicsThreadSleep(0.01);
-                }
+            // delayDo.st:64
+            if seqg_var.active.get() != 0 {
+                *seqg_pnst = 6;
+                *seqg_ptrn = 1;
+                return true;
             }
-            _ => {}
-        }
-    }
-
-    // ****** Code for state "maybeWait" in state set "delayDoMain" ******
-
-    // Event function for state "maybeWait" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_maybeWait(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:121
-        if seqg_var.active.get() != 0 {
-            *seqg_pnst = 6;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        // delayDo.st:130
-        if seqg_env.ef_test(active_mon) || seqg_var.resumeWaiting.get() != 0 {
-            *seqg_pnst = 7;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        // delayDo.st:138
-        if !seqg_env.ef_test(active_mon) {
-            *seqg_pnst = 3;
-            *seqg_ptrn = 2;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "maybeWait" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_maybeWait(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:123
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(123),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> active\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:124
-                {
-                    strcpy(&seqg_var.seqState, "active");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+            // delayDo.st:70
+            if seqg_var.standby.get() == 0 {
+                *seqg_pnst = 3;
+                *seqg_ptrn = 2;
+                return true;
             }
-            1 => {
-                // delayDo.st:132
-                seqg_env.ef_clear(active_mon);
-                // delayDo.st:133
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(133),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> waiting\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:134
-                {
-                    strcpy(&seqg_var.seqState, "waiting");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            2 => {
-                // delayDo.st:140
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(140),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> idle\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:141
-                {
-                    strcpy(&seqg_var.seqState, "idle");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            _ => {}
+            false
         }
-    }
 
-    // ****** Code for state "active" in state set "delayDoMain" ******
-
-    // Event function for state "active" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_active(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:148
-        if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
-            *seqg_pnst = 1;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        // delayDo.st:154
-        if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
-            *seqg_pnst = 4;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        // delayDo.st:160
-        if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() == 0 {
-            *seqg_pnst = 7;
-            *seqg_ptrn = 2;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "active" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_active(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:150
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(150),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("active -> disable\n")]);
-                    epicsThreadSleep(0.01);
+        // Action function for state "maybeStandby" in state set "delayDoMain"
+        pub fn seqg_action_maybeStandby(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:60
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(60), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> standby\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:61
+                    {
+                        strcpy(&seqg_var.seqState, "standby");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
                 }
-                // delayDo.st:151
-                {
-                    strcpy(&seqg_var.seqState, "disable");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
+                1 => {
+                    // delayDo.st:66
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(66), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> active\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:67
+                    {
+                        strcpy(&seqg_var.seqState, "active");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
                 }
+                2 => {
+                    // delayDo.st:72
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(72), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeStandby -> idle\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:73
+                    {
+                        strcpy(&seqg_var.seqState, "idle");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
             }
-            1 => {
-                // delayDo.st:156
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(156),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("active -> standby\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:157
-                {
-                    strcpy(&seqg_var.seqState, "standby");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            2 => {
-                // delayDo.st:162
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(162),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("active -> waiting\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:163
-                {
-                    strcpy(&seqg_var.seqState, "waiting");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            _ => {}
         }
-    }
 
-    // ****** Code for state "waiting" in state set "delayDoMain" ******
+        // ****** Code for state "idle" in state set "delayDoMain" ******
 
-    // Event function for state "waiting" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_waiting(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        let seqg_var = seqg_env.var();
-        // delayDo.st:170
-        if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
-            *seqg_pnst = 1;
-            *seqg_ptrn = 0;
-            return true;
+        // Event function for state "idle" in state set "delayDoMain"
+        pub fn seqg_event_idle(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:80
+            if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
+                *seqg_pnst = 1;
+                *seqg_ptrn = 0;
+                return true;
+            }
+            // delayDo.st:86
+            if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
+                *seqg_pnst = 4;
+                *seqg_ptrn = 1;
+                return true;
+            }
+            // delayDo.st:92
+            if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() != 0 {
+                *seqg_pnst = 6;
+                *seqg_ptrn = 2;
+                return true;
+            }
+            false
         }
-        // delayDo.st:176
-        if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
-            *seqg_pnst = 4;
-            *seqg_ptrn = 1;
-            return true;
-        }
-        // delayDo.st:183
-        if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() != 0 {
-            *seqg_pnst = 6;
-            *seqg_ptrn = 2;
-            return true;
-        }
-        // delayDo.st:189
-        if seqg_env.delay(seqg_var.delayPeriod.get()) {
-            *seqg_pnst = 8;
-            *seqg_ptrn = 3;
-            return true;
-        }
-        false
-    }
 
-    // Action function for state "waiting" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_waiting(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:172
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(172),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> disable\n")]);
-                    epicsThreadSleep(0.01);
+        // Action function for state "idle" in state set "delayDoMain"
+        pub fn seqg_action_idle(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:82
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(82), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("idle -> disable\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:83
+                    {
+                        strcpy(&seqg_var.seqState, "disable");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
                 }
-                // delayDo.st:173
-                {
-                    strcpy(&seqg_var.seqState, "disable");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
+                1 => {
+                    // delayDo.st:88
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(88), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("idle -> standby\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:89
+                    {
+                        strcpy(&seqg_var.seqState, "standby");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
                 }
+                2 => {
+                    // delayDo.st:94
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(94), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("idle -> active\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:95
+                    {
+                        strcpy(&seqg_var.seqState, "active");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
             }
-            1 => {
-                // delayDo.st:178
-                seqg_var.resumeWaiting.set(1);
-                // delayDo.st:179
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(179),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> standby\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:180
-                {
-                    strcpy(&seqg_var.seqState, "standby");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            2 => {
-                // delayDo.st:185
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(185),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> active\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:186
-                {
-                    strcpy(&seqg_var.seqState, "active");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            3 => {
-                // delayDo.st:191
-                seqg_var.resumeWaiting.set(0);
-                // delayDo.st:192
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(192),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> action\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:193
-                {
-                    strcpy(&seqg_var.seqState, "action");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-            }
-            _ => {}
         }
-    }
 
-    // ****** Code for state "action" in state set "delayDoMain" ******
+        // ****** Code for state "standby" in state set "delayDoMain" ******
 
-    // Event function for state "action" in state set "delayDoMain"
-    fn seqg_event_delayDoMain_0_action(
-        _seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_ptrn: &mut usize,
-        seqg_pnst: &mut usize,
-    ) -> bool {
-        // delayDo.st:201
-        if true {
-            *seqg_pnst = 3;
-            *seqg_ptrn = 0;
-            return true;
-        }
-        false
-    }
-
-    // Action function for state "action" in state set "delayDoMain"
-    fn seqg_action_delayDoMain_0_action(
-        seqg_env: &seqg_rt::StateSet<seqg_vars>,
-        seqg_trn: usize,
-        _seqg_pnst: &mut usize,
-    ) {
-        let seqg_var = seqg_env.var();
-        match seqg_trn {
-            0 => {
-                // delayDo.st:203
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(203),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("Processing doSeq\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:204
-                {
-                    seqg_var.doSeq.set(1);
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(5), // doSeq
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
-                // delayDo.st:205
-                if seqg_var.debug_flag.get() >= 3 {
-                    printf(
-                        "<%s,%d,%s,%d> ",
-                        &[
-                            seqg_rt::c::CArg::from("delayDo.st"),
-                            seqg_rt::c::CArg::from(205),
-                            seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()),
-                            seqg_rt::c::CArg::from(3),
-                        ],
-                    );
-                    printf("%s\n", &[seqg_rt::c::CArg::from("action -> idle\n")]);
-                    epicsThreadSleep(0.01);
-                }
-                // delayDo.st:206
-                {
-                    strcpy(&seqg_var.seqState, "idle");
-                    seqg_env.pv_put_tmo(
-                        seqg_rt::ChId(6), // seqState
-                        seqg_rt::CompType::Sync,
-                        seqg_rt::DEFAULT_TIMEOUT,
-                    );
-                }
+        // Event function for state "standby" in state set "delayDoMain"
+        pub fn seqg_event_standby(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:102
+            if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
+                *seqg_pnst = 1;
+                *seqg_ptrn = 0;
+                return true;
             }
-            _ => {}
+            // delayDo.st:109
+            if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() == 0 {
+                *seqg_pnst = 5;
+                *seqg_ptrn = 1;
+                return true;
+            }
+            false
+        }
+
+        // Action function for state "standby" in state set "delayDoMain"
+        pub fn seqg_action_standby(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:104
+                    seqg_var.resumeWaiting.set(0);
+                    // delayDo.st:105
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(105), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("standby -> disable\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:106
+                    {
+                        strcpy(&seqg_var.seqState, "disable");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                1 => {
+                    // delayDo.st:111
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(111), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("standby -> maybeWait\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ****** Code for state "maybeWait" in state set "delayDoMain" ******
+
+        // Event function for state "maybeWait" in state set "delayDoMain"
+        pub fn seqg_event_maybeWait(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:121
+            if seqg_var.active.get() != 0 {
+                *seqg_pnst = 6;
+                *seqg_ptrn = 0;
+                return true;
+            }
+            // delayDo.st:130
+            if seqg_env.ef_test(active_mon) || seqg_var.resumeWaiting.get() != 0 {
+                *seqg_pnst = 7;
+                *seqg_ptrn = 1;
+                return true;
+            }
+            // delayDo.st:138
+            if !seqg_env.ef_test(active_mon) {
+                *seqg_pnst = 3;
+                *seqg_ptrn = 2;
+                return true;
+            }
+            false
+        }
+
+        // Action function for state "maybeWait" in state set "delayDoMain"
+        pub fn seqg_action_maybeWait(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:123
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(123), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> active\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:124
+                    {
+                        strcpy(&seqg_var.seqState, "active");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                1 => {
+                    // delayDo.st:132
+                    seqg_env.ef_clear(active_mon);
+                    // delayDo.st:133
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(133), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> waiting\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:134
+                    {
+                        strcpy(&seqg_var.seqState, "waiting");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                2 => {
+                    // delayDo.st:140
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(140), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("maybeWait -> idle\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:141
+                    {
+                        strcpy(&seqg_var.seqState, "idle");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ****** Code for state "active" in state set "delayDoMain" ******
+
+        // Event function for state "active" in state set "delayDoMain"
+        pub fn seqg_event_active(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:148
+            if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
+                *seqg_pnst = 1;
+                *seqg_ptrn = 0;
+                return true;
+            }
+            // delayDo.st:154
+            if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
+                *seqg_pnst = 4;
+                *seqg_ptrn = 1;
+                return true;
+            }
+            // delayDo.st:160
+            if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() == 0 {
+                *seqg_pnst = 7;
+                *seqg_ptrn = 2;
+                return true;
+            }
+            false
+        }
+
+        // Action function for state "active" in state set "delayDoMain"
+        pub fn seqg_action_active(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:150
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(150), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("active -> disable\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:151
+                    {
+                        strcpy(&seqg_var.seqState, "disable");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                1 => {
+                    // delayDo.st:156
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(156), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("active -> standby\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:157
+                    {
+                        strcpy(&seqg_var.seqState, "standby");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                2 => {
+                    // delayDo.st:162
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(162), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("active -> waiting\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:163
+                    {
+                        strcpy(&seqg_var.seqState, "waiting");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ****** Code for state "waiting" in state set "delayDoMain" ******
+
+        // Event function for state "waiting" in state set "delayDoMain"
+        pub fn seqg_event_waiting(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            let seqg_var = seqg_env.var();
+            // delayDo.st:170
+            if seqg_env.ef_test_and_clear(enable_mon) && seqg_var.enable.get() == 0 {
+                *seqg_pnst = 1;
+                *seqg_ptrn = 0;
+                return true;
+            }
+            // delayDo.st:176
+            if seqg_env.ef_test_and_clear(standby_mon) && seqg_var.standby.get() != 0 {
+                *seqg_pnst = 4;
+                *seqg_ptrn = 1;
+                return true;
+            }
+            // delayDo.st:183
+            if seqg_env.ef_test_and_clear(active_mon) && seqg_var.active.get() != 0 {
+                *seqg_pnst = 6;
+                *seqg_ptrn = 2;
+                return true;
+            }
+            // delayDo.st:189
+            if seqg_env.delay(seqg_var.delayPeriod.get()) {
+                *seqg_pnst = 8;
+                *seqg_ptrn = 3;
+                return true;
+            }
+            false
+        }
+
+        // Action function for state "waiting" in state set "delayDoMain"
+        pub fn seqg_action_waiting(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:172
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(172), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> disable\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:173
+                    {
+                        strcpy(&seqg_var.seqState, "disable");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                1 => {
+                    // delayDo.st:178
+                    seqg_var.resumeWaiting.set(1);
+                    // delayDo.st:179
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(179), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> standby\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:180
+                    {
+                        strcpy(&seqg_var.seqState, "standby");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                2 => {
+                    // delayDo.st:185
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(185), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> active\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:186
+                    {
+                        strcpy(&seqg_var.seqState, "active");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                3 => {
+                    // delayDo.st:191
+                    seqg_var.resumeWaiting.set(0);
+                    // delayDo.st:192
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(192), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("waiting -> action\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:193
+                    {
+                        strcpy(&seqg_var.seqState, "action");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ****** Code for state "action" in state set "delayDoMain" ******
+
+        // Event function for state "action" in state set "delayDoMain"
+        pub fn seqg_event_action(_seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_ptrn: &mut usize, seqg_pnst: &mut usize) -> bool {
+            // delayDo.st:201
+            if true {
+                *seqg_pnst = 3;
+                *seqg_ptrn = 0;
+                return true;
+            }
+            false
+        }
+
+        // Action function for state "action" in state set "delayDoMain"
+        pub fn seqg_action_action(seqg_env: &seqg_rt::StateSet<seqg_vars>, seqg_trn: usize, _seqg_pnst: &mut usize) {
+            let seqg_var = seqg_env.var();
+            match seqg_trn {
+                0 => {
+                    // delayDo.st:203
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(203), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("Processing doSeq\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:204
+                    {
+                        seqg_var.doSeq.set(1);
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(5), // doSeq
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                    // delayDo.st:205
+                    if seqg_var.debug_flag.get() >= 3 {
+                        printf("<%s,%d,%s,%d> ", &[seqg_rt::c::CArg::from("../delayDo.st"), seqg_rt::c::CArg::from(205), seqg_rt::c::CArg::from(seqg_var.SNLtaskName.get()), seqg_rt::c::CArg::from(3)]);
+                        printf("%s\n", &[seqg_rt::c::CArg::from("action -> idle\n")]);
+                        epicsThreadSleep(0.01);
+                    }
+                    // delayDo.st:206
+                    {
+                        strcpy(&seqg_var.seqState, "idle");
+                        seqg_env.pv_put_tmo(
+                            seqg_rt::ChId(6), // seqState
+                            seqg_rt::CompType::Sync,
+                            seqg_rt::DEFAULT_TIMEOUT,
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1028,106 +784,112 @@ mod seqg {
     ];
 
     // Event masks for state set "delayDoMain"
-    static seqg_mask_delayDoMain_0_init: [seqg_rt::SeqMask; 1] = [0x00000000];
-    static seqg_mask_delayDoMain_0_disable: [seqg_rt::SeqMask; 1] = [0x00000022];
-    static seqg_mask_delayDoMain_0_maybeStandby: [seqg_rt::SeqMask; 1] = [0x000000c0];
-    static seqg_mask_delayDoMain_0_idle: [seqg_rt::SeqMask; 1] = [0x000000ee];
-    static seqg_mask_delayDoMain_0_standby: [seqg_rt::SeqMask; 1] = [0x00000066];
-    static seqg_mask_delayDoMain_0_maybeWait: [seqg_rt::SeqMask; 1] = [0x00000088];
-    static seqg_mask_delayDoMain_0_active: [seqg_rt::SeqMask; 1] = [0x000000ee];
-    static seqg_mask_delayDoMain_0_waiting: [seqg_rt::SeqMask; 1] = [0x000001ee];
-    static seqg_mask_delayDoMain_0_action: [seqg_rt::SeqMask; 1] = [0x00000000];
+    mod seqg_mask_delayDoMain {
+        use super::*;
+
+        pub static seqg_mask_init: [seqg_rt::SeqMask; 1] = [0x00000000];
+        pub static seqg_mask_disable: [seqg_rt::SeqMask; 1] = [0x00000022];
+        pub static seqg_mask_maybeStandby: [seqg_rt::SeqMask; 1] = [0x000000c0];
+        pub static seqg_mask_idle: [seqg_rt::SeqMask; 1] = [0x000000ee];
+        pub static seqg_mask_standby: [seqg_rt::SeqMask; 1] = [0x00000066];
+        pub static seqg_mask_maybeWait: [seqg_rt::SeqMask; 1] = [0x00000088];
+        pub static seqg_mask_active: [seqg_rt::SeqMask; 1] = [0x000000ee];
+        pub static seqg_mask_waiting: [seqg_rt::SeqMask; 1] = [0x000001ee];
+        pub static seqg_mask_action: [seqg_rt::SeqMask; 1] = [0x00000000];
+    }
 
     // State table for state set "delayDoMain"
     static seqg_states_delayDoMain: [seqg_rt::SeqState<seqg_vars>; 9] = [
         seqg_rt::SeqState {
             state_name: "init",
-            action_func: seqg_action_delayDoMain_0_init,
-            event_func: seqg_event_delayDoMain_0_init,
+            action_func: seqg_ss_delayDoMain::seqg_action_init,
+            event_func: seqg_ss_delayDoMain::seqg_event_init,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_init,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_init,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "disable",
-            action_func: seqg_action_delayDoMain_0_disable,
-            event_func: seqg_event_delayDoMain_0_disable,
+            action_func: seqg_ss_delayDoMain::seqg_action_disable,
+            event_func: seqg_ss_delayDoMain::seqg_event_disable,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_disable,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_disable,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "maybeStandby",
-            action_func: seqg_action_delayDoMain_0_maybeStandby,
-            event_func: seqg_event_delayDoMain_0_maybeStandby,
+            action_func: seqg_ss_delayDoMain::seqg_action_maybeStandby,
+            event_func: seqg_ss_delayDoMain::seqg_event_maybeStandby,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_maybeStandby,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_maybeStandby,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "idle",
-            action_func: seqg_action_delayDoMain_0_idle,
-            event_func: seqg_event_delayDoMain_0_idle,
+            action_func: seqg_ss_delayDoMain::seqg_action_idle,
+            event_func: seqg_ss_delayDoMain::seqg_event_idle,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_idle,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_idle,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "standby",
-            action_func: seqg_action_delayDoMain_0_standby,
-            event_func: seqg_event_delayDoMain_0_standby,
+            action_func: seqg_ss_delayDoMain::seqg_action_standby,
+            event_func: seqg_ss_delayDoMain::seqg_event_standby,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_standby,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_standby,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "maybeWait",
-            action_func: seqg_action_delayDoMain_0_maybeWait,
-            event_func: seqg_event_delayDoMain_0_maybeWait,
+            action_func: seqg_ss_delayDoMain::seqg_action_maybeWait,
+            event_func: seqg_ss_delayDoMain::seqg_event_maybeWait,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_maybeWait,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_maybeWait,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "active",
-            action_func: seqg_action_delayDoMain_0_active,
-            event_func: seqg_event_delayDoMain_0_active,
+            action_func: seqg_ss_delayDoMain::seqg_action_active,
+            event_func: seqg_ss_delayDoMain::seqg_event_active,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_active,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_active,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "waiting",
-            action_func: seqg_action_delayDoMain_0_waiting,
-            event_func: seqg_event_delayDoMain_0_waiting,
+            action_func: seqg_ss_delayDoMain::seqg_action_waiting,
+            event_func: seqg_ss_delayDoMain::seqg_event_waiting,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_waiting,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_waiting,
             options: seqg_rt::StateOptions::new(0),
         },
         seqg_rt::SeqState {
             state_name: "action",
-            action_func: seqg_action_delayDoMain_0_action,
-            event_func: seqg_event_delayDoMain_0_action,
+            action_func: seqg_ss_delayDoMain::seqg_action_action,
+            event_func: seqg_ss_delayDoMain::seqg_event_action,
             entry_func: None,
             exit_func: None,
-            event_mask: &seqg_mask_delayDoMain_0_action,
+            event_mask: &seqg_mask_delayDoMain::seqg_mask_action,
             options: seqg_rt::StateOptions::new(0),
         },
     ];
 
     // State set table
-    static seqg_statesets: [seqg_rt::SeqSs<seqg_vars>; 1] = [seqg_rt::SeqSs {
-        ss_name: "delayDoMain",
-        states: &seqg_states_delayDoMain,
-    }];
+    static seqg_statesets: [seqg_rt::SeqSs<seqg_vars>; 1] = [
+        seqg_rt::SeqSs {
+            ss_name: "delayDoMain",
+            states: &seqg_states_delayDoMain,
+        },
+    ];
 
     // Program table (global)
     pub static delayDo: seqg_rt::SeqProgram<seqg_vars> = seqg_rt::SeqProgram {
@@ -1138,9 +900,7 @@ mod seqg {
         vars: seqg_rt::VarModel::Reentrant,
         params: "name=delayDo,P=xxx:,R=delayDo1",
         num_ev_flags: 3,
-        options: seqg_rt::ProgOptions::new(
-            seqg_rt::ProgOptions::CONN | seqg_rt::ProgOptions::DEBUG | seqg_rt::ProgOptions::NEWEF,
-        ),
+        options: seqg_rt::ProgOptions::new(seqg_rt::ProgOptions::CONN | seqg_rt::ProgOptions::DEBUG | seqg_rt::ProgOptions::NEWEF),
         init_func: seqg_init,
         entry_func: None,
         exit_func: None,

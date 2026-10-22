@@ -1,0 +1,15 @@
+$ snc opts.st
+opts.st:2: warning: unknown option 'xyz'
+opts.st:2: warning: unknown option 'yz'
+opts.st:2: warning: unknown option 'z'
+opts.st:7: warning: unknown state option 'q'
+$ snc +W opts.st
+opts.st:2: warning: unknown option 'xyz'
+opts.st:2: warning: unknown option 'yz'
+opts.st:2: warning: unknown option 'z'
+opts.st:7: warning: unknown state option 'q'
+$ snc -w opts.st
+opts.st:2: warning: unknown option 'xyz'
+opts.st:2: warning: unknown option 'yz'
+opts.st:2: warning: unknown option 'z'
+opts.st:7: warning: unknown state option 'q'

@@ -52,9 +52,12 @@
 //!   and `let seqg_var = seqg_env.var();` is emitted only where it is
 //!   used. Each statement is preceded by a `// <file>.st:<line>` comment.
 //! - Variables. Each variable is a [`SeqVar<T>`] field of `seqg_vars`,
-//!   using the [`types`] map: `char` [`std::ffi::c_char`], `short` `i16`,
-//!   `int` `i32`, `long` `i64`, `float` `f32`, `double` `f64`, `string`
-//!   [`SeqString`], `char *` [`CharPtr`]. `char` is written
+//!   using the [`types`] map, which covers every SNL type: `char`
+//!   [`std::ffi::c_char`], `int8_t` `i8`, `unsigned char` and `uint8_t`
+//!   `u8`, `short` and `int16_t` `i16`, `unsigned short` and `uint16_t`
+//!   `u16`, `int` and `int32_t` `i32`, `unsigned int` and `uint32_t` `u32`,
+//!   `long` `i64`, `unsigned long` `u64`, `float` `f32`, `double` `f64`,
+//!   `string` [`SeqString`], `char *` [`CharPtr`]. `char` is written
 //!   `std::ffi::c_char` in full and the run-time types `seqg_rt::...`, so
 //!   a companion imports neither. The outer dimension of a multi-PV
 //!   array is split: `[SeqVar<T>; N]`. A block-local variable is a `let`
@@ -101,12 +104,14 @@
 //! `%{ }%` everything between the delimiters. cpp's line-marker lines
 //! (`^#\s*\d+\s+"`, such as `# 540 "Io.st"`) are removed, then every run
 //! of spaces, tabs and newlines outside C string and character literals
-//! and comments becomes one space, and the ends are trimmed. Literals and
-//! comments stay byte-exact, as cpp leaves them, and the scan that finds
-//! them is the bracket count's below. The marker paths and gcc's spacing,
-//! which depend on how `build.rs` runs cpp, never reach an arm. The raw
-//! string uses the fewest `#` (at least one) that can enclose the key, and
-//! a `macro_rules!` arm matches only that exact token.
+//! and comments becomes one space, or one newline when it follows a `//`
+//! comment (so `a // c` newline `b` and `a // c b` are two keys), and the
+//! ends are trimmed. Literals and comments stay byte-exact, as cpp leaves
+//! them, and the scan that finds them is the bracket count's below. The
+//! marker paths and gcc's spacing, which depend on how `build.rs` runs
+//! cpp, never reach an arm. The raw string uses the fewest `#` (at least
+//! one) that can enclose the key, and a `macro_rules!` arm matches only
+//! that exact token.
 //!
 //! Each `%%` line is a fragment of its own, so C split across lines is
 //! bound as one call. A run of statement-position fragments whose `(`,
@@ -148,13 +153,26 @@
 //! ```
 //!
 //! An item arm can expand to the item itself rather than to nothing. A
-//! constant or function that the escaped C defined, and that SNL code
-//! uses, is a companion item with the same name. A function takes its
-//! arguments as the call rule above passes them; under `-r` it reaches
-//! the program's variables through `seqg::seqg_static_vars()`. When a
-//! fragment has no arm, the build fails with that text, so a changed
-//! upstream `.st` cannot compile against a stale companion. A companion
-//! holds one program, because each program defines its own `mod seqg`.
+//! constant, global or function that the escaped C defined, and that SNL
+//! code uses, is a companion item with the same name. Generated code names
+//! it bare (`powers`), and `mod seqg` reaches it through `use super::*`,
+//! so the item sits beside the [`include_program!`] call. A function takes
+//! its arguments as the call rule above passes them; under `-r` it reaches
+//! the program's variables through `seqg::seqg_static_vars()`.
+//!
+//! A global is a constant table: a `static`, an array for a C array, read
+//! by value. femto.st:42's `%%static int powers[] = {...}` is
+//! `static powers: [i32; 16]`, read as `powers[i as usize]`. A buffer
+//! that only a callee writes, through C's decay of an array
+//! (Keithley2kDMM.st:216's `%%char pvname[...]` passed to `sprintf`), is
+//! such a static holding a reference to a companion type that implements
+//! [`Place`] and [`c::CSrc`]. snc-rs refuses SNL code that assigns a
+//! global.
+//!
+//! When a fragment has no arm, the build fails with that text, so a
+//! changed upstream `.st` cannot compile against a stale companion. A
+//! companion holds one program, because each program defines its own
+//! `mod seqg`.
 //!
 //! None of the 16 `.st` programs moving onto this crate uses an SNL
 //! `struct`, a function definition, or escaped C inside a struct, so

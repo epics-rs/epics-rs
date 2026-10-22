@@ -1,0 +1,3 @@
+$ snc selfref2.st
+$ snc +W selfref2.st
+$ snc -w selfref2.st

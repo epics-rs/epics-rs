@@ -1,0 +1,5 @@
+$ snc syncq_after_sync_same_elem.st
+syncq_after_sync_same_elem.st:8: warning: 'v[1]' already sync'd
+$ snc +W syncq_after_sync_same_elem.st
+syncq_after_sync_same_elem.st:8: warning: 'v[1]' already sync'd
+$ snc -w syncq_after_sync_same_elem.st

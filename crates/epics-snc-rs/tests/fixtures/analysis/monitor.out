@@ -1,0 +1,39 @@
+$ snc monitor.st
+monitor.st:10: error: cannot monitor variable 'nope': not declared
+monitor.st:11: error: cannot monitor variable 'n': not assigned
+monitor.st:12: error: variable 'n' is not an array
+monitor.st:14: warning: variable 'a' already monitored
+monitor.st:15: error: variable 'a' is not an array
+monitor.st:16: error: subscript in 'a1[5]' out of range
+monitor.st:18: warning: 'a1[0]' already monitored
+monitor.st:21: warning: array element 'a1[1]' already monitored
+monitor.st:22: error: variable 'a2' is assigned to a single channel and can only be monitored wholesale
+monitor.st:23: error: array element 'a3[0]' not assigned
+monitor.st:24: warning: variable 'a1' already monitored
+monitor.st:30: warning: state local assign is deprecated
+monitor.st:31: warning: state local monitor is deprecated
+monitor.st:32: error: cannot monitor variable 'm': monitor must be in the same scope as declaration
+$ snc +W monitor.st
+monitor.st:10: error: cannot monitor variable 'nope': not declared
+monitor.st:11: error: cannot monitor variable 'n': not assigned
+monitor.st:12: error: variable 'n' is not an array
+monitor.st:14: warning: variable 'a' already monitored
+monitor.st:15: error: variable 'a' is not an array
+monitor.st:16: error: subscript in 'a1[5]' out of range
+monitor.st:18: warning: 'a1[0]' already monitored
+monitor.st:21: warning: array element 'a1[1]' already monitored
+monitor.st:22: error: variable 'a2' is assigned to a single channel and can only be monitored wholesale
+monitor.st:23: error: array element 'a3[0]' not assigned
+monitor.st:24: warning: variable 'a1' already monitored
+monitor.st:30: warning: state local assign is deprecated
+monitor.st:31: warning: state local monitor is deprecated
+monitor.st:32: error: cannot monitor variable 'm': monitor must be in the same scope as declaration
+$ snc -w monitor.st
+monitor.st:10: error: cannot monitor variable 'nope': not declared
+monitor.st:11: error: cannot monitor variable 'n': not assigned
+monitor.st:12: error: variable 'n' is not an array
+monitor.st:15: error: variable 'a' is not an array
+monitor.st:16: error: subscript in 'a1[5]' out of range
+monitor.st:22: error: variable 'a2' is assigned to a single channel and can only be monitored wholesale
+monitor.st:23: error: array element 'a3[0]' not assigned
+monitor.st:32: error: cannot monitor variable 'm': monitor must be in the same scope as declaration

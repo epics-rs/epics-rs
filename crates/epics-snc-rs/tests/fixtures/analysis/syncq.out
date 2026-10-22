@@ -1,0 +1,57 @@
+$ snc syncq.st
+syncq.st:21: error: variable 'nope' not declared
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:23: error: event flag 'nope' not declared
+syncq.st:24: error: variable 'notef' is not an event flag
+syncq.st:25: error: queue size '0' out of range
+syncq.st:26: error: queue size '4294967295' out of range
+syncq.st:27: error: event flag 'ef' is already used for another syncq
+syncq.st:28: error: event flag 'ef' is already used for another syncq
+syncq.st:29: error: event flag 'ef' is already used for another syncq
+syncq.st:30: warning: leaving out the queue size is deprecated, queue size defaults to 100 elements
+syncq.st:31: error: subscript in 'a1[9]' out of range
+syncq.st:33: warning: 'a1[0]' already syncq'd
+syncq.st:35: error: some array elements of 'a1' already syncq'd
+syncq.st:36: error: variable 'a2' is assigned to a single channel and can only be syncq'd wholesale
+syncq.st:39: error: event flag 'ef3' is already used for another syncq
+syncq.st:45: warning: state local assign is deprecated
+syncq.st:46: warning: state local syncq is deprecated
+syncq.st:47: error: cannot syncq variable 'm': syncq must be in the same scope as declaration
+$ snc +W syncq.st
+syncq.st:21: error: variable 'nope' not declared
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:23: error: event flag 'nope' not declared
+syncq.st:24: error: variable 'notef' is not an event flag
+syncq.st:25: error: queue size '0' out of range
+syncq.st:26: error: queue size '4294967295' out of range
+syncq.st:27: error: event flag 'ef' is already used for another syncq
+syncq.st:28: error: event flag 'ef' is already used for another syncq
+syncq.st:29: error: event flag 'ef' is already used for another syncq
+syncq.st:30: warning: leaving out the queue size is deprecated, queue size defaults to 100 elements
+syncq.st:31: error: subscript in 'a1[9]' out of range
+syncq.st:33: warning: 'a1[0]' already syncq'd
+syncq.st:35: error: some array elements of 'a1' already syncq'd
+syncq.st:36: error: variable 'a2' is assigned to a single channel and can only be syncq'd wholesale
+syncq.st:39: error: event flag 'ef3' is already used for another syncq
+syncq.st:45: warning: state local assign is deprecated
+syncq.st:46: warning: state local syncq is deprecated
+syncq.st:47: error: cannot syncq variable 'm': syncq must be in the same scope as declaration
+syncq.st:23: warning: treating undeclared object 'nope' as foreign
+$ snc -w syncq.st
+syncq.st:21: error: variable 'nope' not declared
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:22: error: variable 'n' not assigned
+syncq.st:23: error: event flag 'nope' not declared
+syncq.st:24: error: variable 'notef' is not an event flag
+syncq.st:25: error: queue size '0' out of range
+syncq.st:26: error: queue size '4294967295' out of range
+syncq.st:27: error: event flag 'ef' is already used for another syncq
+syncq.st:28: error: event flag 'ef' is already used for another syncq
+syncq.st:29: error: event flag 'ef' is already used for another syncq
+syncq.st:31: error: subscript in 'a1[9]' out of range
+syncq.st:35: error: some array elements of 'a1' already syncq'd
+syncq.st:36: error: variable 'a2' is assigned to a single channel and can only be syncq'd wholesale
+syncq.st:39: error: event flag 'ef3' is already used for another syncq
+syncq.st:47: error: cannot syncq variable 'm': syncq must be in the same scope as declaration

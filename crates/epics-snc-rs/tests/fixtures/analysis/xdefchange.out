@@ -1,0 +1,6 @@
+$ snc xdefchange.st
+xdefchange.st:6: error: a state with name 'nope' does not exist in state set 's1'
+$ snc +W xdefchange.st
+xdefchange.st:6: error: a state with name 'nope' does not exist in state set 's1'
+$ snc -w xdefchange.st
+xdefchange.st:6: error: a state with name 'nope' does not exist in state set 's1'

@@ -1,0 +1,6 @@
+$ snc dupfunc.st
+dupfunc.st:5: error: variable 'y' already declared at dupfunc.st:4
+$ snc +W dupfunc.st
+dupfunc.st:5: error: variable 'y' already declared at dupfunc.st:4
+$ snc -w dupfunc.st
+dupfunc.st:5: error: variable 'y' already declared at dupfunc.st:4

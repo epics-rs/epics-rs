@@ -1,0 +1,12 @@
+$ snc funcscope.st
+funcscope.st:3: error: event flags can only be declared at the top-level
+funcscope.st:5: error: functions can only be declared at the top-level
+funcscope.st:7: error: functions can only be declared at the top-level
+$ snc +W funcscope.st
+funcscope.st:3: error: event flags can only be declared at the top-level
+funcscope.st:5: error: functions can only be declared at the top-level
+funcscope.st:7: error: functions can only be declared at the top-level
+$ snc -w funcscope.st
+funcscope.st:3: error: event flags can only be declared at the top-level
+funcscope.st:5: error: functions can only be declared at the top-level
+funcscope.st:7: error: functions can only be declared at the top-level

@@ -1,0 +1,28 @@
+[package]
+name = "epics-snc-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of the EPICS sequencer's SNL compiler (snc): turns an unchanged .st program into Rust at build time"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snc-rs"
+path = "src/bin/snc-rs.rs"
+
+[dependencies]
+# StagedStderr: diagnostics reach stderr one write per message.
+epics-libcom-rs = { workspace = true }
+
+[build-dependencies]
+# Perl's localtime for SEQ_RELEASE's build date.
+chrono = "0.4"
+
+[dev-dependencies]
+# Locates the sequencer checkout whose C snc the reference_* tests compare to.
+epics-base-rs = { workspace = true }
+# Scratch directories the reference test preprocesses upstream programs in.
+tempfile = "3"
+# Reads the corpus check's compiler-artifact and compiler-message lines.
+serde_json = { workspace = true }

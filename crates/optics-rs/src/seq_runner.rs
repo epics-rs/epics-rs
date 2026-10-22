@@ -69,6 +69,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use epics_base_rs::server::database::db_access::DbSubscription;
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::records::busy::BusyRecord;
 
@@ -215,21 +216,40 @@ mod tests {
         panic!("NumFilters is {:?}", db.get_pv("N:f:NumFilters").unwrap());
     }
 
-    /// ml_monoCtl's y offset is the `Y_OFF` macro (`ml_monoCtl.st:587`),
-    /// put by initSequence; with every motor readback at 0, chkMotorLimits
-    /// then holds and nothing overwrites it.
+    /// initSequence puts the `Y_OFF` macro into the y offset
+    /// (`ml_monoCtl.st:520-530`), and updatePsuedo puts the y motor readback,
+    /// 0 here, once the readback's first monitor sets `yMotRdbk_mon`, as every
+    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1218`).
+    /// The two state sets run on their own threads, so either put may be the
+    /// last; C guarantees only that every value put is one of the two.
     #[epics_base_rs::epics_test]
-    async fn ml_mono_takes_its_y_offset_from_y_off() {
+    async fn ml_mono_puts_y_off_or_the_y_readback_into_its_y_offset() {
         let db = ml_mono_ioc().await;
+        let mut sub = DbSubscription::subscribe(&db, "Y:ml_mono_yOffset")
+            .await
+            .unwrap();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
+        let mut posts = Vec::new();
         for _ in 0..300 {
-            if db.get_pv("Y:ml_mono_yOffset").unwrap().to_f64() == Some(40.0) {
+            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:536`)
+            let init_done = db.get_pv("Y:ml_monoYPv").unwrap().text_g() == "Y:m10";
+            while let Ok(e) = sub.try_recv_event() {
+                posts.push(e.value().as_value().and_then(|v| v.to_f64()));
+            }
+            if init_done && posts.contains(&Some(0.0)) {
+                assert!(
+                    posts.iter().all(|&p| p == Some(40.0) || p == Some(0.0)),
+                    "y offset posts {posts:?}"
+                );
                 return;
             }
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("yOffset is {:?}", db.get_pv("Y:ml_mono_yOffset").unwrap());
+        panic!(
+            "y offset posts {posts:?}, y motor {:?}",
+            db.get_pv("Y:ml_monoYPv").unwrap()
+        );
     }
 
     /// A motor macro the command line leaves out takes the program's default

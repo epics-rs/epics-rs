@@ -134,7 +134,7 @@ async fn a_listing_is_the_shells_and_an_error_the_errlogs() {
     );
     let _task = mgr.clone().start(db.clone());
     let out = dir.path().join("out.txt");
-    let line = format!("save_restoreShow > {}", out.display());
+    let line = format!("save_restoreShow > \"{}\"", out.display());
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let shell_mgr = mgr.clone();
     std::thread::spawn(move || {

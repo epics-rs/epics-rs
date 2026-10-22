@@ -42,7 +42,7 @@ fn help_prints_cs_synopsis_alone() {
         for synopsis in C_SYNOPSES {
             let name = synopsis.split(' ').next().unwrap();
             shell
-                .execute_line(format!("help {name} > {}", out.display()))
+                .execute_line(format!("help {name} > \"{}\"", out.display()))
                 .unwrap();
             // C's bold name, which `NO_COLOR` turns off.
             let text = std::fs::read_to_string(&out).unwrap();

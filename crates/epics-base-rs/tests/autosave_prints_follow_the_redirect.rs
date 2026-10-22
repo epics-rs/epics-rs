@@ -92,11 +92,11 @@ fn the_build_hook_and_boot_restore_lines_follow_the_redirect() {
                   set_savefile_path(\"{d}\")\n\
                   save_restoreSet_DatedBackupFiles(0)\n\
                   save_restoreSet_Debug(5)\n\
-                  autosaveBuild(\"built.req\", \"_settings.req\", 1) > {d}/build.txt\n\
-                  dbLoadRecords(\"{d}/b.db\") > {d}/load.txt\n\
+                  autosaveBuild(\"built.req\", \"_settings.req\", 1) > \"{d}/build.txt\"\n\
+                  dbLoadRecords(\"{d}/b.db\") > \"{d}/load.txt\"\n\
                   save_restoreSet_Debug(2)\n\
                   set_pass0_restoreFile(\"p.sav\")\n\
-                  iocInit > {d}/init.txt\n\
+                  iocInit > \"{d}/init.txt\"\n\
                   save_restoreSet_Debug(0)\n";
     let [build, load, init] = <[_; 3]>::try_from(redirected(
         &files,
@@ -142,19 +142,19 @@ fn the_command_lines_follow_the_redirect() {
     ];
     let script = "dbLoadRecords(\"{d}/a.db\")\n\
                   save_restoreSet_Debug(20)\n\
-                  set_savefile_path(\"{d}\") > {d}/path.txt\n\
+                  set_savefile_path(\"{d}\") > \"{d}/path.txt\"\n\
                   set_requestfile_path(\"{d}\")\n\
                   save_restoreSet_DatedBackupFiles(0)\n\
-                  save_restoreSet_FilePermissions(0644) > {d}/perm.txt\n\
-                  save_restoreSet_CallbackTimeout(3) > {d}/timeout.txt\n\
+                  save_restoreSet_FilePermissions(0644) > \"{d}/perm.txt\"\n\
+                  save_restoreSet_CallbackTimeout(3) > \"{d}/timeout.txt\"\n\
                   save_restoreSet_Debug(0)\n\
                   iocInit\n\
                   save_restoreSet_Debug(20)\n\
-                  create_manual_set(\"x.req\") > {d}/create.txt\n\
+                  create_manual_set(\"x.req\") > \"{d}/create.txt\"\n\
                   epicsThreadSleep 1\n\
-                  fdbrestore(\"m.sav\") > {d}/restore.txt\n\
+                  fdbrestore(\"m.sav\") > \"{d}/restore.txt\"\n\
                   epicsThreadSleep 2\n\
-                  manual_save(\"x.req\") > {d}/save.txt\n\
+                  manual_save(\"x.req\") > \"{d}/save.txt\"\n\
                   epicsThreadSleep 2\n\
                   save_restoreSet_Debug(0)\n";
     let [path, perm, timeout, create, restore, save] = <[_; 6]>::try_from(redirected(
@@ -229,7 +229,7 @@ fn the_config_menu_line_follows_the_redirect() {
                   set_savefile_path(\"{d}/none\")\n\
                   iocInit\n\
                   dbpf LIST.A X\n\
-                  dbpf LIST.PROC 1 > {d}/list.txt\n";
+                  dbpf LIST.PROC 1 > \"{d}/list.txt\"\n";
     let [list] =
         <[_; 1]>::try_from(redirected(&[("list.db", &db)], script, &["list.txt"])).unwrap();
     assert_eq!(
@@ -246,8 +246,8 @@ fn the_config_menu_line_follows_the_redirect() {
 /// nfs_utils.c:27 and :91.
 #[test]
 fn the_nfs_lines_follow_the_redirect() {
-    let script = "save_restoreSet_NFSHost(\"h\", \"1.2.3.4\", \"\") > {d}/none.txt\n\
-                  save_restoreSet_NFSHost(\"h\", \"1.2.3.4\", \"/mnt/x\") > {d}/mount.txt\n";
+    let script = "save_restoreSet_NFSHost(\"h\", \"1.2.3.4\", \"\") > \"{d}/none.txt\"\n\
+                  save_restoreSet_NFSHost(\"h\", \"1.2.3.4\", \"/mnt/x\") > \"{d}/mount.txt\"\n";
     let [none, mount] =
         <[_; 2]>::try_from(redirected(&[], script, &["none.txt", "mount.txt"])).unwrap();
     assert_eq!(

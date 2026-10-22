@@ -2600,13 +2600,16 @@ mod tests {
     /// C ignores `tcdrain`'s return before the break (:519) and words the
     /// `tcsendbreak` failure itself (:521-524); C `flushIt` ignores `tcflush`'s
     /// and returns asynSuccess (:997, :1000). `/dev/null` is open but no tty, so
-    /// all three calls fail with ENOTTY.
+    /// all three calls fail, with the errno the OS gives (Linux ENOTTY, Darwin
+    /// ENODEV).
     #[test]
     fn break_and_flush_on_a_non_tty_answer_as_c() {
         let mut drv = DrvAsynSerialPort::new("s_notty", "/dev/null").unwrap();
         let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
         assert!(fd >= 0, "could not open /dev/null");
         drv.io.fd = Some(fd);
+        assert!(unsafe { platform::tcsendbreak(fd, 0) } < 0);
+        let why = strerror(&std::io::Error::last_os_error());
 
         let err = drv
             .set_option(&mut AsynUser::default(), "break", "on")
@@ -2614,7 +2617,7 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
         assert_eq!(
             err.message(),
-            "/dev/null tcsendbreak failed: Inappropriate ioctl for device"
+            format!("/dev/null tcsendbreak failed: {why}")
         );
         drv.io_flush(&mut AsynUser::default())
             .expect("C flushIt returns asynSuccess whatever tcflush says");

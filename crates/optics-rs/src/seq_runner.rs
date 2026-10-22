@@ -20,16 +20,14 @@
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
 
-use epics_base_rs::runtime::stdlib::{c_isspace, strtod};
+use epics_base_rs::runtime::stdlib::c_isspace;
 use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::snl::{SeqMacros, seq, spawn_program};
 
 use crate::snl::filter_drive::FilterDriveConfig;
 use crate::snl::flex_combined_motion::FlexConfig;
-use crate::snl::hr_ctl::HrConfig;
 use crate::snl::io::IoConfig;
-use crate::snl::ml_mono_ctl::MlMonoConfig;
 use crate::snl::pf4::Pf4Config;
 
 // `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
@@ -55,8 +53,6 @@ fn scan_int(s: &str) -> i32 {
 
 /// An optics program, configured from its macros as its `.st` reads them.
 enum Program {
-    HrCtl(HrConfig),
-    MlMonoCtl(MlMonoConfig),
     FilterDrive(FilterDriveConfig),
     Pf4(Pf4Config),
     Io(IoConfig),
@@ -69,30 +65,6 @@ impl Program {
     fn new(program: &str, macro_def: &str) -> Result<(Self, SeqMacros), String> {
         let macros = |params| SeqMacros::new(params, macro_def);
         Ok(match program {
-            "hrCtl" => {
-                let m = macros("P=xxx:, N=1, M_PHI1=m9, M_PHI2=m10");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::HrCtl(HrConfig::new(v("P"), v("N"), v("M_PHI1"), v("M_PHI2"))),
-                    m,
-                )
-            }
-            "ml_monoCtl" => {
-                let m =
-                    macros("P=xxx:, M_THETA=m9, M_THETA2=m12, M_Y=m10, M_Z=m11, Y_OFF=35, GEOM=1");
-                let v = |name| m.value(name).unwrap_or_default();
-                (
-                    Self::MlMonoCtl(MlMonoConfig::new(
-                        v("P"),
-                        v("M_THETA"),
-                        v("M_THETA2"),
-                        v("M_Y"),
-                        v("M_Z"),
-                        strtod(v("Y_OFF").as_bytes()).value,
-                    )),
-                    m,
-                )
-            }
             "filterDrive" => {
                 let m = macros("NAME=filterDrive, P=TEST:, R=filter:, NUM_FILTERS=8");
                 let v = |name| m.value(name).unwrap_or_default();
@@ -136,12 +108,6 @@ impl Program {
 
     fn spawn(self, macros: &SeqMacros, bridge: &BlockingBridge, db: &PvDatabase) {
         match self {
-            Self::HrCtl(config) => spawn_program(bridge, db, "hrCtl", macros, move |db| {
-                crate::snl::hr_ctl::run(config, db)
-            }),
-            Self::MlMonoCtl(config) => spawn_program(bridge, db, "ml_monoCtl", macros, move |db| {
-                crate::snl::ml_mono_ctl::run(config, db)
-            }),
             Self::FilterDrive(config) => {
                 spawn_program(bridge, db, "filterDrive", macros, move |db| {
                     crate::snl::filter_drive::run(config, db)
@@ -204,28 +170,52 @@ pub fn seq_start(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::records::busy::BusyRecord;
 
     use super::*;
+
+    /// `records` and the shipped `db`, past `iocInit`'s PINI pass. snc builds
+    /// `+c` by default, so a program starts only once every channel it
+    /// assigns has connected: the database must hold all of them.
+    async fn ioc(records: &str, db: &str, macros: &[(&str, &str)]) -> Arc<PvDatabase> {
+        let macros: HashMap<String, String> = macros
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (db, _) = IocBuilder::new()
+            .register_record_type("busy", || Box::new(BusyRecord::default()))
+            .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))
+            .db_string(records, &macros)
+            .unwrap()
+            .db_file(&format!("{}/db/{db}", env!("CARGO_MANIFEST_DIR")), &macros)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        db.mark_pini_done();
+        db
+    }
+
+    /// `ml_monoSeq.db` under `P=Y:`, with the `th` the tests pass as
+    /// `M_THETA` and the program's default `m12`, `m10` and `m11` motors.
+    async fn ml_mono_ioc() -> Arc<PvDatabase> {
+        ioc(
+            "record(motor, \"Y:th\") {}\nrecord(motor, \"Y:m12\") {}\n\
+             record(motor, \"Y:m10\") {}\nrecord(motor, \"Y:m11\") {}\n",
+            "ml_monoSeq.db",
+            &[("P", "Y:")],
+        )
+        .await
+    }
 
     /// With no macros at all, each program reads what its `.st`'s `program`
     /// statement defines.
     #[test]
     fn every_program_configures_on_its_program_defaults() {
-        let Ok((Program::HrCtl(c), _)) = Program::new("hrCtl", "") else {
-            panic!("hrCtl")
-        };
-        assert_eq!(
-            [&c.prefix, &c.n, &c.m_phi1, &c.m_phi2],
-            ["xxx:", "1", "m9", "m10"]
-        );
-        let Ok((Program::MlMonoCtl(c), _)) = Program::new("ml_monoCtl", "") else {
-            panic!("ml_monoCtl")
-        };
-        assert_eq!(
-            [&c.prefix, &c.m_theta, &c.m_theta2, &c.m_y, &c.m_z],
-            ["xxx:", "m9", "m12", "m10", "m11"]
-        );
-        assert_eq!(c.y_offset, 35.0);
         let Ok((Program::FilterDrive(c), _)) = Program::new("filterDrive", "") else {
             panic!("filterDrive")
         };
@@ -259,17 +249,10 @@ mod tests {
         );
     }
 
-    /// A macro's text converted as the `.st` converts it: Y_OFF by `atof`
-    /// (`ml_monoCtl.st:523`), NUM_FILTERS by `%d` (`filterDrive.st:341`).
+    /// A macro's text converted as the `.st` converts it: NUM_FILTERS by `%d`
+    /// (`filterDrive.st:341`).
     #[test]
     fn macro_text_converts_as_the_st_reads_it() {
-        let y_off = |def| match Program::new("ml_monoCtl", def) {
-            Ok((Program::MlMonoCtl(c), _)) => c.y_offset,
-            _ => panic!("ml_monoCtl"),
-        };
-        assert_eq!(y_off("Y_OFF=40mm"), 40.0);
-        assert_eq!(y_off("Y_OFF= 4e1"), 40.0);
-        assert_eq!(y_off("Y_OFF=mm"), 35.0);
         let filters = |def| match Program::new("filterDrive", def) {
             Ok((Program::FilterDrive(c), _)) => c.num_filters,
             _ => panic!("filterDrive"),
@@ -405,14 +388,7 @@ mod tests {
     /// then holds and nothing overwrites it.
     #[epics_base_rs::epics_test]
     async fn ml_mono_takes_its_y_offset_from_y_off() {
-        let db = PvDatabase::new();
-        db.add_record(
-            "Y:ml_mono_yOffset",
-            Box::new(epics_base_rs::server::records::ao::AoRecord::new(0.0)),
-        )
-        .await
-        .unwrap();
-        db.mark_pini_done();
+        let db = ml_mono_ioc().await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
         for _ in 0..300 {
@@ -428,14 +404,7 @@ mod tests {
     /// (`ml_monoCtl.st:1`), which initSequence names in `{P}ml_monoTheta2Pv`.
     #[epics_base_rs::epics_test]
     async fn ml_mono_theta2_motor_defaults_to_m12() {
-        let db = PvDatabase::new();
-        db.add_record(
-            "Y:ml_monoTheta2Pv",
-            Box::new(epics_base_rs::server::records::stringin::StringinRecord::new("")),
-        )
-        .await
-        .unwrap();
-        db.mark_pini_done();
+        let db = ml_mono_ioc().await;
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th", &bridge, &db).unwrap();
         for _ in 0..300 {

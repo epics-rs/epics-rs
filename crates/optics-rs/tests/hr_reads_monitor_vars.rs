@@ -1,13 +1,15 @@
 //! hrCtl reads autoMode as C's monitored variable, written as the monitor
 //! arrives (hrCtl.st:64-66, no efflag).
 
-use epics_base_rs::runtime::task::{self, BlockingBridge};
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
+use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
-use optics_rs::snl::hr_ctl::{self, HrConfig};
+use epics_seq_rs::seq;
+use optics_rs::snl::hr_ctl::hrCtl;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +32,7 @@ async fn string_of(ioc: &PvDatabase, pv: &str) -> String {
     }
 }
 
-async fn boot() -> Arc<PvDatabase> {
+async fn boot() -> (Arc<PvDatabase>, ScanOwner) {
     let macros: HashMap<String, String> =
         [("P", "H:"), ("N", "1"), ("M_PHI1", "p1"), ("M_PHI2", "p2")]
             .into_iter()
@@ -47,6 +49,9 @@ async fn boot() -> Arc<PvDatabase> {
         .await
         .unwrap()
         .0;
+    // iocInit's PINI pass, which the program's start waits for.
+    let scan = ScanOwner::start(ioc.clone());
+    ioc.wait_for_pini().await;
     let db = PvDatabase::clone(&ioc);
     for name in ["H:p1", "H:p2"] {
         db.get_record(name)
@@ -59,14 +64,14 @@ async fn boot() -> Arc<PvDatabase> {
             .pos
             .rbv = 200_000.0;
     }
-    BlockingBridge::capture().spawn(hr_ctl::run(HrConfig::new("H:", "1", "p1", "p2"), db));
+    seq(&hrCtl, "P=H:, N=1, M_PHI1=p1, M_PHI2=p2", 0, &db).expect("hrCtl starts");
     // The boot phiLimits pass: theta1Hi = HLM in degrees.
     wait_near(&ioc, "H:HR1_Theta1AO.DRVH", 1.5e6 * UR2D).await;
     assert_eq!(
         string_of(&ioc, "H:HR1_SeqMsg1SI").await,
         "Motor Soft Limit Changed"
     );
-    ioc
+    (ioc, scan)
 }
 
 /// Return with the sequencer idle after an enter. An ack posted during a
@@ -117,7 +122,7 @@ fn post(db: &PvDatabase, pv: &str, v: EpicsValue) {
 /// though E is taken before Mode.
 #[epics_base_rs::epics_test]
 async fn an_e_put_queued_after_auto_mode_moves() {
-    let ioc = boot().await;
+    let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     let e = f64_of(&ioc, "H:HR1_EAO").await;
     let before = f64_of(&ioc, "H:p1.VAL").await;
@@ -155,7 +160,7 @@ async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
 /// Use derives them again from the motor HLM/LLM.
 #[epics_base_rs::epics_test]
 async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
-    let ioc = boot().await;
+    let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     let put = |pv: &'static str, v: EpicsValue| {
         let db = db.clone();
@@ -191,7 +196,7 @@ async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
 /// oracle: "Wavelength > 2d spacing of crystal 1.", E back from theta1).
 #[epics_base_rs::epics_test]
 async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
-    let ioc = boot().await;
+    let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     // The oracle's limits, which leave ELo negative.
     for (rec, field, v) in [
@@ -224,7 +229,7 @@ async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
 /// command pass (hrCtl.st:1511-1533).
 #[epics_base_rs::epics_test]
 async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
-    let ioc = boot().await;
+    let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     post(&db, "H:p1", EpicsValue::Double(300_000.0));
     post(&db, "H:p2", EpicsValue::Double(400_000.0));
@@ -294,7 +299,7 @@ async fn debug_prints_c_lines() {
         );
         return;
     }
-    let ioc = boot().await;
+    let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
     post(&db, "H:HR1CtlDebug", EpicsValue::Long(1));

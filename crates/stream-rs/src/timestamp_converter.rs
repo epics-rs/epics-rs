@@ -791,14 +791,14 @@ mod ctime {
     unsafe extern "C" {
         fn tzset();
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     unsafe extern "C" {
         #[link_name = "timezone"]
         static TIMEZONE: libc::c_long;
     }
 
     /// `tzset(); timezone`: seconds west of UTC, standard time.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     pub fn timezone() -> i32 {
         // SAFETY: tzset takes no argument; timezone is the C library's
         // global it sets.
@@ -808,17 +808,34 @@ mod ctime {
         }
     }
 
-    /// `tzset(); timezone`, from `tm_gmtoff` as C does on the BSDs; C's
-    /// BSD branch keeps tm_gmtoff's sign, east positive, which is the
+    /// `tzset(); timezone` without a `timezone` global. C's BSD branch
+    /// takes today's tm_gmtoff, DST included and east positive, the
     /// reverse of timezone's.
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
     pub fn timezone() -> i32 {
         // SAFETY: tzset takes no argument.
         unsafe { tzset() };
-        let t = now();
-        let half_year = 183 * 86400;
-        let (a, b) = (localtime(t), localtime(t + half_year));
-        let standard = if a.tm_isdst > 0 { b } else { a };
+        standard_west(now())
+    }
+
+    /// Seconds west of UTC from the `tm_gmtoff` of a standard-time instant
+    /// in the year from `t`; `t` and half a year on can both be summer
+    /// time, as late October and late April are in Europe.
+    #[cfg(all(
+        unix,
+        any(
+            test,
+            not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+        )
+    ))]
+    pub fn standard_west(t: libc::time_t) -> i32 {
+        let standard = (0..12)
+            .map(|month: libc::time_t| localtime(t + month * 30 * 86400))
+            .find(|tm| tm.tm_isdst == 0)
+            .unwrap_or_else(|| localtime(t));
         -(standard.tm_gmtoff as i32)
     }
 
@@ -865,5 +882,20 @@ mod tests {
         assert_eq!(scan_today(1689336000, b"%H:%M", b"12:30"), 1689330600.0);
         // The day is kept, the rest of today is not.
         assert_eq!(scan_today(1700000000, b"%M", b"5"), 1699916700.0);
+    }
+
+    /// The standard time taken from tm_gmtoff is the C library's
+    /// `timezone` on every day of a year, 2026-10-22 CEST included.
+    #[cfg(unix)]
+    #[test]
+    fn standard_west_is_timezone_all_year() {
+        // SAFETY: as in scan_today.
+        unsafe { std::env::set_var("TZ", "CET-1CEST,M3.5.0,M10.5.0/3") };
+        let west = ctime::timezone();
+        assert_eq!(west, -3600);
+        for day in 0..366 {
+            let t = 1767222000 + day * 86400;
+            assert_eq!(ctime::standard_west(t), west, "{t}");
+        }
     }
 }

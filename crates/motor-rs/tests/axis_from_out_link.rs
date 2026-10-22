@@ -793,6 +793,13 @@ record(calc, "N:n") { field(CALC, "A+1") field(INPA, "N:n NPP") }
     )
     .await;
     db.scan_control().run();
+    // The init writes' callbacks print after the boot returns.
+    for _ in 0..1000 {
+        if trace.text().matches("asynCallback").count() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     // init_record's line has no newline in C, so the next print runs on.
     assert_eq!(
@@ -888,6 +895,17 @@ record(motor, "SR:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(STOPRD,0)") f
     db.put_record_field_from_ca("SR:m", "STOP", EpicsValue::Short(1))
         .await
         .unwrap();
+    // The stop's MOTOR_ACCEL read prints on the poller thread.
+    for _ in 0..1000 {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if text
+            .lines()
+            .any(|l| l.contains("getDoubleParam") && l.contains("MOTOR_ACCEL"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -949,6 +967,17 @@ record(motor, "PR:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(PARAMRD,0)") 
     db.put_record_field_from_ca("PR:m", "STOP", EpicsValue::Short(1))
         .await
         .unwrap();
+    // The stop's MOTOR_ACCEL read prints on the poller thread.
+    for _ in 0..1000 {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if text
+            .lines()
+            .any(|l| l.contains("getDoubleParam") && l.contains("MOTOR_ACCEL"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);

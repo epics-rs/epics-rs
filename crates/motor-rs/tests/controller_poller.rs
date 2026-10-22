@@ -19,6 +19,15 @@ type Log = Arc<Mutex<Vec<(&'static str, Instant)>>>;
 const SLOW: Duration = Duration::from_millis(40);
 const PERIOD: Duration = Duration::from_millis(5);
 
+/// Waits for `done`: a slow host's timers reach it late, never not at all.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 struct Axis {
     name: &'static str,
     log: Log,
@@ -79,7 +88,7 @@ async fn run_controller() -> Vec<(&'static str, Instant)> {
         senders.push(poll_cmd_tx);
     }
     let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
-    tokio::time::sleep(SLOW * 4).await;
+    until("two passes", || log.lock().unwrap().len() >= 6).await;
     senders[1].send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
     log.lock().unwrap().clone()
@@ -277,7 +286,7 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
     };
     let a1 = controller.axis(Arc::new(Mutex::new(watching)), user(1));
     let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
-    tokio::time::sleep(PERIOD * 8).await;
+    until("three passes", || seen.lock().unwrap().len() >= 3).await;
     a1.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
     drop(a0);
@@ -337,7 +346,7 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
         .send(PollCommand::Wakeup)
         .await
         .unwrap();
-    tokio::time::sleep(PERIOD * 4).await;
+    until("the woken pass", || names(&log).len() >= 5).await;
     assert_eq!(names(&log), ["C", "C", "A0", "A1", "A2"]);
     joined[0]
         .poll_cmd_tx
@@ -421,17 +430,18 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
         motor_rs::devices::register_axis(m1.axis.clone()).unwrap();
         (m0, record)
     };
+    let axes = controller.axes();
     let idle = Duration::from_secs(60);
     let poller = tokio::spawn(controller.build(idle, idle, 0).start());
-    tokio::time::sleep(PERIOD * 4).await;
+    until("the startup pass", || axes.first_polls_pending() == 0).await;
     tokio::task::spawn_blocking(move || port.write_float64_blocking(index::MOVE_ABS, 1, 3.0))
         .await
         .unwrap()
         .unwrap();
-    tokio::time::sleep(PERIOD * 4).await;
+    until("the woken pass", || seen.lock().unwrap().len() >= 2).await;
     // m0 once more: every post m1's records had by now.
     m0.0.poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
-    tokio::time::sleep(PERIOD * 4).await;
+    until("the forced poll", || seen.lock().unwrap().len() >= 3).await;
     m0.0.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
     let seen = seen.lock().unwrap().clone();
@@ -829,9 +839,11 @@ async fn a_failed_poll_reporting_moving_keeps_the_moving_period() {
     let poller = controller
         .build(PERIOD, Duration::from_secs(3600), 0)
         .start();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let polls = log.lock().unwrap().len();
-    assert!(polls > 5, "{polls} polls in 200 ms at a 5 ms moving period");
+    // The hour-long idle period would poll once in the 10 s this allows.
+    until("polls at the 5 ms moving period", || {
+        log.lock().unwrap().len() > 5
+    })
+    .await;
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -970,6 +982,14 @@ impl AsynMotor for Bailing {
     }
 }
 
+/// The processes `reads` sees: the first, then any other in PERIOD * 8 of
+/// polls after it.
+async fn processes(reads: &passes::Reads) -> usize {
+    let first = reads.wait(Duration::from_secs(10)).await.len();
+    tokio::time::sleep(PERIOD * 8).await;
+    first + reads.take().len()
+}
+
 /// What a bailing poll set raises statusChanged_ (asynMotorAxis.cpp:
 /// 255-264). A port write that runs no axis method still ends in
 /// pAxis->callParamCallbacks(), which posts it (asynMotorController.cpp:246).
@@ -995,10 +1015,8 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
     let reads = passes::bind_support(&mut record, None);
     motor_rs::devices::register_axis(m.axis.clone()).unwrap();
     let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
-    let processes = || reads.take().len();
-    tokio::time::sleep(PERIOD * 8).await;
     assert_eq!(
-        processes(),
+        processes(&reads).await,
         1,
         "only the startup poll, which the constructor raised, posts"
     );
@@ -1006,8 +1024,7 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::sleep(PERIOD * 8).await;
-    assert_eq!(processes(), 1);
+    assert_eq!(processes(&reads).await, 1);
     m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
 }
@@ -1016,6 +1033,7 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
 struct LateFirstPoll {
     bails: u32,
     constructor_calls_back: bool,
+    polls: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AsynMotor for LateFirstPoll {
@@ -1038,6 +1056,7 @@ impl AsynMotor for LateFirstPoll {
         PollFailure::NONE
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.bails > 0 {
             self.bails -= 1;
             return Err(asyn_rs::error::AsynError::Status {
@@ -1063,9 +1082,11 @@ async fn the_first_poll_to_call_back_posts_unless_the_constructor_did() {
     use epics_base_rs::server::device_support::DeviceSupport;
     for (constructor_calls_back, posts) in [(false, 1), (true, 0)] {
         let mut controller = ControllerBuilder::new();
+        let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let motor = LateFirstPoll {
             bails: 2,
             constructor_calls_back,
+            polls: polls.clone(),
         };
         let m = controller.axis(
             Arc::new(Mutex::new(motor)),
@@ -1078,7 +1099,11 @@ async fn the_first_poll_to_call_back_posts_unless_the_constructor_did() {
         record.bind_dev_sup_gate(&InterruptGate::opened());
         let reads = passes::bind_support(&mut record, None);
         let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).start());
-        tokio::time::sleep(PERIOD * 12).await;
+        // The poll after the one that calls back, which its post precedes.
+        until("four polls", || {
+            polls.load(std::sync::atomic::Ordering::SeqCst) >= 4
+        })
+        .await;
         m.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
         poller.await.unwrap();
         let processes = reads.take().len();

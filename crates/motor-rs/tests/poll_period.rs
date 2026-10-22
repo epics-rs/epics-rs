@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
@@ -50,10 +50,30 @@ fn context() -> CommandContext {
     )
 }
 
-/// Start a poller on `port` with hour-long periods and `forced` fast polls,
-/// run `cmd` on it with a 10 ms period, and return the polls the next
-/// 300 ms make.
-fn polls_after(port: &str, forced: u32, cmd: CommandDef) -> usize {
+/// Once `count` shows the startup pass, runs `cmd` on `port`'s poller with a
+/// 10 ms period and waits for ten more: the hour-long period it replaces
+/// makes one, the wakeup's, in the 10 s this allows.
+fn ten_after(port: &str, cmd: CommandDef, count: &AtomicUsize) {
+    let reach = |n: usize, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count.load(Ordering::Relaxed) < n {
+            assert!(
+                Instant::now() < deadline,
+                "{} of {n} {what}",
+                count.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    reach(1, "before the command");
+    let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
+    cmd.handler.call(&args, &context()).unwrap();
+    reach(count.load(Ordering::Relaxed) + 10, "after the command");
+}
+
+/// Start a poller on `port` with hour-long periods and `forced` fast polls
+/// and run `cmd` on it.
+fn polls_after(port: &str, forced: u32, cmd: CommandDef) {
     register_controller_port(&open_owner(), port, 1, ()).unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
     let mut controller = ControllerBuilder::new().port(port);
@@ -69,20 +89,13 @@ fn polls_after(port: &str, forced: u32, cmd: CommandDef) -> usize {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
     rt.spawn(controller.build(hour, hour, forced).start());
-    // The startup pass.
-    std::thread::sleep(Duration::from_millis(100));
-    let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
-    cmd.handler.call(&args, &context()).unwrap();
-    let before = polls.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(300));
-    polls.load(Ordering::Relaxed) - before
+    ten_after(port, cmd, &polls);
 }
 
 #[test]
 fn set_idle_poll_period_paces_an_idle_poller() {
     let cmd = motor_rs::ioc::set_idle_poll_period_command();
-    let polls = polls_after("POLLIDLE", 0, cmd);
-    assert!(polls >= 10, "{polls} polls");
+    polls_after("POLLIDLE", 0, cmd);
 }
 
 /// The wakeup reloads the forced fast polls, which run at the new moving
@@ -90,8 +103,7 @@ fn set_idle_poll_period_paces_an_idle_poller() {
 #[test]
 fn set_moving_poll_period_paces_the_forced_fast_polls() {
     let cmd = motor_rs::ioc::set_moving_poll_period_command();
-    let polls = polls_after("POLLMOVING", 1_000_000, cmd);
-    assert!(polls >= 10, "{polls} polls");
+    polls_after("POLLMOVING", 1_000_000, cmd);
 }
 
 /// C finds the controller by its port (findAsynPortDriver), so a
@@ -113,14 +125,7 @@ fn set_idle_poll_period_reaches_a_poller_with_no_axes() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
     rt.spawn(controller.build(hour, hour, 0).start());
-    std::thread::sleep(Duration::from_millis(100));
-    let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
-    let cmd = motor_rs::ioc::set_idle_poll_period_command();
-    cmd.handler.call(&args, &context()).unwrap();
-    let before = passes.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(300));
-    let passes = passes.load(Ordering::Relaxed) - before;
-    assert!(passes >= 10, "{passes} passes");
+    ten_after(port, motor_rs::ioc::set_idle_poll_period_command(), &passes);
 }
 
 /// A controller of one axis (MotorBuilder::build_axis, motor-common's
@@ -144,12 +149,5 @@ fn set_idle_poll_period_reaches_a_one_axis_controller() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter();
     rt.spawn(setup.poll_loop.start());
-    std::thread::sleep(Duration::from_millis(100));
-    let args = [ArgValue::String(port.into()), ArgValue::Double(0.01)];
-    let cmd = motor_rs::ioc::set_idle_poll_period_command();
-    cmd.handler.call(&args, &context()).unwrap();
-    let before = polls.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(300));
-    let polls = polls.load(Ordering::Relaxed) - before;
-    assert!(polls >= 10, "{polls} polls");
+    ten_after(port, motor_rs::ioc::set_idle_poll_period_command(), &polls);
 }

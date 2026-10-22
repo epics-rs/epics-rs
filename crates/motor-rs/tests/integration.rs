@@ -372,20 +372,23 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
 
     poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
 
-    // Give any erroneous busy-spin a 100ms window to accumulate polls.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // seq starts at 1 (init), +1 for the startup pass's post of its changed
     // status to the record already bound (asynMotorController.cpp:630,
     // asynMotorAxis.cpp:318-320), +1 for the single ForcePoll poll → 3.
     // A busy-spin would drive it into the hundreds/thousands.
-    let seq = device_state
-        .lock()
-        .unwrap()
-        .latest_status
-        .as_ref()
-        .map(|s| s.seq)
-        .unwrap_or(0);
+    let seq = || {
+        device_state
+            .lock()
+            .unwrap()
+            .latest_status
+            .as_ref()
+            .map(|s| s.seq)
+            .unwrap_or(0)
+    };
+    assert!(wait_until(Duration::from_secs(10), || seq() >= 3).await);
+    // Give any erroneous busy-spin a 100ms window to accumulate polls.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seq = seq();
     assert_eq!(
         seq, 3,
         "zero idle interval must poll once on ForcePoll then block (event-only), got seq {seq}"
@@ -445,6 +448,7 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
     // (asynMotorController.cpp:630, asynMotorAxis.cpp:318-320; seq 1→2);
     // ForcePoll forces one more → 3.
     poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 3).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         seq(&device_state),
@@ -455,6 +459,7 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
     // A second ForcePoll is a FORCED poll → re-posts even though the status
     // is byte-identical → seq 3→4.
     poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 4).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         seq(&device_state),
@@ -1551,15 +1556,17 @@ async fn the_axis_polls_with_no_record_request() {
         0,
     );
     let poll_handle = tokio::spawn(poll_loop.start());
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    reads.take();
+    assert!(
+        !reads.wait(Duration::from_secs(10)).await.is_empty(),
+        "the startup pass's post"
+    );
 
     motor
         .lock()
         .unwrap()
         .move_absolute(&asyn_rs::user::AsynUser::new(0), 0.2, 0.0, 100.0, 100.0)
         .unwrap();
-    let posted = reads.wait(Duration::from_millis(500)).await;
+    let posted = reads.wait(Duration::from_secs(10)).await;
     assert!(!posted.is_empty(), "a timed poll saw the move");
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
@@ -1656,9 +1663,11 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
     let settled = |n: usize| {
         let polls = polls.clone();
         async move {
+            let seen = || polls.load(Ordering::SeqCst);
+            assert!(wait_until(Duration::from_secs(10), || seen() >= n).await);
+            // Past any forced fast poll still to come, 10 ms apart.
             tokio::time::sleep(Duration::from_millis(400)).await;
-            let seen = polls.load(Ordering::SeqCst);
-            assert_eq!(seen, n, "polls so far");
+            assert_eq!(seen(), n, "polls so far");
         }
     };
     // Startup: the startup poll and its 5 forced fast polls.

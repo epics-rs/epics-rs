@@ -392,8 +392,10 @@ fn a_pass_blocked_on_a_deferred_move_release_polls_after_its_done_0() {
     std::thread::sleep(Duration::from_millis(200));
     release_tx.send(()).unwrap();
     writer.join().unwrap().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(done(3), "DONE=0 after the forced poll's done=1");
+    assert!(
+        eventually(|| done(3)),
+        "DONE=0 after the forced poll's done=1"
+    );
 }
 
 /// One poll that sets OWN on its own address twice, first as a port set

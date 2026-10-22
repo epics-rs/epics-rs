@@ -1911,6 +1911,7 @@ impl asyn_rs::interfaces::motor::AsynMotor for Servoed {
 #[derive(Default)]
 struct Servo {
     reason: usize,
+    entered: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ControllerParams for Servo {
@@ -1928,6 +1929,8 @@ impl ControllerParams for Servo {
         if user.reason != self.reason {
             return ParamWrite::PassToBase(Ok(()));
         }
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(200));
         ParamWrite::Handled(user.run(base, MotorCommand::SetClosedLoop { enable: value != 0 }))
     }
@@ -1941,7 +1944,12 @@ fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
     use motor_rs::poll_loop::{MotorPollLoop, PollerInbox};
     use motor_rs::trace::MotorTrace;
     let name = "CPQUEUE";
-    let port = register_controller_port(&open_owner(), name, 1, Servo::default()).unwrap();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let servo = Servo {
+        entered: entered.clone(),
+        ..Servo::default()
+    };
+    let port = register_controller_port(&open_owner(), name, 1, servo).unwrap();
     let reason = BASE_PARAMS.len();
     let (poll_tx, poll) = mpsc::channel(4);
     let (motor_tx, commands) = mpsc::unbounded_channel();
@@ -1974,7 +1982,12 @@ fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
         let port = port.clone();
         std::thread::spawn(move || port.write_int32_blocking(reason, 0, 1))
     };
-    std::thread::sleep(Duration::from_millis(50));
+    // The move below runs while the write holds the axis.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(std::time::Instant::now() < deadline, "the write never ran");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     motor_tx
         .send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
             trace: Arc::new(MotorTrace::with_user(user)),

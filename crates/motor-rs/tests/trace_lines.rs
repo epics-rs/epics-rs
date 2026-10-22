@@ -521,6 +521,16 @@ async fn status_callback_and_update_values_print_under_traceio_device() {
         .unwrap();
     let db = Arc::clone(ioc.database());
     assert!(ioc.run().await);
+    // The boot's line, then 200 ms for any after it.
+    for _ in 0..1000 {
+        if std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("needUpdate=1")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let booted = std::fs::read_to_string(&path).unwrap().len();
     db.put_record_field_from_ca("TL:m", "VAL", EpicsValue::Double(0.1))

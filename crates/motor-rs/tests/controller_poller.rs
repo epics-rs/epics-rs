@@ -28,6 +28,15 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// [`until`] on a thread that may block.
+fn until_blocking(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 struct Axis {
     name: &'static str,
     log: Log,
@@ -162,11 +171,10 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
     let poller = tokio::spawn(controller.build(idle, idle, 0).start());
     // The startup pass runs on the poller thread and would poll A0 or not
     // by when the add lands, as C's may: add after it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while axes.first_polls_pending() > 0 {
-        assert!(Instant::now() < deadline, "the startup pass never ended");
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    until("the startup pass never ended", || {
+        axes.first_polls_pending() == 0
+    })
+    .await;
     let (motor, user) = axis("A0", 0);
     // Held: a dropped axis ends the poller.
     let _a0 = tokio::task::spawn_blocking(move || axes.add(motor, user))
@@ -176,11 +184,10 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
     let joined = log.lock().unwrap().len();
     for pass in 1..=2 {
         poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while log.lock().unwrap().len() < joined + 3 * pass {
-            assert!(Instant::now() < deadline, "pass {pass} never ran");
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        until(&format!("pass {pass} never ran"), || {
+            log.lock().unwrap().len() >= joined + 3 * pass
+        })
+        .await;
     }
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
@@ -316,9 +323,7 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
         log.lock().unwrap().iter().map(|(name, _)| *name).collect()
     };
     // Created after the startup pass, not merely after the spawn.
-    while names(&log).is_empty() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    until("the startup pass", || !names(&log).is_empty()).await;
     let mut joined = Vec::new();
     for (addr, name) in ["A0", "A1", "A2"].into_iter().enumerate() {
         let motor = Axis {
@@ -518,11 +523,9 @@ async fn a_started_poller_is_pending_until_its_startup_pass_ends() {
     let idle = Duration::from_secs(3600);
     let poller = controller.build(idle, idle, 0).start();
     assert_eq!(axes.first_polls_pending(), 1);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while axes.first_polls_pending() > 0 {
-        assert!(Instant::now() < deadline, "the startup pass never ended");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    until_blocking("the startup pass never ended", || {
+        axes.first_polls_pending() == 0
+    });
     let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["A0", "A1"]);
     senders[1].send(PollCommand::Shutdown).await.unwrap();
@@ -555,11 +558,9 @@ async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
     let poller = controller.build(idle, idle, 0).start();
     let first = axes.clone();
     let settle = || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while first.first_polls_pending() > 0 {
-            assert!(Instant::now() < deadline, "a first poll never ran");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until_blocking("a first poll never ran", || {
+            first.first_polls_pending() == 0
+        })
     };
     settle();
     let (motor, user) = axis("A0", 0);
@@ -605,11 +606,9 @@ async fn an_axis_built_under_the_lock_is_polled_by_the_pass_that_waited() {
     let poller = controller.build(idle, idle, 0).start();
     let first = axes.clone();
     let settle = || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while first.first_polls_pending() > 0 {
-            assert!(Instant::now() < deadline, "a first poll never ran");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until_blocking("a first poll never ran", || {
+            first.first_polls_pending() == 0
+        })
     };
     settle();
     let (motor, user) = axis("B0", 0);
@@ -660,11 +659,9 @@ async fn no_pass_polls_between_two_builds_of_one_batch() {
     let poller = controller.build(idle, idle, 0).start();
     let first = axes.clone();
     let settle = || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while first.first_polls_pending() > 0 {
-            assert!(Instant::now() < deadline, "a first poll never ran");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until_blocking("a first poll never ran", || {
+            first.first_polls_pending() == 0
+        })
     };
     settle();
     let builds = [("C1", 1, "built C1"), ("C2", 2, "built C2")].map(|(name, addr, built)| {
@@ -728,11 +725,9 @@ async fn a_failed_build_ends_the_batch_and_keeps_the_axes_before_it() {
     let poller = controller.build(idle, idle, 0).start();
     let first = axes.clone();
     let settle = || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while first.first_polls_pending() > 0 {
-            assert!(Instant::now() < deadline, "a first poll never ran");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until_blocking("a first poll never ran", || {
+            first.first_polls_pending() == 0
+        })
     };
     settle();
     type Build = Box<dyn FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, ()), String> + Send>;
@@ -768,14 +763,9 @@ async fn a_failed_build_ends_the_batch_and_keeps_the_axes_before_it() {
         .unwrap()
         .unwrap();
     // C2's first poll ends before the pass reaches C3.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while log.lock().unwrap().len() < 9 {
-        assert!(
-            Instant::now() < deadline,
-            "the pass after the retry never ended"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    until_blocking("the pass after the retry never ended", || {
+        log.lock().unwrap().len() >= 9
+    });
     let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
     assert_eq!(
         names[..9],
@@ -874,11 +864,9 @@ async fn a_port_named_by_its_axis_counts_the_controllers_first_poll() {
     let poller = controller.build(idle, idle, 0).start();
     assert_eq!(axes.first_polls_pending(), 1);
     assert_eq!(first_polls_pending(port), Some(1));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while axes.first_polls_pending() > 0 {
-        assert!(Instant::now() < deadline, "the startup pass never ended");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    until_blocking("the startup pass never ended", || {
+        axes.first_polls_pending() == 0
+    });
     assert_eq!(first_polls_pending(port), Some(0));
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;

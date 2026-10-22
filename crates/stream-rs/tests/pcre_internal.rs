@@ -57,12 +57,13 @@ fn config_answers_as_c() {
                 )
             }
             ConfigValue::Long(l) => {
-                let c = c_long::from_ne_bytes(buf[..8].try_into().unwrap());
+                let c = c_long::from_ne_bytes(buf[..size_of::<c_long>()].try_into().unwrap());
                 assert_eq!(l as c_long, c, "{what}")
             }
             ConfigValue::Str(s) => {
                 assert!(s.is_none());
-                assert_eq!(usize::from_ne_bytes(buf[..8].try_into().unwrap()), 0)
+                let p = usize::from_ne_bytes(buf[..size_of::<usize>()].try_into().unwrap());
+                assert_eq!(p, 0)
             }
             ConfigValue::Int(_) => {}
         }

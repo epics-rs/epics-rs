@@ -35,15 +35,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
-  # for this workspace measures 91,635 MB here, against the ~86 GB an
-  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
-  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
-  # runner's own diagnostic log ("System.IO.IOException: No space left on
-  # device"), which also loses the job log, so the failure arrives with no
-  # output to read. `line-tables-only` keeps the file:line a backtrace is read
-  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # No debuginfo, not even line tables. The all-features test build on
+  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
+  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
+  # disk kills the runner's own diagnostic log, so the job log goes with it.
+  # Panics keep their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
   # This workflow never builds the RTEMS target, so the rustc-wrapper wired
   # in .cargo/config.toml (the has-thread-local spec rewrite — a pure
   # passthrough for host builds) has no role in any cell, and on Windows

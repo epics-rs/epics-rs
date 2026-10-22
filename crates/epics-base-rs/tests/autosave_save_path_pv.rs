@@ -101,20 +101,30 @@ async fn the_path_and_name_pvs_place_the_file() {
     assert_eq!(saved_a(&sav.join("sub/named.sav")).await, 3.0);
 }
 
-/// An absolute path PV is the directory itself (:2023).
+/// An absolute path PV is the directory itself (:2023). C reads the PV as
+/// one DBR_STRING (:2021), so the directory's path must fit in 39
+/// characters, which macOS's and Windows' own temp directories do not.
 #[epics_macros_rs::epics_test]
 async fn an_absolute_path_pv_is_the_directory() {
     let dir = tempfile::tempdir().unwrap();
     let sav = dir.path().join("sav");
-    let abs = dir.path().join("abs");
     std::fs::create_dir_all(&sav).unwrap();
-    std::fs::create_dir_all(&abs).unwrap();
+    #[cfg(unix)]
+    let root = std::path::PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let root = std::env::temp_dir()
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
+    let short = tempfile::tempdir_in(root).unwrap();
+    let abs = short.path();
     let db = db(abs.to_str().unwrap()).await;
     let mgr = manager(&sav, &[("SAVEPATHPV", "PP")]).await;
     let status = mgr.save_file_op(&db, "a.req", "", &sav.join("")).await;
     assert_eq!(status, 0);
     assert!(files(&sav).is_empty(), "{:?}", files(&sav));
-    assert_eq!(files(&abs), ["a.sav"]);
+    assert_eq!(files(abs), ["a.sav"]);
 }
 
 /// The oracle's `b.req`: EE "" wrote nothing, and its asVerify of ""

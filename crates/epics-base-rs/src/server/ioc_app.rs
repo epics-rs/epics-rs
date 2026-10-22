@@ -4252,7 +4252,7 @@ mod tests {
         assert!(matches!(
             shell.execute_line(format!(
                 "dbLoadGroup(\"/no/such/group.json\") 2> {}",
-                err.display()
+                crate::server::iocsh::script_token(&err)
             )),
             Ok(crate::server::iocsh::registry::CommandOutcome::Failed)
         ));

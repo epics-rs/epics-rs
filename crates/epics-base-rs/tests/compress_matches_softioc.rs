@@ -25,11 +25,11 @@ async fn compress_cycles_match_softioc_compressrecord_c_process() {
     let rs = std::thread::spawn(move || {
         let shell = IocShell::new(db, bridge);
         let out = tempfile::NamedTempFile::new().unwrap();
+        // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+        let token = out.path().display().to_string().replace('\\', "/");
         let mut rs = String::new();
         for line in CMDS.lines() {
-            shell
-                .execute_line(format!("{line} > {}", out.path().display()))
-                .unwrap();
+            shell.execute_line(format!("{line} > {token}")).unwrap();
             rs.push_str(&std::fs::read_to_string(out.path()).unwrap());
         }
         rs

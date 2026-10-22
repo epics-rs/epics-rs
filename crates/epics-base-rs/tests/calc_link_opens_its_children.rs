@@ -23,7 +23,8 @@ async fn child_script() {
 /// and each named file.
 fn run(db: &str, script: &str, names: &[&str]) -> (String, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
-    let d = dir.path().display().to_string();
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    let d = dir.path().display().to_string().replace('\\', "/");
     std::fs::write(format!("{d}/a.db"), db).unwrap();
     std::fs::write(
         format!("{d}/st.cmd"),

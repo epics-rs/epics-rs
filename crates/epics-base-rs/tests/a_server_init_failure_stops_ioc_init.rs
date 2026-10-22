@@ -30,7 +30,8 @@ fn mark(into: Arc<Mutex<Vec<String>>>) -> CommandDef {
 fn script(name: &str, lines: &[&str]) -> String {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write the script");
-    path.to_string_lossy().into_owned()
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[epics_macros_rs::epics_test]

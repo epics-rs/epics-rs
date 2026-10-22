@@ -21,7 +21,13 @@ async fn a_bad_calc_s_postfix_number_goes_to_the_dbpf_s_file() {
         .unwrap()
         .0;
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("c.txt").display().to_string();
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    let file = dir
+        .path()
+        .join("c.txt")
+        .display()
+        .to_string()
+        .replace('\\', "/");
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let line = format!("dbpf S.CALC \"1+\" > {file}");
     std::thread::spawn(move || IocShell::new(db, bridge).execute_line(line))

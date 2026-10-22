@@ -599,7 +599,10 @@ mod tests {
         let shell = crate::server::iocsh::IocShell::new(Arc::new(PvDatabase::new()), bridge);
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        let _ = shell.execute_line(format!("registryDump > {}", path.display()));
+        let _ = shell.execute_line(format!(
+            "registryDump > {}",
+            crate::server::iocsh::script_token(&path)
+        ));
         std::mem::forget(rt);
         let out = std::fs::read_to_string(&path).unwrap();
         // Everything after the section header. `split_once`, not `split`,

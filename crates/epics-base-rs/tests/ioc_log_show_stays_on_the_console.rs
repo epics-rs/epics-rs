@@ -22,7 +22,8 @@ async fn child_shell() {
         std::env::set_var("EPICS_IOC_LOG_PORT", port.to_string());
     }
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
-    let file = file.into_string().unwrap();
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    let file = file.into_string().unwrap().replace('\\', "/");
     std::thread::spawn(move || {
         let shell = IocShell::new(Arc::new(PvDatabase::new()), bridge);
         shell.execute_line("iocLogInit").unwrap();

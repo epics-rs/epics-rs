@@ -36,7 +36,8 @@ const PROMPT: &str = "epics> ";
 #[test]
 fn the_autoprint_prompt_hangs_on_the_console() {
     let dir = tempfile::tempdir().unwrap();
-    let d = dir.path().display().to_string();
+    // iocsh reads an unquoted `\` as an escape, as C `split()` does.
+    let d = dir.path().display().to_string().replace('\\', "/");
     std::fs::write(
         format!("{d}/a.db"),
         "record(ai, \"A\") {}\nrecord(ai, \"B\") { field(INP, \"A NPP\") }\n",

@@ -1964,6 +1964,16 @@ pub(crate) fn join_backslash_continuations(input: &[u8]) -> Vec<(usize, Vec<u8>)
     out
 }
 
+/// A path as an unquoted iocsh token. The arg scanner honors C's
+/// out-of-quote backslash escape, which would eat the separators of
+/// a native Windows path — forward slashes survive the scanner and
+/// every Windows API accepts them (what a real Windows st.cmd
+/// writes too).
+#[cfg(test)]
+pub(crate) fn script_token(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 #[cfg(test)]
 impl IocShell {
     /// `line > f` on this shell: what `f` got, and what reached C's raw
@@ -1982,7 +1992,7 @@ impl IocShell {
         let file = dir.path().join("f.txt");
         let console = dir.path().join("console.txt");
         let sink = std::fs::File::create(&console).unwrap();
-        let line = format!("{line} {fd}> {}", file.display());
+        let line = format!("{line} {fd}> {}", script_token(&file));
         let _ = match fd {
             1 => self
                 .ctx
@@ -2103,15 +2113,6 @@ mod tests {
         );
     }
 
-    /// A path as an unquoted iocsh token. The arg scanner honors C's
-    /// out-of-quote backslash escape, which would eat the separators of
-    /// a native Windows path — forward slashes survive the scanner and
-    /// every Windows API accepts them (what a real Windows st.cmd
-    /// writes too).
-    fn script_token(p: &std::path::Path) -> String {
-        p.display().to_string().replace('\\', "/")
-    }
-
     /// C gates redirect detection on `!quote && !backslash`
     /// (`iocsh.cpp:273`), so a `>` inside EITHER quote — or escaped —
     /// is data. The port saw only the double quote, so a `'`-quoted
@@ -2148,7 +2149,7 @@ mod tests {
 
         // Backslash half: C makes `echo a\>b` print `a>b`.
         let escaped = dir.path().join("escaped_target");
-        let line = format!("echo a\\>{}", escaped.display());
+        let line = format!("echo a\\>{}", script_token(&escaped));
         shell.execute_line(&line).expect("an escaped `>` is data");
         assert!(
             !escaped.exists(),
@@ -3032,7 +3033,7 @@ mod tests {
         // `scope.errored`). What must hold is that the recursion
         // TERMINATES and the scope stack unwinds.
         let path = dir.path().join("self.cmd");
-        std::fs::write(&path, format!("< {}\n", path.display())).unwrap();
+        std::fs::write(&path, format!("< {}\n", script_token(&path))).unwrap();
         shell
             .execute_script(path.display().to_string())
             .expect("the cap terminates the recursion; continue keeps ret 0");
@@ -3058,7 +3059,11 @@ mod tests {
         // (`iocsh.cpp:1233`). Carrying the message up is what used to print
         // it once per frame.
         let path3 = dir.path().join("self3.cmd");
-        std::fs::write(&path3, format!("on error break\n< {}\n", path3.display())).unwrap();
+        std::fs::write(
+            &path3,
+            format!("on error break\n< {}\n", script_token(&path3)),
+        )
+        .unwrap();
         let err = shell
             .execute_script(path3.display().to_string())
             .expect_err("break makes the cap's failure the script's result");
@@ -3078,7 +3083,7 @@ mod tests {
         let inner = dir.path().join("inner.cmd");
         std::fs::write(&inner, "#- inner\n").unwrap();
         let outer = dir.path().join("outer.cmd");
-        std::fs::write(&outer, format!("< {}\n", inner.display())).unwrap();
+        std::fs::write(&outer, format!("< {}\n", script_token(&inner))).unwrap();
         let outer_path = outer.display().to_string();
         shell
             .execute_script(&outer_path)
@@ -3156,7 +3161,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_dbl_redirect.txt");
-        let line = format!("dbl > {}", tmp.display());
+        let line = format!("dbl > {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         let content = std::fs::read_to_string(&tmp).unwrap();
@@ -3173,7 +3178,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_append.txt");
         std::fs::write(&tmp, "existing\n").unwrap();
-        let line = format!("dbl >> {}", tmp.display());
+        let line = format!("dbl >> {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         let content = std::fs::read_to_string(&tmp).unwrap();
@@ -3221,7 +3226,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_test_fd2_redirect.txt");
-        let line = format!("dbl 2> {}", tmp.display());
+        let line = format!("dbl 2> {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
         // The dbl listing is stdout; a 2> redirect must not divert it
@@ -3996,7 +4001,7 @@ mod tests {
         let shell = make_shell();
         let tmpdir = tempfile::tempdir().expect("fixture root");
         let tmp = tmpdir.path().join("iocsh_dbsr_report.txt");
-        let line = format!("dbsr > {}", tmp.display());
+        let line = format!("dbsr > {}", script_token(&tmp));
         assert!(matches!(
             shell.execute_line(&line),
             Ok(CommandOutcome::Continue)
@@ -4082,8 +4087,8 @@ mod tests {
             &outer,
             format!(
                 "< {}\nnonexistent_cmd\ndbl > {}\n",
-                inner.display(),
-                out.display()
+                script_token(&inner),
+                script_token(&out)
             ),
         )
         .unwrap();
@@ -4118,7 +4123,7 @@ mod tests {
             &script,
             format!(
                 "iocshRun \"nonexistent_cmd\"\nnonexistent_cmd\ndbl > {}\n",
-                after.display()
+                script_token(&after)
             ),
         )
         .unwrap();
@@ -4148,7 +4153,7 @@ mod tests {
             &script,
             format!(
                 "on error wait 0.25\nnonexistent_cmd\ndbl > {}\n",
-                out.display()
+                script_token(&out)
             ),
         )
         .unwrap();
@@ -4213,7 +4218,7 @@ mod tests {
             dir.path(),
             &format!(
                 "on error wait {WAIT_UNIT}\nnonexistent_cmd\ndbl > {}\n# one\n",
-                out.display()
+                script_token(&out)
             ),
         );
         assert!(out.exists(), "'wait' continues the script after the stall");
@@ -4235,13 +4240,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("inner.txt");
         let inner = dir.path().join("inner.cmd");
-        std::fs::write(&inner, format!("dbl > {}\n", out.display())).unwrap();
+        std::fs::write(&inner, format!("dbl > {}\n", script_token(&out))).unwrap();
         let elapsed = timed_script(
             &shell,
             dir.path(),
             &format!(
                 "on error wait {WAIT_UNIT}\nnonexistent_cmd\n< {}\n",
-                inner.display()
+                script_token(&inner)
             ),
         );
         assert!(out.exists(), "the include itself must have run");

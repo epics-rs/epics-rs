@@ -40,40 +40,7 @@ fn zone() -> MutexGuard<'static, ()> {
         set_stream_msg_time_stamped(0);
         set_get_thread_name_function(None);
     });
-    #[cfg(windows)]
-    ucrt::return_from_invalid_parameters();
     time
-}
-
-/// UCRT's strftime calls the invalid parameter handler, which ends the
-/// process, on a conversion it does not know or a time localtime_s could
-/// not convert, under C's printDouble as under the port's. Here the
-/// handler returns, strftime returns 0, and `run` marks the line.
-#[cfg(windows)]
-mod ucrt {
-    use std::cell::Cell;
-
-    type Handler = unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
-    unsafe extern "C" {
-        fn _set_thread_local_invalid_parameter_handler(handler: Option<Handler>)
-        -> Option<Handler>;
-    }
-
-    thread_local!(static REFUSED: Cell<bool> = const { Cell::new(false) });
-
-    unsafe extern "C" fn refuse(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {
-        REFUSED.with(|r| r.set(true));
-    }
-
-    pub fn return_from_invalid_parameters() {
-        // SAFETY: the handler only sets a thread-local flag.
-        unsafe { _set_thread_local_invalid_parameter_handler(Some(refuse)) };
-    }
-
-    /// Whether UCRT refused a call since the last time this was asked.
-    pub fn refused() -> bool {
-        REFUSED.with(|r| r.replace(false))
-    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -109,8 +76,6 @@ fn run(case: &str) -> String {
     let mut fmt = StreamFormat::default();
     let mut info = StreamBuffer::new();
     capture_stderr();
-    #[cfg(windows)]
-    ucrt::refused();
     let format_type = match f[0] {
         "pd" => FormatType::PrintFormat,
         "sd" => FormatType::ScanFormat,
@@ -142,10 +107,6 @@ fn run(case: &str) -> String {
         }
     }
     write!(line, " err={}", hex(&take_captured())).unwrap();
-    #[cfg(windows)]
-    if ucrt::refused() {
-        line.push_str(" refused");
-    }
     line
 }
 
@@ -182,8 +143,9 @@ enum Libc {
     Printed(i32, &'static str),
     /// `n`, the value and the error text.
     Scanned(isize, f64, &'static str),
-    /// UCRT refused strftime: the process ends, in C as in the port.
-    Refused,
+    /// UCRT refused strftime, which ends C's process; the port's strftime
+    /// returns 0 there, so it prints nothing, as on any 0 return.
+    Exits,
 }
 use Libc::*;
 
@@ -203,16 +165,16 @@ const MACOS: &[(&str, Libc)] = &[
 /// no time before 1970 or after 3000; its TZ takes no rules, so CEST is
 /// the US's summer time and "CES", and its mktime stops at 3000 too.
 const WINDOWS: &[(&str, Libc)] = &[
-    ("pd\t%T(%.4s)\t0", Refused),
-    ("pd\t%T(%3d)\t0", Refused),
-    ("pd\t%T(%.x)\t0", Refused),
-    ("pd\t%T(%.3x)\t0", Refused),
-    ("pd\t%T(%0)\t0", Refused),
-    ("pd\t%T(%0x)\t1700000000", Refused),
-    ("pd\t%T(%Ey %Od %q)\t1700000000", Refused),
-    ("pd\t%T(%s)\t1700000000", Refused),
-    ("pd\t%T(%F %T)\t253402300799", Refused),
-    ("pd\t%T(%F)\t-62135596800", Refused),
+    ("pd\t%T(%.4s)\t0", Exits),
+    ("pd\t%T(%3d)\t0", Exits),
+    ("pd\t%T(%.x)\t0", Exits),
+    ("pd\t%T(%.3x)\t0", Exits),
+    ("pd\t%T(%0)\t0", Exits),
+    ("pd\t%T(%0x)\t1700000000", Exits),
+    ("pd\t%T(%Ey %Od %q)\t1700000000", Exits),
+    ("pd\t%T(%s)\t1700000000", Exits),
+    ("pd\t%T(%F %T)\t253402300799", Exits),
+    ("pd\t%T(%F)\t-62135596800", Exits),
     (
         "pd\t%T(%Z %z %j %a %b)\t1690000000",
         Printed(1, "CES +0200 203 Sat Jul"),
@@ -256,7 +218,7 @@ fn as_on_this_libc(case: &str, c_line: &str) -> String {
             val.to_bits(),
             hex(err.as_bytes())
         ),
-        Some(Refused) => format!("{head} ok=1 out= err= refused"),
+        Some(Exits) => format!("{head} ok=1 out= err="),
     }
 }
 
@@ -365,12 +327,13 @@ fn print_double_leaves_out_cs_bugs() {
         };
         assert_eq!(out_text(want), c_out, "{case}");
         let got = run(case);
-        if cfg!(windows) && case.contains("\t-") {
-            // The floored second is before 1970, which UCRT refuses.
-            assert!(got.ends_with(" refused"), "{case}: {got}");
+        // The floored second is before 1970, which UCRT refuses.
+        let rs_out = if cfg!(windows) && case.contains("\t-") {
+            ""
         } else {
-            assert_eq!(out_text(&got), rs_out, "{case}");
-        }
+            rs_out
+        };
+        assert_eq!(out_text(&got), rs_out, "{case}");
         seen += 1;
     }
     assert_eq!(seen, PRINT_BUGS_NOT_COPIED.len());
@@ -533,12 +496,14 @@ fn a_rounded_fraction_carries_into_the_second() {
     let line = run("pd\t%T(%Y-%m-%d %H:%M:%S.%3f)\t1704063599.9996");
     assert_eq!(out_text(&line), "2024-01-01 00:00:00.000");
     let line = run("pd\t%T(%F %T.%3f)\t-0.0004");
-    if cfg!(windows) {
-        // Its floored second, before 1970, is formatted before the carry.
-        assert!(line.ends_with(" refused"), "{line}");
+    // On Windows its floored second, before 1970, is formatted before the
+    // carry and refused.
+    let carried = if cfg!(windows) {
+        ""
     } else {
-        assert_eq!(out_text(&line), "1970-01-01 01:00:00.000");
-    }
+        "1970-01-01 01:00:00.000"
+    };
+    assert_eq!(out_text(&line), carried);
     let line = run("pd\t%T(%S.%2f)\t1704063599.994");
     assert_eq!(out_text(&line), "59.99");
 }

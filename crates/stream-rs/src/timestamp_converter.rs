@@ -748,12 +748,31 @@ mod ctime {
     #[cfg(unix)]
     use libc::strftime;
 
+    #[cfg(windows)]
+    type InvalidParameterHandler =
+        unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+    #[cfg(windows)]
+    unsafe extern "C" {
+        fn _set_thread_local_invalid_parameter_handler(
+            handler: Option<InvalidParameterHandler>,
+        ) -> Option<InvalidParameterHandler>;
+    }
+    #[cfg(windows)]
+    unsafe extern "C" fn returning(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {}
+
     /// `strftime` into C's `char buffer[40]`: nothing when the result does
-    /// not fit.
+    /// not fit, or when UCRT refuses the format or the time.
     pub fn strftime40(format: &[u8], tm: &Tm) -> Vec<u8> {
         let mut format = format.to_vec();
         format.push(0);
         let mut buffer = [0u8; 40];
+        // C bug not copied: UCRT's strftime calls the invalid parameter
+        // handler on a conversion it does not know or a tm localtime_s
+        // could not fill, and C leaves the default one, which ends the IOC.
+        // Under one that returns, strftime returns 0.
+        #[cfg(windows)]
+        // SAFETY: the handler only returns; the old one is put back below.
+        let previous = unsafe { _set_thread_local_invalid_parameter_handler(Some(returning)) };
         // SAFETY: `format` is 0-terminated and `buffer` holds the 40 bytes
         // strftime is allowed to write.
         let length = unsafe {
@@ -763,6 +782,11 @@ mod ctime {
                 format.as_ptr().cast(),
                 tm,
             )
+        };
+        #[cfg(windows)]
+        // SAFETY: as above.
+        unsafe {
+            _set_thread_local_invalid_parameter_handler(previous)
         };
         buffer[..length].to_vec()
     }

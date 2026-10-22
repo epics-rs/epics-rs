@@ -1,913 +1,489 @@
-//! Ion chamber (I0) intensity calculation state machine.
+//! `Io.st`, compiled by snc-rs from `build.rs` and run on `epics-seq-rs`.
 //!
-//! Pure Rust port of `Io.st` — converts scaler counts to photon flux using
-//! gas mixture properties and energy-dependent absorption coefficients.
-//!
-//! The calculation uses polynomial fits to mass-absorption coefficients
-//! for common ion-chamber gases and window/path materials, faithfully
-//! reproducing the C functions in the original SNL program.
+//! The escaped C is the flux calculation in the `%{ }%` block and the
+//! prototypes `%%` declares for it. `EvalFlux` reads the scaler and chamber
+//! variables and writes `flux`, `ionPhotons`, `ionAbs` and `detector`, the
+//! statics C's escaped code reaches by name. `Io.st` is compiled `-r`, so
+//! they are the block `seqg::seqg_static_vars()` returns.
 
-/// Gas/material identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GasId {
-    Helium = 1,
-    Nitrogen = 2,
-    Argon = 3,
-    Air = 4,
-    Beryllium = 5,
-    Kapton = 6,
-    CO2 = 7,
+use epics_seq_rs::c::*;
+
+macro_rules! seqg_escaped {
+    (r#"#include "epicsThread.h""#) => {};
+    (r#"#include <stdlib.h>"#) => {};
+    (r#"#include <math.h>"#) => {};
+    (r#"static void EvalFlux(double aln, double dln1, double dln2, double dHe, double dAir, double dBe, double energy);"#) => {};
+    (r#"static double photon(double cps, double work, double VtoF, double Volt_per_A, double aln, double deadL, double Kapton, int gasId, double energy);"#) => {};
+    (r#"static double absorb(int id, double energy);"#) => {};
+    (r#"static double absH(double energy);"#) => {};
+    (r#"static double absHe(double energy);"#) => {};
+    (r#"static double absBe(double energy);"#) => {};
+    (r#"static double absC(double energy);"#) => {};
+    (r#"static double absN(double energy);"#) => {};
+    (r#"static double absO(double energy);"#) => {};
+    (r#"static double absAr(double energy);"#) => {};
+    (r#"static double absArPhoto(double energy);"#) => {};
+    (r#"void EvalFlux( double aln, double dln1, double dln2, double dHe, double dAir, double dBe, double energy) { double AirAbs; double HeAbs; double KapAbs; double BeAbs; double fillAbsorb; double frontAbs; double cps; aln = aln / 10.; dln1 = dln1 / 10.; dln2 = dln2 / 10.; dHe = dHe / 10.; dAir = dAir / 10.; dBe = dBe * 2.54; switch (icChannel) { case 2: cps = s2; break; case 3: cps = s3; break; case 4: cps = s4; break; case 5: cps = s5; break; case 6: cps = s6; break; case 7: cps = s7; break; case 8: cps = s8; break; case 9: cps = s9; break; case 10: cps = s10; break; case 11: cps = s11; break; case 12: cps = s12; break; case 13: cps = s13; break; case 14: cps = s14; break; case 15: cps = s15; break; default: cps = 0; } cps /= (ticks/clock_rate); flux = 0.; flux += xHe * photon(cps,29.6, v2f,VperA,aln,dln1,kapton1,1,energy); flux += xN2 * photon(cps,36.3, v2f,VperA,aln,dln1,kapton1,2,energy); flux += xAr * photon(cps,24.4, v2f,VperA,aln,dln1,kapton1,3,energy); flux += xAir* photon(cps,35.36,v2f,VperA,aln,dln1,kapton1,4,energy); flux += xCO2* photon(cps,35.36,v2f,VperA,aln,dln1,kapton1,7,energy); AirAbs = exp(-dAir*absorb(4,energy)); HeAbs = exp(-dHe * absorb(1,energy) ); KapAbs = exp(-(kapton2+kapton1)*2.54 * absorb(6,energy) ); BeAbs = exp(-dBe * absorb(5,energy) ); fillAbsorb = absorb(1,energy)*xHe + absorb(2,energy)*xN2 + absorb(3,energy)*xAr + absorb(4,energy)*xAir + absorb(7,energy)*xCO2; ionAbs = exp(-(dln1+dln2+aln) * fillAbsorb); detector = flux * AirAbs * HeAbs * KapAbs * BeAbs * ionAbs * dEff; frontAbs = exp( -2.54*kapton1*absorb(6,energy) - dln1*fillAbsorb ); ionPhotons = (1.- exp(-aln * fillAbsorb)) * frontAbs * flux; } double photon( double cps, double work, double VtoF, double Volt_per_A, double aln, double deadL, double Kapton, int gasId, double energy) { double convHe = 6.647; double rhoHe = 0.0001785; double convN = 23.26; double rhoN = 0.00125; double convAr = 66.32; double rhoAr = 0.001784; double edgeAr = 3.202; double sum,E1,E2,E3; double part1,part2,part3; double photo; static double aHe[4] = { 6.06488, -3.29055, -0.107256, 0.0144465 }; static double aN[4] = { 11.2765, -2.65400, -0.200445, 0.0200765 }; static double aAr1[4] = { 13.9491, -1.82276, -0.328827, 0.0274382 }; static double aAr2[4] = { 12.2960, -2.63279, -0.073660, 0.0 }; static double aO[4] = { 11.7130, -2.57229, -0.205893, 0.0199244 }; static double aC[4] = { 10.6879, -2.71400, -0.200530, 0.0207248 }; E1 = log(energy); E2 = E1 * E1; E3 = E2 * E1; photo = 0; if (gasId == 1) { sum = exp(aHe[0] + aHe[1]*E1 + aHe[2]*E2 + aHe[3]*E3); photo = sum * rhoHe / convHe; } else if (gasId == 2) { sum = exp(aN[0] + aN[1]*E1 + aN[2]*E2 + aN[3]*E3); photo = sum * rhoN / convN; } else if (gasId == 3) { if (E1 > edgeAr) sum = exp(aAr1[0] + aAr1[1]*E1 + aAr1[2]*E2 + aAr1[3]*E3); else sum = exp(aAr2[0] + aAr2[1]*E1 + aAr2[2]*E2 + aAr2[3]*E3); photo = sum * rhoAr / convAr; } else if (gasId == 4) { sum = exp(aN[0] + aN[1]*E1 + aN[2]*E2 + aN[3]*E3); photo = sum * 0.000922 / convN; sum = exp(aO[0] + aO[1]*E1 + aO[2]*E2 + aO[3]*E3); photo += sum * 0.000266 / convN; if (E1 > edgeAr) sum = exp(aAr1[0] + aAr1[1]*E1 + aAr1[2]*E2 + aAr1[3]*E3); else sum = exp(aAr2[0] + aAr2[1]*E1 + aAr2[2]*E2 + aAr2[3]*E3); photo += sum * 1.66E-5 / convAr; } else if (gasId == 7) { sum = exp(aC[0] + aC[1]*E1 + aC[2]*E2 + aC[3]*E3); photo = sum * 0.0005396 / convN; sum = exp(aO[0] + aO[1]*E1 + aO[2]*E2 + aO[3]*E3); photo += sum * 0.0014374 / convN; } part1 = cps * work / (1.602E-19 * VtoF * Volt_per_A * energy * 1000.); part2 = 1 - exp(-photo * aln); part3 = exp(absorb(gasId,energy) * deadL) * exp(absorb(6,energy) * Kapton * 2.54); return (part1 * part3 / part2); } double absorb( int id, double energy) { double rhoH; double rhoHe; double rhoBe; double rhoC; double rhoN; double rhoO; double rhoAr; switch (id) { case 1: rhoHe = 0.0001785; return(absHe(energy)*rhoHe); case 5: rhoBe = 1.848; return(absBe(energy)*rhoBe); case 2: rhoN = 0.00125; return(absN(energy)*rhoN); case 4: rhoN = 0.000922; rhoO = 0.000266; rhoAr = 1.66E-5; return(absN(energy)*rhoN + absO(energy)*rhoO + absAr(energy)*rhoAr); case 3: rhoAr = 0.001784; return(absAr(energy)*rhoAr); case 6: rhoC = 0.981; rhoH = 0.037; rhoO = 0.297; rhoN = 0.105; return(absC(energy)*rhoC + absH(energy)*rhoH + absO(energy)*rhoO + absN(energy)*rhoN); case 7: rhoC = 0.0005396; rhoO = 0.0014374; return(absC(energy)*rhoC + absO(energy)*rhoO); } return 0; } double absH( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 2.44964E+00,-3.34953E+00,-4.71370E-02, 7.09962E-03 }; static double b[4] = {-1.19075E-01,-9.37086E-01,-2.00538E-01, 1.06587E-02 }; static double c[4] = {-2.15772E+00, 1.32685E+00,-3.05620E-01, 1.85025E-02 }; conv = 1.674; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return( (photo+coherent+compton)/conv); } double absHe( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 6.06488E+00,-3.29055E+00,-1.07256E-01, 1.44465E-02 }; static double b[4] = { 1.04768E+00,-8.51805E-02,-4.03527E-01, 2.69398E-02 }; static double c[4] = {-2.56357E+00, 2.02536E+00,-4.48710E-01, 2.79691E-02 }; conv = 6.647; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absBe( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 9.04511E+00,-2.83487E+00,-2.10021E-01, 2.29526E-02 }; static double b[4] = { 2.00860E+00,-4.61920E-02,-3.37018E-01, 1.86939E-02 }; static double c[4] = {-6.90079E-01, 9.46448E-01,-1.71142E-01, 6.51413E-03 }; conv = 14.96; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absC( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 1.06879E+01,-2.71400E+00,-2.00530E-01, 2.07248E-02 }; static double b[4] = { 3.10861E+00,-2.60580E-01,-2.71974E-01, 1.35181E-02 }; static double c[4] = {-9.82878E-01, 1.46693E+00,-2.93743E-01, 1.56005E-02 }; conv = 19.94; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absN( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 1.12765E+01,-2.65400E+00,-2.00445E-01, 2.00765E-02 }; static double b[4] = { 3.47760E+00,-2.15762E-01,-2.88874E-01, 1.51312E-02 }; static double c[4] = {-1.23693E+00, 1.74510E+00,-3.54660E-01, 1.98705E-02 }; conv = 23.26; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absO( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; static double a[4] = { 1.17130E+01,-2.57229E+00,-2.05893E-01, 1.99244E-02 }; static double b[4] = { 3.77239E+00,-1.48539E-01,-3.07124E-01, 1.67303E-02 }; static double c[4] = {-1.73679E+00, 2.17686E+00,-4.49050E-01, 2.64733E-02 }; conv = 26.57; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; photo = exp( a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absAr( double energy) { double conv; double E1,E2,E3; double photo; double coherent; double compton; double edge; static double a1[4] = { 1.39491E+01,-1.82276E+00,-3.28827E-01, 2.74382E-02 }; static double a2[4] = { 1.22960E+01,-2.63279E+00,-7.36600E-02, 0.}; static double b[4] = { 5.21079E+00, 1.35618E-01,-3.47214E-01, 1.84333E-02 }; static double c[4] = {-6.82105E-01, 1.74279E+00,-3.17646E-01, 1.56467E-02 }; conv = 66.32; edge = 3.202; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; if (energy>edge) photo = exp( a1[0] + a1[1]*E1 + a1[2]*E2 + a1[3]*E3); else photo = exp( a2[0] + a2[1]*E1 + a2[2]*E2 + a2[3]*E3); coherent = exp( b[0] + b[1]*E1 + b[2]*E2 + b[3]*E3); compton = exp( c[0] + c[1]*E1 + c[2]*E2 + c[3]*E3); return((photo+coherent+compton)/conv); } double absArPhoto( double energy) { double conv; double E1,E2,E3; double photo; double rho; double edge; static double aAr1[4] = {13.9491, -1.82276, -0.328827, 0.0274382 }; static double aAr2[4] = {12.2960, -2.63279, -0.073660, 0.0 }; conv = 66.32; rho = 0.001784; edge = 3.202; E1 = log(energy); E2 = E1*E1; E3 = E2*E1; if (energy>edge) photo = exp( aAr1[0] + aAr1[1]*E1 + aAr1[2]*E2 + aAr1[3]*E3); else photo = exp( aAr2[0] + aAr2[1]*E1 + aAr2[2]*E2 + aAr2[3]*E3); return (photo / conv * rho); }"#) => {};
 }
 
-/// Conversion constant: inches to centimetres.
+epics_seq_rs::include_program!("Io");
+
+// The `#define`s the block uses; cpp has expanded them in the SNL code.
+const _HELIUM_: i32 = 1;
+const _NITROGEN_: i32 = 2;
+const _ARGON_: i32 = 3;
+const _AIR_: i32 = 4;
+const _BERYLLIUM_: i32 = 5;
+const _KAPTON_: i32 = 6;
+const _CO2_: i32 = 7;
 const CM_PER_INCH: f64 = 2.54;
 
-// Gas work functions (eV per ion pair).
-const WORK_HE: f64 = 29.6;
-const WORK_N2: f64 = 36.3;
-const WORK_AR: f64 = 24.4;
-const WORK_AIR: f64 = 35.36;
-const WORK_CO2: f64 = 35.36;
-
-/// Ion chamber configuration.
-#[derive(Debug, Clone)]
-pub struct IoConfig {
-    pub prefix: String,
-    pub mono_pv: String,
-    pub scaler_pv: String,
+/// `exp(a[0] + a[1]*E1 + a[2]*E2 + a[3]*E3)` with `E1 = log(energy)`.
+fn fit(a: [f64; 4], energy: f64) -> f64 {
+    let e1 = energy.ln();
+    let e2 = e1 * e1;
+    let e3 = e2 * e1;
+    (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp()
 }
 
-impl IoConfig {
-    pub fn new(p: &str, mono: &str, vsc: &str) -> Self {
-        Self {
-            prefix: p.to_string(),
-            mono_pv: mono.to_string(),
-            scaler_pv: vsc.to_string(),
+/// `EvalFlux`: the flux just before the chamber, and the share of it the
+/// chamber gas and the path after it pass, from the selected scaler
+/// channel's count rate. Lengths arrive in mm, `d_be` in inches.
+#[allow(non_snake_case)]
+fn EvalFlux(aln: f64, dln1: f64, dln2: f64, d_he: f64, d_air: f64, d_be: f64, energy: f64) {
+    let v = seqg::seqg_static_vars();
+    let aln = aln / 10.;
+    let dln1 = dln1 / 10.;
+    let dln2 = dln2 / 10.;
+    let d_he = d_he / 10.;
+    let d_air = d_air / 10.;
+    let d_be = d_be * CM_PER_INCH;
+
+    let cps = match v.icChannel.get() {
+        2 => v.s2.get(),
+        3 => v.s3.get(),
+        4 => v.s4.get(),
+        5 => v.s5.get(),
+        6 => v.s6.get(),
+        7 => v.s7.get(),
+        8 => v.s8.get(),
+        9 => v.s9.get(),
+        10 => v.s10.get(),
+        11 => v.s11.get(),
+        12 => v.s12.get(),
+        13 => v.s13.get(),
+        14 => v.s14.get(),
+        15 => v.s15.get(),
+        _ => 0.,
+    } / (v.ticks.get() / v.clock_rate.get());
+
+    let (v2f, v_per_a, kapton1) = (v.v2f.get(), v.VperA.get(), v.kapton1.get());
+    let (x_he, x_n2, x_ar) = (v.xHe.get(), v.xN2.get(), v.xAr.get());
+    let (x_air, x_co2) = (v.xAir.get(), v.xCO2.get());
+    let gas = |work, id| photon(cps, work, v2f, v_per_a, aln, dln1, kapton1, id, energy);
+    let mut flux = 0.;
+    flux += x_he * gas(29.6, _HELIUM_);
+    flux += x_n2 * gas(36.3, _NITROGEN_);
+    flux += x_ar * gas(24.4, _ARGON_);
+    flux += x_air * gas(35.36, _AIR_);
+    flux += x_co2 * gas(35.36, _CO2_);
+
+    let air_abs = (-d_air * absorb(_AIR_, energy)).exp();
+    let he_abs = (-d_he * absorb(_HELIUM_, energy)).exp();
+    let kap_abs = (-(v.kapton2.get() + kapton1) * CM_PER_INCH * absorb(_KAPTON_, energy)).exp();
+    let be_abs = (-d_be * absorb(_BERYLLIUM_, energy)).exp();
+    let fill_absorb = absorb(_HELIUM_, energy) * x_he
+        + absorb(_NITROGEN_, energy) * x_n2
+        + absorb(_ARGON_, energy) * x_ar
+        + absorb(_AIR_, energy) * x_air
+        + absorb(_CO2_, energy) * x_co2;
+
+    let ion_abs = (-(dln1 + dln2 + aln) * fill_absorb).exp();
+    let detector = flux * air_abs * he_abs * kap_abs * be_abs * ion_abs * v.dEff.get();
+    let front_abs = (-CM_PER_INCH * kapton1 * absorb(_KAPTON_, energy) - dln1 * fill_absorb).exp();
+    v.flux.set(flux);
+    v.ionAbs.set(ion_abs);
+    v.detector.set(detector);
+    v.ionPhotons
+        .set((1. - (-aln * fill_absorb).exp()) * front_abs * flux);
+}
+
+const A_HE: [f64; 4] = [6.06488, -3.29055, -0.107256, 0.0144465];
+const A_N: [f64; 4] = [11.2765, -2.65400, -0.200445, 0.0200765];
+const A_AR1: [f64; 4] = [13.9491, -1.82276, -0.328827, 0.0274382];
+const A_AR2: [f64; 4] = [12.2960, -2.63279, -0.073660, 0.0];
+const A_O: [f64; 4] = [11.7130, -2.57229, -0.205893, 0.0199244];
+const A_C: [f64; 4] = [10.6879, -2.71400, -0.200530, 0.0207248];
+const EDGE_AR: f64 = 3.202;
+
+/// `photon`: photons/sec just upstream of the chamber's first Kapton window
+/// that give `cps` in a chamber filled with gas `gas_id`.
+#[allow(clippy::too_many_arguments)]
+fn photon(
+    cps: f64,
+    work: f64,
+    v_to_f: f64,
+    volt_per_a: f64,
+    aln: f64,
+    dead_l: f64,
+    kapton: f64,
+    gas_id: i32,
+    energy: f64,
+) -> f64 {
+    const CONV_HE: f64 = 6.647;
+    const RHO_HE: f64 = 0.0001785;
+    const CONV_N: f64 = 23.26;
+    const RHO_N: f64 = 0.00125;
+    const CONV_AR: f64 = 66.32;
+    const RHO_AR: f64 = 0.001784;
+
+    // Io.st tests `E1 > edgeAr`, log(energy) against an edge in keV, which
+    // takes the below-edge fit up to 24.6 keV. absAr and absArPhoto test
+    // `energy>edge`; so does this.
+    let ar = || {
+        if energy > EDGE_AR {
+            fit(A_AR1, energy)
+        } else {
+            fit(A_AR2, energy)
         }
-    }
-}
-
-/// Ion chamber parameters for flux calculation.
-#[derive(Debug, Clone)]
-pub struct IoParams {
-    /// Energy in keV.
-    pub energy: f64,
-    /// Current amplifier gain in V/A.
-    pub v_per_a: f64,
-    /// Voltage-to-frequency converter in Hz/V.
-    pub v2f: f64,
-    /// Gas fractions (atm): N2, Ar, He, Air, CO2.
-    pub x_n2: f64,
-    pub x_ar: f64,
-    pub x_he: f64,
-    pub x_air: f64,
-    pub x_co2: f64,
-    /// Active length of ion chamber (mm).
-    pub active_len: f64,
-    /// Dead length before active region (mm).
-    pub dead_front: f64,
-    /// Dead length after active region (mm).
-    pub dead_rear: f64,
-    /// Kapton window thicknesses (inches): front, rear.
-    pub kapton_front: f64,
-    pub kapton_rear: f64,
-    /// He path after ion chamber (mm).
-    pub he_path: f64,
-    /// Air path after ion chamber (mm).
-    pub air_path: f64,
-    /// Be thickness after ion chamber (inches).
-    pub be_thickness: f64,
-    /// Detector efficiency.
-    pub detector_efficiency: f64,
-    /// Scaler channel to use (2–15).
-    pub scaler_channel: usize,
-    /// Clock rate in Hz.
-    pub clock_rate: f64,
-    /// Whether using Argon proportional counter.
-    pub ar_pcntr: bool,
-}
-
-impl Default for IoParams {
-    fn default() -> Self {
-        Self {
-            energy: 10.0,
-            v_per_a: 1.0e8,
-            v2f: 1.0e5,
-            x_n2: 0.0,
-            x_ar: 0.0,
-            x_he: 0.0,
-            x_air: 1.0,
-            x_co2: 0.0,
-            active_len: 60.0,
-            dead_front: 17.5,
-            dead_rear: 17.5,
-            kapton_front: 0.001,
-            kapton_rear: 0.001,
-            he_path: 0.0,
-            air_path: 0.0,
-            be_thickness: 0.0,
-            detector_efficiency: 1.0,
-            scaler_channel: 2,
-            clock_rate: 1.0e7,
-            ar_pcntr: false,
+    };
+    let photo = match gas_id {
+        _HELIUM_ => fit(A_HE, energy) * RHO_HE / CONV_HE,
+        _NITROGEN_ => fit(A_N, energy) * RHO_N / CONV_N,
+        _ARGON_ => ar() * RHO_AR / CONV_AR,
+        _AIR_ => {
+            fit(A_N, energy) * 0.000922 / CONV_N
+                + fit(A_O, energy) * 0.000266 / CONV_N
+                + ar() * 1.66E-5 / CONV_AR
         }
-    }
-}
-
-/// Results of the ion chamber flux calculation.
-#[derive(Debug, Clone, Default)]
-pub struct IoResults {
-    /// Photon flux before ion chamber (photons/sec).
-    pub flux: f64,
-    /// Photons absorbed in the active region.
-    pub ion_photons: f64,
-    /// Transmission factor of the ion chamber gas.
-    pub ion_abs: f64,
-    /// Photons/sec at the detector location.
-    pub detector: f64,
-}
-
-// ---------- Mass-absorption coefficient functions ----------
-
-/// Mass absorption coefficient for Hydrogen (cm^2/g).
-fn abs_h(energy: f64) -> f64 {
-    let a = [2.44964, -3.34953, -0.047137, 0.00709962];
-    let b = [-0.119075, -0.937086, -0.200538, 0.0106587];
-    let c = [-2.15772, 1.32685, -0.30562, 0.0185025];
-    let conv = 1.674;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Helium (cm^2/g).
-fn abs_he(energy: f64) -> f64 {
-    let a = [6.06488, -3.29055, -0.107256, 0.0144465];
-    let b = [1.04768, -0.0851805, -0.403527, 0.0269398];
-    let c = [-2.56357, 2.02536, -0.44871, 0.0279691];
-    let conv = 6.647;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Beryllium (cm^2/g).
-fn abs_be(energy: f64) -> f64 {
-    let a = [9.04511, -2.83487, -0.210021, 0.0229526];
-    let b = [2.00860, -0.046192, -0.337018, 0.0186939];
-    let c = [-0.690079, 0.946448, -0.171142, 0.00651413];
-    let conv = 14.96;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Carbon (cm^2/g).
-fn abs_c(energy: f64) -> f64 {
-    let a = [10.6879, -2.71400, -0.20053, 0.0207248];
-    let b = [3.10861, -0.26058, -0.271974, 0.0135181];
-    let c = [-0.982878, 1.46693, -0.293743, 0.0156005];
-    let conv = 19.94;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Nitrogen (cm^2/g).
-fn abs_n(energy: f64) -> f64 {
-    let a = [11.2765, -2.65400, -0.200445, 0.0200765];
-    let b = [3.47760, -0.215762, -0.288874, 0.0151312];
-    let c = [-1.23693, 1.74510, -0.35466, 0.0198705];
-    let conv = 23.26;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Oxygen (cm^2/g).
-fn abs_o(energy: f64) -> f64 {
-    let a = [11.7130, -2.57229, -0.205893, 0.0199244];
-    let b = [3.77239, -0.148539, -0.307124, 0.0167303];
-    let c = [-1.73679, 2.17686, -0.44905, 0.0264733];
-    let conv = 26.57;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = (a[0] + a[1] * e1 + a[2] * e2 + a[3] * e3).exp();
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
-}
-
-/// Mass absorption coefficient for Argon (cm^2/g).
-fn abs_ar(energy: f64) -> f64 {
-    let a1 = [13.9491, -1.82276, -0.328827, 0.0274382];
-    let a2 = [12.2960, -2.63279, -0.07366, 0.0];
-    let b = [5.21079, 0.135618, -0.347214, 0.0184333];
-    let c = [-0.682105, 1.74279, -0.317646, 0.0156467];
-    let conv = 66.32;
-    let edge = 3.202;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = if energy > edge {
-        (a1[0] + a1[1] * e1 + a1[2] * e2 + a1[3] * e3).exp()
-    } else {
-        (a2[0] + a2[1] * e1 + a2[2] * e2 + a2[3] * e3).exp()
+        _CO2_ => fit(A_C, energy) * 0.0005396 / CONV_N + fit(A_O, energy) * 0.0014374 / CONV_N,
+        _ => 0.,
     };
-    let coherent = (b[0] + b[1] * e1 + b[2] * e2 + b[3] * e3).exp();
-    let compton = (c[0] + c[1] * e1 + c[2] * e2 + c[3] * e3).exp();
-    (photo + coherent + compton) / conv
+
+    let part1 = cps * work / (1.602E-19 * v_to_f * volt_per_a * energy * 1000.);
+    let part2 = 1. - (-photo * aln).exp();
+    let part3 = (absorb(gas_id, energy) * dead_l).exp()
+        * (absorb(_KAPTON_, energy) * kapton * CM_PER_INCH).exp();
+    part1 * part3 / part2
 }
 
-/// Photo-electric part of Argon mass absorption coefficient (cm^2/g).
-fn abs_ar_photo(energy: f64) -> f64 {
-    let a1 = [13.9491, -1.82276, -0.328827, 0.0274382];
-    let a2 = [12.2960, -2.63279, -0.07366, 0.0];
-    let conv = 66.32;
-    let edge = 3.202;
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-    let photo = if energy > edge {
-        (a1[0] + a1[1] * e1 + a1[2] * e2 + a1[3] * e3).exp()
-    } else {
-        (a2[0] + a2[1] * e1 + a2[2] * e2 + a2[3] * e3).exp()
-    };
-    photo / conv * 0.001784 // rho_Ar
-}
-
-/// Linear absorption coefficient (1/cm) for a given material/gas.
-pub fn absorb(id: GasId, energy: f64) -> f64 {
+/// `absorb`: the linear absorption coefficient (1/cm) of absorber `id`.
+fn absorb(id: i32, energy: f64) -> f64 {
     match id {
-        GasId::Helium => abs_he(energy) * 0.0001785,
-        GasId::Beryllium => abs_be(energy) * 1.848,
-        GasId::Nitrogen => abs_n(energy) * 0.00125,
-        GasId::Air => {
-            // Dry air: 79% N2, 20% O2, 1% Ar by volume
-            abs_n(energy) * 0.000922 + abs_o(energy) * 0.000266 + abs_ar(energy) * 1.66e-5
-        }
-        GasId::Argon => abs_ar(energy) * 0.001784,
-        GasId::Kapton => {
-            // C22 H10 O5 N2, rho=1.42 g/cm^3
+        _HELIUM_ => abs_he(energy) * 0.0001785,
+        _BERYLLIUM_ => abs_be(energy) * 1.848,
+        _NITROGEN_ => abs_n(energy) * 0.00125,
+        // 79% N2, 20% O2 and 1% Ar by volume.
+        _AIR_ => abs_n(energy) * 0.000922 + abs_o(energy) * 0.000266 + abs_ar(energy) * 1.66E-5,
+        _ARGON_ => abs_ar(energy) * 0.001784,
+        // C22 H10 O5 N2, 1.42 g/cm^3.
+        _KAPTON_ => {
             abs_c(energy) * 0.981
                 + abs_h(energy) * 0.037
                 + abs_o(energy) * 0.297
                 + abs_n(energy) * 0.105
         }
-        GasId::CO2 => {
-            // CO2, density = 0.001977 g/cm^3
-            abs_c(energy) * 0.0005396 + abs_o(energy) * 0.0014374
-        }
+        _CO2_ => abs_c(energy) * 0.0005396 + abs_o(energy) * 0.0014374,
+        _ => 0.,
     }
 }
 
-/// Calculate photon flux for one gas component.
-///
-/// Returns photons/sec at the point just upstream of the ion chamber front window.
-#[allow(clippy::too_many_arguments)]
-fn photon(
-    cps: f64,
-    work: f64,
-    v2f: f64,
-    v_per_a: f64,
-    active_len_cm: f64,
-    dead_front_cm: f64,
-    kapton_front_in: f64,
-    gas_id: GasId,
-    energy: f64,
-) -> f64 {
-    let rho_he = 0.0001785;
-    let rho_n = 0.00125;
-    let rho_ar = 0.001784;
-    let conv_he = 6.647;
-    let conv_n = 23.26;
-    let conv_ar = 66.32;
-    let edge_ar = 3.202;
-
-    let e1 = energy.ln();
-    let e2 = e1 * e1;
-    let e3 = e2 * e1;
-
-    let a_he = [6.06488, -3.29055, -0.107256, 0.0144465];
-    let a_n = [11.2765, -2.65400, -0.200445, 0.0200765];
-    let a_ar1 = [13.9491, -1.82276, -0.328827, 0.0274382];
-    let a_ar2 = [12.2960, -2.63279, -0.07366, 0.0];
-    let a_o = [11.7130, -2.57229, -0.205893, 0.0199244];
-    let a_c = [10.6879, -2.71400, -0.20053, 0.0207248];
-
-    let photo: f64 = match gas_id {
-        GasId::Helium => {
-            let sum = (a_he[0] + a_he[1] * e1 + a_he[2] * e2 + a_he[3] * e3).exp();
-            sum * rho_he / conv_he
-        }
-        GasId::Nitrogen => {
-            let sum = (a_n[0] + a_n[1] * e1 + a_n[2] * e2 + a_n[3] * e3).exp();
-            sum * rho_n / conv_n
-        }
-        GasId::Argon => {
-            let sum = if energy > edge_ar {
-                (a_ar1[0] + a_ar1[1] * e1 + a_ar1[2] * e2 + a_ar1[3] * e3).exp()
-            } else {
-                (a_ar2[0] + a_ar2[1] * e1 + a_ar2[2] * e2 + a_ar2[3] * e3).exp()
-            };
-            sum * rho_ar / conv_ar
-        }
-        GasId::Air => {
-            // 79% N2, 20% O2, 1% Ar
-            let sum_n = (a_n[0] + a_n[1] * e1 + a_n[2] * e2 + a_n[3] * e3).exp();
-            let sum_o = (a_o[0] + a_o[1] * e1 + a_o[2] * e2 + a_o[3] * e3).exp();
-            let sum_ar = if energy > edge_ar {
-                (a_ar1[0] + a_ar1[1] * e1 + a_ar1[2] * e2 + a_ar1[3] * e3).exp()
-            } else {
-                (a_ar2[0] + a_ar2[1] * e1 + a_ar2[2] * e2 + a_ar2[3] * e3).exp()
-            };
-            sum_n * 0.000922 / conv_n + sum_o * 0.000266 / conv_n + sum_ar * 1.66e-5 / conv_ar
-        }
-        GasId::CO2 => {
-            let sum_c = (a_c[0] + a_c[1] * e1 + a_c[2] * e2 + a_c[3] * e3).exp();
-            let sum_o = (a_o[0] + a_o[1] * e1 + a_o[2] * e2 + a_o[3] * e3).exp();
-            sum_c * 0.0005396 / conv_n + sum_o * 0.0014374 / conv_n
-        }
-        _ => 0.0,
-    };
-
-    // Parts 1, 2, 3 calculate the flux in photons/sec
-    let part1 = cps * work / (1.602e-19 * v2f * v_per_a * energy * 1000.0);
-    let part2 = 1.0 - (-photo * active_len_cm).exp();
-    let part3 = (absorb(gas_id, energy) * dead_front_cm).exp()
-        * (absorb(GasId::Kapton, energy) * kapton_front_in * CM_PER_INCH).exp();
-
-    if part2.abs() < 1e-30 {
-        return 0.0;
-    }
-    part1 * part3 / part2
+/// Photo-electric, coherent and Compton fits over `conv`: a mass absorption
+/// coefficient (cm^2/g).
+fn mass_abs(photo: f64, b: [f64; 4], c: [f64; 4], conv: f64, energy: f64) -> f64 {
+    (photo + fit(b, energy) + fit(c, energy)) / conv
 }
 
-/// Evaluate flux through the ion chamber.
-///
-/// This is the main calculation function, ported from `EvalFlux` in `Io.st`.
-pub fn eval_flux(params: &IoParams, scaler_counts: &[f64], ticks: f64) -> IoResults {
-    let energy = params.energy;
-    // C EvalFlux has no ticks guard: ionAbs is the gas transmission factor
-    // (Io.st:444), independent of counting, so ticks<=0 must still yield a
-    // finite ionAbs (it drives cps to 0, hence flux/detector/ionPhotons to 0,
-    // but leaves ionAbs intact). Only energy<=0 (log domain) and
-    // clock_rate<=0 short the whole calculation out.
-    if energy <= 0.0 || params.clock_rate <= 0.0 {
-        return IoResults::default();
-    }
+/// `absH`.
+fn abs_h(energy: f64) -> f64 {
+    let a = [2.44964E+00, -3.34953E+00, -4.71370E-02, 7.09962E-03];
+    let b = [-1.19075E-01, -9.37086E-01, -2.00538E-01, 1.06587E-02];
+    let c = [-2.15772E+00, 1.32685E+00, -3.05620E-01, 1.85025E-02];
+    mass_abs(fit(a, energy), b, c, 1.674, energy)
+}
 
-    // Convert units to cm
-    let aln = params.active_len / 10.0;
-    let dln1 = params.dead_front / 10.0;
-    let dln2 = params.dead_rear / 10.0;
-    let d_he = params.he_path / 10.0;
-    let d_air = params.air_path / 10.0;
-    let d_be = params.be_thickness * CM_PER_INCH;
+/// `absHe`.
+fn abs_he(energy: f64) -> f64 {
+    let a = [6.06488E+00, -3.29055E+00, -1.07256E-01, 1.44465E-02];
+    let b = [1.04768E+00, -8.51805E-02, -4.03527E-01, 2.69398E-02];
+    let c = [-2.56357E+00, 2.02536E+00, -4.48710E-01, 2.79691E-02];
+    mass_abs(fit(a, energy), b, c, 6.647, energy)
+}
 
-    // Counts per second from the selected scaler channel. C switch(icChannel)
-    // selects s2..s15 for channels 2-15 and falls through to cps=0 for any
-    // other channel, including 0/1 (Io.st:409-426). ticks<=0 (count_time<=0)
-    // likewise yields cps=0.
-    let count_time = ticks / params.clock_rate;
-    let cps = if (2..=15).contains(&params.scaler_channel) && count_time > 0.0 {
-        scaler_counts
-            .get(params.scaler_channel - 2)
-            .copied()
-            .unwrap_or(0.0)
-            / count_time
+/// `absBe`.
+fn abs_be(energy: f64) -> f64 {
+    let a = [9.04511E+00, -2.83487E+00, -2.10021E-01, 2.29526E-02];
+    let b = [2.00860E+00, -4.61920E-02, -3.37018E-01, 1.86939E-02];
+    let c = [-6.90079E-01, 9.46448E-01, -1.71142E-01, 6.51413E-03];
+    mass_abs(fit(a, energy), b, c, 14.96, energy)
+}
+
+/// `absC`.
+fn abs_c(energy: f64) -> f64 {
+    let a = [1.06879E+01, -2.71400E+00, -2.00530E-01, 2.07248E-02];
+    let b = [3.10861E+00, -2.60580E-01, -2.71974E-01, 1.35181E-02];
+    let c = [-9.82878E-01, 1.46693E+00, -2.93743E-01, 1.56005E-02];
+    mass_abs(fit(a, energy), b, c, 19.94, energy)
+}
+
+/// `absN`.
+fn abs_n(energy: f64) -> f64 {
+    let a = [1.12765E+01, -2.65400E+00, -2.00445E-01, 2.00765E-02];
+    let b = [3.47760E+00, -2.15762E-01, -2.88874E-01, 1.51312E-02];
+    let c = [-1.23693E+00, 1.74510E+00, -3.54660E-01, 1.98705E-02];
+    mass_abs(fit(a, energy), b, c, 23.26, energy)
+}
+
+/// `absO`.
+fn abs_o(energy: f64) -> f64 {
+    let a = [1.17130E+01, -2.57229E+00, -2.05893E-01, 1.99244E-02];
+    let b = [3.77239E+00, -1.48539E-01, -3.07124E-01, 1.67303E-02];
+    let c = [-1.73679E+00, 2.17686E+00, -4.49050E-01, 2.64733E-02];
+    mass_abs(fit(a, energy), b, c, 26.57, energy)
+}
+
+/// `absAr`.
+fn abs_ar(energy: f64) -> f64 {
+    let a1 = [1.39491E+01, -1.82276E+00, -3.28827E-01, 2.74382E-02];
+    let a2 = [1.22960E+01, -2.63279E+00, -7.36600E-02, 0.];
+    let b = [5.21079E+00, 1.35618E-01, -3.47214E-01, 1.84333E-02];
+    let c = [-6.82105E-01, 1.74279E+00, -3.17646E-01, 1.56467E-02];
+    let photo = if energy > EDGE_AR {
+        fit(a1, energy)
     } else {
-        0.0
+        fit(a2, energy)
     };
-
-    // Calculate flux from each gas component
-    let mut flux = 0.0;
-    flux += params.x_he
-        * photon(
-            cps,
-            WORK_HE,
-            params.v2f,
-            params.v_per_a,
-            aln,
-            dln1,
-            params.kapton_front,
-            GasId::Helium,
-            energy,
-        );
-    flux += params.x_n2
-        * photon(
-            cps,
-            WORK_N2,
-            params.v2f,
-            params.v_per_a,
-            aln,
-            dln1,
-            params.kapton_front,
-            GasId::Nitrogen,
-            energy,
-        );
-    flux += params.x_ar
-        * photon(
-            cps,
-            WORK_AR,
-            params.v2f,
-            params.v_per_a,
-            aln,
-            dln1,
-            params.kapton_front,
-            GasId::Argon,
-            energy,
-        );
-    flux += params.x_air
-        * photon(
-            cps,
-            WORK_AIR,
-            params.v2f,
-            params.v_per_a,
-            aln,
-            dln1,
-            params.kapton_front,
-            GasId::Air,
-            energy,
-        );
-    flux += params.x_co2
-        * photon(
-            cps,
-            WORK_CO2,
-            params.v2f,
-            params.v_per_a,
-            aln,
-            dln1,
-            params.kapton_front,
-            GasId::CO2,
-            energy,
-        );
-
-    // Absorption from front of ion chamber to detector
-    let air_abs = (-d_air * absorb(GasId::Air, energy)).exp();
-    let he_abs = (-d_he * absorb(GasId::Helium, energy)).exp();
-    let kap_abs =
-        (-(params.kapton_rear + params.kapton_front) * CM_PER_INCH * absorb(GasId::Kapton, energy))
-            .exp();
-    let be_abs = (-d_be * absorb(GasId::Beryllium, energy)).exp();
-
-    let fill_absorb = absorb(GasId::Helium, energy) * params.x_he
-        + absorb(GasId::Nitrogen, energy) * params.x_n2
-        + absorb(GasId::Argon, energy) * params.x_ar
-        + absorb(GasId::Air, energy) * params.x_air
-        + absorb(GasId::CO2, energy) * params.x_co2;
-
-    let ion_abs = (-(dln1 + dln2 + aln) * fill_absorb).exp();
-    let detector =
-        flux * air_abs * he_abs * kap_abs * be_abs * ion_abs * params.detector_efficiency;
-    let front_abs = (-CM_PER_INCH * params.kapton_front * absorb(GasId::Kapton, energy)
-        - dln1 * fill_absorb)
-        .exp();
-    let ion_photons = (1.0 - (-aln * fill_absorb).exp()) * front_abs * flux;
-
-    IoResults {
-        flux,
-        ion_photons,
-        ion_abs,
-        detector,
-    }
+    mass_abs(photo, b, c, 66.32, energy)
 }
 
-/// Calculate Argon proportional counter efficiency.
-pub fn ar_pcntr_efficiency(energy: f64) -> f64 {
-    let eff = 1.0 - (-(4.0 * CM_PER_INCH) * abs_ar_photo(energy)).exp();
-    let window_abs = (-0.005 * CM_PER_INCH * absorb(GasId::Beryllium, energy)).exp();
-    eff * window_abs
-}
-
-/// Async entry point — runs the Io state machine against live PVs.
-pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use epics_base_rs::runtime::task::sleep;
-    use epics_base_rs::types::EpicsValue;
-    use epics_ca_rs::client::{CaChannel, CaClient};
-    use std::time::Duration;
-    use tokio::select;
-
-    /// Helper: read f64 from channel.
-    async fn get_f64(ch: &CaChannel) -> f64 {
-        match ch.get().await {
-            Ok((_, val)) => val.to_f64().unwrap_or(0.0),
-            Err(_) => 0.0,
-        }
-    }
-
-    /// Helper: read i32 from channel.
-    async fn get_i32(ch: &CaChannel) -> i32 {
-        match ch.get().await {
-            Ok((_, val)) => val.to_f64().unwrap_or(0.0) as i32,
-            Err(_) => 0,
-        }
-    }
-
-    /// Helper: read string from channel (empty on non-string / error).
-    async fn get_string(ch: &CaChannel) -> String {
-        match ch.get().await {
-            Ok((_, EpicsValue::String(s))) => s.to_string(),
-            _ => String::new(),
-        }
-    }
-
-    /// Helper: write f64.
-    async fn put_f64(ch: &CaChannel, v: f64) {
-        let _ = ch.put(&EpicsValue::Double(v)).await;
-    }
-
-    let client = CaClient::new().await?;
-    let p = &config.prefix;
-    let vsc = &config.scaler_pv;
-
-    // Connect PVs
-    let ch_emono = client.create_channel(&config.mono_pv);
-    let ch_e_using = client.create_channel(format!("{p}E_using"));
-    let ch_flux = client.create_channel(format!("{p}flux"));
-    let ch_ion_photons = client.create_channel(format!("{p}ionPhotons"));
-    let ch_ion_abs = client.create_channel(format!("{p}ionAbs"));
-    let ch_detector = client.create_channel(format!("{p}detector"));
-
-    let ch_cnt = client.create_channel(format!("{vsc}.CNT"));
-    let ch_clock_rate = client.create_channel(format!("{vsc}.FREQ"));
-    let ch_ticks = client.create_channel(format!("{vsc}.S1"));
-
-    // Connect scaler channels 2-15
-    let mut ch_scalers: Vec<CaChannel> = Vec::new();
-    for i in 2..=15 {
-        ch_scalers.push(client.create_channel(format!("{vsc}.S{i}")));
-    }
-
-    // Connect scaler channel-name fields 2-15 ({VSC}.NMn): C copies the
-    // selected channel's name into {P}scaler.DESC (Io.st:351-364).
-    let mut ch_scaler_names: Vec<CaChannel> = Vec::new();
-    for i in 2..=15 {
-        ch_scaler_names.push(client.create_channel(format!("{vsc}.NM{i}")));
-    }
-
-    let ch_v_per_a = client.create_channel(format!("{p}VperA"));
-    let ch_v2f = client.create_channel(format!("{p}v2f"));
-    let ch_x_n2 = client.create_channel(format!("{p}xN2"));
-    let ch_x_ar = client.create_channel(format!("{p}xAr"));
-    let ch_x_he = client.create_channel(format!("{p}xHe"));
-    let ch_x_air = client.create_channel(format!("{p}xAir"));
-    let ch_x_co2 = client.create_channel(format!("{p}xCO2"));
-    let ch_active_len = client.create_channel(format!("{p}activeLen"));
-    let ch_dead_front = client.create_channel(format!("{p}deadFront"));
-    let ch_dead_rear = client.create_channel(format!("{p}deadRear"));
-    let ch_kapton1 = client.create_channel(format!("{p}kapton1"));
-    let ch_kapton2 = client.create_channel(format!("{p}kapton2"));
-    let ch_he_path = client.create_channel(format!("{p}HePath"));
-    let ch_air_path = client.create_channel(format!("{p}airPath"));
-    let ch_be = client.create_channel(format!("{p}Be"));
-    let ch_d_eff = client.create_channel(format!("{p}efficiency"));
-    let ch_scaler_ch = client.create_channel(format!("{p}scaler"));
-    let ch_scaler_desc = client.create_channel(format!("{p}scaler.DESC"));
-    let ch_ar_pcntr = client.create_channel(format!("{p}ArPcntr"));
-
-    // Subscriptions
-    let mut sub_emono = ch_emono.subscribe().await?;
-    let mut sub_e_using = ch_e_using.subscribe().await?;
-    let mut sub_cnt = ch_cnt.subscribe().await?;
-    let mut sub_v_per_a = ch_v_per_a.subscribe().await?;
-    let mut sub_x_n2 = ch_x_n2.subscribe().await?;
-    let mut sub_active_len = ch_active_len.subscribe().await?;
-    let mut sub_ar_pcntr = ch_ar_pcntr.subscribe().await?;
-    let mut sub_d_eff = ch_d_eff.subscribe().await?;
-
-    // Initialize parameters
-    let mut params = IoParams {
-        energy: get_f64(&ch_emono).await,
-        ..Default::default()
+/// `absArPhoto`: the photo-electric part of Argon's linear absorption
+/// coefficient (1/cm).
+#[allow(non_snake_case)]
+fn absArPhoto(energy: f64) -> f64 {
+    let photo = if energy > EDGE_AR {
+        fit(A_AR1, energy)
+    } else {
+        fit(A_AR2, energy)
     };
-    if params.energy == 0.0 {
-        params.energy = 10.0;
-    }
-    put_f64(&ch_e_using, params.energy).await;
-
-    // Seed the four computed-output PVs at startup (C Io.st:192-195) so they
-    // display sane values before the first update cycle. The 18 operator-tunable
-    // defaults C also force-writes at init (icChannel/VperA/v2f/xAir/.../ArPcntr,
-    // Io.st:174-191) are intentionally NOT written here: those are autosave-
-    // restored settings, and force-writing them on every boot would clobber a
-    // saved configuration. Operators get them from autosave/.db defaults instead.
-    put_f64(&ch_flux, 0.0).await;
-    put_f64(&ch_ion_photons, 0.0).await;
-    put_f64(&ch_ion_abs, 1.0).await;
-    put_f64(&ch_detector, 0.0).await;
-
-    tracing::info!("Io state machine running for {p}");
-
-    let update_rate = Duration::from_secs(10);
-
-    loop {
-        let needs_update = select! {
-            Some(Ok(_snap)) = sub_emono.recv() => {
-                let e = get_f64(&ch_emono).await;
-                params.energy = e;
-                put_f64(&ch_e_using, e).await;
-                true
-            }
-            Some(Ok(_snap)) = sub_e_using.recv() => {
-                params.energy = get_f64(&ch_e_using).await;
-                true
-            }
-            Some(Ok(_snap)) = sub_cnt.recv() => true,
-            Some(Ok(_snap)) = sub_v_per_a.recv() => {
-                params.v_per_a = get_f64(&ch_v_per_a).await;
-                true
-            }
-            Some(Ok(_snap)) = sub_x_n2.recv() => {
-                params.x_n2 = get_f64(&ch_x_n2).await;
-                params.x_ar = get_f64(&ch_x_ar).await;
-                params.x_he = get_f64(&ch_x_he).await;
-                params.x_air = get_f64(&ch_x_air).await;
-                params.x_co2 = get_f64(&ch_x_co2).await;
-                true
-            }
-            Some(Ok(_snap)) = sub_active_len.recv() => {
-                params.active_len = get_f64(&ch_active_len).await;
-                params.dead_front = get_f64(&ch_dead_front).await;
-                params.dead_rear = get_f64(&ch_dead_rear).await;
-                true
-            }
-            Some(Ok(_snap)) = sub_ar_pcntr.recv() => {
-                let val = get_i32(&ch_ar_pcntr).await;
-                params.ar_pcntr = val != 0;
-                if params.ar_pcntr {
-                    params.detector_efficiency = ar_pcntr_efficiency(params.energy);
-                    put_f64(&ch_d_eff, params.detector_efficiency).await;
-                }
-                true
-            }
-            Some(Ok(_snap)) = sub_d_eff.recv() => {
-                params.detector_efficiency = get_f64(&ch_d_eff).await;
-                params.ar_pcntr = false;
-                let _ = ch_ar_pcntr.put(&EpicsValue::Long(0)).await;
-                true
-            }
-            _ = sleep(update_rate) => true,
-        };
-
-        if needs_update {
-            // Read current parameters
-            params.v2f = get_f64(&ch_v2f).await;
-            params.kapton_front = get_f64(&ch_kapton1).await;
-            params.kapton_rear = get_f64(&ch_kapton2).await;
-            params.he_path = get_f64(&ch_he_path).await;
-            params.air_path = get_f64(&ch_air_path).await;
-            params.be_thickness = get_f64(&ch_be).await;
-            params.scaler_channel = get_i32(&ch_scaler_ch).await.max(0) as usize;
-            params.clock_rate = get_f64(&ch_clock_rate).await;
-
-            // Read scaler values
-            let ticks = get_f64(&ch_ticks).await;
-            let mut scaler_counts: Vec<f64> = Vec::with_capacity(14);
-            for ch in &ch_scalers {
-                scaler_counts.push(get_f64(ch).await);
-            }
-
-            let results = eval_flux(&params, &scaler_counts, ticks);
-
-            put_f64(&ch_flux, results.flux).await;
-            put_f64(&ch_ion_photons, results.ion_photons).await;
-            put_f64(&ch_ion_abs, results.ion_abs).await;
-            put_f64(&ch_detector, results.detector).await;
-
-            // C Io.st:351-364 (UpdateDisplay): copy the selected scaler
-            // channel's name ({VSC}.NMn) into {P}scaler.DESC. C branches only
-            // on channels 2-15; outside that range it leaves DESC untouched.
-            if (2..=15).contains(&params.scaler_channel) {
-                let name = get_string(&ch_scaler_names[params.scaler_channel - 2]).await;
-                let _ = ch_scaler_desc.put_string(&name).await;
-            }
-        }
-    }
+    photo / 66.32 * 0.001784
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default)]
 mod tests {
+    use std::sync::Mutex;
+
+    use epics_seq_rs::{ProgOptions, VarModel};
+
     use super::*;
+
+    /// `EvalFlux` works on the program's one static block.
+    static BLOCK: Mutex<()> = Mutex::new(());
+
+    /// Io.st:1, compiled with snc's defaults.
+    #[test]
+    fn the_program_is_the_st_one() {
+        assert_eq!(Io.validate(), Ok(()));
+        assert_eq!(
+            Io.params,
+            "P=7idd:Io:,MONO=7id:HHLM:energy_get,VSC=7idd:scaler1"
+        );
+        assert_eq!(
+            Io.options,
+            ProgOptions::new(ProgOptions::CONN | ProgOptions::NEWEF)
+        );
+        assert!(matches!(Io.vars, VarModel::Static(_)));
+    }
 
     #[test]
     fn test_absorb_helium() {
-        let mu = absorb(GasId::Helium, 10.0);
+        let mu = absorb(_HELIUM_, 10.0);
         assert!(mu > 0.0, "He absorption at 10 keV should be positive: {mu}");
         assert!(mu < 1.0, "He absorption at 10 keV should be small: {mu}");
     }
 
     #[test]
     fn test_absorb_nitrogen() {
-        let mu = absorb(GasId::Nitrogen, 10.0);
+        let mu = absorb(_NITROGEN_, 10.0);
         assert!(mu > 0.0, "N2 absorption at 10 keV should be positive: {mu}");
     }
 
     #[test]
     fn test_absorb_argon() {
-        let mu = absorb(GasId::Argon, 10.0);
+        let mu = absorb(_ARGON_, 10.0);
         assert!(mu > 0.0);
-        // Argon should absorb more than Helium at the same energy
-        assert!(mu > absorb(GasId::Helium, 10.0));
+        assert!(mu > absorb(_HELIUM_, 10.0));
     }
 
     #[test]
     fn test_absorb_kapton() {
-        let mu = absorb(GasId::Kapton, 10.0);
-        assert!(mu > 0.0);
+        assert!(absorb(_KAPTON_, 10.0) > 0.0);
     }
 
     #[test]
     fn test_absorb_air() {
-        let mu = absorb(GasId::Air, 10.0);
-        assert!(mu > 0.0);
+        assert!(absorb(_AIR_, 10.0) > 0.0);
     }
 
     #[test]
     fn test_absorb_co2() {
-        let mu = absorb(GasId::CO2, 10.0);
-        assert!(mu > 0.0);
+        assert!(absorb(_CO2_, 10.0) > 0.0);
     }
 
     #[test]
     fn test_absorb_beryllium() {
-        let mu = absorb(GasId::Beryllium, 10.0);
+        let mu = absorb(_BERYLLIUM_, 10.0);
         assert!(mu > 0.0);
-        // Be is a solid, so linear absorption should be significant
-        assert!(mu > absorb(GasId::Helium, 10.0));
+        assert!(mu > absorb(_HELIUM_, 10.0));
+    }
+
+    /// An id outside the switch falls out of it: `return 0`.
+    #[test]
+    fn absorb_of_an_unknown_absorber_is_zero() {
+        assert_eq!(absorb(0, 10.0), 0.0);
+        assert_eq!(absorb(8, 10.0), 0.0);
     }
 
     #[test]
     fn test_abs_ar_photo() {
-        let mu = abs_ar_photo(10.0);
-        assert!(mu > 0.0);
+        assert!(absArPhoto(10.0) > 0.0);
     }
 
+    /// The `ArPcntr` clause's detector efficiency (Io.st:258-259) at 10 keV.
     #[test]
     fn test_ar_pcntr_efficiency() {
-        let eff = ar_pcntr_efficiency(10.0);
+        let eff = (1. - (-(4. * CM_PER_INCH) * absArPhoto(10.0)).exp())
+            * (-(0.005 * CM_PER_INCH) * absorb(_BERYLLIUM_, 10.0)).exp();
         assert!(eff > 0.0 && eff <= 1.0, "Efficiency = {eff}");
+    }
+
+    /// The inputs `UpdateDisplay` reads, the hand port's defaults: 60 mm
+    /// active, 17.5 mm dead each side, 1 mil Kapton, 1 atm of air, scaler
+    /// channel 2, 10 MHz clock.
+    fn chamber(ic_channel: i16, counts: [f64; 14], ticks: f64) {
+        let v = seqg::seqg_static_vars();
+        v.icChannel.set(ic_channel);
+        for (s, n) in [
+            &v.s2, &v.s3, &v.s4, &v.s5, &v.s6, &v.s7, &v.s8, &v.s9, &v.s10, &v.s11, &v.s12, &v.s13,
+            &v.s14, &v.s15,
+        ]
+        .into_iter()
+        .zip(counts)
+        {
+            s.set(n);
+        }
+        v.ticks.set(ticks);
+        v.clock_rate.set(1.0e7);
+        v.VperA.set(1.0e8);
+        v.v2f.set(1.0e5);
+        v.xAir.set(1.0);
+        for x in [&v.xN2, &v.xAr, &v.xHe, &v.xCO2] {
+            x.set(0.0);
+        }
+        v.kapton1.set(0.001);
+        v.kapton2.set(0.001);
+        v.dEff.set(1.0);
+    }
+
+    /// `EvalFlux(activeLen,deadFront,deadRear,HePath,airPath,Be,E_using)`.
+    fn eval(energy: f64) -> [f64; 4] {
+        EvalFlux(60.0, 17.5, 17.5, 0.0, 0.0, 0.0, energy);
+        let v = seqg::seqg_static_vars();
+        [
+            v.flux.get(),
+            v.ionPhotons.get(),
+            v.ionAbs.get(),
+            v.detector.get(),
+        ]
     }
 
     #[test]
     fn test_eval_flux_zero_counts() {
-        let params = IoParams::default();
-        let results = eval_flux(&params, &[0.0; 14], 1e7);
-        assert_eq!(results.flux, 0.0);
-        assert_eq!(results.detector, 0.0);
+        let _block = BLOCK.lock().unwrap();
+        chamber(2, [0.0; 14], 1e7);
+        let [flux, _, _, detector] = eval(10.0);
+        assert_eq!(flux, 0.0);
+        assert_eq!(detector, 0.0);
     }
 
+    /// 1e6 counts in 1 s at 10 keV.
     #[test]
     fn test_eval_flux_with_counts() {
-        let params = IoParams {
-            energy: 10.0,
-            v_per_a: 1.0e8,
-            v2f: 1.0e5,
-            x_air: 1.0,
-            active_len: 60.0,
-            dead_front: 17.5,
-            dead_rear: 17.5,
-            kapton_front: 0.001,
-            kapton_rear: 0.001,
-            scaler_channel: 2,
-            clock_rate: 1.0e7,
-            detector_efficiency: 1.0,
-            ..Default::default()
-        };
-
-        // 1 million counts with 1 second counting time
-        let scaler_counts = [1.0e6; 14];
-        let ticks = 1.0e7; // 1 second at 10 MHz clock
-        let results = eval_flux(&params, &scaler_counts, ticks);
-        assert!(results.flux > 0.0, "flux = {}", results.flux);
-        assert!(results.detector > 0.0, "detector = {}", results.detector);
-        assert!(results.ion_abs > 0.0 && results.ion_abs <= 1.0);
+        let _block = BLOCK.lock().unwrap();
+        chamber(2, [1.0e6; 14], 1.0e7);
+        let [flux, ion_photons, ion_abs, detector] = eval(10.0);
+        assert!(flux > 0.0, "flux = {flux}");
+        assert!(detector > 0.0, "detector = {detector}");
+        assert!(ion_photons > 0.0 && ion_photons < flux);
+        assert!(ion_abs > 0.0 && ion_abs <= 1.0);
     }
 
+    /// C has no energy guard: `log(0)` is -inf, and every result is NaN.
     #[test]
     fn test_eval_flux_zero_energy() {
-        let mut params = IoParams::default();
-        params.energy = 0.0;
-        let results = eval_flux(&params, &[1e6; 14], 1e7);
-        assert_eq!(results.flux, 0.0);
+        let _block = BLOCK.lock().unwrap();
+        chamber(2, [1.0e6; 14], 1.0e7);
+        assert!(eval(0.0).iter().all(|r| r.is_nan()));
     }
 
+    /// `cps /= (ticks/clock_rate)` with no guard: zero ticks make the rate,
+    /// and every result built on it, NaN (the gases with no fraction add
+    /// 0 * inf). `ionAbs` is the gas column's transmission alone.
     #[test]
     fn test_eval_flux_zero_ticks() {
-        // C EvalFlux computes ionAbs (the gas transmission factor, Io.st:444)
-        // independent of counting: ticks=0 drives cps->0 (flux/detector/
-        // ionPhotons = 0) but leaves ionAbs finite. Default params (energy=10,
-        // x_air=1) give a real gas column, so ionAbs is in (0,1].
-        let params = IoParams::default();
-        let results = eval_flux(&params, &[1e6; 14], 0.0);
-        assert_eq!(results.flux, 0.0);
-        assert_eq!(results.detector, 0.0);
-        assert!(
-            results.ion_abs > 0.0 && results.ion_abs <= 1.0,
-            "ion_abs = {}",
-            results.ion_abs
-        );
+        let _block = BLOCK.lock().unwrap();
+        chamber(2, [1.0e6; 14], 0.0);
+        let [flux, ion_photons, ion_abs, detector] = eval(10.0);
+        assert!(flux.is_nan() && ion_photons.is_nan() && detector.is_nan());
+        assert!(ion_abs > 0.0 && ion_abs <= 1.0, "ion_abs = {ion_abs}");
     }
 
+    /// Channels 2-15 select s2..s15 (Io.st:409-423); any other is the
+    /// switch default, `cps = 0` (Io.st:424-426).
     #[test]
     fn test_eval_flux_channel_window_boundaries() {
-        // 2-15 is the valid scaler-channel window (Io.st:409-423); a channel
-        // outside it falls to the C switch default cps=0 (Io.st:424-426), so it
-        // must NOT borrow an adjacent channel's counts.
-        let mk = |ch: usize| IoParams {
-            scaler_channel: ch,
-            ..Default::default()
-        };
-        // counts present only in s15 (index 13)
+        let _block = BLOCK.lock().unwrap();
         let mut counts15 = [0.0; 14];
         counts15[13] = 1e6;
-        assert!(
-            eval_flux(&mk(15), &counts15, 1e7).flux > 0.0,
-            "channel 15 should use s15"
-        );
-        assert_eq!(
-            eval_flux(&mk(16), &counts15, 1e7).flux,
-            0.0,
-            "channel 16 is out of range"
-        );
-        // counts present only in s2 (index 0)
         let mut counts2 = [0.0; 14];
         counts2[0] = 1e6;
-        assert_eq!(
-            eval_flux(&mk(0), &counts2, 1e7).flux,
-            0.0,
-            "channel 0 must not borrow s2"
-        );
-        assert_eq!(
-            eval_flux(&mk(1), &counts2, 1e7).flux,
-            0.0,
-            "channel 1 must not borrow s2"
-        );
-        assert!(
-            eval_flux(&mk(2), &counts2, 1e7).flux > 0.0,
-            "channel 2 should use s2"
-        );
+        let flux = |channel, counts| {
+            chamber(channel, counts, 1e7);
+            eval(10.0)[0]
+        };
+        assert!(flux(15, counts15) > 0.0, "channel 15 should use s15");
+        assert_eq!(flux(16, counts15), 0.0, "channel 16 is out of range");
+        assert_eq!(flux(0, counts2), 0.0, "channel 0 must not borrow s2");
+        assert_eq!(flux(1, counts2), 0.0, "channel 1 must not borrow s2");
+        assert!(flux(2, counts2) > 0.0, "channel 2 should use s2");
     }
 
     #[test]
     fn test_photon_gas_comparison() {
-        // With the same CPS and chamber config, heavier gases should give more flux
-        // because they have higher photoelectric cross-sections
-        let cps = 1.0e6;
-        let v2f = 1.0e5;
-        let vpa = 1.0e8;
-        let aln = 6.0; // cm
-        let dln = 1.75; // cm
-        let kap = 0.001; // inches
-        let energy = 10.0;
+        let (cps, v2f, vpa, aln, dln, kap, energy) = (1.0e6, 1.0e5, 1.0e8, 6.0, 1.75, 0.001, 10.0);
+        for (work, id) in [(29.6, _HELIUM_), (36.3, _NITROGEN_), (24.4, _ARGON_)] {
+            assert!(photon(cps, work, v2f, vpa, aln, dln, kap, id, energy) > 0.0);
+        }
+    }
 
-        let flux_he = photon(cps, WORK_HE, v2f, vpa, aln, dln, kap, GasId::Helium, energy);
-        let flux_n2 = photon(
-            cps,
-            WORK_N2,
-            v2f,
-            vpa,
-            aln,
-            dln,
-            kap,
-            GasId::Nitrogen,
-            energy,
-        );
-        let flux_ar = photon(cps, WORK_AR, v2f, vpa, aln, dln, kap, GasId::Argon, energy);
-
-        // All should be positive
-        assert!(flux_he > 0.0);
-        assert!(flux_n2 > 0.0);
-        assert!(flux_ar > 0.0);
+    /// Argon's photo-electric fit switches at the K edge in keV, in
+    /// `photon` as in absAr; Io.st's `E1 > edgeAr` would switch at
+    /// e^3.202 = 24.6 keV.
+    #[test]
+    fn photon_switches_argon_fits_at_the_k_edge_in_kev() {
+        let ar = |energy| photon(1.0e6, 24.4, 1.0e5, 1.0e8, 6.0, 1.75, 0.001, _ARGON_, energy);
+        let photo_part2 =
+            |a: [f64; 4], energy: f64| 1. - (-(fit(a, energy) * 0.001784 / 66.32) * 6.0).exp();
+        let energy: f64 = 10.0;
+        let part1 = 1.0e6 * 24.4 / (1.602E-19 * 1.0e5 * 1.0e8 * energy * 1000.);
+        let part3 = (absorb(_ARGON_, energy) * 1.75).exp()
+            * (absorb(_KAPTON_, energy) * 0.001 * CM_PER_INCH).exp();
+        assert_eq!(ar(energy), part1 * part3 / photo_part2(A_AR1, energy));
     }
 
     #[test]
     fn test_absorb_energy_dependence() {
-        // Absorption should generally decrease with energy (above edge)
-        let mu_5 = absorb(GasId::Air, 5.0);
-        let mu_20 = absorb(GasId::Air, 20.0);
+        let mu_5 = absorb(_AIR_, 5.0);
+        let mu_20 = absorb(_AIR_, 20.0);
         assert!(
             mu_5 > mu_20,
             "Air absorption should decrease with energy: {mu_5} vs {mu_20}"
@@ -916,9 +492,8 @@ mod tests {
 
     #[test]
     fn test_argon_k_edge() {
-        // Argon has K-edge at 3.202 keV - absorption should be higher just above
-        let mu_below = absorb(GasId::Argon, 3.0);
-        let mu_above = absorb(GasId::Argon, 3.5);
+        let mu_below = absorb(_ARGON_, 3.0);
+        let mu_above = absorb(_ARGON_, 3.5);
         assert!(
             mu_above > mu_below,
             "Argon absorption should jump at K-edge: below={mu_below}, above={mu_above}"

@@ -22,39 +22,9 @@
 
 use epics_base_rs::runtime::task::BlockingBridge;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::snl::{SeqMacros, seq};
-
-use crate::snl::io::IoConfig;
 
 // `SEQ_PROGRAMS`: every program `build.rs` compiled from `src/snl/*.st`.
 include!(concat!(env!("OUT_DIR"), "/seq_programs.rs"));
-
-/// An optics program, configured from its macros as its `.st` reads them.
-enum Program {
-    Io(IoConfig),
-}
-
-impl Program {
-    /// Each arm's parameters are its `.st`'s `program` statement. A macro
-    /// with no value reads as "", what `seqMacEval` puts for its `{name}`.
-    fn new(program: &str, macro_def: &str) -> Result<(Self, SeqMacros), String> {
-        let macros = |params| SeqMacros::new(params, macro_def);
-        Ok(match program {
-            "Io" => {
-                let m = macros("P=7idd:Io:,MONO=7id:HHLM:energy_get,VSC=7idd:scaler1");
-                let v = |name| m.value(name).unwrap_or_default();
-                (Self::Io(IoConfig::new(v("P"), v("MONO"), v("VSC"))), m)
-            }
-            _ => return Err(format!("Can't find sequencer `{program}'.")),
-        })
-    }
-
-    fn spawn(self, macros: &SeqMacros, bridge: &BlockingBridge, db: &PvDatabase) {
-        match self {
-            Self::Io(config) => seq(bridge, "Io", macros, crate::snl::io::run(config)),
-        }
-    }
-}
 
 /// Start an optics SNL program by name.
 ///
@@ -84,16 +54,14 @@ impl Program {
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    bridge: &BlockingBridge,
+    _bridge: &BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
     if let Some(compiled) = SEQ_PROGRAMS.iter().find(|p| p.prog_name() == program) {
         let _ = compiled.start(macro_str, 0, db);
         return Ok(());
     }
-    let (program, macros) = Program::new(program, macro_str)?;
-    program.spawn(&macros, bridge, db);
-    Ok(())
+    Err(format!("Can't find sequencer `{program}'."))
 }
 
 #[cfg(test)]
@@ -150,19 +118,6 @@ mod tests {
             &[("P", "Y:")],
         )
         .await
-    }
-
-    /// With no macros at all, each program reads what its `.st`'s `program`
-    /// statement defines.
-    #[test]
-    fn every_program_configures_on_its_program_defaults() {
-        let Ok((Program::Io(c), _)) = Program::new("Io", "") else {
-            panic!("Io")
-        };
-        assert_eq!(
-            [&c.prefix, &c.mono_pv, &c.scaler_pv],
-            ["7idd:Io:", "7id:HHLM:energy_get", "7idd:scaler1"]
-        );
     }
 
     /// `seq_main.c:67`, `:140-142`: every start posts the sequencer release

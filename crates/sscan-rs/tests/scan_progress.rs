@@ -1,12 +1,13 @@
-//! `scanProg.st` run against the shipped `scanProgress.db`, with stand-in
-//! `sscan` records carrying the four fields the program reads.
+//! `scanProg.st`, compiled by snc-rs, run against the shipped
+//! `scanProgress.db`, with stand-in `sscan` records carrying the four fields
+//! the program reads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::task::{Reactor, sleep};
+use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
@@ -15,7 +16,8 @@ use epics_base_rs::server::records::{
     stringout::StringoutRecord,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use sscan_rs::scan_prog::{self, ScanProgressConfig};
+use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+use sscan_rs::scan_prog::scanProgress;
 
 const P: &str = "prog:";
 const S: &str = "S:";
@@ -93,17 +95,13 @@ async fn ioc() -> Arc<PvDatabase> {
         .await
         .unwrap();
     db.ioc_init().await;
+    // seq holds each state set in its first state until PINI is done.
+    db.mark_pini_done();
     db
 }
 
-fn start(db: &Arc<PvDatabase>) {
-    let db = (**db).clone();
-    // Detached: the program runs for the rest of the test.
-    drop(
-        Reactor::current()
-            .expect("a runtime")
-            .spawn(scan_prog::run(ScanProgressConfig::new(P, S), db)),
-    );
+fn start(db: &PvDatabase) -> SeqThreadId {
+    seq(&scanProgress, &format!("S={S},P={P}"), 0, db).expect("scanProgress starts")
 }
 
 fn f(db: &PvDatabase, leaf: &str) -> f64 {
@@ -145,11 +143,12 @@ async fn init_publishes_the_version_and_clears_the_progress() {
     db.put_pv(&format!("{P}hungTimeStr"), EpicsValue::String("x".into()))
         .await
         .unwrap();
-    start(&db);
+    let tid = start(&db);
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
     assert!(eventually(5, || f(&db, "Ntotal") == 0.0).await);
     assert_eq!(s(&db, "hungTimeStr"), "");
     assert_eq!(f(&db, "running"), 0.0);
+    seq_stop(tid);
 }
 
 /// A busy outer scan sets the dimension: Ntotal is the product of the
@@ -161,7 +160,7 @@ async fn a_two_dimensional_scan_counts_points_across_both() {
     for (n, npts) in [(1, 10.0), (2, 3.0), (3, 7.0)] {
         scan(&db, n, "NPTS", npts).await;
     }
-    start(&db);
+    let tid = start(&db);
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
 
     // Outer first, as an sscan sets BUSY before its triggers start the
@@ -193,6 +192,7 @@ async fn a_two_dimensional_scan_counts_points_across_both() {
     assert_eq!(f(&db, "Nfinished"), 40.0);
     assert_eq!(f(&db, "fractionDone"), 1.0, "limited to 1");
     assert_eq!(s(&db, "remainingTimeStr"), "00:00:00");
+    seq_stop(tid);
 }
 
 /// A pause on a running scan raises `paused` and counts once; lifting it
@@ -201,7 +201,7 @@ async fn a_two_dimensional_scan_counts_points_across_both() {
 async fn a_pause_is_counted_once_and_released() {
     let db = ioc().await;
     scan(&db, 1, "NPTS", 10.0).await;
-    start(&db);
+    let tid = start(&db);
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
     // initPause sleeps a second before it watches the flags.
     sleep(Duration::from_millis(1200)).await;
@@ -217,6 +217,7 @@ async fn a_pause_is_counted_once_and_released() {
     assert!(eventually(5, || f(&db, "paused") == 0.0).await);
     assert!(eventually(5, || s(&db, "pauseTimeStr").starts_with("00:00:")).await);
     assert_eq!(f(&db, "Npauses"), 1.0);
+    seq_stop(tid);
 }
 
 /// A pause on the outer scan while the inner one still runs is not yet a
@@ -226,7 +227,7 @@ async fn an_outer_pause_waits_for_the_inner_scan() {
     let db = ioc().await;
     scan(&db, 1, "NPTS", 10.0).await;
     scan(&db, 2, "NPTS", 3.0).await;
-    start(&db);
+    let tid = start(&db);
     assert!(eventually(5, || f(&db, "version") == 2.3).await);
     sleep(Duration::from_millis(1200)).await;
 
@@ -243,4 +244,66 @@ async fn an_outer_pause_waits_for_the_inner_scan() {
 
     scan(&db, 1, "BUSY", 0.0).await;
     assert!(eventually(2, || f(&db, "paused") == 1.0).await);
+    seq_stop(tid);
+}
+
+/// Set in the child process a debug-line test reruns itself as, to capture
+/// the program's stdout.
+const DEBUG_CHILD: &str = "SCAN_PROGRESS_DEBUG_CHILD";
+
+/// The program's stdout at every debug level, started without a name macro
+/// as upstream's st.cmd starts it, from a child process running `test`;
+/// `None` in that child, once the program has run.
+async fn debug_stdout(test: &str) -> Option<String> {
+    if std::env::var_os(DEBUG_CHILD).is_some() {
+        let db = ioc().await;
+        db.put_pv(&format!("{P}debug"), EpicsValue::Short(7))
+            .await
+            .unwrap();
+        let tid = start(&db);
+        assert!(eventually(5, || f(&db, "version") == 2.3).await);
+        sleep(Duration::from_millis(1500)).await;
+        seq_stop(tid);
+        return None;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(DEBUG_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(stdout)
+}
+
+/// With no name macro the debug header names the program, not `(null)`
+/// (:126-129).
+#[epics_base_rs::epics_test]
+async fn the_debug_header_names_the_program() {
+    let Some(stdout) = debug_stdout("the_debug_header_names_the_program").await else {
+        return;
+    };
+    let init = stdout
+        .lines()
+        .find(|l| l.ends_with("init complete in state init"))
+        .expect("no init line");
+    assert!(init.contains(",scanProgress,1> "), "{init}");
+}
+
+/// idlePause prints its event flags as the numbers they are, not as `%p`
+/// pointers (:400).
+#[epics_base_rs::epics_test]
+async fn idle_pause_prints_its_event_flags_as_numbers() {
+    let Some(stdout) = debug_stdout("idle_pause_prints_its_event_flags_as_numbers").await else {
+        return;
+    };
+    let pause = stdout
+        .lines()
+        .find(|l| l.contains("monitors are"))
+        .expect("no idlePause line");
+    assert!(pause.ends_with("monitors are : 3,  4,  5,  6"), "{pause}");
 }

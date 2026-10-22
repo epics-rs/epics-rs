@@ -2201,20 +2201,32 @@ mod tests {
     }
 
     /// A bind host that does not resolve is C's lookup text with the errno the
-    /// resolver left (drvAsynIPServerPort.c:431-434), as libCom prints it on
-    /// this box: a bare name the resolver gives up on leaves EAGAIN, and
-    /// `.invalid` (RFC 6761), refused locally, leaves 0.
-    #[cfg(target_os = "linux")]
+    /// resolver left (drvAsynIPServerPort.c:431-434). `getaddrinfo` promises
+    /// no errno, so the expected one is what the host's resolver leaves: EAGAIN
+    /// for a bare name and 0 for `.invalid` on one Linux box, 0 for both on
+    /// another.
+    #[cfg(unix)]
     #[test]
     fn an_unresolvable_bind_host_is_reported_with_the_resolver_s_errno() {
-        for (host, errno_text) in [
-            ("nonexistent-host-xyz", "Resource temporarily unavailable"),
-            ("no-such-nic.invalid", "Success"),
-        ] {
+        /// What C `hostToIPAddr` (osdSock.c:250-273) leaves in `errno`.
+        fn resolver_errno(host: &str) -> String {
+            let node = std::ffi::CString::new(host).unwrap();
+            // SAFETY: zeroed `addrinfo` is the hint C builds with `memset`.
+            let mut hint: libc::addrinfo = unsafe { std::mem::zeroed() };
+            hint.ai_family = libc::AF_INET;
+            let mut result: *mut libc::addrinfo = std::ptr::null_mut();
+            // SAFETY: `node` is NUL-terminated; a failed call allocates nothing.
+            let ret =
+                unsafe { libc::getaddrinfo(node.as_ptr(), std::ptr::null(), &hint, &mut result) };
+            assert_ne!(ret, 0, "{host} resolved");
+            errno_text(&std::io::Error::last_os_error())
+        }
+        for host in ["nonexistent-host-xyz", "no-such-nic.invalid"] {
             let srv = DrvAsynIPServerPort::new("rb_unresolved", &format!("{host}:0")).unwrap();
+            let why = resolver_errno(host);
             assert_eq!(
                 srv.resolve_bind_addr().unwrap_err().message(),
-                format!("using ANY interface, cannot lookup '{host}': {errno_text}")
+                format!("using ANY interface, cannot lookup '{host}': {why}")
             );
         }
     }

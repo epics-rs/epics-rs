@@ -1,6 +1,6 @@
 // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — sync tests that hand-build their own tokio runtime; all three passed under `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-base-rs --lib server::autosave::startup::`.
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -286,19 +286,22 @@ impl AutosaveStartupConfig {
         // overrun `save_file` (:2455).
         let base = filename.rfind('.').map_or(filename, |i| &filename[..i]);
         let sav_name = format!("{base}.sav");
-        match &self.save_file_path {
-            Some(dir) => dir.join(&sav_name),
-            None => PathBuf::from(&sav_name),
-        }
+        self.under_save_path(&sav_name)
     }
 
     /// C `concatenate_paths(saveRestoreFilePath, filename)` unless
     /// `filename` is absolute.
     pub fn save_dir_file(&self, filename: &str) -> PathBuf {
-        match &self.save_file_path {
-            Some(dir) => dir.join(filename),
-            None => PathBuf::from(filename),
+        if super::request::is_absolute(filename) {
+            return PathBuf::from(filename);
         }
+        self.under_save_path(filename)
+    }
+
+    /// C `concatenate_paths(saveRestoreFilePath, name)`.
+    fn under_save_path(&self, name: &str) -> PathBuf {
+        let dir = self.save_file_path.as_deref().unwrap_or(Path::new(""));
+        super::request::concatenate(&dir.to_string_lossy(), name).into()
     }
 
     /// The set a request file describes, named by the file as C's lists are.
@@ -1448,6 +1451,21 @@ mod tests {
             .as_ref()
             .map(|m| m.set_names())
             .unwrap_or_default()
+    }
+
+    /// C's `/` after the save path on every OS; an absolute name as given
+    /// (dbrestore.c:819-823), but not for a set's own file (:2457).
+    #[test]
+    fn save_files_join_the_save_path_with_cs_slash() {
+        let mut cfg = AutosaveStartupConfig::new();
+        cfg.save_file_path = Some(PathBuf::from("d"));
+        assert_eq!(cfg.resolve_save_file("s.req").to_str(), Some("d/s.sav"));
+        assert_eq!(
+            cfg.resolve_save_file("/a/s.req").to_str(),
+            Some("d/a/s.sav")
+        );
+        assert_eq!(cfg.save_dir_file("s.sav").to_str(), Some("d/s.sav"));
+        assert_eq!(cfg.save_dir_file("/a/s.sav").to_str(), Some("/a/s.sav"));
     }
 
     /// The C oracle IOC's save files for these request files: s.sav,

@@ -892,7 +892,8 @@ impl SaveSet {
             end -= 1;
         }
         let mut path = self.save_path.lock().unwrap();
-        *path = path.with_file_name(&save_filename[..end]);
+        let dir = path.parent().unwrap_or(Path::new("")).to_string_lossy();
+        *path = request::concatenate(&dir, &save_filename[..end]).into();
     }
 
     /// C's `plist->save_file`, the name SR_recentlyStr and `SR_<i>_Name` use.

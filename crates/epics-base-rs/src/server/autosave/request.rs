@@ -96,6 +96,14 @@ struct IncludeWalk<'a> {
 /// C `concatenate_paths` (save_restore.c:750-768): one `/` between the
 /// two, so an absolute `s2` lands UNDER `s1` rather than replacing it.
 pub(crate) fn concatenate_paths(s1: &str, s2: &str, settings: &SrSettings) -> String {
+    let dest = concatenate(s1, s2);
+    concatenated(&dest, settings);
+    dest
+}
+
+/// [`concatenate_paths`] without its trace. The separator is `/` on every
+/// OS, where `Path::join` would write `\` on Windows.
+pub(crate) fn concatenate(s1: &str, s2: &str) -> String {
     let mut dest = s1.to_string();
     if !s2.is_empty() && !s2.starts_with('/') && !dest.is_empty() && !dest.ends_with('/') {
         dest.push('/');
@@ -104,7 +112,6 @@ pub(crate) fn concatenate_paths(s1: &str, s2: &str, settings: &SrSettings) -> St
         Some(rest) if dest.ends_with('/') => dest.push_str(rest),
         _ => dest.push_str(s2),
     }
-    concatenated(&dest, settings);
     dest
 }
 

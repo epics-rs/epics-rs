@@ -1279,6 +1279,42 @@ pub struct ArrayOwner {
     arrays: parking_lot::Mutex<Vec<Option<Held>>>,
 }
 
+/// [`ArrayOwner::persistent`]'s array, refilled and published in place. Only
+/// [`ArrayOwner::replace_persistent`] replaces it, releasing the old buffer
+/// before the new one is allocated, as C does.
+///
+/// ```compile_fail,E0308
+/// # use ad_core_rs::ndarray::{NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(16);
+/// # let alloc = || pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let owner = pool.owner().clone();
+/// owner.replace_persistent(0, || Some(alloc()));
+/// let next = PersistentArray::new(alloc());
+/// owner.persistent(0, |p| *p = next);
+/// ```
+pub struct PersistentArrayMut<'a>(&'a mut PersistentArray);
+
+impl PersistentArrayMut<'_> {
+    /// [`PersistentArray::refill`].
+    pub fn refill(&mut self) -> NDArrayMut<'_> {
+        self.0.refill()
+    }
+
+    /// [`PersistentArray::published`].
+    pub fn published(&mut self) -> PublishedArray {
+        self.0.published()
+    }
+}
+
+impl std::ops::Deref for PersistentArrayMut<'_> {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
+        self.0
+    }
+}
+
 /// What C's `pArrays[addr]` points at.
 enum Held {
     /// An array handed over whole, which nothing changes after.
@@ -1398,10 +1434,10 @@ impl ArrayOwner {
     pub fn persistent<R>(
         &self,
         addr: usize,
-        f: impl FnOnce(&mut PersistentArray) -> R,
+        f: impl FnOnce(&mut PersistentArrayMut<'_>) -> R,
     ) -> Option<R> {
         match self.arrays.lock().get_mut(addr)? {
-            Some(Held::Persistent(array)) => Some(f(array)),
+            Some(Held::Persistent(array)) => Some(f(&mut PersistentArrayMut(array))),
             _ => None,
         }
     }
@@ -2092,6 +2128,23 @@ pub(crate) mod tests {
         assert!(owner.array(0).is_none());
         assert!(owner.persistent(0, |_| ()).is_none());
         assert_eq!(pool.num_free_buffers(), 1);
+    }
+
+    /// C releases the old array before allocating its replacement
+    /// (NDDriverStdArrays.cpp:153-158), so a pool with room for one buffer
+    /// still replaces it.
+    #[test]
+    fn a_persistent_replacement_releases_the_old_buffer_first() {
+        use crate::ndarray::{NDDataType, NDDimension};
+        let pool = crate::ndarray_pool::DriverPool::standalone(8);
+        let owner = pool.owner().clone();
+        let alloc = || {
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                .ok()
+        };
+        assert!(owner.replace_persistent(0, alloc));
+        assert!(owner.replace_persistent(0, alloc));
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 
     /// C changes `pArrays[0]` under the driver lock (simDetector.cpp:824-828),

@@ -395,22 +395,15 @@ mod simd_kernels {
 }
 
 /// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`),
-/// into a buffer the caller owns: `out` keeps its element type (that is the
-/// target) and its allocation when it is large enough, so a pooled output
-/// buffer is filled in place as C's `convertType` fills the buffer
-/// `NDArrayPool::alloc` handed it.
+/// into `out`, which keeps its element type (that is the target) and its
+/// allocation when it is large enough, as C's `convertType` fills the
+/// buffer `NDArrayPool::alloc` handed it; a pooled `out` stops at its
+/// charge.
 ///
 /// Every element goes through the C cast (`(dataTypeOut)value`) of
 /// `CCast`: narrowing truncates to the low bits and wraps, it does not
 /// clamp, and a float source truncates toward zero before that, exactly as
 /// [`convert_dims_into`] casts it.
-pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
-    convert_buffer_into(&src.data, out);
-    Ok(())
-}
-
-/// [`convert_type_into`] of a buffer: as many elements as `out` takes, which
-/// for a pooled `out` stops at its charge.
 pub(crate) fn convert_buffer_into(src: &NDDataBuffer, out: &mut NDDataBuffer) {
     if src.data_type() == out.data_type() {
         out.copy_from(src);
@@ -429,8 +422,9 @@ pub(crate) fn convert_buffer_into(src: &NDDataBuffer, out: &mut NDDataBuffer) {
 }
 
 /// The C cast `(D)value` of one `f64` to the element type of `data_type`,
-/// in little-endian bytes: the `CCast` [`convert_type_into`] applies to
-/// every element.
+/// in little-endian bytes: the `CCast`
+/// [`NDArrayPool::convert_type`](crate::ndarray_pool::NDArrayPool::convert_type)
+/// applies to every element.
 pub fn c_cast_f64_le(value: f64, data_type: NDDataType) -> Vec<u8> {
     macro_rules! le {
         ($t:ty) => {

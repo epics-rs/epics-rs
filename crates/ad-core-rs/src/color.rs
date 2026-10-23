@@ -1,5 +1,5 @@
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension};
+use crate::ndarray::{NDArray, NDDataType, NDDataView, NDDataViewMut, NDDimension};
 use crate::ndarray_pool::NDArrayPool;
 
 /// Color mode for NDArray interpretation.
@@ -337,16 +337,6 @@ fn rgb_layout_rows_scalar<T: Copy>(
             }
         }
     }
-}
-
-/// Convert NDArray element type using C cast semantics, into a buffer the
-/// caller owns — the alias for [`crate::convert::convert_type_into`], C++
-/// `convertType` (`NDArrayPool.cpp:378-388`), `*pDataOut++ =
-/// (dataTypeOut)(*pDataIn++)`. A C cast truncates to the low bits on
-/// narrowing (`(epicsUInt8)300 == 44`); it does **not** clamp, so this must
-/// not reintroduce a `clamp()`.
-pub fn convert_data_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
-    crate::convert::convert_type_into(src, out)
 }
 
 /// Convert RGB1 to YUV444 using BT.601 coefficients.

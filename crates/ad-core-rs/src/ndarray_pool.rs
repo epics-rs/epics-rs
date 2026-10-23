@@ -2446,7 +2446,7 @@ mod tests {
         let same = pool.convert_type(&src, NDDataType::UInt8).unwrap();
         assert_eq!(same.unique_id, 77);
 
-        // Differing type: the convert_data_type_into branch.
+        // Differing type: the convert_buffer_into branch.
         let widened = pool.convert_type(&src, NDDataType::Float64).unwrap();
         assert_eq!(widened.unique_id, 77);
 

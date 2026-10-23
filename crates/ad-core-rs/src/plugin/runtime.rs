@@ -136,6 +136,9 @@ pub enum ParamUpdate {
         reason: usize,
         addr: i32,
         value: Vec<f64>,
+        /// An array holding the plugin's state, such as an axis, rather than
+        /// a frame's data; see [`PortDriverBase::do_callbacks_state_array`].
+        state: bool,
     },
     /// C `callParamCallbacks(addr)` where it stands.
     Callbacks { addr: i32 },
@@ -180,6 +183,7 @@ impl ParamUpdate {
             reason,
             addr: 0,
             value,
+            state: false,
         }
     }
     /// Create a Float64Array update at a specific addr.
@@ -188,6 +192,16 @@ impl ParamUpdate {
             reason,
             addr,
             value,
+            state: false,
+        }
+    }
+    /// Create a state Float64Array update at addr 0.
+    pub fn state_float64_array(reason: usize, value: Vec<f64>) -> Self {
+        Self::Float64Array {
+            reason,
+            addr: 0,
+            value,
+            state: true,
         }
     }
     /// Create an Octet (string) update at addr 0.
@@ -236,11 +250,15 @@ impl ParamUpdate {
                 reason,
                 addr,
                 value,
-            } => ParamSetValue::array(
-                *reason,
-                *addr,
-                ParamValue::Float64Array(value.clone().into()),
-            ),
+                state,
+            } => {
+                let value = ParamValue::Float64Array(value.clone().into());
+                if *state {
+                    ParamSetValue::state_array(*reason, *addr, value)
+                } else {
+                    ParamSetValue::array(*reason, *addr, value)
+                }
+            }
             Self::Callbacks { addr } => ParamSetValue::callbacks(*addr),
         }
     }
@@ -601,6 +619,8 @@ pub enum SideParam {
         reason: usize,
         addr: i32,
         value: Vec<f64>,
+        /// As [`ParamUpdate::Float64Array`]'s.
+        state: bool,
     },
     /// C `callParamCallbacks(addr)`, at once.
     Callbacks { addr: i32 },
@@ -640,10 +660,12 @@ impl From<ParamUpdate> for SideParam {
                 reason,
                 addr,
                 value,
+                state,
             } => Self::Float64Array {
                 reason,
                 addr,
                 value,
+                state,
             },
             ParamUpdate::Callbacks { addr } => Self::Callbacks { addr },
         }
@@ -841,7 +863,14 @@ fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
             reason,
             addr,
             value,
+            state: false,
         } => base.do_callbacks_array(reason, addr, ParamValue::Float64Array(value.into())),
+        SideParam::Float64Array {
+            reason,
+            addr,
+            value,
+            state: true,
+        } => base.do_callbacks_state_array(reason, addr, ParamValue::Float64Array(value.into())),
         SideParam::Callbacks { addr } => base.call_param_callbacks(addr),
     }
 }
@@ -1120,7 +1149,6 @@ trait ValidateWrite: Send + Sync {
         base: &PortDriverBase,
     ) -> WriteOutcome<String>;
     fn posts_before_write(&self, reason: usize, value: i32) -> bool;
-    fn edge_posts(&self) -> Vec<ParamUpdate>;
 }
 
 impl<P: NDPluginProcess> ValidateWrite for P {
@@ -1167,9 +1195,6 @@ impl<P: NDPluginProcess> ValidateWrite for P {
     }
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         NDPluginProcess::posts_before_write(self, reason, value)
-    }
-    fn edge_posts(&self) -> Vec<ParamUpdate> {
-        NDPluginProcess::edge_posts(self)
     }
 }
 
@@ -1341,13 +1366,6 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// Return param updates to be written back to the port driver.
     fn on_param_change(&self, _reason: usize, _params: &PluginParamSnapshot) -> ParamChangeResult {
         ParamChangeResult::empty()
-    }
-
-    /// The arrays posted again when the port's interrupts open
-    /// ([`PortDriver::interrupts_opened`]): an axis C builds from a frame,
-    /// which every record dropped if that frame came before the gate.
-    fn edge_posts(&self) -> Vec<ParamUpdate> {
-        Vec::new()
     }
 
     /// Return a handle to the latest NDArray data for array reads.
@@ -1567,7 +1585,7 @@ struct SharedProcessorInner {
     prev_input_array: Option<PublishedArray>,
     /// Previous array dimensions, for firing an NDDimensions int32-array
     /// callback when dimensions change (C++ `dimsPrev_`, G8).
-    dims_prev: DimsPrev,
+    dims_prev: Vec<i32>,
     /// Source address selected via the NDArrayAddr PV (C++ `NDArrayAddr`, G6).
     nd_array_addr: i32,
     /// NumThreads as the port's write path accepted it.
@@ -1668,10 +1686,9 @@ impl SharedProcessorInner {
         {
             *slot = d.size as i32;
         }
-        let mut dims_prev = self.dims_prev.lock();
-        (cur_dims != *dims_prev).then(|| {
-            *dims_prev = cur_dims.clone();
-            asyn_rs::request::ParamSetValue::array(
+        (cur_dims != self.dims_prev).then(|| {
+            self.dims_prev = cur_dims.clone();
+            asyn_rs::request::ParamSetValue::state_array(
                 self.ndarray_params.array_dimensions,
                 0,
                 ParamValue::Int32Array(cur_dims.into()),
@@ -2307,10 +2324,6 @@ pub const ASYN_MULTIDEVICE: PortFlags = PortFlags {
     ..ASYN_NONE
 };
 
-/// C `dimsPrev_`: written by the data side, read by the port at the
-/// interrupt edge.
-type DimsPrev = Arc<parking_lot::Mutex<Vec<i32>>>;
-
 /// PortDriver implementation for a plugin's control plane.
 #[allow(dead_code)]
 pub struct PluginPortDriver {
@@ -2345,9 +2358,6 @@ pub struct PluginPortDriver {
     /// A plugin built with blocking callbacks has not, so its configure-line
     /// queueSize stands unfloored until it first goes non-blocking.
     callback_threads: bool,
-    /// C `dimsPrev_`, which the frame's dimensions post writes and the
-    /// interrupt edge posts again.
-    dims_prev: DimsPrev,
 }
 
 impl PluginPortDriver {
@@ -2467,11 +2477,6 @@ impl PluginPortDriver {
             owner,
             pool: pool.clone(),
             callback_threads,
-            // NDPluginDriver.cpp:111.
-            dims_prev: Arc::new(parking_lot::Mutex::new(vec![
-                0;
-                crate::ndarray::ND_ARRAY_MAX_DIMS
-            ])),
         };
         Ok((driver, processor, pool))
     }
@@ -2912,23 +2917,6 @@ impl PortDriver for PluginPortDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// NDDimensions posts only when the dims change (NDPluginDriver.cpp:
-    /// 245-246), so a first frame before the gate left Dimensions_RBV empty
-    /// until they changed. Zeros are the constructor's, never posted.
-    fn interrupts_opened(&mut self) {
-        let dims = self.dims_prev.lock().clone();
-        if dims.iter().any(|&d| d != 0) {
-            let _ = self.base.do_callbacks_array(
-                self.ndarray_params.array_dimensions,
-                0,
-                ParamValue::Int32Array(dims.into()),
-            );
-        }
-        for post in self.validator.edge_posts() {
-            let _ = set_side(&mut self.base, post.into());
-        }
     }
 
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -3445,7 +3433,6 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
     let std_array_data_param = driver.std_array_data_param;
-    let dims_prev = driver.dims_prev.clone();
 
     // Create port runtime (actor thread for param I/O).
     //
@@ -3513,7 +3500,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
-        dims_prev,
+        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
@@ -5136,6 +5123,16 @@ mod tests {
         Vec<String>,
     );
 
+    /// When the port's interrupt edge sweep runs.
+    #[derive(Clone, Copy)]
+    enum Sweep {
+        /// The gate is open from the start.
+        First,
+        /// The gate opens before the frame, its sweep runs after the frame's
+        /// posts.
+        AfterTheFrame,
+    }
+
     /// What one frame of `data` through a StdArrays plugin posts on
     /// STD_ARRAY_DATA: each binding on `bound` records its post's interface
     /// and value, and an observer, which binds nothing, every post's
@@ -5144,7 +5141,9 @@ mod tests {
         port: &str,
         data: crate::ndarray::NDDataBuffer,
         bound: &[asyn_rs::interfaces::InterfaceType],
+        sweep: Sweep,
     ) -> StdArrayPosts {
+        use epics_libcom_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
         fn shown(v: &ParamValue) -> String {
             match v {
                 ParamValue::Int8Array(a) => format!("Int8 {a:?}"),
@@ -5171,12 +5170,28 @@ mod tests {
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle().clone();
-        claim
-            .publish(
-                port.clone(),
-                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
-            )
-            .unwrap();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (gate, opener) = match sweep {
+            Sweep::First => {
+                let gate = InterruptGate::opened();
+                claim.publish(port.clone(), &gate).unwrap();
+                (gate, None)
+            }
+            Sweep::AfterTheFrame => {
+                let gate = InterruptGate::new();
+                // Runs ahead of the port's own edge callback, the gate open.
+                let held = release.clone();
+                gate.on_open(move || {
+                    held.wait();
+                    EdgeDone::Inline
+                });
+                claim.publish(port.clone(), &gate).unwrap();
+                let opening = gate.clone();
+                let opener = std::thread::spawn(move || opening.set(true));
+                wait_until("the gate to open", || gate.is_open());
+                (gate, Some(opener))
+            }
+        };
         enable_callbacks(&handle);
         let std = port
             .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
@@ -5212,6 +5227,17 @@ mod tests {
         params_applied(&handle);
         // The flush is enqueued, not run: a round trip runs behind it.
         port.read_int32_blocking(counter, 0).unwrap();
+        if let Some(opener) = opener {
+            release.wait();
+            opener.join().unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(gate.jobs_settled());
+            wait_until("the edge sweep", || {
+                port.interrupts().edge_sweeps().is_clear()
+            });
+        }
         let mut observed = Vec::new();
         loop {
             match observer.try_recv() {
@@ -5249,7 +5275,8 @@ mod tests {
                 "[4294967295.0]",
             ),
         ] {
-            let (posts, observed) = std_array_posts(port, data, &[Int32Array, Float64Array]);
+            let (posts, observed) =
+                std_array_posts(port, data, &[Int32Array, Float64Array], Sweep::First);
             assert_eq!(
                 posts,
                 [
@@ -5270,10 +5297,30 @@ mod tests {
     /// `arrayInterruptCallback` converts only for a node on its list.
     #[test]
     fn a_std_arrays_frame_with_no_bound_interface_posts_nothing() {
-        let (posts, observed) =
-            std_array_posts("STDNONE", crate::ndarray::NDDataBuffer::U8(vec![255]), &[]);
+        let (posts, observed) = std_array_posts(
+            "STDNONE",
+            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            &[],
+            Sweep::First,
+        );
         assert!(posts.is_empty());
         assert_eq!(observed, ["dims"]);
+    }
+
+    /// A frame the open gate delivered before the port's edge sweep ran: the
+    /// sweep posts no dims of its own, whatever the frame left in
+    /// `dimsPrev_`.
+    #[test]
+    fn a_std_arrays_frame_before_the_edge_sweep_is_posted_once() {
+        use asyn_rs::interfaces::InterfaceType::Int32Array;
+        let (posts, observed) = std_array_posts(
+            "STDSWEEP",
+            crate::ndarray::NDDataBuffer::U8(vec![255]),
+            &[Int32Array],
+            Sweep::AfterTheFrame,
+        );
+        assert_eq!(posts, [(Some(Int32Array), "Int32 [255]".to_string())]);
+        assert_eq!(observed, ["dims", "Some(Int32Array)"]);
     }
 
     /// Sets its own STAMP to ten times the frame's id and forwards the frame.

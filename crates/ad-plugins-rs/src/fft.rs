@@ -429,13 +429,13 @@ impl FFTProcessor {
     }
 
     /// C `createAxisArrays`' two posts (NDPluginFFT.cpp:253-254) for an
-    /// input `n_x` wide, padded as the transform pads it.
+    /// input `n_x` wide, padded as the transform pads it: state posts.
     fn axis_posts(&self, frame: &FFTFrame<'_>, n_x: usize) -> Vec<ParamUpdate> {
         let n_time = next_pow2(n_x);
         let time = (self.params.time_axis)
-            .map(|idx| ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
+            .map(|idx| ParamUpdate::state_float64_array(idx, frame.time_axis(n_time)));
         let freq = (self.params.freq_axis)
-            .map(|idx| ParamUpdate::float64_array(idx, frame.freq_axis(n_time / 2)));
+            .map(|idx| ParamUpdate::state_float64_array(idx, frame.freq_axis(n_time / 2)));
         time.into_iter().chain(freq).collect()
     }
 }
@@ -840,23 +840,6 @@ impl NDPluginProcess for FFTProcessor {
             }
             None => ProcessResult::sink(updates),
         }
-    }
-
-    /// The axes the last size or TimePerPoint change posted (:118, :330),
-    /// again: C posts them next only on another change, so a first frame
-    /// that beat `interruptAccept` left every record without them. That C
-    /// bug is not copied. Before any frame, nothing, as in C.
-    fn edge_posts(&self) -> Vec<ParamUpdate> {
-        let state = self.state.lock();
-        let Some((n_x, _, time_per_point)) = state.axes_for else {
-            return Vec::new();
-        };
-        let frame = FFTFrame {
-            config: state.config,
-            time_per_point,
-            planner: &self.planner,
-        };
-        self.axis_posts(&frame, n_x)
     }
 
     fn plugin_type(&self) -> &str {

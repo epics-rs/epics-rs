@@ -828,6 +828,15 @@ pub enum ParamSetValue {
         addr: i32,
         value: ParamValue,
     },
+    /// [`Self::Array`] of an array that holds the driver's state rather than
+    /// a frame's data ([`PortDriverBase::do_callbacks_state_array`]).
+    ///
+    /// [`PortDriverBase::do_callbacks_state_array`]: crate::port::PortDriverBase::do_callbacks_state_array
+    StateArray {
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    },
     /// C `callParamCallbacks(addr)` where it stands in the batch.
     Callbacks { addr: i32 },
 }
@@ -897,6 +906,15 @@ impl ParamSetValue {
         }
     }
 
+    /// [`Self::StateArray`].
+    pub fn state_array(reason: usize, addr: i32, value: ParamValue) -> Self {
+        Self::StateArray {
+            reason,
+            addr,
+            value,
+        }
+    }
+
     /// C `callParamCallbacks(addr)`.
     pub fn callbacks(addr: i32) -> Self {
         Self::Callbacks { addr }
@@ -911,6 +929,7 @@ impl ParamSetValue {
             | Self::AlarmStatus { addr, .. }
             | Self::AlarmSeverity { addr, .. }
             | Self::Array { addr, .. }
+            | Self::StateArray { addr, .. }
             | Self::Callbacks { addr } => *addr,
         }
     }
@@ -926,7 +945,7 @@ impl ParamSetValue {
             | Self::Status { addr, .. }
             | Self::AlarmStatus { addr, .. }
             | Self::AlarmSeverity { addr, .. } => Some(*addr),
-            Self::Array { .. } | Self::Callbacks { .. } => None,
+            Self::Array { .. } | Self::StateArray { .. } | Self::Callbacks { .. } => None,
         }
     }
 }

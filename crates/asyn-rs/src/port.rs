@@ -679,6 +679,9 @@ pub struct PortDriverBase {
     /// parameter read carries. Zero-initialised in C, so the EPICS epoch
     /// until the driver updates or sets it.
     time_stamp: SystemTime,
+    /// The state arrays a closed gate dropped, by `(reason, addr)`; see
+    /// [`Self::do_callbacks_state_array`].
+    owed_arrays: Vec<(usize, i32, ParamValue)>,
     /// By reason; empty until a rule is registered, so a port without one
     /// pays a bounds check per store.
     int32_rules: Vec<Option<Int32StoreRule>>,
@@ -876,6 +879,7 @@ impl PortDriverBase {
                 + Duration::from_secs(
                     epics_libcom_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS,
                 ),
+            owed_arrays: Vec::new(),
             int32_rules: Vec::new(),
             octet_write_rules: Vec::new(),
             octet_writer: OctetWriter::ASYN_PORT_DRIVER,
@@ -2570,6 +2574,11 @@ impl PortDriverBase {
                 addr,
                 ref value,
             } => self.do_callbacks_array(reason, addr, value.clone()),
+            P::StateArray {
+                reason,
+                addr,
+                ref value,
+            } => self.do_callbacks_state_array(reason, addr, value.clone()),
             P::Callbacks { addr } => self.call_param_callbacks(addr),
         }
     }
@@ -2805,6 +2814,43 @@ impl PortDriverBase {
             eom_reason: EomReason::empty(),
         });
         Ok(())
+    }
+
+    /// [`Self::do_callbacks_array`] of an array holding the driver's state,
+    /// as an axis does. A record drops a post while the gate is closed
+    /// (devAsynXXXArray.cpp:407-410) and C's edge sweep posts no array; that
+    /// C loss is not copied: the post stays owed until one here is posted
+    /// open, and the edge sweep posts what is still owed.
+    pub fn do_callbacks_state_array(
+        &mut self,
+        reason: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
+        let owed = self
+            .owed_arrays
+            .iter()
+            .position(|&(r, a, _)| (r, a) == (reason, addr));
+        // Read before the post: a gate that opens during it may let a record
+        // take a post owed here, posted twice rather than lost.
+        match (self.interrupts.accepting(), owed) {
+            (true, Some(i)) => drop(self.owed_arrays.remove(i)),
+            (true, None) => {}
+            (false, Some(i)) => self.owed_arrays[i].2 = value.clone(),
+            (false, None) => self.owed_arrays.push((reason, addr, value.clone())),
+        }
+        self.do_callbacks_array(reason, addr, value)
+    }
+
+    /// The edge sweep's posts of what [`Self::do_callbacks_state_array`]
+    /// owes; kept for the next edge while the gate is closed again.
+    pub(crate) fn post_owed_arrays(&mut self) {
+        if !self.interrupts.accepting() {
+            return;
+        }
+        for (reason, addr, value) in std::mem::take(&mut self.owed_arrays) {
+            let _ = self.do_callbacks_array(reason, addr, value);
+        }
     }
 }
 
@@ -3096,12 +3142,6 @@ fn read_array_not_implemented() -> AsynError {
 pub trait PortDriver: Any + Send + Sync {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
-
-    /// Runs on the port at each interrupt edge, after the parameter sweep.
-    /// That sweep posts no array (asynPortDriver.cpp:846-865), so an array
-    /// posted while the gate was closed reached no record; a driver posts
-    /// here the arrays that hold its state rather than a frame's data.
-    fn interrupts_opened(&mut self) {}
 
     // --- AsynCommon ---
 
@@ -4267,6 +4307,71 @@ pub(crate) mod tests {
             "the seed preserved across the gated call must reach the subscriber \
              once interrupts are accepted"
         );
+    }
+
+    /// The values a record takes from `posts` of one array, each `(value,
+    /// gate open, state post)`, then the edge sweep's posts, with the gate
+    /// closed (`false`) or open at that sweep.
+    fn array_posts_a_record_takes(posts: &[(i32, bool, bool)], sweep_open: bool) -> Vec<i32> {
+        use crate::interrupt::InterruptFilter;
+        use std::sync::{Arc, Mutex};
+
+        let gate = InterruptGate::new();
+        let mut base = PortDriverBase::new(
+            "owed",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(gate.clone());
+        let axis = base.create_param("AXIS", ParamType::Int32Array).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, record_gate) = (seen.clone(), gate.clone());
+        // A record's callback returns while the gate is closed.
+        let _record = base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                if let (ParamValue::Int32Array(a), true) = (&iv.value, record_gate.is_open()) {
+                    sink.lock().unwrap().push(a[0]);
+                }
+            })
+            .unwrap();
+        for &(v, open, state) in posts {
+            gate.set(open);
+            let value = ParamValue::Int32Array(Arc::from([v]));
+            if state {
+                base.do_callbacks_state_array(axis, 0, value).unwrap();
+            } else {
+                base.do_callbacks_array(axis, 0, value).unwrap();
+            }
+        }
+        gate.set(sweep_open);
+        base.post_owed_arrays();
+        if !sweep_open {
+            gate.set(true);
+            base.post_owed_arrays();
+        }
+        seen.lock().unwrap().clone()
+    }
+
+    /// Boundaries of what a state array owes the edge: a dropped post, a
+    /// delivered one, a delivered one after a drop, two drops, a plain
+    /// post's drop, and a sweep the gate closed again before.
+    #[test]
+    fn the_edge_posts_a_state_array_only_as_a_closed_gate_dropped_it() {
+        assert_eq!(array_posts_a_record_takes(&[(1, false, true)], true), [1]);
+        assert_eq!(array_posts_a_record_takes(&[(1, true, true)], true), [1]);
+        assert_eq!(
+            array_posts_a_record_takes(&[(1, false, true), (2, true, true)], true),
+            [2]
+        );
+        assert_eq!(
+            array_posts_a_record_takes(&[(1, false, true), (2, false, true)], true),
+            [2]
+        );
+        assert!(array_posts_a_record_takes(&[(1, false, false)], true).is_empty());
+        assert_eq!(array_posts_a_record_takes(&[(1, false, true)], false), [1]);
     }
 
     struct TestDriver {

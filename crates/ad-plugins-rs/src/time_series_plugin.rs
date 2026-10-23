@@ -302,6 +302,8 @@ impl TimeSeriesState {
     /// `i * averagingTimeActual_`; Circular mode ends at 0 with
     /// `-(numTimePoints_-1-i) * averagingTimeActual_`. Returns the `TS_TIME_AXIS`
     /// update (C `doCallbacksFloat64Array(timeAxis_, ..., P_TSTimeAxis, 0)`).
+    /// A state post from the first frame on (:422): one before it is C's,
+    /// which a closed gate drops for good.
     fn create_axis_array(&self) -> Vec<ParamUpdate> {
         let axis: Vec<f64> = (0..self.num_time_points)
             .map(|i| match self.acquire_mode {
@@ -311,7 +313,12 @@ impl TimeSeriesState {
                 }
             })
             .collect();
-        vec![ParamUpdate::float64_array(self.p.ts_time_axis, axis)]
+        let post = if self.num_signals_in < 0 {
+            ParamUpdate::float64_array
+        } else {
+            ParamUpdate::state_float64_array
+        };
+        vec![post(self.p.ts_time_axis, axis)]
     }
 
     /// C `acquireReset` (NDPluginTimeSeries.cpp:137-145): zero the circular buffer
@@ -722,19 +729,6 @@ impl NDPluginProcess for TimeSeriesProcessor {
         result
     }
 
-    /// The axis the first frame posted (:422), again: C posts it next only
-    /// on a size, type or setting change, so a first frame that beat
-    /// `interruptAccept` left every record without it. C loses it the same
-    /// way when its first frame wins that race; that C bug is not copied.
-    /// Before any frame, nothing, as C's constructor axis (:160).
-    fn edge_posts(&self) -> Vec<ParamUpdate> {
-        let state = self.state.lock();
-        if state.num_signals_in < 0 {
-            return Vec::new();
-        }
-        state.create_axis_array()
-    }
-
     fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
         self.array_callbacks = array_callbacks;
     }
@@ -1059,6 +1053,7 @@ mod tests {
                 reason: r,
                 addr: a,
                 value,
+                ..
             } if *r == reason && *a == addr => Some(value.clone()),
             _ => None,
         })
@@ -1257,6 +1252,7 @@ mod tests {
                 reason: r,
                 addr: a,
                 value,
+                ..
             } if *r == reason && *a == addr => Some(value.clone()),
             _ => None,
         })
@@ -1361,6 +1357,7 @@ mod tests {
                     reason,
                     addr,
                     value,
+                    ..
                 } if *reason == proc.state.lock().p.ts_time_series && *addr == 0 => {
                     Some(value.clone())
                 }

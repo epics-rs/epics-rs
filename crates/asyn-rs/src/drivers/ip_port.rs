@@ -1027,7 +1027,9 @@ pub struct DrvAsynIPPort {
     /// The parsed hostInfo; `None` is C's `FLAG_SHUTDOWN` after a failed
     /// `parseHostInfo` (drvAsynIPPort.c:286, :399-400), which `connectIt`
     /// refuses.
-    config: Option<IpPortConfig>,
+    config: Option<HostInfo>,
+    /// The lookup C's `hostToIPAddr` makes; a test answers its own.
+    resolver: Resolver,
     /// `TCP_NODELAY` for the next TCP connect: C sets it unconditionally
     /// (connectIt :580-589); the rs-only `noDelay` option can turn it off, and
     /// a hostInfo reparse leaves it alone.
@@ -1039,6 +1041,28 @@ pub struct DrvAsynIPPort {
     /// string's protocol token was `COM` — C's `tty->isCom` (`drvAsynIPPort.c`
     /// :113, :364-365) and the `asynInterposeCOM` install it gates (:1115).
     com: Option<ComState>,
+}
+
+/// A name lookup: every answer, in the resolver's order; none on a failure.
+type Resolver = Box<dyn Fn(&str, u16) -> Vec<std::net::SocketAddr> + Send + Sync>;
+
+/// The system resolver, asked as `hostToIPAddr` asks it.
+fn system_lookup(host: &str, port: u16) -> Vec<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .unwrap_or_default()
+}
+
+/// The parsed hostInfo and the address its lookup kept: one value, so a new
+/// hostInfo owes a lookup by construction, as C `parseHostInfo` sets
+/// `FLAG_NEED_LOOKUP` beside each new `farAddr` (drvAsynIPPort.c:351-355).
+struct HostInfo {
+    config: IpPortConfig,
+    /// C's `farAddr` once looked up (`FLAG_DONE_LOOKUP`, :488-497); `None`
+    /// while a lookup is owed (`FLAG_NEED_LOOKUP`).
+    kept: Option<std::net::SocketAddr>,
 }
 
 /// The two halves of C's `asynInterposeCOM`, which it interposes on the port as
@@ -1472,7 +1496,7 @@ impl DrvAsynIPPort {
 
     /// C `FLAG_CONNECT_PER_TRANSACTION`, which a shut-down port has lost.
     fn per_transaction(&self) -> bool {
-        matches!(&self.config, Some(c) if c.protocol == IpProtocol::Http)
+        matches!(&self.config, Some(h) if h.config.protocol == IpProtocol::Http)
     }
 
     /// The driver's one connection-edge owner. C's COM interpose restores its
@@ -1582,7 +1606,8 @@ impl DrvAsynIPPort {
 
         Ok(Self {
             base,
-            config: Some(config),
+            config: Some(HostInfo { config, kept: None }),
+            resolver: Box::new(system_lookup),
             no_delay: true,
             io: IpIoState::new(config_str.to_string()),
             disconnect_on_read_timeout: false,
@@ -1764,21 +1789,31 @@ impl DrvAsynIPPort {
         }
     }
 
-    /// Resolve the remote at connect time, as C does in case the device has
-    /// just appeared in DNS, to the one address C's `hostToIPAddr` gives
-    /// (drvAsynIPPort.c:484-494): one connect, under one
-    /// `autoConnectTimeout`, whatever else the name answers. A failed or
-    /// empty lookup is C's one message for `hostToIPAddr` failing.
-    fn resolve_remote(config: &IpPortConfig) -> AsynResult<std::net::SocketAddr> {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<_> = (config.host.as_str(), config.port)
-            .to_socket_addrs()
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        one_remote(&addrs).ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("Unknown host \"{}\"", config.host),
-        })
+    /// C `connectIt`'s `farAddr` (drvAsynIPPort.c:484-497): the address an
+    /// earlier lookup kept, else a lookup now — at the first connect rather
+    /// than at configure, "in case a device has just appeared in a DNS
+    /// database" — kept for every later connect until a TCP connect to it
+    /// fails ([`Self::connect_tcp`]). One address, `hostToIPAddr`'s
+    /// ([`one_remote`]), so one connect under one `autoConnectTimeout`; a
+    /// numeric host is its own address and asks the resolver nothing. A
+    /// failed or empty lookup is C's one message for `hostToIPAddr` failing.
+    fn resolve_remote(&mut self) -> AsynResult<std::net::SocketAddr> {
+        let host_info = self.config.as_mut().expect("the port is shut down");
+        if let Some(addr) = host_info.kept {
+            return Ok(addr);
+        }
+        let IpPortConfig { host, port, .. } = &host_info.config;
+        let addr = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, *port),
+            Err(_) => {
+                one_remote(&(self.resolver)(host, *port)).ok_or_else(|| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("Unknown host \"{host}\""),
+                })?
+            }
+        };
+        host_info.kept = Some(addr);
+        Ok(addr)
     }
 
     fn enable_nodelay(&self, stream: &TcpStream) -> AsynResult<()> {
@@ -1788,8 +1823,9 @@ impl DrvAsynIPPort {
         })
     }
 
-    fn connect_tcp(&self, config: &IpPortConfig) -> AsynResult<TcpStream> {
-        let remote_addr = Self::resolve_remote(config)?;
+    fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
+        let remote_addr = self.resolve_remote()?;
+        let config = self.config();
         // C binds the local address only when one was configured — "a very
         // unusual configuration" (:499-506).
         let local_addr: Option<std::net::SocketAddr> = config.local_port.map(|local_port| {
@@ -1805,18 +1841,27 @@ impl DrvAsynIPPort {
         // C bounds the connect by `pasynBase->autoConnectTimeout`, read here
         // and now (drvAsynIPPort.c:541-566).
         let timeout = crate::runtime::config::connect_poll_timeout();
-        socket::tcp_connect(remote_addr, local_addr, opts, timeout).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: connect_failure_text(&self.io.host_info, &e),
+        socket::tcp_connect(remote_addr, local_addr, opts, timeout).map_err(|e| {
+            // C :572-574: a failed connect, not a failed setup step, owes the
+            // next connect a lookup, "in case the problem is just that the
+            // device has DHCP'd itself an new number" (:530-532).
+            if !matches!(e, socket::TcpConnectError::Setup(_)) {
+                self.config.as_mut().expect("the port is shut down").kept = None;
+            }
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: connect_failure_text(&self.io.host_info, &e),
+            }
         })
     }
 
-    fn connect_udp(&self, config: &IpPortConfig) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+    fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
         // C drvAsynIPPort.c::connectIt (484-493) resolves the remote name to
         // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
         // Resolve the peer once, then leave the socket unconnected and bind
         // a local endpoint of the peer's address family.
-        let peer = Self::resolve_remote(config)?;
+        let peer = self.resolve_remote()?;
+        let config = self.config();
         let local_port = config.local_port.unwrap_or(0);
         let local_addr: std::net::SocketAddr = if peer.is_ipv6() {
             (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
@@ -1837,10 +1882,10 @@ impl DrvAsynIPPort {
     }
 
     #[cfg(asyn_af_unix)]
-    fn connect_unix(&self, config: &IpPortConfig) -> AsynResult<std::os::unix::net::UnixStream> {
+    fn connect_unix(&self) -> AsynResult<std::os::unix::net::UnixStream> {
         // C's one connect text for every family (drvAsynIPPort.c:568-571); an
         // AF_UNIX connect fails at once, so its own errno is the one C saves.
-        let stream = std::os::unix::net::UnixStream::connect(&config.host).map_err(|e| {
+        let stream = std::os::unix::net::UnixStream::connect(&self.config().host).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!(
@@ -1921,7 +1966,7 @@ impl DrvAsynIPPort {
             });
         }
         // C :429-432, after the already-open check.
-        let Some(config) = &self.config else {
+        let Some(protocol) = self.config.as_ref().map(|h| h.config.protocol) else {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("{}: Link shutdown!", self.io.host_info),
@@ -1930,12 +1975,12 @@ impl DrvAsynIPPort {
         // Built into a local and installed by `publish_transport` below, never
         // stored here: a step after the install that can fail is exactly what
         // wedged the port.
-        let inner = match config.protocol {
+        let inner = match protocol {
             // C :364-367 — `com` leaves `socketType = SOCK_STREAM` and sets no
             // flags, so its transport is plain TCP; the whole of what `COM` adds
             // rides in the interpose, not the socket.
             IpProtocol::Tcp | IpProtocol::TcpReusePort | IpProtocol::Com => {
-                let stream = self.connect_tcp(config)?;
+                let stream = self.connect_tcp()?;
                 if self.no_delay {
                     self.enable_nodelay(&stream)?;
                 }
@@ -1950,11 +1995,11 @@ impl DrvAsynIPPort {
             | IpProtocol::UdpBroadcastReusePort => {
                 // BROADCAST / SO_REUSEPORT are the socket's, applied by
                 // `new_socket` before the bind — they are not a post-bind fixup.
-                let (socket, peer) = self.connect_udp(config)?;
+                let (socket, peer) = self.connect_udp()?;
                 IpIoInner::Udp(socket, peer)
             }
             #[cfg(asyn_af_unix)]
-            IpProtocol::Unix => IpIoInner::Unix(self.connect_unix(config)?),
+            IpProtocol::Unix => IpIoInner::Unix(self.connect_unix()?),
             // Unreachable rather than defensive: `IpPortConfig::parse` refuses
             // a `unix://` spec outright on a platform without AF_UNIX, so no
             // config carrying this variant can exist here. The arm is present
@@ -1970,7 +2015,7 @@ impl DrvAsynIPPort {
             // HTTP opens its socket per transaction, from write_octet and
             // read_octet_core.
             IpProtocol::Http => {
-                let stream = self.connect_tcp(config)?;
+                let stream = self.connect_tcp()?;
                 self.enable_nodelay(&stream)?;
                 IpIoInner::Tcp(stream)
             }
@@ -2146,7 +2191,10 @@ impl PortDriver for DrvAsynIPPort {
             self.io.n_written = 0;
             self.io.host_info = value.to_string();
             self.config = None;
-            self.config = Some(IpPortConfig::parse(value)?);
+            self.config = Some(HostInfo {
+                config: IpPortConfig::parse(value)?,
+                kept: None,
+            });
         } else if !key.is_empty() {
             // C drvAsynIPPort.c::setOption (lines 941-945): any non-empty
             // unsupported key returns asynError "Unsupported key"; the empty
@@ -2187,10 +2235,10 @@ impl PortDriver for DrvAsynIPPort {
     }
 }
 
-#[cfg(test)]
 impl DrvAsynIPPort {
+    /// The parsed hostInfo of a port that is not shut down.
     fn config(&self) -> &IpPortConfig {
-        self.config.as_ref().expect("the port is shut down")
+        &self.config.as_ref().expect("the port is shut down").config
     }
 }
 
@@ -4096,6 +4144,157 @@ mod tests {
         );
     }
 
+    /// A resolver the test answers for, which counts the lookups it is asked.
+    #[derive(Clone, Default)]
+    struct FakeDns {
+        answer: std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeDns {
+        /// A driver for `hostInfo` that looks its names up here, answering `at`.
+        fn port(host_info: &str, at: std::net::SocketAddr) -> (DrvAsynIPPort, Self) {
+            let dns = Self::default();
+            dns.answer(at);
+            let mut drv = DrvAsynIPPort::new("iptest", host_info).unwrap();
+            let asked = dns.clone();
+            drv.resolver = Box::new(move |_, _| {
+                asked
+                    .lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                asked.answer.lock().unwrap().clone()
+            });
+            (drv, dns)
+        }
+
+        fn answer(&self, at: std::net::SocketAddr) {
+            *self.answer.lock().unwrap() = vec![at];
+        }
+
+        fn forget(&self) {
+            self.answer.lock().unwrap().clear();
+        }
+
+        fn lookups(&self) -> usize {
+            self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Read the EOF of a peer that closed, which closes the link (C readIt,
+    /// drvAsynIPPort.c:815-821).
+    fn read_the_peer_s_close(drv: &mut DrvAsynIPPort) {
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let (n, eom) = drv.io_read_octet(&user, &mut [0u8; 8]).unwrap();
+        assert!(n == 0 && eom.contains(EomReason::END));
+        assert!(!drv.base().is_connected());
+    }
+
+    /// C keeps `farAddr` once looked up (`FLAG_DONE_LOOKUP`,
+    /// drvAsynIPPort.c:488-497): a reconnect after the peer closes looks
+    /// nothing up.
+    #[test]
+    fn a_reconnect_after_the_peer_closes_looks_nothing_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let (mut drv, dns) = FakeDns::port(&format!("dev.test:{}", at.port()), at);
+        drv.connect(&AsynUser::default()).unwrap();
+        drop(listener.accept().unwrap());
+        read_the_peer_s_close(&mut drv);
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(listener.accept().is_ok());
+        assert_eq!(dns.lookups(), 1);
+    }
+
+    /// The kept address is the device's whatever DNS says later, so a name
+    /// gone from it still reconnects.
+    #[test]
+    fn a_name_gone_from_dns_still_reconnects_to_the_kept_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let (mut drv, dns) = FakeDns::port(&format!("dev.test:{}", at.port()), at);
+        drv.connect(&AsynUser::default()).unwrap();
+        drop(listener.accept().unwrap());
+        read_the_peer_s_close(&mut drv);
+        dns.forget();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(listener.accept().is_ok());
+    }
+
+    /// A failed TCP connect owes the next connect a lookup, "in case the
+    /// device has DHCP'd itself an new number" (drvAsynIPPort.c:530-532,
+    /// :572-574), and the new number is the one it reaches.
+    #[test]
+    fn a_failed_connect_owes_the_next_connect_a_lookup() {
+        let refused = named_port::HeldPort::closed_tcp();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let moved = listener.local_addr().unwrap();
+        let (mut drv, dns) = FakeDns::port(
+            "dev.test:1",
+            std::net::SocketAddr::from(([127, 0, 0, 1], refused.port)),
+        );
+        drv.connect(&AsynUser::default()).unwrap_err();
+        dns.answer(moved);
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(listener.accept().is_ok());
+        assert_eq!(dns.lookups(), 2);
+    }
+
+    /// A numeric host is its own address: no lookup, not even after a
+    /// failed connect.
+    #[test]
+    fn a_numeric_host_never_looks_up() {
+        let refused = named_port::HeldPort::closed_tcp();
+        let at = std::net::SocketAddr::from(([127, 0, 0, 1], refused.port));
+        let (mut drv, dns) = FakeDns::port(&at.to_string(), at);
+        drv.connect(&AsynUser::default()).unwrap_err();
+        drv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(dns.lookups(), 0);
+    }
+
+    /// A UDP port never fails a connect, so C looks its name up once per
+    /// hostInfo: a reconnect looks nothing up, a new hostInfo does.
+    #[test]
+    fn a_udp_port_looks_up_once_per_host_info() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = peer.local_addr().unwrap();
+        let host_info = format!("dev.test:{} udp", at.port());
+        let (mut drv, dns) = FakeDns::port(&host_info, at);
+        let mut user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        drv.disconnect(&user).unwrap();
+        drv.connect(&user).unwrap();
+        assert_eq!(dns.lookups(), 1);
+        drv.set_option(&mut user, "hostInfo", &host_info).unwrap();
+        drv.connect(&user).unwrap();
+        assert_eq!(dns.lookups(), 2);
+    }
+
+    /// Each HTTP transaction opens its own socket to the kept address
+    /// (drvAsynIPPort.c:776-780), looking nothing up after the first.
+    #[test]
+    fn http_transactions_look_the_name_up_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                s.write_all(b"HELLO").unwrap();
+            }
+        });
+        let (mut drv, dns) = FakeDns::port(&format!("dev.test:{} HTTP", at.port()), at);
+        drv.connect(&AsynUser::default()).unwrap();
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        for _ in 0..2 {
+            let mut buf = [0u8; 5];
+            let (n, _) = drv.io_read_octet(&user, &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"HELLO");
+            let (n, eom) = drv.io_read_octet(&user, &mut buf).unwrap();
+            assert!(n == 0 && eom.contains(EomReason::END));
+        }
+        server.join().unwrap();
+        assert_eq!(dns.lookups(), 1);
+    }
+
     /// A refusal the poll finds still reports `connect()`'s own errno, as C's
     /// saved `sockerrmsg` does (drvAsynIPPort.c:534-539, :568-571). Linux only:
     /// its loopback connect defers the refusal to `SO_ERROR`, other stacks may
@@ -4231,8 +4430,8 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
-        let stream = drv.connect_tcp(drv.config()).unwrap();
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
+        let stream = drv.connect_tcp().unwrap();
         assert_eq!(stream.local_addr().unwrap().port(), local);
         let mut on: libc::c_int = -1;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

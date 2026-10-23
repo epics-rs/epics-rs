@@ -51,7 +51,7 @@
 pub mod port_holders;
 pub mod verdict;
 
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
 use epics_libcom_rs::net::port_held;
 use epics_libcom_rs::runtime::socket::{Readiness, poll_ready};
@@ -381,23 +381,25 @@ impl HeldPort {
     /// after the connector has retried its SYN for 2 s (2.00-2.05 s on
     /// windows-latest and windows-11-arm).
     pub fn unanswered_tcp() -> Self {
-        if !cfg!(target_os = "linux") {
-            return Self::closed(Type::STREAM);
+        Self::of(unanswered_on(Ipv4Addr::LOCALHOST.into(), 0).expect("open an unanswered hold"))
+    }
+
+    /// [`HeldPort::unanswered_tcp`] on `::1` as well, one number for both,
+    /// so each address of a dual-stack `localhost` leaves a connect in
+    /// progress.
+    pub fn unanswered_tcp_dual_stack() -> Self {
+        for _ in 0..ATTEMPTS {
+            let mut held = Self::unanswered_tcp();
+            match unanswered_on(Ipv6Addr::LOCALHOST.into(), held.port) {
+                Ok(v6) => {
+                    held.holds.extend(v6);
+                    return held;
+                }
+                Err(e) if port_held(&e) => {}
+                Err(e) => panic!("open the IPv6 unanswered hold: {e}"),
+            }
         }
-        let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open an unanswered hold");
-        let mut held = Self::bind_on(hold, Ipv4Addr::LOCALHOST);
-        held.holds[0].listen(0).expect("listen on the hold");
-        let filler = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open the filler");
-        filler
-            .connect(&SocketAddr::from((Ipv4Addr::LOCALHOST, held.port)).into())
-            .expect("connect the filler");
-        // The queue is full once the listener has the filler, which can be
-        // after the filler's connect returns.
-        let queued =
-            poll_ready(&held.holds[0], Readiness::Readable, 10_000).expect("poll the hold");
-        assert!(queued, "the filler never reached the accept queue");
-        held.holds.push(filler);
-        held
+        panic!("the number of each of {ATTEMPTS} unanswered holds was taken on IPv6");
     }
 
     fn closed(ty: Type) -> Self {
@@ -414,16 +416,18 @@ impl HeldPort {
     fn bind_on(hold: Socket, ip: Ipv4Addr) -> Self {
         let at = SocketAddr::from((ip, 0));
         hold.bind(&at.into()).expect("bind the hold");
-        let port = hold
+        Self::of(vec![hold])
+    }
+
+    /// The holds, the first of them bound to the number.
+    fn of(holds: Vec<Socket>) -> Self {
+        let port = holds[0]
             .local_addr()
             .expect("read the held port")
             .as_socket()
             .expect("an inet address")
             .port();
-        Self {
-            holds: vec![hold],
-            port,
-        }
+        Self { holds, port }
     }
 
     /// The TCP hold connected to a loopback peer, which is kept beside it.
@@ -435,6 +439,36 @@ impl HeldPort {
         self.holds.push(accepted.into());
         self
     }
+}
+
+/// The sockets of [`HeldPort::unanswered_tcp`] on `lo`'s family, on `port`
+/// (0: the kernel's pick). Off Linux the closed hold is on the family's
+/// wildcard, as [`HeldPort::closed`] binds it.
+fn unanswered_on(lo: IpAddr, port: u16) -> std::io::Result<Vec<Socket>> {
+    let domain = Domain::for_address(SocketAddr::new(lo, port));
+    let hold = Socket::new(domain, Type::STREAM, None)?;
+    if lo.is_ipv6() {
+        hold.set_only_v6(true)?;
+    }
+    if !cfg!(target_os = "linux") {
+        #[cfg(windows)]
+        exclusive_address_use(&hold);
+        let any: IpAddr = match lo {
+            IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+            IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+        };
+        hold.bind(&SocketAddr::new(any, port).into())?;
+        return Ok(vec![hold]);
+    }
+    hold.bind(&SocketAddr::new(lo, port).into())?;
+    hold.listen(0)?;
+    let filler = Socket::new(domain, Type::STREAM, None)?;
+    filler.connect(&hold.local_addr()?)?;
+    // The queue is full once the listener has the filler, which can be
+    // after the filler's connect returns.
+    let queued = poll_ready(&hold, Readiness::Readable, 10_000)?;
+    assert!(queued, "the filler never reached the accept queue");
+    Ok(vec![hold, filler])
 }
 
 #[cfg(windows)]
@@ -614,16 +648,23 @@ mod tests {
     }
 
     /// A connect to the unanswered hold is still in progress at its own
-    /// deadline, a second one too.
+    /// deadline, a second one too, on either loopback of the dual-stack one.
     #[test]
     fn an_unanswered_hold_leaves_a_connect_in_progress() {
-        let held = HeldPort::unanswered_tcp();
-        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, held.port));
-        for _ in 0..2 {
-            let e =
-                std::net::TcpStream::connect_timeout(&at, std::time::Duration::from_millis(300))
-                    .unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        let held = HeldPort::unanswered_tcp_dual_stack();
+        for lo in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            let at = SocketAddr::new(lo, held.port);
+            for _ in 0..2 {
+                let e = std::net::TcpStream::connect_timeout(
+                    &at,
+                    std::time::Duration::from_millis(300),
+                )
+                .unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{at}: {e}");
+            }
         }
     }
 

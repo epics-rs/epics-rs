@@ -1765,21 +1765,20 @@ impl DrvAsynIPPort {
     }
 
     /// Resolve the remote at connect time, as C does in case the device has
-    /// just appeared in DNS; a failed or empty lookup is C's one message for
-    /// `hostToIPAddr` failing (drvAsynIPPort.c:484-494).
-    fn resolve_remote(config: &IpPortConfig) -> AsynResult<Vec<std::net::SocketAddr>> {
+    /// just appeared in DNS, to the one address C's `hostToIPAddr` gives
+    /// (drvAsynIPPort.c:484-494): one connect, under one
+    /// `autoConnectTimeout`, whatever else the name answers. A failed or
+    /// empty lookup is C's one message for `hostToIPAddr` failing.
+    fn resolve_remote(config: &IpPortConfig) -> AsynResult<std::net::SocketAddr> {
         use std::net::ToSocketAddrs;
         let addrs: Vec<_> = (config.host.as_str(), config.port)
             .to_socket_addrs()
             .map(Iterator::collect)
             .unwrap_or_default();
-        if addrs.is_empty() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("Unknown host \"{}\"", config.host),
-            });
-        }
-        Ok(addrs)
+        one_remote(&addrs).ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("Unknown host \"{}\"", config.host),
+        })
     }
 
     fn enable_nodelay(&self, stream: &TcpStream) -> AsynResult<()> {
@@ -1790,35 +1789,26 @@ impl DrvAsynIPPort {
     }
 
     fn connect_tcp(&self, config: &IpPortConfig) -> AsynResult<TcpStream> {
-        let addrs = Self::resolve_remote(config)?;
-        let mut last_err: Option<AsynError> = None;
-        for remote_addr in &addrs {
-            // C binds the local address only when one was configured — "a very
-            // unusual configuration" (:499-506).
-            let local_addr: Option<std::net::SocketAddr> = config.local_port.map(|local_port| {
-                if remote_addr.is_ipv6() {
-                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
-                } else {
-                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
-                }
-            });
-            // No SO_REUSEADDR before the local bind (:499-509): during the last
-            // connection's TIME_WAIT, C's reconnect fails the bind.
-            let opts = Self::socket_options(config);
-            // C bounds the connect by `pasynBase->autoConnectTimeout`, read here
-            // and now (drvAsynIPPort.c:541-566).
-            let timeout = crate::runtime::config::connect_poll_timeout();
-            match socket::tcp_connect(*remote_addr, local_addr, opts, timeout) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    last_err = Some(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: connect_failure_text(&self.io.host_info, &e),
-                    })
-                }
+        let remote_addr = Self::resolve_remote(config)?;
+        // C binds the local address only when one was configured — "a very
+        // unusual configuration" (:499-506).
+        let local_addr: Option<std::net::SocketAddr> = config.local_port.map(|local_port| {
+            if remote_addr.is_ipv6() {
+                (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+            } else {
+                (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
             }
-        }
-        Err(last_err.expect("resolve_remote returns at least one address"))
+        });
+        // No SO_REUSEADDR before the local bind (:499-509): during the last
+        // connection's TIME_WAIT, C's reconnect fails the bind.
+        let opts = Self::socket_options(config);
+        // C bounds the connect by `pasynBase->autoConnectTimeout`, read here
+        // and now (drvAsynIPPort.c:541-566).
+        let timeout = crate::runtime::config::connect_poll_timeout();
+        socket::tcp_connect(remote_addr, local_addr, opts, timeout).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: connect_failure_text(&self.io.host_info, &e),
+        })
     }
 
     fn connect_udp(&self, config: &IpPortConfig) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
@@ -1826,7 +1816,7 @@ impl DrvAsynIPPort {
         // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
         // Resolve the peer once, then leave the socket unconnected and bind
         // a local endpoint of the peer's address family.
-        let peer = Self::resolve_remote(config)?[0];
+        let peer = Self::resolve_remote(config)?;
         let local_port = config.local_port.unwrap_or(0);
         let local_addr: std::net::SocketAddr = if peer.is_ipv6() {
             (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
@@ -1862,6 +1852,17 @@ impl DrvAsynIPPort {
         })?;
         Ok(stream)
     }
+}
+
+/// `hostToIPAddr`'s answer from a lookup's: its first IPv4 address, else its
+/// first address, so a name with only IPv6 ones, which C cannot reach, still
+/// connects.
+fn one_remote(addrs: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .copied()
 }
 
 impl DrvAsynIPPort {
@@ -4010,6 +4011,84 @@ mod tests {
         assert!(
             took >= Duration::from_millis(950) && took < Duration::from_millis(1400),
             "asynSetAutoConnectTimeout 1 bounds the connect at 1 s, took {took:?}"
+        );
+        assert_eq!(
+            err.message(),
+            format!("Can't connect to {device}: {}", connect_in_progress_text())
+        );
+    }
+
+    /// `hostToIPAddr` answers a name with its first IPv4 address whatever
+    /// comes before it, and a name with none keeps its first address.
+    #[test]
+    fn the_remote_is_the_first_ipv4_answer_else_the_first() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(
+            one_remote(&[a("[::1]:5"), a("127.0.0.2:5"), a("127.0.0.1:5")]),
+            Some(a("127.0.0.2:5"))
+        );
+        assert_eq!(
+            one_remote(&[a("[::1]:5"), a("[::2]:5")]),
+            Some(a("[::1]:5"))
+        );
+        assert_eq!(one_remote(&[]), None);
+    }
+
+    /// A dual-stack `localhost` reaches its 127.0.0.1 listener, over TCP and
+    /// UDP, and never `::1`, which every CI cell answers first. Where the
+    /// hosts file gives `localhost` 127.0.0.1 alone there is nothing else to
+    /// reach; `the_remote_is_the_first_ipv4_answer_else_the_first` holds the
+    /// rule there.
+    #[test]
+    fn a_dual_stack_name_reaches_its_ipv4_address() {
+        use std::net::Ipv6Addr;
+
+        let (tcp4, tcp6, udp4, udp6) = (0..named_port::ATTEMPTS)
+            .find_map(|_| {
+                let tcp4 = TcpListener::bind("127.0.0.1:0").ok()?;
+                let port = tcp4.local_addr().ok()?.port();
+                let tcp6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).ok()?;
+                let udp4 = UdpSocket::bind(("127.0.0.1", port)).ok()?;
+                let udp6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).ok()?;
+                Some((tcp4, tcp6, udp4, udp6))
+            })
+            .expect("one number free on both loopbacks for TCP and UDP");
+        let port = tcp4.local_addr().unwrap().port();
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("localhost:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        tcp4.set_nonblocking(true).unwrap();
+        tcp6.set_nonblocking(true).unwrap();
+        assert!(tcp4.accept().is_ok(), "the connect reached 127.0.0.1");
+        assert!(tcp6.accept().is_err(), "and not ::1");
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("localhost:{port} udp")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"ping").unwrap();
+        udp4.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 8];
+        let n = udp4.recv(&mut buf).expect("the datagram reached 127.0.0.1");
+        assert_eq!(&buf[..n], b"ping");
+        udp6.set_nonblocking(true).unwrap();
+        assert!(udp6.recv(&mut buf).is_err(), "and not ::1");
+    }
+
+    /// C `connectIt` makes one connect, to `hostToIPAddr`'s one address,
+    /// under one `autoConnectTimeout` (drvAsynIPPort.c:484-494, :541-571),
+    /// so a `localhost` whose `::1` and 127.0.0.1 both leave the handshake
+    /// unanswered fails in 0.5 s, not 0.5 s for each.
+    #[test]
+    fn a_name_s_unanswered_addresses_wait_one_auto_connect_timeout() {
+        let held = named_port::HeldPort::unanswered_tcp_dual_stack();
+        let device = format!("localhost:{}", held.port);
+        let mut drv = DrvAsynIPPort::new("iptest", &device).unwrap();
+        let start = std::time::Instant::now();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(450) && took < Duration::from_millis(900),
+            "one C DEFAULT_AUTOCONNECT_TIMEOUT of 0.5 s, took {took:?}"
         );
         assert_eq!(
             err.message(),

@@ -869,23 +869,20 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let (rows_per_strip, planes) = ((rows_per_strip as usize).min(height), planes as usize);
     let strips_per_plane = strips_per_plane as usize;
     let num_strips = strips_per_plane * planes;
-    // One entry per strip of the geometry, cut or zero-filled, as
-    // TIFFFetchStripThing leaves the tables. TileOffsets and TileByteCounts
-    // fill the same tables as StripOffsets and StripByteCounts; the later
-    // entry in the directory wins.
+    // TileOffsets and TileByteCounts fill the same tables as StripOffsets
+    // and StripByteCounts; the later entry in the directory wins.
     let table = |strip: u16, tile: u16| -> ADResult<Option<Vec<u64>>> {
         let (strip_values, tile_values) = (values(strip)?, values(tile)?);
-        let v = if entries.get(&tile) > entries.get(&strip) {
+        Ok(if entries.get(&tile) > entries.get(&strip) {
             tile_values
         } else {
             strip_values
-        };
-        Ok(v.map(|v| {
-            (0..num_strips)
-                .map(|i| v.get(i).copied().unwrap_or(0))
-                .collect()
-        }))
+        })
     };
+    // TIFFFetchStripThing cuts or zero-fills a table to the strip count; a
+    // strip past the file's entries reads 0 here without that table, which
+    // C allocates whole and crashes on for a 2^32-strip header.
+    let at = |table: &[u64], strip: usize| table.get(strip).copied().unwrap_or(0);
     let offsets =
         table(TAG_STRIP_OFFSETS, TAG_TILE_OFFSETS)?.ok_or_else(|| err("no StripOffsets"))?;
     let mut array = pool.alloc(dims, data_type)?;
@@ -894,35 +891,41 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     // TIFFScanlineSize: one row of one plane.
     let scanline = size / height / planes;
     let file_size = bytes.len() as u64;
-    let estimate = || vec![(scanline * (height / strips_per_plane)) as u64; num_strips];
-    // TIFFReadDirectory estimates the counts from the geometry when they are
-    // missing, when a single one is 0, past the file or short of the image,
-    // or when the first two of more than two contiguous strips differ
+    // TIFFReadDirectory estimates the counts from the geometry (`None`) when
+    // they are missing, when a single one is 0, past the file or short of the
+    // image, or when the first two of more than two contiguous strips differ
     // (tif_dirread.c:3901-3976).
     let counts = match table(TAG_STRIP_BYTE_COUNTS, TAG_TILE_BYTE_COUNTS)? {
         None if num_strips != planes => return Err(err("no StripByteCounts")),
-        None => estimate(),
         Some(c)
             if num_strips == 1
-                && offsets[0] != 0
-                && (c[0] == 0
-                    || c[0] > file_size.wrapping_sub(offsets[0])
-                    || c[0] < (scanline * height) as u64) =>
+                && at(&offsets, 0) != 0
+                && (at(&c, 0) == 0
+                    || at(&c, 0) > file_size.wrapping_sub(at(&offsets, 0))
+                    || at(&c, 0) < (scanline * height) as u64) =>
         {
-            estimate()
+            None
         }
-        Some(c) if !separate && num_strips > 2 && c[0] != c[1] && c[0] != 0 && c[1] != 0 => {
-            estimate()
+        Some(c)
+            if !separate
+                && num_strips > 2
+                && at(&c, 0) != at(&c, 1)
+                && at(&c, 0) != 0
+                && at(&c, 1) != 0 =>
+        {
+            None
         }
-        Some(c) => c,
+        counts => counts,
     };
+    let estimate = (scanline * (height / strips_per_plane)) as u64;
     let mut total = 0;
     for strip in 0..num_strips {
         // TIFFReadEncodedStrip: the strip's rows from the geometry, capped at
         // what the image has left; the count only has to cover them.
         let rows = (height - strip % strips_per_plane * rows_per_strip).min(rows_per_strip);
         let len = (rows * scanline).min(size - total);
-        let (offset, count) = (offsets[strip], counts[strip]);
+        let offset = at(&offsets, strip);
+        let count = counts.as_deref().map_or(estimate, |c| at(c, strip));
         if count > file_size || offset > file_size - count {
             return Err(err(&format!("strip {strip} runs past the end of the file")));
         }
@@ -3255,5 +3258,22 @@ mod tests {
             })
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C sizes its strip tables to the strip count before it reads a strip,
+    /// and crashes on a header of 2^32 - 2 one-row strips; the tables here
+    /// hold the file's entries, so the pool's limit refuses the image.
+    #[test]
+    fn strip_tables_are_not_sized_by_the_geometry() {
+        let file = TagFile {
+            values: &[(TAG_IMAGE_LENGTH, &[0xffff_fffe])],
+            ..TagFile::default()
+        };
+        let read = decode(
+            &file.file(),
+            NDAttributeList::new(),
+            &NDArrayPool::new(1 << 20),
+        );
+        assert!(read.is_err());
     }
 }

@@ -36,7 +36,7 @@ use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 
-use asyn_rs::port_handle::PortHandle;
+use asyn_rs::port_handle::{CallbacksGate, PortHandle};
 
 use crate::attributes::NDAttributeList;
 use crate::driver::ndarray_driver::{
@@ -1844,13 +1844,8 @@ impl SharedProcessorInner {
 
     /// A param batch carrying only the current DroppedArrays / queue counters,
     /// used when an array is dropped before processing (B5).
-    fn dropped_arrays_only_batch(&self) -> ProcessOutput {
-        ProcessOutput {
-            arrays: vec![],
-            scatter: false,
-            batch: self.build_status_params_batch(),
-            addressed: vec![],
-        }
+    fn dropped_arrays_only_batch(&self) -> ParamBatch {
+        self.build_status_params_batch()
     }
 
     /// Flush the sort buffer head-first while contiguous or stale (C++
@@ -2084,28 +2079,40 @@ struct OutputSenders {
 }
 
 impl ProcessOutput {
-    /// Publish arrays to downstream senders (async, concurrent fan-out).
+    /// The only way an output's arrays leave: store the batch, deliver the
+    /// arrays, then fire the callbacks — C's order under the port lock
+    /// (NDPluginDriver.cpp:332, :539), so whoever the delivery reaches reads
+    /// this frame's params from the port.
     ///
     /// Broadcast frames are published to every sender concurrently (independent
     /// backpressure per sender). Scatter frames are routed to a single consumer
     /// via `scatter_publish`, which advances the persistent `scatter_cursor`.
     /// Arrays are published in order — the next array's fan-out starts only
     /// after the previous one completes.
-    async fn publish_arrays(&self, senders: &OutputSenders, scatter_cursor: &mut usize) {
+    async fn complete(
+        self,
+        callbacks_gate: &mut CallbacksGate,
+        senders: &OutputSenders,
+        scatter_cursor: &mut usize,
+    ) {
+        let callbacks = self.batch.store(callbacks_gate);
         for (addr, arr) in &self.addressed {
             if let Some(subscribers) = senders.by_addr.get(*addr) {
                 let futs = subscribers.iter().map(|s| s.publish(arr.clone()));
                 futures_util::future::join_all(futs).await;
             }
         }
-        let senders = senders.main.as_slice();
+        let main = senders.main.as_slice();
         for arr in &self.arrays {
             if self.scatter {
-                Self::scatter_publish(arr, senders, scatter_cursor).await;
+                Self::scatter_publish(arr, main, scatter_cursor).await;
             } else {
-                let futs = senders.iter().map(|s| s.publish(arr.clone()));
+                let futs = main.iter().map(|s| s.publish(arr.clone()));
                 futures_util::future::join_all(futs).await;
             }
+        }
+        if let Some(callbacks) = callbacks {
+            flush_failed(callbacks.end());
         }
     }
 
@@ -2186,19 +2193,34 @@ impl ParamBatch {
         self.sets.extend(other.sets);
     }
 
-    /// Flush via reliable async enqueue. Call from async context.
-    async fn flush(self, port: &asyn_rs::port_handle::PortHandle) {
-        let sent = match self.time_stamp {
+    /// Store and fire the callbacks in one request, for a batch no delivery
+    /// comes between. Call from async context.
+    async fn flush(self, port: &PortHandle) {
+        flush_failed(match self.time_stamp {
             Some(ts) => {
                 port.set_time_stamp_params_and_notify(0, ts, self.sets)
                     .await
             }
             None if !self.sets.is_empty() => port.set_params_and_notify(0, self.sets).await,
             None => Ok(()),
-        };
-        if let Err(e) = sent {
-            epics_libcom_rs::stderr_println!("plugin param flush error: {e}");
+        });
+    }
+
+    /// The sets, queued ahead of a delivery; the callbacks fire when the
+    /// returned section ends. `None` for an empty batch, which posts nothing.
+    fn store(self, gate: &mut CallbacksGate) -> Option<asyn_rs::port_handle::CallbacksAfter<'_>> {
+        if self.sets.is_empty() && self.time_stamp.is_none() {
+            return None;
         }
+        gate.open(0, self.time_stamp, self.sets)
+            .map_err(|e| flush_failed(Err(e)))
+            .ok()
+    }
+}
+
+fn flush_failed(sent: AsynResult<()>) {
+    if let Err(e) = sent {
+        epics_libcom_rs::stderr_println!("plugin param flush error: {e}");
     }
 }
 
@@ -3783,6 +3805,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
 async fn complete_frame(
     shared: &Arc<parking_lot::Mutex<SharedProcessorInner>>,
     item: DoneItem,
+    callbacks_gate: &mut CallbacksGate,
     scatter_cursor: &mut usize,
 ) {
     let DoneItem {
@@ -3790,18 +3813,18 @@ async fn complete_frame(
         processed,
         elapsed_ms,
     } = item;
-    let (output, senders, port) = {
+    let (output, senders) = {
         let mut guard = shared.lock();
         let output = match processed {
             Some((result, begin)) => guard.post_process(&msg.array, result, &begin, elapsed_ms),
             None => guard.unprocessed(elapsed_ms),
         };
         let senders = guard.senders_for(&output);
-        let port = guard.port_handle.clone();
-        (output, senders, port)
+        (output, senders)
     };
-    output.publish_arrays(&senders, scatter_cursor).await;
-    output.batch.flush(&port).await;
+    output
+        .complete(callbacks_gate, &senders, scatter_cursor)
+        .await;
     // msg dropped here → completion signaled (if tracked)
 }
 
@@ -3891,6 +3914,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // reroutes past full consumers. One per plugin instance, for its
         // lifetime — matching `nextClient_(1)` set once at construction.
         let mut scatter_cursor: usize = 0;
+        // The port's only `CallbacksGate`: every frame's sets and callbacks
+        // go through it, one section at a time.
+        let mut callbacks_gate = shared.lock().port_handle.callbacks_gate();
         // Barriers held until the array queue drains. A barrier acks only at
         // full quiescence — params applied AND no queued arrays — because a
         // param applied while an older array still waits in the queue would
@@ -3974,7 +4000,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                     match done {
                         Some(item) => {
                             in_flight -= 1;
-                            complete_frame(&shared, item, &mut scatter_cursor).await;
+                            complete_frame(&shared, item, &mut callbacks_gate, &mut scatter_cursor)
+                                .await;
                         }
                         // Every worker is gone without a reply: nothing can
                         // come back, so stop waiting on frames that are lost.
@@ -3993,7 +4020,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         let guard = shared.lock();
                         (guard.dropped_arrays_only_batch(), guard.port_handle.clone())
                     };
-                    out.batch.flush(&port).await;
+                    out.flush(&port).await;
                 }
                 // C `driverCallback` republishes QueueFree after each
                 // `trySend` (`:447-448`). With a callback thread idle, C's
@@ -4028,15 +4055,15 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             let _ = ack.send(());
                         }
                         Some(PluginParamMsg::Publish(published, addressed)) => {
-                            let (po, senders, port) = {
+                            let (po, senders) = {
                                 let mut guard = shared.lock();
                                 let mut po = guard.end_published(published);
                                 po.addressed = guard.delivery.publishable_addressed(addressed);
                                 let senders = guard.senders_for(&po);
-                                (po, senders, guard.port_handle.clone())
+                                (po, senders)
                             };
-                            po.publish_arrays(&senders, &mut scatter_cursor).await;
-                            po.batch.flush(&port).await;
+                            po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                .await;
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
                             if reason == enable_callbacks_reason {
@@ -4123,6 +4150,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             complete_frame(
                                                 &shared,
                                                 item,
+                                                &mut callbacks_gate,
                                                 &mut scatter_cursor,
                                             )
                                             .await;
@@ -4156,8 +4184,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     // pool finished has been published.
                                     while let Some(item) = old_done.recv().await {
                                         in_flight = in_flight.saturating_sub(1);
-                                        complete_frame(&shared, item, &mut scatter_cursor)
-                                            .await;
+                                        complete_frame(
+                                            &shared,
+                                            item,
+                                            &mut callbacks_gate,
+                                            &mut scatter_cursor,
+                                        )
+                                        .await;
                                     }
                                     // C republishes QueueFree after
                                     // createCallbackThreads (`:1006`).
@@ -4227,7 +4260,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                     guard.port_handle.clone(),
                                                 )
                                             };
-                                            out.batch.flush(&port).await;
+                                            out.flush(&port).await;
                                         }
                                     }
                                     Some(array) => {
@@ -4250,20 +4283,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                         guard.port_handle.clone(),
                                                     )
                                                 };
-                                                out.batch.flush(&port).await;
+                                                out.flush(&port).await;
                                             }
                                             Admission::Admit => {
-                                                let (po, senders, port) = {
+                                                let (po, senders) = {
                                                     let mut guard = shared.lock();
                                                     let output = guard
                                                         .process_and_publish(&*processor, &array);
                                                     let senders = guard.senders_for(&output);
-                                                    let port = guard.port_handle.clone();
-                                                    (output, senders, port)
+                                                    (output, senders)
                                                 };
-                                                po.publish_arrays(&senders, &mut scatter_cursor)
-                                                    .await;
-                                                po.batch.flush(&port).await;
+                                                po.complete(
+                                                    &mut callbacks_gate,
+                                                    &senders,
+                                                    &mut scatter_cursor,
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -4315,9 +4350,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     if mode == 0 {
                                         let output = guard.flush_sort_buffer();
                                         let senders = guard.senders_for(&output);
-                                        let port = guard.port_handle.clone();
                                         sort_flush_active = false;
-                                        Some((output, senders, port))
+                                        Some((output, senders))
                                     } else {
                                         sort_flush_active = sort_time > 0.0;
                                         if sort_flush_active {
@@ -4329,9 +4363,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         None
                                     }
                                 };
-                                if let Some((output, senders, port)) = flush_work {
-                                    output.publish_arrays(&senders, &mut scatter_cursor).await;
-                                    output.batch.flush(&port).await;
+                                if let Some((output, senders)) = flush_work {
+                                    output
+                                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                        .await;
                                 }
                             }
                             if reason == sort_time_reason {
@@ -4371,7 +4406,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 addr,
                                 value,
                             };
-                            let (process_output, senders, port) = {
+                            let (process_output, senders) = {
                                 let mut guard = shared.lock();
                                 let result = processor.on_param_change(reason, &snapshot);
                                 let output = if !result.output_arrays.is_empty()
@@ -4387,11 +4422,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     None
                                 };
                                 let senders = output.as_ref().map(|o| guard.senders_for(o));
-                                (output, senders, guard.port_handle.clone())
+                                (output, senders)
                             };
                             if let (Some(po), Some(senders)) = (process_output, senders) {
-                                po.publish_arrays(&senders, &mut scatter_cursor).await;
-                                po.batch.flush(&port).await;
+                                po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                    .await;
                             }
                         }
                         None => break,
@@ -4400,15 +4435,15 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 _ = sort_flush_interval.tick(), if sort_flush_active => {
                     // B3: drain head-first while contiguous or past the
                     // staleness deadline — NOT the whole buffer.
-                    let (output, senders, port) = {
+                    let (output, senders) = {
                         let mut guard = shared.lock();
                         let output = guard.tick_sort_buffer();
                         let senders = guard.senders_for(&output);
-                        let port = guard.port_handle.clone();
-                        (output, senders, port)
+                        (output, senders)
                     };
-                    output.publish_arrays(&senders, &mut scatter_cursor).await;
-                    output.batch.flush(&port).await;
+                    output
+                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                        .await;
                 }
             }
         }
@@ -5044,7 +5079,7 @@ mod tests {
             output.add(downstream_sender);
             let (handle, _jh) = create_plugin_runtime_with_output(
                 &asyn_rs::asyn_record::claim_port(name).unwrap(),
-                StampProcessor { stamp: 0 },
+                StampProcessor { stamp: 0, addr: 0 },
                 1_000_000,
                 10,
                 0,
@@ -5319,9 +5354,11 @@ mod tests {
         assert_eq!(observed, ["dims", "Some(Int32Array)"]);
     }
 
-    /// Sets its own STAMP to ten times the frame's id and forwards the frame.
+    /// Sets its own STAMP at `addr` to ten times the frame's id and forwards
+    /// the frame.
     struct StampProcessor {
         stamp: usize,
+        addr: i32,
     }
 
     impl NDPluginProcess for StampProcessor {
@@ -5331,11 +5368,18 @@ mod tests {
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(
                 array,
-                vec![ParamUpdate::int32(self.stamp, array.unique_id * 10)],
+                vec![ParamUpdate::int32_addr(
+                    self.stamp,
+                    self.addr,
+                    array.unique_id * 10,
+                )],
             )
         }
         fn plugin_type(&self) -> &str {
             "Stamp"
+        }
+        fn max_addr(&self) -> usize {
+            self.addr as usize + 1
         }
         fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
             self.stamp = base.create_param("STAMP", asyn_rs::param::ParamType::Int32)?;
@@ -5355,7 +5399,7 @@ mod tests {
         output.add(downstream_sender);
         let (handle, _data_jh) = create_plugin_runtime_with_output(
             &asyn_rs::asyn_record::claim_port("ATTRS1").unwrap(),
-            StampProcessor { stamp: 0 },
+            StampProcessor { stamp: 0, addr: 0 },
             1_000_000,
             10,
             0,
@@ -5385,6 +5429,91 @@ mod tests {
             Some(NDAttrValue::Int32(30))
         );
         assert!(input.attributes.get("Stamp").is_none());
+    }
+
+    /// C stores a frame's params, delivers the frame and then calls
+    /// `callParamCallbacks`, all under the port lock (NDPluginDriver.cpp:332,
+    /// :539): a consumer still holding the frame reads its STAMP from the
+    /// port, and STAMP has not been posted — on list 0, which C's
+    /// `callParamCallbacks()` posts, and on a further list alike.
+    fn a_held_frame_reads_its_stamp_unposted(port_name: &str, blocking_callbacks: i32, addr: i32) {
+        use epics_libcom_rs::runtime::task::block_on_sync;
+        use std::sync::atomic::AtomicBool;
+        let (mut downstream, mut downstream_rx) = ndarray_channel(&format!("{port_name}_DOWN"), 10);
+        // A blocking consumer holds its producer until it drops the frame.
+        downstream.set_mode_flags(
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut output = NDArrayOutput::new();
+        output.add(downstream);
+        let claim = asyn_rs::asyn_record::claim_port(port_name).unwrap();
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &claim,
+            StampProcessor { stamp: 0, addr },
+            1_000_000,
+            10,
+            blocking_callbacks,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle().clone();
+        claim
+            .publish(
+                port.clone(),
+                &epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+            )
+            .unwrap();
+        enable_callbacks(&handle);
+        let stamp = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STAMP", 0))
+            .unwrap()
+            .reason;
+        let posts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = posts.clone();
+        let _binding = port
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(stamp),
+                    addr: Some(addr),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if let ParamValue::Int32(v) = iv.value {
+                        log.lock().push(v);
+                    }
+                },
+            )
+            .unwrap();
+        let sender = handle.array_sender().clone();
+        let producer =
+            std::thread::spawn(move || block_on_sync(sender.publish(make_test_array(3))).unwrap());
+        let held = block_on_sync(downstream_rx.recv_msg()).unwrap().unwrap();
+        assert_eq!(port.read_int32_blocking(stamp, addr).ok(), Some(30));
+        // The read's round trip ran behind anything enqueued before it.
+        assert!(posts.lock().is_empty(), "posted before the delivery ended");
+        drop(held);
+        producer.join().unwrap();
+        wait_until("the STAMP post", || !posts.lock().is_empty());
+        assert_eq!(*posts.lock(), [30]);
+    }
+
+    #[test]
+    fn a_callback_thread_frame_is_stored_before_and_posted_after_its_delivery() {
+        a_held_frame_reads_its_stamp_unposted("ORDERQ", 0, 0);
+    }
+
+    #[test]
+    fn a_blocking_frame_is_stored_before_and_posted_after_its_delivery() {
+        a_held_frame_reads_its_stamp_unposted("ORDERB", 1, 0);
+    }
+
+    #[test]
+    fn a_further_list_is_stored_before_and_posted_after_its_delivery() {
+        a_held_frame_reads_its_stamp_unposted("ORDERL", 0, 1);
     }
 
     /// Sets a float into its int STAMP, a set C's `setDoubleParam` refuses.

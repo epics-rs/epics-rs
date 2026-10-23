@@ -277,6 +277,7 @@ impl From<&PortCommand> for RequestOp {
                 addr: *addr,
                 updates: vec![],
                 time_stamp: None,
+                gate: None,
             },
             PortCommand::SetParams => Self::SetParams { updates: vec![] },
             PortCommand::GetOption { key } => Self::GetOption { key: key.clone() },

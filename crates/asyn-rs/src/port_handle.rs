@@ -30,7 +30,9 @@ use crate::interrupt::InterruptManager;
 use crate::port::QueueGate;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorLink, ActorMessage, Claimed, Lend};
-use crate::request::{CancelToken, DriverCall, PortCalls, PortLockCall, RequestOp, RequestResult};
+use crate::request::{
+    CancelToken, DriverCall, PortCalls, PortLockCall, RequestOp, RequestResult, SectionCallbacks,
+};
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, QueueDeadline};
 
@@ -1255,6 +1257,7 @@ impl PortHandle {
                 addr,
                 updates: vec![],
                 time_stamp: None,
+                gate: None,
             },
             user,
         )
@@ -1362,6 +1365,7 @@ impl PortHandle {
                 addr,
                 updates: vec![],
                 time_stamp: None,
+                gate: None,
             },
             user,
         )?;
@@ -1406,6 +1410,7 @@ impl PortHandle {
                 addr,
                 updates,
                 time_stamp: None,
+                gate: None,
             },
             addr,
         )
@@ -1426,10 +1431,21 @@ impl PortHandle {
                 addr,
                 updates,
                 time_stamp: Some(ts),
+                gate: None,
             },
             addr,
         )
         .await
+    }
+
+    /// A [`CallbacksGate`] on this port, for one caller to reuse section
+    /// after section.
+    pub fn callbacks_gate(&self) -> CallbacksGate {
+        CallbacksGate {
+            port: self.clone(),
+            sections: Arc::default(),
+            seq: 0,
+        }
     }
 
     /// Sync version of [`set_params_and_notify`](Self::set_params_and_notify)
@@ -1452,6 +1468,7 @@ impl PortHandle {
                     addr,
                     updates,
                     time_stamp: None,
+                    gate: None,
                 },
                 addr,
             ),
@@ -1476,6 +1493,10 @@ impl PortHandle {
 
     /// Enqueue-only async helper: guaranteed delivery, no reply wait.
     async fn enqueue(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
+        self.enqueue_now(op, addr)
+    }
+
+    fn enqueue_now(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
         let (reply_tx, _) = oneshot::channel();
         self.send(ActorMessage::new(op, user, CancelToken::new(), reply_tx))
@@ -2177,6 +2198,83 @@ fn string_param_result(result: &StringParamSlot) -> AsynResult<Vec<u8>> {
                 message: "getStringParam did not run".into(),
             })
         })
+}
+
+/// [`PortHandle::set_params_and_notify`] around sections of the caller's, as
+/// C runs the sets, a section and `callParamCallbacks` under one lock
+/// (NDPluginDriver.cpp:332, :539). One per caller, reused: a section
+/// allocates nothing of its own.
+pub struct CallbacksGate {
+    port: PortHandle,
+    sections: Arc<crate::request::Sections>,
+    /// The next section's number.
+    seq: u64,
+}
+
+impl CallbacksGate {
+    /// Queue the sets ahead of anything the section causes; the callbacks
+    /// fire once the returned [`CallbacksAfter`] ends.
+    pub fn open(
+        &mut self,
+        addr: i32,
+        time_stamp: Option<SystemTime>,
+        updates: Vec<crate::request::ParamSetValue>,
+    ) -> AsynResult<CallbacksAfter<'_>> {
+        self.port.enqueue_now(
+            RequestOp::CallParamCallbacks {
+                addr,
+                updates,
+                time_stamp,
+                gate: Some(SectionCallbacks::Open {
+                    sections: self.sections.clone(),
+                    seq: self.seq,
+                }),
+            },
+            addr,
+        )?;
+        Ok(CallbacksAfter { gate: self, addr })
+    }
+}
+
+/// The callbacks a [`CallbacksGate::open`] section owes at its end:
+/// [`Self::end`], or the drop of one never ended.
+#[must_use = "the callbacks fire when the section ends"]
+pub struct CallbacksAfter<'a> {
+    gate: &'a mut CallbacksGate,
+    addr: i32,
+}
+
+impl CallbacksAfter<'_> {
+    /// End the section. The callbacks fire on the actor, from this end when
+    /// the actor holds them, else as soon as it reaches the sets.
+    pub fn end(self) -> AsynResult<()> {
+        std::mem::ManuallyDrop::new(self).finish()
+    }
+
+    fn finish(&mut self) -> AsynResult<()> {
+        let gate = &mut *self.gate;
+        let seq = gate.seq;
+        gate.seq += 1;
+        if !gate.sections.end(seq) {
+            return Ok(());
+        }
+        gate.port.enqueue_now(
+            RequestOp::CallParamCallbacks {
+                addr: self.addr,
+                updates: Vec::new(),
+                time_stamp: None,
+                gate: Some(SectionCallbacks::Held(gate.sections.clone())),
+            },
+            self.addr,
+        )
+    }
+}
+
+impl Drop for CallbacksAfter<'_> {
+    fn drop(&mut self) {
+        // A gone actor has nothing to post.
+        let _ = self.finish();
+    }
 }
 
 type ArraySlot = Arc<Mutex<Option<AsynResult<()>>>>;
@@ -5189,6 +5287,7 @@ mod tests {
                         // A good update in the same batch must still land.
                         ParamSetValue::new(0, 0, ParamValue::Int32(42)),
                     ],
+                    gate: None,
                 },
                 AsynUser::new(0),
             )
@@ -5212,6 +5311,156 @@ mod tests {
             ),
             "the failed update stored nothing: the Float64 param is still undefined"
         );
+    }
+
+    type Posts = Arc<parking_lot::Mutex<Vec<(i32, i32)>>>;
+
+    /// A handle on a two-address driver, and each VAL post its actor fires
+    /// as `(addr, value)`.
+    fn gated_handle() -> (
+        PortHandle,
+        Posts,
+        crate::interrupt::SyncCallbackSubscription,
+    ) {
+        let mut base = PortDriverBase::new(
+            "gated",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
+        let posts = Posts::default();
+        let recorder = posts.clone();
+        let sub = base
+            .interrupts
+            .register_sync_callback(
+                crate::interrupt::InterruptFilter {
+                    reason: Some(val),
+                    ..Default::default()
+                },
+                move |iv| {
+                    let ParamValue::Int32(v) = iv.value else {
+                        panic!("VAL posted {:?}", iv.value)
+                    };
+                    recorder.lock().push((iv.addr, v));
+                },
+            )
+            .unwrap();
+        (make_handle(TestDriver { base }), posts, sub)
+    }
+
+    fn set_val(addr: i32, v: i32) -> crate::request::ParamSetValue {
+        crate::request::ParamSetValue::new(0, addr, ParamValue::Int32(v))
+    }
+
+    /// Hold `handle`'s actor until the returned sender sends.
+    fn hold_actor(
+        handle: &PortHandle,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<AsynResult<()>>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let busy = handle.clone();
+        let hold = std::thread::spawn(move || {
+            busy.with_driver_blocking(move |_: &mut TestDriver| {
+                started_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            })
+        });
+        started_rx.recv().unwrap();
+        (go_tx, hold)
+    }
+
+    /// C runs the sets, the caller's section and `callParamCallbacks` under
+    /// one lock (NDPluginDriver.cpp:332, :539): a read inside the section
+    /// sees the sets, and nothing posts before its end — then every list
+    /// the sets wrote, the request's first.
+    #[test]
+    fn an_open_section_holds_the_callbacks_until_it_ends() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(0, None, vec![set_val(1, 11), set_val(0, 10)])
+            .unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 10);
+        assert_eq!(handle.read_int32_blocking(0, 1).unwrap(), 11);
+        assert!(posts.lock().is_empty(), "posted inside the section");
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 10), (1, 11)]);
+    }
+
+    /// A section that ends before the actor reaches the sets leaves the
+    /// callbacks to the actor, in the same order.
+    #[test]
+    fn a_section_ended_first_leaves_the_callbacks_to_the_actor() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let (go, hold) = hold_actor(&handle);
+        gate.open(0, None, vec![set_val(1, 21), set_val(0, 20)])
+            .unwrap()
+            .end()
+            .unwrap();
+        go.send(()).unwrap();
+        hold.join().unwrap().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 20), (1, 21)]);
+    }
+
+    /// The gate is reused: an actor that reaches a section's sets after the
+    /// caller has opened the next one fires them, not holds them for it.
+    #[test]
+    fn a_section_the_caller_has_moved_past_is_not_held() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let (go, hold) = hold_actor(&handle);
+        gate.open(0, None, vec![set_val(0, 40)])
+            .unwrap()
+            .end()
+            .unwrap();
+        let second = gate.open(0, None, vec![set_val(0, 41)]).unwrap();
+        go.send(()).unwrap();
+        hold.join().unwrap().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 40)], "held the first for the second");
+        second.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 40), (0, 41)]);
+    }
+
+    /// Held sections back to back: the next section's sets queue behind the
+    /// last one's end, which fires only what that section held.
+    #[test]
+    fn a_held_section_fires_before_the_next_one_holds() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let first = gate
+            .open(0, None, vec![set_val(1, 51), set_val(0, 50)])
+            .unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        first.end().unwrap();
+        let second = gate.open(0, None, vec![set_val(0, 52)]).unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 50), (1, 51)]);
+        second.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 50), (1, 51), (0, 52)]);
+    }
+
+    /// A section dropped without its end still ends it.
+    #[test]
+    fn a_dropped_section_still_fires_the_callbacks() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate.open(0, None, vec![set_val(0, 30)]).unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        drop(section);
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 30)]);
     }
 
     /// A handle whose actor never answers. `ActorId::new()` mints an id that

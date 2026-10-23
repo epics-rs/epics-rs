@@ -1,7 +1,7 @@
 //! Request types for the port actor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
 use parking_lot::Mutex;
 use std::time::SystemTime;
@@ -1316,6 +1316,9 @@ pub enum RequestOp {
         /// `beginProcessCallbacks` stamps the port with the frame's epicsTS
         /// (NDPluginDriver.cpp:232); `None` keeps the port's timestamp.
         time_stamp: Option<std::time::SystemTime>,
+        /// `Some`: the callbacks wait for the end of a section of the
+        /// caller's that follows the sets; `None` fires them at once.
+        gate: Option<SectionCallbacks>,
     },
     /// C `setIntegerParam`/`setDoubleParam` alone: the values land in the
     /// store and are marked changed, and only a later `CallParamCallbacks`
@@ -1883,8 +1886,102 @@ impl Default for CancelToken {
     }
 }
 
+/// What a [`RequestOp::CallParamCallbacks`] owes a section of its caller's
+/// that runs between the sets and the callbacks, as C runs the sets, the
+/// section and `callParamCallbacks` under one lock (NDPluginDriver.cpp:332,
+/// :539).
+#[derive(Clone, Debug)]
+pub enum SectionCallbacks {
+    /// The sets of section `seq`: the actor holds the callbacks while it is
+    /// open.
+    Open { sections: Arc<Sections>, seq: u64 },
+    /// From the end of a section whose callbacks the actor holds.
+    Held(Arc<Sections>),
+}
+
+impl SectionCallbacks {
+    /// The actor, sets done: `flush` each list the request owes, the
+    /// request's first, unless an open section holds them.
+    pub(crate) fn run(&self, addr: i32, updates: &[ParamSetValue], flush: impl FnMut(i32)) {
+        match self {
+            // Only the actor takes this lock, so firing under it waits on no
+            // one.
+            Self::Open { sections, seq } => {
+                let mut lists = sections.held.lock();
+                lists.push(addr);
+                push_further_lists(addr, updates, &mut lists);
+                if !sections.hold(*seq) {
+                    lists.drain(..).for_each(flush);
+                }
+            }
+            Self::Held(sections) => sections.held.lock().drain(..).for_each(flush),
+        }
+    }
+}
+
+/// One caller's sections, one open at a time. Whichever of the actor (sets
+/// done) and the caller (section ended) comes second fires the callbacks, so
+/// a section that ends before the actor reaches its sets costs no further
+/// request.
+#[derive(Debug, Default)]
+pub struct Sections {
+    /// The open section's number, shifted left once; the low bit is set while
+    /// the actor holds its callbacks.
+    word: AtomicU64,
+    /// The lists whose callbacks the actor holds.
+    held: Mutex<Vec<i32>>,
+}
+
+impl Sections {
+    /// The actor: `true` while section `seq` is open, which leaves its
+    /// callbacks to its end. A later section open means `seq` ended.
+    fn hold(&self, seq: u64) -> bool {
+        self.word
+            .compare_exchange(
+                seq << 1,
+                seq << 1 | 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The caller, section `seq` ended: `true` when the actor holds its
+    /// callbacks, which this end then owes.
+    pub(crate) fn end(&self, seq: u64) -> bool {
+        self.word.swap((seq + 1) << 1, AtomicOrdering::AcqRel) & 1 == 1
+    }
+}
+
+/// Push every list `updates` writes besides `addr` and those `lists` has, in
+/// the order they first write it: what a bundled set-then-flush owes a flush
+/// beyond the request's own.
+pub(crate) fn push_further_lists(addr: i32, updates: &[ParamSetValue], lists: &mut Vec<i32>) {
+    for list in updates.iter().filter_map(ParamSetValue::list) {
+        if list != addr && !lists.contains(&list) {
+            lists.push(list);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Exactly one of the actor and the caller fires a section's callbacks:
+    /// the end after a hold, the actor after an end — and a section the
+    /// caller has moved past is ended, never held for the next one.
+    #[test]
+    fn whichever_of_the_actor_and_the_caller_comes_second_fires() {
+        let sections = super::Sections::default();
+        assert!(sections.hold(0));
+        assert!(sections.end(0));
+        assert!(!sections.end(1));
+        assert!(!sections.hold(1));
+        assert!(!sections.end(2));
+        assert!(!sections.hold(2), "held for section 3");
+        assert!(sections.hold(3));
+        assert!(sections.end(3));
+    }
+
     /// bab72deef: the entry the actor still holds for a request the timer took
     /// (C unlinks it, asynManager.c:664-674) must not claim the cell's next
     /// request — `begin_running` from `Done` would run that one twice.

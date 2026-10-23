@@ -724,9 +724,6 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
             return Err(err(&format!("tag {tag} is not one value per sample")));
         }
     }
-    for tag in [TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS] {
-        values(tag)?;
-    }
 
     let data_type = match (bits, sample_format as u16) {
         (8, SAMPLEFORMAT_INT) => NDDataType::Int8,
@@ -793,15 +790,24 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let strips_per_plane = height.div_ceil(rows_per_strip);
     let num_strips = strips_per_plane * planes;
     // One entry per strip of the geometry, cut or zero-filled, as
-    // TIFFFetchStripThing leaves the tables.
-    let table = |tag: u16| -> ADResult<Option<Vec<u64>>> {
-        Ok(values(tag)?.map(|v| {
+    // TIFFFetchStripThing leaves the tables. TileOffsets and TileByteCounts
+    // fill the same tables as StripOffsets and StripByteCounts; the later
+    // entry in the directory wins.
+    let table = |strip: u16, tile: u16| -> ADResult<Option<Vec<u64>>> {
+        let (strip_values, tile_values) = (values(strip)?, values(tile)?);
+        let v = if entries.get(&tile) > entries.get(&strip) {
+            tile_values
+        } else {
+            strip_values
+        };
+        Ok(v.map(|v| {
             (0..num_strips)
                 .map(|i| v.get(i).copied().unwrap_or(0))
                 .collect()
         }))
     };
-    let offsets = table(TAG_STRIP_OFFSETS)?.ok_or_else(|| err("no StripOffsets"))?;
+    let offsets =
+        table(TAG_STRIP_OFFSETS, TAG_TILE_OFFSETS)?.ok_or_else(|| err("no StripOffsets"))?;
     let mut array = pool.alloc(dims, data_type)?;
     let image = array.data_mut().as_u8_slice_mut();
     let size = image.len();
@@ -813,7 +819,7 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     // missing, when a single one is 0, past the file or short of the image,
     // or when the first two of more than two contiguous strips differ
     // (tif_dirread.c:3901-3976).
-    let counts = match table(TAG_STRIP_BYTE_COUNTS)? {
+    let counts = match table(TAG_STRIP_BYTE_COUNTS, TAG_TILE_BYTE_COUNTS)? {
         None if num_strips != planes => return Err(err("no StripByteCounts")),
         None => estimate(),
         Some(c)
@@ -2763,7 +2769,8 @@ mod tests {
     /// writes it so that C's reads of those files pin this reader: a 4-wide
     /// image whose sample bytes run `(j+1)*7` from offset 8, 16 0xee bytes,
     /// the out-of-line tag values, then the IFD. `types` rewrites a tag's
-    /// entry type and `values` its values; `extra` entries follow the rest.
+    /// entry type and `values` its values, `omit` leaves tags out; `lead`
+    /// entries go ahead of the rest and `extra` entries after them.
     #[derive(Clone, Copy)]
     struct TagFile {
         height: u32,
@@ -2774,6 +2781,8 @@ mod tests {
         format: u16,
         types: &'static [(u16, u16)],
         values: &'static [(u16, &'static [i64])],
+        omit: &'static [u16],
+        lead: &'static [(u16, u16, &'static [i64])],
         extra: &'static [(u16, u16, &'static [i64])],
     }
 
@@ -2788,6 +2797,8 @@ mod tests {
                 format: 1,
                 types: &[],
                 values: &[],
+                omit: &[],
+                lead: &[],
                 extra: &[],
             }
         }
@@ -2860,7 +2871,15 @@ mod tests {
                     *values = v.to_vec();
                 }
             }
-            tags.extend(self.extra.iter().map(|&(t, k, v)| (t, k, v.to_vec())));
+            tags.retain(|(tag, _, _)| !self.omit.contains(tag));
+            let entry = |&(t, k, v): &(u16, u16, &[i64])| (t, k, v.to_vec());
+            let tags: Vec<_> = self
+                .lead
+                .iter()
+                .map(entry)
+                .chain(tags)
+                .chain(self.extra.iter().map(entry))
+                .collect();
             let arrays_at = 8 + data.len();
             let mut arrays = Vec::new();
             let mut ifd = (tags.len() as u16).to_le_bytes().to_vec();
@@ -3049,6 +3068,12 @@ mod tests {
             ("tiled_l", TagFile { extra: &[(TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
             ("tiled_wl", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[16]), (TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
             ("tiled_w5", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[5])], ..s }, None),
+            ("toffs_shift", TagFile { extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some("UInt8 4,3 0e151c232a31383f464d54ee")),
+            ("toffs_one", TagFile { rows: 3, extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[10])], ..s }, Some("UInt8 4,3 151c232a31383f464d54eeee")),
+            ("toffs_only", TagFile { omit: &[TAG_STRIP_OFFSETS], extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[8, 12, 16])], ..s }, Some(GRAY)),
+            ("toffs_first", TagFile { lead: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some(GRAY)),
+            ("tcounts_fix", TagFile { values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, 2])], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("tcounts_only", TagFile { omit: &[TAG_STRIP_BYTE_COUNTS], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
         ];
         let wrong: Vec<_> = cases
             .iter()

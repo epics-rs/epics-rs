@@ -277,17 +277,26 @@ pub fn compress_zlib(src: &NDArray, level: i32) -> Result<NDArray, CodecFailure>
     // the frame handed on uncompressed.
     let bound =
         original_size + (original_size >> 12) + (original_size >> 14) + (original_size >> 25) + 13;
+    let deflate = |level: u32, dst: &mut [u8]| {
+        let mut z = Compress::new(Compression::new(level), true);
+        match z.compress(raw, dst, FlushCompress::Finish) {
+            Ok(Status::StreamEnd) => Some(z.total_out() as usize),
+            _ => None,
+        }
+    };
     let arr = encoded_output(
         src,
         bound,
         codec,
         "Failed to allocate zlib output array",
         |dst| {
-            let mut z = Compress::new(Compression::new(level.clamp(0, 9) as u32), true);
-            match z.compress(raw, dst, FlushCompress::Finish) {
-                Ok(Status::StreamEnd) => Ok(z.total_out() as usize),
-                _ => Err("zlib compress2 failed".into()),
-            }
+            // zlib stores a block that does not shrink, which is what keeps
+            // it in `compressBound`; miniz's level 1 keeps blocks past its
+            // 32 KiB window Huffman-coded and can overrun it on noise. Such a
+            // frame is stored instead: 31 KiB blocks of 5 bytes overhead fit.
+            deflate(level.clamp(0, 9) as u32, dst)
+                .or_else(|| deflate(0, dst))
+                .ok_or_else(|| "zlib compress2 failed".into())
         },
     )?;
 
@@ -3851,6 +3860,45 @@ mod tests {
                 .compressed_size
         };
         assert!(size(0) > size(9), "level 0 stores, level 9 compresses");
+    }
+
+    /// C's `compress2` fits any frame in `compressBound`, so every level
+    /// compresses noise into exactly that charge and the stream inflates
+    /// back: u8 past miniz's 32 KiB window, and each element type.
+    #[test]
+    fn zlib_fits_noise_in_cs_bound_at_every_level() {
+        let c_bound = |n: usize| n + (n >> 12) + (n >> 14) + (n >> 25) + 13;
+        let check = |nx: usize, data_type, level| {
+            let pool = NDArrayPool::new(0);
+            let mut src = pool.alloc(vec![NDDimension::new(nx)], data_type).unwrap();
+            let mut s = 12345u32;
+            for b in src.data_mut().as_u8_slice_mut() {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (s >> 24) as u8;
+            }
+            let n = src.data().len() * data_type.element_size();
+            let before = pool.allocated_bytes();
+            let out = compress_zlib(&src, level)
+                .unwrap_or_else(|e| panic!("{n} B {data_type:?} level {level}: {e}"));
+            assert_eq!((pool.allocated_bytes() - before) as usize, c_bound(n));
+            let back = decompress_zlib(&out).unwrap();
+            assert_eq!(back.data().as_u8_slice(), src.data().as_u8_slice());
+        };
+        for n in [65536, 300003, 1 << 20, 4 << 20] {
+            check(n, NDDataType::UInt8, 1);
+        }
+        for data_type in [
+            NDDataType::UInt8,
+            NDDataType::UInt16,
+            NDDataType::Int32,
+            NDDataType::Float32,
+            NDDataType::Float64,
+        ] {
+            check(65536, data_type, 1);
+        }
+        for level in 0..=9 {
+            check(131072, NDDataType::UInt8, level);
+        }
     }
 
     // ---- COMPRESSOR ordinal mapping ----

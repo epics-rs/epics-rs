@@ -8,7 +8,6 @@ use crate::codec::Codec;
 use crate::driver::ndarray_driver::ArrayOwner;
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension, PoolTie};
-use crate::timestamp::EpicsTimestamp;
 
 /// If a free-list buffer is more than this ratio larger than needed, discard
 /// it and allocate fresh to avoid wasting memory.
@@ -20,9 +19,10 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Leave to change what only the pool sets on an [`NDDataBuffer`]: its
-/// element type ([`NDDataBuffer::retype`]) and its charge
-/// ([`NDDataBuffer::charge`]). Only this module makes one, as C's pool is
-/// the one writer of `dataType` and `dataSize` on a buffer it hands out.
+/// element type ([`NDDataBuffer::retype`]) and, with the array's tie to the
+/// pool, its charge ([`NDArray::tie`]). Only this module makes one, as C's
+/// pool is the one writer of `dataType` and `dataSize` on a buffer it hands
+/// out.
 pub(crate) struct PoolOnly(());
 
 /// A recycled buffer waiting in the free list, with the `data_size` the pool
@@ -89,26 +89,20 @@ impl NDArrayPool {
     }
 
     /// Wrap a buffer in an array that belongs to this pool.
-    fn adopt(&self, dims: Vec<NDDimension>, mut data: NDDataBuffer, data_size: usize) -> NDArray {
-        data.charge(PoolOnly(()), data_size);
-        NDArray {
-            unique_id: self.next_unique_id.fetch_add(1, Ordering::Relaxed),
-            // The "Initialize fields" block of C++ NDArrayPool::alloc
-            // (NDArrayPool.cpp:187-199) sets neither `epicsTS` nor `timeStamp`:
-            // the driver owns both and stamps them together via
-            // asynNDArrayDriver::updateTimeStamps (asynNDArrayDriver.cpp:832-836).
-            // Stamping only `epicsTS` here left `timeStamp` at 0.0 (fresh buffer)
-            // or at the previous frame's value (reused buffer), so the two
-            // published timestamps disagreed. See NDArray::update_time_stamps.
-            timestamp: EpicsTimestamp::default(),
-            time_stamp: 0.0,
-            dims,
-            data,
-            attributes: NDAttributeList::new(),
-            codec: None,
-            pool: Some(PoolTie::Charged(self.this.clone())),
-            data_size,
-        }
+    fn adopt(&self, dims: Vec<NDDimension>, data: NDDataBuffer, data_size: usize) -> NDArray {
+        // The "Initialize fields" block of C++ NDArrayPool::alloc
+        // (NDArrayPool.cpp:187-199) sets neither `epicsTS` nor `timeStamp`,
+        // and neither does `with_data`: the driver owns both and stamps them
+        // together via asynNDArrayDriver::updateTimeStamps
+        // (asynNDArrayDriver.cpp:832-836). Stamping only `epicsTS` here left
+        // `timeStamp` at 0.0 (fresh buffer) or at the previous frame's value
+        // (reused buffer), so the two published timestamps disagreed. See
+        // NDArray::update_time_stamps.
+        let mut array = NDArray::with_data(dims, data);
+        array.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
+        array.data_size = data_size;
+        array.tie(PoolOnly(()), PoolTie::Charged(self.this.clone()));
+        array
     }
 
     /// The driver that owns the pool, `None` for an unowned pool or a driver
@@ -565,7 +559,7 @@ impl DriverPool {
     /// plain [`NDArrayPool`], such as [`crate::roi::crop_roi`]; `None` for
     /// any other array.
     pub fn adopt(&self, array: NDArray) -> Option<DriverArray> {
-        let charged = matches!(&array.pool, Some(PoolTie::Charged(_)));
+        let charged = matches!(array.pool_tie(), Some(PoolTie::Charged(_)));
         (charged && array.pool_id() == self.pool.id()).then(|| DriverArray {
             array,
             pool: self.clone(),
@@ -726,6 +720,10 @@ impl SharedCharge {
     pub(crate) fn pool(&self) -> &Weak<NDArrayPool> {
         &self.pool
     }
+
+    pub(crate) fn data_size(&self) -> usize {
+        self.data_size
+    }
 }
 
 impl Drop for SharedCharge {
@@ -752,12 +750,15 @@ pub struct PersistentArray {
 
 impl PersistentArray {
     pub fn new(mut array: DriverArray) -> Self {
-        if let Some(PoolTie::Charged(pool)) = array.array.pool.take() {
-            array.array.pool = Some(PoolTie::Shared(Arc::new(SharedCharge {
-                pool,
+        if let Some(PoolTie::Charged(pool)) = array.array.pool_tie() {
+            let charge = SharedCharge {
+                pool: pool.clone(),
                 data_size: array.array.data_size,
                 parked: Mutex::default(),
-            })));
+            };
+            array
+                .array
+                .tie(PoolOnly(()), PoolTie::Shared(Arc::new(charge)));
         }
         Self { array, shown: None }
     }
@@ -773,10 +774,9 @@ impl PersistentArray {
         self.shown
             .get_or_insert_with(|| {
                 let mut copy = NDArray::clone(&self.array);
-                copy.pool = match &self.array.array.pool {
-                    Some(PoolTie::Shared(charge)) => Some(PoolTie::Shared(charge.clone())),
-                    _ => None,
-                };
+                if let Some(PoolTie::Shared(charge)) = self.array.pool_tie() {
+                    copy.tie(PoolOnly(()), PoolTie::Shared(charge.clone()));
+                }
                 PublishedArray {
                     array: Arc::new(copy),
                     pool: self.array.pool.clone(),
@@ -788,7 +788,8 @@ impl PersistentArray {
 
 impl Drop for PersistentArray {
     fn drop(&mut self) {
-        if let Some(PoolTie::Shared(charge)) = &self.array.array.pool {
+        if let Some(PoolTie::Shared(charge)) = self.array.array.pool_tie() {
+            let charge = Arc::clone(charge);
             *charge.parked.lock() = std::mem::take(&mut self.array.array.data);
         }
     }
@@ -864,6 +865,24 @@ mod tests {
         drop(held);
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
         assert!(alloc().is_ok());
+    }
+
+    /// A publish is held to the persistent array's one charge: back with the
+    /// driver as its last holder, it grows no further than the array could.
+    #[test]
+    fn a_persistent_array_publish_never_grows_past_its_charge() {
+        let pool = DriverPool::standalone(8);
+        let mut flat = PersistentArray::new(
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                .unwrap(),
+        );
+        let held = flat.published();
+        flat.refill().unique_id = 1;
+        let Ok(mut copy) = held.try_into_driver() else {
+            panic!("the refill let go of the publish");
+        };
+        copy.data.resize(3);
+        assert_eq!(copy.data.len(), 2);
     }
 
     /// A reused free buffer is tied to its pool and owner as a fresh one is.

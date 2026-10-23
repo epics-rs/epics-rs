@@ -82,7 +82,8 @@ pub struct NDDataBuffer {
     len: usize,
     storage: Vec<Chunk>,
     /// The bytes its pool charged for it (C's `dataSize`), past which no
-    /// method grows it; `None` off the pool.
+    /// method grows it; set with its array's pool tie ([`NDArray::tie`]),
+    /// `None` off the pool.
     charge: Option<usize>,
 }
 
@@ -339,12 +340,6 @@ impl NDDataBuffer {
         self.set_len(len);
     }
 
-    /// Charged `bytes` by its pool, which no method grows it past: C's
-    /// `dataSize`, at which its pool's copy stops (NDArrayPool.cpp:296).
-    pub(crate) fn charge(&mut self, _: PoolOnly, bytes: usize) {
-        self.charge = Some(bytes);
-    }
-
     /// Resize the buffer, zeroing new elements if growing, up to its pool
     /// charge.
     pub fn resize(&mut self, new_len: usize) {
@@ -566,9 +561,8 @@ pub struct NDArray {
     pub attributes: NDAttributeList,
     pub codec: Option<Codec>,
     /// The pool that allocated this array (C++ `pNDArrayPool`), `None` for an
-    /// array built outside any pool. Set only by `NDArrayPool::alloc` and
-    /// `PersistentArray`.
-    pub(crate) pool: Option<PoolTie>,
+    /// array built outside any pool. Written only by [`Self::tie`].
+    pool: Option<PoolTie>,
     /// Requested byte count at allocation time (C++ `dataSize`). This is the exact
     /// `num_elements * element_size` requested, NOT the allocator-rounded Vec capacity.
     /// Pool memory accounting adds/subtracts this exact value.
@@ -677,6 +671,22 @@ impl NDArray {
     /// no pool or that pool is gone (C++ `pNDArrayPool`).
     pub fn pool_id(&self) -> u64 {
         self.pool().map_or(0, |pool| pool.id())
+    }
+
+    /// Tie the array to its pool and charge its buffer what that pool
+    /// accounts for it: C's `dataSize`, at which its pool's copy stops
+    /// (NDArrayPool.cpp:296). The one writer of both, so no pool-tied buffer
+    /// goes uncharged.
+    pub(crate) fn tie(&mut self, _: PoolOnly, tie: PoolTie) {
+        self.data.charge = Some(match &tie {
+            PoolTie::Charged(_) => self.data_size,
+            PoolTie::Shared(charge) => charge.data_size(),
+        });
+        self.pool = Some(tie);
+    }
+
+    pub(crate) fn pool_tie(&self) -> Option<&PoolTie> {
+        self.pool.as_ref()
     }
 
     /// Stamp both timestamps from one time source.

@@ -263,8 +263,10 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out
 
     #[cfg(feature = "parallel")]
     // At least 800 ps per pixel serially, u8 and u16 alike; the split
-    // measured faster from 10 us (u16 128x128 0.77x serial, u8 0.61x).
-    if par_util::pool_wins(n, 800, 10, h) && w > 0 {
+    // measured faster from 30 us at every frame gap (u16 200x200 0.74x
+    // serial back-to-back, 0.97x 10 ms apart), but not at 128x128 10 ms
+    // apart (1.12x), where it ends before a sleeping worker wakes.
+    if par_util::pool_wins(n, 800, 30, h) && w > 0 {
         par_util::for_each_chunk_mut(out, w * 3, row);
         return;
     }

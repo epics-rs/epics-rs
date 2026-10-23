@@ -92,9 +92,9 @@ fn pool_output(
 struct Buffers {
     /// The transform's complex working array; after a forward transform it
     /// starts with the first row's nFreqX bins.
-    data: Vec<Complex<f64>>,
+    data: LineBuf,
     /// The gathered columns of [`fft_columns`].
-    cols: Vec<Complex<f64>>,
+    cols: LineBuf,
     /// The spectrum, or the inverse transform's samples.
     out: Vec<f64>,
     /// One set per pool job of the widest pass so far.
@@ -106,10 +106,10 @@ struct Buffers {
 /// it, so a frame the size of the last faults no pages in.
 #[derive(Default)]
 struct JobBufs {
-    scratch: Vec<Complex<f64>>,
-    row: Vec<Complex<f64>>,
-    a: Vec<Complex<f64>>,
-    b: Vec<Complex<f64>>,
+    scratch: LineBuf,
+    row: LineBuf,
+    a: LineBuf,
+    b: LineBuf,
 }
 
 /// [`Buffers`] and the frame's samples as `f64`, apart so a transform reads
@@ -154,18 +154,63 @@ impl FreeSets {
     }
 }
 
-/// The first `n` elements of `v`, which grows to `n` if shorter.
-fn at_least(v: &mut Vec<Complex<f64>>, n: usize) -> &mut [Complex<f64>] {
-    if v.len() < n {
-        v.resize(n, Complex::new(0.0, 0.0));
+/// A reused complex buffer whose window starts on a 64-byte line. rustfft
+/// moves 32 bytes per load, and a buffer at 16 mod 32, where glibc places
+/// one by allocation order, splits every other load across two lines: a
+/// 1000x9 inverse frame ran 8% more cycles on the same instructions.
+#[derive(Default)]
+struct LineBuf {
+    buf: Vec<Complex<f64>>,
+    start: usize,
+    len: usize,
+}
+
+impl LineBuf {
+    /// The most elements a line start can sit past the buffer's first.
+    const PAD: usize = 64 / size_of::<Complex<f64>>() - 1;
+
+    /// The window as `n` elements, the buffer grown as [`resize`] grows it
+    /// on `jobs` pool jobs. The values are unspecified: every pass writes
+    /// the elements it then reads.
+    fn resize(&mut self, n: usize, jobs: usize) -> &mut [Complex<f64>] {
+        resize(&mut self.buf, n + Self::PAD, Complex::new(0.0, 0.0), jobs);
+        self.start = self.buf.as_ptr().align_offset(64).min(Self::PAD);
+        self.len = n;
+        self
     }
-    &mut v[..n]
+
+    /// The first `n` elements of the window, which grows to `n` if shorter.
+    fn at_least(&mut self, n: usize) -> &mut [Complex<f64>] {
+        if self.len < n {
+            self.resize(n, 1);
+        }
+        &mut self.buf[self.start..self.start + n]
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+}
+
+impl std::ops::Deref for LineBuf {
+    type Target = [Complex<f64>];
+
+    fn deref(&self) -> &[Complex<f64>] {
+        &self.buf[self.start..self.start + self.len]
+    }
+}
+
+impl std::ops::DerefMut for LineBuf {
+    fn deref_mut(&mut self) -> &mut [Complex<f64>] {
+        &mut self.buf[self.start..self.start + self.len]
+    }
 }
 
 /// `fft` over every chunk of `fft.len()` elements of `buf` in place, in
 /// `scratch` rather than a scratch `Fft::process` allocates per call.
-fn run(fft: &dyn Fft<f64>, buf: &mut [Complex<f64>], scratch: &mut Vec<Complex<f64>>) {
-    fft.process_with_scratch(buf, at_least(scratch, fft.get_inplace_scratch_len()));
+fn run(fft: &dyn Fft<f64>, buf: &mut [Complex<f64>], scratch: &mut LineBuf) {
+    fft.process_with_scratch(buf, scratch.at_least(fft.get_inplace_scratch_len()));
 }
 
 /// The fewest complex values a transform pass must cover for the pool to
@@ -390,7 +435,7 @@ fn fft_columns(
     data: &mut [Complex<f64>],
     w: usize,
     jobs: usize,
-    cols: &mut Vec<Complex<f64>>,
+    cols: &mut LineBuf,
     job_bufs: &mut Vec<JobBufs>,
 ) {
     const COLS: usize = 8;
@@ -417,7 +462,7 @@ fn fft_columns(
             job_bufs.push(JobBufs::default());
         }
         let scratch = &mut job_bufs[0].scratch;
-        let cols = at_least(cols, COLS * h);
+        let cols = cols.at_least(COLS * h);
         for c0 in (0..w).step_by(COLS) {
             let c1 = w.min(c0 + COLS);
             let cols = &mut cols[..(c1 - c0) * h];
@@ -433,7 +478,7 @@ fn fft_columns(
     // `WAVE_ELEMENTS` values.
     let blocks = w.div_ceil(COLS);
     let wave = blocks.min(jobs.max(WAVE_ELEMENTS.div_ceil(COLS * h)));
-    resize(cols, wave * COLS * h, Complex::new(0.0, 0.0), jobs);
+    let cols = cols.resize(wave * COLS * h, jobs);
     for b0 in (0..blocks).step_by(wave) {
         let c0 = b0 * COLS;
         let c1 = w.min(c0 + wave * COLS);
@@ -524,9 +569,7 @@ fn fft_1d_rows_with(
     // bins, reusing `bufs.data`'s allocation.
     let first_row = Mutex::new(std::mem::take(&mut bufs.data));
     let keep_first_row = |bins: &[Complex<f64>]| {
-        let mut first_row = first_row.lock();
-        first_row.clear();
-        first_row.extend_from_slice(bins);
+        first_row.lock().resize(bins.len(), 1).copy_from_slice(bins);
     };
     for_each_chunk_with(
         magnitudes,
@@ -534,7 +577,7 @@ fn fft_1d_rows_with(
         jobs,
         &mut bufs.per_job,
         |job, pair, mags| {
-            let row_buf = at_least(&mut job.row, padded);
+            let row_buf = job.row.at_least(padded);
             if mags.len() == n_freq {
                 load_row(row_buf, vals, height - 1, width);
                 run(&*fft, row_buf, &mut job.scratch);
@@ -549,7 +592,7 @@ fn fft_1d_rows_with(
             }
             load_row_pair(row_buf, vals, 2 * pair, width);
             run(&*fft, row_buf, &mut job.scratch);
-            let (a_bins, b_bins) = (at_least(&mut job.a, n_freq), at_least(&mut job.b, n_freq));
+            let (a_bins, b_bins) = (job.a.at_least(n_freq), job.b.at_least(n_freq));
             unpack_pair(row_buf, a_bins, b_bins);
             if pair == 0 {
                 keep_first_row(a_bins);
@@ -629,8 +672,7 @@ fn fft_2d_with(
     // rows zero as the transform of zeros. A reused `data` holds an earlier
     // frame there.
     let zero = Complex::new(0.0, 0.0);
-    let data = &mut bufs.data;
-    resize(data, n_freq_x * h, zero, jobs);
+    let data = bufs.data.resize(n_freq_x * h, jobs);
     let (rows_in, padding) = data.split_at_mut(src_h * n_freq_x);
     for_each_run(padding, n_freq_x, jobs, |_, r| r.fill(zero));
     for_each_chunk_with(
@@ -639,7 +681,7 @@ fn fft_2d_with(
         jobs,
         &mut bufs.per_job,
         |job, pair, bins| {
-            let row_buf = at_least(&mut job.row, w);
+            let row_buf = job.row.at_least(w);
             if bins.len() == n_freq_x {
                 load_row(row_buf, vals, src_h - 1, src_w);
                 run(&*rows, row_buf, &mut job.scratch);
@@ -712,7 +754,7 @@ fn fft_1d_rows_inverse_with(
 
     let zero = Complex::new(0.0, 0.0);
     for_each_chunk_with(samples, width, jobs, &mut bufs.per_job, |job, row, out| {
-        let row_buf = at_least(&mut job.row, width);
+        let row_buf = job.row.at_least(width);
         load_row(row_buf, vals, row, width);
         if suppress_dc {
             row_buf[0] = zero;
@@ -754,8 +796,7 @@ fn fft_2d_inverse_with(
     // Every row loads in full, so a reused `data` keeps nothing of an
     // earlier frame.
     let zero = Complex::new(0.0, 0.0);
-    let data = &mut bufs.data;
-    resize(data, w * h, zero, jobs);
+    let data = bufs.data.resize(w * h, jobs);
     for_each_chunk(data, w, jobs, |row, r| load_row(r, vals, row, w));
 
     if suppress_dc {
@@ -1386,10 +1427,14 @@ mod tests {
             &mut data,
             w,
             1,
-            &mut Vec::new(),
+            &mut LineBuf::default(),
             &mut Vec::new(),
         );
-        run(&*planner.plan_fft_inverse(w), &mut data, &mut Vec::new());
+        run(
+            &*planner.plan_fft_inverse(w),
+            &mut data,
+            &mut LineBuf::default(),
+        );
         let scale = 1.0 / (w * h) as f64;
         data.iter().map(|c| (c.re * scale).to_bits()).collect()
     }
@@ -1524,7 +1569,14 @@ mod tests {
             .collect();
         let columns = |jobs| {
             let mut d = data.clone();
-            fft_columns(&fft, &mut d, w, jobs, &mut Vec::new(), &mut Vec::new());
+            fft_columns(
+                &fft,
+                &mut d,
+                w,
+                jobs,
+                &mut LineBuf::default(),
+                &mut Vec::new(),
+            );
             d.iter()
                 .map(|c| (c.re.to_bits(), c.im.to_bits()))
                 .collect::<Vec<_>>()

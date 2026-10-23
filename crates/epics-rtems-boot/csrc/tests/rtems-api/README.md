@@ -50,9 +50,11 @@ Proved on every push, by `scripts/csrc-check.sh`:
 - Nothing was hand-written into the record to make an error go away
   (`scripts/rtems-api-check.sh` pass 1).
 
-Proved wherever `RTEMS_BSP_PREFIX` is set — the bring-up box, an image build —
-by `scripts/rtems-api-check.sh` pass 2: every recorded block still appears
-verbatim in the header it names.
+Proved by `scripts/rtems-api-check.sh` pass 2, run with `RTEMS_BSP_PREFIX`
+naming a series-6 prefix (`scripts/rtems-bsp.sh --series 6`): every recorded
+block still appears verbatim in the header it names. The script looks only
+under `arm-rtems6/`, so against the default series-7 prefix pass 2 stops with
+"is not a directory" and cannot check the record against RTEMS 7 headers.
 
 Not proved anywhere but on the target: that the image links, that the sizes and
 values agree with the real ABI, and that it boots. The on-target run stays the
@@ -104,5 +106,6 @@ generating it would need the very toolchain CI does not have.
    goes under `/* @rtems-api-local: <why> */` instead. Pass 1 rejects a
    declaration under neither.
 
-4. Run `scripts/rtems-api-check.sh` there, with `RTEMS_BSP_PREFIX` set, so
-   pass 2 confirms the copy; then `scripts/csrc-check.sh` anywhere.
+4. Run `scripts/rtems-api-check.sh` there, with `RTEMS_BSP_PREFIX` naming a
+   series-6 prefix, so pass 2 confirms the copy; then `scripts/csrc-check.sh`
+   anywhere.

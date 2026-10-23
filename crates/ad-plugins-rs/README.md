@@ -109,9 +109,9 @@ Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency 
 
 **Thread pool management:**
 
-All plugins share a single rayon `ThreadPool` to avoid over-subscription when multiple plugins process data concurrently. The pool is sized to `available_cores - 2` (minimum 1), reserving headroom for port driver data threads, autoconnect tasks, and the async runtime.
+All plugins share one rayon `ThreadPool` per L3 cache domain, to avoid over-subscription when multiple plugins process data concurrently, and a pass runs on the pool of the domain its caller runs in, whose cache holds the frame. A domain's pool has one worker per physical core the process may use there (its CPUs in sysfs within the process's affinity mask), at most `available_cores - 2`, reserving headroom for port driver data threads, autoconnect tasks, and the async runtime; its workers are pinned to those CPUs. With one domain, or no topology in sysfs (and off Linux), there is one unpinned pool of `available_cores - 2` workers (minimum 1).
 
-To override the thread count, call `set_num_threads()` before the first array is processed:
+To override the thread count, which gives one unpinned pool of that many workers, call `set_num_threads()` before the first array is processed:
 
 ```rust
 ad_plugins_rs::par_util::set_num_threads(4);

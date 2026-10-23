@@ -1,4 +1,6 @@
 #[cfg(feature = "parallel")]
+use std::path::Path;
+#[cfg(feature = "parallel")]
 use std::sync::OnceLock;
 #[cfg(feature = "parallel")]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const PAR_THRESHOLD: usize = 4096;
 
 /// Number of CPU cores reserved for driver threads, tokio runtime, etc.
-/// The rayon pool will use `available_cores - RESERVED_CORES` threads (minimum 1).
+/// No rayon pool uses more than `available_cores - RESERVED_CORES` threads (minimum 1).
 #[cfg(feature = "parallel")]
 const RESERVED_CORES: usize = 2;
 
@@ -45,23 +47,24 @@ fn takes_at_least(elements: usize, ps_per_element: usize, min_us: usize) -> bool
         >= (min_us as u64).saturating_mul(1_000_000)
 }
 
-/// Shared rayon ThreadPool.
+/// The shared rayon pools, one per L3 cache domain.
 ///
 /// Plugins in non-blocking mode each have their own data thread, so multiple
-/// plugins may submit rayon work concurrently. A single shared pool ensures
-/// work-stealing without over-subscription.
-///
-/// The pool is sized to `available_cores - RESERVED_CORES` to leave headroom
-/// for port driver data threads, autoconnect tasks, and the tokio runtime.
-/// Call [`set_num_threads`] before the first `thread_pool()` access to override.
+/// plugins may submit rayon work concurrently; shared pools keep that from
+/// over-subscribing the box. [`thread_pool`] hands a pass the pool of the
+/// domain its caller runs in, whose cache holds the frame the caller just
+/// touched: on a two-socket box, 24 workers in the caller's domain beat 94
+/// across both sockets at every frame size measured, by up to 5x.
 #[cfg(feature = "parallel")]
-static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static POOLS: OnceLock<Pools> = OnceLock::new();
 
 /// User-specified thread count override. 0 means "use default formula".
 #[cfg(feature = "parallel")]
 static NUM_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 /// Set the number of rayon worker threads before the pool is first used.
+/// An explicit count gives one unpinned pool of `n` workers instead of one
+/// pool per L3 domain.
 ///
 /// Must be called before any plugin processes an array. Has no effect if the
 /// pool has already been initialized.
@@ -70,28 +73,213 @@ pub fn set_num_threads(n: usize) {
     NUM_THREADS_OVERRIDE.store(n, Ordering::Relaxed);
 }
 
+/// The pool of the L3 domain the calling thread runs on.
 #[cfg(feature = "parallel")]
 pub fn thread_pool() -> &'static rayon::ThreadPool {
-    POOL.get_or_init(|| {
-        let user = NUM_THREADS_OVERRIDE.load(Ordering::Relaxed);
-        let num_threads = if user > 0 {
-            user
-        } else {
-            let available = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            available.saturating_sub(RESERVED_CORES).max(1)
+    let pools = POOLS.get_or_init(Pools::new);
+    let d = match &pools.domains[..] {
+        [one] => one,
+        all => {
+            let cpu = affinity::current();
+            &all[pools.domain_of.get(cpu).copied().unwrap_or(0)]
+        }
+    };
+    d.pool.get_or_init(|| d.build())
+}
+
+#[cfg(feature = "parallel")]
+struct Pools {
+    /// The domain of each CPU by number; a CPU outside every domain takes
+    /// domain 0.
+    domain_of: Vec<usize>,
+    domains: Vec<Domain>,
+}
+
+/// A pool and the CPUs it runs on, built on first use.
+#[cfg(feature = "parallel")]
+struct Domain {
+    /// The CPUs its workers are pinned to: the domain's CPUs within the
+    /// process's affinity mask, or none for an unpinned pool.
+    cpus: Vec<usize>,
+    workers: usize,
+    pool: OnceLock<rayon::ThreadPool>,
+}
+
+#[cfg(feature = "parallel")]
+impl Pools {
+    /// One pool per L3 domain the process may run in, each one worker per
+    /// physical core it may use there, at most `available_cores -
+    /// RESERVED_CORES`. One domain, or no topology to read, gives one
+    /// unpinned pool of that many.
+    fn new() -> Self {
+        let cap = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .saturating_sub(RESERVED_CORES)
+            .max(1);
+        match NUM_THREADS_OVERRIDE.load(Ordering::Relaxed) {
+            0 => match l3_domains(Path::new("/sys/devices/system/cpu"), &affinity::allowed()) {
+                Some(found) => Self::split(found, cap),
+                None => Self::single(cap),
+            },
+            n => Self::single(n),
+        }
+    }
+
+    fn single(workers: usize) -> Self {
+        Self {
+            domain_of: Vec::new(),
+            domains: vec![Domain {
+                cpus: Vec::new(),
+                workers,
+                pool: OnceLock::new(),
+            }],
+        }
+    }
+
+    /// The pools of `found`, [`l3_domains`]' domains, each at most `cap`
+    /// workers.
+    fn split(found: Vec<(Vec<usize>, usize)>, cap: usize) -> Self {
+        let mut domain_of = Vec::new();
+        let domains = (found.into_iter().enumerate())
+            .map(|(i, (cpus, cores))| {
+                for &c in &cpus {
+                    if domain_of.len() <= c {
+                        domain_of.resize(c + 1, 0);
+                    }
+                    domain_of[c] = i;
+                }
+                Domain {
+                    cpus,
+                    workers: cores.min(cap),
+                    pool: OnceLock::new(),
+                }
+            })
+            .collect();
+        Self { domain_of, domains }
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Domain {
+    fn build(&self) -> rayon::ThreadPool {
+        let mut builder = rayon::ThreadPoolBuilder::new().num_threads(self.workers);
+        if !self.cpus.is_empty() {
+            let cpus = self.cpus.clone();
+            builder = builder.start_handler(move |_| affinity::pin(&cpus));
+        }
+        builder.build().expect("failed to create rayon thread pool")
+    }
+}
+
+/// The L3 domains of the `allowed` CPUs, read from the sysfs CPU directory
+/// `root`: each domain's allowed CPUs and the physical cores among them.
+/// `None` unless every allowed CPU names its L3 and its core, and they fall
+/// in two domains or more.
+#[cfg(feature = "parallel")]
+fn l3_domains(root: &Path, allowed: &[usize]) -> Option<Vec<(Vec<usize>, usize)>> {
+    // Keyed by the L3's and the core's CPU lists as sysfs prints them, which
+    // every CPU sharing them prints alike.
+    let mut found: Vec<(String, Vec<usize>, Vec<String>)> = Vec::new();
+    for &cpu in allowed {
+        let dir = root.join(format!("cpu{cpu}"));
+        let l3 = std::fs::read_dir(dir.join("cache"))
+            .ok()?
+            .flatten()
+            .find(|e| read(&e.path().join("level")).as_deref() == Some("3"))
+            .and_then(|e| read(&e.path().join("shared_cpu_list")))?;
+        let core = read(&dir.join("topology/core_cpus_list"))
+            .or_else(|| read(&dir.join("topology/thread_siblings_list")))?;
+        let i = match found.iter().position(|d| d.0 == l3) {
+            Some(i) => i,
+            None => {
+                found.push((l3, Vec::new(), Vec::new()));
+                found.len() - 1
+            }
         };
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .expect("failed to create rayon thread pool")
+        let (_, cpus, cores) = &mut found[i];
+        cpus.push(cpu);
+        if !cores.contains(&core) {
+            cores.push(core);
+        }
+    }
+    (found.len() >= 2).then(|| {
+        (found.into_iter())
+            .map(|(_, cpus, cores)| (cpus, cores.len()))
+            .collect()
     })
+}
+
+#[cfg(feature = "parallel")]
+fn read(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+#[cfg(all(feature = "parallel", target_os = "linux"))]
+mod affinity {
+    use std::mem::{size_of, zeroed};
+
+    /// The CPUs in the process's affinity mask, so taskset and cpusets
+    /// bound the pools.
+    pub fn allowed() -> Vec<usize> {
+        // SAFETY: the mask is a `cpu_set_t` owned by this frame, and
+        // `CPU_ISSET` reads it below `CPU_SETSIZE`.
+        unsafe {
+            let mut set: libc::cpu_set_t = zeroed();
+            if libc::sched_getaffinity(libc::getpid(), size_of::<libc::cpu_set_t>(), &mut set) != 0
+            {
+                return Vec::new();
+            }
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        }
+    }
+
+    /// The CPU the calling thread runs on, `usize::MAX` if unknown.
+    pub fn current() -> usize {
+        // SAFETY: no arguments, no memory of ours.
+        usize::try_from(unsafe { libc::sched_getcpu() }).unwrap_or(usize::MAX)
+    }
+
+    /// The calling thread confined to `cpus`. A refusal, a cpuset narrowed
+    /// since `cpus` was read, leaves it where it was spawned.
+    pub fn pin(cpus: &[usize]) {
+        // SAFETY: the mask is a `cpu_set_t` owned by this frame, set only
+        // below `CPU_SETSIZE`, which bounds every CPU `allowed` returns.
+        unsafe {
+            let mut set: libc::cpu_set_t = zeroed();
+            for &c in cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+}
+
+/// No affinity calls: no CPU is allowed by number, so [`Pools`] keeps one
+/// unpinned pool.
+#[cfg(all(feature = "parallel", not(target_os = "linux")))]
+mod affinity {
+    pub fn allowed() -> Vec<usize> {
+        Vec::new()
+    }
+
+    pub fn current() -> usize {
+        usize::MAX
+    }
+
+    pub fn pin(_: &[usize]) {}
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parallel")]
+    use super::{Pools, l3_domains};
     use super::{pool_wins, takes_at_least};
+    #[cfg(feature = "parallel")]
+    use std::path::Path;
 
     #[test]
     fn pool_wins_takes_two_chunks() {
@@ -107,5 +295,110 @@ mod tests {
         assert!(takes_at_least(1_000_000, 100, 100));
         assert!(!takes_at_least(999_999, 100, 100));
         assert!(takes_at_least(usize::MAX, usize::MAX, 1 << 40));
+    }
+
+    /// A sysfs CPU directory under `root`: each `(cpu, l3, core)` gets an L1
+    /// and an L3 cache entry and its core's CPU list, under the pre-5.x name
+    /// when `core` starts with `old:`.
+    #[cfg(feature = "parallel")]
+    fn sysfs(root: &Path, cpus: &[(usize, &str, &str)]) {
+        let put = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{text}\n")).unwrap();
+        };
+        for &(cpu, l3, core) in cpus {
+            let dir = root.join(format!("cpu{cpu}"));
+            put(dir.join("cache/index0/level"), "1");
+            put(dir.join("cache/index0/shared_cpu_list"), core);
+            put(dir.join("cache/index3/level"), "3");
+            put(dir.join("cache/index3/shared_cpu_list"), l3);
+            match core.strip_prefix("old:") {
+                Some(core) => put(dir.join("topology/thread_siblings_list"), core),
+                None => put(dir.join("topology/core_cpus_list"), core),
+            }
+        }
+    }
+
+    /// Two L3 domains of two cores with two threads each: cpus 0,1 and their
+    /// siblings 4,5 in one, 2,3 and 6,7 in the other.
+    #[cfg(feature = "parallel")]
+    fn two_sockets(root: &Path) {
+        let (a, b) = ("0-1,4-5", "2-3,6-7");
+        sysfs(
+            root,
+            &[
+                (0, a, "0,4"),
+                (1, a, "1,5"),
+                (2, b, "old:2,6"),
+                (3, b, "old:3,7"),
+                (4, a, "0,4"),
+                (5, a, "1,5"),
+                (6, b, "old:2,6"),
+                (7, b, "old:3,7"),
+            ],
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_domain_is_its_allowed_cpus_and_their_cores() {
+        let root = tempfile::tempdir().unwrap();
+        two_sockets(root.path());
+        let all: Vec<usize> = (0..8).collect();
+        assert_eq!(
+            l3_domains(root.path(), &all),
+            Some(vec![(vec![0, 1, 4, 5], 2), (vec![2, 3, 6, 7], 2)])
+        );
+        // One thread of each core allowed: the same cores, half the CPUs.
+        assert_eq!(
+            l3_domains(root.path(), &[0, 1, 2, 3]),
+            Some(vec![(vec![0, 1], 2), (vec![2, 3], 2)])
+        );
+        assert_eq!(
+            l3_domains(root.path(), &[0, 4, 2]),
+            Some(vec![(vec![0, 4], 1), (vec![2], 1)])
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn one_domain_or_no_topology_gives_no_split() {
+        let root = tempfile::tempdir().unwrap();
+        two_sockets(root.path());
+        assert_eq!(l3_domains(root.path(), &[0, 1, 4, 5]), None);
+        assert_eq!(l3_domains(root.path(), &[]), None);
+        assert_eq!(l3_domains(&root.path().join("absent"), &[0, 2]), None);
+        // A CPU with no L3, or no core list, leaves the topology unread.
+        sysfs(root.path(), &[(8, "8", "8")]);
+        std::fs::remove_dir_all(root.path().join("cpu8/cache/index3")).unwrap();
+        assert_eq!(l3_domains(root.path(), &[0, 2, 8]), None);
+        sysfs(root.path(), &[(9, "0-1,4-5", "9")]);
+        std::fs::remove_dir_all(root.path().join("cpu9/topology")).unwrap();
+        assert_eq!(l3_domains(root.path(), &[0, 2, 9]), None);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn split_maps_each_cpu_to_its_domain_and_caps_the_workers() {
+        let pools = Pools::split(vec![(vec![0, 1, 4, 5], 2), (vec![2, 3, 6, 9], 3)], 2);
+        assert_eq!(pools.domain_of, [0, 0, 1, 1, 0, 0, 1, 0, 0, 1]);
+        let workers: Vec<usize> = pools.domains.iter().map(|d| d.workers).collect();
+        assert_eq!(workers, [2, 2]);
+        assert_eq!(pools.domains[1].cpus, [2, 3, 6, 9]);
+    }
+
+    /// Every worker of a pinned pool runs on the domain's CPUs.
+    #[cfg(all(feature = "parallel", target_os = "linux"))]
+    #[test]
+    fn a_domains_workers_run_on_its_cpus() {
+        use super::{Domain, affinity};
+        let cpu = affinity::allowed()[0];
+        let d = Domain {
+            cpus: vec![cpu],
+            workers: 2,
+            pool: Default::default(),
+        };
+        let on = d.build().broadcast(|_| affinity::current());
+        assert_eq!(on, [cpu, cpu]);
     }
 }

@@ -37,6 +37,11 @@ rust-hdf5 = { version = "0.7.9", features = ["threadsafe", "all_filters", "paral
 epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
 
+# `par_util`'s pools: the affinity mask they are bounded by, the CPU a pass
+# is submitted from, and the pinning of each L3 domain's workers.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
+
 # Only `build.rs`'s `emit_rust_hdf5_pin` uses this: the `rust-hdf5` pin has to
 # be read out of the dependency table by key, because `cargo package` reshapes
 # the manifest it reads.
@@ -56,5 +61,5 @@ tiff = "0.9"
 default = ["parallel", "simd"]
 ioc = ["dep:epics-ca-rs", "ad-core-rs/ioc"]
 pva = ["dep:epics-pva-rs", "dep:epics-bridge-rs"]
-parallel = ["rayon"]
+parallel = ["rayon", "dep:libc"]
 simd = ["dep:fearless_simd", "dep:fearless_simd_macros", "ad-core-rs/simd"]

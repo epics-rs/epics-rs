@@ -37,6 +37,7 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "rayon",

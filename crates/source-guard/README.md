@@ -3,8 +3,10 @@
 Test-only. The one production-slice rule the workspace's mechanical guards
 share, and the derived file sets they sweep.
 
-Never published (`publish = false`); every consumer takes it as a `path`-only
-dev-dependency, which `cargo package` drops from the uploaded manifest.
+Never published (`publish = false`). The published crates that use it take it
+as a `path`-only dev-dependency, which `cargo package` drops from the uploaded
+manifest; the unpublished `tools/record-seam-gate` and `tools/cfloat-gate` take
+it as a plain one.
 
 ## What a source guard is
 
@@ -36,6 +38,8 @@ quietly dropped them from the census that exists to cover them.
 Excluded lines are **blanked, not deleted**, so a 1-based line number taken
 from the slice still names the same line of the original file. Guards that
 report offending line numbers were relying on truncation for that.
+`production_str` is the same rule returning owned text, for a source that is
+not `'static`.
 
 `Comments::Strip` is the second half of the rule, because guards forbid *code*
 from naming something while the prose beside that code names it constantly —
@@ -86,7 +90,7 @@ guards over this workspace's source, and this workspace is where they run.
 
 Taken by `epics-base-rs`, `epics-libcom-rs`, `epics-ca-rs`, `epics-pva-rs`,
 `epics-bridge-rs`, `epics-rtems-boot`, `asyn-rs`, `ad-core-rs`,
-`ad-plugins-rs`, and `tools/record-seam-gate`.
+`ad-plugins-rs`, `tools/record-seam-gate` and `tools/cfloat-gate`.
 
 ## Testing
 
@@ -94,7 +98,7 @@ Taken by `epics-base-rs`, `epics-libcom-rs`, `epics-ca-rs`, `epics-pva-rs`,
 cargo nextest run -p source-guard
 ```
 
-14 tests, one per boundary of the rule. `tests/slice_rule.rs` keeps the
+20 tests, one per boundary of the rule. `tests/slice_rule.rs` keeps the
 positional rule it replaced as a named function, so every test that disproves it
 fails if `production` ever goes back to it.
 

@@ -21,8 +21,6 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 #[cfg(feature = "parallel")]
 use crate::par_util;
 use crate::stats::{StatsElem, merge_range};
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
 /// Configuration for a single ROI region. The default is NDPluginROIStat.cpp's
 /// starting ROI: Use 0 (`:557`) and zero geometry.
@@ -534,21 +532,16 @@ impl NDPluginProcess for ROIStatProcessor {
                 clamped.iter().flatten().count(),
             ) {
                 let data = &array.data;
-                par_util::thread_pool().install(|| {
-                    rois.par_iter()
-                        .zip(clamped.par_iter())
-                        .map(|(roi, clamp)| match clamp {
-                            Some((offset, size)) => Self::compute_roi_stats(
-                                data,
-                                ndims,
-                                array_size_x,
-                                *offset,
-                                *size,
-                                roi.bgd_width,
-                            ),
-                            None => ROIStatResult::default(),
-                        })
-                        .collect()
+                par_util::map_indices(rois.len(), |i| match clamped[i] {
+                    Some((offset, size)) => Self::compute_roi_stats(
+                        data,
+                        ndims,
+                        array_size_x,
+                        offset,
+                        size,
+                        rois[i].bgd_width,
+                    ),
+                    None => ROIStatResult::default(),
                 })
             } else {
                 serial_results()

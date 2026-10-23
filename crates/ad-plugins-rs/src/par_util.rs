@@ -30,7 +30,8 @@ pub fn should_parallelize(num_elements: usize) -> bool {
 /// C runs these passes serially, so the split must never lose to that: a
 /// lone chunk has nothing to split, and a pass shorter than `min_us`, the
 /// serial time from which the split measured faster at the calling site,
-/// loses to handing its chunks to sleeping workers. Always false without
+/// loses more to waking a worker and claiming and merging chunks than the
+/// workers win back. Always false without
 /// the `parallel` feature, so a caller needs no `#[cfg]` fallback of its own.
 ///
 /// Unit tests split every pass of two or more chunks, so test-sized frames
@@ -45,6 +46,225 @@ pub fn pool_wins(elements: usize, ps_per_element: usize, min_us: usize, chunks: 
 fn takes_at_least(elements: usize, ps_per_element: usize, min_us: usize) -> bool {
     (elements as u64).saturating_mul(ps_per_element as u64)
         >= (min_us as u64).saturating_mul(1_000_000)
+}
+
+/// `f(i)` for each `i` in `0..n`, returned in order of `i`, by the calling
+/// thread and the [`thread_pool`] workers that start while indices remain.
+///
+/// The caller claims indices from the first, so the pass never waits for a
+/// worker to wake: one that starts after the last claim does nothing, and
+/// the caller waits only for indices already claimed. Between frames the
+/// workers sleep, and waking one costs more than a short pass takes.
+/// Without the `parallel` feature the caller runs them all.
+pub fn map_indices<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let slots: Vec<parking_lot::Mutex<Option<R>>> =
+        (0..n).map(|_| parking_lot::Mutex::new(None)).collect();
+    claim::run(n, &|claims| {
+        for i in claims {
+            *slots[i].lock() = Some(f(i));
+        }
+    });
+    (slots.into_iter())
+        .map(|s| s.into_inner().expect("every index ran"))
+        .collect()
+}
+
+/// `f` of each `len`-element chunk of `v`, in order, as [`map_indices`]
+/// runs them.
+pub fn map_chunks<T: Sync, R: Send>(v: &[T], len: usize, f: impl Fn(&[T]) -> R + Sync) -> Vec<R> {
+    map_indices(v.len().div_ceil(len), |i| {
+        f(&v[i * len..v.len().min((i + 1) * len)])
+    })
+}
+
+/// One `S` per thread that took chunks of `v`, each from `init()` and then
+/// `f(&mut s, chunk)` for every `len`-element chunk that thread claimed, as
+/// [`map_indices`] claims them.
+pub fn fold_chunks<T: Sync, S: Send>(
+    v: &[T],
+    len: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &[T]) + Sync,
+) -> Vec<S> {
+    let states = parking_lot::Mutex::new(Vec::new());
+    claim::run(v.len().div_ceil(len), &|claims| {
+        let mut state = None;
+        for i in claims {
+            f(
+                state.get_or_insert_with(&init),
+                &v[i * len..v.len().min((i + 1) * len)],
+            );
+        }
+        states.lock().extend(state);
+    });
+    states.into_inner()
+}
+
+/// `f(i, chunk)` for each `len`-element chunk `i` of `out`, as
+/// [`map_indices`] claims them.
+pub fn for_each_chunk_mut<T: Send>(out: &mut [T], len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let chunks: Vec<parking_lot::Mutex<&mut [T]>> =
+        out.chunks_mut(len).map(parking_lot::Mutex::new).collect();
+    claim::run(chunks.len(), &|claims| {
+        for i in claims {
+            f(i, &mut chunks[i].lock());
+        }
+    });
+}
+
+/// The claiming behind [`map_indices`]: each participant, the caller first,
+/// gets an iterator over the indices it claims.
+#[cfg(feature = "parallel")]
+mod claim {
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+
+    /// The indices one participant claims, until none are left.
+    pub struct Claims<'a> {
+        next: &'a AtomicUsize,
+        n: usize,
+    }
+
+    impl Iterator for Claims<'_> {
+        type Item = usize;
+
+        fn next(&mut self) -> Option<usize> {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            (i < self.n).then_some(i)
+        }
+    }
+
+    type Body<'a> = dyn Fn(Claims<'_>) + Sync + 'a;
+
+    /// Set in `Job::inside` once the caller admits no more helpers.
+    const CLOSED: usize = 1 << (usize::BITS - 1);
+
+    struct Job {
+        next: AtomicUsize,
+        n: usize,
+        /// Helpers admitted and not yet done, with `CLOSED` once the caller
+        /// stops admitting them.
+        inside: AtomicUsize,
+        /// Helpers still to spawn, below 0 once all are.
+        recruits: AtomicIsize,
+        pool: &'static rayon::ThreadPool,
+        /// The caller's body, its lifetime erased: only an admitted helper
+        /// calls it, and the caller does not return before every admitted
+        /// helper is done.
+        body: *const Body<'static>,
+        panic: parking_lot::Mutex<Option<Box<dyn Any + Send>>>,
+    }
+
+    // SAFETY: `body` is `Sync`, and `Job` dereferences it only while the
+    // caller that owns it waits (see `Job::body`).
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        fn claims(&self) -> Claims<'_> {
+            Claims {
+                next: &self.next,
+                n: self.n,
+            }
+        }
+
+        /// Spawn up to two more helpers while more indices remain than one.
+        fn recruit(self: &Arc<Self>) {
+            for _ in 0..2 {
+                if self.next.load(Ordering::Relaxed) + 1 >= self.n
+                    || self.recruits.fetch_sub(1, Ordering::Relaxed) <= 0
+                {
+                    return;
+                }
+                let job = self.clone();
+                self.pool.spawn(move || job.help());
+            }
+        }
+
+        fn help(self: Arc<Self>) {
+            if self.inside.fetch_add(1, Ordering::AcqRel) & CLOSED != 0 {
+                self.inside.fetch_sub(1, Ordering::Release);
+                return;
+            }
+            self.recruit();
+            // SAFETY: admitted before `CLOSED`, so the caller waits for the
+            // `fetch_sub` below before its body goes away.
+            let body = unsafe { &*self.body };
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| body(self.claims()))) {
+                self.next.fetch_max(self.n, Ordering::Relaxed);
+                *self.panic.lock() = Some(payload);
+            }
+            self.inside.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Closes the job and waits out its admitted helpers, on return and on
+    /// unwind alike.
+    struct Close<'a>(&'a Job);
+
+    impl Drop for Close<'_> {
+        fn drop(&mut self) {
+            let job = self.0;
+            // Ends the helpers' claims when the caller unwinds early.
+            job.next.fetch_max(job.n, Ordering::Relaxed);
+            let mut inside = job.inside.fetch_or(CLOSED, Ordering::AcqRel);
+            let mut spins = 0u32;
+            while inside & !CLOSED != 0 {
+                if spins < 1 << 10 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+                spins += 1;
+                inside = job.inside.load(Ordering::Acquire);
+            }
+        }
+    }
+
+    /// `body` once on the calling thread and once on each pool worker
+    /// that starts while indices of `0..n` remain.
+    pub fn run(n: usize, body: &Body<'_>) {
+        let pool = super::thread_pool();
+        let helpers = pool.current_num_threads().min(n.saturating_sub(1));
+        if helpers == 0 {
+            return body(Claims {
+                next: &AtomicUsize::new(0),
+                n,
+            });
+        }
+        // SAFETY: only the lifetime changes; `Job::body` says why it holds.
+        let erased = unsafe { std::mem::transmute::<*const Body<'_>, *const Body<'static>>(body) };
+        let job = Arc::new(Job {
+            next: AtomicUsize::new(0),
+            n,
+            inside: AtomicUsize::new(0),
+            recruits: AtomicIsize::new(helpers as isize - 1),
+            pool,
+            body: erased,
+            panic: parking_lot::Mutex::new(None),
+        });
+        {
+            let job = job.clone();
+            pool.spawn(move || job.help());
+        }
+        {
+            let _close = Close(&job);
+            body(job.claims());
+        }
+        if let Some(payload) = job.panic.lock().take() {
+            resume_unwind(payload);
+        }
+    }
+}
+
+/// Without the pool the caller claims every index.
+#[cfg(not(feature = "parallel"))]
+mod claim {
+    pub fn run(n: usize, body: &(dyn Fn(std::ops::Range<usize>) + Sync + '_)) {
+        body(0..n)
+    }
 }
 
 /// The shared rayon pools, one per L3 cache domain.
@@ -386,6 +606,114 @@ mod tests {
         let workers: Vec<usize> = pools.domains.iter().map(|d| d.workers).collect();
         assert_eq!(workers, [2, 2]);
         assert_eq!(pools.domains[1].cpus, [2, 3, 6, 9]);
+    }
+
+    #[test]
+    fn map_indices_returns_every_index_in_order() {
+        for n in [0, 1, 2, 1000] {
+            let got = super::map_indices(n, |i| i * 3);
+            assert_eq!(got, (0..n).map(|i| i * 3).collect::<Vec<_>>());
+        }
+        let v: Vec<u32> = (0..1000).collect();
+        let sums = super::map_chunks(&v, 7, |c| c.iter().sum::<u32>());
+        assert_eq!(
+            sums,
+            v.chunks(7).map(|c| c.iter().sum()).collect::<Vec<u32>>()
+        );
+        let counts = super::fold_chunks(&v, 7, || 0usize, |n, c| *n += c.len());
+        assert_eq!(counts.iter().sum::<usize>(), 1000);
+        let mut out = vec![0usize; 1000];
+        super::for_each_chunk_mut(&mut out, 7, |i, c| c.fill(i));
+        assert!(out.iter().enumerate().all(|(k, &i)| i == k / 7));
+        let nested = super::map_indices(8, |i| {
+            super::map_indices(8, |j| i * j).iter().sum::<usize>()
+        });
+        assert_eq!(nested, (0..8).map(|i| i * 28).collect::<Vec<usize>>());
+    }
+
+    /// With every worker of every pool busy, the caller runs the whole pass
+    /// itself instead of waiting for one.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn the_caller_runs_the_pass_while_every_worker_is_busy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let pools = super::POOLS.get_or_init(super::Pools::new);
+        let busy = Arc::new((AtomicUsize::new(0), AtomicBool::new(false)));
+        let workers: usize = pools.domains.iter().map(|d| d.workers).sum();
+        for d in &pools.domains {
+            let pool = d.pool.get_or_init(|| d.build());
+            for _ in 0..d.workers {
+                let busy = busy.clone();
+                pool.spawn(move || {
+                    busy.0.fetch_add(1, Ordering::SeqCst);
+                    while !busy.1.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        }
+        while busy.0.load(Ordering::SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let caller = std::thread::current().id();
+        let on = super::map_indices(64, |_| std::thread::current().id());
+        busy.1.store(true, Ordering::SeqCst);
+        assert!(on.iter().all(|&t| t == caller));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_helpers_panic_reaches_the_caller() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let helped = AtomicBool::new(false);
+        let r = std::panic::catch_unwind(|| {
+            super::map_indices(64, |i| {
+                if rayon::current_thread_index().is_some() {
+                    helped.store(true, Ordering::SeqCst);
+                    panic!("helper {i}");
+                }
+                while !helped.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            })
+        });
+        let payload = r.expect_err("the helper's panic");
+        assert!(
+            payload
+                .downcast_ref::<String>()
+                .unwrap()
+                .starts_with("helper ")
+        );
+    }
+
+    /// The caller's panic does not unwind past the data a helper still reads.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_callers_panic_waits_for_its_helpers() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0 no helper yet, 1 a helper inside, 2 that helper done.
+        let helper = AtomicU8::new(0);
+        let r = std::panic::catch_unwind(|| {
+            super::map_indices(64, |_| {
+                if rayon::current_thread_index().is_some() {
+                    if helper
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        helper.store(2, Ordering::SeqCst);
+                    }
+                    return;
+                }
+                while helper.load(Ordering::SeqCst) == 0 {
+                    std::thread::yield_now();
+                }
+                panic!("caller");
+            })
+        });
+        assert!(r.is_err());
+        assert_eq!(helper.load(Ordering::SeqCst), 2);
     }
 
     /// Every worker of a pinned pool runs on the domain's CPUs.

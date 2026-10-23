@@ -5,8 +5,6 @@ use std::sync::Arc;
 #[cfg(feature = "parallel")]
 use crate::par_util;
 use parking_lot::Mutex;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
 use ad_core_rs::color::{self, NDBayerPattern, NDColorMode};
 use ad_core_rs::error::{ADError, ADResult};
@@ -267,11 +265,7 @@ fn demosaic<T: BayerPixel>(src: &[T], w: usize, h: usize, phase: BayerPhase, out
     // At least 800 ps per pixel serially, u8 and u16 alike; the split
     // measured faster from 10 us (u16 128x128 0.77x serial, u8 0.61x).
     if par_util::pool_wins(n, 800, 10, h) && w > 0 {
-        par_util::thread_pool().install(|| {
-            out.par_chunks_mut(w * 3)
-                .enumerate()
-                .for_each(|(y, out_row)| row(y, out_row));
-        });
+        par_util::for_each_chunk_mut(out, w * 3, row);
         return;
     }
     if w > 0 {

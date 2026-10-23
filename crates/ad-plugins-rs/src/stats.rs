@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
 use crate::par_util;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -1025,18 +1023,12 @@ fn stats_of<T: StatsElem + Send + Sync>(
         80,
         v.len().div_ceil(PAR_CHUNK),
     ) {
-        range = par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .map(T::range)
-                .reduce_with(merge_range)
-                .expect("a non-empty slice has at least one chunk")
-        });
+        range = (par_util::map_chunks(v, PAR_CHUNK, T::range).into_iter())
+            .reduce(merge_range)
+            .expect("a non-empty slice has at least one chunk");
         let mean = range.total / n;
-        variance = par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .map(|c| T::variance(c, mean))
-                .sum::<f64>()
-        });
+        variance =
+            (par_util::map_chunks(v, PAR_CHUNK, |c| T::variance(c, mean)).into_iter()).sum::<f64>();
     } else {
         range = T::range(v);
         variance = T::variance(v, range.total / n);
@@ -1308,14 +1300,10 @@ fn project_of<T: StatsElem + Sync>(
         y_size.div_ceil((PAR_CHUNK / x_size).max(1)),
     ) {
         let band = (PAR_CHUNK / x_size).max(1) * x_size;
-        return par_util::thread_pool().install(|| {
-            v.par_chunks(band)
-                .map(|band| project_band(band, x_size, threshold))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .reduce(Projection::append)
-                .unwrap_or_else(|| Projection::zeroed(x_size, y_size))
-        });
+        return (par_util::map_chunks(v, band, |band| project_band(band, x_size, threshold)))
+            .into_iter()
+            .reduce(Projection::append)
+            .unwrap_or_else(|| Projection::zeroed(x_size, y_size));
     }
     project_band(v, x_size, threshold)
 }
@@ -1646,17 +1634,15 @@ fn histogram_of<T: StatsElem + Sync>(
         60,
         v.len().div_ceil(PAR_CHUNK),
     ) {
-        return par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .fold(
-                    || HistCounts::zeroed(hist_size),
-                    |mut acc, chunk| {
-                        map.count(&mut acc, chunk);
-                        acc
-                    },
-                )
-                .reduce(|| HistCounts::zeroed(hist_size), HistCounts::merge)
-        });
+        return (par_util::fold_chunks(
+            v,
+            PAR_CHUNK,
+            || HistCounts::zeroed(hist_size),
+            |acc, chunk| map.count(acc, chunk),
+        ))
+        .into_iter()
+        .reduce(HistCounts::merge)
+        .expect("the caller counts at least one chunk");
     }
     let mut acc = HistCounts::zeroed(hist_size);
     map.count(&mut acc, v);

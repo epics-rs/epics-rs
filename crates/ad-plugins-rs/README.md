@@ -101,9 +101,9 @@ The `parallel` feature (enabled by default) uses [rayon](https://docs.rs/rayon) 
 
 | Plugin | Parallelized Operations |
 |--------|------------------------|
-| **NDROIStat** | Per-ROI stats computation (`par_iter` over ROI regions) |
-| **NDStats** | Basic stats (fold+reduce), centroid (fold+reduce), histogram (par_chunks + merge) |
-| **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1` row-parallel) |
+| **NDROIStat** | Per-ROI stats computation (one ROI per claim) |
+| **NDStats** | Basic stats, centroid and histogram (chunks, merged in order) |
+| **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1`, one row per claim) |
 
 Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency chain), profiles (memory access pattern), NDProcess (memory-bound element-wise pass), Overlay/Transform (lightweight).
 
@@ -117,7 +117,7 @@ To override the thread count, which gives one unpinned pool of that many workers
 ad_plugins_rs::par_util::set_num_threads(4);
 ```
 
-A pass is split only when it has at least two chunks and its estimated serial time reaches the point from which the split measured faster at that site (`par_util::pool_wins`); below that, the sequential path is used, as C does for every frame.
+A pass is split only when it has at least two chunks and its estimated serial time reaches the point from which the split measured faster at that site (`par_util::pool_wins`); below that, the sequential path is used, as C does for every frame. A split pass runs on the calling thread as well: it claims chunks from the first, and pool workers join as they wake, so a pass never waits for a sleeping worker (`par_util::map_indices`).
 
 To disable parallelism entirely:
 

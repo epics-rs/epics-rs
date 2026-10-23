@@ -15,7 +15,7 @@ use asyn_rs::port::InterfaceMask;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PortPost, ProcessResult};
 use asyn_rs::trace::TraceMask;
@@ -455,7 +455,7 @@ fn attribute_value_to_variant(val: &ad_core_rs::attributes::NDAttrValue) -> Vari
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
     use epics_pva_rs::pvdata::{ScalarType, TypedScalarArray};
 
     #[test]

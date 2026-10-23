@@ -238,8 +238,9 @@ struct TimeSeriesState {
     /// C `pNDArrayPool`, which `pTimeCircular_` is allocated from.
     pool: PluginPool,
     /// C `pTimeCircular_`: `[num_time_points, num_signals]` of `data_type`,
-    /// indexed `signal * num_time_points + t`.
-    circular: NDArray,
+    /// indexed `signal * num_time_points + t`. `None` where C's is NULL, after
+    /// the pool refused it.
+    circular: Option<NDArray>,
     /// C `timeStamp_`: per-output-point source timestamps (length `num_time_points`).
     time_stamp: Vec<f64>,
     /// C `startTime_`.
@@ -286,7 +287,7 @@ impl TimeSeriesState {
             acquire_mode: AcquireMode::Fixed,
             acquiring: false,
             pool: PluginPool::new(DriverPool::standalone(0)),
-            circular: NDArray::new(vec![], NDDataType::Float64),
+            circular: None,
             time_stamp: vec![0.0; num_time_points],
             start_time: Instant::now(),
             unique_id: 0,
@@ -318,7 +319,9 @@ impl TimeSeriesState {
     /// and timestamps, reset `currentTimePoint_`, restart `startTime_`. C does
     /// **not** reset the averaging accumulator here.
     fn acquire_reset(&mut self) -> Vec<ParamUpdate> {
-        self.circular.data.as_u8_slice_mut().fill(0);
+        if let Some(circular) = &mut self.circular {
+            circular.data.as_u8_slice_mut().fill(0);
+        }
         self.time_stamp.iter_mut().for_each(|v| *v = 0.0);
         self.current_time_point = 0;
         self.start_time = Instant::now();
@@ -330,19 +333,14 @@ impl TimeSeriesState {
     /// and reset acquisition.
     fn allocate_arrays(&mut self) -> Vec<ParamUpdate> {
         // C releases the old buffer before it allocates the new one (:125).
-        self.circular = NDArray::new(vec![], self.data_type);
+        self.circular = None;
         let dims = vec![
             NDDimension::new(self.num_time_points),
             NDDimension::new(self.num_signals),
         ];
         // C dereferences a refused alloc (:141); the pool has printed its
-        // line, and an unpooled buffer keeps the plugin running.
-        self.circular = self
-            .pool
-            .current()
-            .pool()
-            .alloc(dims.clone(), self.data_type)
-            .unwrap_or_else(|_| NDArray::new(dims, self.data_type));
+        // line, and the plugin goes on with no buffer.
+        self.circular = self.pool.current().pool().alloc(dims, self.data_type).ok();
         self.time_stamp = vec![0.0; self.num_time_points];
         let mut updates = self.create_axis_array();
         updates.extend(self.acquire_reset());
@@ -379,9 +377,15 @@ impl TimeSeriesState {
         array_callbacks: &ArrayCallbacks,
         posts: &mut Vec<(usize, Arc<NDArray>)>,
     ) -> Vec<ParamUpdate> {
-        let updates = self.time_series_waveforms();
+        // C reads a refused buffer through NULL (:269); with none there is
+        // nothing to post.
+        let Some(circular) = &self.circular else {
+            return Vec::new();
+        };
+        let updates = self.time_series_waveforms(circular);
         if array_callbacks.get() {
-            self.post_time_series_arrays(posts);
+            let values = circular.data.to_f64_vec();
+            self.post_time_series_arrays(&values, posts);
         }
         updates
     }
@@ -389,15 +393,15 @@ impl TimeSeriesState {
     /// C :341-385: the whole series as a 2-D `[numTimePoints, numSignals]`
     /// array at `addr == numSignals_`, then each signal's row as a 1-D array at
     /// `addr == signal`. Fixed mode copies the buffer as is; Circular mode
-    /// rotates it so the oldest point is first. The posts are built outside
-    /// any pool; publishing copies them into C's `pNDArrayPool`, the last
-    /// frame's pool (NDPluginDriver.cpp:419), on the frame and write path alike.
-    fn post_time_series_arrays(&mut self, posts: &mut Vec<(usize, Arc<NDArray>)>) {
+    /// rotates it so the oldest point is first. Each post comes from C's
+    /// `pNDArrayPool`, the last frame's pool (NDPluginDriver.cpp:419), as
+    /// C's `copy` and `alloc` do (:347-351, :374), on the frame and write
+    /// path alike; one the pool refuses is not posted.
+    fn post_time_series_arrays(&mut self, values: &[f64], posts: &mut Vec<(usize, Arc<NDArray>)>) {
         let ntp = self.num_time_points;
         let ns = self.num_signals;
         let cur = self.current_time_point;
         let mut series = Vec::with_capacity(ns * ntp);
-        let values = self.circular.data.to_f64_vec();
         for ring in values.chunks(ntp).take(ns) {
             match self.acquire_mode {
                 AcquireMode::Fixed => series.extend_from_slice(ring),
@@ -412,44 +416,41 @@ impl TimeSeriesState {
         let time_stamp = EpicsTimestamp::now().as_f64();
         let epics_ts = self.epics_ts;
         let data_type = self.data_type;
-        let make = |dims: Vec<NDDimension>, values: &[f64]| -> Arc<NDArray> {
-            let mut arr = NDArray::new(dims, data_type);
+        let pool = self.pool.current();
+        let make = |dims: Vec<NDDimension>, values: &[f64]| -> Option<Arc<NDArray>> {
+            let mut arr = pool.pool().alloc(dims, data_type).ok()?;
             arr.data.fill_from_f64(values);
             arr.unique_id = unique_id;
             arr.time_stamp = time_stamp;
             arr.timestamp = epics_ts;
-            Arc::new(arr)
+            Some(Arc::new(arr))
         };
-        posts.push((
-            ns,
-            make(vec![NDDimension::new(ntp), NDDimension::new(ns)], &series),
-        ));
+        posts.extend(
+            make(vec![NDDimension::new(ntp), NDDimension::new(ns)], &series).map(|a| (ns, a)),
+        );
         for (signal, row) in series.chunks(ntp).enumerate() {
-            posts.push((signal, make(vec![NDDimension::new(ntp)], row)));
+            posts.extend(make(vec![NDDimension::new(ntp)], row).map(|a| (signal, a)));
         }
-    }
-
-    fn at(&self, index: usize) -> f64 {
-        self.circular
-            .data
-            .get_as_f64(index)
-            .expect("index inside the circular buffer")
     }
 
     /// C `doTimeSeriesCallbacksT` (NDPluginTimeSeries.cpp:263-290): emit one
     /// `TS_TIME_SERIES` Float64Array per signal at `addr == signal`. Fixed mode
     /// emits the filled prefix (`currentTimePoint_` points); Circular mode emits
     /// the full ring rotated so the oldest point is first.
-    fn time_series_waveforms(&self) -> Vec<ParamUpdate> {
+    fn time_series_waveforms(&self, circular: &NDArray) -> Vec<ParamUpdate> {
+        let at = |index| {
+            circular
+                .data
+                .get_as_f64(index)
+                .expect("index inside the circular buffer")
+        };
         let ntp = self.num_time_points;
         let mut updates = Vec::with_capacity(self.num_signals);
         match self.acquire_mode {
             AcquireMode::Fixed => {
                 for signal in 0..self.num_signals {
                     let start = signal * ntp;
-                    let series = (start..start + self.current_time_point)
-                        .map(|i| self.at(i))
-                        .collect();
+                    let series = (start..start + self.current_time_point).map(at).collect();
                     updates.push(ParamUpdate::float64_array_addr(
                         self.p.ts_time_series,
                         signal as i32,
@@ -463,7 +464,7 @@ impl TimeSeriesState {
                     let mut series = Vec::with_capacity(ntp);
                     let mut time_in = self.current_time_point;
                     for _ in 0..ntp {
-                        series.push(self.at(base + time_in));
+                        series.push(at(base + time_in));
                         time_in += 1;
                         if time_in >= ntp {
                             time_in = 0;
@@ -491,6 +492,11 @@ impl TimeSeriesState {
         array_callbacks: &ArrayCallbacks,
         posts: &mut Vec<(usize, Arc<NDArray>)>,
     ) -> Vec<ParamUpdate> {
+        // C takes `pTimeCircular_->pData` first (:173); a refused buffer
+        // takes no point.
+        let Some(circular) = self.circular.as_mut() else {
+            return Vec::new();
+        };
         let mut updates = Vec::new();
         let num_signals_in = self.num_signals_in.max(0) as usize;
         if num_signals_in == 0 {
@@ -523,7 +529,7 @@ impl TimeSeriesState {
             // Collected the desired number of points to average.
             for s in 0..self.num_signals {
                 let avg = averaged_value(self.average_store[s], self.num_averaged, self.data_type);
-                self.circular
+                circular
                     .data
                     .set_from_f64(s * ntp + self.current_time_point, avg);
                 self.average_store[s] = 0.0;
@@ -1053,6 +1059,77 @@ mod tests {
         assert!(res.addressed.iter().all(|(_, a)| a.unique_id == 0));
     }
 
+    /// A 2-signal port with a 3-point Fixed buffer on `pool`, acquiring.
+    fn on_pool(port: &str, pool: &DriverPool) -> TimeSeriesProcessor {
+        let mut proc = make_proc(2, port);
+        proc.state.get_mut().num_time_points = 3;
+        proc.bind_pool(PluginPool::new(pool.clone()));
+        proc.state.get_mut().acquiring = true;
+        proc
+    }
+
+    /// The UInt16 frame `[[1,10],[2,20],[3,30]]`, which fills a 3-point buffer.
+    fn three_points() -> Arc<NDArray> {
+        Arc::new(NDArray::with_data(
+            vec![NDDimension::new(2), NDDimension::new(3)],
+            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+        ))
+    }
+
+    /// C takes every post from `pNDArrayPool`, the series by `copy`
+    /// (:347-351) and each signal by `alloc` (:374), so each is charged there.
+    #[test]
+    fn every_post_is_allocated_from_the_plugin_pool() {
+        let pool = DriverPool::standalone(0);
+        let proc = on_pool("TST_TS_POOLED", &pool);
+
+        let res = proc.process_array(&three_points(), pool.pool());
+
+        assert_eq!(res.addressed.len(), 3);
+        assert!(res.addressed.iter().all(|(_, a)| a.pool_id() == pool.id()));
+        // The 12-byte buffer, the 12-byte series and two 6-byte signals.
+        assert_eq!(pool.allocated_bytes(), 12 + 12 + 6 + 6);
+    }
+
+    /// C allocates `pTimeCircular_` from `pNDArrayPool` (:132) and
+    /// dereferences a refused one (:141). Here the plugin keeps no buffer:
+    /// a frame takes no point and a TSRead posts nothing.
+    #[test]
+    fn a_buffer_the_pool_refuses_takes_no_points() {
+        // Under the 12 bytes of a [3, 2] UInt16 buffer.
+        let pool = DriverPool::standalone(11);
+        let proc = on_pool("TST_TS_REFUSED", &pool);
+
+        let res = proc.process_array(&three_points(), pool.pool());
+
+        assert!(res.addressed.is_empty());
+        let series = proc.state.lock().p.ts_time_series;
+        assert!(
+            !res.param_updates.iter().any(
+                |u| matches!(u, ParamUpdate::Float64Array { reason, .. } if *reason == series)
+            )
+        );
+        assert_eq!(proc.state.lock().current_time_point, 0);
+        let mut base = PortDriverBase::new(
+            "TST_TS_REFUSED_B",
+            3,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let read = proc.state.lock().p.ts_read;
+        let out = proc.validate_int32(
+            read,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
+        assert_eq!(side_array(&out, series, 0), None);
+        assert!(out.addressed.0.is_empty());
+        assert_eq!(pool.allocated_bytes(), 0);
+    }
+
     fn side_array(out: &WriteOutcome<i32>, reason: usize, addr: i32) -> Option<Vec<f64>> {
         out.side.iter().find_map(|p| match p {
             SideParam::Float64Array {
@@ -1297,11 +1374,25 @@ mod tests {
         assert_eq!(proc.state.lock().current_time_point, 1);
         let ntp = proc.state.lock().num_time_points;
         assert_eq!(
-            proc.state.lock().circular.data.get_as_f64(0).unwrap(),
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(0)
+                .unwrap(),
             200.0
         );
         assert_eq!(
-            proc.state.lock().circular.data.get_as_f64(ntp).unwrap(),
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(ntp)
+                .unwrap(),
             200.0
         ); // signal 1, t0
         // Current point posted; Fixed mode not full yet, so no waveform callback.
@@ -1353,7 +1444,10 @@ mod tests {
         assert!(proc.state.lock().acquiring);
         assert_eq!(proc.state.lock().current_time_point, 2);
         // Reading rotates so the oldest point is first: [3,4,5].
-        let updates = proc.state.lock().time_series_waveforms();
+        let updates = {
+            let state = proc.state.lock();
+            state.time_series_waveforms(state.circular.as_ref().unwrap())
+        };
         let wf = updates
             .iter()
             .find_map(|u| match u {
@@ -1386,13 +1480,37 @@ mod tests {
         assert_eq!(proc.state.lock().num_signals, 3);
         assert_eq!(proc.state.lock().current_time_point, 1);
         let ntp = proc.state.lock().num_time_points;
-        assert_eq!(proc.state.lock().circular.data.get_as_f64(0).unwrap(), 11.0);
         assert_eq!(
-            proc.state.lock().circular.data.get_as_f64(ntp).unwrap(),
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(0)
+                .unwrap(),
+            11.0
+        );
+        assert_eq!(
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(ntp)
+                .unwrap(),
             22.0
         );
         assert_eq!(
-            proc.state.lock().circular.data.get_as_f64(2 * ntp).unwrap(),
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(2 * ntp)
+                .unwrap(),
             33.0
         );
     }
@@ -1411,10 +1529,27 @@ mod tests {
         proc.process_array(&Arc::new(arr), &pool);
 
         assert_eq!(proc.state.lock().num_signals, 2);
-        assert_eq!(proc.state.lock().circular.data.get_as_f64(0).unwrap(), 1.0);
+        assert_eq!(
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(0)
+                .unwrap(),
+            1.0
+        );
         let ntp = proc.state.lock().num_time_points;
         assert_eq!(
-            proc.state.lock().circular.data.get_as_f64(ntp).unwrap(),
+            proc.state
+                .lock()
+                .circular
+                .as_ref()
+                .unwrap()
+                .data
+                .get_as_f64(ntp)
+                .unwrap(),
             2.0
         );
     }

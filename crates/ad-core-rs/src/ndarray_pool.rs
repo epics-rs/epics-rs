@@ -147,6 +147,10 @@ impl NDArrayPool {
     /// [`alloc`](Self::alloc), and takes `data` as its buffer. C's unchecked
     /// caller-supplied `pData` branch has no caller in ADCore or the drivers
     /// and is not offered.
+    #[deprecated(
+        since = "0.32.1",
+        note = "alloc_with drops the free buffer it takes for the one passed in; alloc and fill the array in place"
+    )]
     pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<NDArray> {
         let data_type = data.data_type();
         let data_size = data.len() * data_type.element_size();
@@ -555,6 +559,14 @@ impl DriverPool {
     }
 
     /// [`NDArrayPool::alloc_with`].
+    #[deprecated(
+        since = "0.32.1",
+        note = "alloc_with drops the free buffer it takes for the one passed in; alloc and fill the array in place"
+    )]
+    #[expect(
+        deprecated,
+        reason = "forwards to the deprecated NDArrayPool::alloc_with"
+    )]
     pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<DriverArray> {
         self.own(self.pool.alloc_with(dims, data))
     }
@@ -881,6 +893,7 @@ mod tests {
     /// A frame takes a free buffer that holds it, as an alloc does, and is
     /// filled with the caller's data.
     #[test]
+    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
     fn a_frame_with_data_reuses_a_free_buffer_like_an_alloc() {
         let owner = ArrayOwner::new();
         let pool = NDArrayPool::for_driver(64, &owner);
@@ -905,6 +918,7 @@ mod tests {
     /// before the driver's copy (NDArrayPool.cpp:207-233), after evicting the
     /// free buffers.
     #[test]
+    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
     fn a_frame_with_data_over_max_memory_is_refused() {
         let pool = NDArrayPool::new(64);
         drop(
@@ -1152,6 +1166,7 @@ mod tests {
     /// A frame takes the smallest free buffer that holds it and keeps that
     /// buffer's `dataSize` (NDArrayPool.cpp:166-183).
     #[test]
+    #[expect(deprecated, reason = "pins alloc_with until it is removed in 0.33")]
     fn a_frame_with_data_takes_the_smallest_free_buffer_that_holds_it() {
         let pool = NDArrayPool::new(1_000_000);
         let big = pool

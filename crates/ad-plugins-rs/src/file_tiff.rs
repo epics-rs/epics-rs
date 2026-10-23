@@ -60,6 +60,7 @@ const PLANARCONFIG_SEPARATE: u16 = 2;
 const SAMPLEFORMAT_UINT: u16 = 1;
 const SAMPLEFORMAT_INT: u16 = 2;
 const SAMPLEFORMAT_IEEEFP: u16 = 3;
+const SAMPLEFORMAT_COMPLEXIEEEFP: u16 = 6;
 
 /// The image geometry C derives in `NDFileTIFF::openFile` (NDFileTIFF.cpp:
 /// 180-224) together with the strip layout its `writeFile` (:383-406) writes.
@@ -637,10 +638,15 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     let photometric =
         one(TAG_PHOTOMETRIC, short)?.ok_or_else(|| err("no PhotometricInterpretation"))?;
     let planar_config = one(TAG_PLANAR_CONFIG, short)?.unwrap_or(u64::from(PLANARCONFIG_CONTIG));
-    // C: "Sample format is not defined! Default UINT is used." (:457-463)
+    // _TIFFVSetField fails the open on a SampleFormat outside 1..=6. Without
+    // the tag, C's sampleFormat is left uninitialized; UINT here, as its 0
+    // branch (:457-463) intends.
     let sample_format = match per_sample(TAG_SAMPLE_FORMAT)? {
-        Some(0) | None => u64::from(SAMPLEFORMAT_UINT),
+        Some(v) if !(SAMPLEFORMAT_UINT..=SAMPLEFORMAT_COMPLEXIEEEFP).contains(&(v as u16)) => {
+            return Err(err(&format!("bad value {v} for SampleFormat")));
+        }
         Some(v) => v,
+        None => u64::from(SAMPLEFORMAT_UINT),
     };
 
     let data_type = match (bits, sample_format as u16) {
@@ -2917,6 +2923,14 @@ mod tests {
             ("comp_two_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1])], ..rgb }, None),
             ("comp_mixed_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1, 5])], ..rgb }, None),
             ("comp_lzw_rgb", TagFile { values: &[(TAG_COMPRESSION, &[5, 5, 5])], ..rgb }, None),
+            ("sf0", TagFile { format: 0, ..s }, None),
+            ("sf0_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[0, 0, 0])], ..rgb }, None),
+            ("sf4", TagFile { format: 4, ..s }, None),
+            ("sf6", TagFile { format: 6, ..s }, None),
+            ("sf7", TagFile { format: 7, ..s }, None),
+            ("pc0", TagFile { values: &[(TAG_PLANAR_CONFIG, &[0])], ..s }, None),
+            ("pc3", TagFile { values: &[(TAG_PLANAR_CONFIG, &[3])], ..s }, None),
+            ("pc3_rgb", TagFile { values: &[(TAG_PLANAR_CONFIG, &[3])], ..rgb }, None),
         ];
         let wrong: Vec<_> = cases
             .iter()

@@ -752,6 +752,27 @@ impl Drop for SharedCharge {
 /// the pool counts one buffer until the driver and every plugin have let go,
 /// as C's reserve/release of the one array (pilatusDetector.cpp:1728, :290;
 /// NDDriverStdArrays.cpp:153-158, :328).
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(8);
+/// # let a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// let mut flat = PersistentArray::new(a);
+/// *flat = other;
+/// ```
+///
+/// ```compile_fail,E0594
+/// # use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::DriverPool;
+/// # let pool = DriverPool::standalone(8);
+/// # let a = pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let other = NDArray::new(vec![NDDimension::new(1000)], NDDataType::Int32);
+/// # let owner = pool.owner().clone();
+/// owner.replace_persistent(0, || Some(a));
+/// owner.persistent(0, |p| **p = other);
+/// ```
 pub struct PersistentArray {
     array: DriverArray,
     shown: Option<PublishedArray>,

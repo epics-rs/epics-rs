@@ -97,6 +97,19 @@ struct Buffers {
     cols: Vec<Complex<f64>>,
     /// The spectrum, or the inverse transform's samples.
     out: Vec<f64>,
+    /// One set per pool job of the widest pass so far.
+    per_job: Vec<JobBufs>,
+}
+
+/// A pool job's buffers: the plan scratch, and the row and the two rows'
+/// bins a row pass transforms in. Each grows to the largest pass that used
+/// it, so a frame the size of the last faults no pages in.
+#[derive(Default)]
+struct JobBufs {
+    scratch: Vec<Complex<f64>>,
+    row: Vec<Complex<f64>>,
+    a: Vec<Complex<f64>>,
+    b: Vec<Complex<f64>>,
 }
 
 /// [`Buffers`] and the frame's samples as `f64`, apart so a transform reads
@@ -107,23 +120,18 @@ struct Scratch {
     bufs: Buffers,
 }
 
-/// A rustfft plan with its scratch, so a frame's transforms allocate the
-/// scratch once instead of on every `Fft::process`.
-struct Plan {
-    fft: Arc<dyn Fft<f64>>,
-    scratch: Vec<Complex<f64>>,
+/// The first `n` elements of `v`, which grows to `n` if shorter.
+fn at_least(v: &mut Vec<Complex<f64>>, n: usize) -> &mut [Complex<f64>] {
+    if v.len() < n {
+        v.resize(n, Complex::new(0.0, 0.0));
+    }
+    &mut v[..n]
 }
 
-impl Plan {
-    fn new(fft: Arc<dyn Fft<f64>>) -> Self {
-        let scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
-        Self { fft, scratch }
-    }
-
-    /// Transform every chunk of `fft.len()` elements of `buf` in place.
-    fn run(&mut self, buf: &mut [Complex<f64>]) {
-        self.fft.process_with_scratch(buf, &mut self.scratch);
-    }
+/// `fft` over every chunk of `fft.len()` elements of `buf` in place, in
+/// `scratch` rather than a scratch `Fft::process` allocates per call.
+fn run(fft: &dyn Fft<f64>, buf: &mut [Complex<f64>], scratch: &mut Vec<Complex<f64>>) {
+    fft.process_with_scratch(buf, at_least(scratch, fft.get_inplace_scratch_len()));
 }
 
 /// The fewest complex values a transform pass must cover for the pool to
@@ -151,32 +159,50 @@ fn frame_jobs(dims: &[NDDimension], direction: FFTDirection) -> usize {
 }
 
 /// `f(state, i, chunk)` for chunk `i` of the `len`-element chunks of `out`:
-/// in order with one `state` when `jobs` or the chunk count is 1, else on
-/// the shared pool, at most one job per chunk, with a `state` from `init`
-/// per pool job. A chunk's result is the same whichever job computes it,
-/// so the output does not depend on `jobs`.
-fn for_each_chunk<T: Send, S>(
+/// in order with `states[0]` when `jobs` or the chunk count is 1, else on
+/// the shared pool as at most `jobs` runs of adjacent chunks, one per state.
+/// `states` grows to the job count and keeps its states for later passes.
+/// A chunk's result is the same whichever job computes it, so the output
+/// does not depend on `jobs`.
+fn for_each_chunk_with<T: Send, S: Default + Send>(
     out: &mut [T],
     len: usize,
     jobs: usize,
-    init: impl Fn() -> S + Sync + Send,
-    f: impl Fn(&mut S, usize, &mut [T]) + Sync + Send,
+    states: &mut Vec<S>,
+    f: impl Fn(&mut S, usize, &mut [T]) + Sync,
 ) {
     let chunks = out.len().div_ceil(len);
-    if jobs.min(chunks) > 1 {
+    let jobs = jobs.min(chunks).max(1);
+    if states.len() < jobs {
+        states.resize_with(jobs, S::default);
+    }
+    let run_chunks = |s: &mut S, first: usize, part: &mut [T]| {
+        for (i, c) in part.chunks_mut(len).enumerate() {
+            f(s, first + i, c);
+        }
+    };
+    if jobs > 1 {
         #[cfg(feature = "parallel")]
         return par_util::thread_pool().install(|| {
             use rayon::prelude::*;
-            out.par_chunks_mut(len)
-                .with_min_len(chunks.div_ceil(jobs))
+            let per_job = chunks.div_ceil(jobs);
+            out.par_chunks_mut(per_job * len)
+                .zip(states.par_iter_mut())
                 .enumerate()
-                .for_each_init(&init, |s, (i, c)| f(s, i, c));
+                .for_each(|(j, (part, s))| run_chunks(s, j * per_job, part));
         });
     }
-    let mut s = init();
-    for (i, c) in out.chunks_mut(len).enumerate() {
-        f(&mut s, i, c);
-    }
+    run_chunks(&mut states[0], 0, out);
+}
+
+/// [`for_each_chunk_with`] for a pass that keeps no state.
+fn for_each_chunk<T: Send>(
+    out: &mut [T],
+    len: usize,
+    jobs: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    for_each_chunk_with(out, len, jobs, &mut Vec::new(), |(), i, c| f(i, c));
 }
 
 /// `buf` resized to `n` elements, new ones `fill`, written by the pool when
@@ -202,17 +228,11 @@ fn resize<T: Copy + Send + Sync>(buf: &mut Vec<T>, n: usize, fill: T, jobs: usiz
 /// `v` as `f64` into `out`, each sample cast as `to_f64_vec` casts it.
 fn to_f64_into<T: PixelCast + Sync>(out: &mut [f64], v: &[T], jobs: usize) {
     const CHUNK: usize = 1 << 16;
-    for_each_chunk(
-        out,
-        CHUNK,
-        jobs,
-        || (),
-        |(), i, out| {
-            for (o, &x) in out.iter_mut().zip(&v[i * CHUNK..]) {
-                *o = x.to_f64();
-            }
-        },
-    );
+    for_each_chunk(out, CHUNK, jobs, |i, out| {
+        for (o, &x) in out.iter_mut().zip(&v[i * CHUNK..]) {
+            *o = x.to_f64();
+        }
+    });
 }
 
 /// The samples of `data` as `f64` into `vals`, as `jobs` pool jobs.
@@ -306,6 +326,7 @@ fn fft_columns(
     w: usize,
     jobs: usize,
     cols: &mut Vec<Complex<f64>>,
+    job_bufs: &mut Vec<JobBufs>,
 ) {
     const COLS: usize = 8;
     const WAVE_ELEMENTS: usize = 1 << 20;
@@ -325,12 +346,12 @@ fn fft_columns(
         let c0 = b0 * COLS;
         let c1 = w.min(c0 + wave * COLS);
         let src = &*data;
-        for_each_chunk(
+        for_each_chunk_with(
             &mut cols[..(c1 - c0) * h],
             COLS * h,
             jobs,
-            || Plan::new(fft.clone()),
-            |plan, i, cols| {
+            job_bufs,
+            |job, i, cols| {
                 let c0 = c0 + i * COLS;
                 let nc = cols.len() / h;
                 for (row, r) in src.chunks_exact(w).enumerate() {
@@ -338,21 +359,15 @@ fn fft_columns(
                         cols[k * h + row] = v;
                     }
                 }
-                plan.run(cols);
+                run(&**fft, cols, &mut job.scratch);
             },
         );
         let cols = &*cols;
-        for_each_chunk(
-            data,
-            w,
-            jobs,
-            || (),
-            |(), row, r| {
-                for (j, v) in r[c0..c1].iter_mut().enumerate() {
-                    *v = cols[j * h + row];
-                }
-            },
-        );
+        for_each_chunk(data, w, jobs, |row, r| {
+            for (j, v) in r[c0..c1].iter_mut().enumerate() {
+                *v = cols[j * h + row];
+            }
+        });
     }
 }
 
@@ -425,30 +440,22 @@ fn fft_1d_rows_with(
     // The rows are real, so each transform carries two of them; an odd
     // height leaves the last chunk one row. The first chunk keeps row 0's
     // bins, reusing `bufs.data`'s allocation.
-    let zero = Complex::new(0.0, 0.0);
     let first_row = Mutex::new(std::mem::take(&mut bufs.data));
     let keep_first_row = |bins: &[Complex<f64>]| {
         let mut first_row = first_row.lock();
         first_row.clear();
         first_row.extend_from_slice(bins);
     };
-    for_each_chunk(
+    for_each_chunk_with(
         magnitudes,
         2 * n_freq,
         jobs,
-        || {
-            let plan = Plan::new(fft.clone());
-            (
-                plan,
-                vec![zero; padded],
-                vec![zero; n_freq],
-                vec![zero; n_freq],
-            )
-        },
-        |(plan, row_buf, a_bins, b_bins), pair, mags| {
+        &mut bufs.per_job,
+        |job, pair, mags| {
+            let row_buf = at_least(&mut job.row, padded);
             if mags.len() == n_freq {
                 load_row(row_buf, vals, height - 1, width);
-                plan.run(row_buf);
+                run(&*fft, row_buf, &mut job.scratch);
                 if pair == 0 {
                     keep_first_row(&row_buf[..n_freq]);
                 }
@@ -459,7 +466,8 @@ fn fft_1d_rows_with(
                 return;
             }
             load_row_pair(row_buf, vals, 2 * pair, width);
-            plan.run(row_buf);
+            run(&*fft, row_buf, &mut job.scratch);
+            let (a_bins, b_bins) = (at_least(&mut job.a, n_freq), at_least(&mut job.b, n_freq));
             unpack_pair(row_buf, a_bins, b_bins);
             if pair == 0 {
                 keep_first_row(a_bins);
@@ -542,43 +550,45 @@ fn fft_2d_with(
     let data = &mut bufs.data;
     resize(data, n_freq_x * h, zero, jobs);
     let (rows_in, padding) = data.split_at_mut(src_h * n_freq_x);
-    for_each_chunk(padding, n_freq_x, jobs, || (), |(), _, r| r.fill(zero));
-    for_each_chunk(
+    for_each_chunk(padding, n_freq_x, jobs, |_, r| r.fill(zero));
+    for_each_chunk_with(
         rows_in,
         2 * n_freq_x,
         jobs,
-        || (Plan::new(rows.clone()), vec![zero; w]),
-        |(plan, row_buf), pair, bins| {
+        &mut bufs.per_job,
+        |job, pair, bins| {
+            let row_buf = at_least(&mut job.row, w);
             if bins.len() == n_freq_x {
                 load_row(row_buf, vals, src_h - 1, src_w);
-                plan.run(row_buf);
+                run(&*rows, row_buf, &mut job.scratch);
                 bins.copy_from_slice(&row_buf[..n_freq_x]);
                 return;
             }
             load_row_pair(row_buf, vals, 2 * pair, src_w);
-            plan.run(row_buf);
+            run(&*rows, row_buf, &mut job.scratch);
             let (a, b) = bins.split_at_mut(n_freq_x);
             unpack_pair(row_buf, a, b);
         },
     );
-    fft_columns(&cols, data, n_freq_x, jobs, &mut bufs.cols);
+    fft_columns(
+        &cols,
+        data,
+        n_freq_x,
+        jobs,
+        &mut bufs.cols,
+        &mut bufs.per_job,
+    );
 
     let data = &*data;
     let magnitudes = &mut bufs.out;
     resize(magnitudes, n_freq_x * n_freq_y, 0.0, jobs);
-    for_each_chunk(
-        magnitudes,
-        n_freq_x,
-        jobs,
-        || (),
-        |(), fy, mags| {
-            magnitudes_into(
-                mags,
-                &data[fy * n_freq_x..(fy + 1) * n_freq_x],
-                (w * h) as f64,
-            );
-        },
-    );
+    for_each_chunk(magnitudes, n_freq_x, jobs, |fy, mags| {
+        magnitudes_into(
+            mags,
+            &data[fy * n_freq_x..(fy + 1) * n_freq_x],
+            (w * h) as f64,
+        );
+    });
 
     if suppress_dc {
         magnitudes[0] = 0.0;
@@ -623,22 +633,17 @@ fn fft_1d_rows_inverse_with(
     resize(samples, width * height, 0.0, jobs);
 
     let zero = Complex::new(0.0, 0.0);
-    for_each_chunk(
-        samples,
-        width,
-        jobs,
-        || (Plan::new(fft.clone()), vec![zero; width]),
-        |(plan, row_buf), row, out| {
-            load_row(row_buf, vals, row, width);
-            if suppress_dc {
-                row_buf[0] = zero;
-            }
-            plan.run(row_buf);
-            for (s, c) in out.iter_mut().zip(&*row_buf) {
-                *s = c.re * scale;
-            }
-        },
-    );
+    for_each_chunk_with(samples, width, jobs, &mut bufs.per_job, |job, row, out| {
+        let row_buf = at_least(&mut job.row, width);
+        load_row(row_buf, vals, row, width);
+        if suppress_dc {
+            row_buf[0] = zero;
+        }
+        run(&*fft, row_buf, &mut job.scratch);
+        for (s, c) in out.iter_mut().zip(&*row_buf) {
+            *s = c.re * scale;
+        }
+    });
 
     Some(src.dims.clone())
 }
@@ -673,36 +678,26 @@ fn fft_2d_inverse_with(
     let zero = Complex::new(0.0, 0.0);
     let data = &mut bufs.data;
     resize(data, w * h, zero, jobs);
-    for_each_chunk(data, w, jobs, || (), |(), row, r| load_row(r, vals, row, w));
+    for_each_chunk(data, w, jobs, |row, r| load_row(r, vals, row, w));
 
     if suppress_dc {
         data[0] = zero;
     }
 
-    fft_columns(&cols, data, w, jobs, &mut bufs.cols);
-    for_each_chunk(
-        data,
-        w,
-        jobs,
-        || Plan::new(rows.clone()),
-        |plan, _, r| plan.run(r),
-    );
+    fft_columns(&cols, data, w, jobs, &mut bufs.cols, &mut bufs.per_job);
+    for_each_chunk_with(data, w, jobs, &mut bufs.per_job, |job, _, r| {
+        run(&*rows, r, &mut job.scratch)
+    });
 
     // Inverse transform yields signed real samples: keep the real part.
     let data = &*data;
     let samples = &mut bufs.out;
     resize(samples, w * h, 0.0, jobs);
-    for_each_chunk(
-        samples,
-        w,
-        jobs,
-        || (),
-        |(), row, out| {
-            for (s, c) in out.iter_mut().zip(&data[row * w..]) {
-                *s = c.re * scale;
-            }
-        },
-    );
+    for_each_chunk(samples, w, jobs, |row, out| {
+        for (s, c) in out.iter_mut().zip(&data[row * w..]) {
+            *s = c.re * scale;
+        }
+    });
     Some(vec![NDDimension::new(w), NDDimension::new(h)])
 }
 
@@ -1304,8 +1299,9 @@ mod tests {
             w,
             1,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
-        Plan::new(planner.plan_fft_inverse(w)).run(&mut data);
+        run(&*planner.plan_fft_inverse(w), &mut data, &mut Vec::new());
         let scale = 1.0 / (w * h) as f64;
         data.iter().map(|c| (c.re * scale).to_bits()).collect()
     }
@@ -1401,13 +1397,9 @@ mod tests {
     #[test]
     fn a_lone_chunk_runs_on_the_calling_thread() {
         let caller = std::thread::current().id();
-        for_each_chunk(
-            &mut [0u8; 4],
-            4,
-            8,
-            || (),
-            |(), _, _| assert_eq!(std::thread::current().id(), caller),
-        );
+        for_each_chunk(&mut [0u8; 4], 4, 8, |_, _| {
+            assert_eq!(std::thread::current().id(), caller)
+        });
     }
 
     /// The pool takes a frame from `POOL_ELEMENTS` values per transform
@@ -1444,7 +1436,7 @@ mod tests {
             .collect();
         let columns = |jobs| {
             let mut d = data.clone();
-            fft_columns(&fft, &mut d, w, jobs, &mut Vec::new());
+            fft_columns(&fft, &mut d, w, jobs, &mut Vec::new(), &mut Vec::new());
             d.iter()
                 .map(|c| (c.re.to_bits(), c.im.to_bits()))
                 .collect::<Vec<_>>()

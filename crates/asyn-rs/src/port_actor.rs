@@ -3047,14 +3047,12 @@ impl PortActor {
                     }
                 };
                 match gate {
-                    // The section is still open: its end sends the gate back.
-                    Some(gate) if gate.park() => {}
-                    Some(gate) => gate.lists().for_each(flush),
+                    Some(gate) => gate.run(*addr, updates, flush),
                     None => {
                         flush(*addr);
-                        crate::request::further_lists(*addr, updates)
-                            .into_iter()
-                            .for_each(flush);
+                        let mut further = Vec::new();
+                        crate::request::push_further_lists(*addr, updates, &mut further);
+                        further.into_iter().for_each(flush);
                     }
                 }
                 match failed {

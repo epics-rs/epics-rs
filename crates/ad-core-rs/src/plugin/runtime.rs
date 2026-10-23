@@ -36,7 +36,7 @@ use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 
-use asyn_rs::port_handle::PortHandle;
+use asyn_rs::port_handle::{CallbacksGate, PortHandle};
 
 use crate::attributes::NDAttributeList;
 use crate::driver::ndarray_driver::{
@@ -2091,11 +2091,11 @@ impl ProcessOutput {
     /// after the previous one completes.
     async fn complete(
         self,
-        port: &PortHandle,
+        callbacks_gate: &mut CallbacksGate,
         senders: &OutputSenders,
         scatter_cursor: &mut usize,
     ) {
-        let callbacks = self.batch.store(port);
+        let callbacks = self.batch.store(callbacks_gate);
         for (addr, arr) in &self.addressed {
             if let Some(subscribers) = senders.by_addr.get(*addr) {
                 let futs = subscribers.iter().map(|s| s.publish(arr.clone()));
@@ -2208,11 +2208,11 @@ impl ParamBatch {
 
     /// The sets, queued ahead of a delivery; the callbacks fire when the
     /// returned section ends. `None` for an empty batch, which posts nothing.
-    fn store(self, port: &PortHandle) -> Option<asyn_rs::port_handle::CallbacksAfter<'_>> {
+    fn store(self, gate: &mut CallbacksGate) -> Option<asyn_rs::port_handle::CallbacksAfter<'_>> {
         if self.sets.is_empty() && self.time_stamp.is_none() {
             return None;
         }
-        port.call_param_callbacks_after(0, self.time_stamp, self.sets)
+        gate.open(0, self.time_stamp, self.sets)
             .map_err(|e| flush_failed(Err(e)))
             .ok()
     }
@@ -3805,6 +3805,7 @@ fn spawn_worker_pool<P: NDPluginProcess>(
 async fn complete_frame(
     shared: &Arc<parking_lot::Mutex<SharedProcessorInner>>,
     item: DoneItem,
+    callbacks_gate: &mut CallbacksGate,
     scatter_cursor: &mut usize,
 ) {
     let DoneItem {
@@ -3812,17 +3813,18 @@ async fn complete_frame(
         processed,
         elapsed_ms,
     } = item;
-    let (output, senders, port) = {
+    let (output, senders) = {
         let mut guard = shared.lock();
         let output = match processed {
             Some((result, begin)) => guard.post_process(&msg.array, result, &begin, elapsed_ms),
             None => guard.unprocessed(elapsed_ms),
         };
         let senders = guard.senders_for(&output);
-        let port = guard.port_handle.clone();
-        (output, senders, port)
+        (output, senders)
     };
-    output.complete(&port, &senders, scatter_cursor).await;
+    output
+        .complete(callbacks_gate, &senders, scatter_cursor)
+        .await;
     // msg dropped here → completion signaled (if tracked)
 }
 
@@ -3912,6 +3914,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // reroutes past full consumers. One per plugin instance, for its
         // lifetime — matching `nextClient_(1)` set once at construction.
         let mut scatter_cursor: usize = 0;
+        // The port's only `CallbacksGate`: every frame's sets and callbacks
+        // go through it, one section at a time.
+        let mut callbacks_gate = shared.lock().port_handle.callbacks_gate();
         // Barriers held until the array queue drains. A barrier acks only at
         // full quiescence — params applied AND no queued arrays — because a
         // param applied while an older array still waits in the queue would
@@ -3995,7 +4000,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                     match done {
                         Some(item) => {
                             in_flight -= 1;
-                            complete_frame(&shared, item, &mut scatter_cursor).await;
+                            complete_frame(&shared, item, &mut callbacks_gate, &mut scatter_cursor)
+                                .await;
                         }
                         // Every worker is gone without a reply: nothing can
                         // come back, so stop waiting on frames that are lost.
@@ -4049,14 +4055,15 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             let _ = ack.send(());
                         }
                         Some(PluginParamMsg::Publish(published, addressed)) => {
-                            let (po, senders, port) = {
+                            let (po, senders) = {
                                 let mut guard = shared.lock();
                                 let mut po = guard.end_published(published);
                                 po.addressed = guard.delivery.publishable_addressed(addressed);
                                 let senders = guard.senders_for(&po);
-                                (po, senders, guard.port_handle.clone())
+                                (po, senders)
                             };
-                            po.complete(&port, &senders, &mut scatter_cursor).await;
+                            po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                .await;
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
                             if reason == enable_callbacks_reason {
@@ -4143,6 +4150,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                             complete_frame(
                                                 &shared,
                                                 item,
+                                                &mut callbacks_gate,
                                                 &mut scatter_cursor,
                                             )
                                             .await;
@@ -4176,8 +4184,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     // pool finished has been published.
                                     while let Some(item) = old_done.recv().await {
                                         in_flight = in_flight.saturating_sub(1);
-                                        complete_frame(&shared, item, &mut scatter_cursor)
-                                            .await;
+                                        complete_frame(
+                                            &shared,
+                                            item,
+                                            &mut callbacks_gate,
+                                            &mut scatter_cursor,
+                                        )
+                                        .await;
                                     }
                                     // C republishes QueueFree after
                                     // createCallbackThreads (`:1006`).
@@ -4273,16 +4286,19 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                 out.flush(&port).await;
                                             }
                                             Admission::Admit => {
-                                                let (po, senders, port) = {
+                                                let (po, senders) = {
                                                     let mut guard = shared.lock();
                                                     let output = guard
                                                         .process_and_publish(&*processor, &array);
                                                     let senders = guard.senders_for(&output);
-                                                    let port = guard.port_handle.clone();
-                                                    (output, senders, port)
+                                                    (output, senders)
                                                 };
-                                                po.complete(&port, &senders, &mut scatter_cursor)
-                                                    .await;
+                                                po.complete(
+                                                    &mut callbacks_gate,
+                                                    &senders,
+                                                    &mut scatter_cursor,
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -4334,9 +4350,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     if mode == 0 {
                                         let output = guard.flush_sort_buffer();
                                         let senders = guard.senders_for(&output);
-                                        let port = guard.port_handle.clone();
                                         sort_flush_active = false;
-                                        Some((output, senders, port))
+                                        Some((output, senders))
                                     } else {
                                         sort_flush_active = sort_time > 0.0;
                                         if sort_flush_active {
@@ -4348,8 +4363,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         None
                                     }
                                 };
-                                if let Some((output, senders, port)) = flush_work {
-                                    output.complete(&port, &senders, &mut scatter_cursor).await;
+                                if let Some((output, senders)) = flush_work {
+                                    output
+                                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                        .await;
                                 }
                             }
                             if reason == sort_time_reason {
@@ -4389,7 +4406,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 addr,
                                 value,
                             };
-                            let (process_output, senders, port) = {
+                            let (process_output, senders) = {
                                 let mut guard = shared.lock();
                                 let result = processor.on_param_change(reason, &snapshot);
                                 let output = if !result.output_arrays.is_empty()
@@ -4405,10 +4422,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     None
                                 };
                                 let senders = output.as_ref().map(|o| guard.senders_for(o));
-                                (output, senders, guard.port_handle.clone())
+                                (output, senders)
                             };
                             if let (Some(po), Some(senders)) = (process_output, senders) {
-                                po.complete(&port, &senders, &mut scatter_cursor).await;
+                                po.complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                                    .await;
                             }
                         }
                         None => break,
@@ -4417,14 +4435,15 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 _ = sort_flush_interval.tick(), if sort_flush_active => {
                     // B3: drain head-first while contiguous or past the
                     // staleness deadline — NOT the whole buffer.
-                    let (output, senders, port) = {
+                    let (output, senders) = {
                         let mut guard = shared.lock();
                         let output = guard.tick_sort_buffer();
                         let senders = guard.senders_for(&output);
-                        let port = guard.port_handle.clone();
-                        (output, senders, port)
+                        (output, senders)
                     };
-                    output.complete(&port, &senders, &mut scatter_cursor).await;
+                    output
+                        .complete(&mut callbacks_gate, &senders, &mut scatter_cursor)
+                        .await;
                 }
             }
         }

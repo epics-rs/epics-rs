@@ -1,7 +1,7 @@
 //! Request types for the port actor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
 use parking_lot::Mutex;
 use std::time::SystemTime;
@@ -1318,7 +1318,7 @@ pub enum RequestOp {
         time_stamp: Option<std::time::SystemTime>,
         /// `Some`: the callbacks wait for the end of a section of the
         /// caller's that follows the sets; `None` fires them at once.
-        gate: Option<CallbacksGate>,
+        gate: Option<SectionCallbacks>,
     },
     /// C `setIntegerParam`/`setDoubleParam` alone: the values land in the
     /// store and are marked changed, and only a later `CallParamCallbacks`
@@ -1886,92 +1886,100 @@ impl Default for CancelToken {
     }
 }
 
-const SECTION_OPEN: u8 = 0;
-const SECTION_PARKED: u8 = 1;
-const SECTION_ENDED: u8 = 2;
-
-/// The callbacks of a [`RequestOp::CallParamCallbacks`] whose caller runs a
-/// section between the sets and them, as C runs the sets, the section and
-/// `callParamCallbacks` under one lock (NDPluginDriver.cpp:332, :539).
-/// Whichever of the actor (sets done) and the caller (section ended) comes
-/// second fires them, so a section that ends before the actor reaches the
-/// sets costs no further request.
+/// What a [`RequestOp::CallParamCallbacks`] owes a section of its caller's
+/// that runs between the sets and the callbacks, as C runs the sets, the
+/// section and `callParamCallbacks` under one lock (NDPluginDriver.cpp:332,
+/// :539).
 #[derive(Clone, Debug)]
-pub struct CallbacksGate(Arc<GateInner>);
-
-#[derive(Debug)]
-struct GateInner {
-    state: AtomicU8,
-    addr: i32,
-    /// Each further list the sets wrote, in the order they first wrote it.
-    further: Vec<i32>,
+pub enum SectionCallbacks {
+    /// The sets of section `seq`: the actor holds the callbacks while it is
+    /// open.
+    Open { sections: Arc<Sections>, seq: u64 },
+    /// From the end of a section whose callbacks the actor holds.
+    Held(Arc<Sections>),
 }
 
-impl CallbacksGate {
-    pub(crate) fn new(addr: i32, updates: &[ParamSetValue]) -> Self {
-        Self(Arc::new(GateInner {
-            state: AtomicU8::new(SECTION_OPEN),
-            addr,
-            further: further_lists(addr, updates),
-        }))
+impl SectionCallbacks {
+    /// The actor, sets done: `flush` each list the request owes, the
+    /// request's first, unless an open section holds them.
+    pub(crate) fn run(&self, addr: i32, updates: &[ParamSetValue], flush: impl FnMut(i32)) {
+        match self {
+            // Only the actor takes this lock, so firing under it waits on no
+            // one.
+            Self::Open { sections, seq } => {
+                let mut lists = sections.held.lock();
+                lists.push(addr);
+                push_further_lists(addr, updates, &mut lists);
+                if !sections.hold(*seq) {
+                    lists.drain(..).for_each(flush);
+                }
+            }
+            Self::Held(sections) => sections.held.lock().drain(..).for_each(flush),
+        }
     }
+}
 
-    pub(crate) fn addr(&self) -> i32 {
-        self.0.addr
-    }
+/// One caller's sections, one open at a time. Whichever of the actor (sets
+/// done) and the caller (section ended) comes second fires the callbacks, so
+/// a section that ends before the actor reaches its sets costs no further
+/// request.
+#[derive(Debug, Default)]
+pub struct Sections {
+    /// The open section's number, shifted left once; the low bit is set while
+    /// the actor holds its callbacks.
+    word: AtomicU64,
+    /// The lists whose callbacks the actor holds.
+    held: Mutex<Vec<i32>>,
+}
 
-    /// The request's list, then each further one.
-    pub(crate) fn lists(&self) -> impl Iterator<Item = i32> + '_ {
-        std::iter::once(self.0.addr).chain(self.0.further.iter().copied())
-    }
-
-    /// The actor, sets done: `true` while the section is open, which leaves
-    /// the callbacks to its end.
-    pub(crate) fn park(&self) -> bool {
-        self.0
-            .state
+impl Sections {
+    /// The actor: `true` while section `seq` is open, which leaves its
+    /// callbacks to its end. A later section open means `seq` ended.
+    fn hold(&self, seq: u64) -> bool {
+        self.word
             .compare_exchange(
-                SECTION_OPEN,
-                SECTION_PARKED,
+                seq << 1,
+                seq << 1 | 1,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             )
             .is_ok()
     }
 
-    /// The caller, section ended: `true` when the actor parked the callbacks,
-    /// which this end then owes. Only the first end can be `true`.
-    pub(crate) fn end(&self) -> bool {
-        self.0.state.swap(SECTION_ENDED, AtomicOrdering::AcqRel) == SECTION_PARKED
+    /// The caller, section `seq` ended: `true` when the actor holds its
+    /// callbacks, which this end then owes.
+    pub(crate) fn end(&self, seq: u64) -> bool {
+        self.word.swap((seq + 1) << 1, AtomicOrdering::AcqRel) & 1 == 1
     }
 }
 
-/// Every list `updates` writes besides `addr`, in the order they first write
-/// it: what a bundled set-then-flush owes a flush beyond the request's own.
-pub(crate) fn further_lists(addr: i32, updates: &[ParamSetValue]) -> Vec<i32> {
-    let mut lists = Vec::new();
+/// Push every list `updates` writes besides `addr` and those `lists` has, in
+/// the order they first write it: what a bundled set-then-flush owes a flush
+/// beyond the request's own.
+pub(crate) fn push_further_lists(addr: i32, updates: &[ParamSetValue], lists: &mut Vec<i32>) {
     for list in updates.iter().filter_map(ParamSetValue::list) {
         if list != addr && !lists.contains(&list) {
             lists.push(list);
         }
     }
-    lists
 }
 
 #[cfg(test)]
 mod tests {
-    /// Exactly one of the actor and the caller fires a gate's callbacks: the
-    /// end after a park, the actor after an end.
+    /// Exactly one of the actor and the caller fires a section's callbacks:
+    /// the end after a hold, the actor after an end — and a section the
+    /// caller has moved past is ended, never held for the next one.
     #[test]
     fn whichever_of_the_actor_and_the_caller_comes_second_fires() {
-        use super::CallbacksGate;
-        let parked = CallbacksGate::new(0, &[]);
-        assert!(parked.park());
-        assert!(parked.end());
-        assert!(!parked.end());
-        let ended = CallbacksGate::new(0, &[]);
-        assert!(!ended.end());
-        assert!(!ended.park());
+        let sections = super::Sections::default();
+        assert!(sections.hold(0));
+        assert!(sections.end(0));
+        assert!(!sections.end(1));
+        assert!(!sections.hold(1));
+        assert!(!sections.end(2));
+        assert!(!sections.hold(2), "held for section 3");
+        assert!(sections.hold(3));
+        assert!(sections.end(3));
     }
 
     /// bab72deef: the entry the actor still holds for a request the timer took

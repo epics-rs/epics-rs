@@ -847,16 +847,27 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
     }
     let rows_per_strip = match one(TAG_ROWS_PER_STRIP, long)? {
         Some(0) => return Err(err("bad value 0 for RowsPerStrip")),
-        Some(rows) => (rows as usize).min(height),
-        None => height,
+        Some(rows) => rows,
+        None => long,
     };
     let separate = planar_config == u64::from(PLANARCONFIG_SEPARATE);
-    let planes = if separate {
-        samples_per_pixel as usize
-    } else {
+    let planes = if separate { samples_per_pixel } else { 1 };
+    // TIFFNumberOfStrips: howmany_32 gives 0 where height + RowsPerStrip
+    // passes a u32, _TIFFMultiply32 gives 0 where the planes do, and
+    // TIFFReadDirectory fails on 0 strips (tif_strip.c:61-72,
+    // tif_dirread.c:3620).
+    let strips_per_plane = if rows_per_strip == long {
         1
+    } else if (height as u64) < long - (rows_per_strip - 1) {
+        (height as u64).div_ceil(rows_per_strip)
+    } else {
+        0
     };
-    let strips_per_plane = height.div_ceil(rows_per_strip);
+    if strips_per_plane == 0 || strips_per_plane * planes > long {
+        return Err(err("zero number of strips"));
+    }
+    let (rows_per_strip, planes) = ((rows_per_strip as usize).min(height), planes as usize);
+    let strips_per_plane = strips_per_plane as usize;
     let num_strips = strips_per_plane * planes;
     // One entry per strip of the geometry, cut or zero-filled, as
     // TIFFFetchStripThing leaves the tables. TileOffsets and TileByteCounts
@@ -3137,6 +3148,11 @@ mod tests {
             ("rps_ascii", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_ASCII)], ..s }, None),
             ("rps_two", TagFile { values: &[(TAG_ROWS_PER_STRIP, &[1, 1])], ..s }, None),
             ("rps_over_long", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_LONG8)], values: &[(TAG_ROWS_PER_STRIP, &[1 << 32])], ..s }, None),
+            ("rps_wrap_edge", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_fffc])], ..s }, Some(GRAY)),
+            ("rps_wraps", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_fffd])], ..s }, None),
+            ("rps_max", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_ffff])], ..s }, Some(GRAY)),
+            ("height_wraps", TagFile { values: &[(TAG_IMAGE_LENGTH, &[0xffff_ffff])], ..s }, None),
+            ("planes_wrap", TagFile { values: &[(TAG_IMAGE_LENGTH, &[0x5555_5556])], separate: true, ..rgb }, None),
             ("depth_one", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_LONG, &[1])], ..s }, Some(GRAY)),
             ("depth_ascii", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_ASCII, &[1])], ..s }, None),
             ("depth_two", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_LONG, &[1, 1])], ..s }, None),

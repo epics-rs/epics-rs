@@ -130,7 +130,7 @@ fn translate_st(
     snc.translate(&input, &name.to_string_lossy(), output)
 }
 
-/// The name make hands cpp and snc: RULES_SNCSEQ runs both in O.<arch>
+/// The name make hands cpp and snc: RULES_SNCSEQ runs both in `O.<arch>`
 /// on vpath's `../<file>`, so `__FILE__`, line markers and diagnostics do
 /// not depend on the checkout.
 fn vpath_name(st: &Path) -> PathBuf {

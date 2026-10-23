@@ -5,7 +5,7 @@ use std::time::Duration;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -90,7 +90,30 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
     rt::run_thread_named("XrtSimTask", move || acquisition_loop_async(ctx))
 }
 
+/// Convert accumulated intensity (`nx` columns of `nz`) to a u16 image
+/// scaled to 65000 at its peak, transposed for AD. Every element of `out`
+/// is written.
+fn scale_into_u16(accum: &[f64], nx: usize, nz: usize, out: &mut [u16]) {
+    let max_val = accum.iter().cloned().fold(0.0_f64, f64::max);
+    let scale = if max_val > 0.0 {
+        65000.0 / max_val
+    } else {
+        0.0
+    };
+
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let v = accum[ix * nz + iz] * scale;
+            out[iz * nx + ix] = v.round().clamp(0.0, 65535.0) as u16;
+        }
+    }
+}
+
 async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
+    let nx = ctx.sim_config.screen_nx;
+    let nz = ctx.sim_config.screen_nz;
+    let mut accum = vec![0.0f64; nx * nz];
+
     loop {
         // Wait for Start command
         match ctx.acq_rx.recv().await {
@@ -156,9 +179,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Accumulate ray tracing over acquire_time
             let mut stopped = false;
-            let nx = ctx.sim_config.screen_nx;
-            let nz = ctx.sim_config.screen_nz;
-            let mut accum = vec![0.0f64; nx * nz];
+            accum.fill(0.0);
             let mut total_captured = 0usize;
             let mut total_efficiency = 0.0f64;
             let mut last_cx = 0.0f64;
@@ -252,28 +273,17 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             let rms_x = last_rms_x;
             let rms_z = last_rms_z;
 
-            // Convert accumulated intensity to u16 image (transpose for AD)
-            let max_val = accum.iter().cloned().fold(0.0_f64, f64::max);
-            let scale = if max_val > 0.0 {
-                65000.0 / max_val
-            } else {
-                0.0
-            };
-
-            let mut u16_data = vec![0u16; nx * nz];
-            for ix in 0..nx {
-                for iz in 0..nz {
-                    let v = accum[ix * nz + iz] * scale;
-                    u16_data[iz * nx + ix] = v.round().clamp(0.0, 65535.0) as u16;
-                }
-            }
-
             let dims = vec![NDDimension::new(nx), NDDimension::new(nz)];
             // As C simDetector, the last image is released and the next is
             // allocated in its place under one lock (simDetector.cpp:694-699).
             // A refused wrap has printed the pool's limit line.
             let Some(frame) = ctx.pool.owner().replace_array(0, || {
-                ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)).ok()
+                let mut frame = ctx.pool.alloc(dims, NDDataType::UInt16).ok()?;
+                let NDDataBuffer::U16(out) = &mut frame.data else {
+                    unreachable!("the frame was allocated as UInt16")
+                };
+                scale_into_u16(&accum, nx, nz, out);
+                Some(frame)
             }) else {
                 continue;
             };
@@ -422,6 +432,30 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     WaitOutcome::Continue => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Against the per-frame `Vec` conversion it replaced, into a reused
+    /// frame buffer: scaled to the peak, transposed, a dark frame zero.
+    #[test]
+    fn scale_into_u16_matches_the_old_conversion() {
+        for (accum, nx, nz, want) in [
+            (
+                &[0.0, 1.0, 2.0, 3.0, -1.0, 0.5][..],
+                3,
+                2,
+                &[0, 43333, 0, 21667, 65000, 10833][..],
+            ),
+            (&[0.0, -2.0, 0.0, -1.0], 2, 2, &[0, 0, 0, 0]),
+        ] {
+            let mut out = vec![u16::MAX; nx * nz];
+            scale_into_u16(accum, nx, nz, &mut out);
+            assert_eq!(out, want, "{accum:?}");
         }
     }
 }

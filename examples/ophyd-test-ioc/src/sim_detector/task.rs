@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -175,26 +175,29 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // Generate the image
             let width = config.size_x;
             let height = config.size_y;
-            let img_data = physics::moving_dot_image_with_config(
-                width,
-                height,
-                config.motor_x,
-                config.motor_y,
-                config.beam_current,
-                config.acquire_time,
-                config.shutter_open,
-                &mut rng,
-                &ctx.image_config,
-            );
-
-            // Build NDArray from f64 data
             let dims = vec![NDDimension::new(height), NDDimension::new(width)];
             // As C simDetector, the last image is released and the next is
             // allocated in its place under one lock (simDetector.cpp:694-699);
             // it stays there through the exposure wait. A refused wrap has
             // printed the pool's limit line.
             let Some(frame) = ctx.pool.owner().replace_array(0, || {
-                ctx.pool.alloc_with(dims, NDDataBuffer::F64(img_data)).ok()
+                let mut frame = ctx.pool.alloc(dims, NDDataType::Float64).ok()?;
+                let NDDataBuffer::F64(img) = &mut frame.data else {
+                    unreachable!("the frame was allocated as Float64")
+                };
+                physics::moving_dot_image_with_config(
+                    img,
+                    width,
+                    height,
+                    config.motor_x,
+                    config.motor_y,
+                    config.beam_current,
+                    config.acquire_time,
+                    config.shutter_open,
+                    &mut rng,
+                    &ctx.image_config,
+                );
+                Some(frame)
             }) else {
                 continue;
             };

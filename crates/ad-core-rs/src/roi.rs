@@ -1,14 +1,16 @@
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer};
+use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 
 use crate::color_layout::ColorLayout;
-use crate::pixel_cast::{PixelCast, with_buffer};
+use crate::driver::ColorMode;
 
 /// Crop a region of interest from the source array.
 /// Data type and color mode are preserved. ROI parameters are clamped
 /// to source dimensions so the function never panics on out-of-bounds input.
-/// The crop is allocated from `pool`.
+/// The crop is allocated from `pool` and copied into the buffer it hands
+/// back, as C's `NDArrayPool::convert` fills the array its `alloc` returns
+/// (NDArrayPool.cpp:647-716).
 pub fn crop_roi(
     pool: &NDArrayPool,
     source: &NDArray,
@@ -51,30 +53,32 @@ pub fn crop_roi(
     let dims = dst_layout.make_dims();
     let data_type = source_data.data_type();
 
+    let mut result = pool.alloc(dims, data_type)?;
+
     // Fast path: full-frame copy (no actual crop needed)
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
-        return pool.alloc_with(dims, source_data.clone());
+        result.data.copy_from(source_data);
+        return Ok(result);
     }
 
-    let num_elements = dst_layout.num_elements();
-    let mut dst_data = NDDataBuffer::zeros(data_type, num_elements);
-    with_buffer!(source_data, |src_v| {
-        crate::pixel_cast::with_buffer_mut!(&mut dst_data, |dst_v| {
-            for y in 0..size_y {
-                let src_y = min_y + y;
-                for x in 0..size_x {
-                    let src_x = min_x + x;
-                    for ch in 0..src_layout.num_colors() {
-                        let si = src_layout.index(src_x, src_y, ch);
-                        let di = dst_layout.index(x, y, ch);
-                        let val = PixelCast::to_f64(src_v[si]);
-                        dst_v[di] = PixelCast::from_f64(val);
-                    }
-                }
-            }
-        });
-    });
-    let mut result = pool.alloc_with(dims, dst_data)?;
+    // One run per row of the region: all three colours of it in RGB1, one
+    // colour plane's row in RGB2 and RGB3. The output is the source's data
+    // type, so a run is C convertDim's same-type copy, byte for byte.
+    let (planes, run) = match src_layout.color_mode {
+        ColorMode::RGB1 => (1, 3 * size_x),
+        ColorMode::RGB2 | ColorMode::RGB3 => (3, size_x),
+        _ => (1, size_x),
+    };
+    let es = data_type.element_size();
+    let src = source_data.as_u8_slice();
+    let dst = result.data.as_u8_slice_mut();
+    for y in 0..size_y {
+        for c in 0..planes {
+            let s = src_layout.index(min_x, min_y + y, c) * es;
+            let d = dst_layout.index(0, y, c) * es;
+            dst[d..d + run * es].copy_from_slice(&src[s..s + run * es]);
+        }
+    }
 
     // Update output dims to track cumulative offset from source
     let (x_dim, y_dim) = match src_layout.color_mode {
@@ -97,8 +101,7 @@ pub fn crop_roi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::ColorMode;
-    use crate::ndarray::NDDimension;
+    use crate::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 
     fn make_mono_array(size_x: usize, size_y: usize, data: NDDataBuffer) -> NDArray {
         let dims = vec![NDDimension::new(size_x), NDDimension::new(size_y)];
@@ -210,6 +213,87 @@ mod tests {
         let result = crop_roi(&NDArrayPool::new(0), &arr, &layout, 2, 2, 10, 10).unwrap();
         assert_eq!(result.dims[0].size, 2);
         assert_eq!(result.dims[1].size, 2);
+    }
+
+    /// Each colour mode's sub-region and full frame against a per-element
+    /// walk of `ColorLayout::index`.
+    #[test]
+    fn crop_matches_an_element_walk_in_every_color_mode() {
+        for mode in [
+            ColorMode::Mono,
+            ColorMode::RGB1,
+            ColorMode::RGB2,
+            ColorMode::RGB3,
+        ] {
+            let src_layout = ColorLayout {
+                color_mode: mode,
+                size_x: 5,
+                size_y: 4,
+            };
+            let n = src_layout.num_elements() as u16;
+            let mut src = NDArray::new(src_layout.make_dims(), NDDataType::UInt16);
+            src.data = NDDataBuffer::U16((0..n).collect());
+            let pool = NDArrayPool::new(0);
+            for (min_x, min_y, size_x, size_y) in [(1, 2, 3, 2), (2, 1, 3, 2), (0, 0, 5, 4)] {
+                let dst_layout = ColorLayout {
+                    color_mode: mode,
+                    size_x,
+                    size_y,
+                };
+                let mut want = vec![0u16; dst_layout.num_elements()];
+                for y in 0..size_y {
+                    for x in 0..size_x {
+                        for ch in 0..src_layout.num_colors() {
+                            want[dst_layout.index(x, y, ch)] =
+                                src_layout.index(min_x + x, min_y + y, ch) as u16;
+                        }
+                    }
+                }
+                let out = crop_roi(&pool, &src, &src_layout, min_x, min_y, size_x, size_y).unwrap();
+                let NDDataBuffer::U16(got) = &out.data else {
+                    panic!("{:?}", out.data.data_type());
+                };
+                assert_eq!(got, &want, "{mode:?} ({min_x},{min_y}) {size_x}x{size_y}");
+            }
+        }
+    }
+
+    /// C's convert fills the array `alloc` handed it (NDArrayPool.cpp:647,
+    /// :671, :716), so a crop after a released one reuses its buffer.
+    #[test]
+    fn a_crop_fills_the_buffer_the_pool_reuses() {
+        let layout = ColorLayout {
+            color_mode: ColorMode::Mono,
+            size_x: 4,
+            size_y: 4,
+        };
+        let arr = make_mono_array(4, 4, NDDataBuffer::U16((0..16).collect()));
+        for (min_x, size_x) in [(0, 4), (1, 2)] {
+            let pool = NDArrayPool::new(0);
+            let first = crop_roi(&pool, &arr, &layout, min_x, 0, size_x, 4).unwrap();
+            let ptr = first.data.as_u8_slice().as_ptr();
+            drop(first);
+            let second = crop_roi(&pool, &arr, &layout, min_x, 0, size_x, 4).unwrap();
+            assert_eq!(second.data.as_u8_slice().as_ptr(), ptr, "size_x {size_x}");
+        }
+    }
+
+    /// A crop copies elements as C's same-type `convertDim` does, so 64-bit
+    /// values past 2^53 come through exactly.
+    #[test]
+    fn a_crop_copies_64_bit_values_exactly() {
+        let layout = ColorLayout {
+            color_mode: ColorMode::Mono,
+            size_x: 2,
+            size_y: 2,
+        };
+        let big = (1u64 << 53) + 1;
+        let arr = make_mono_array(2, 2, NDDataBuffer::U64(vec![1, big, 3, u64::MAX]));
+        let out = crop_roi(&NDArrayPool::new(0), &arr, &layout, 1, 0, 1, 2).unwrap();
+        let NDDataBuffer::U64(v) = &out.data else {
+            panic!("{:?}", out.data.data_type());
+        };
+        assert_eq!(v, &[big, u64::MAX]);
     }
 
     #[test]

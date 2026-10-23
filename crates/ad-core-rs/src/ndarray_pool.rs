@@ -19,6 +19,12 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 /// NDArrayPool.cpp:352 checks `pArray->pNDArrayPool == this`).
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Leave to change an [`NDDataBuffer`]'s element type
+/// ([`NDDataBuffer::retype`]). Only this module makes one: the pool is the
+/// one owner of retyping, as C's pool is the one writer of `dataType` on a
+/// buffer it hands out.
+pub(crate) struct Retype(());
+
 /// A recycled buffer waiting in the free list, with the `data_size` the pool
 /// charged for it when it was allocated (C++ keeps the whole `NDArray`; only
 /// its buffer and its accounting are worth keeping).
@@ -181,11 +187,7 @@ impl NDArrayPool {
         };
 
         if let Some(mut reused) = reused {
-            if reused.data.data_type() != data_type {
-                reused.data = NDDataBuffer::zeros(data_type, num_elements);
-            } else {
-                reused.data.resize(num_elements);
-            }
+            reused.data.retype(Retype(()), data_type, num_elements);
             return Ok(self.adopt(dims, reused.data, reused.data_size));
         }
 
@@ -360,17 +362,21 @@ impl NDArrayPool {
         }
         out.codec = src.codec.as_ref().map(Codec::copied);
 
+        if copy_data_type {
+            let len = if copy_data {
+                src.data.len()
+            } else {
+                out.data.len()
+            };
+            out.data.retype(Retype(()), src.data.data_type(), len);
+        }
         if copy_data {
-            if copy_data_type || out.data.data_type() == src.data.data_type() {
-                // Output adopts the source type; same-typed buffers are
-                // refilled in place.
+            if out.data.data_type() == src.data.data_type() {
                 out.data.copy_from(&src.data);
             } else {
                 // Output keeps its own type: convert pixel values.
                 crate::color::convert_data_type_into(src, &mut out.data)?;
             }
-        } else if copy_data_type && out.data.data_type() != src.data.data_type() {
-            out.data = NDDataBuffer::zeros(src.data.data_type(), out.data.len());
         }
 
         out.attributes.clear();
@@ -1073,6 +1079,61 @@ mod tests {
         assert_eq!(c.data_size, 1000);
         assert_eq!(pool.num_alloc_buffers(), 1);
         assert_eq!(pool.allocated_bytes(), 1000);
+    }
+
+    /// A free buffer of another element type that holds the request is
+    /// reused in its own allocation, as C sets `dataType` on the array it
+    /// takes from the free list (NDArrayPool.cpp:191).
+    #[test]
+    fn a_free_buffer_of_another_type_is_reused_in_its_allocation() {
+        let pool = NDArrayPool::new(1_000_000);
+        let a = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt16)
+            .unwrap();
+        let ptr = a.data.as_u8_slice().as_ptr();
+        pool.release(a);
+
+        let b = pool
+            .alloc(vec![NDDimension::new(250)], NDDataType::Float64)
+            .unwrap();
+        assert_eq!(b.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(
+            (b.data.data_type(), b.data.len()),
+            (NDDataType::Float64, 250)
+        );
+        pool.release(b);
+
+        // Narrower and smaller, within THRESHOLD_SIZE_RATIO.
+        let c = pool
+            .alloc(vec![NDDimension::new(1500)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(c.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(
+            (c.data.data_type(), c.data.len()),
+            (NDDataType::UInt8, 1500)
+        );
+        assert_eq!(
+            (pool.num_alloc_buffers(), pool.allocated_bytes()),
+            (1, 2000)
+        );
+    }
+
+    /// `copy` with `copy_data_type` retypes the output in its own buffer
+    /// (NDArrayPool.cpp:290-299).
+    #[test]
+    fn copy_data_type_retypes_the_output_in_its_buffer() {
+        let pool = NDArrayPool::new(1_000_000);
+        let src = NDArray::with_data(
+            vec![NDDimension::new(2)],
+            NDDataBuffer::from_vec::<f64>(vec![1.5, -2.0]),
+        );
+        let out = pool
+            .alloc(vec![NDDimension::new(16)], NDDataType::UInt8)
+            .unwrap();
+        let ptr = out.data.as_u8_slice().as_ptr();
+        let out = pool.copy(&src, Some(out), true, true, true).unwrap();
+        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, -2.0][..]));
     }
 
     /// A buffer is not stretched past its `dataSize` whatever its capacity:

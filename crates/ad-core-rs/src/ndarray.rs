@@ -5,7 +5,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
-use crate::ndarray_pool::NDArrayPool;
+use crate::ndarray_pool::{NDArrayPool, Retype};
 use crate::timestamp::EpicsTimestamp;
 
 /// Maximum number of NDArray dimensions (C++ `ND_ARRAY_MAX_DIMS`,
@@ -320,6 +320,15 @@ impl NDDataBuffer {
         self.len = len;
     }
 
+    /// `len` elements of `data_type` in this buffer's storage, which grows
+    /// only when it is too small; the bytes keep whatever they held. C's
+    /// pool setting `pArray->dataType` on an array it reuses
+    /// (NDArrayPool.cpp:191); only the pool holds a [`Retype`].
+    pub(crate) fn retype(&mut self, _: Retype, data_type: NDDataType, len: usize) {
+        self.data_type = data_type;
+        self.set_len(len);
+    }
+
     /// Resize the buffer, zeroing new elements if growing.
     pub fn resize(&mut self, new_len: usize) {
         let old_bytes = self.total_bytes();
@@ -443,15 +452,15 @@ impl NDDataBuffer {
         });
     }
 
-    /// Make this buffer a copy of `src`. A same-typed buffer is refilled in
-    /// place so a pooled allocation survives the copy (C's pool `copy`
-    /// memcpy's into the buffer it already holds); a differently typed one is
-    /// replaced by a clone of `src`.
-    pub fn copy_from(&mut self, src: &NDDataBuffer) {
-        if self.data_type != src.data_type {
-            *self = src.clone();
-            return;
-        }
+    /// Make this buffer a copy of `src`, which has its element type, in its
+    /// own storage when that holds `src` (C's pool `copy` memcpy's into the
+    /// buffer it already holds). A buffer of another type is retyped by its
+    /// pool first.
+    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer) {
+        assert_eq!(
+            self.data_type, src.data_type,
+            "copy_from across element types"
+        );
         self.set_len(src.len);
         self.as_u8_slice_mut().copy_from_slice(src.as_u8_slice());
     }

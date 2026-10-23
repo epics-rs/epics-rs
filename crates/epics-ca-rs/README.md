@@ -26,7 +26,7 @@ epics-ca-rs implements the full Channel Access protocol used by C EPICS for over
 
 ### Protocol
 - **CA header** — standard 16-byte header with command/payload_size/data_type/data_count/parameter1/parameter2
-- **Extended header** — 32-byte form for payloads >64 KB or counts >65535
+- **Extended header** — 24-byte form for payloads >64 KB or counts >65535
 - **Big-endian wire format** — matches C EPICS exactly
 - **All commands** — VERSION, EVENT_ADD, EVENT_CANCEL, READ_NOTIFY, WRITE_NOTIFY, SEARCH, NOT_FOUND, ACCESS_RIGHTS, RSRV_IS_UP, BEACON, etc.
 - **DBR type encoding** — PLAIN(0-6), STS(7-13), TIME(14-20), GR(21-27), CTRL(28-34) for all 7 native types (String, Short, Float, Enum, Char, Long, Double)

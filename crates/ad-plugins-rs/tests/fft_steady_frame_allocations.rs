@@ -42,7 +42,7 @@ const N: usize = 1 << 16;
 fn a_second_1d_frame_allocates_no_complex_buffer() {
     let frame = Arc::new(NDArray::with_data(
         vec![NDDimension::new(N)],
-        NDDataBuffer::U16((0..N).map(|i| (i * 7919 % 4093) as u16).collect()),
+        NDDataBuffer::from_vec::<u16>((0..N).map(|i| (i * 7919 % 4093) as u16).collect()),
     ));
     let pool = NDArrayPool::new(0);
     for direction in [FFTDirection::Forward, FFTDirection::Inverse] {

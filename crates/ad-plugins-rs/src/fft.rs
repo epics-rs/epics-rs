@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use ad_core_rs::error::ADResult;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::pixel_cast::PixelCast;
 use ad_core_rs::plugin::runtime::{ArrayCallbacks, NDPluginProcess, ParamUpdate, ProcessResult};
@@ -76,7 +76,7 @@ fn pool_output(
     jobs: usize,
 ) -> ADResult<NDArray> {
     let mut arr = pool.alloc(dims, NDDataType::Float64)?;
-    let NDDataBuffer::F64(out) = &mut arr.data else {
+    let NDDataViewMut::F64(out) = arr.data.view_mut() else {
         unreachable!("the output was allocated as Float64");
     };
     to_f64_into(out, values, jobs);
@@ -516,7 +516,10 @@ pub fn fft_1d_rows(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         suppress_dc,
         &mut s.bufs,
     )?;
-    Some(NDArray::with_data(dims, NDDataBuffer::F64(s.bufs.out)))
+    Some(NDArray::with_data(
+        dims,
+        NDDataBuffer::from_vec::<f64>(s.bufs.out),
+    ))
 }
 
 /// [`fft_1d_rows`] on `vals`, the samples of `src` as `f64`, into
@@ -625,7 +628,10 @@ pub fn fft_2d(src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         suppress_dc,
         &mut s.bufs,
     )?;
-    Some(NDArray::with_data(dims, NDDataBuffer::F64(s.bufs.out)))
+    Some(NDArray::with_data(
+        dims,
+        NDDataBuffer::from_vec::<f64>(s.bufs.out),
+    ))
 }
 
 /// [`fft_2d`] as [`fft_1d_rows_with`] runs [`fft_1d_rows`], with the
@@ -1313,6 +1319,7 @@ impl NDPluginProcess for FFTProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDataView;
 
     /// C NDPluginFFT.cpp:216-218: the spectrum's epicsTS is the input's, by
     /// way of the port timestamp; its `timeStamp` is the wall clock, not the
@@ -1321,7 +1328,7 @@ mod tests {
     fn the_pool_output_takes_the_input_epics_ts_and_a_fresh_time_stamp() {
         let mut src = NDArray::with_data(
             vec![NDDimension::new(4), NDDimension::new(2)],
-            NDDataBuffer::F64(vec![0.0; 8]),
+            NDDataBuffer::from_vec::<f64>(vec![0.0; 8]),
         );
         src.timestamp = ad_core_rs::timestamp::EpicsTimestamp { sec: 7, nsec: 11 };
         src.time_stamp = 123.5;
@@ -1345,7 +1352,7 @@ mod tests {
             .collect();
         let arr = NDArray::with_data(
             vec![NDDimension::new(w), NDDimension::new(h)],
-            NDDataBuffer::F64(vals.clone()),
+            NDDataBuffer::from_vec::<f64>(vals.clone()),
         );
         let (pw, ph) = (next_pow2(w), next_pow2(h));
         let mut planner = FftPlanner::<f64>::new();
@@ -1363,8 +1370,8 @@ mod tests {
             .flat_map(|r| r[..pw / 2].iter().map(|c| c.norm() / pw as f64))
             .collect();
         let got = fft_1d_rows(&arr, false).unwrap();
-        let got_1d = match &got.data {
-            NDDataBuffer::F64(v) => v.clone(),
+        let got_1d = match got.data.view() {
+            NDDataView::F64(v) => v,
             _ => unreachable!(),
         };
         assert_eq!(got_1d.len(), want_1d.len());
@@ -1387,8 +1394,8 @@ mod tests {
             .map(|(fy, fx)| data[fy * pw + fx].norm() / (pw * ph) as f64)
             .collect();
         let got = fft_2d(&arr, false).unwrap();
-        let got_2d = match &got.data {
-            NDDataBuffer::F64(v) => v.clone(),
+        let got_2d = match got.data.view() {
+            NDDataView::F64(v) => v,
             _ => unreachable!(),
         };
         assert_eq!(got_2d.len(), want_2d.len());
@@ -1454,7 +1461,7 @@ mod tests {
             let dims = if h > 1 { vec![w, h] } else { vec![w] };
             let arr = NDArray::with_data(
                 dims.into_iter().map(NDDimension::new).collect(),
-                NDDataBuffer::F64(vals.clone()),
+                NDDataBuffer::from_vec::<f64>(vals.clone()),
             );
             for suppress_dc in [false, true] {
                 let mut rows_1d = |jobs: usize| {
@@ -1595,12 +1602,12 @@ mod tests {
         let n = 3 * (1 << 16) + 5;
         let ints = (0..n as i64).map(|i| (i * 7919) % 70001 - 35000);
         for data in [
-            NDDataBuffer::U16(ints.clone().map(|i| i as u16).collect()),
-            NDDataBuffer::I32(ints.clone().map(|i| i as i32 * 977).collect()),
+            NDDataBuffer::from_vec::<u16>(ints.clone().map(|i| i as u16).collect()),
+            NDDataBuffer::from_vec::<i32>(ints.clone().map(|i| i as i32 * 977).collect()),
             // Past 2^53, so the cast rounds.
-            NDDataBuffer::I64(ints.clone().map(|i| (i << 40) | 1).collect()),
-            NDDataBuffer::F32(ints.clone().map(|i| i as f32 / 3.0).collect()),
-            NDDataBuffer::F64(ints.clone().map(|i| i as f64 / 7.0).collect()),
+            NDDataBuffer::from_vec::<i64>(ints.clone().map(|i| (i << 40) | 1).collect()),
+            NDDataBuffer::from_vec::<f32>(ints.clone().map(|i| i as f32 / 3.0).collect()),
+            NDDataBuffer::from_vec::<f64>(ints.clone().map(|i| i as f64 / 7.0).collect()),
         ] {
             let want = bits(&data.to_f64_vec());
             for (jobs, start) in [(1, 9), (1, n + 9), (3, 9), (3, n + 9)] {
@@ -1629,7 +1636,7 @@ mod tests {
             let dims = if h > 1 { vec![w, h] } else { vec![w] };
             Arc::new(NDArray::with_data(
                 dims.into_iter().map(NDDimension::new).collect(),
-                NDDataBuffer::U16(
+                NDDataBuffer::from_vec::<u16>(
                     (0..w * h)
                         .map(|i| ((i * 7919 + seed) % 4093) as u16 + 1)
                         .collect(),
@@ -1639,8 +1646,8 @@ mod tests {
         let pool = NDArrayPool::new(0);
         let out = |proc: &FFTProcessor, arr: &Arc<NDArray>| {
             let r = proc.process_array(arr, &pool);
-            match &r.output_arrays[0].data {
-                NDDataBuffer::F64(v) => bits(v),
+            match r.output_arrays[0].data.view() {
+                NDDataView::F64(v) => bits(v),
                 _ => unreachable!(),
             }
         };
@@ -1685,7 +1692,7 @@ mod tests {
         let frame = |w: usize, h: usize| {
             Arc::new(NDArray::with_data(
                 vec![NDDimension::new(w), NDDimension::new(h)],
-                NDDataBuffer::U16((0..w * h).map(|i| (i % 251) as u16).collect()),
+                NDDataBuffer::from_vec::<u16>((0..w * h).map(|i| (i % 251) as u16).collect()),
             ))
         };
         for direction in [FFTDirection::Forward, FFTDirection::Inverse] {
@@ -1732,7 +1739,7 @@ mod tests {
     fn test_fft_1d_dc() {
         // Constant signal: DC component should dominate
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..8 {
                 v[i] = 1.0;
             }
@@ -1741,7 +1748,7 @@ mod tests {
         let result = fft_1d_rows(&arr, false).unwrap();
         // Output is half spectrum: N/2 = 4 bins
         assert_eq!(result.dims[0].size, 4);
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC component normalized by N: 8/8 = 1.0
             assert!((v[0] - 1.0).abs() < 1e-10);
             // Other components should be ~0
@@ -1754,7 +1761,7 @@ mod tests {
         // Sine wave at frequency 1: peak at k=1 and k=N-1
         let n = 16;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = (2.0 * std::f64::consts::PI * i as f64 / n as f64).sin();
             }
@@ -1763,7 +1770,7 @@ mod tests {
         let result = fft_1d_rows(&arr, false).unwrap();
         // Output is N/2 = 8 bins
         assert_eq!(result.dims[0].size, 8);
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC should be ~0
             assert!(v[0].abs() < 1e-10);
             // Peak at k=1, normalized by N: magnitude = N/2 / N = 0.5
@@ -1790,14 +1797,14 @@ mod tests {
     fn test_fft_1d_suppress_dc() {
         // Constant signal: DC component should be suppressed
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..8 {
                 v[i] = 1.0;
             }
         }
 
         let result = fft_1d_rows(&arr, true).unwrap();
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC component should be zeroed out
             assert!((v[0]).abs() < 1e-15);
             // Other components should still be ~0 for constant signal
@@ -1814,14 +1821,14 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for val in v.iter_mut() {
                 *val = 3.0;
             }
         }
 
         let result = fft_2d(&arr, true).unwrap();
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC at [0,0] should be zeroed
             assert!((v[0]).abs() < 1e-15);
         } else {
@@ -1836,7 +1843,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for val in v.iter_mut() {
                 *val = 2.0;
             }
@@ -1846,7 +1853,7 @@ mod tests {
         // Half spectrum: 2x2
         assert_eq!(result.dims[0].size, 2);
         assert_eq!(result.dims[1].size, 2);
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC normalized by N*M: 32 / 16 = 2.0
             assert!((v[0] - 2.0).abs() < 1e-10, "DC = {}, expected 2", v[0]);
             // All other bins should be ~0
@@ -1863,7 +1870,7 @@ mod tests {
         // Cosine at frequency 3 in N=16: peaks at k=3 and k=N-3=13
         let n = 16;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).cos();
             }
@@ -1872,7 +1879,7 @@ mod tests {
         let result = fft_1d_rows(&arr, false).unwrap();
         // Half spectrum: 8 bins
         assert_eq!(result.dims[0].size, 8);
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // DC should be ~0
             assert!(v[0].abs() < 1e-10);
             // k=3 should have magnitude N/2 / N = 8/16 = 0.5
@@ -1906,7 +1913,7 @@ mod tests {
         let pool = NDArrayPool::new(0);
 
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..8 {
                 v[i] = 5.0;
             }
@@ -1914,7 +1921,7 @@ mod tests {
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
-        if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
+        if let NDDataView::F64(v) = result.output_arrays[0].data.view() {
             // suppress_dc: DC should be 0
             assert!(v[0].abs() < 1e-15);
         } else {
@@ -1934,7 +1941,7 @@ mod tests {
 
         // Frame 1: constant = 2.0 => DC magnitude (normalized) = 2.0
         let mut arr1 = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr1.data {
+        if let NDDataViewMut::F64(v) = arr1.data.view_mut() {
             for i in 0..8 {
                 v[i] = 2.0;
             }
@@ -1942,7 +1949,7 @@ mod tests {
 
         // Frame 2: constant = 4.0 => DC magnitude (normalized) = 4.0
         let mut arr2 = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr2.data {
+        if let NDDataViewMut::F64(v) = arr2.data.view_mut() {
             for i in 0..8 {
                 v[i] = 4.0;
             }
@@ -1951,14 +1958,14 @@ mod tests {
         let r1 = proc.process_array(&Arc::new(arr1), &pool);
         assert_eq!(r1.output_arrays.len(), 1);
         // After 1 frame: exponential avg with N=1, so output = 2.0
-        if let NDDataBuffer::F64(ref v) = r1.output_arrays[0].data {
+        if let NDDataView::F64(v) = r1.output_arrays[0].data.view() {
             assert!((v[0] - 2.0).abs() < 1e-10, "partial avg DC = {}", v[0]);
         }
 
         let r2 = proc.process_array(&Arc::new(arr2), &pool);
         assert_eq!(r2.output_arrays.len(), 1);
         // After 2 frames: exp avg = 2.0*(1-1/2) + 4.0*(1/2) = 1.0 + 2.0 = 3.0
-        if let NDDataBuffer::F64(ref v) = r2.output_arrays[0].data {
+        if let NDDataView::F64(v) = r2.output_arrays[0].data.view() {
             assert!((v[0] - 3.0).abs() < 1e-10, "averaged DC = {}", v[0]);
         }
     }
@@ -1975,7 +1982,7 @@ mod tests {
 
         // Frame 1: width=8
         let mut arr1 = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr1.data {
+        if let NDDataViewMut::F64(v) = arr1.data.view_mut() {
             for i in 0..8 {
                 v[i] = 1.0;
             }
@@ -1987,7 +1994,7 @@ mod tests {
 
         // Frame 3: width=4 — dimension change should reset
         let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr2.data {
+        if let NDDataViewMut::F64(v) = arr2.data.view_mut() {
             for i in 0..4 {
                 v[i] = 1.0;
             }
@@ -2006,7 +2013,7 @@ mod tests {
             vec![NDDimension::new(w), NDDimension::new(h)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             // Row 0: all 1.0
             for i in 0..w {
                 v[i] = 1.0;
@@ -2020,7 +2027,7 @@ mod tests {
         let result = fft_1d_rows(&arr, false).unwrap();
         let n_freq = w / 2; // half spectrum
         assert_eq!(result.dims[0].size, n_freq);
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data.view() {
             // Row 0 DC = 4*1/4 = 1.0 (normalized by N=4)
             assert!((v[0] - 1.0).abs() < 1e-10);
             // Row 1 DC = 4*3/4 = 3.0
@@ -2037,7 +2044,7 @@ mod tests {
         // IFFT of [N, 0, ...0] (real input) should give constant = 1.0 for each sample
         let n = 8;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v[0] = 8.0; // DC = N
             // rest are 0
         }
@@ -2052,7 +2059,7 @@ mod tests {
 
         let result = proc.process_array(&Arc::new(arr), &pool);
         assert_eq!(result.output_arrays.len(), 1);
-        if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
+        if let NDDataView::F64(v) = result.output_arrays[0].data.view() {
             // Each sample should be magnitude 1.0 (8/8 = 1.0 after normalization)
             for i in 0..n {
                 assert!(
@@ -2085,7 +2092,7 @@ mod tests {
                 ad_core_rs::attributes::NDAttrSource::Driver,
                 ad_core_rs::attributes::NDAttrValue::Int32(0),
             ));
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v[0] = 1.0;
         }
 
@@ -2120,7 +2127,7 @@ mod tests {
         port.write_int32_blocking(num_average, 0, 4).unwrap();
         assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v[0] = 1.0;
         }
         let mut averaged = Vec::new();
@@ -2170,7 +2177,7 @@ mod tests {
                     // A constant frame's DC magnitude is its level.
                     level += 1.0;
                     let mut arr = NDArray::new(vec![NDDimension::new(width)], NDDataType::Float64);
-                    if let NDDataBuffer::F64(ref mut v) = arr.data {
+                    if let NDDataViewMut::F64(v) = arr.data.view_mut() {
                         v.fill(level);
                     }
                     publish(&handle, &arr);
@@ -2221,7 +2228,7 @@ mod tests {
             .map(|input_id| {
                 let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
                 arr.unique_id = input_id;
-                if let NDDataBuffer::F64(ref mut v) = arr.data {
+                if let NDDataViewMut::F64(v) = arr.data.view_mut() {
                     v.iter_mut().for_each(|s| *s = 2.0);
                 }
                 let r = proc.process_array(&Arc::new(arr), &pool);
@@ -2250,7 +2257,7 @@ mod tests {
         // power of two; nFreqX = paddedWidth / 2.
         let n = 5; // -> padded to 8 -> n_freq = 4
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = 1.0;
             }
@@ -2283,7 +2290,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|x| *x = 2.0);
         }
         let result = proc.process_array(&Arc::new(arr), &pool);
@@ -2292,7 +2299,7 @@ mod tests {
         assert_eq!(out.dims.len(), 2);
         assert_eq!(out.dims[0].size, 2); // nFreqX = 4/2
         assert_eq!(out.dims[1].size, 2); // nFreqY = 4/2 (per-row 1-D would be 4)
-        if let NDDataBuffer::F64(ref v) = out.data {
+        if let NDDataView::F64(v) = out.data.view() {
             // 2-D DC: 32 / 16 = 2.0.
             assert!((v[0] - 2.0).abs() < 1e-10, "DC = {}", v[0]);
         }
@@ -2304,7 +2311,7 @@ mod tests {
         let proc = FFTProcessor::new();
         let pool = NDArrayPool::new(0);
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v.iter_mut().for_each(|x| *x = 1.0);
         }
         let result = proc.process_array(&Arc::new(arr), &pool);
@@ -2373,7 +2380,7 @@ mod tests {
 
         let n = 16;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).cos();
             }
@@ -2418,7 +2425,7 @@ mod tests {
 
         let n = 16;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for i in 0..n {
                 v[i] = (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).cos();
             }
@@ -2457,7 +2464,7 @@ mod tests {
         let frame = |dims: Vec<usize>| {
             NDArray::with_data(
                 dims.into_iter().map(NDDimension::new).collect(),
-                NDDataBuffer::F64(row.clone()),
+                NDDataBuffer::from_vec::<f64>(row.clone()),
             )
         };
         let pool = NDArrayPool::new(0);
@@ -2465,13 +2472,13 @@ mod tests {
         let out = &r.output_arrays[0];
         let dims: Vec<usize> = out.dims.iter().map(|d| d.size).collect();
         assert_eq!(dims, [4, 1]);
-        let (NDDataBuffer::F64(got), Some(NDDataBuffer::F64(want))) = (
-            &out.data,
-            fft_1d_rows(&frame(vec![6]), false).map(|a| a.data.clone()),
-        ) else {
+        let want = fft_1d_rows(&frame(vec![6]), false);
+        let (NDDataView::F64(got), Some(NDDataView::F64(want))) =
+            (out.data.view(), want.as_ref().map(|a| a.data.view()))
+        else {
             panic!("expected F64 spectra");
         };
-        for (g, w) in got.iter().zip(&want) {
+        for (g, w) in got.iter().zip(want) {
             assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
         }
     }
@@ -2486,12 +2493,12 @@ mod tests {
         let (w, h) = (16, 8);
         let arr = NDArray::with_data(
             vec![NDDimension::new(w), NDDimension::new(h)],
-            NDDataBuffer::F64((0..w * h).map(|i| ((i * 7919) % 251) as f64).collect()),
+            NDDataBuffer::from_vec::<f64>((0..w * h).map(|i| ((i * 7919) % 251) as f64).collect()),
         );
         let r = proc.process_array(&Arc::new(arr), &pool);
         let abs = find_array_update(&r.param_updates, proc.params.abs_value.unwrap()).unwrap();
         let out = &r.output_arrays[0];
-        let NDDataBuffer::F64(spectrum) = &out.data else {
+        let NDDataView::F64(spectrum) = out.data.view() else {
             panic!("expected F64 output");
         };
         let dims: Vec<usize> = out.dims.iter().map(|d| d.size).collect();
@@ -2531,7 +2538,7 @@ mod tests {
             });
             let arr = NDArray::with_data(
                 vec![NDDimension::new(w), NDDimension::new(h)],
-                NDDataBuffer::F64(vals.clone()),
+                NDDataBuffer::from_vec::<f64>(vals.clone()),
             );
             let u = proc
                 .process_array(&Arc::new(arr), &NDArrayPool::new(0))
@@ -2585,7 +2592,7 @@ mod tests {
 
         let n = 8;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v[0] = 1.0;
         }
         let result = proc.process_array(&Arc::new(arr), &pool);
@@ -2704,7 +2711,7 @@ mod tests {
 
         let n = 5;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i + 1) as f64; // 1,2,3,4,5
             }
@@ -2739,7 +2746,7 @@ mod tests {
         let proc = fft_proc_with_params(config);
         let pool = NDArrayPool::new(0);
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v[0] = 8.0;
         }
         let result = proc.process_array(&Arc::new(arr), &pool);
@@ -2763,7 +2770,7 @@ mod tests {
         // output contains negative values (the old code took the modulus).
         let n = 8;
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             // Spectrum with a single non-DC bin: inverse is a real cosine
             // that swings negative.
             v[1] = 4.0;
@@ -2777,7 +2784,7 @@ mod tests {
         let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
         let result = proc.process_array(&Arc::new(arr), &pool);
-        if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {
+        if let NDDataView::F64(v) = result.output_arrays[0].data.view() {
             let has_negative = v.iter().any(|&x| x < -1e-6);
             assert!(
                 has_negative,
@@ -2790,7 +2797,7 @@ mod tests {
 
     fn ones(n: usize) -> Arc<NDArray> {
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data.view_mut() {
             v.fill(1.0);
         }
         Arc::new(arr)
@@ -2803,7 +2810,7 @@ mod tests {
 
         let first = proc.process_array(&ones(8), &pool).output_arrays;
         assert_eq!(first[0].pool_id(), pool.id());
-        let NDDataBuffer::F64(v) = &first[0].data else {
+        let NDDataView::F64(v) = first[0].data.view() else {
             panic!("expected F64 output");
         };
         assert!((v[0] - 1.0).abs() < 1e-10);
@@ -2811,7 +2818,7 @@ mod tests {
         drop(first);
 
         let second = proc.process_array(&ones(8), &pool).output_arrays;
-        let NDDataBuffer::F64(v) = &second[0].data else {
+        let NDDataView::F64(v) = second[0].data.view() else {
             panic!("expected F64 output");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

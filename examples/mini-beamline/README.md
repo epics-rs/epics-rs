@@ -39,19 +39,19 @@ Follows the ADDriver pattern and supports Single/Multiple/Continuous image modes
 - Background noise: `Poisson(lambda=1000)`
 - When the shutter is closed, only background noise is produced (dark frame)
 
-The MovingDot acquisition task is fully async. A driver author only needs three types from `ad_core_rs::plugin::channel`:
+The MovingDot acquisition task is fully async. A driver author only needs three types:
 
 | Type | Purpose |
 |------|---------|
-| `PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
-| `ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
-| `DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
+| `asyn_rs::port_handle::PortHandle` | Read/write parameters via `read_int32().await`, `set_params_and_notify().await` |
+| `ad_core_rs::plugin::channel::ArrayPublisher` | Publish a generated frame to downstream plugins: `publisher.publish(frame).await` |
+| `ad_core_rs::ndarray_pool::DriverPool` | Frames plugins receive; their queued count holds ADAcquireBusy under WaitForPlugins |
 
-The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread. All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
+The acquisition loop runs inside a `current_thread` tokio runtime created by the task thread (`ad_core_rs::runtime::run_thread_named`). All I/O is async and reliable — there are no lossy or blocking APIs in the data path.
 
 ### Kohzu DCM (Double Crystal Monochromator)
 
-Simulates a Kohzu-style double-crystal monochromator using the `kohzuCtl` state machine from `optics-rs`. Three `SimMotor` axes (Theta, Y, Z) are driven by the controller based on energy setpoint.
+Simulates a Kohzu-style double-crystal monochromator with optics' `kohzuCtl.st`, compiled by `epics-snc-rs` and run on `epics-seq-rs` (`seqStart("kohzuCtl", ...)` in `st.cmd`). Three `SimMotor` axes (Theta, Y, Z) are driven by the program from the energy setpoint.
 
 | PV | Type | Description |
 |----|------|-------------|
@@ -62,9 +62,19 @@ Simulates a Kohzu-style double-crystal monochromator using the `kohzuCtl` state 
 | `mini:KohzuMoving` | busy | Moving indicator |
 | `mini:KohzuModeBO` | bo | Manual(0) / Auto(1) |
 
-Set the energy and the controller calculates the Bragg angle, then drives the theta motor:
+The motors boot at 0, and `kohzuCtl` refuses a theta, Y or Z readback of 0
+(`mini:KohzuSeqMsg1SI` reads "Theta Readback of 0 not reasonable"), so move them
+off zero first. The program then finishes its init and sets Manual once more
+(`mini:KohzuSeqMsg1SI` reads "y offset changed to 17.500000", about 3 s later).
+After that, switch to Auto and set the energy; the program calculates the Bragg
+angle and drives the motors:
 
 ```bash
+caput -w 10 mini:dcm:theta 10
+caput -w 10 mini:dcm:y 10
+caput -w 10 mini:dcm:z 50
+sleep 5
+caput mini:KohzuModeBO 1
 caput mini:BraggEAO 8.0
 caget mini:BraggThetaRdbkAO
 camonitor mini:dcm:theta.RBV
@@ -193,7 +203,7 @@ with plugins under the same prefix (`mini:dot:image1:`, `mini:dot:Stats1:`, etc.
 | `mini:dot:cam1:ShutterOpen_RBV` | bi | Shutter status readback |
 | `mini:dot:cam1:Manufacturer_RBV` | stringin | Manufacturer ("Mini Beamline") |
 | `mini:dot:cam1:Model_RBV` | stringin | Model name ("Moving Dot") |
-| `mini:dot:image1:ArrayData` | waveform | Image data (FTVL=DOUBLE, NELM=307200) |
+| `mini:dot:image1:ArrayData` | waveform | Image data (FTVL=SHORT, NELM=307200) |
 
 ## Quick Start
 
@@ -232,11 +242,12 @@ import matplotlib.pyplot as plt
 
 # Acquire
 epics.caput('mini:dot:cam1:ArrayCallbacks', 1)
+epics.caput('mini:dot:image1:EnableCallbacks', 1)
 epics.caput('mini:dot:cam1:ImageMode', 0)
 epics.caput('mini:dot:cam1:AcquireTime', 0.1)
 epics.caput('mini:dot:cam1:Acquire', 1, wait=True)
 
-# Read image (Float64 waveform, 640x480 pixels)
+# Read image (16-bit waveform, 640x480 pixels)
 data = epics.caget('mini:dot:image1:ArrayData')
 sx = epics.caget('mini:dot:cam1:SizeX_RBV')
 sy = epics.caget('mini:dot:cam1:SizeY_RBV')
@@ -344,12 +355,12 @@ Optics devices are configured in `st.cmd`:
 ```bash
 # Kohzu DCM: 3 SimMotors + kohzuSeq.db + kohzuCtl state machine
 simMotorCreate("dcm_theta", -10000, 90000, 100)
-simMotorCreate("dcm_y", -50000, 50000, 100)
-simMotorCreate("dcm_z", -50000, 50000, 100)
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta")
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y")
-dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z")
-dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
+simMotorCreate("dcm_y", -250000, 250000, 100)
+simMotorCreate("dcm_z", -250000, 250000, 100)
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z,yOffHi=50,yOffLo=-50")
 seqStart("kohzuCtl", "P=mini:,M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
 
 # HSC-1 slit: SimHsc port driver
@@ -359,14 +370,8 @@ simHscCreate("HSC1", 100)
 simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
 ```
 
-To switch from simulation to real hardware, replace the `sim*Create` commands:
-
-```bash
-# Real hardware (same DB templates, same seqStart)
-# motorCreate("dcm_theta", "/dev/ttyUSB0", ...)
-# hscCreate("HSC1", "/dev/ttyUSB1", 9600, 100)
-# qxbpmCreate("QXBPM1", "/dev/ttyUSB2", 9600, 100)
-```
+Only the simulated `simHscCreate` / `simQxbpmCreate` ports exist as iocsh
+commands.
 
 ### Example
 
@@ -376,7 +381,6 @@ epicsEnvSet("BEAM_PERIOD",    "1.0")
 epicsEnvSet("BEAM_AMPLITUDE", "50.0")
 epicsEnvSet("DOT_SIZE_X",     "128")
 epicsEnvSet("DOT_SIZE_Y",     "96")
-epicsEnvSet("MOTOR_VELO",     "10.0")
 ```
 
 ## Architecture
@@ -455,7 +459,13 @@ The CA server port can be changed with the `EPICS_CA_SERVER_PORT` environment va
 ### Verify
 
 ```bash
-# Enable Auto mode (required — Manual mode ignores energy setpoints)
+# Move the DCM motors off 0 (kohzuCtl refuses a 0 readback), wait for its
+# init to set Manual, then Auto mode (required — Manual mode ignores energy
+# setpoints)
+caput -w 10 mini:dcm:theta 10
+caput -w 10 mini:dcm:y 10
+caput -w 10 mini:dcm:z 50
+sleep 5
 caput mini:KohzuModeBO 1
 
 # Set DCM energy and watch the theta motor move
@@ -475,6 +485,7 @@ caput mini:ph:mtr 20
 
 # Acquire a MovingDot image
 caput mini:dot:cam1:ArrayCallbacks 1
+caput mini:dot:image1:EnableCallbacks 1
 caput mini:dot:cam1:ImageMode 0        # Single
 caput mini:dot:cam1:AcquireTime 0.1
 caput mini:dot:cam1:Acquire 1

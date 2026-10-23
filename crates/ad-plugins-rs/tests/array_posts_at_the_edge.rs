@@ -28,6 +28,8 @@ enum Frame {
     /// No frame; the param written while the gate is closed.
     WriteBeforeTheGate(&'static str, i32),
     BeforeTheGate(Vec<f64>),
+    /// A frame, then the param written, both while the gate is closed.
+    WriteAfterAFrameBeforeTheGate(Vec<f64>, &'static str, i32),
     /// Processed with the gate open, before the port's edge sweep runs.
     BeforeTheSweep(Vec<f64>),
     AfterTheGate(Vec<f64>),
@@ -118,18 +120,26 @@ fn array_posts_a_record_receives<P: NDPluginProcess>(
         // it acked; a request queued behind them lands after them.
         port.call_param_callbacks_blocking(0).unwrap();
     };
+    let write = |name: &str, value: i32| {
+        let reason = port
+            .drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+            .unwrap()
+            .reason;
+        port.write_int32_blocking(reason, 0, value).unwrap();
+    };
     match frame {
         Frame::None => open(),
         Frame::WriteBeforeTheGate(name, value) => {
-            let reason = port
-                .drv_user_create_blocking(&DrvUserRequest::new(name, 0))
-                .unwrap()
-                .reason;
-            port.write_int32_blocking(reason, 0, value).unwrap();
+            write(name, value);
             open();
         }
         Frame::BeforeTheGate(values) => {
             send(values);
+            open();
+        }
+        Frame::WriteAfterAFrameBeforeTheGate(values, name, value) => {
+            send(values);
+            write(name, value);
             open();
         }
         Frame::BeforeTheSweep(values) => {
@@ -192,6 +202,19 @@ fn a_time_series_write_before_the_gate_posts_no_axis_at_the_edge() {
         Frame::WriteBeforeTheGate("TS_NUM_POINTS", 16),
     );
     assert!(posts.is_empty(), "{posts:?}");
+}
+
+/// Boundary: a TSNumPoints write after a frame, both while the gate was
+/// closed: the edge posts the axis the write made, once.
+#[test]
+fn a_time_series_write_after_a_frame_before_the_gate_has_its_axis_posted_at_the_edge() {
+    let posts = array_posts_a_record_receives(
+        "TSAXEDGEFW",
+        TimeSeriesProcessor::new(1),
+        &["TS_TIME_AXIS"],
+        Frame::WriteAfterAFrameBeforeTheGate(vec![1.0], "TS_NUM_POINTS", 16),
+    );
+    assert_eq!(lengths(posts), [("TS_TIME_AXIS", 16)]);
 }
 
 /// Boundary: a frame the open gate delivered before the edge sweep ran:

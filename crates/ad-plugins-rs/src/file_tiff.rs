@@ -596,6 +596,13 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         }
     };
 
+    // C decodes through libtiff's codecs; with none here, a compressed strip
+    // would come back as its raw bytes.
+    let compression = scalar(TAG_COMPRESSION).unwrap_or(u64::from(COMPRESSION_NONE));
+    if compression != u64::from(COMPRESSION_NONE) {
+        return Err(err(&format!("unsupported Compression={compression}")));
+    }
+
     let offsets = tags
         .get(&TAG_STRIP_OFFSETS)
         .ok_or_else(|| err("no StripOffsets"))?;
@@ -2185,5 +2192,94 @@ mod tests {
         assert!(std::path::Path::new(&full_name).exists());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The C comparison set's file: a 4x3 UInt8 image, pixels 0..12 in
+    /// strips of `rows` rows, `pad` 0xee bytes after them, then the strip
+    /// arrays and the IFD. `counts` is StripByteCounts as written (`None`
+    /// leaves the tag out); `overrides` replaces a tag's written value.
+    fn strip_file(
+        rows: u32,
+        counts: Option<&[u32]>,
+        pad: usize,
+        overrides: &[(u16, u32)],
+    ) -> Vec<u8> {
+        let (width, height) = (4u32, 3u32);
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for first in (0..height).step_by(rows as usize) {
+            offsets.push(8 + data.len() as u32);
+            let end = (first + rows).min(height);
+            data.extend((first * width..end * width).map(|p| p as u8));
+        }
+        data.extend(std::iter::repeat_n(0xee, pad));
+        let mut arrays = Vec::new();
+        let mut put = |values: &[u32]| match values {
+            [one] => *one,
+            _ => {
+                let at = 8 + (data.len() + arrays.len()) as u32;
+                arrays.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+                at
+            }
+        };
+        let offsets_at = put(&offsets);
+        let counts_at = counts.map(&mut put);
+        if (data.len() + arrays.len()) % 2 == 1 {
+            arrays.push(0);
+        }
+        let ifd = 8 + (data.len() + arrays.len()) as u32;
+        let mut entries = vec![
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 8),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (TAG_PHOTOMETRIC, TYPE_SHORT, 1, 1),
+            (
+                TAG_STRIP_OFFSETS,
+                TYPE_LONG,
+                offsets.len() as u32,
+                offsets_at,
+            ),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
+            (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, rows),
+        ];
+        if let (Some(counts), Some(at)) = (counts, counts_at) {
+            entries.push((TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts.len() as u32, at));
+        }
+        entries.push((TAG_PLANAR_CONFIG, TYPE_SHORT, 1, 1));
+        entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1));
+        let mut file = b"II".to_vec();
+        file.extend(42u16.to_le_bytes());
+        file.extend(ifd.to_le_bytes());
+        file.extend(data);
+        file.extend(arrays);
+        file.extend((entries.len() as u16).to_le_bytes());
+        for (tag, kind, n, value) in entries {
+            let value = overrides
+                .iter()
+                .find(|(t, _)| *t == tag)
+                .map_or(value, |(_, v)| *v);
+            file.extend(tag.to_le_bytes());
+            file.extend(kind.to_le_bytes());
+            file.extend(n.to_le_bytes());
+            file.extend(value.to_le_bytes());
+        }
+        file.extend(0u32.to_le_bytes());
+        file
+    }
+
+    /// C reads a compressed file through libtiff's codec; this reader has
+    /// none, so it refuses one even when its strips fill the image.
+    #[test]
+    fn a_compressed_file_is_refused() {
+        let lzw = strip_file(3, Some(&[12]), 16, &[(TAG_COMPRESSION, 5)]);
+        let read = decode(&lzw, NDAttributeList::new(), &NDArrayPool::new(0));
+        assert!(
+            read.is_err(),
+            "{:?}",
+            read.map(|a| a.data().as_u8_slice().to_vec())
+        );
+        let none = strip_file(3, Some(&[12]), 16, &[]);
+        assert!(decode(&none, NDAttributeList::new(), &NDArrayPool::new(0)).is_ok());
     }
 }

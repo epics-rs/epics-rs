@@ -405,18 +405,20 @@ mod simd_kernels {
 /// clamp, and a float source truncates toward zero before that, exactly as
 /// [`convert_dims_into`] casts it.
 pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
-    convert_prefix_into(&src.data, src.data.len(), out);
+    convert_buffer_into(&src.data, out);
     Ok(())
 }
 
-/// [`convert_type_into`] of the first `n` elements of `src`.
-pub(crate) fn convert_prefix_into(src: &NDDataBuffer, n: usize, out: &mut NDDataBuffer) {
+/// [`convert_type_into`] of a buffer: as many elements as `out` takes, which
+/// for a pooled `out` stops at its charge.
+pub(crate) fn convert_buffer_into(src: &NDDataBuffer, out: &mut NDDataBuffer) {
     if src.data_type() == out.data_type() {
-        out.copy_from(src, n);
+        out.copy_from(src);
         return;
     }
 
-    out.resize(n);
+    out.resize(src.len());
+    let n = out.len();
     macro_rules! cast_into {
         ($v:expr, $out:expr) => {
             crate::with_buffer_mut_typed!($out, |o: T| CCast::<T>::cast_into($v, o))

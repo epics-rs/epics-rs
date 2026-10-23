@@ -5,7 +5,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use crate::attributes::NDAttributeList;
 use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
-use crate::ndarray_pool::{NDArrayPool, Retype};
+use crate::ndarray_pool::{NDArrayPool, PoolOnly};
 use crate::timestamp::EpicsTimestamp;
 
 /// Maximum number of NDArray dimensions (C++ `ND_ARRAY_MAX_DIMS`,
@@ -81,6 +81,9 @@ pub struct NDDataBuffer {
     /// Elements in use: `len * element_size <= storage.len() * CHUNK`.
     len: usize,
     storage: Vec<Chunk>,
+    /// The bytes its pool charged for it (C's `dataSize`), past which no
+    /// method grows it; `None` off the pool.
+    charge: Option<usize>,
 }
 
 /// An [`NDDataBuffer`]'s elements read as its element type: C's `pData` cast
@@ -198,13 +201,14 @@ impl Default for NDDataBuffer {
     }
 }
 
-/// The elements in use, in an allocation of their size.
+/// The elements in use, in an allocation of their size, off the pool.
 impl Clone for NDDataBuffer {
     fn clone(&self) -> Self {
         Self {
             data_type: self.data_type,
             len: self.len,
             storage: self.storage[..chunks_for(self.total_bytes())].to_vec(),
+            charge: None,
         }
     }
 }
@@ -234,6 +238,7 @@ impl NDDataBuffer {
             data_type,
             len: count,
             storage: bytemuck::zeroed_vec(chunks_for(count * data_type.element_size())),
+            charge: None,
         }
     }
 
@@ -311,11 +316,14 @@ impl NDDataBuffer {
         self.storage.capacity() * CHUNK
     }
 
-    /// `len` elements of the element type, growing the storage only when it
-    /// is too small. Elements that were not in use keep whatever bytes the
-    /// storage held.
+    /// `len` elements of the element type, or as many as the pool charged
+    /// for, growing the storage only when it is too small. Elements that
+    /// were not in use keep whatever bytes the storage held. Every method
+    /// that grows the buffer goes through here.
     fn set_len(&mut self, len: usize) {
-        let chunks = chunks_for(len * self.data_type.element_size());
+        let elem = self.data_type.element_size();
+        let len = self.charge.map_or(len, |bytes| len.min(bytes / elem));
+        let chunks = chunks_for(len * elem);
         if chunks > self.storage.len() {
             self.storage.resize(chunks, Chunk([0; CHUNK]));
         }
@@ -325,13 +333,20 @@ impl NDDataBuffer {
     /// `len` elements of `data_type` in this buffer's storage, which grows
     /// only when it is too small; the bytes keep whatever they held. C's
     /// pool setting `pArray->dataType` on an array it reuses
-    /// (NDArrayPool.cpp:191); only the pool holds a [`Retype`].
-    pub(crate) fn retype(&mut self, _: Retype, data_type: NDDataType, len: usize) {
+    /// (NDArrayPool.cpp:191); only the pool holds a [`PoolOnly`].
+    pub(crate) fn retype(&mut self, _: PoolOnly, data_type: NDDataType, len: usize) {
         self.data_type = data_type;
         self.set_len(len);
     }
 
-    /// Resize the buffer, zeroing new elements if growing.
+    /// Charged `bytes` by its pool, which no method grows it past: C's
+    /// `dataSize`, at which its pool's copy stops (NDArrayPool.cpp:296).
+    pub(crate) fn charge(&mut self, _: PoolOnly, bytes: usize) {
+        self.charge = Some(bytes);
+    }
+
+    /// Resize the buffer, zeroing new elements if growing, up to its pool
+    /// charge.
     pub fn resize(&mut self, new_len: usize) {
         let old_bytes = self.total_bytes();
         self.set_len(new_len);
@@ -420,11 +435,13 @@ impl NDDataBuffer {
         out
     }
 
-    /// Refill this buffer with `values`, keeping its element type and, when
-    /// the capacity suffices, its allocation: the in-place form of
-    /// [`from_f64`](Self::from_f64) for a pooled output buffer.
+    /// Refill this buffer with `values`, as many as its pool charge holds,
+    /// keeping its element type and, when the capacity suffices, its
+    /// allocation: the in-place form of [`from_f64`](Self::from_f64) for a
+    /// pooled output buffer.
     pub fn fill_from_f64(&mut self, values: &[f64]) {
         self.set_len(values.len());
+        let values = &values[..self.len];
         #[cfg(feature = "simd")]
         {
             use crate::simd;
@@ -454,16 +471,16 @@ impl NDDataBuffer {
         });
     }
 
-    /// Make this buffer a copy of the first `len` elements of `src`, which
-    /// has its element type, in its own storage when that holds them (C's
+    /// Make this buffer a copy of `src`, which has its element type, as much
+    /// as its pool charge holds, in its own storage when that holds it (C's
     /// pool `copy` memcpy's into the buffer it already holds). A buffer of
     /// another type is retyped by its pool first.
-    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer, len: usize) {
+    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer) {
         assert_eq!(
             self.data_type, src.data_type,
             "copy_from across element types"
         );
-        self.set_len(len);
+        self.set_len(src.len);
         let n = self.total_bytes();
         self.as_u8_slice_mut()
             .copy_from_slice(&src.as_u8_slice()[..n]);

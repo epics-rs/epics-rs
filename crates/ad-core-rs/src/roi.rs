@@ -58,7 +58,7 @@ pub fn crop_roi(
     // epilogue (NDArrayPool.cpp:662-672).
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
         let mut result = pool.alloc(dst_layout.make_dims(), data_type)?;
-        crate::ndarray_pool::copy_within_charge(source_data, &mut result);
+        result.data.copy_from(source_data);
         return Ok(result);
     }
 

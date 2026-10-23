@@ -19,11 +19,11 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 /// NDArrayPool.cpp:352 checks `pArray->pNDArrayPool == this`).
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Leave to change an [`NDDataBuffer`]'s element type
-/// ([`NDDataBuffer::retype`]). Only this module makes one: the pool is the
-/// one owner of retyping, as C's pool is the one writer of `dataType` on a
-/// buffer it hands out.
-pub(crate) struct Retype(());
+/// Leave to change what only the pool sets on an [`NDDataBuffer`]: its
+/// element type ([`NDDataBuffer::retype`]) and its charge
+/// ([`NDDataBuffer::charge`]). Only this module makes one, as C's pool is
+/// the one writer of `dataType` and `dataSize` on a buffer it hands out.
+pub(crate) struct PoolOnly(());
 
 /// A recycled buffer waiting in the free list, with the `data_size` the pool
 /// charged for it when it was allocated (C++ keeps the whole `NDArray`; only
@@ -89,7 +89,8 @@ impl NDArrayPool {
     }
 
     /// Wrap a buffer in an array that belongs to this pool.
-    fn adopt(&self, dims: Vec<NDDimension>, data: NDDataBuffer, data_size: usize) -> NDArray {
+    fn adopt(&self, dims: Vec<NDDimension>, mut data: NDDataBuffer, data_size: usize) -> NDArray {
+        data.charge(PoolOnly(()), data_size);
         NDArray {
             unique_id: self.next_unique_id.fetch_add(1, Ordering::Relaxed),
             // The "Initialize fields" block of C++ NDArrayPool::alloc
@@ -186,9 +187,10 @@ impl NDArrayPool {
             }
         };
 
-        if let Some(mut reused) = reused {
-            reused.data.retype(Retype(()), data_type, num_elements);
-            return Ok(self.adopt(dims, reused.data, reused.data_size));
+        if let Some(reused) = reused {
+            let mut array = self.adopt(dims, reused.data, reused.data_size);
+            array.data.retype(PoolOnly(()), data_type, num_elements);
+            return Ok(array);
         }
 
         // Fresh allocation with CAS loop to avoid TOCTOU race. The reserved
@@ -274,7 +276,7 @@ impl NDArrayPool {
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
         let mut copy = self.alloc_for(source)?;
-        copy_within_charge(&source.data, &mut copy);
+        crate::convert::convert_buffer_into(&source.data, &mut copy.data);
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
@@ -377,12 +379,11 @@ impl NDArrayPool {
             } else {
                 out.data.len()
             };
-            let len = len.min(room(&out, src.data.data_type()));
-            out.data.retype(Retype(()), src.data.data_type(), len);
+            out.data.retype(PoolOnly(()), src.data.data_type(), len);
         }
         if copy_data {
             // Output keeps its own type: convert pixel values.
-            copy_within_charge(&src.data, &mut out);
+            crate::convert::convert_buffer_into(&src.data, &mut out.data);
         }
 
         out.attributes.clear();
@@ -405,7 +406,7 @@ impl NDArrayPool {
         // Allocate the output through the pool so it counts against
         // allocated_bytes / num_alloc_buffers.
         let mut out = self.alloc(src.dims.clone(), target_type)?;
-        copy_within_charge(&src.data, &mut out);
+        crate::convert::convert_buffer_into(&src.data, &mut out.data);
         out.unique_id = src.unique_id;
         out.copy_time_stamps_from(src);
         out.attributes.copy_from(&src.attributes);
@@ -469,20 +470,6 @@ impl NDArrayPool {
         }
         out
     }
-}
-
-/// The elements of `data_type` that `array`'s `dataSize` holds.
-fn room(array: &NDArray, data_type: NDDataType) -> usize {
-    array.data_size / data_type.element_size()
-}
-
-/// `src`'s elements, converted to `out`'s element type, as many as `out`'s
-/// `dataSize` holds: C's copy memcpy's at most `pOut->dataSize` bytes
-/// (NDArrayPool.cpp:296), so no copy grows a buffer past what its pool
-/// charged for it.
-pub(crate) fn copy_within_charge(src: &NDDataBuffer, out: &mut NDArray) {
-    let n = src.len().min(room(out, out.data.data_type()));
-    crate::convert::convert_prefix_into(src, n, &mut out.data);
 }
 
 // Compile-time check: NDArrayPool is Send + Sync
@@ -1175,6 +1162,42 @@ mod tests {
         let out = pool.copy(&src, Some(out), true, true, true).unwrap();
         assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
         assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, -2.0][..]));
+    }
+
+    /// No buffer method takes a pooled buffer past the bytes its pool
+    /// charged, the reused buffer's `dataSize` and not the request when
+    /// reused; a buffer off the pool, a clone included, grows as asked.
+    #[test]
+    fn a_pooled_buffer_never_grows_past_its_charge() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut a = pool
+            .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
+            .unwrap();
+        let ptr = a.data.as_u8_slice().as_ptr();
+        a.data.resize(16);
+        assert_eq!(a.data.len(), 4);
+        a.data.fill_from_f64(&[9.0; 16]);
+        assert_eq!(a.data.as_slice::<u8>(), Some(&[9u8; 4][..]));
+        assert_eq!(a.data.as_u8_slice().as_ptr(), ptr);
+
+        let mut copy = a.data.clone();
+        copy.resize(16);
+        assert_eq!(copy.len(), 16);
+        let mut loose = NDDataBuffer::zeros(NDDataType::UInt8, 4);
+        loose.fill_from_f64(&[1.0; 16]);
+        assert_eq!(loose.len(), 16);
+
+        let b = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(b);
+        let mut c = pool
+            .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(c.data_size, 100);
+        c.data.resize(200);
+        assert_eq!(c.data.len(), 100);
+        assert_eq!(pool.allocated_bytes(), 4 + 100);
     }
 
     /// `copy` into an existing output writes at most its `dataSize` bytes

@@ -1345,6 +1345,23 @@ mod tests {
         NDArrayPool::new(0)
     }
 
+    /// C's output is the pool array its dims size (NDPluginProcess.cpp:235):
+    /// a source buffer longer than its dims does not stretch it.
+    #[test]
+    fn the_output_holds_what_its_dims_size() {
+        let src = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            ad_core_rs::ndarray::NDDataBuffer::from_vec::<u8>((1..=10).collect()),
+        );
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_offset_scale: true,
+            ..Default::default()
+        });
+        let out = state.process(&pool(), &src).unwrap().unwrap();
+        assert_eq!(out.data.as_slice::<u8>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(out.data.total_bytes(), out.data_size);
+    }
+
     /// Both halves of the timestamp pair travel to `build_output`'s result.
     ///
     /// C reaches its output through `NDArrayPool::convert`, which copies the

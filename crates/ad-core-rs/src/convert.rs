@@ -405,20 +405,25 @@ mod simd_kernels {
 /// clamp, and a float source truncates toward zero before that, exactly as
 /// [`convert_dims_into`] casts it.
 pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
-    if src.data.data_type() == out.data_type() {
-        out.copy_from(&src.data);
-        return Ok(());
+    convert_prefix_into(&src.data, src.data.len(), out);
+    Ok(())
+}
+
+/// [`convert_type_into`] of the first `n` elements of `src`.
+pub(crate) fn convert_prefix_into(src: &NDDataBuffer, n: usize, out: &mut NDDataBuffer) {
+    if src.data_type() == out.data_type() {
+        out.copy_from(src, n);
+        return;
     }
 
-    out.resize(src.data.len());
+    out.resize(n);
     macro_rules! cast_into {
         ($v:expr, $out:expr) => {
             crate::with_buffer_mut_typed!($out, |o: T| CCast::<T>::cast_into($v, o))
         };
     }
 
-    crate::with_buffer!(&src.data, |v| cast_into!(v, out));
-    Ok(())
+    crate::with_buffer!(src, |v| cast_into!(&v[..n], out));
 }
 
 /// The C cast `(D)value` of one `f64` to the element type of `data_type`,

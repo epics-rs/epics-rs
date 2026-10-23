@@ -454,17 +454,19 @@ impl NDDataBuffer {
         });
     }
 
-    /// Make this buffer a copy of `src`, which has its element type, in its
-    /// own storage when that holds `src` (C's pool `copy` memcpy's into the
-    /// buffer it already holds). A buffer of another type is retyped by its
-    /// pool first.
-    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer) {
+    /// Make this buffer a copy of the first `len` elements of `src`, which
+    /// has its element type, in its own storage when that holds them (C's
+    /// pool `copy` memcpy's into the buffer it already holds). A buffer of
+    /// another type is retyped by its pool first.
+    pub(crate) fn copy_from(&mut self, src: &NDDataBuffer, len: usize) {
         assert_eq!(
             self.data_type, src.data_type,
             "copy_from across element types"
         );
-        self.set_len(src.len);
-        self.as_u8_slice_mut().copy_from_slice(src.as_u8_slice());
+        self.set_len(len);
+        let n = self.total_bytes();
+        self.as_u8_slice_mut()
+            .copy_from_slice(&src.as_u8_slice()[..n]);
     }
 }
 

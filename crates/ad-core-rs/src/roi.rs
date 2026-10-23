@@ -58,7 +58,7 @@ pub fn crop_roi(
     // epilogue (NDArrayPool.cpp:662-672).
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
         let mut result = pool.alloc(dst_layout.make_dims(), data_type)?;
-        result.data.copy_from(source_data);
+        crate::ndarray_pool::copy_within_charge(source_data, &mut result);
         return Ok(result);
     }
 
@@ -276,6 +276,22 @@ mod tests {
             let second = crop_roi(&pool, &arr, &layout, min_x, 0, size_x, 4).unwrap();
             assert_eq!(second.data.as_u8_slice().as_ptr(), ptr, "size_x {size_x}");
         }
+    }
+
+    /// The full-frame crop fills the frame the pool charged for, not a
+    /// longer source buffer.
+    #[test]
+    fn a_full_frame_crop_stops_at_the_frame() {
+        let layout = ColorLayout {
+            color_mode: ColorMode::Mono,
+            size_x: 2,
+            size_y: 2,
+        };
+        let arr = make_mono_array(2, 2, NDDataBuffer::from_vec::<u8>((1..=6).collect()));
+        let pool = NDArrayPool::new(0);
+        let out = crop_roi(&pool, &arr, &layout, 0, 0, 2, 2).unwrap();
+        assert_eq!(out.data.as_slice::<u8>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(pool.allocated_bytes(), 4);
     }
 
     /// A crop copies elements as C's same-type `convertDim` does, so 64-bit

@@ -273,15 +273,24 @@ impl NDArrayPool {
     /// NDArrayPool.cpp:283-302).
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
-        let dims = source.dims.clone();
-        let data_type = source.data.data_type();
-        let mut copy = self.alloc(dims, data_type)?;
-        copy.data.copy_from(&source.data);
+        let mut copy = self.alloc_for(source)?;
+        copy_within_charge(&source.data, &mut copy);
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
         copy.codec = source.codec.as_ref().map(Codec::copied);
         Ok(copy)
+    }
+
+    /// An output for a copy of `source`, sized for its payload: C sizes it
+    /// by the dims, which a codec's bytes under the original dims do not
+    /// follow here.
+    fn alloc_for(&self, source: &NDArray) -> ADResult<NDArray> {
+        self.alloc_sized(
+            source.dims.clone(),
+            source.data.data_type(),
+            source.data.total_bytes(),
+        )
     }
 
     /// Give an array back to the pool now.
@@ -352,7 +361,7 @@ impl NDArrayPool {
     ) -> ADResult<NDArray> {
         let mut out = match out {
             Some(o) => o,
-            None => self.alloc(src.dims.clone(), src.data.data_type())?,
+            None => self.alloc_for(src)?,
         };
 
         out.unique_id = src.unique_id;
@@ -368,15 +377,12 @@ impl NDArrayPool {
             } else {
                 out.data.len()
             };
+            let len = len.min(room(&out, src.data.data_type()));
             out.data.retype(Retype(()), src.data.data_type(), len);
         }
         if copy_data {
-            if out.data.data_type() == src.data.data_type() {
-                out.data.copy_from(&src.data);
-            } else {
-                // Output keeps its own type: convert pixel values.
-                crate::color::convert_data_type_into(src, &mut out.data)?;
-            }
+            // Output keeps its own type: convert pixel values.
+            copy_within_charge(&src.data, &mut out);
         }
 
         out.attributes.clear();
@@ -399,7 +405,7 @@ impl NDArrayPool {
         // Allocate the output through the pool so it counts against
         // allocated_bytes / num_alloc_buffers.
         let mut out = self.alloc(src.dims.clone(), target_type)?;
-        crate::color::convert_data_type_into(src, &mut out.data)?;
+        copy_within_charge(&src.data, &mut out);
         out.unique_id = src.unique_id;
         out.copy_time_stamps_from(src);
         out.attributes.copy_from(&src.attributes);
@@ -463,6 +469,20 @@ impl NDArrayPool {
         }
         out
     }
+}
+
+/// The elements of `data_type` that `array`'s `dataSize` holds.
+fn room(array: &NDArray, data_type: NDDataType) -> usize {
+    array.data_size / data_type.element_size()
+}
+
+/// `src`'s elements, converted to `out`'s element type, as many as `out`'s
+/// `dataSize` holds: C's copy memcpy's at most `pOut->dataSize` bytes
+/// (NDArrayPool.cpp:296), so no copy grows a buffer past what its pool
+/// charged for it.
+pub(crate) fn copy_within_charge(src: &NDDataBuffer, out: &mut NDArray) {
+    let n = src.len().min(room(out, out.data.data_type()));
+    crate::convert::convert_prefix_into(src, n, &mut out.data);
 }
 
 // Compile-time check: NDArrayPool is Send + Sync
@@ -1155,6 +1175,74 @@ mod tests {
         let out = pool.copy(&src, Some(out), true, true, true).unwrap();
         assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
         assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, -2.0][..]));
+    }
+
+    /// `copy` into an existing output writes at most its `dataSize` bytes
+    /// (NDArrayPool.cpp:296), in its own buffer, on each path that sets the
+    /// output's length: same type, retyped, converted, retyped without data.
+    #[test]
+    fn copy_into_an_output_stops_at_its_data_size() {
+        let pool = NDArrayPool::new(1_000_000);
+        let bytes: Vec<u8> = (1..=16).collect();
+        let src_u8 =
+            NDArray::with_data(vec![NDDimension::new(16)], NDDataBuffer::from_slice(&bytes));
+        let src_f64 = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            NDDataBuffer::from_vec::<f64>(vec![1.5, 2.5, 3.5, 4.5]),
+        );
+        let output = |n: usize, data_type: NDDataType| {
+            let out = pool.alloc(vec![NDDimension::new(n)], data_type).unwrap();
+            let ptr = out.data.as_u8_slice().as_ptr();
+            (out, ptr)
+        };
+
+        let (out, ptr) = output(4, NDDataType::UInt8);
+        let out = pool.copy(&src_u8, Some(out), true, false, false).unwrap();
+        assert_eq!(out.data.as_slice::<u8>(), Some(&bytes[..4]));
+        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+
+        let (out, ptr) = output(16, NDDataType::UInt8);
+        let out = pool.copy(&src_f64, Some(out), true, false, true).unwrap();
+        assert_eq!(out.data.as_slice::<f64>(), Some(&[1.5, 2.5][..]));
+        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+
+        let (out, ptr) = output(4, NDDataType::UInt16);
+        let out = pool.copy(&src_u8, Some(out), true, false, false).unwrap();
+        assert_eq!(out.data.as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(out.data.as_u8_slice().as_ptr(), ptr);
+
+        let (out, _) = output(12, NDDataType::UInt8);
+        let out = pool.copy(&src_f64, Some(out), false, false, true).unwrap();
+        assert_eq!(out.data.data_type(), NDDataType::Float64);
+        assert!(out.data.total_bytes() <= out.data_size);
+
+        assert_eq!(pool.allocated_bytes(), 4 + 16 + 8 + 12);
+    }
+
+    /// A copy the pool allocates holds the source's payload and is charged
+    /// for it, also when the payload is not what the dims say (a codec's
+    /// bytes under the original dims), and `convert_type` fills only the
+    /// output it charged for.
+    #[test]
+    fn a_pool_made_copy_is_charged_for_what_it_holds() {
+        let pool = NDArrayPool::new(1_000_000);
+        let payload: Vec<u8> = (1..=10).collect();
+        let src = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            NDDataBuffer::from_slice(&payload),
+        );
+
+        let out = pool.copy(&src, None, true, true, true).unwrap();
+        assert_eq!(out.data.as_slice::<u8>(), Some(&payload[..]));
+        assert_eq!((out.data_size, pool.allocated_bytes()), (10, 10));
+
+        let copy = pool.alloc_copy(&src).unwrap();
+        assert_eq!(copy.data.as_slice::<u8>(), Some(&payload[..]));
+        assert_eq!((copy.data_size, pool.allocated_bytes()), (10, 20));
+
+        let wide = pool.convert_type(&src, NDDataType::UInt16).unwrap();
+        assert_eq!(wide.data.as_slice::<u16>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!((wide.data_size, pool.allocated_bytes()), (8, 28));
     }
 
     /// A buffer is not stretched past its `dataSize` whatever its capacity:

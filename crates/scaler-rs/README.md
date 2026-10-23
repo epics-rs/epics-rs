@@ -1,6 +1,6 @@
 # scaler-rs
 
-Pure Rust port of the EPICS [scaler](https://github.com/epics-modules/scaler) module — multi-channel counter/timer record with preset and auto-count support.
+Pure Rust port of the EPICS [scaler](https://github.com/epics-modules/scaler) module (scaler 4.1) — multi-channel counter/timer record with preset and auto-count support.
 
 No C dependencies. Just `cargo build`.
 
@@ -24,13 +24,14 @@ scaler-rs is a faithful Rust port of the C++ scalerRecord, including the full st
 - **Two count modes** — OneShot (CNT=1 → count then stop) and AutoCount (continuous with rate-limited display)
 - **Delayed start** — DLY (OneShot delay) and DLY1 (AutoCount delay) for synchronizing with external events
 - **Display rate** — RATE/RAT1 control how often counts are read while counting
-- **Output links** — COUT (count direction toggle) and COUTP (count start/stop transition) fired on state changes
+- **Output links** — COUT ("CNT Output") and COUTP ("CNT Output Prompt") write CNT out when counting starts or stops
 - **Per-channel naming** — NMx fields populate display labels in OPI screens
-- **Status fields** — CNT (count enable), CONT (continuous counting), TCNT (counts when finished), VAL (elapsed time)
+- **Status fields** — CNT (count enable), CONT (OneShot/AutoCount select), T and VAL (elapsed time)
 
 ### Device Support
 - **Device support** (`scaler_asyn.rs`) — bridges the scaler record to a `ScalerDriver` trait with `reset`, `read`, `write_preset`, `arm` operations and a `SCALER_DONE` interrupt registration (`DoneInterrupt`, with `DoneParam` for an `asynPortDriver`-style driver and its boot replay), and exports the seven asyn `drvInfo` strings (`SCALER_RESET`, `SCALER_READ`, …) a port driver would match on. It implements `epics_base_rs`'s `DeviceSupport` directly; the crate does not depend on `asyn-rs`
-- **Software scaler** (`scaler_soft.rs`) — pure Rust simulation driver for testing (configurable count rates per channel)
+- **Software scaler** (`scaler_soft.rs`) — `SoftScalerDriver`, C `drvScalerSoft.c` over a `CountSource`: the input PVs, or an in-process array (`SharedCounts`) a test writes
+- **Soft scaler ports** (`soft_port.rs`) — `SoftScalerPorts::configure(port, max_chans, pv_template)`, C `drvScalerSoftConfigure`: counters read from the database PVs the template names, served to `Asyn Scaler` device support
 - **Synchronous dset** — device support binds the driver to the record at init; `process()` calls `arm`/`reset`/`write_preset`/`read` at the points C's `scalerRecord.c` does; completion arrives as the driver's done interrupt, which processes the record (`deviceCallbackFunc`)
 
 ### Database Templates (bundled)
@@ -56,9 +57,10 @@ scaler-rs/
 │   │   └── scaler.rs           # ScalerRecord (Record trait + state machine)
 │   ├── records/dbd_generated.rs # the field table generated from scalerRecord.dbd
 │   └── device_support/
-│       ├── mod.rs              # ScalerDriver trait
-│       ├── scaler_asyn.rs      # DeviceSupport impl + asyn drvInfo strings
-│       └── scaler_soft.rs      # software simulation driver
+│       ├── mod.rs              # module list
+│       ├── scaler_asyn.rs      # ScalerDriver trait, DeviceSupport impl, asyn drvInfo strings
+│       ├── scaler_soft.rs      # SoftScalerDriver (drvScalerSoft.c)
+│       └── soft_port.rs        # SoftScalerPorts (drvScalerSoftConfigure)
 ├── db/                         # database templates + autosave .req files
 └── ui/                         # PyDM .ui screens (16/32/64 channel)
 ```
@@ -100,6 +102,7 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
 
 // The channel count alone; it is clamped to MAX_SCALER_CHANNELS (64).
+// Its counts are an in-process array: `driver.shared_counts()`.
 let driver = SoftScalerDriver::new(16);
 ```
 
@@ -132,7 +135,7 @@ Test coverage: state machine transitions (OneShot → arm → counting → done)
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

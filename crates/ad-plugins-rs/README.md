@@ -1,6 +1,6 @@
 # ad-plugins-rs
 
-NDPlugin implementations for [ad-core-rs](../ad-core-rs/). 26 image processing
+NDPlugin implementations for [ad-core-rs](../ad-core-rs/). 27 image processing
 and data handling plugins for real-time detector data pipelines.
 
 No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT).
@@ -24,7 +24,7 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 |--------|-------------|
 | **NDROIPlugin** | Region-of-interest extraction with auto-center (CoM/Peak), binning, per-dimension enable |
 | **NDTransform** | 8 geometric transforms: rotations (90/180/270), flips (H/V/diagonal) |
-| **NDColorConvert** | RGB/Mono conversion, Bayer demosaic (bilinear), false-color jet LUT |
+| **NDColorConvert** | RGB/Mono conversion, Bayer demosaic (bilinear), false-color Rainbow and Iron maps (ADCore `colorMaps.h`) |
 | **NDOverlay** | Draw shapes (cross, rectangle, ellipse, text) with 5x7 bitmap font |
 
 ### Array Processing
@@ -39,7 +39,7 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 | Plugin | Description |
 |--------|-------------|
 | **NDCircularBuff** | Pre/post-trigger ring buffer with Calc expression evaluator |
-| **NDTimeSeries** | OneShot/RingBuffer accumulation for statistics channels |
+| **NDTimeSeries** | Fixed/Circular (C `TSAcquireMode`) accumulation for statistics channels |
 | **NDStdArrays** | Latest array storage (passthrough with caching) |
 
 ### File I/O
@@ -49,21 +49,22 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 | **NDFileHDF5** | HDF5 file writer via `rust-hdf5`, with the custom-layout XML engine of C's `NDFileHDF5` |
 | **NDFileJPEG** | JPEG encoding/decoding via jpeg-encoder/jpeg-decoder |
 | **NDFileTIFF** | TIFF encoding/decoding via the `image` crate |
-| **NDFileNetCDF** | netCDF-3 classic writer |
+| **NDFileNetCDF** | netCDF-4 writer, through `rust-hdf5` |
 | **NDFileNexus** | NeXus file writer |
 | **NDFileMagick** | the ImageMagick-style format set, via the `image` crate |
+| **NDFileNull** | writes nothing, so `DeleteDriverFile` can delete a driver's own files |
 
 ### Codec
 
 | Plugin | Description |
 |--------|-------------|
-| **NDCodec** | Lossless compression: LZ4 (lz4_flex) + JPEG, preserves original data type |
+| **NDCodec** | Compression and decompression: JPEG, Zlib, LZ4 (lz4_flex), LZ4HDF5, Blosc, BSLZ4; preserves original data type |
 
 ### Position & Pixel Correction
 
 | Plugin | Description |
 |--------|-------------|
-| **NDPos** | Attach position metadata from JSON list (Discard/Keep modes) |
+| **NDPos** | Attach position metadata from an XML (C `pos_layout`) or JSON list (Discard/Keep modes) |
 | **NDBadPixel** | Bad pixel correction: Set (fixed value), Replace (neighbor), Median (kernel). JSON config |
 
 ### Multiplexing
@@ -72,13 +73,13 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 |--------|-------------|
 | **NDGather** | Passthrough multiplexer (many → one) |
 | **NDScatter** | Round-robin splitter (one → many) |
-| **Passthrough** | No-op stub for unimplemented plugin types |
+| **Passthrough** | No-op stand-in for NDPluginPva / NDPluginPvxs without the `pva` feature |
 
 ### Serving
 
 | Plugin | Description |
 |--------|-------------|
-| **NDPluginPva** | serves the latest NDArray as an NTNDArray over pvAccess (`pva` feature) |
+| **NDPluginPva** | serves the latest NDArray as an NTNDArray over pvAccess (`pva` feature); `NDPvaConfigure` and `NDPvxsConfigure` |
 
 ## Features
 
@@ -86,9 +87,9 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 [features]
 default   = ["parallel", "simd"]
 parallel  = ["rayon"]       # rayon data-parallelism for CPU-heavy plugins
-simd      = ["fearless_simd", "ad-core-rs/simd"]  # the SIMD kernels
-ioc       = ["ad-core-rs/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
-pva       = ["epics-pva-rs", "epics-bridge-rs"]   # NDPluginPva
+simd      = ["dep:fearless_simd", "dep:fearless_simd_macros", "ad-core-rs/simd"]  # the SIMD kernels
+ioc       = ["dep:epics-ca-rs", "ad-core-rs/ioc"]  # IOC startup commands (NDStatsConfigure, etc.)
+pva       = ["dep:epics-pva-rs", "dep:epics-bridge-rs"]   # NDPluginPva
 ```
 
 HDF5 is not feature-gated: `rust-hdf5` is an unconditional dependency, built
@@ -130,7 +131,7 @@ ad-plugins-rs = { version = "0.32", default-features = false }
 Each plugin implements `NDPluginProcess`:
 
 ```rust
-use ad_core_rs::plugin::NDPluginProcess;
+use ad_core_rs::plugin::runtime::NDPluginProcess;
 use ad_plugins_rs::stats::StatsProcessor;
 
 let stats = StatsProcessor::new();
@@ -145,9 +146,10 @@ With the `ioc` feature, plugins register as st.cmd startup commands:
 
 ```bash
 # In st.cmd
-NDStatsConfigure("STATS1", 5, "SIM1")
-NDROIConfigure("ROI1", 5, "SIM1")
-NDStdArraysConfigure("IMAGE1", 5, "SIM1")
+# portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr
+NDStatsConfigure("STATS1", 5, 0, "SIM1", 0)
+NDROIConfigure("ROI1", 5, 0, "SIM1", 0)
+NDStdArraysConfigure("IMAGE1", 5, 0, "SIM1", 0)
 ```
 
 ## Build

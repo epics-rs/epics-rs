@@ -34,11 +34,11 @@ cargo build --release -p mqtt-ioc --features ioc
 Driver diagnostics are asyn trace lines on port `MQTT1`, printed as C's
 `drvMqtt` prints them. `ASYN_TRACE_ERROR` is on by default:
 
-- `MqttDriver::onDisconnectCb: Connection lost. Reconnecting... (<error>)` —
-  the `rumqttc` error tells a real network failure from a recoverable state
-  error.
-- `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` — each failed
-  reconnect attempt, subscribe or publish.
+- `MqttDriver::onDisconnectCb: Connection lost. Reconnecting...` — a live
+  session was lost. As in C, the line carries no cause.
+- `MqttDriver::onFailCb: MQTT Operation error: 'Error: <error>'` — the boot
+  connect failed, or a subscribe or publish failed. Failed reconnect attempts
+  after a loss print nothing.
 - `MqttDriver::onConnectCb: Reconnected.` — a reconnect after a loss.
 - `MqttDriver::onMessageCb: ...` — an inbound payload a record could not take.
 - `MqttDriver::<x>Write: Failed to set value for topic ...` — a failed write.

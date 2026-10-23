@@ -124,9 +124,15 @@ jobs:
         run: |
           sudo ifconfig lo0 alias 127.0.0.2 up
           sudo ifconfig lo0 alias 127.0.0.4 up
-          # A second broadcast-capable address for the multi-NIC broadcast
-          # bundle tests; the hosted image has one.
-          sudo ifconfig en0 alias 198.18.0.2 netmask 255.255.255.0 broadcast 198.18.0.255
+          # A second broadcast-capable NIC for the multi-NIC broadcast bundle
+          # tests, on a feth pair, not en0: the VM's DHCP renewals go
+          # unanswered, so en0 is re-leased when its 1 h lease expires, and
+          # with an alias on en0 the VM's network never comes back.
+          sudo ifconfig feth0 create
+          sudo ifconfig feth1 create
+          sudo ifconfig feth0 peer feth1
+          sudo ifconfig feth1 up
+          sudo ifconfig feth0 inet 198.18.0.2 netmask 255.255.255.0 broadcast 198.18.0.255 up
 
       - name: Test prerequisites (::1, external NIC) - Windows
         if: runner.os == 'Windows'

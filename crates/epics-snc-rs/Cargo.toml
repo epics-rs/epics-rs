@@ -3,6 +3,7 @@ name = "epics-snc-rs"
 version.workspace = true
 edition.workspace = true
 description = "Rust port of the EPICS sequencer's SNL compiler (snc): turns an unchanged .st program into Rust at build time"
+readme = "README.md"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

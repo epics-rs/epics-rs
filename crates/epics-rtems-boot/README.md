@@ -53,8 +53,9 @@ here is reachable from `softioc-rs`.
 | `rtems_stats.c` | the C side of the stats funnel. Compiling it is what emits `rtems_boot_linked` |
 
 `csrc/tests/rtems-api/` records the RTEMS and libbsd declarations
-`rtems_init.c` names, so a runner with no cross toolchain can still compile
-that file with `-Werror`. `scripts/rtems-api-check.sh` is its integrity gate:
+`rtems_init.c` and `rtems_shell_cmds.c` name, so a runner with no cross
+toolchain can still compile those files with `-Werror`
+(`scripts/csrc-check.sh`). `scripts/rtems-api-check.sh` is its integrity gate:
 pass 1 refuses an unmarked declaration anywhere in the record and needs no
 toolchain; pass 2 requires each `@rtems-api <header>` block to appear in that
 header as a contiguous run of byte-identical lines, so it runs wherever
@@ -166,7 +167,7 @@ to avoid. The script diffs the stock print against its own output and refuses
 to emit if more than that one key changed, so the deviation cannot silently
 widen.
 
-Two operational notes:
+Three operational notes:
 
 - `RTEMS_USE_STOCK_SPEC=1` builds against the stock builtin spec instead.
   Toggling it — or first building after the wrapper was introduced, over a

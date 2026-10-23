@@ -1016,13 +1016,13 @@ fn stats_of<T: StatsElem + Send + Sync>(
     let n = v.len() as f64;
     let (range, variance);
     #[cfg(feature = "parallel")]
-    // Both passes take 170 ps + 55 ps per element byte serially; the split
-    // measured faster from 600 us (u16 1448x1448 0.85-1.17x serial, f64
-    // 1024x1024 0.81x).
+    // Both passes take 190 ps + 25 ps per element byte serially at these
+    // sizes; the split measured faster from 80 us (u16 600x600 0.85x serial,
+    // f64 512x512 0.83x, u8 724x724 0.55x).
     if par_util::pool_wins(
         v.len(),
-        170 + 55 * size_of::<T>(),
-        600,
+        190 + 25 * size_of::<T>(),
+        80,
         v.len().div_ceil(PAR_CHUNK),
     ) {
         range = par_util::thread_pool().install(|| {
@@ -1298,13 +1298,13 @@ fn project_of<T: StatsElem + Sync>(
 ) -> Projection {
     let v = &v[..x_size * y_size];
     #[cfg(feature = "parallel")]
-    // About 320 ps per element serially for every type; the split measured
-    // faster from 450 us (u16 1024x1024 0.92-0.98x serial, 1214x1214 0.89x;
-    // u8 1024x1024 1.67x on a loaded box).
+    // About 320 ps per element serially (u8 470, f64 310); the split
+    // measured faster from 60 us (u16 470x470 0.83x serial, u8 430x430 0.74x,
+    // f64 512x512 0.85x).
     if par_util::pool_wins(
         v.len(),
         320,
-        450,
+        60,
         y_size.div_ceil((PAR_CHUNK / x_size).max(1)),
     ) {
         let band = (PAR_CHUNK / x_size).max(1) * x_size;

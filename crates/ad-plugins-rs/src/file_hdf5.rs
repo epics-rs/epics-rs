@@ -5473,18 +5473,25 @@ impl NDPluginProcess for Hdf5FileProcessor {
             }
         }
 
-        // Performance stats
-        if ctrl.writer.lock().cfg.store_performance {
+        // Performance stats. One snapshot under one lock: the writer mutex is
+        // not reentrant, so a second `writer.lock()` inside the same statement
+        // (its first guard still live as a temporary) deadlocks this thread
+        // against itself — and, as it holds `ctrl`, the whole port with it.
+        let perf = {
+            let w = ctrl.writer.lock();
+            w.cfg
+                .store_performance
+                .then(|| (w.total_runtime, w.total_bytes))
+        };
+        if let Some((total_runtime, total_bytes)) = perf {
             if let Some(idx) = self.hdf5_params.total_runtime {
                 result
                     .param_updates
-                    .push(ParamUpdate::float64(idx, ctrl.writer.lock().total_runtime));
+                    .push(ParamUpdate::float64(idx, total_runtime));
             }
             if let Some(idx) = self.hdf5_params.total_io_speed {
-                let speed = if ctrl.writer.lock().total_runtime > 0.0 {
-                    ctrl.writer.lock().total_bytes as f64
-                        / ctrl.writer.lock().total_runtime
-                        / 1_000_000.0
+                let speed = if total_runtime > 0.0 {
+                    total_bytes as f64 / total_runtime / 1_000_000.0
                 } else {
                     0.0
                 };
@@ -6186,6 +6193,50 @@ mod tests {
         });
         assert_eq!(posted, Some(0), "ReadFile");
         assert_eq!(proc.ctrl.lock().writer.lock().swmr_cb_counter, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The template seeds HDF5_storePerformance = 1, so the performance
+    /// block runs on every IOC's first frame. It must take the writer lock
+    /// once: v0.32.0 took it twice in one statement and deadlocked the
+    /// worker against itself, with `ctrl` held, hanging the whole port.
+    #[test]
+    fn a_frame_with_store_performance_posts_io_speed() {
+        let (proc, mut base) = hdf5_port();
+        let dir = std::env::temp_dir().join(format!("h5perf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, v) in [
+            ("FILE_PATH", format!("{}/", dir.display())),
+            ("FILE_NAME", "p".to_owned()),
+            ("FILE_TEMPLATE", "%s%s.h5".to_owned()),
+        ] {
+            proc.validate_octet(
+                idx(&base, name),
+                0,
+                &v,
+                WriteVerdict::Accept(v.clone()),
+                &base,
+            );
+        }
+        let speed = idx(&base, "HDF5_totalIoSpeed");
+        let runtime = idx(&base, "HDF5_totalRuntime");
+        let mut int = |name: &str, v: i32| {
+            let mut port = ad_core_rs::plugin::runtime::WritePort::new(&mut base);
+            let reason = idx(&port, name);
+            proc.validate_int32(reason, 0, v, WriteVerdict::Accept(v), &mut port)
+        };
+        int("WRITE_MODE", 0);
+        int("AUTO_SAVE", 1);
+        int("HDF5_storePerformance", 1);
+        let out = proc.process_array(&Arc::new(ramp_u16(4, 5)), &NDArrayPool::new(0));
+        let posted = |want: usize| {
+            out.param_updates.iter().rev().find_map(|u| match u {
+                ParamUpdate::Float64 { reason, value, .. } if *reason == want => Some(*value),
+                _ => None,
+            })
+        };
+        assert!(posted(runtime).is_some(), "totalRuntime posted");
+        assert!(posted(speed).is_some(), "totalIoSpeed posted");
         std::fs::remove_dir_all(&dir).ok();
     }
 

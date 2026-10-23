@@ -101,7 +101,7 @@ nobody has built yet.
 cargo nextest run -p rtems-exec-gate
 ```
 
-51 tests. `every_backend_deriving_crate_is_accounted_for` is the reverse check
+59 tests. `every_backend_deriving_crate_is_accounted_for` is the reverse check
 (every crate whose `build.rs` derives the backend must carry the gate test);
 `mod_gate_resolution` pins how a gated `mod` declaration charges the file it
 names, through `mod.rs` and through a `#[path]` override; `pin_maintenance`

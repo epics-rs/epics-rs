@@ -57,15 +57,16 @@ fn takes_at_least(elements: usize, ps_per_element: usize, min_us: usize) -> bool
 /// workers sleep, and waking one costs more than a short pass takes.
 /// Without the `parallel` feature the caller runs them all.
 pub fn map_indices<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    let slots: Vec<parking_lot::Mutex<Option<R>>> =
-        (0..n).map(|_| parking_lot::Mutex::new(None)).collect();
+    let mut slots: Vec<Option<R>> = (0..n).map(|_| None).collect();
+    let base = Disjoint(slots.as_mut_ptr());
     claim::run(n, &|claims| {
         for i in claims {
-            *slots[i].lock() = Some(f(i));
+            // SAFETY: `i` is claimed once, so its slot is written once.
+            unsafe { *base.at(i) = Some(f(i)) };
         }
     });
     (slots.into_iter())
-        .map(|s| s.into_inner().expect("every index ran"))
+        .map(|s| s.expect("every index ran"))
         .collect()
 }
 
@@ -103,13 +104,31 @@ pub fn fold_chunks<T: Sync, S: Send>(
 /// `f(i, chunk)` for each `len`-element chunk `i` of `out`, as
 /// [`map_indices`] claims them.
 pub fn for_each_chunk_mut<T: Send>(out: &mut [T], len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let chunks: Vec<parking_lot::Mutex<&mut [T]>> =
-        out.chunks_mut(len).map(parking_lot::Mutex::new).collect();
-    claim::run(chunks.len(), &|claims| {
+    let n = out.len();
+    let base = Disjoint(out.as_mut_ptr());
+    claim::run(n.div_ceil(len), &|claims| {
         for i in claims {
-            f(i, &mut chunks[i].lock());
+            let start = i * len;
+            // SAFETY: `i` is claimed once, so its chunk is borrowed once.
+            f(i, unsafe {
+                std::slice::from_raw_parts_mut(base.at(start), len.min(n - start))
+            });
         }
     });
+}
+
+/// Elements that the claiming threads each reach at an index of their own.
+struct Disjoint<T>(*mut T);
+
+// SAFETY: a thread dereferences only the elements of the indices it claimed.
+unsafe impl<T: Send> Sync for Disjoint<T> {}
+
+impl<T> Disjoint<T> {
+    /// # Safety
+    /// `i` is inside the slice `self.0` starts.
+    unsafe fn at(&self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
+    }
 }
 
 /// The claiming behind [`map_indices`]: each participant, the caller first,

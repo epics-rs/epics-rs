@@ -1064,14 +1064,16 @@ impl NDPluginProcess for FFTProcessor {
 
         let output = dims.and_then(|dims| {
             let mags = &scratch.bufs.out;
-            // FFTAbsValue waveform mirrors the (possibly averaged) NDArray
-            // magnitude buffer — for 1D forward this is the half-spectrum
-            // magnitude that the NDArray output already carries.
+            // FFTAbsValue is the first row of the (possibly averaged)
+            // spectrum: C posts `MIN(nFreqX, nFreqX_)` of it
+            // (NDPluginFFT.cpp:227), and the averaging restarts on a size
+            // change, so the two widths agree.
             if frame.config.direction == FFTDirection::Forward
                 && let Some(idx) = self.params.abs_value
                 && !mags.is_empty()
             {
-                updates.push(ParamUpdate::float64_array(idx, mags.clone()));
+                let first_row = mags[..dims[0].size].to_vec();
+                updates.push(ParamUpdate::float64_array(idx, first_row));
             }
             // C allocates, copies and numbers the output only
             // `if (arrayCallbacks)` (NDPluginFFT.cpp:209-220).
@@ -2215,6 +2217,29 @@ mod tests {
         // Time series is the raw input row.
         assert_eq!(ts.len(), n);
         assert!((ts[0] - 1.0).abs() < 1e-9);
+    }
+
+    /// C posts FFTAbsValue as the first row of the spectrum,
+    /// `MIN(nFreqX, nFreqX_)` elements (NDPluginFFT.cpp:227), not the whole
+    /// 2-D array the output carries.
+    #[test]
+    fn abs_value_is_the_first_row_of_a_2d_spectrum() {
+        let proc = fft_proc_with_params(FFTConfig::default());
+        let pool = NDArrayPool::new(0);
+        let (w, h) = (16, 8);
+        let arr = NDArray::with_data(
+            vec![NDDimension::new(w), NDDimension::new(h)],
+            NDDataBuffer::F64((0..w * h).map(|i| ((i * 7919) % 251) as f64).collect()),
+        );
+        let r = proc.process_array(&Arc::new(arr), &pool);
+        let abs = find_array_update(&r.param_updates, proc.params.abs_value.unwrap()).unwrap();
+        let out = &r.output_arrays[0];
+        let NDDataBuffer::F64(spectrum) = &out.data else {
+            panic!("expected F64 output");
+        };
+        let dims: Vec<usize> = out.dims.iter().map(|d| d.size).collect();
+        assert_eq!(dims, [8, 4]);
+        assert_eq!(abs, &spectrum[..8]);
     }
 
     #[test]

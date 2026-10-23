@@ -7,7 +7,7 @@
 // itself, which the backend does not remove.
 use asyn_rs::port::InterfaceMask;
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
@@ -22,15 +22,14 @@ use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamUpdate, ProcessResult, WriteOutcome, WritePort, WriteVerdict,
 };
 
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use lz4_flex::block::{
     compress, compress_into, decompress, decompress_into, get_maximum_output_size,
 };
 use parking_lot::Mutex;
 use rust_hdf5::format::messages::filter::{
-    FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters,
+    FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters_masked_bounded,
 };
 
 /// The original (uncompressed) element type of an NDArray.
@@ -49,6 +48,18 @@ pub fn original_data_type(array: &NDArray) -> NDDataType {
         Some(c) => c.original_data_type,
         None => array.data.data_type(),
     }
+}
+
+/// The bytes of the image `src` decodes to: its dims of its original element
+/// type, the output C's `allocArray(input)` gives every decompressor
+/// (NDPluginCodec.cpp:64-84), so no frame decodes past it. `None` when the
+/// dims overflow.
+fn image_bytes(src: &NDArray) -> Option<usize> {
+    src.dims
+        .iter()
+        .try_fold(original_data_type(src).element_size(), |n, d| {
+            n.checked_mul(d.size)
+        })
 }
 
 /// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
@@ -312,9 +323,7 @@ fn decode_lz4(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     // C++ uses LZ4_decompress_fast with a known uncompressed size; the original
     // element type travels in the codec (C `NDArray::dataType`).
     let original_type = original_data_type(src);
-    let num_elements: usize = src.dims.iter().map(|d| d.size).product();
-    let uncompressed_size = num_elements * original_type.element_size();
-    let decompressed = decompress(compressed, uncompressed_size).ok()?;
+    let decompressed = decompress(compressed, image_bytes(src)?).ok()?;
     Some((original_type, decompressed))
 }
 
@@ -323,7 +332,7 @@ fn decode_lz4(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
 // ---------------------------------------------------------------------------
 //
 // C++ `compressZlib`/`decompressZlib` call zlib `compress2`/`uncompress` on the
-// raw element bytes. We use `flate2`'s `ZlibEncoder`/`ZlibDecoder`, which emit
+// raw element bytes. We use `flate2`'s `ZlibEncoder`/`Decompress`, which emit
 // and parse the same zlib (RFC 1950) stream. The original data type is stored
 // as an attribute so decompression can rebuild the typed buffer.
 
@@ -401,13 +410,13 @@ fn decode_zlib(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     let compressed = src.data.as_u8_slice();
 
     let original_type = original_data_type(src);
-    let num_elements: usize = src.dims.iter().map(|d| d.size).product();
-    let uncompressed_size = num_elements * original_type.element_size();
-
-    let mut decoder = ZlibDecoder::new(compressed);
-    let mut decompressed = Vec::with_capacity(uncompressed_size);
-    decoder.read_to_end(&mut decompressed).ok()?;
-    Some((original_type, decompressed))
+    // C `uncompress`es into the image (NDPluginCodec.cpp:409-411), a stream
+    // that does not end within it failing; `decompress_vec` never grows `out`.
+    let mut out = Vec::with_capacity(image_bytes(src)?);
+    let status = Decompress::new(true)
+        .decompress_vec(compressed, &mut out, FlushDecompress::Finish)
+        .ok()?;
+    (status == Status::StreamEnd).then_some((original_type, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +538,8 @@ fn decode_lz4hdf5(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
     }
     let total_bytes = u64::from_be_bytes(buf[0..8].try_into().ok()?) as usize;
     let block_size = u32::from_be_bytes(buf[8..12].try_into().ok()?) as usize;
-    if block_size == 0 {
+    // C refuses a header past the image (lz4hdf5.c:61-64).
+    if block_size == 0 || total_bytes > image_bytes(src)? {
         return None;
     }
 
@@ -1352,8 +1362,7 @@ fn bslz4_layout(src: &NDArray) -> Option<(NDDataType, usize)> {
     if elem_size == 0 {
         return None;
     }
-    let total_elems: usize = src.dims.iter().map(|d| d.size).product();
-    Some((original_type, total_elems * elem_size))
+    Some((original_type, image_bytes(src)?))
 }
 
 /// Decode the block stream of `src` into `dst`, the [`bslz4_layout`] bytes.
@@ -1580,8 +1589,16 @@ fn decode_jpeg(
 
     let compressed = src.data.as_u8_slice();
     let mut decoder = jpeg_decoder::Decoder::new(compressed);
-    let pixels = decoder.decode().ok()?;
+    decoder.read_info().ok()?;
     let metadata = decoder.info()?;
+    // C decodes into the image (NDPluginCodec.cpp:283) and writes a larger
+    // JPEG's rows past it; such a frame is refused before its planes exist.
+    let decoded = (metadata.width as usize * metadata.height as usize)
+        .checked_mul(metadata.pixel_format.pixel_bytes())?;
+    if decoded > image_bytes(src)? {
+        return None;
+    }
+    let pixels = decoder.decode().ok()?;
 
     let width = metadata.width as usize;
     let height = metadata.height as usize;
@@ -1726,7 +1743,10 @@ fn decode_blosc(src: &NDArray) -> Option<(NDDataType, Vec<u8>)> {
         }],
     };
 
-    let decompressed = reverse_filters(&pipeline, compressed).ok()?;
+    // C's `blosc_decompress_ctx` into the image (NDPluginCodec.cpp:506-515)
+    // refuses a frame whose nbytes it cannot hold.
+    let decompressed =
+        reverse_filters_masked_bounded(&pipeline, compressed, 0, image_bytes(src)?).ok()?;
     Some((original_type, decompressed))
 }
 
@@ -2418,6 +2438,99 @@ mod tests {
             [word(4), word(8), word(12), word(16)],
             [512, 512, frame.len(), 20]
         );
+    }
+
+    /// Records the largest allocation each thread asks for, for
+    /// [`largest_allocation`].
+    struct Largest;
+
+    thread_local! {
+        static LARGEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn note_allocation(size: usize) {
+        // A thread being torn down records nothing.
+        let _ = LARGEST.try_with(|l| l.set(l.get().max(size)));
+    }
+
+    unsafe impl std::alloc::GlobalAlloc for Largest {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            note_allocation(layout.size());
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            note_allocation(layout.size());
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            note_allocation(new_size);
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Largest = Largest;
+
+    /// `f`'s result and the largest allocation this thread made during it.
+    fn largest_allocation<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        LARGEST.with(|l| l.set(0));
+        let r = f();
+        (r, LARGEST.with(|l| l.get()))
+    }
+
+    /// A frame decodes into the image its dims give, as C decodes into
+    /// `allocArray(input)`: one decoding past it, even by an element, is
+    /// refused before anything larger than the image is allocated.
+    #[test]
+    fn a_frame_decoding_past_its_image_is_refused_unallocated() {
+        type Decoder = fn(&NDArray) -> Result<NDArray, CodecFailure>;
+        // 4 MiB of u16, and a 256 x 256 JPEG.
+        let elems = 2 << 20;
+        let arr = NDArray::new(vec![NDDimension::new(elems)], NDDataType::UInt16);
+        let blosc = compress_blosc(&arr, &BloscConfig::default()).unwrap();
+        let zlib = compress_zlib(&arr, 6).unwrap();
+        let lz4 = compress_lz4(&arr).unwrap();
+        let lz4hdf5 = compress_lz4hdf5(&arr, 0).unwrap();
+        let jpeg = compress_jpeg(&make_u8_array(256, 256), 90).unwrap();
+        let (one, short) = ([elems, 1], [elems - 1, 1]);
+        // (codec, decoder, frame, the dims it fills, dims an element or row short)
+        let cases: [(&str, Decoder, NDArray, [usize; 2], [usize; 2]); 5] = [
+            ("blosc", decompress_blosc, blosc, one, short),
+            ("zlib", decompress_zlib, zlib, one, short),
+            ("lz4", decompress_lz4, lz4, one, short),
+            ("lz4hdf5", decompress_lz4hdf5, lz4hdf5, one, short),
+            ("jpeg", decompress_jpeg, jpeg, [256, 256], [256, 255]),
+        ];
+        for (name, decode, mut frame, fills, short) in cases {
+            let bytes = original_data_type(&frame).element_size();
+            for (dims, fits) in [
+                (fills, true),
+                (short, false),
+                ([fills[0] / 4, fills[1]], false),
+            ] {
+                frame.dims = dims.map(NDDimension::new).to_vec();
+                let image = dims[0] * dims[1] * bytes;
+                let (out, largest) = largest_allocation(|| decode(&frame));
+                assert_eq!(out.is_ok(), fits, "{name} into {dims:?}");
+                if !fits {
+                    assert!(
+                        largest <= image,
+                        "{name} into {image} bytes allocated {largest}"
+                    );
+                }
+            }
+        }
     }
 
     // ---- LZ4 tests ----

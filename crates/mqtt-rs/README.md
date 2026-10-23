@@ -4,13 +4,15 @@ MQTT driver for [epics-rs](https://github.com/epics-rs/epics-rs) — publish/sub
 
 An asyn PortDriver that bridges MQTT brokers to the EPICS record layer. Incoming MQTT messages update PVs via I/O Intr scanning; EPICS output record writes are published to the broker.
 
-Inspired by [epicsMQTT](https://github.com/epics-modules/mqtt) (C++ MQTT support for EPICS using autoparamDriver + Paho). This is an independent Rust implementation, not a port.
+A port of [epicsMQTT](https://github.com/epics-modules/mqtt)'s `drvMqtt` (C++ on autoparamDriver + Paho; revision `278a6a4`, the tree has no tags) onto asyn-rs and rumqttc.
 
 ## Features
 
 - **Generic MQTT** — works with any MQTT broker and topic structure
 - **FLAT payloads** — single values: `INT`, `FLOAT`, `DIGITAL`, `STRING`, `INTARRAY`, `FLOATARRAY`
-- **JSON payloads** — extract nested fields via dot-path (e.g. `sensor.temperature`)
+- **JSON payloads** — an inbound field is found by its whole key at any depth
+  (C `findJsonField`'s sorted-key search); a write publishes the value under
+  the key, a dotted key building nested objects
 - **Bidirectional** — input records subscribe, output records publish
 - **Auto-reconnect** — rumqttc handles broker reconnection transparently
 - **Connection status PV** — bi record with alarm on disconnect; tracked via ConnAck *and* inbound activity (Publish / PingResp) so the PV cannot get stuck at 0 after a recoverable rumqttc error
@@ -21,15 +23,15 @@ Inspired by [epicsMQTT](https://github.com/epics-modules/mqtt) (C++ MQTT support
 Records reference MQTT topics through the asyn drvInfo string:
 
 ```
-FORMAT:TYPE topic/name [json.field.path]
+FORMAT:TYPE topic/name [json_field]
 ```
 
 | Field | Values |
 |-------|--------|
 | FORMAT | `FLAT`, `JSON` |
 | TYPE | `INT`, `FLOAT`, `DIGITAL`, `STRING`, `INTARRAY`, `FLOATARRAY` |
-| topic | MQTT topic (no wildcards, spaces allowed) |
-| json.field.path | Dot-separated path for JSON payloads (required for JSON, forbidden for FLAT) |
+| topic | MQTT topic (no wildcards; FLAT takes the rest of the line, JSON a topic with spaces in double quotes) |
+| json_field | JSON key, matched whole, never split on `.` (required for JSON) |
 
 Examples:
 ```
@@ -37,7 +39,7 @@ FLAT:FLOAT sensors/temperature
 FLAT:INT   sensors/counter
 FLAT:STRING device/status
 JSON:FLOAT sensors/environment humidity
-JSON:INT   sensors/data reading.value
+JSON:INT   sensors/data value
 ```
 
 ## Generic MQTT Usage
@@ -165,7 +167,7 @@ app = register_z2m_commands(app);  // adds mqttZ2m* commands
 | `mqttZ2mMotion` | `port prefix dev topic` | Motion sensor |
 | `mqttZ2mRemote2` | `port prefix dev topic` | 2-button remote |
 
-**QoS values:** 0 = at most once, 1 = at least once (default), 2 = exactly once
+**QoS values:** 0 = at most once (an omitted `qos`, as in C), 1 = at least once, 2 = exactly once
 
 ## Supported Record Types
 
@@ -175,8 +177,8 @@ app = register_z2m_commands(app);  // adds mqttZ2m* commands
 | asynFloat64 | `FLAT:FLOAT` | `JSON:FLOAT` | Read / Write |
 | asynUInt32Digital | `FLAT:DIGITAL` | `JSON:DIGITAL` | Read / Write |
 | asynOctet | `FLAT:STRING` | `JSON:STRING` | Read / Write |
-| asynInt32Array | `FLAT:INTARRAY` | — | Read / Write |
-| asynFloat64Array | `FLAT:FLOATARRAY` | — | Read / Write |
+| asynInt32Array | `FLAT:INTARRAY` | `JSON:INTARRAY` | Read / Write |
+| asynFloat64Array | `FLAT:FLOATARRAY` | `JSON:FLOATARRAY` | Read / Write |
 
 ## Connection Status PV
 

@@ -51,7 +51,7 @@ cargo run -p ioc-spawn-gate --bin ioc-spawn-census   # what the sources say
 cargo nextest run -p ioc-spawn-gate                  # the gate itself
 ```
 
-32 tests. `every_ioc_spawning_binary_is_declared_in_a_test_group` is the gate;
+34 tests. `every_ioc_spawning_binary_is_declared_in_a_test_group` is the gate;
 the rest pin the scan's boundaries — what counts as a spawn, how the mod graph
 is followed (the gate reads module structure, not call sites), which `path`
 dev-dependency a binary inherits a spawn from (the ones it names as

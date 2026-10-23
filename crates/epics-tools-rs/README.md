@@ -4,10 +4,12 @@ Operational tooling for EPICS deployments — process supervisors, log/audit
 dumpers, config validators.
 
 First tenant: **`procserv`** — a pure-Rust port of
-[`epics-modules/procServ`](https://github.com/epics-modules/procServ).
-PTY-based process supervisor with a multi-client telnet console. Drop-in
-flag compatibility with C `procServ`, so existing wrapper scripts and
-systemd units do not need to be rewritten.
+[`epics-modules/procServ`](https://github.com/epics-modules/procServ)
+at `v2.8.0-50-ge106eb8`. PTY-based process supervisor with a multi-client
+telnet console. It takes every C `procServ` option, so wrapper scripts and
+systemd units keep their flags, with one exception: the control endpoint
+must be given with `-P`. C's positional form, `procServ 4051 softIoc ...`,
+is not accepted.
 
 Host platforms only, and `build.rs` owns that decision as an allowlist
 (`PROCSERV_HOST_TARGETS`: linux, macos, the four BSDs, solaris, illumos,
@@ -62,7 +64,7 @@ without the CLI dependencies (`clap`, `tracing-subscriber`):
 
 ```toml
 [dependencies]
-epics-tools-rs = { version = "*", default-features = false, features = ["procserv"] }
+epics-tools-rs = { version = "0.32", default-features = false, features = ["procserv"] }
 ```
 
 ## Run
@@ -123,6 +125,9 @@ Everything after `--` is the child program and its argv.
 | `-T, --autorestartcmd <CHAR>` | Toggle restart-mode key (caret notation) | `^T` |
 | `-x, --logoutcmd <CHAR>` | Per-client logout key (caret notation; disabled by default) | none |
 
+Not in C: `--unixpath`, `--max-restarts` and `--restart-window`, and the
+short forms `-S`, `-F`, `-N`, `-T`, `-C` and `-K`, which C spells long only.
+
 ### Connecting to the console
 
 ```bash
@@ -136,7 +141,8 @@ in a party-line fashion. The command keys:
 
 - `Ctrl-X` — force-kill the child (`SIGKILL` unless `-K` says otherwise).
   Rebind with `-k`, disable with an empty value.
-- `Ctrl-T` — toggle restart mode (`OnExit` ↔ off); `-T` rebinds it.
+- `Ctrl-T` — cycle the restart mode, `OnExit` → `Disabled` → `OneShot`
+  (C `restart` → `norestart` → `oneshot`); `-T` rebinds it.
 - `Ctrl-R` — manually restart the child when it is dead.
 - `Ctrl-Q` — shut the supervisor down. Always enabled and never exposed
   on the CLI (C `quitChar`, `procServ.cc:69`); it fires only while the
@@ -189,8 +195,8 @@ The C → Rust mapping is documented at the crate root in
 - Stateless command-key dispatch (no menu FSM); keys are still echoed
   to other connections.
 - Narrow telnet usage — only `IAC WILL ECHO` and `IAC DO LINEMODE` are
-  negotiated, so the in-crate parser stays under ~80 LOC instead of
-  vendoring `libtelnet.c`.
+  negotiated, so a small in-crate parser replaces vendoring
+  `libtelnet.c`.
 
 ## License
 

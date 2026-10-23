@@ -57,13 +57,15 @@ impl NDDataType {
     }
 }
 
-/// The storage unit of an [`NDDataBuffer`]: 64 bytes aligned to 64, so its
-/// bytes are aligned for every element type they can be retyped to.
+/// The storage unit of an [`NDDataBuffer`]: the widest element, aligned to
+/// it, so its bytes are aligned for every element type they can be retyped
+/// to. No wider: above the allocator's minimum alignment `zeros` stops being
+/// a zeroed allocation and writes every byte.
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 struct Chunk([u8; CHUNK]);
 
-const CHUNK: usize = 64;
+const CHUNK: usize = 8;
 
 /// The chunks that hold `bytes`.
 fn chunks_for(bytes: usize) -> usize {

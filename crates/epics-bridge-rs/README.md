@@ -18,7 +18,8 @@ only the CLI (`clap`, `tracing-subscriber`) for its binary:
 | feature | what it selects |
 |---|---|
 | `qsrv-core` | the QSRV bridge without the client stack — the configuration an RTEMS IOC builds, and the twin of `epics-ca-rs/client-core` |
-| `qsrv` (default) | `qsrv-core` plus `pvalink` and the PVA client/TLS stack |
+| `qsrv` (default) | `qsrv-core` plus `pvalink`, `calink-core` with the full CA client, and the PVA client/TLS stack |
+| `calink-core` | the network half of the `ca` link set over `epics-ca-rs/client-core`; a link to a local record resolves in `epics-base-rs` without it |
 | `ca-gateway` (default) | the CA fan-out gateway |
 | `ca-gateway-tls` | the gateway over `epics-ca-rs/experimental-rust-tls` |
 | `pvalink` | `pva://` record links on their own |
@@ -99,10 +100,10 @@ CLI options:
 | `--access <FILE>` | Path to `.access` ACF file |
 | `--preload <FILE>` | Pre-subscribe upstream PVs (one per line) |
 | `--putlog <FILE>` | Put-event audit log file |
-| `--port <N>` | CA server TCP port (0 = default 5064) |
+| `--port <N>` | CA server port; omitted takes `EPICS_CAS_SERVER_PORT`, then `EPICS_CA_SERVER_PORT`, then 5064; 0 binds an ephemeral port |
 | `--read-only` | Reject all client puts |
 | `--no-stats` | Disable `gateway:*` stats PVs |
-| `--stats-prefix <S>` | Custom stats PV prefix (default `"gateway:"`) |
+| `--stats-prefix <S>` | Stats PV namespace, `:` added (default the host name, falling back to `gateway`) |
 | `--heartbeat-interval <N>` | Heartbeat counter period (s; 0 = disable) |
 | `--cleanup-interval <N>` | Cache eviction sweep period (s) |
 | `--stats-interval <N>` | Stats refresh period (s) |
@@ -143,8 +144,9 @@ The `--preload` file is still supported as an optional warm-cache mechanism but 
 
 ### Group PV Channels
 - Composite PvStructure from multiple records (C++ QSRV JSON format compatible)
-- 5 field mapping types: Scalar, Plain, Meta, Any, Proc
-- Trigger rules: `"*"` (all), `"field1,field2"` (selective), `""` (none)
+- 7 field mapping types: Scalar, Plain, Meta, Any, Proc, Structure, Const
+- Trigger rules: `"*"` (all), `"field1,field2"` (selective), `""` (none),
+  and no `+trigger` (the member's own field only)
 - Atomic put mode (sequential write without yielding)
 - Per-member `+id`, `+putorder`, `+type` configuration
 - info(Q:group, ...) parsing from record definitions + external JSON file merging
@@ -155,13 +157,13 @@ The `--preload` file is still supported as an optional warm-cache mechanism but 
 - Initial complete snapshot on start (C++ BaseMonitor::connect pattern)
 - Group monitor: fan-in channel across all members with trigger rule evaluation
 - Partial updates for `TriggerDef::Fields` (only re-read triggered members)
-- Overflow counter for tracking lost events
+- On queue overflow the newest update replaces the tail (latest-value coalescing)
 
 ### Infrastructure
 - **ChannelProvider** trait — channel search, list, create
-- **Channel** trait — get, put, getField, createMonitor
+- **Channel** trait — get, put, get_field
 - **PvaMonitor** trait — start, poll, stop
-- Record metadata cache (avoids repeated introspection)
+- Per-record NT type / DBF type cache (`BridgeProvider::clear_cache`)
 - Pluggable AccessControl trait (default: AllowAllAccess)
 - Enum index <-> string bidirectional conversion
 - DBF type-aware value conversion (`scalar_to_epics_typed`)
@@ -234,22 +236,22 @@ epics-bridge-rs = "0.32"
 ```rust
 use epics_bridge_rs::{BridgeProvider, ChannelProvider, Channel};
 
-// Create bridge from an existing PvDatabase
-let mut bridge = BridgeProvider::new(db.clone());
+// Create bridge from an existing Arc<PvDatabase>
+let bridge = BridgeProvider::new(db.clone());
 
 // Load group PV definitions
 bridge.load_group_file("groups.json")?;
 
 // Or from record info tags
-bridge.load_info_group("TEMP:sensor", r#"{
+bridge.load_info_group(b"TEMP:sensor", r#"{
     "TEMP:group": {
         "temperature": {"+channel": "VAL", "+type": "plain", "+trigger": "*"}
     }
 }"#)?;
 
 // Search and create channels
-if bridge.channel_find("TEMP:ai").await {
-    let ch = bridge.create_channel("TEMP:ai").await?;
+if bridge.channel_find(b"TEMP:ai").await {
+    let ch = bridge.create_channel(b"TEMP:ai").await?;
     let value = ch.get(&request).await?;
 }
 ```
@@ -265,17 +267,20 @@ Tests cover: type conversion roundtrips, NormativeType structure building, pvReq
 ## Dependencies
 
 - epics-base-rs — Record trait, PvDatabase, Snapshot, DbSubscription, and the
-  `runtime` layer (the tokio dependency is that crate's, not this one's)
+  `runtime` layer
+- tokio — the full runtime on a host; RTEMS and VxWorks drop `net`,
+  `signal` and `process`
 - epics-pva-rs — PvStructure, ScalarValue, FieldDesc (`qsrv-core`, `pvalink`,
   `pva-gateway`)
-- epics-ca-rs — the gateway's two CA sides (`ca-gateway`, `qsrv`)
+- epics-ca-rs — the gateway's two CA sides (`ca-gateway`), the network half
+  of `ca` links (`calink-core`), and `dual-ioc`
 - serde / serde_json — group config JSON parsing; toml — `dual-gateway`
 - regex — `.pvlist` rules and the PVA gateway's name matching
 - thiserror, parking_lot, arc-swap, bytes, chrono, async-trait, tracing
 
 ## Requirements
 
-- Rust 1.94.0 (`rust-toolchain.toml`), edition 2024
+- Rust 1.99.1 (`rust-toolchain.toml`), edition 2024
 
 ## License
 

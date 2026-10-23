@@ -5,9 +5,9 @@ module for synchrotron beamline optical device control.
 
 ## Overview
 
-optics-rs provides record types, state machine controllers, and device drivers
-for monochromators, slits, filters, diffractometer tables, beam position
-monitors, and other optical components.
+optics-rs provides the table record, the module's twelve sequence programs
+and its math for monochromators, slits, filters, diffractometer tables, beam
+position monitors, and other optical components.
 
 | Component | Rust module | Original |
 |---|---|---|
@@ -24,41 +24,43 @@ monitors, and other optical components.
 | XIA PF4 dual filter | `snl::pf4` | pf4.st |
 | Ion chamber I0 | `snl::io` | Io.st |
 | Coarse+fine flexure | `snl::flex_combined_motion` | flexCombinedMotion.st |
-| HSC-1 slit controller | `drivers::hsc` (port driver) and `snl::xiahsc` | xiahsc.st |
-| XIA slit with sscan | `snl::xia_slit` | xia_slit.st |
-| Quad X-ray BPM | `drivers::qxbpm` (port driver) and `snl::qxbpm` | sncqxbpm.st |
+| HSC-1 slit controller | `snl::xiahsc` | xiahsc.st |
+| HSC-1 slit, scannable (busy records) | `snl::xia_slit` | xia_slit.st |
+| Quad X-ray BPM | `snl::qxbpm` | sncqxbpm.st |
+| Simulated HSC-1 and quad BPM | `drivers::hsc`, `drivers::qxbpm` | none (rs only) |
 
-The serial actors in `snl/` are async entry points taking the read and
-write halves of the connection (`run(config, reader, writer, cmd_rx,
-status_tx)`); they are not `seqStart` programs.
+Each `snl` module is the upstream `.st`, with C defects fixed in place under
+a comment, compiled by epics-snc-rs in `build.rs` and run on epics-seq-rs; the `.rs` beside it supplies what the
+program's escaped C supplied. As in C, each state set runs on its own OS
+thread.
 
 ## Architecture
 
-The original C module mixed three concerns into SNL (State Notation Language)
-programs: device I/O, control logic, and physics calculations. This Rust port
-separates them:
-
 ```
-records/     Pure EPICS record types (table)
-math/        Physics calculations (matrix3, orient)
-data/        Reference data tables (chantler X-ray absorption)
-snl/         Control logic as async state machines (epics-ca-rs)
-drivers/     Device I/O as asyn port drivers (SimHsc, SimQxbpm)
-seq_runner/  The `seqStart` command — the Rust stand-in for C's `seq`
-db/          32 database templates and 4 .vdb from the original module
+records/       The table record
+math/          matrix3, orient
+data/          chantler X-ray absorption tables
+snl/           The twelve upstream .st programs and their companions
+drivers/       Simulated asyn ports for the HSC-1 and the quad BPM
+seq_runner.rs  seq_start: start a compiled program by name
+db/            32 database templates and 4 .vdb from the original module
+ui/            PyDM screens
 ```
 
-State machines (`snl/`) monitor PVs and drive motors. They contain no I/O
-code and no EPICS record logic, only the control algorithm.
-
-Port drivers (`drivers/`) own the hardware protocol. Each has a simulation
-backend for testing without hardware.
+`xiahsc`, `xia_slit` and `sncqxbpm` talk to the device themselves, through
+the asyn record their `S` macro names, as in C. `drivers/` has no C
+counterpart: asyn ports over an in-memory HSC-1 (blade, gap and center
+positions) and quad BPM (diode currents and beam position), for running
+without hardware.
 
 ## Usage in st.cmd
 
 ### State machines (control logic)
 
-Start with `seqStart`, the Rust equivalent of the C EPICS `seq` command:
+`seqStart` is the startup command an IOC registers around
+`optics_rs::seq_runner::seq_start` (`examples/mini-beamline` registers it),
+its stand-in for C's `seq`. A macro left out takes the default on the
+program's `.st` `program` line.
 
 ```bash
 # Kohzu double-crystal monochromator
@@ -80,86 +82,70 @@ seqStart("filterDrive", "NAME=filters,P=BL1:,R=filter:,NUM_FILTERS=8")
 seqStart("pf4", "name=pf4_1,P=BL1:,H=pf4:,B=A,M=BL1:userTranpf4.I,B1=BL1:userTranpf4.A,B2=BL1:userTranpf4.B,B3=BL1:userTranpf4.C,B4=BL1:userTranpf4.D")
 
 # Ion chamber intensity
-seqStart("Io", "P=BL1:,MONO=BL1:mono:,VSC=BL1:scaler:")
+seqStart("Io", "P=BL1:Io:,MONO=BL1:BraggERdbkAO,VSC=BL1:scaler1")
 
 # Coarse+fine flexure stage
-seqStart("flexCombinedMotion", "P=BL1:,M=flex:,CAP=flex:cap:,FM=flex:fine,CM=flex:coarse")
+seqStart("flexCombinedMotion", "P=BL1:,M=flex1,C=cap1,FM=flex:fine,CM=flex:coarse")
+
+# HSC-1 slit on the asyn record BL1:asyn_hsc, with $(OPTICS)/db/xiahsc.db loaded
+seqStart("xiahsc", "name=hsc1,P=BL1:,HSC=hsc1:,S=BL1:asyn_hsc")
 ```
 
-### Serial device drivers
+A program can also be started directly, as the tests do:
 
-#### HSC-1 slit controller
-
-```bash
-# Simulation (no hardware)
-simHscCreate("HSC1", 100)
-
-# Real hardware
-hscCreate("HSC1", "/dev/ttyUSB0", 9600, 100)
-
-# Load slit database
-dbLoadRecords("$(OPTICS)/db/xiahsc.db", "P=BL1:,HSC=HSC1:")
+```rust
+epics_seq_rs::seq(&optics_rs::snl::kohzu_ctl::kohzuCtl, "P=BL1:,M_THETA=dcm:theta", 0, &db);
 ```
 
-#### Quad X-ray BPM
+### Simulated serial devices
+
+`HscHolder::sim_hsc_create_command()` and
+`QxbpmHolder::sim_qxbpm_create_command()` give an IOC the `simHscCreate` and
+`simQxbpmCreate` commands. Each makes an asyn port; `examples/mini-beamline`
+loads its `hsc.template` and `qxbpm.template` on them:
 
 ```bash
-# Simulation (beam at center)
-simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
-
-# Real hardware
-qxbpmCreate("QXBPM1", "/dev/ttyUSB1", 9600, 100)
-
-# Load BPM database
-dbLoadRecords("$(OPTICS)/db/qxbpm.db", "P=BL1:,PORT=QXBPM1")
+simHscCreate("HSC1", 100)                # port, pollMs
+simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)  # port, xPos, yPos, pollMs
+dbLoadRecords("$(MINI_BEAMLINE)/db/hsc.template", "P=$(PREFIX),HSC=hsc1:,PORT=HSC1")
+dbLoadRecords("$(MINI_BEAMLINE)/db/qxbpm.template", "P=$(PREFIX)bpm1:,PORT=QXBPM1")
 ```
 
 ### Table record
 
-The 6-DOF optical table record is registered as a record type:
+The 6-DOF optical table record is registered as a record type;
+`table_record_factory()` also loads the record's `.dbd`:
 
 ```rust
 // In your IOC binary
-use optics_rs::records::table::TableRecord;
-
-app = app.register_record_type("table", || Box::new(TableRecord::new()));
+let (name, factory) = optics_rs::table_record_factory();
+app = app.register_record_type(name, factory);
 ```
 
 ```bash
 # st.cmd
-dbLoadRecords("$(OPTICS)/db/table.db", "P=BL1:,Q=table1:,T=table1")
+dbLoadRecords("$(OPTICS)/db/table.db", "P=BL1:,Q=Table1,T=table1,M0X=m1,M0Y=m2,M1Y=m3,M2X=m4,M2Y=m5,M2Z=m6,GEOM=SRI")
 ```
 
-## Switching from simulation to real hardware
+## Available programs
 
-Simulation and real hardware use the same driver, database, and state
-machines. Only the `Create` command changes:
+Each program's macros, as its `.st` `program` line lists them; that line
+also gives each one's default.
 
-```bash
-# Development / testing
-simMotorCreate("dcm_theta", -10000, 90000, 100)  # steps, at MRES 0.001
-simHscCreate("HSC1", 100)
-simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
-
-# Production (same DB, same seqStart, different drivers)
-# motorCreate("dcm_theta", "/dev/ttyUSB0", ...)
-# hscCreate("HSC1", "/dev/ttyUSB1", 9600, 100)
-# qxbpmCreate("QXBPM1", "/dev/ttyUSB2", 9600, 100)
-```
-
-## Available seqStart programs
-
-| Program | Required macros | Optional macros |
+| Program | `.st` | Macros |
 |---|---|---|
-| `kohzuCtl` | P, M_THETA, M_Y, M_Z | GEOM |
-| `kohzuCtl_soft` | P, M_THETA, M_Y, M_Z | MONO, GEOM |
-| `hrCtl` | P, M_PHI1, M_PHI2 | N |
-| `ml_monoCtl` | P, M_THETA | M_THETA2, M_Y, M_Z, Y_OFF, GEOM |
-| `orient` | P, PM, mTTH, mTH, mCHI, mPHI | |
-| `filterDrive` | P, R, NUM_FILTERS | NAME |
-| `pf4` | P, B | H, M, BP, B1..B4, name |
-| `Io` | P | MONO, VSC |
-| `flexCombinedMotion` | P, M, FM, CM | CAP |
+| `kohzuCtl` | kohzuCtl.st | P, M_THETA, M_Y, M_Z, GEOM |
+| `kohzuCtl_soft` | kohzuCtl_soft.st | P, MONO, M_THETA, M_Y, M_Z, GEOM |
+| `hrCtl` | hrCtl.st | P, N, M_PHI1, M_PHI2 |
+| `ml_monoCtl` | ml_monoCtl.st | P, M_THETA, M_THETA2, M_Y, M_Z, Y_OFF, GEOM |
+| `orient` | orient_st.st | P, PM, mTTH, mTH, mCHI, mPHI |
+| `filterDrive` | filterDrive.st | NAME, P, R, NUM_FILTERS |
+| `pf4` | pf4.st | name, P, H, B, BP, B1..B4, M |
+| `Io` | Io.st | P, MONO, VSC |
+| `flexCombinedMotion` | flexCombinedMotion.st | name, P, M, C, FM, CM |
+| `xiahsc` | xiahsc.st | name, S, P, HSC |
+| `xia_slit` | xia_slit.st | name, P, HSC, S |
+| `sncqxbpm` | sncqxbpm.st | name, P, S |
 
 ## Database templates
 
@@ -192,12 +178,13 @@ What the suite covers:
 - **Matrix/orient**: Round-trip verification against published
   crystallographic data (Si, Be, VO2) from the original optics test suite.
 - **Chantler**: X-ray absorption coefficients for 22 elements.
-- **State machines**: Physics calculations for each controller.
-- **Serial protocol**: Command formatting, response parsing, coordinate
-  math for HSC-1 and QXBPM.
+- **State machines**: each compiled `.st` run on its shipped `.db`.
+- **Serial devices**: `xiahsc`, `xia_slit` and `sncqxbpm` against mock
+  HSC-1 and quad BPM devices on TCP behind an asyn record; the C programs
+  ran against the same mocks for the expected values.
 - **Port drivers**: SimHsc and SimQxbpm parameter updates and poll loops.
 - **Table record**: Field access, geometry modes, process logic.
-- **seq_runner**: Macro parsing, program dispatch.
+- **seq_runner**: program lookup, macro defaults, start before PINI.
 
 ```sh
 cargo nextest run -p optics-rs

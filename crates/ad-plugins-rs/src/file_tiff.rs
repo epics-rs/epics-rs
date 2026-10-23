@@ -603,39 +603,79 @@ fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADRe
         return Err(err(&format!("unsupported Compression={compression}")));
     }
 
-    let offsets = tags
-        .get(&TAG_STRIP_OFFSETS)
-        .ok_or_else(|| err("no StripOffsets"))?;
-    let counts = tags
-        .get(&TAG_STRIP_BYTE_COUNTS)
-        .ok_or_else(|| err("no StripByteCounts"))?;
-    if offsets.len() != counts.len() {
-        return Err(err("StripOffsets/StripByteCounts length mismatch"));
+    // libtiff refuses these at TIFFOpen (tif_dirread.c:3561, :3621, :4053).
+    if width == 0 || height == 0 {
+        return Err(err("no image"));
     }
+    let rows_per_strip = match scalar(TAG_ROWS_PER_STRIP) {
+        Some(0) => return Err(err("bad value 0 for RowsPerStrip")),
+        Some(rows) => (rows as usize).min(height),
+        None => height,
+    };
+    let separate = planar_config == u64::from(PLANARCONFIG_SEPARATE);
+    let planes = if separate {
+        samples_per_pixel as usize
+    } else {
+        1
+    };
+    let strips_per_plane = height.div_ceil(rows_per_strip);
+    let num_strips = strips_per_plane * planes;
+    // One entry per strip of the geometry, cut or zero-filled, as
+    // TIFFFetchStripThing leaves the tables.
+    let table = |tag: u16| {
+        tags.get(&tag).map(|v| {
+            (0..num_strips)
+                .map(|i| v.get(i).copied().unwrap_or(0))
+                .collect::<Vec<_>>()
+        })
+    };
+    let offsets = table(TAG_STRIP_OFFSETS).ok_or_else(|| err("no StripOffsets"))?;
     let mut array = pool.alloc(dims, data_type)?;
     let image = array.data_mut().as_u8_slice_mut();
     let size = image.len();
+    // TIFFScanlineSize: one row of one plane.
+    let scanline = size / height / planes;
+    let file_size = bytes.len() as u64;
+    let estimate = || vec![(scanline * (height / strips_per_plane)) as u64; num_strips];
+    // TIFFReadDirectory estimates the counts from the geometry when they are
+    // missing, when a single one is 0, past the file or short of the image,
+    // or when the first two of more than two contiguous strips differ
+    // (tif_dirread.c:3901-3976).
+    let counts = match table(TAG_STRIP_BYTE_COUNTS) {
+        None if num_strips != planes => return Err(err("no StripByteCounts")),
+        None => estimate(),
+        Some(c)
+            if num_strips == 1
+                && offsets[0] != 0
+                && (c[0] == 0
+                    || c[0] > file_size.wrapping_sub(offsets[0])
+                    || c[0] < (scanline * height) as u64) =>
+        {
+            estimate()
+        }
+        Some(c) if !separate && num_strips > 2 && c[0] != c[1] && c[0] != 0 && c[1] != 0 => {
+            estimate()
+        }
+        Some(c) => c,
+    };
     let mut total = 0;
-    for (offset, byte_count) in offsets.iter().zip(counts) {
-        let (start, len) = (*offset as usize, *byte_count as usize);
-        let strip = bytes
-            .get(start..start + len)
-            .ok_or_else(|| err("strip extends past the end of the file"))?;
-        image
-            .get_mut(total..total + len)
-            .ok_or_else(|| {
-                err(&format!(
-                    "file size too large ={}, must be <= {size}",
-                    total + len
-                ))
-            })?
-            .copy_from_slice(strip);
+    for strip in 0..num_strips {
+        // TIFFReadEncodedStrip: the strip's rows from the geometry, capped at
+        // what the image has left; the count only has to cover them.
+        let rows = (height - strip % strips_per_plane * rows_per_strip).min(rows_per_strip);
+        let len = (rows * scanline).min(size - total);
+        let (offset, count) = (offsets[strip], counts[strip]);
+        if count > file_size || offset > file_size - count {
+            return Err(err(&format!("strip {strip} runs past the end of the file")));
+        }
+        if count < len as u64 {
+            return Err(err(&format!(
+                "strip {strip} has {count} bytes, its rows {len}"
+            )));
+        }
+        let start = offset as usize;
+        image[total..total + len].copy_from_slice(&bytes[start..start + len]);
         total += len;
-    }
-    if total != size {
-        return Err(err(&format!(
-            "strip data is {total} bytes, the image {size}"
-        )));
     }
     array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
@@ -2281,5 +2321,70 @@ mod tests {
         );
         let none = strip_file(3, Some(&[12]), 16, &[]);
         assert!(decode(&none, NDAttributeList::new(), &NDArrayPool::new(0)).is_ok());
+    }
+
+    /// Each file of the C comparison set reads as C `readFile` reads it with
+    /// libtiff 4.0.6 and 4.5.1 alike: `None` where C fails the read or the
+    /// open, else C's pixels.
+    #[test]
+    fn a_strip_table_reads_as_libtiff_reads_it() {
+        let image: Vec<u8> = (0..12).collect();
+        let c = Some(image.as_slice());
+        let cases = [
+            ("ok1", strip_file(3, Some(&[12]), 16, &[]), c),
+            ("ok3", strip_file(1, Some(&[4, 4, 4]), 16, &[]), c),
+            ("over1", strip_file(3, Some(&[16]), 16, &[]), c),
+            ("over3_last", strip_file(1, Some(&[4, 4, 6]), 16, &[]), c),
+            (
+                "short3_last",
+                strip_file(1, Some(&[4, 4, 2]), 16, &[]),
+                None,
+            ),
+            ("rps2", strip_file(2, Some(&[8, 4]), 16, &[]), c),
+            ("rps2_short", strip_file(2, Some(&[8, 2]), 16, &[]), None),
+            // "Bogus": one strip, its count short of the image or past the file.
+            ("short1", strip_file(3, Some(&[8]), 16, &[]), c),
+            ("short1_nobytes", strip_file(3, Some(&[8]), 0, &[]), c),
+            ("over1_pasteof", strip_file(3, Some(&[1000]), 16, &[]), c),
+            // "Wrong": three strips, the first two counts differ.
+            ("short3_mid", strip_file(1, Some(&[4, 2, 4]), 16, &[]), c),
+            (
+                "over3_first_short_mid",
+                strip_file(1, Some(&[6, 2, 4]), 16, &[]),
+                c,
+            ),
+            // No StripByteCounts: estimated for one strip, refused for more.
+            ("nocounts1", strip_file(3, None, 16, &[]), c),
+            ("nocounts3", strip_file(1, None, 16, &[]), None),
+            (
+                "rps0",
+                strip_file(3, Some(&[12]), 16, &[(TAG_ROWS_PER_STRIP, 0)]),
+                None,
+            ),
+            (
+                "w0",
+                strip_file(3, Some(&[12]), 16, &[(TAG_IMAGE_WIDTH, 0)]),
+                None,
+            ),
+            (
+                "h0",
+                strip_file(3, Some(&[12]), 16, &[(TAG_IMAGE_LENGTH, 0)]),
+                None,
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, file, c)| {
+                let read = decode(file, NDAttributeList::new(), &NDArrayPool::new(0));
+                let rs = read.as_ref().ok().map(|a| a.data().as_u8_slice());
+                (rs != *c).then(|| {
+                    format!(
+                        "{name}: {:?}",
+                        read.map(|a| a.data().as_u8_slice().to_vec())
+                    )
+                })
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
